@@ -1,0 +1,7 @@
+{
+    "languages" : ["go"],
+    "payload_output" : "N/A",
+    "c2" : "N/A",
+    "mythic_version" : "3.3.1-rc57",
+    "agent_version" : "1.0"
+}

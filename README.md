@@ -8,6 +8,8 @@ Sage is an interface to AI and LLMs as a Mythic callback. This Mythic agent itse
 
 ## Getting Started
 
+> **__NOTE:__** REQUIRES MYTHIC v3.3.1-rc57 OR LATER
+
 ### Download & Install
 
 To get started:
