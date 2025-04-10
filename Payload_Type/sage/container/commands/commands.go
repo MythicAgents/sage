@@ -25,7 +25,7 @@ type Job struct {
 func Commands() (commands []structs.Command) {
 	// TODO Add the following commands: sharpgen
 	commands = append(
-		commands, chat(), list(), query(),
+		commands, chat(), list(), query(), mcpConnect(),
 	)
 	return
 }

@@ -74,7 +74,19 @@ Sage is a _different_ kind of Mythic agent because it is not an agent that runs 
 
 ## Model Providers
 
+### Anthropic
+
+In order to interact with Anthropic, you must set the following values:
+
+- API_KEY (e.g., `sk-ant-api03-abc123XYZ456_DEF789ghi0JKLmno1PQRsTu2vWXyz34AB56CDef78GHIjk9LMN_OPQRSTUVWXYZabcdef0123456789-ABCDEFG`)
+
+Example [model strings](https://docs.anthropic.com/en/docs/about-claude/models/all-models) to us with Anthropic:
+
+- `claude-3-7-sonnet-latest`
+
 ### Bedrock
+
+> **__NOTE:__** Only Anthropic Claude is supported at this time
 
 **You must have an AWS account that has Bedrock permissions AND have access to the desired model in your bedrock configuration**
 
@@ -112,7 +124,28 @@ Alternatively create a Docker compose file with
 
 In order to interact with an ollama, you must set the following:
 
-- API_ENDPOINT (e.g., `http://127.0.0.1:11434`)
+- API_ENDPOINT (e.g., `http://127.0.0.1:11434/v1`)
+
+## Model Context Protocol (MCP)
+
+Sage can connect to Stdio MCP servers and use the provided tools/functions with interacting with a model using the `mcp-connect` command.
+
+> **__NOTE:__** StdIO MCP servers must be running in the same location as Sage container
+
+Stdio MCP server require Sage to launch the process and then connect to the child process. If you are using the Sage Docker container, everything you need to run for the MCP server must be in the container. Alternatively, you can run Sage locally on the same host Mythic is running as and connect that way.
+
+For example, to connect to the [Mythic MCP](https://github.com/xpn/mythic_mcp) server, you must have `uv`, `python3`, and the source code in the container. For this MCP server, the `command` would be `uv` and you would create one `argument` for each of these:
+
+- `--directory`
+- `/opt/mythic_mcp/` - The location where Mythic MCP server source code is
+- `run`
+- `main.py`
+- `mythic_admin` - The Mythic username to connect to the API with
+- `SuperSecretPassword` - The password for the Mythic User to connect to the API with
+- `127.0.0.1` - Mythic's IP address; Don't use the loopback if your running Sage in a container
+- `7443` - The port that Mythic is listening on
+
+> **__NOTE:__** MYTHIC MCP IS ALREADY INSTALLED IN THE CONTAINER AT /opt/mythic_mcp
 
 ## Run Sage Locally
 Use the following commands to run the Sage container from the command line without using Docker (typicall for testing and troubleshooting):

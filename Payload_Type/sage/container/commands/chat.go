@@ -7,8 +7,9 @@ import (
 	"sync"
 
 	// Internal
-	b "github.com/MythicAgents/sage/Payload_Type/sage/container/pkg/bedrock"
+	"github.com/MythicAgents/sage/Payload_Type/sage/container/pkg/anthropic"
 	"github.com/MythicAgents/sage/Payload_Type/sage/container/pkg/env"
+	"github.com/MythicAgents/sage/Payload_Type/sage/container/pkg/message"
 	"github.com/MythicAgents/sage/Payload_Type/sage/container/pkg/openai"
 
 	// Mythic
@@ -93,6 +94,40 @@ func chat() structs.Command {
 		},
 	}
 
+	tools := structs.CommandParameter{
+		Name:             "tools",
+		ModalDisplayName: "tools",
+		CLIName:          "tools",
+		ParameterType:    structs.COMMAND_PARAMETER_TYPE_BOOLEAN,
+		DefaultValue:     true,
+		Description:      "Use tools to enhance the model's capabilities",
+		ParameterGroupInformation: []structs.ParameterGroupInfo{
+			{
+				ParameterIsRequired:   false,
+				GroupName:             "Default",
+				UIModalPosition:       3,
+				AdditionalInformation: nil,
+			},
+		},
+	}
+
+	verbose := structs.CommandParameter{
+		Name:             "verbose",
+		ModalDisplayName: "Verbose",
+		CLIName:          "verobse",
+		ParameterType:    structs.COMMAND_PARAMETER_TYPE_BOOLEAN,
+		DefaultValue:     false,
+		Description:      "Show verbose output of all User & AI messages",
+		ParameterGroupInformation: []structs.ParameterGroupInfo{
+			{
+				ParameterIsRequired:   false,
+				GroupName:             "Default",
+				UIModalPosition:       4,
+				AdditionalInformation: nil,
+			},
+		},
+	}
+
 	apiEndpoint := structs.CommandParameter{
 		Name:             "API_ENDPOINT",
 		ModalDisplayName: "API Endpoint",
@@ -104,7 +139,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       3,
+				UIModalPosition:       5,
 				AdditionalInformation: nil,
 			},
 		},
@@ -121,7 +156,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       4,
+				UIModalPosition:       6,
 				AdditionalInformation: nil,
 			},
 		},
@@ -138,7 +173,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       5,
+				UIModalPosition:       7,
 				AdditionalInformation: nil,
 			},
 		},
@@ -155,7 +190,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       6,
+				UIModalPosition:       8,
 				AdditionalInformation: nil,
 			},
 		},
@@ -171,7 +206,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       7,
+				UIModalPosition:       9,
 				AdditionalInformation: nil,
 			},
 		},
@@ -187,7 +222,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       8,
+				UIModalPosition:       10,
 				AdditionalInformation: nil,
 			},
 		},
@@ -204,7 +239,7 @@ func chat() structs.Command {
 		MitreAttackMappings:            []string{},
 		ScriptOnlyCommand:              false,
 		CommandAttributes:              attr,
-		CommandParameters:              []structs.CommandParameter{provider, model, prompt, apiEndpoint, apiKey, awsAccessKey, awsSecretAccessKey, awsSessionToken, awsRegion},
+		CommandParameters:              []structs.CommandParameter{provider, model, prompt, tools, verbose, apiEndpoint, apiKey, awsAccessKey, awsSecretAccessKey, awsSessionToken, awsRegion},
 		AssociatedBrowserScript:        nil,
 		TaskFunctionOPSECPre:           nil,
 		TaskFunctionCreateTasking:      chatCreateTask,
@@ -227,7 +262,9 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 	var provider string
 	var model string
 	var prompt string
-	var output string
+	var tools bool
+	var verbose bool
+	var output []message.Message
 
 	// Handle interactive tasks (everything after the first task)
 	if task.Task.IsInteractiveTask {
@@ -259,19 +296,6 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 
 		resp.TaskID = parentTask.ID
 
-		// Unmarshal parentTask.Params in to Chat struct
-		/*
-			fmt.Printf("parentTask.OriginalParams: %s\n", parentTask.OriginalParams)
-			err = json.Unmarshal([]byte(parentTask.OriginalParams), &chatParams)
-			if err != nil {
-				err = fmt.Errorf("there was an error unmarshalling the parent task params: %s", err)
-				resp.Error = err.Error()
-				resp.Success = false
-				logging.LogError(err, "returning with error")
-				return
-			}
-		*/
-
 		// Get the session from the repository
 		chatParams, ok := sessions.Get(parentTask.ID)
 		if !ok {
@@ -285,7 +309,8 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 		// Update the task args with chatParams
 		task.Args.SetArgValue("provider", chatParams.Provider)
 		task.Args.SetArgValue("model", chatParams.Model)
-		task.Args.SetArgValue("prompt", chatParams.Prompt)
+		task.Args.SetArgValue("tools", chatParams.Tools)
+		task.Args.SetArgValue("verbose", chatParams.Verbose)
 		task.Args.SetArgValue("API_ENDPOINT", chatParams.Endpoint)
 		task.Args.SetArgValue("API_KEY", chatParams.Key)
 		task.Args.SetArgValue("AWS_ACCESS_KEY_ID", chatParams.AWSAccessKeyID)
@@ -294,12 +319,14 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 		task.Args.SetArgValue("AWS_DEFAULT_REGION", chatParams.AWSDefaultRegion)
 
 		provider = chatParams.Provider
+		model = chatParams.Model
+		tools = chatParams.Tools
+		verbose = chatParams.Verbose
 
 		switch InteractiveTask.MessageType(task.Task.InteractiveTaskType) {
 		case InteractiveTask.Input:
 			// Handle input messages
-			prompt = fmt.Sprintf("%sUser> %s", chatParams.Prompt, task.Args.GetCommandLine())
-			sessions.UpdatePrompt(resp.TaskID, fmt.Sprintf("\nUser> %s\n", task.Args.GetCommandLine()))
+			prompt = task.Args.GetCommandLine()
 		case InteractiveTask.Exit:
 			sessions.Delete(parentTask.ID)
 			resp.Success = true
@@ -318,57 +345,117 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 			return
 		}
 		// Store the chat session in the repository
-		sessions.Add(task.Task.ID, chat)
+		sessions.Add(resp.TaskID, chat)
 
-		provider = chat.Provider
-		model = chat.Model
-		prompt = chat.Prompt
-	}
-
-	switch strings.ToLower(provider) {
-	case "bedrock":
-		output, err = b.Chat(task, prompt)
+		prompt, err = task.Args.GetStringArg("prompt")
 		if err != nil {
-			resp.Error = fmt.Sprintf("Failed to invoke model: %s", err.Error())
-			resp.Success = false
-			logging.LogError(err, pkg)
-			return
-		}
-	case "openai":
-		output, err = openai.Chat(task, prompt)
-		if err != nil {
-			err = fmt.Errorf("there was an error with the openai chat: %s", err)
 			resp.Error = err.Error()
 			resp.Success = false
 			logging.LogError(err, "returning with error")
 			return
 		}
+
+		provider = chat.Provider
+		model = chat.Model
+		tools = chat.Tools
+		verbose = chat.Verbose
+
+		respMsg := mythicrpc.MythicRPCResponseCreateMessage{
+			TaskID:   task.Task.ID,
+			Response: []byte(fmt.Sprintf("👤> %s\n", prompt)),
+		}
+
+		_, err = mythicrpc.SendMythicRPCResponseCreate(respMsg)
+		if err != nil {
+			resp.Error = fmt.Sprintf("Failed to send response: %s", err.Error())
+			resp.Success = false
+			logging.LogError(err, pkg)
+			return
+		}
+	}
+
+	m := message.Message{
+		Role:    message.User,
+		Content: prompt,
+	}
+	sessions.UpdateMessages(resp.TaskID, m)
+
+	switch strings.ToLower(provider) {
+	case "anthropic":
+		output, err = anthropic.Chat(task, sessions.GetMessages(resp.TaskID), tools, verbose)
+	case "bedrock":
+		if !strings.Contains(model, ".anthropic.") {
+			err = fmt.Errorf("⚠️ model '%s' is not supported by Bedrock", model)
+			resp.Error = err.Error()
+			resp.Success = false
+			logging.LogError(err, pkg)
+			return
+		}
+		output, err = anthropic.Chat(task, sessions.GetMessages(resp.TaskID), tools, verbose)
+	case "openai":
+		output, err = openai.Chat(task, sessions.GetMessages(resp.TaskID), tools, verbose)
 	default:
 		resp.Error = fmt.Sprintf("Unknown provider: %s", provider)
 		resp.Success = false
 		logging.LogError(fmt.Errorf("unknown provider: %s", provider), pkg)
 		return
 	}
-	output = fmt.Sprintf("AI> %s\n\n", output)
-
-	sessions.UpdatePrompt(resp.TaskID, output)
-
-	// If this is the first message in an interactive task, add the prompt to the output
-	if !task.Task.IsInteractiveTask {
-		output = fmt.Sprintf("%s%s", prompt, output)
-	}
-
-	msg := mythicrpc.MythicRPCResponseCreateMessage{
-		TaskID:   resp.TaskID,
-		Response: []byte(output),
-	}
-
-	r, err := mythicrpc.SendMythicRPCResponseCreate(msg)
 	if err != nil {
-		resp.Error = fmt.Sprintf("Failed to send response: %s", err.Error())
-		resp.Success = r.Success
-		logging.LogError(err, pkg)
-		return
+		msg := mythicrpc.MythicRPCResponseCreateMessage{
+			TaskID:   resp.TaskID,
+			Response: []byte(fmt.Sprintf("⚠️ %s\n", err.Error())),
+		}
+
+		r, err := mythicrpc.SendMythicRPCResponseCreate(msg)
+		if err != nil {
+			resp.Error = fmt.Sprintf("Failed to send response: %s", err.Error())
+			resp.Success = r.Success
+			logging.LogError(err, pkg)
+			return
+		}
+	}
+
+	// Store the assistant message in the session and send the response to the user
+	for k, o := range output {
+		m = message.Message{
+			Role:    message.Assistant,
+			Content: o.Content,
+		}
+		sessions.UpdateMessages(resp.TaskID, m)
+
+		if verbose {
+			x := fmt.Sprintf("🤖> %s\n", o.Content)
+			// If it is the last message add the user prompt icon
+			if k == len(output)-1 {
+				x = fmt.Sprintf("🤖> %s\n👤> ", o.Content)
+			}
+			msg := mythicrpc.MythicRPCResponseCreateMessage{
+				TaskID:   resp.TaskID,
+				Response: []byte(x),
+			}
+
+			r, err := mythicrpc.SendMythicRPCResponseCreate(msg)
+			if err != nil {
+				resp.Error = fmt.Sprintf("Failed to send response: %s", err.Error())
+				resp.Success = r.Success
+				logging.LogError(err, pkg)
+				return
+			}
+		} else if k == len(output)-1 {
+			msg := mythicrpc.MythicRPCResponseCreateMessage{
+				TaskID:   resp.TaskID,
+				Response: []byte(fmt.Sprintf("🤖> %s\n👤> ", o.Content)),
+			}
+
+			r, err := mythicrpc.SendMythicRPCResponseCreate(msg)
+			if err != nil {
+				resp.Error = fmt.Sprintf("Failed to send response: %s", err.Error())
+				resp.Success = r.Success
+				logging.LogError(err, pkg)
+				return
+			}
+		}
+
 	}
 
 	resp.Success = true
@@ -388,15 +475,18 @@ func chatCreateTask(task *structs.PTTaskMessageAllData) (resp structs.PTTaskCrea
 }
 
 type Chat struct {
-	Provider           string `json:"provider"`
-	Model              string `json:"model"`
-	Prompt             string `json:"prompt"`
-	Endpoint           string `json:"API_ENDPOINT"`
-	Key                string `json:"API_KEY"`
-	AWSAccessKeyID     string `json:"AWS_ACCESS_KEY_ID"`
-	AWSSecretAccessKey string `json:"AWS_SECRET_ACCESS_KEY"`
-	AWSSessionToken    string `json:"AWS_SESSION_TOKEN"`
-	AWSDefaultRegion   string `json:"AWS_DEFAULT_REGION"`
+	Provider           string            `json:"provider"`
+	Model              string            `json:"model"`
+	Messages           []message.Message `json:"messages"`
+	Count              int               `json:"count"` // Number of messages in the chat
+	Tools              bool              `json:"tools"`
+	Verbose            bool              `json:"verbose"`
+	Endpoint           string            `json:"API_ENDPOINT"`
+	Key                string            `json:"API_KEY"`
+	AWSAccessKeyID     string            `json:"AWS_ACCESS_KEY_ID"`
+	AWSSecretAccessKey string            `json:"AWS_SECRET_ACCESS_KEY"`
+	AWSSessionToken    string            `json:"AWS_SESSION_TOKEN"`
+	AWSDefaultRegion   string            `json:"AWS_DEFAULT_REGION"`
 }
 
 func NewChat(task *structs.PTTaskMessageAllData) (chat Chat, err error) {
@@ -408,11 +498,14 @@ func NewChat(task *structs.PTTaskMessageAllData) (chat Chat, err error) {
 	if err != nil {
 		return
 	}
-	chat.Prompt, err = task.Args.GetStringArg("prompt")
+	chat.Tools, err = task.Args.GetBooleanArg("tools")
 	if err != nil {
 		return
 	}
-	chat.Prompt = fmt.Sprintf("User> %s\n", chat.Prompt)
+	chat.Verbose, err = task.Args.GetBooleanArg("verbose")
+	if err != nil {
+		return
+	}
 
 	// If the key is empty, an error will be returned. It is OK if the key is empty for some providers
 	chat.Endpoint, _ = env.Get(task, "API_ENDPOINT")
@@ -451,12 +544,23 @@ func (r *Repository) Delete(taskID int) {
 	delete(r.chats, taskID)
 }
 
-func (r *Repository) UpdatePrompt(taskID int, prompt string) {
+func (r *Repository) GetMessages(taskID int) []message.Message {
 	r.Lock()
 	defer r.Unlock()
 	chat, ok := r.chats[taskID]
 	if ok {
-		chat.Prompt += prompt
+		return chat.Messages
+	}
+	return nil
+}
+
+func (r *Repository) UpdateMessages(taskID int, msg message.Message) {
+	r.Lock()
+	defer r.Unlock()
+	chat, ok := r.chats[taskID]
+	if ok {
+		chat.Messages = append(chat.Messages, msg)
+		chat.Count++
 		r.chats[taskID] = chat
 	}
 }
