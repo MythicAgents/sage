@@ -71,12 +71,35 @@ func chat() structs.Command {
 		},
 	}
 
+	systemPrompt := structs.CommandParameter{
+		Name:                                    "system_prompt",
+		ModalDisplayName:                        "System Prompt",
+		CLIName:                                 "system_prompt",
+		ParameterType:                           structs.COMMAND_PARAMETER_TYPE_STRING,
+		Description:                             "The top-level system prompt for model for inference",
+		DefaultValue:                            "",
+		SupportedAgents:                         nil,
+		SupportedAgentBuildParameters:           nil,
+		ChoicesAreAllCommands:                   false,
+		ChoicesAreLoadedCommands:                false,
+		FilterCommandChoicesByCommandAttributes: nil,
+		DynamicQueryFunction:                    nil,
+		ParameterGroupInformation: []structs.ParameterGroupInfo{
+			{
+				ParameterIsRequired:   false,
+				GroupName:             "Default",
+				UIModalPosition:       2,
+				AdditionalInformation: nil,
+			},
+		},
+	}
+
 	prompt := structs.CommandParameter{
 		Name:                                    "prompt",
 		ModalDisplayName:                        "prompt",
 		CLIName:                                 "prompt",
 		ParameterType:                           structs.COMMAND_PARAMETER_TYPE_STRING,
-		Description:                             "The prompt to send to the model for inference",
+		Description:                             "The user prompt to send to the model for inference",
 		DefaultValue:                            "",
 		SupportedAgents:                         nil,
 		SupportedAgentBuildParameters:           nil,
@@ -88,7 +111,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   true,
 				GroupName:             "Default",
-				UIModalPosition:       2,
+				UIModalPosition:       3,
 				AdditionalInformation: nil,
 			},
 		},
@@ -105,7 +128,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       3,
+				UIModalPosition:       4,
 				AdditionalInformation: nil,
 			},
 		},
@@ -122,7 +145,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       4,
+				UIModalPosition:       5,
 				AdditionalInformation: nil,
 			},
 		},
@@ -139,7 +162,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       5,
+				UIModalPosition:       6,
 				AdditionalInformation: nil,
 			},
 		},
@@ -156,7 +179,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       6,
+				UIModalPosition:       7,
 				AdditionalInformation: nil,
 			},
 		},
@@ -173,7 +196,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       7,
+				UIModalPosition:       8,
 				AdditionalInformation: nil,
 			},
 		},
@@ -190,7 +213,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       8,
+				UIModalPosition:       9,
 				AdditionalInformation: nil,
 			},
 		},
@@ -206,7 +229,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       9,
+				UIModalPosition:       10,
 				AdditionalInformation: nil,
 			},
 		},
@@ -222,7 +245,7 @@ func chat() structs.Command {
 			{
 				ParameterIsRequired:   false,
 				GroupName:             "Default",
-				UIModalPosition:       10,
+				UIModalPosition:       11,
 				AdditionalInformation: nil,
 			},
 		},
@@ -239,7 +262,7 @@ func chat() structs.Command {
 		MitreAttackMappings:            []string{},
 		ScriptOnlyCommand:              false,
 		CommandAttributes:              attr,
-		CommandParameters:              []structs.CommandParameter{provider, model, prompt, tools, verbose, apiEndpoint, apiKey, awsAccessKey, awsSecretAccessKey, awsSessionToken, awsRegion},
+		CommandParameters:              []structs.CommandParameter{provider, model, systemPrompt, prompt, tools, verbose, apiEndpoint, apiKey, awsAccessKey, awsSecretAccessKey, awsSessionToken, awsRegion},
 		AssociatedBrowserScript:        nil,
 		TaskFunctionOPSECPre:           nil,
 		TaskFunctionCreateTasking:      chatCreateTask,
@@ -505,6 +528,16 @@ func NewChat(task *structs.PTTaskMessageAllData) (chat Chat, err error) {
 	chat.Verbose, err = task.Args.GetBooleanArg("verbose")
 	if err != nil {
 		return
+	}
+
+	// Get the system prompt and add it to the messages; it's OK if an error is returned because the prompt wasn't found
+	systemPrompt, err := env.Get(task, "system_prompt")
+	if err == nil && systemPrompt != "" {
+		m := message.Message{
+			Role:    message.System,
+			Content: systemPrompt,
+		}
+		chat.Messages = append(chat.Messages, m)
 	}
 
 	// If the key is empty, an error will be returned. It is OK if the key is empty for some providers

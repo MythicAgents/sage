@@ -73,7 +73,13 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 
 	client := anthropic.NewClient(opt)
 
-	for _, msg := range msgs {
+	// Create the request body
+	body := anthropic.MessageNewParams{
+		Model:     modelID,
+		MaxTokens: 2000,
+	}
+
+	for i, msg := range msgs {
 		tbp := anthropic.TextBlockParam{
 			Text: msg.Content,
 		}
@@ -82,6 +88,11 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 			mp.Role = anthropic.MessageParamRoleUser
 		} else if msg.Role == sageMessage.Assistant {
 			mp.Role = anthropic.MessageParamRoleAssistant
+		} else if msg.Role == sageMessage.System {
+			body.System = []anthropic.TextBlockParam{tbp}
+			// Delete this message from the msgs slice
+			msgs = append(msgs[:i], msgs[i+1:]...)
+			continue
 		}
 		mp.Content = []anthropic.ContentBlockParamUnion{
 			{
@@ -90,13 +101,7 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 		}
 		messages = append(messages, mp)
 	}
-
-	// Create the request body
-	body := anthropic.MessageNewParams{
-		Model:     modelID,
-		MaxTokens: 1024,
-		Messages:  messages,
-	}
+	body.Messages = messages
 
 	// Get MCP Tools
 	if useTools {
@@ -105,6 +110,7 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 	}
 
 	// Send the initial request and iterate over all response messages until we reach a stopping point
+	logging.LogInfo("Making Anthropic call", "Model", modelID, "Provider", provider)
 	done := false
 	for !done {
 		var message *anthropic.Message

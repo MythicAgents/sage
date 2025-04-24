@@ -124,7 +124,7 @@ func ExecuteTool(toolName string, args map[string]interface{}) (resp string, err
 	for _, r := range result.Content {
 		switch r.(type) {
 		case mcp.TextContent:
-			//logging.LogDebug("🛠️ MCP Tool Call Result", "Tool Name", toolName, "Result", r.(mcp.TextContent).Text)
+			logging.LogDebug("🛠️ MCP Tool Call Result", "Tool Name", toolName, "Result", r.(mcp.TextContent).Text)
 			resp += r.(mcp.TextContent).Text
 		case mcp.ImageContent:
 			err = fmt.Errorf("⚠️ Unhandled mcp.Content Result (ImageContent): %+v", r.(mcp.ImageContent))

@@ -122,7 +122,7 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 	// Get the OPENAI_API_ENDPOINT
 	OPENAI_API_ENDPOINT, err := env.Get(task, "API_ENDPOINT")
 	if err != nil {
-		return response, err
+		OPENAI_API_ENDPOINT = "https://api.openai.com/v1"
 	}
 
 	c, err := GetClient(task)
@@ -137,6 +137,8 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 			mp.Role = oai.ChatMessageRoleUser
 		} else if m.Role == sageMessage.Assistant {
 			mp.Role = oai.ChatMessageRoleAssistant
+		} else if m.Role == sageMessage.System {
+			mp.Role = oai.ChatMessageRoleSystem
 		}
 		mp.Content = m.Content
 		messages = append(messages, mp)
@@ -169,8 +171,8 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 			done = true
 			break
 		}
-		for i, choice := range resp.Choices {
-			logging.LogDebug(fmt.Sprintf("Choice (%d): %+v", i, choice))
+		for _, choice := range resp.Choices {
+			//logging.LogDebug(fmt.Sprintf("Choice (%d): %+v", i, choice))
 			switch choice.FinishReason {
 			case oai.FinishReasonStop:
 				done = true
@@ -211,7 +213,7 @@ func Chat(task *structs.PTTaskMessageAllData, msgs []sageMessage.Message, useToo
 		}
 		if len(resp.Choices) > 0 {
 			for _, choice := range resp.Choices {
-				if choice.FinishReason != oai.FinishReasonToolCalls && choice.Message.Content != "" {
+				if choice.FinishReason != oai.FinishReasonToolCalls && choice.Message.Content != "" && choice.Message.Role != oai.ChatMessageRoleSystem {
 					response = append(response, sageMessage.Message{
 						Role:    sageMessage.Assistant,
 						Content: choice.Message.Content,
