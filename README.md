@@ -134,18 +134,18 @@ Sage can connect to Stdio MCP servers and use the provided tools/functions with 
 
 Stdio MCP server require Sage to launch the process and then connect to the child process. If you are using the Sage Docker container, everything you need to run for the MCP server must be in the container. Alternatively, you can run Sage locally on the same host Mythic is running as and connect that way.
 
-For example, to connect to the [Mythic MCP](https://github.com/xpn/mythic_mcp) server, you must have `uv`, `python3`, and the source code in the container. For this MCP server, the `command` would be `uv` and you would create one `argument` for each of these:
+For example, to connect to the built-in Mythic MCP server, you must have `uv`, `python3`, and the source code in the container. For this MCP server, the `command` would be `uv` and you would create one `argument` for each of these:
 
 - `--directory`
-- `/opt/mythic_mcp/` - The location where Mythic MCP server source code is
+- `/Mythic/mcp/mythic` - The location where Mythic MCP server source code is
 - `run`
 - `main.py`
 - `mythic_admin` - The Mythic username to connect to the API with
 - `SuperSecretPassword` - The password for the Mythic User to connect to the API with
-- `127.0.0.1` - Mythic's IP address; Don't use the loopback if your running Sage in a container
+- `192.168.1.100` - Mythic's IP address; Don't use the loopback if your running Sage in a container
 - `7443` - The port that Mythic is listening on
 
-> **__NOTE:__** MYTHIC MCP IS ALREADY INSTALLED IN THE CONTAINER AT /opt/mythic_mcp
+> **__NOTE:__** MYTHIC MCP IS ALREADY INSTALLED IN THE CONTAINER AT /Mythic/mcp/mythic
 
 ## Run Sage Locally
 Use the following commands to run the Sage container from the command line without using Docker (typicall for testing and troubleshooting):
