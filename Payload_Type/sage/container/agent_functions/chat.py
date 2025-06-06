@@ -58,18 +58,18 @@ class ChatArguments(TaskArguments):
         )
         # API Endpoint
         api_endpoint = CommandParameter(
-            name="api_endpoint",
+            name="API_ENDPOINT",
             display_name="API Endpoint",
-            cli_name="api-endpoint",
+            cli_name="API_ENDPOINT",
             type=ParameterType.String,
             description="[OPTIONAL] The API endpoint to use for the selected provider",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=5)]
         )
         # API Key
         api_key = CommandParameter(
-            name="api_key",
+            name="API_KEY",
             display_name="API Key",
-            cli_name="api-key",
+            cli_name="API_KEY",
             type=ParameterType.String,
             description="[OPTIONAL] The API key to use for the selected provider",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=6)]

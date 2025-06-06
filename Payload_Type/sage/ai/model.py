@@ -114,7 +114,7 @@ class Model:
         :param prompt: The user prompt to send to the model.
         :return: The model's response as a string.
         """
-        logger.debug(f"Invoking model {self.provider} {self.model} with prompt: {prompt}")
+        logger.warning(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
 
         # If this is a subsequent call, increment the counter
         if self.counter > 0:
@@ -126,10 +126,8 @@ class Model:
         while not done:
             try:
                 if self.config is not None and self.config.get("configurable"):
-                    logger.debug(f"Invoking model 2 {self.provider} {self.model} with prompt: {prompt}")
                     resp = self.llm.invoke(self.messages, self.config["configurable"])
                 else:
-                    logger.debug(f"Invoking model 3 {self.provider} {self.model} with prompt: {prompt}")
                     resp = self.llm.invoke(self.messages)
                 self.messages.append(resp)
                 logger.debug(f"🤖> Invoke response: {resp}")

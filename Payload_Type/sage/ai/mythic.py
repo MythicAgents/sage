@@ -52,6 +52,7 @@ class MythicAPIClient:
             server_port=self.port, 
             ssl=self.ssl
         )
+    
     @mythic_tool
     async def get_all_commands_for_payloadtype(self, payload: str) -> str:
         """Executes a graphql query to get information about all current commands for a payload type. The default set of attributes returned in the dictionary can be found at graphql_queries.commands_fragment. If you want to use your own `custom_return_attributes` string to identify what information you want back, you have to include the `attributes` and `cmd` fields, everything else is optional.
