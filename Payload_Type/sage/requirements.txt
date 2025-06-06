@@ -1,0 +1,8 @@
+langchain[anthropic]
+langchain[aws]
+langchain[ollama]
+langchain[openai]
+langgraph
+langsmith
+mythic
+mythic-container
