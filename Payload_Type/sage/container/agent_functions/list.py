@@ -22,18 +22,18 @@ class ListArguments(TaskArguments):
 
         # API Endpoint
         api_endpoint = CommandParameter(
-            name="api_endpoint",
+            name="API_ENDPOINT",
             display_name="API Endpoint",
-            cli_name="api-endpoint",
+            cli_name="API_ENDPOINT",
             type=ParameterType.String,
             description="[OPTIONAL] The API endpoint to use for the selected provider",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=5)]
         )
         # API Key
         api_key = CommandParameter(
-            name="api_key",
+            name="API_KEY",
             display_name="API Key",
-            cli_name="api-key",
+            cli_name="API_KEY",
             type=ParameterType.String,
             description="[OPTIONAL] The API key to use for the selected provider",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=6)]
@@ -82,7 +82,8 @@ class ListArguments(TaskArguments):
         pass
 
     async def parse_dictionary(self, dictionary_arguments):
-        pass
+        for arg in dictionary_arguments:
+            self.add_arg(arg, dictionary_arguments[arg])
 
 class ListCommand(CommandBase):
     cmd = "list"
@@ -108,10 +109,10 @@ class ListCommand(CommandBase):
                 # These can be None as they are optional
         api_endpoint = get_secret(taskData=taskData, key="API_ENDPOINT")
         api_key = get_secret(taskData=taskData, key="API_KEY")
-        aws_access_key_id = get_secret(taskData=taskData, key="AWS_ACCESS_KEY_ID")
-        aws_secret_access_key = get_secret(taskData=taskData, key="AWS_SECRET_ACCESS_KEY")
-        aws_session_token = get_secret(taskData=taskData, key="AWS_SESSION_TOKEN")
-        aws_region = get_secret(taskData=taskData, key="AWS_DEFAULT_REGION")
+        # aws_access_key_id = get_secret(taskData=taskData, key="AWS_ACCESS_KEY_ID")
+        # aws_secret_access_key = get_secret(taskData=taskData, key="AWS_SECRET_ACCESS_KEY")
+        # aws_session_token = get_secret(taskData=taskData, key="AWS_SESSION_TOKEN")
+        # aws_region = get_secret(taskData=taskData, key="AWS_DEFAULT_REGION")
 
         if (provider.lower() == "openai" or provider.lower() == "anthropic") and not api_key:
             response.Error = "An API key was not found in the task, user secrets, payload build parameters, or in the payload container's environment variables. Please set the API key."
@@ -125,7 +126,8 @@ class ListCommand(CommandBase):
             if not api_endpoint:
                 # response.Error = "An API endpoint was not found in the task, user secrets, payload build parameters, or in the payload container's environment variables. Please set the API endpoint."
                 api_endpoint = "https://api.openai.com"
-
+            api_endpoint = api_endpoint.removesuffix("v1/")  # Ensure no trailing v1/
+            api_endpoint = api_endpoint.removesuffix("v1")  # Ensure no trailing v1
             resp = requests.get(
                 urljoin(api_endpoint, "v1/models"),
                 headers={"Authorization": f"Bearer {api_key}"}
