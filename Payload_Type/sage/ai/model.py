@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_core.utils.function_calling import convert_to_openai_function
 from .mythic import MythicAPIClient
 from mythic_container.logging import logger
+from .mcp import MCPManager
 
 
 class State(TypedDict):

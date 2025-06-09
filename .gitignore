@@ -1,3 +1,7 @@
 .DS_STORE
 .vscode/
 **/__pycache__/
+.npmrc
+package.json
+package-lock.json
+CLAUDE.md

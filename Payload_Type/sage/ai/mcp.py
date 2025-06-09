@@ -315,6 +315,7 @@ class MCPServerManager:
         for server_name in server_names:
             await self.disconnect_server(server_name)
 
+MCPManager = MCPServerManager()
 
 # Convenience functions to create connection configs
 def create_stdio_config(name: str, command: str, args: List[str] | None, 

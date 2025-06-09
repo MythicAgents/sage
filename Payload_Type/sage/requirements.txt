@@ -4,5 +4,6 @@ langchain[ollama]
 langchain[openai]
 langgraph
 langsmith
+langchain-mcp-adapters
 mythic
 mythic-container
