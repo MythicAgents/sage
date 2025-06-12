@@ -189,12 +189,37 @@ class MCPServerManager:
             # Use the langchain_mcp_adapters function to load and convert tools
             langchain_tools = await load_mcp_tools(session, connection=connection)
             
-            self.tools[server_name] = langchain_tools
-            logger.info(f"Loaded {len(langchain_tools)} tools from server '{server_name}'")
+            # Check for tool name conflicts with existing tools
+            unique_tools = []
+            existing_tool_names = self._get_all_existing_tool_names()
+            conflicts_found = 0
+            
+            for tool in langchain_tools:
+                if tool.name in existing_tool_names:
+                    logger.error(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Excluding this tool.")
+                    conflicts_found += 1
+                else:
+                    unique_tools.append(tool)
+                    existing_tool_names.add(tool.name)
+            
+            self.tools[server_name] = unique_tools
+            
+            if conflicts_found > 0:
+                logger.warning(f"Loaded {len(unique_tools)} tools from server '{server_name}' ({conflicts_found} tools excluded due to name conflicts)")
+            else:
+                logger.info(f"Loaded {len(unique_tools)} tools from server '{server_name}'")
             
         except Exception as e:
             logger.error(f"Failed to load tools for server '{server_name}': {e}")
             self.tools[server_name] = []
+    
+    def _get_all_existing_tool_names(self) -> set:
+        """Get a set of all existing tool names from all connected servers"""
+        existing_names = set()
+        for server_tools in self.tools.values():
+            for tool in server_tools:
+                existing_names.add(tool.name)
+        return existing_names
     
     def get_all_tools(self) -> List[BaseTool]:
         """

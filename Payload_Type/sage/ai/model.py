@@ -6,10 +6,9 @@ from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
-from langchain_core.utils.function_calling import convert_to_openai_function
-from .mythic import MythicAPIClient
 from mythic_container.logging import logger
 from .mcp import MCPManager
+from .tools import UnifiedToolManager
 
 
 class State(TypedDict):
@@ -38,6 +37,7 @@ class Model:
         self.config = config if config and config.get("configurable") else None
         self.verbose = False
         self.mythic_client = None
+        self.tool_manager = None
         self.counter = 0
         self.messages = []
         if system_prompt:
@@ -48,14 +48,31 @@ class Model:
 
     async def with_tools(self, agent_task_id: str):
         """
-        Bind all available tools to the model.
+        Bind all available tools from both Mythic and MCP to the model.
         :param agent_task_id: The agent task ID, a UUID, of the agent task interacting with the model.
         """
-        self.mythic_client = await MythicAPIClient.create(agent_task_id)
-        tool_definitions = self.mythic_client.get_tool_definitions_for_llm()
-        if self.provider.lower() == "openai":
-            tool_definitions = [convert_to_openai_function(tool) for tool in tool_definitions]
-        self.llm = self.llm.bind_tools(tool_definitions) # type: ignore
+        # Initialize the unified tool manager
+        self.tool_manager = UnifiedToolManager(MCPManager)
+        
+        # Initialize Mythic tools
+        await self.tool_manager.initialize_mythic_tools(agent_task_id)
+        
+        # Get all tools (Mythic + MCP) as LangChain BaseTool instances
+        all_tools = self.tool_manager.get_all_tools()
+        
+        # For backward compatibility, keep the mythic_client reference
+        self.mythic_client = self.tool_manager.mythic_client
+        
+        # Bind tools to the LLM
+        if all_tools:
+            try:
+                self.llm = self.llm.bind_tools(all_tools)
+                logger.info(f"Bound {len(all_tools)} tools to model (Mythic: {len(self.tool_manager.get_mythic_tools())}, MCP: {len(self.tool_manager.get_mcp_tools())})")
+            except AttributeError as e:
+                logger.error(f"LLM does not support tool binding: {e}")
+                logger.warning("Continuing without tool binding - tools will be available but not bound to LLM")
+        else:
+            logger.warning("No tools available to bind to model")
 
     def set_verbose(self, verbose: bool):
         """
@@ -131,7 +148,7 @@ class Model:
                 else:
                     resp = self.llm.invoke(self.messages)
                 self.messages.append(resp)
-                logger.debug(f"🤖> Invoke response: {resp}")
+                logger.warning(f"🤖> Invoke response: {resp}")
             except Exception as e:
                 logger.error(f"Error invoking model: {e}")
                 # return f"❗> Error invoking model: {e}\n"
@@ -147,30 +164,74 @@ class Model:
             elif resp.response_metadata.get("stop_reason") == "end_turn": # Anthropic
                 done = True
             if done:
-                logger.debug("Model indicated end of turn, stopping.")
+                logger.warning("Model indicated end of turn, stopping.")
                 break
             tool_calls = []
             if hasattr(resp, "tool_calls") and resp.tool_calls:
                 tool_calls = resp.tool_calls
 
             for tool_call in tool_calls:
-                logger.debug(f"🛠️> Name: '{tool_call.get('name', '')}', Arguments: '{tool_call.get('input', '')}', ID: '{tool_call.get('id', '')}'")
+                # Handle both dict and object tool calls
+                if hasattr(tool_call, '__dict__'):
+                    # If it's an object, get its attributes
+                    tool_call_dict = tool_call.__dict__ if hasattr(tool_call, '__dict__') else {}
+                    tool_name = getattr(tool_call, 'name', tool_call_dict.get('name', ''))
+                    tool_args = getattr(tool_call, 'args', tool_call_dict.get('args', {}))
+                    tool_id = getattr(tool_call, 'id', tool_call_dict.get('id', ''))
+                    
+                    logger.warning(f"🛠️> Object tool_call - Name: '{tool_name}', Args: '{tool_args}', ID: '{tool_id}'")
+                    logger.warning(f"🛠️> Object type: {type(tool_call)}, dict: {tool_call_dict}")
+                else:
+                    # If it's a dict, access normally
+                    tool_name = tool_call.get("name", "")
+                    tool_args = (
+                        tool_call.get("args") or 
+                        tool_call.get("input") or 
+                        tool_call.get("arguments") or 
+                        tool_call.get("parameters") or
+                        {}
+                    )
+                    tool_id = tool_call.get("id", "")
+                    
+                    logger.warning(f"🛠️> Dict tool_call - Name: '{tool_name}', Args: '{tool_args}', ID: '{tool_id}'")
+                    logger.warning(f"🛠️> Full tool_call structure: {tool_call}")
+                
                 if self.verbose:
                     pass
-                    #return_message += f"🛠️> Name: '{tool_call.get('name', '')}', Arguments: '{tool_call.get('input', '')}', ID: '{tool_call.get('id', '')}'\n"
-                if not self.mythic_client:
-                    logger.error("Mythic client is not initialized, cannot execute tool.")
-                    return "❗> Mythic client is not initialized, cannot execute tool.\n"
-                result = await self.mythic_client.execute_tool(
-                    tool_name=tool_call.get("name", ""),
-                    **(tool_call.get("input", {}) if isinstance(tool_call.get("input", {}), dict) else {})
-                )
+                    #return_message += f"🛠️> Name: '{tool_name}', Arguments: '{tool_args}', ID: '{tool_id}'\n"
+                
+                # Use unified tool manager to execute tools
+                if not self.tool_manager:
+                    logger.error("Tool manager is not initialized, cannot execute tool.")
+                    return "❗> Tool manager is not initialized, cannot execute tool.\n"
+                
+                # Find the tool by name
+                tool = self.tool_manager.get_tool_by_name(tool_name)
+                
+                if not tool:
+                    logger.error(f"Tool '{tool_name}' not found in available tools.")
+                    result = f"Error: Tool '{tool_name}' not found"
+                else:
+                    try:
+                        logger.warning(f"🛠️> Final tool_args for execution: {tool_args}")
+                        
+                        # Ensure tool_args is a dict
+                        if not isinstance(tool_args, dict):
+                            logger.error(f"Tool args is not a dict: {type(tool_args)} = {tool_args}")
+                            tool_args = {}
+                        
+                        # Use the tool's ainvoke method instead of _arun to handle config properly
+                        result = await tool.ainvoke(tool_args)
+                    except Exception as e:
+                        logger.error(f"Error executing tool '{tool_name}': {e}")
+                        result = f"Error executing tool '{tool_name}': {str(e)}"
+                
                 tool_message = ToolMessage(
                     content=json.dumps(result) if isinstance(result, dict) else str(result),
-                    tool_call_id=tool_call.get('id', '')
+                    tool_call_id=tool_id
                 )
                 self.messages.append(tool_message)
-                logger.debug(f"🛠️> Result: {result}")
+                logger.warning(f"🛠️> Result: {result}")
         
         return self._generate_mythic_output()
 
@@ -184,11 +245,11 @@ async def get_session(session_id: str) -> Model|None:
         return None
 
 async def add_session(session_id: str, model: Model):
-    logger.debug(f"Adding session {session_id} with model {model.provider} {model.model}")
+    logger.warning(f"Adding session {session_id} with model {model.provider} {model.model}")
     sessions[session_id] = model
 
 async def remove_session(session_id: str):
-    logger.debug(f"Removing session {session_id}")
+    logger.warning(f"Removing session {session_id}")
     if session_id in sessions:
         del sessions[session_id]
     else:

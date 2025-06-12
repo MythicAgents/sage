@@ -6,7 +6,8 @@ import json
 import threading
 import logging
 from contextlib import contextmanager
-from typing import Dict
+from typing import Dict, List
+from langchain_core.tools import BaseTool
 from mythic_container.MythicRPC import MythicRPCAPITokenCreateMessage
 from mythic import mythic
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
@@ -36,7 +37,7 @@ class MythicAPIClient:
 
     async def _initialize(self, task_id: str):
         """Private async initialization method"""
-        logger.debug(f"Initializing MythicAPIClient with task ID: {task_id}")
+        logger.warning(f"Initializing MythicAPIClient with task ID: {task_id}")
         resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=task_id))
         if resp.Success:
             self.api_key = resp.APIToken
@@ -55,12 +56,15 @@ class MythicAPIClient:
     
     @mythic_tool
     async def get_all_commands_for_payloadtype(self, payload: str) -> str:
-        """Executes a graphql query to get information about all current commands for a payload type. The default set of attributes returned in the dictionary can be found at graphql_queries.commands_fragment. If you want to use your own `custom_return_attributes` string to identify what information you want back, you have to include the `attributes` and `cmd` fields, everything else is optional.
+        """Get all available commands for a specific payload type (agent).
+        
+        This tool retrieves information about all commands available for a given payload type,
+        including command parameters, descriptions, and requirements.
 
         Args:
-            payload: Name of the agent or payload to get commands and their arguments for.
+            payload: The name of the payload type (e.g., 'sage', 'apollo', 'poseidon')
         Returns:
-            str: JSON string of the commands and their arguments.
+            str: JSON string containing all commands and their detailed information
         """
         attr = """
         cmd
@@ -87,12 +91,13 @@ class MythicAPIClient:
     
     @mythic_tool
     async def get_all_active_callbacks(self) -> str:
-        """Executes a graphql query to get information about all currently active callbacks. The default set of attributes returned in the dictionary can be found at graphql_queries.callback_fragment. If you want to use your own `custom_return_attributes` string to identify what information you want back, you have to include the `id` field, everything else is optional.
+        """Get information about all currently active agent callbacks.
+        
+        This tool retrieves details about all active agent connections (callbacks) in the Mythic framework,
+        including callback IDs, agent information, and connection status.
 
-        Args:
-            custom_return_attributes: Optional string of attributes to return. If not provided, the default set of attributes will be used.
         Returns:
-            str: JSON string of the callbacks and their attributes.
+            str: JSON string containing information about all active callbacks
         """
         if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
@@ -123,6 +128,18 @@ class MythicAPIClient:
                 tool_definitions.append(tool_def)
         
         return tool_definitions
+    
+    def get_langchain_tools(self) -> List[BaseTool]:
+        """Returns LangChain BaseTool instances for all Mythic tools."""
+        tools = []
+        
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if callable(attr) and hasattr(attr, '_is_mythic_tool'):
+                tool = self._create_langchain_tool(attr_name, attr)
+                tools.append(tool)
+        
+        return tools
     
     def _create_tool_definition(self, name, method):
         """Creates a single tool definition for the LLM."""
@@ -179,6 +196,71 @@ class MythicAPIClient:
         }
         
         return type_mapping.get(annotation, "string")
+    
+    def _create_langchain_tool(self, name: str, method) -> BaseTool:
+        """Creates a LangChain BaseTool instance for a Mythic tool method."""
+        from langchain_core.tools import tool
+        
+        # Get docstring
+        docstring = method.__doc__ or ""
+        
+        # Create wrapper function with explicit parameters
+        if name == "get_all_commands_for_payloadtype":
+            @tool
+            async def get_all_commands_for_payloadtype(payload: str) -> str:
+                """Get all available commands for a specific payload type (agent).
+                
+                This tool retrieves information about all commands available for a given payload type,
+                including command parameters, descriptions, and requirements.
+
+                Args:
+                    payload: The name of the payload type (e.g., 'sage', 'apollo', 'poseidon')
+                Returns:
+                    str: JSON string containing all commands and their detailed information
+                """
+                try:
+                    result = await self.execute_tool("get_all_commands_for_payloadtype", payload=payload)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing get_all_commands_for_payloadtype: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return get_all_commands_for_payloadtype
+            
+        elif name == "get_all_active_callbacks":
+            @tool
+            async def get_all_active_callbacks() -> str:
+                """Get information about all currently active agent callbacks.
+                
+                This tool retrieves details about all active agent connections (callbacks) in the Mythic framework,
+                including callback IDs, agent information, and connection status.
+
+                Returns:
+                    str: JSON string containing information about all active callbacks
+                """
+                try:
+                    result = await self.execute_tool("get_all_active_callbacks")
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing get_all_active_callbacks: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return get_all_active_callbacks
+        
+        # Fallback for any other tools - dynamic creation
+        else:
+            # Create a wrapper function with **kwargs
+            async def generic_tool_wrapper(**kwargs):
+                try:
+                    result = await self.execute_tool(name, **kwargs)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing {name}: {e}")
+                    return f"Error executing tool {name}: {str(e)}"
+            
+            # Set metadata
+            generic_tool_wrapper.__name__ = name
+            generic_tool_wrapper.__doc__ = docstring
+            
+            return tool(generic_tool_wrapper)
     
     def _parse_docstring_params(self, docstring):
         """Extract parameter descriptions from docstring Args section."""
