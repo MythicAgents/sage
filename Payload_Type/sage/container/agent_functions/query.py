@@ -193,13 +193,13 @@ class QueryCommand(CommandBase):
                 config["configurable"]["aws_session_token"] = aws_session_token
             if aws_region is not None:
                 config["configurable"]["region"] = aws_region
-        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config)
+        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, agent_task_id=taskData.Task.ID)
         if verbose:
             llm.set_verbose(True)
         if tools:
             await llm.with_tools(str(taskData.Task.AgentTaskID))
         
-        llm_resp = await llm.invoke(prompt)
+        llm_resp = await llm.invoke_graph(prompt)
         
         resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(taskData.Task.ID, llm_resp.encode()))
         if not resp.Success:

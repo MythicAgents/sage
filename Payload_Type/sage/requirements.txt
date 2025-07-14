@@ -3,6 +3,7 @@ langchain[aws]
 langchain[ollama]
 langchain[openai]
 langgraph
+langgraph-checkpoint-sqlite
 langsmith
 langchain-mcp-adapters
 mythic

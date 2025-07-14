@@ -5,3 +5,6 @@
 package.json
 package-lock.json
 CLAUDE.md
+venv/
+Notes
+sage.db*

@@ -104,6 +104,48 @@ class MythicAPIClient:
         resp = await mythic.get_all_active_callbacks(self.client)
         return json.dumps(resp)
 
+    @mythic_tool
+    async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
+        """Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
+
+        Args:
+            command: The command name to execute from the "cmd" field from the get_all_commands_for_payloadtype tool. Validate the agent's operating system and the supported_os match.
+            parameters: The command's parameters or arguments. Prefer a JSON string that leverages the commandparameters "name" value (e.g. {"arguments": "value"}). Alternatively, use a non-JSON string that has dash with the "cli_name" field (e.g. -path /etc/issue).
+            callback_display_id: The callback_display_id of the target agent to run the command on.
+            token_id: Optional Mythic identifier for tracked Windows user access tokens to use for impersonation.
+            timeout: Optional timeout in seconds for the task to complete.
+        Returns:
+            str: Command output (binary output coerced to string).
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            results = await mythic.issue_task_and_waitfor_task_output(self.client, command, parameters, callback_display_id, token_id, timeout)
+            if results is None:
+                return "No results returned from task."
+            else:
+                return str(results)
+        except Exception as e:
+            return f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+        
+    @mythic_tool
+    async def execute_graphql_query(self, query: str, variables: dict={}) -> str:
+        """Execute a Mythic graphql query.
+
+        Args:
+            query: The graphql query to execute.
+            variables: The variables parameter should contain a JSON object with key-value pairs that correspond to the variable names used in your GraphQL query. Each key should match a variable name defined in the query (without the $ prefix), and each value should match the expected type for that variable. These variables will be passed to the GraphQL server along with the query to provide dynamic values for the operation.
+        Returns:
+            str: JSON string of the Mythic GraphQL response.
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            results = await mythic.execute_custom_query(self.client, query, variables)
+            return json.dumps(results)
+        except Exception as e:
+            return f"Error executing query: {e}"
+
     def get_all_tools(self):
         """Returns a simple list of callable tool methods for internal iteration."""
         tools = []
@@ -244,13 +286,73 @@ class MythicAPIClient:
                     logger.error(f"Error executing get_all_active_callbacks: {e}")
                     return f"Error executing tool: {str(e)}"
             return get_all_active_callbacks
+            
+        elif name == "issue_task_and_waitfor_task_output":
+            @tool
+            async def issue_task_and_waitfor_task_output(command: str, parameters: str, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
+                """Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
+
+                Args:
+                    command: The command name to execute from the "cmd" field from the get_all_commands_for_payloadtype tool. Validate the agent's operating system and the supported_os match.
+                    parameters: The command's parameters or arguments. Prefer a JSON string that leverages the commandparameters "name" value (e.g. {"arguments": "value"}). Alternatively, use a non-JSON string that has dash with the "cli_name" field (e.g. -path /etc/issue).
+                    callback_display_id: The callback_display_id of the target agent to run the command on.
+                    token_id: Optional Mythic identifier for tracked Windows user access tokens to use for impersonation.
+                    timeout: Optional timeout in seconds for the task to complete.
+                Returns:
+                    str: Command output (binary output coerced to string).
+                """
+                try:
+                    result = await self.execute_tool("issue_task_and_waitfor_task_output", 
+                                                    command=command, 
+                                                    parameters=parameters, 
+                                                    callback_display_id=callback_display_id, 
+                                                    token_id=token_id, 
+                                                    timeout=timeout)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing issue_task_and_waitfor_task_output: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return issue_task_and_waitfor_task_output
+            
+        elif name == "execute_graphql_query":
+            @tool
+            async def execute_graphql_query(query: str, variables: dict = {}) -> str:
+                """Execute a Mythic graphql query.
+
+                Args:
+                    query: The graphql query to execute.
+                    variables: The variables parameter should contain a JSON object with key-value pairs that correspond to the variable names used in your GraphQL query. Each key should match a variable name defined in the query (without the $ prefix), and each value should match the expected type for that variable. These variables will be passed to the GraphQL server along with the query to provide dynamic values for the operation.
+                Returns:
+                    str: JSON string of the Mythic GraphQL response.
+                """
+                try:
+                    result = await self.execute_tool("execute_graphql_query", 
+                                                    query=query, 
+                                                    variables=variables)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing execute_graphql_query: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return execute_graphql_query
         
         # Fallback for any other tools - dynamic creation
         else:
-            # Create a wrapper function with **kwargs
-            async def generic_tool_wrapper(**kwargs):
+            # Get the original method to inspect its signature
+            original_method = getattr(self, name)
+            sig = inspect.signature(original_method)
+            
+            # Create wrapper function with proper signature
+            async def generic_tool_wrapper(*args, **kwargs):
                 try:
-                    result = await self.execute_tool(name, **kwargs)
+                    # Bind arguments to parameters
+                    bound_args = sig.bind(self, *args, **kwargs)
+                    bound_args.apply_defaults()
+                    
+                    # Remove 'self' from arguments
+                    call_kwargs = dict(bound_args.arguments)
+                    call_kwargs.pop('self', None)
+                    
+                    result = await self.execute_tool(name, **call_kwargs)
                     return str(result)
                 except Exception as e:
                     logger.error(f"Error executing {name}: {e}")
