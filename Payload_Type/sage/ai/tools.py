@@ -26,14 +26,15 @@ class UnifiedToolManager:
     All tools are presented through a consistent LangChain BaseTool interface.
     """
     
-    def __init__(self, mcp_manager: MCPServerManager):
+    def __init__(self, mcp_manager: MCPServerManager | None):
         """
         Initialize the UnifiedToolManager.
         
         Args:
             mcp_manager: Instance of MCPServerManager for MCP tool access
         """
-        self.mcp_manager = mcp_manager
+        if mcp_manager:
+            self.mcp_manager = mcp_manager
         self.mythic_client: Optional[MythicAPIClient] = None
         self._logger = logging.getLogger(__name__)
     
