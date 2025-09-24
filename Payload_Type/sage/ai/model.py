@@ -1,17 +1,13 @@
 import json
-import aiosqlite
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import tools_condition, ToolNode
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage
 from mythic_container.logging import logger
-from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate
+
 from typing import Any
 from .mcp import MCPManager
 from .mythic import MythicAPIClient
@@ -34,7 +30,6 @@ class Model:
     llm: BaseChatModel | Any
     messages: list[BaseMessage]
     system_message: SystemMessage
-    # memory: MemorySaver
     memory: AsyncSqliteSaver
     graph: StateGraph
     agent: CompiledStateGraph | None
@@ -56,11 +51,6 @@ class Model:
         self.counter = 0
         self.messages = []
         self.agent_task_id = agent_task_id
-        self.graph = StateGraph(State)
-        # self.memory = MemorySaver()
-        db_path = "sage.db"  # Path to your SQLite database
-        conn = aiosqlite.connect(db_path, check_same_thread=False)
-        self.memory = AsyncSqliteSaver(conn)
         self.system_message = SystemMessage(content=system_prompt)
         if system_prompt:
             self.messages.insert(0, SystemMessage(content=system_prompt))
@@ -73,8 +63,6 @@ class Model:
                 }
             )
         self.llm = init_chat_model(model_provider=provider,model=model,configurable_fields="any", api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None)
-        #if self.config:
-        #        self.llm = self.llm.with_config(self.config["configurable"])
 
     async def with_tools(self, agent_task_id: str):
         """
@@ -111,7 +99,7 @@ class Model:
         """
         self.verbose = verbose
 
-    def _generate_mythic_output(self) -> str:
+
         """
         Generate a string representation of the model's messages for Mythic output.
         :return: A string containing the messages formatted for Mythic.
@@ -156,26 +144,38 @@ class Model:
                 result += f"❓> Unknown message type: {m.get('type', 'unknown')} with content: {m}\n"
         return result
 
-    def _tool_node(self, state: MessagesState):
-        return {"messages": [self.llm.invoke(state["messages"])]}
+    def _generate_mythic_output(self) -> str:
+        """
+        Generate a string representation of the model's messages for Mythic output.
+        :return: A string containing the messages formatted for Mythic.
+        """
+        return_message = ""
+        for i, message in enumerate(self.messages):
+            if i < self.counter:
+                continue
+            if isinstance(message, HumanMessage):
+                return_message += f"👤> {message.content}\n"
+            elif isinstance(message, AIMessage):
+                is_last_message = i == len(self.messages) - 1
+                show_content = is_last_message or self.verbose
+                
+                if show_content:
+                    if isinstance(message.content, str):
+                        if message.content:
+                            return_message += f"🤖> {message.content}\n"
+                    elif isinstance(message.content, list):
+                        return_message += self._process_ai_content_list(message.content)
+            elif isinstance(message, SystemMessage):
+                pass
+            elif isinstance(message, ToolMessage):
+                if self.verbose:
+                    return_message += f"🛠️> Tool Call ID: '{message.tool_call_id}', Content: '{message.content}'\n"
+            else:
+                return_message += f"❓> Unknown message type: {type(message)} with content: {message}\n"
+            
+            self.counter += 1
 
-    def _assistant_node(self, state: MessagesState):
-        if isinstance(self.config, dict) and "configurable" in self.config:
-            config = RunnableConfig(
-                    configurable={
-                        k: v 
-                        for k, v in self.config["configurable"].items()
-                        if k not in ["thread_id"]  # Remove thread_id if present
-                    }
-                )
-            return {"messages": [self.llm.invoke([self.system_message] + state["messages"], config=config)]}
-        else:
-            return {"messages": [self.llm.invoke([self.system_message] + state["messages"])]}
-    
-    async def _mythic_response_node(self, content: str):
-        resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(self.agent_task_id, content.encode()))
-        if not resp.Success:
-            logger.error(f"Failed to send Mythic response: {resp.Error}")
+        return return_message
         
     async def invoke(self, prompt: str) -> str:
         """
@@ -284,26 +284,6 @@ class Model:
                 self.messages.append(tool_message)
                 logger.warning(f"🛠️> Result: {result}")
         
-        return self._generate_mythic_output()
-
-    async def invoke_graph(self, prompt: str):
-        if not self.agent:
-            self.graph.add_node("assistant", self._assistant_node)
-            if self.tool_manager:
-                self.graph.add_node("tools", ToolNode(self.tool_manager.get_all_tools()))
-            self.graph.add_edge(START, "assistant")
-            self.graph.add_conditional_edges("assistant", tools_condition)
-            self.graph.add_edge("tools", "assistant")
-            self.agent = self.graph.compile(checkpointer=self.memory)
-
-        if isinstance(self.config, dict) and "configurable" in self.config:
-            self.config["configurable"]["thread_id"] = str(self.agent_task_id)
-        else:
-            self.config = {"configurable": {"thread_id": str(self.agent_task_id)}}
-        
-        resp = await self.agent.ainvoke({"messages": [HumanMessage(content=prompt)]}, config=self.config)
-        logger.warning(f"🤖> Invoke2 response - {self.agent_task_id}: {self.messages}")
-        self.messages = resp["messages"]
         return self._generate_mythic_output()
 
 sessions: dict[str, Model] = {}

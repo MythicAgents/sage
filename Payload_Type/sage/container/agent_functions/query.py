@@ -2,7 +2,7 @@ from mythic_container.MythicCommandBase import TaskArguments, CommandBase, Comma
 from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate 
 from mythic_container.logging import logger
 from .utils import get_secret
-from ai.model import Model
+from ai.langgraph.model import Model
 
 class QueryArguments(TaskArguments):
     def __init__(self, command_line, **kwargs):
@@ -193,13 +193,12 @@ class QueryCommand(CommandBase):
                 config["configurable"]["aws_session_token"] = aws_session_token
             if aws_region is not None:
                 config["configurable"]["region"] = aws_region
-        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, agent_task_id=taskData.Task.ID)
+        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID)
+        await llm.initialize()
         if verbose:
             llm.set_verbose(True)
-        if tools:
-            await llm.with_tools(str(taskData.Task.AgentTaskID))
         
-        llm_resp = await llm.invoke_graph(prompt)
+        llm_resp = await llm.invoke(prompt)
         
         resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(taskData.Task.ID, llm_resp.encode()))
         if not resp.Success:

@@ -1,8 +1,10 @@
-langchain[anthropic]
+langchain==1.0.0a5
+langchain-core==1.0.0a3
+langchain-anthropic==1.0.0a1
 langchain[aws]
 langchain[ollama]
 langchain[openai]
-langgraph
+langgraph==1.0.0a3
 langgraph-checkpoint-sqlite
 langsmith
 langchain-mcp-adapters

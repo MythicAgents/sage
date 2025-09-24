@@ -2,7 +2,7 @@ from mythic_container.MythicCommandBase import TaskArguments, CommandBase, Comma
 from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
 from mythic_container.logging import logger
 from .utils import get_secret
-from ai.model import Model, add_session, get_session, remove_session
+from ai.langgraph.model import Model, add_session, get_session, remove_session
 
 class ChatArguments(TaskArguments):
     def __init__(self, command_line, **kwargs):
@@ -241,14 +241,15 @@ class ChatCommand(CommandBase):
                     config["configurable"]["aws_session_token"] = aws_session_token
                 if aws_region is not None:
                     config["configurable"]["region"] = aws_region
-            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, agent_task_id=taskData.Task.ID)
+            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID)
+            await llm.initialize()
             if verbose:
                 llm.set_verbose(True)
-            if tools:
-                await llm.with_tools(str(taskData.Task.AgentTaskID))
+            # if tools:
+            #    await llm.with_tools(str(taskData.Task.AgentTaskID))
             await add_session(str(taskData.Task.ID), llm)
 
-        llm_resp = await llm.invoke_graph(prompt)
+        llm_resp = await llm.invoke(prompt)
         llm_resp += "\n👤> "  # Add the user prompt to the response for context
 
         id = response.TaskID if not taskData.Task.IsInteractiveTask else taskData.Task.ParentTaskID
