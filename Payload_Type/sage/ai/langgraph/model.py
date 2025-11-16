@@ -114,7 +114,7 @@ class Model:
     async def _fetch_dynamic_data(self):
         """Fetch dynamic data from Mythic APIs for use in agent prompts."""
         ensure_logger_initialized()
-        logger.info("🔄 Starting _fetch_dynamic_data()")
+        logger.info("🔄 Starting _fetch_dynamic_data() ")
         force_flush_all_handlers()
 
         try:
