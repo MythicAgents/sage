@@ -1,10 +1,11 @@
+import json
 import aiosqlite
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt import tools_condition
+from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
-from langchain.agents.tool_node import ToolNode
 from langgraph.types import Command
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -12,14 +13,24 @@ from langchain_core.runnables.config import RunnableConfig
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage, AnyMessage
 from mythic_container.logging import logger
 from typing import Any
-from .mythic import MythicTools
-from langchain.tools import tool
+from .mythic_tools import MythicTools
+from .tool_cache import ToolCache
+
+# Import logging fix - handle both relative and absolute imports
+try:
+    from .logging_fix import ensure_logger_initialized, force_flush_all_handlers
+except ImportError:
+    from logging_fix import ensure_logger_initialized, force_flush_all_handlers
 from typing import Annotated
-from langchain_core.tools import tool, InjectedToolCallId
-from langchain.agents.tool_node import InjectedState
+from langchain_core.tools import tool
+from langchain.tools import ToolRuntime
+from langgraph.errors import GraphRecursionError
 
 class SageState(MessagesState):
     count: int
+    remaining_steps: RemainingSteps
+    recursion_summary_requested: bool
+    recursion_handback: bool
 
 class Model:
     """A class to represent an LLM model with its configuration for use with Mythic commands.
@@ -37,8 +48,15 @@ class Model:
     messages: list[AnyMessage]
     system_message: SystemMessage
     memory: AsyncSqliteSaver # The LangChain AsyncSqliteSaver instance for saving messages to the SQLite database in sage.db
-    state: SageState
+    state: dict[str, Any]
     graph: CompiledStateGraph | None
+    # Tool cache for flexible data caching
+    tool_cache: ToolCache
+    # Dynamic data cache for agent prompts
+    _payload_names: list[str] | None
+    _c2_profiles: list[dict[str, str]] | None
+    _cached_commands: dict[str, Any] | None
+    _dynamic_data_loaded: bool
 
     def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str):
         """
@@ -58,13 +76,20 @@ class Model:
         self.messages = []
         self.agent_task_id = agent_task_id
         self.task_id = task_id
+        # Initialize dynamic data cache
+        self._payload_names = None
+        self._c2_profiles = None
+        self._cached_commands = None
+        self._dynamic_data_loaded = False
         db_path = "sage.db"  # Path to your SQLite database
+        self.tool_cache = ToolCache(db_path)
         conn = aiosqlite.connect(db_path, check_same_thread=False)
         self.memory = AsyncSqliteSaver(conn)
         self.system_message = SystemMessage(content=system_prompt)
         if system_prompt:
             self.messages.insert(0, SystemMessage(content=system_prompt))
-        self.state = SageState(messages=self.messages, count=self.counter)
+        self.state = {"messages": self.messages, "count": self.counter}
+        # Note: remaining_steps and recursion_summary_requested will be managed by LangGraph
         if config:
             self.config = RunnableConfig(
                 configurable={
@@ -73,12 +98,125 @@ class Model:
                     if k not in ["thread_id"]  # Remove thread_id if present
                 }
             )
-        self.llm = init_chat_model(model_provider=provider,model=model, api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None)
+        logger.debug(f"Initializing Model with provider={provider}, model={model}")
+        #logger.debug(f"Initializing Model with provider={provider}, model={model}, config={self.config}")
+        if provider.lower() == "bedrock":
+            region = config["configurable"].get("region") if config and config.get("configurable") else "us-east-1"
+            aws_access_key_id = config["configurable"].get("aws_access_key_id") if config and config.get("configurable") else None
+            aws_secret_access_key = config["configurable"].get("aws_secret_access_key") if config and config.get("configurable") else None
+            aws_session_token = config["configurable"].get("aws_session_token") if config and config.get("configurable") else None
+            self.llm = init_chat_model(model_provider=provider, model=model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
+        elif self.config and config.get("configurable") and config["configurable"].get("base_url"):
+            self.llm = init_chat_model(model_provider=provider, model=model, api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None, base_url=config["configurable"]["base_url"])
+        else:
+            self.llm = init_chat_model(model_provider=provider, model=model, api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None)
+
+    async def _fetch_dynamic_data(self):
+        """Fetch dynamic data from Mythic APIs for use in agent prompts."""
+        ensure_logger_initialized()
+        logger.info("🔄 Starting _fetch_dynamic_data()")
+        force_flush_all_handlers()
+
+        try:
+            if self.mythic_client is None:
+                logger.warning("Mythic client not available, using default values for agent prompts")
+                self._payload_names = ["merlin"]  # Default fallback
+                self._c2_profiles = [{"name": "http", "description": "HTTP/S C2 Profile"}]  # Default fallback
+                self._cached_commands = {}
+                self._dynamic_data_loaded = True
+                return
+
+            # Fetch payload names
+            try:
+                self._payload_names = await self.mythic_client.get_payload_names()
+                logger.debug(f"Fetched {len(self._payload_names)} payload names: {self._payload_names}")
+                force_flush_all_handlers()
+            except Exception as e:
+                logger.warning(f"Failed to fetch payload names: {e}, using defaults")
+                self._payload_names = ["merlin"]
+
+            # Fetch C2 profiles
+            try:
+                self._c2_profiles = await self.mythic_client.get_c2_profile_names()
+                logger.debug(f"Fetched {len(self._c2_profiles)} C2 profiles: {[p['name'] for p in self._c2_profiles]}")
+                force_flush_all_handlers()
+            except Exception as e:
+                logger.warning(f"Failed to fetch C2 profiles: {e}, using defaults")
+                self._c2_profiles = [{"name": "http", "description": "HTTP/S C2 Profile"}]
+
+            # Pre-load commands for all payloads EXCEPT 'sage'
+            # (sage is the running program and doesn't need to call itself)
+            # This ensures they're cached and available in agent prompts
+            self._cached_commands = {}
+            # Pre-load all available payloads except 'sage'
+            common_payloads = [p for p in self._payload_names if p.lower() != "sage"]
+
+            logger.info(f"📦 Pre-loading commands for payloads: {common_payloads}")
+            logger.debug(f"Available payload names: {self._payload_names}")
+            force_flush_all_handlers()
+
+            for payload in common_payloads:
+                if payload in self._payload_names:
+                    try:
+                        logger.info(f"🔄 Pre-loading commands for payload '{payload}'...")
+                        force_flush_all_handlers()
+                        # Use 24-hour TTL since commands rarely change
+                        commands = await self.get_commands_for_payload_cached(payload, ttl_seconds=86400)
+                        self._cached_commands[payload] = commands
+
+                        # Log summary of what was cached
+                        if isinstance(commands, dict):
+                            cmd_count = len(commands.get('commands', commands.get('command', [])))
+                            logger.info(f"✅ Pre-loaded {cmd_count} commands for payload '{payload}'")
+                        elif isinstance(commands, list):
+                            logger.info(f"✅ Pre-loaded {len(commands)} commands for payload '{payload}'")
+                        else:
+                            logger.warning(f"⚠️  Pre-loaded commands for payload '{payload}' has unexpected type: {type(commands).__name__}")
+                        force_flush_all_handlers()
+                    except Exception as e:
+                        logger.error(f"❌ Failed to pre-load commands for payload '{payload}': {e}", exc_info=True)
+                        force_flush_all_handlers()
+                else:
+                    logger.warning(f"⚠️  Payload '{payload}' not in available payloads: {self._payload_names}")
+
+            self._dynamic_data_loaded = True
+            logger.info("Dynamic data successfully loaded for agent prompts")
+            force_flush_all_handlers()
+
+        except Exception as e:
+            logger.error(f"Error fetching dynamic data: {e}", exc_info=True)
+            force_flush_all_handlers()
+            # Set defaults to ensure agents still work
+            self._payload_names = ["merlin"]
+            self._c2_profiles = [{"name": "http", "description": "HTTP/S C2 Profile"}]
+            self._cached_commands = {}
+            self._dynamic_data_loaded = True
 
     async def initialize(self):
         """ Initialize the model's graph and Mythic client."""
+        # Ensure logger has handlers before any logging calls
+        ensure_logger_initialized()
+        #logger.info("🚀 Starting Model initialization...")
+        force_flush_all_handlers()
+
+        # Initialize tool cache
+        await self.tool_cache.initialize()
+
         self.mythic_client = MythicTools(agent_task_id=self.agent_task_id)
         await self.mythic_client.login()
+
+        # CRITICAL: After RPC call, check if logger still has handlers
+        ensure_logger_initialized()
+        logger.info("✅ Mythic client logged in, starting dynamic data fetch")
+        force_flush_all_handlers()
+
+        # Fetch dynamic data for agent prompts before building graph
+        await self._fetch_dynamic_data()
+
+        ensure_logger_initialized()
+        logger.info("✅ Dynamic data fetch completed, building graph")
+        force_flush_all_handlers()
+
         if not self.graph:
             # Build and compile the graph
             self.graph = (
@@ -100,6 +238,99 @@ class Model:
         :param verbose: If True, the model will print all User & AI messages.
         """
         self.verbose = verbose
+
+    # Cache-aware wrapper methods for Mythic tools
+    async def get_commands_for_payload_cached(self, payload: str, ttl_seconds: int = 3600) -> Any:
+        """Get commands for a payload type with caching.
+
+        Args:
+            payload: The payload type name (e.g., "sage", "merlin")
+            ttl_seconds: Cache TTL in seconds (default: 1 hour)
+
+        Returns:
+            Command data for the payload (parsed as dict/list, not JSON string)
+        """
+        logger.debug(f"get_commands_for_payload_cached called for payload '{payload}'")
+
+        # Check cache first
+        cached = await self.tool_cache.get("get_all_commands_for_payloadtype", payload)
+        if cached is not None:
+            # Defensive: If cache contains old string data (from before JSON parsing was added),
+            # parse it now to ensure consistent return type
+            if isinstance(cached, str):
+                logger.warning(f"⚠️  Cached data for '{payload}' is a JSON string (old format), parsing now")
+                try:
+                    cached = json.loads(cached)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse cached JSON string for '{payload}': {e}")
+                    # Invalidate bad cache entry
+                    await self.tool_cache.invalidate("get_all_commands_for_payloadtype", payload)
+                    # Fall through to fetch fresh data below
+                    cached = None
+
+            if cached is not None:
+                logger.info(f"✅ CACHE HIT: Using cached commands for payload '{payload}'")
+                force_flush_all_handlers()
+                return cached
+
+        # Cache miss - fetch from API
+        logger.info(f"❌ CACHE MISS: Fetching commands for '{payload}' from Mythic API")
+        force_flush_all_handlers()
+        if self.mythic_client is None:
+            raise ValueError("Mythic client not initialized")
+
+        result_json_str = await self.mythic_client.get_all_commands_for_payloadtype(payload)
+
+        # Parse JSON string to Python object for better caching and display
+        try:
+            result = json.loads(result_json_str) if isinstance(result_json_str, str) else result_json_str
+            logger.debug(f"Parsed commands result type: {type(result)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse commands JSON for payload '{payload}': {e}")
+            result = result_json_str  # Fall back to string if parsing fails
+
+        # Cache the parsed result
+        await self.tool_cache.set("get_all_commands_for_payloadtype", payload, result, ttl_seconds)
+        logger.info(f"💾 Cached commands for payload '{payload}' with TTL {ttl_seconds}s")
+        force_flush_all_handlers()
+
+        return result
+
+    async def get_callbacks_cached(self, ttl_seconds: int = 60) -> Any:
+        """Get active callbacks with caching.
+
+        Args:
+            ttl_seconds: Cache TTL in seconds (default: 60 seconds for more frequent updates)
+
+        Returns:
+            Active callbacks data
+        """
+        # Check cache first
+        cached = await self.tool_cache.get("get_all_active_callbacks")
+        if cached is not None:
+            logger.info("Using cached active callbacks")
+            return cached
+
+        # Cache miss - fetch from API
+        logger.info("Cache miss for active callbacks - fetching from API")
+        if self.mythic_client is None:
+            raise ValueError("Mythic client not initialized")
+
+        result = await self.mythic_client.get_all_active_callbacks()
+
+        # Cache the result
+        await self.tool_cache.set("get_all_active_callbacks", None, result, ttl_seconds)
+
+        return result
+
+    async def invalidate_tool_cache(self, tool_name: str, params: Any = None):
+        """Invalidate cache for a specific tool or all entries for that tool.
+
+        Args:
+            tool_name: Name of the tool to invalidate
+            params: Optional parameters to match (if None, invalidates all entries for this tool)
+        """
+        await self.tool_cache.invalidate(tool_name, params)
 
     # Agent definitions
     def _generalist_agent(self):
@@ -127,19 +358,35 @@ class Model:
             model=self.llm,
             tools=tools,
             name=name,
-            prompt=SystemMessage(content=prompt),
+            system_prompt=prompt,
         )
     
     def _mythic_operator_agent(self):
         name = "Mythic_Operator" # Note: name must match the agent_name in _create_handoff_tool and cannot have spaces
-        prompt = """
-        You are a Mythic Operator Agent responsible for handling prompts or tasks issued to Mythic from a human operator interacting with Mythic. 
+
+        # Build cached commands section for pre-loaded payloads
+        commands_text = ""
+        if self._cached_commands:
+            #logger.debug(f"🎯 Building Mythic_Operator agent with {len(self._cached_commands)} cached payload(s)")
+            for payload_name, commands in self._cached_commands.items():
+                commands_json = json.dumps(commands, indent=2) if isinstance(commands, (dict, list)) else str(commands)
+                #logger.debug(f"Adding {len(commands_json)} chars of commands for '{payload_name}' to prompt")
+                commands_text += f"\n### Available Commands for '{payload_name}' Payload:\n{commands_json}\n"
+            commands_text += "\n**Note:** Use the get_all_commands_for_payloadtype tool if you need commands for other payload types or want to refresh this data.\n"
+            #logger.debug(f"✅ Injected cached commands into Mythic_Operator prompt ({len(commands_text)} chars)")
+        else:
+            #logger.debug("⚠️  No cached commands available for Mythic_Operator agent prompt")
+            pass
+
+        prompt = f"""
+        You are a Mythic Operator Agent responsible for handling prompts or tasks issued to Mythic from a human operator interacting with Mythic.
         Your primary role is to take actions within Mythic based on the operator's requests, ensuring that tasks are executed accurately and efficiently.
 
         Responsibilities:
         - Interpret and execute commands related to Mythic operations, such as managing callbacks, issuing Mythic tasks, and monitoring their status.
         - Provide updates on the status of operations and any relevant information to the operator.
         - Ensure that all actions taken within Mythic are logged and traceable.
+        - **CRITICAL**: Monitor the remaining_steps value to prevent hitting recursion limits during complex operations.
 
         Guidelines:
         - Always confirm the operator's intent before executing any critical commands.
@@ -148,11 +395,49 @@ class Model:
         - Prioritize accuracy and efficiency in executing tasks.
         - If a command is unclear or outside your scope, ask for clarification or suggest consulting another agent.
 
-        Your goal is to assist the human operator effectively, ensuring that their requests are fulfilled accurately within the Mythic environment.
+        **CRITICAL: Check Existing Task History BEFORE Issuing New Commands:**
+        Before issuing ANY new commands, you MUST follow this workflow:
+
+        1. **Get Active Callbacks**: Use get_all_active_callbacks to identify available agents
+        2. **Check Task History**: Use get_task_history_for_callback to see what commands have already been executed
+        3. **Review Existing Output**: Use get_all_task_output_by_task_id to retrieve results from relevant past tasks
+        4. **Analyze What You Have**: Determine if the requested information already exists in the task history
+        5. **Issue New Tasks Only If Needed**: Only run new commands if the required information is missing or outdated
+
+        **Why This Matters:**
+        - Operators often have 40+ tasks already executed with valuable reconnaissance data
+        - Re-running the same commands wastes time and creates noise
+        - Task history contains the answers to most questions - check it FIRST
+        - Always prefer retrieving existing data over generating new tasks
+
+        **Example Workflow for "Do host-based recon":**
+        1. Get active callbacks → Identify callback #5 (Merlin agent)
+        2. Get task history for callback #5 → See tasks: whoami, hostname, ps, ifconfig already executed
+        3. Get output for those task IDs → Retrieve the actual reconnaissance results
+        4. Analyze the existing data → If complete, present it to the operator
+        5. Only if gaps exist → Issue additional commands to fill in missing information
+
+        **Recursion Limit Management:**
+        - You have access to a `remaining_steps` value that shows how many more operations can be performed.
+        - **Before each major tool call sequence, check remaining_steps**.
+        - When remaining_steps is 4 or fewer, you MUST use the `summarize_and_handback` tool instead of continuing.
+        - This prevents hitting the recursion limit and allows the Supervisor to ask the user how to proceed.
+        - In your summary, include:
+          - What tasks you've completed so far
+          - What information you've gathered
+          - What still needs to be done
+          - Any important findings or results
+
+        **Work Prioritization:**
+        - For complex multi-step tasks (like comprehensive reconnaissance), break them into phases
+        - Complete the most critical information gathering first
+        - If approaching recursion limit, prioritize getting essential results over comprehensive coverage
+        {commands_text}
+        Your goal is to assist the human operator effectively while managing system resources responsibly.
         """
         # Tools
         if self.mythic_client is not None:
-            tools = self.mythic_client.get_tools([
+            mythic_tools = self.mythic_client.get_tools([
                 "get_all_active_callbacks",
                 "get_all_commands_for_payloadtype",
                 "issue_task_and_waitfor_task_output",
@@ -160,19 +445,36 @@ class Model:
                 "get_all_task_output_by_task_id",
                 "get_operations",
             ])
+            # Add the handback tool for recursion limit management
+            handback_tool = _create_summarize_handback_tool()
+            tools = mythic_tools + [handback_tool]
         else:
             raise ValueError("Mythic client not initialized for Mythic Operator Agent.")
         return create_agent(
             model=self.llm,
             tools=tools,
             name=name,
-            prompt=SystemMessage(content=prompt),
+            system_prompt=prompt,
         )
 
     def _mythic_payload_agent(self):
         name = "Mythic_Payload"
-        prompt = """
-        You are the Mythic Payload Agent, an AI/LLM-based assistant designed to help users create Mythic Payloads within the Mythic C2 framework. Always remember and clearly distinguish that Mythic agents refer to the software components or payload types in the Mythic C2 system (e.g., Apollo, Poseidon, Apfell, Merlin)—these are wildly different from AI/LLM agents like yourself, which are language models for conversational tasks.
+
+        # Build dynamic lists from cached data
+        installed_payloads_text = ""
+        if self._payload_names:
+            installed_payloads_text = "\n".join([f"        - {payload}" for payload in self._payload_names])
+        else:
+            installed_payloads_text = "        - (No payload data available)"
+
+        installed_c2_profiles_text = ""
+        if self._c2_profiles:
+            installed_c2_profiles_text = "\n".join([f"        - {profile['name']}: {profile['description']}" for profile in self._c2_profiles])
+        else:
+            installed_c2_profiles_text = "        - (No C2 profile data available)"
+
+        prompt = f"""
+        You are the Mythic Payload Agent, an AI/LLM-based assistant designed to help users **create or build** Mythic Payloads within the Mythic C2 framework. Always remember and clearly distinguish that Mythic agents refer to the software components or payload types in the Mythic C2 system (e.g., Apollo, Poseidon, Apfell, Merlin)—these are wildly different from AI/LLM agents like yourself, which are language models for conversational tasks.
 
         ### Core Responsibilities:
         - Your primary function is to guide users through creating Mythic Payloads. These are executable files (or other formats) that run on a target system to establish a command-and-control (C2) connection back to a Mythic server.
@@ -185,6 +487,8 @@ class Model:
         - If the user's query lacks sufficient details (e.g., no OS, no C2 profile, or incompatible choices), do not proceed. Instead, respond politely asking for the missing information, and explain why it's needed (e.g., "To build a compatible executable, please specify the target OS and a supported C2 profile for the Apollo agent.").
 
         ### Response Guidelines:
+        - **Payload Verification**: Only create payloads for installed Mythic agents with the `get_payload_names` tool. If the requested agent is not installed, inform the user and suggest alternatives.
+        - ** C2 Profile Verification**: Use the `get_c2_profile_names` tool to list installed C2 profiles. If the requested profile is not available, inform the user and suggest alternatives.
         - **Step-by-Step Process**: When sufficient info is provided, outline the payload creation steps clearly, including any Mythic agent-specific configurations from the build container. Reference supported features like task queuing, opsec checks, or browser scripting if relevant.
         - **Validation**: Always validate compatibility (e.g., "Apollo supports Windows with http and websocket profiles").
         - **Documentation Reference**: Direct users to official docs for details: https://docs.mythic-c2.net/operational-pieces/payload-types. If needed, suggest checking agent repos at https://github.com/MythicAgents for source code and features.
@@ -192,7 +496,12 @@ class Model:
         - **Edge Cases**: For advanced features (e.g., wrappers like scarecrow_wrapper or AI-integrated agents like sage), explain limitations and requirements.
         - **Tone**: Be professional, helpful, and concise. Avoid jargon unless explaining it, and focus on operational safety.
 
-        Common Mythic Agents for Reference (based on community and official sources; always verify latest via docs):
+        ### Currently Installed Mythic Agents (payloads):
+        {installed_payloads_text}
+        ### Currently Installed C2 profiles:
+        {installed_c2_profiles_text}
+
+        ### Common Mythic Agents for Reference (based on community and official sources; always verify latest via docs):
         - Apollo: Windows (.NET), supports http, websocket.
         - Poseidon: Linux/macOS (Golang), supports http, websocket, dns.
         - Merlin: Windows, Linux, macOS, freebsd (Golang), supports http.
@@ -205,32 +514,34 @@ class Model:
         """
         # Tools
         if self.mythic_client:
-            tools = self.mythic_client.get_tools([
+            mythic_tools = self.mythic_client.get_tools([
                 "get_payload_names",
                 "create_payload",
                 "get_all_payload_info",
-                "get_all_commands_for_payloadtype",
                 "get_c2_profiles_for_payload",
-                "issue_task_and_waitfor_task_output",
             ])
+            # Add the handback tool for recursion limit management
+            handback_tool = _create_summarize_handback_tool()
+            tools = mythic_tools + [handback_tool]
         else:
             raise ValueError("Mythic client not initialized for Mythic Payload Agent.")
         return create_agent(
             model=self.llm,
             tools=tools,
             name=name,
-            prompt=SystemMessage(content=prompt),
+            system_prompt=prompt,
         )
 
     def _supervisor_agent(self):
         name = "Supervisor"
         prompt = """
-            You are a Supervisor Agent responsible for managing and coordinating multiple specialized agents. 
-            Your primary role is to ensure that tasks are delegated effectively, progress is monitored, and results are integrated seamlessly. 
+            You are a Supervisor Agent responsible for managing and coordinating multiple specialized agents.
+            Your primary role is to ensure that tasks are delegated effectively, progress is monitored, and results are integrated seamlessly.
             You have access to the following agents, each with their own expertise:
 
             1. **Generalist Agent**: Handles general inquiries and tasks that do not fit for other agents.
             2. **Mythic Operator Agent**: Handles prompts or tasks issued to Mythic from a human operator interacting with Mythic and to take actions within Mythic.
+            3. **Mythic Payload Agent**: Helps create Mythic payloads within the C2 framework.
 
             Your responsibilities include:
             - Understanding the user's high-level goals and breaking them into smaller, manageable tasks.
@@ -238,16 +549,28 @@ class Model:
             - Monitoring the progress of each agent and ensuring timely completion of tasks.
             - Integrating the outputs from all agents into a cohesive response for the user.
             - Providing clear and concise updates to the user about the status of tasks.
+            - **CRITICAL**: Monitoring the remaining_steps value to detect when approaching the recursion limit.
+
+            **Recursion Limit Management:**
+            - You have access to a `remaining_steps` value that shows how many more operations can be performed.
+            - When remaining_steps is 3 or fewer, you MUST use the `request_continuation` tool.
+            - **Important**: You may receive handbacks from specialist agents (like Mythic_Operator) when they approach recursion limits.
+            - When you receive a handback (indicated by messages mentioning "Progress Handback"), you should:
+              1. Review the progress summary provided by the specialist agent
+              2. Use the `request_continuation` tool to ask the user how to proceed
+              3. Include the specialist's findings in your summary to the user
+            - This allows the user to decide whether to continue, stop, or redirect the task.
 
             When interacting with the agents:
             - Clearly specify the task, context, and expected output.
             - Use structured communication to ensure clarity and avoid misunderstandings.
-            - Handle any errors or unexpected behavior by reassigning tasks or consulting the Error Handling Agent.
+            - Handle any errors or unexpected behavior by reassigning tasks or consulting other agents.
 
             When responding to the user:
             - Summarize the progress and results of all agents.
             - Provide actionable insights or next steps based on the outputs of the agents.
             - Maintain a professional and concise tone.
+            - Always check remaining_steps before delegating to other agents.
 
             Always prioritize efficiency, accuracy, and clarity in your management and communication.
         """
@@ -266,36 +589,52 @@ class Model:
                 agent_name="Mythic_Payload",
                 description="Assign task to a mythic payload agent.",
             )
-        
+
+        # Recursion limit management tool
+        request_continuation_tool = _create_recursion_summary_tool()
+
         # Tools
         tools = [
             assign_to_generalist_agent,
             assign_to_mythic_operator_agent,
             assign_to_mythic_payload_agent,
+            request_continuation_tool,
         ]
 
         return create_agent(
             model=self.llm,
             tools=tools,
             name=name,
-            prompt=SystemMessage(content=prompt),
+            system_prompt=prompt,
         )
 
-    def _process_ai_content_list(self, content_list):
+    def _process_ai_content_list(self, content_list, agent_name=None):
         """Helper method to process AI message content lists"""
         result = ""
+        logger.info(f"🔍 _process_ai_content_list called with {len(content_list)} items, agent_name={agent_name}")
         for m in content_list:
             if m.get("type") == "text":
-                result += f"🤖> {m.get('text', '')}\n"
+                logger.debug(f"  Processing text content: {m.get('text', '')[:50]}...")
+                if agent_name:
+                    result += f"🤖[{agent_name}]> {m.get('text', '')}\n"
+                else:
+                    result += f"🤖> {m.get('text', '')}\n"
             elif m.get("type") == "tool_use":
-                result += f"🛠️> Name: '{m.get('name', '')}', Arguments: '{m.get('input', '')}', ID: '{m.get('id', '')}'\n"
+                tool_name = m.get('name', '')
+                logger.info(f"  ✅ Processing tool_use: name={tool_name}, id={m.get('id', '')}")
+                result += f"🛠️[{m.get('id', '')}> Name: '{tool_name}', Arguments: '{m.get('input', '')}'\n"
             else:
+                logger.warning(f"  ❓ Unknown message type: {m.get('type', 'unknown')}")
                 result += f"❓> Unknown message type: {m.get('type', 'unknown')} with content: {m}\n"
+        logger.info(f"🔍 _process_ai_content_list returning {len(result)} chars")
+        force_flush_all_handlers()
         return result
 
-    def _generate_mythic_output(self, resp) -> str:
+    def _generate_mythic_output(self, resp, skip_counter=False) -> str:
         """
         Generate a string representation of the model's messages for Mythic output.
+        :param resp: The response containing messages
+        :param skip_counter: If True, show all messages regardless of counter (used for recursion recovery)
         :return: A string containing the messages formatted for Mythic.
         """
 
@@ -303,54 +642,162 @@ class Model:
         # check that the messages key is in the resp or throw an error
         if "messages" not in resp:
             raise ValueError("No messages found in the response from the graph invocation.")
+
+        # Track the current active agent by looking at handoff tool messages
+        current_agent = "Supervisor"  # Start with supervisor
+
+        # When skip_counter is True, we want to show all messages from the beginning
+        # This is used when recovering from recursion errors to show full context
+        start_index = 0 if skip_counter else self.counter
+
+        logger.info(f"_generate_mythic_output: Processing {len(resp['messages'])} total messages, starting from index {start_index}, skip_counter={skip_counter}")
+
         for i, message in enumerate(resp["messages"]):
             # print(f"Processing message {i}: {message}")
-            if i < self.counter:
+            if i < start_index:
                 continue
             if isinstance(message, HumanMessage):
                 return_message += f"👤> {message.content}\n"
             elif isinstance(message, AIMessage):
                 is_last_message = i == len(resp["messages"]) - 1
-                show_content = is_last_message or self.verbose
-                
-                if show_content:
-                    if isinstance(message.content, str):
-                        if message.content and message.name:
-                            return_message += f"🤖 ({message.name})> {message.content}\n"
-                        elif message.content:
-                            return_message += f"🤖> {message.content}\n"
-                        else:
-                            return_message += "🤖> NO CONTENT"
-                    elif isinstance(message.content, list):
-                        if len(message.content) > 0:
-                            return_message += self._process_ai_content_list(message.content)
-                        elif is_last_message and not self.verbose and not message.content:
-                            logger.debug("Last message has empty content list and not verbose, searching for last AIMessage with content list") 
-                            # If last message has empty content list and not verbose, find the last AIMessage with content
-                            for j in range(len(resp["messages"]) - 2, -1, -1):
-                                prev_message = resp["messages"][j]
-                                if isinstance(prev_message, AIMessage):
-                                    if isinstance(prev_message.content, str) and prev_message.content:
-                                        if prev_message.name:
-                                            return_message += f"🤖 ({prev_message.name})> {prev_message.content}\n"
-                                        else:
-                                            return_message += f"🤖> {prev_message.content}\n"
-                                        break
-                                    elif isinstance(prev_message.content, list) and len(prev_message.content) > 0:
-                                        return_message += self._process_ai_content_list(prev_message.content)
-                                        break
+
+                # Debug: log message attributes to see what's available
+                agent_name = getattr(message, 'name', None) or current_agent
+                tool_calls = getattr(message, 'tool_calls', None) or []
+                has_tool_calls = len(tool_calls) > 0
+
+                # Separate logic for text vs tool calls:
+                # - Text content: ALWAYS show (all AI responses throughout conversation)
+                # - Tool calls: Only show when verbose is ON
+                show_tool_calls = self.verbose
+
+                logger.info(f"📝 AIMessage #{i}: is_last={is_last_message}, verbose={self.verbose}, "
+                           f"show_tools={show_tool_calls}, "
+                           f"agent={agent_name}, content_type={type(message.content).__name__}, "
+                           f"content_is_list={isinstance(message.content, list)}, "
+                           f"content_len={len(message.content) if isinstance(message.content, list) else 'N/A'}, "
+                           f"has_tool_calls={has_tool_calls}, tool_calls_count={len(tool_calls)}")
+                force_flush_all_handlers()
+
+                # ALWAYS display text content from AI messages (responses, thinking, etc.)
+                # regardless of verbose mode - users want to see AI reasoning
+                if isinstance(message.content, str):
+                    if message.content:
+                        return_message += f"🤖[{agent_name}]> {message.content}\n"
+                    else:
+                        # Skip empty messages that have no tool_calls (they're usually framework artifacts)
+                        # Only log a warning if this is the last message and it's truly empty
+                        if not has_tool_calls and is_last_message:
+                            logger.warning(f"Last message #{i} has no content and no tool_calls - skipping display")
+                elif isinstance(message.content, list):
+                    if len(message.content) > 0:
+                        # Process list content - extract only TEXT blocks, skip tool_use
+                        # (tool_use in content is the Anthropic format, we handle tool_calls separately below)
+                        logger.info(f"  ➡️  Processing content list for message #{i} (extracting text only)")
+                        force_flush_all_handlers()
+                        for item in message.content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                if text:
+                                    return_message += f"🤖[{agent_name}]> {text}\n"
+
+                # Display tool_calls ONLY when verbose mode is ON
+                if show_tool_calls and has_tool_calls:
+                    logger.info(f"  ➡️  Processing {len(tool_calls)} tool_calls for message #{i}")
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.get('name', 'unknown')
+                        tool_id = tool_call.get('id', 'unknown')
+                        tool_args = tool_call.get('args', {})
+                        logger.info(f"    ✅ Tool call: name={tool_name}, id={tool_id}")
+                        return_message += f"🛠️[{tool_id}]> Name: '{tool_name}', Arguments: '{tool_args}'\n"
+                    force_flush_all_handlers()
+                elif not show_tool_calls and has_tool_calls:
+                    logger.info(f"  ⏭️  Skipping {len(tool_calls)} tool_calls (verbose=False)")
+                    force_flush_all_handlers()
             elif isinstance(message, SystemMessage):
                 pass
             elif isinstance(message, ToolMessage):
+                # Check if this is a handoff tool message to track which agent is active
+                if message.name and message.name.startswith("transfer_to_"):
+                    agent_name = message.name.replace("transfer_to_", "")
+                    current_agent = agent_name
+                    logger.debug(f"Agent handoff detected: now using {current_agent}")
+
                 if self.verbose:
-                    return_message += f"🛠️> Tool Call ID: '{message.tool_call_id}', Content: '{message.content}'\n"
+                    return_message += f"🛠️[{message.tool_call_id}]> {message.content}\n"
             else:
                 return_message += f"❓> Unknown message type: {type(message)} with content: {message}\n"
             
             self.counter += 1
 
         return return_message
-    
+
+    def _cleanup_dangling_tool_calls(self):
+        """
+        Clean up ANY dangling tool_use blocks throughout the entire conversation state.
+
+        Anthropic's API requires that every tool_use block must have a corresponding
+        tool_result block. This function scans ALL messages to find tool_use blocks
+        that don't have matching tool_results and injects synthetic ToolMessages.
+
+        This is critical when resuming from a recursion limit hit or checkpoint restore,
+        where execution may have stopped after tool_use blocks but before their results.
+        """
+        if "messages" not in self.state or not self.state["messages"]:
+            return
+
+        messages = self.state["messages"]
+        logger.info(f"Scanning {len(messages)} messages for dangling tool calls...")
+
+        # Track which tool_call_ids have been fulfilled with ToolMessages
+        fulfilled_tool_call_ids = set()
+
+        # First pass: collect all fulfilled tool_call_ids
+        for msg in messages:
+            if isinstance(msg, ToolMessage):
+                tool_call_id = getattr(msg, "tool_call_id", None)
+                if tool_call_id:
+                    fulfilled_tool_call_ids.add(tool_call_id)
+
+        logger.info(f"Found {len(fulfilled_tool_call_ids)} fulfilled tool calls")
+
+        # Second pass: find dangling tool_use blocks
+        dangling_tool_calls = []
+        for i, msg in enumerate(messages):
+            if isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None)
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        tool_call_id = tool_call.get("id")
+                        tool_name = tool_call.get("name", "unknown")
+
+                        if tool_call_id and tool_call_id not in fulfilled_tool_call_ids:
+                            logger.warning(f"Found dangling tool_use at message {i}: id={tool_call_id}, name={tool_name}")
+                            dangling_tool_calls.append((i, tool_call_id, tool_name))
+
+        if dangling_tool_calls:
+            logger.warning(f"Found {len(dangling_tool_calls)} dangling tool_use blocks - injecting synthetic results")
+
+            # CRITICAL: Insert synthetic ToolMessages RIGHT AFTER their corresponding AIMessages
+            # Process in REVERSE order to avoid index shifting issues
+            for msg_index, tool_call_id, tool_name in reversed(dangling_tool_calls):
+                logger.info(f"Creating synthetic ToolMessage for tool_use id={tool_call_id}, name={tool_name}")
+
+                synthetic_tool_message = ToolMessage(
+                    content="[Tool execution cancelled - recursion limit or checkpoint restore. User requested continuation.]",
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+
+                # Insert RIGHT AFTER the AIMessage (at msg_index + 1)
+                insert_position = msg_index + 1
+                self.state["messages"].insert(insert_position, synthetic_tool_message)
+                logger.info(f"Inserted synthetic ToolMessage at position {insert_position} (right after message {msg_index})")
+
+            logger.info(f"Successfully injected {len(dangling_tool_calls)} synthetic ToolMessages at correct positions")
+        else:
+            logger.info("No dangling tool calls found - state is clean")
+
     async def invoke(self, prompt: str) -> str:
         """
         Invoke the model with a prompt and return the response.
@@ -358,18 +805,385 @@ class Model:
         :return: The model's response as a string.
         """
         logger.debug(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
-        
+
         if "messages" not in self.state:
             self.state["messages"] = []
+
+        # CRITICAL: Reset recursion flags before each invocation
+        # Without this, the graph sees stale flags from previous runs and
+        # immediately returns with recursion_summary_requested=True, causing
+        # the recursion summary to be shown again instead of continuing
+        if "recursion_summary_requested" in self.state:
+            logger.debug("Resetting recursion_summary_requested flag before invocation")
+            self.state["recursion_summary_requested"] = False
+        if "recursion_handback" in self.state:
+            logger.debug("Resetting recursion_handback flag before invocation")
+            self.state["recursion_handback"] = False
+
+        # CRITICAL: Clean up any dangling tool_use blocks before adding the user's message
+        # This prevents Anthropic API errors when resuming from recursion limit
+        # Note: We don't load from checkpoint here because self.state already contains
+        # the full conversation history from the graph's checkpointing mechanism
+        self._cleanup_dangling_tool_calls()
+
         self.state["messages"].append(HumanMessage(content=prompt))
-        
+
         if self.graph:
-            resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": self.task_id}}) # Default {"recursion_limit": 25}
+            try:
+                # Use default recursion limit - RemainingSteps will handle graceful termination
+                resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25})
+
+                # Check if we got a recursion summary request or handback from specialist
+                if resp.get("recursion_summary_requested", False):
+                    logger.info("Recursion limit approached - user continuation requested")
+                    # Use the counter-based approach - it tracks which messages have been shown
+                    return self._generate_mythic_output(resp, skip_counter=False)
+                elif resp.get("recursion_handback", False):
+                    logger.info("Recursion handback received from specialist agent")
+                    # Use the counter-based approach - it tracks which messages have been shown
+                    return self._generate_mythic_output(resp, skip_counter=False)
+
+            except GraphRecursionError as e:
+                # Catch recursion limit error and return progress made so far
+                logger.warning(f"Recursion limit hit: {e}")
+
+                # First, log what's currently in self.state
+                current_msg_count = len(self.state.get("messages", []))
+                logger.info(f"Current state has {current_msg_count} messages before checkpoint collection")
+                logger.info(f"Current counter value: {self.counter}")
+
+                # Get the latest state from the checkpoint to show all progress
+                # The graph execution stopped, but checkpointer has saved all messages
+                thread_id = f"{self.agent_task_id}-{self.task_id}"
+                config = RunnableConfig(configurable={"thread_id": thread_id})
+
+                # Collect all messages from parent and nested agent checkpoints
+                all_messages = []
+                checkpoint_count = 0
+                try:
+                    # Get all checkpoints for this thread (including nested agents)
+                    # LangGraph stores nested agent states with namespace prefixes
+                    async for checkpoint_tuple in self.memory.alist(config, limit=200):
+                        checkpoint_count += 1
+                        if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                            ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
+                            checkpoint_id = checkpoint_tuple.checkpoint.get("id", "unknown")
+
+                            logger.info(f"Checkpoint {checkpoint_count}: namespace='{ns}', id={checkpoint_id}")
+
+                            nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                            if "messages" in nested_state:
+                                nested_messages = nested_state["messages"]
+                                logger.info(f"  Found {len(nested_messages)} messages in this checkpoint")
+
+                                # Log message types for debugging
+                                msg_types = [type(m).__name__ for m in nested_messages]
+                                logger.info(f"  Message types: {msg_types}")
+
+                                # Add messages that aren't already in all_messages (avoid duplicates)
+                                for msg in nested_messages:
+                                    if msg not in all_messages:
+                                        all_messages.append(msg)
+
+                    logger.info(f"Total checkpoints examined: {checkpoint_count}")
+                    logger.info(f"Total unique messages collected: {len(all_messages)}")
+
+                    if all_messages:
+                        self.state["messages"] = all_messages
+                        logger.info(f"Updated state with {len(all_messages)} messages from checkpoints")
+                    else:
+                        logger.warning("No messages found in any checkpoint!")
+
+                except Exception as checkpoint_error:
+                    logger.warning(f"Could not retrieve checkpoint after recursion limit: {checkpoint_error}")
+
+                # Ask the LLM to summarize the progress made so far
+                # Include recent context from the conversation for the summary
+                recent_messages = self.state["messages"][-10:] if len(self.state["messages"]) > 10 else self.state["messages"]
+                summary_prompt = HumanMessage(content="""Based on the conversation so far, provide a brief summary of:
+                    1. What tasks have been completed
+                    2. What information has been gathered
+                    3. What still needs to be done
+
+                    Keep it concise (3-5 bullet points).""")
+
+                # Create a summary request with context
+                try:
+                    summary_messages = recent_messages + [summary_prompt]
+                    summary_resp = await self.llm.ainvoke(summary_messages)
+                    summary_text = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
+                except Exception as summary_error:
+                    logger.warning(f"Could not generate summary: {summary_error}")
+                    summary_text = "Multiple reconnaissance and information gathering tasks were in progress."
+
+                # Create continuation message with LLM-generated summary
+                continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached**
+
+                    **Progress Summary:**
+                    {summary_text}
+
+                    **Status:** Hit the system's iteration limit of 25 steps. All work has been preserved in the conversation history.
+
+                    **Your Options:**
+                    • Reply **"continue"** to increase the limit and keep going from where we left off
+                    • Reply **"stop"** to end the current task
+                    • Provide specific instructions to redirect the approach
+
+                    **What would you like to do?**"""
+                )
+
+                # Add continuation message to state
+                self.state["messages"].append(continuation_message)
+                self.state["recursion_summary_requested"] = True
+
+                # Return only NEW messages since last output (avoid duplicates)
+                # Don't reset counter - it already tracks which messages have been shown
+                resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
+
+                # Use skip_counter=False to respect the counter and show only new messages
+                # This prevents showing messages that were already displayed before recursion limit
+                logger.info(f"Returning recursion summary from counter position {self.counter}")
+                return self._generate_mythic_output(resp, skip_counter=False)
+
         else:
             raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
 
         return self._generate_mythic_output(resp)
 
+    async def handle_continuation_response(self, response: str) -> str:
+        """
+        Handle user response to recursion limit continuation request.
+        :param response: User's response ('continue', 'stop', 'redirect', or specific instruction)
+        :return: The model's response after handling the continuation
+        """
+        logger.debug(f"Handling continuation response: '{response}'")
+
+        # Reset the recursion flags
+        if "recursion_summary_requested" in self.state:
+            self.state["recursion_summary_requested"] = False
+        if "recursion_handback" in self.state:
+            self.state["recursion_handback"] = False
+
+        thread_id = f"{self.agent_task_id}-{self.task_id}"
+        config = RunnableConfig(configurable={"thread_id": thread_id})
+
+        if response.lower().strip() in ["continue", "yes", "keep going"]:
+            # Increase recursion limit and continue
+            logger.info("User requested to continue - increasing recursion limit")
+            self.state["messages"].append(HumanMessage(content="Please continue with the previous task."))
+
+            if self.graph:
+                try:
+                    resp = await self.graph.ainvoke(self.state, {
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": 50  # Increased limit for continuation
+                    })
+
+                    # Check again for recursion summary request
+                    if resp.get("recursion_summary_requested", False):
+                        return self._generate_mythic_output(resp)
+
+                except GraphRecursionError as e:
+                    # Hit recursion limit again even with increased limit
+                    logger.warning(f"Recursion limit hit again: {e}")
+
+                    # Get checkpoint state including nested agents
+                    all_messages = []
+                    try:
+                        checkpoint = await self.memory.aget_tuple(config)
+                        if checkpoint and checkpoint.checkpoint:
+                            saved_state = checkpoint.checkpoint.get("channel_values", {})
+                            if "messages" in saved_state:
+                                all_messages.extend(saved_state["messages"])
+
+                        # Get nested agent checkpoints too
+                        async for checkpoint_tuple in self.memory.alist(config, limit=100):
+                            if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                                ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
+                                if ns and ("Mythic_Operator" in ns or "Mythic_Payload" in ns or "Generalist" in ns):
+                                    nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                                    if "messages" in nested_state:
+                                        for msg in nested_state["messages"]:
+                                            if msg not in all_messages:
+                                                all_messages.append(msg)
+
+                        if all_messages:
+                            self.state["messages"] = all_messages
+                    except Exception as checkpoint_error:
+                        logger.warning(f"Could not retrieve checkpoint: {checkpoint_error}")
+
+                    # Generate summary again
+                    continuation_message = AIMessage(content="""🔄 **Recursion Limit Reached Again**
+
+**Status:** Hit the increased iteration limit. The task appears to be very complex or open-ended.
+
+**Your Options:**
+• Reply **"continue"** to try again with an even higher limit
+• Reply **"stop"** to end and review what's been done
+• Provide more specific instructions to narrow the scope
+
+**What would you like to do?**""")
+
+                    self.state["messages"].append(continuation_message)
+                    self.state["recursion_summary_requested"] = True
+                    resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
+
+                    # Don't reset counter - show only new messages to avoid duplicates
+                    logger.info(f"Recursion limit hit again, returning from counter position {self.counter}")
+                    return self._generate_mythic_output(resp, skip_counter=False)
+            else:
+                raise ValueError("No graph defined for the model.")
+
+        elif response.lower().strip() in ["stop", "no", "end", "quit"]:
+            # User wants to stop
+            logger.info("User requested to stop the task")
+            return "✅ Task stopped as requested. The session remains active for new tasks."
+
+        else:
+            # User provided new instructions or redirection
+            logger.info("User provided new instructions for continuation")
+            self.state["messages"].append(HumanMessage(content=response))
+
+            if self.graph:
+                try:
+                    resp = await self.graph.ainvoke(self.state, {
+                        "configurable": {"thread_id": thread_id},
+                        "recursion_limit": 25  # Reset to default for new task direction
+                    })
+
+                    # Check for recursion summary request
+                    if resp.get("recursion_summary_requested", False):
+                        return self._generate_mythic_output(resp)
+
+                except GraphRecursionError as e:
+                    # Handle recursion error for new direction too
+                    logger.warning(f"Recursion limit hit on redirect: {e}")
+
+                    # Get checkpoint state including nested agents
+                    all_messages = []
+                    try:
+                        checkpoint = await self.memory.aget_tuple(config)
+                        if checkpoint and checkpoint.checkpoint:
+                            saved_state = checkpoint.checkpoint.get("channel_values", {})
+                            if "messages" in saved_state:
+                                all_messages.extend(saved_state["messages"])
+
+                        # Get nested agent checkpoints too
+                        async for checkpoint_tuple in self.memory.alist(config, limit=100):
+                            if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                                ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
+                                if ns and ("Mythic_Operator" in ns or "Mythic_Payload" in ns or "Generalist" in ns):
+                                    nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                                    if "messages" in nested_state:
+                                        for msg in nested_state["messages"]:
+                                            if msg not in all_messages:
+                                                all_messages.append(msg)
+
+                        if all_messages:
+                            self.state["messages"] = all_messages
+                    except Exception as checkpoint_error:
+                        logger.warning(f"Could not retrieve checkpoint: {checkpoint_error}")
+
+                    continuation_message = AIMessage(content="🔄 Hit recursion limit again. Reply 'continue' to proceed or 'stop' to end.")
+                    self.state["messages"].append(continuation_message)
+                    self.state["recursion_summary_requested"] = True
+                    resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
+
+                    # Don't reset counter - show only new messages to avoid duplicates
+                    logger.info(f"Recursion limit hit again, returning from counter position {self.counter}")
+                    return self._generate_mythic_output(resp, skip_counter=False)
+            else:
+                raise ValueError("No graph defined for the model.")
+
+        return self._generate_mythic_output(resp)
+
+def _create_summarize_handback_tool():
+    """
+    Create a tool that allows specialist agents to hand back control to the Supervisor
+    when approaching recursion limits, with a progress summary.
+    """
+    @tool("summarize_and_handback")
+    def summarize_and_handback(
+        runtime: ToolRuntime,
+        progress_summary: Annotated[str, "Summary of work completed so far"],
+        tasks_remaining: Annotated[str, "Description of tasks that still need to be completed"],
+        key_findings: Annotated[str, "Important findings or results discovered"] = "",
+    ) -> Command:
+        """Hand back control to Supervisor when approaching recursion limit with progress summary."""
+
+        handback_message = f"""🔄 **Approaching Recursion Limit - Progress Handback**
+
+**Work Completed:**
+{progress_summary}
+
+**Key Findings:**
+{key_findings if key_findings else "No specific findings to report yet."}
+
+**Remaining Tasks:**
+{tasks_remaining}
+
+**Status:** Handing back to Supervisor to avoid hitting recursion limit and allow user to decide how to proceed."""
+
+        tool_message = ToolMessage(
+            content=handback_message,
+            name="summarize_and_handback",
+            tool_call_id=runtime.tool_call_id,
+        )
+
+        # Mark that we've had a recursion handback from a specialist
+        updated_state = {**runtime.state, "recursion_handback": True}
+
+        return Command(
+            goto="Supervisor",
+            update={**updated_state, "messages": runtime.state["messages"] + [tool_message]},
+            graph=Command.PARENT,
+        )
+
+    return summarize_and_handback
+
+def _create_recursion_summary_tool():
+    """
+    Create a tool that allows the supervisor to handle recursion limit situations
+    by asking the user if they want to continue.
+    """
+    @tool("request_continuation")
+    def request_continuation(
+        runtime: ToolRuntime,
+        summary: Annotated[str, "Summary of progress made so far"],
+    ) -> Command:
+        """Request user input on whether to continue when approaching recursion limit."""
+
+        continuation_message = f"""🔄 **Recursion Limit Approaching**
+
+**Progress Summary:**
+{summary}
+
+**Status:** We've been working through a complex task and are approaching the system's iteration limit.
+
+**Your Options:**
+• Reply **"continue"** to increase the limit and keep going with the current approach
+• Reply **"stop"** to end the current task
+• Reply **"redirect"** to give new specific instructions
+• Ask a specific question to help focus the next steps
+
+**What would you like to do?**"""
+
+        tool_message = ToolMessage(
+            content=continuation_message,
+            name="request_continuation",
+            tool_call_id=runtime.tool_call_id,
+        )
+
+        # Mark that we've requested a recursion summary - this will help detect the response
+        updated_state = {**runtime.state, "recursion_summary_requested": True}
+
+        return Command(
+            goto="__end__",  # End the graph execution and wait for user input
+            update={**updated_state, "messages": runtime.state["messages"] + [tool_message]},
+            graph=Command.PARENT,
+        )
+
+    return request_continuation
 
 def _create_handoff_tool(*, agent_name: str, description: str | None = None):
     """
@@ -386,18 +1200,17 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
 
     @tool(name, description=description)
     def handoff_tool(
-        state: Annotated[MessagesState, InjectedState],
-        tool_call_id: Annotated[str, InjectedToolCallId],
+        runtime: ToolRuntime,
     ) -> Command:
         tool_message = ToolMessage(
             content=f"Successfully transferred to {agent_name}",
             name=name,
-            tool_call_id=tool_call_id,
+            tool_call_id=runtime.tool_call_id,
         )
         return Command(
-            goto=agent_name,  
-            update={**state, "messages": state["messages"] + [tool_message]},  
-            graph=Command.PARENT,  
+            goto=agent_name,
+            update={**runtime.state, "messages": runtime.state["messages"] + [tool_message]},
+            graph=Command.PARENT,
         )
 
     return handoff_tool

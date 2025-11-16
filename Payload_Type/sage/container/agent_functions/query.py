@@ -1,5 +1,5 @@
 from mythic_container.MythicCommandBase import TaskArguments, CommandBase, CommandParameter, ParameterType, ParameterGroupInfo, PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse
-from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate 
+from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
 from mythic_container.logging import logger
 from .utils import get_secret
 from ai.langgraph.model import Model
@@ -197,7 +197,8 @@ class QueryCommand(CommandBase):
         await llm.initialize()
         if verbose:
             llm.set_verbose(True)
-        
+
+        await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
         llm_resp = await llm.invoke(prompt)
         
         resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(taskData.Task.ID, llm_resp.encode()))
@@ -214,5 +215,5 @@ class QueryCommand(CommandBase):
         )
         if not resp.Success:
             logger.error(f"Failed to update callback for task {taskData.Task.ID}: {resp.Error}")
-
+        response.Completed = True
         return response

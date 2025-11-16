@@ -3,6 +3,7 @@ import pathlib
 from mythic_container.PayloadBuilder import *
 from mythic_container.MythicCommandBase import *
 from mythic_container.MythicRPC import *
+from mythic_container.logging import logger
 
 class Sage(PayloadType):
     name = "Sage"
@@ -102,6 +103,7 @@ class Sage(PayloadType):
     build_parameters = [provider, model, system_prompt, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region]
 
     async def build(self) -> BuildResponse:
+        logger.debug("Starting Sage build process")
         create_resp = await SendMythicRPCCallbackCreate(MythicRPCCallbackCreateMessage(
             PayloadUUID=self.uuid,
             CallbackType="Sage",

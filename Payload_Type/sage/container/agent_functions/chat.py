@@ -1,5 +1,5 @@
 from mythic_container.MythicCommandBase import TaskArguments, CommandBase, CommandParameter, ParameterType, ParameterGroupInfo, SupportedUIFeature, PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse
-from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
+from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
 from mythic_container.logging import logger
 from .utils import get_secret
 from ai.langgraph.model import Model, add_session, get_session, remove_session
@@ -249,6 +249,10 @@ class ChatCommand(CommandBase):
             #    await llm.with_tools(str(taskData.Task.AgentTaskID))
             await add_session(str(taskData.Task.ID), llm)
 
+        if taskData.Task.IsInteractiveTask:
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ParentTaskID, UpdateStatus="LLM Processing..."))
+        else:
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
         llm_resp = await llm.invoke(prompt)
         llm_resp += "\n👤> "  # Add the user prompt to the response for context
 
@@ -272,5 +276,5 @@ class ChatCommand(CommandBase):
 
         if taskData.Task.IsInteractiveTask:
             response.Completed = True
-
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ParentTaskID, UpdateStatus="success"))
         return response

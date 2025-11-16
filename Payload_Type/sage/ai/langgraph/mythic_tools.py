@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import base64
 from typing import Annotated, List, Dict, TypedDict
 from mythic import mythic, mythic_classes
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
@@ -98,6 +99,7 @@ class MythicTools:
         """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug("🛠️ Calling get_all_active_callbacks tool")
         resp = await mythic.get_all_active_callbacks(self.client)
         return json.dumps(resp)
 
@@ -123,6 +125,7 @@ class MythicTools:
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug("🛠️ Calling get_all_payload_info tool")
             results = await mythic.execute_custom_query(self.client, query,)
             return json.dumps(results)
         except Exception as e:
@@ -139,9 +142,28 @@ class MythicTools:
             """
         if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+        logger.debug("🛠️ Calling get_payload_names tool")
         resp = await mythic.execute_custom_query(self.client, query)
-        return [p['name'] for p in resp]
+        # Payload names response: {'payloadtype': [{'name': 'sage'}, {'name': 'merlin'}]}, type: <class 'dict'>
+        return [p['name'] for p in resp['payloadtype']]
 
+    async def get_c2_profile_names(self) -> List[dict[str, str]]:
+        """Get a list of all C2 profile names."""
+        query = """
+            query C2ProfileNames {
+                c2profile {
+                    name
+                    description
+                }
+            }
+            """
+        if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+        logger.debug("🛠️ Calling get_c2_profile_names tool")
+        resp = await mythic.execute_custom_query(self.client, query)
+        # C2 profile names response: {'c2profile': [{'name': 'http', 'description': 'HTTP/S C2 Profile'}, {'name': 'websocket', 'description': 'WebSocket C2 Profile'}, {'name': 'dns', 'description': 'DNS C2 Profile'}]}, type: <class 'dict'>
+        return [{'name': c['name'], 'description': c['description']} for c in resp['c2profile']] if resp.get('c2profile') else []
+    
     async def get_c2_profiles_for_payload(self, payload: Annotated[str, "The name of the payload type to retrieve C2 profiles for such as 'merlin', 'apollo', etc."]):
         """Get C2 profiles for a specific payload type.
         Args:
@@ -175,6 +197,7 @@ class MythicTools:
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_c2_profiles_for_payload tool for: {payload}")
             results = await mythic.execute_custom_query(self.client, query,)
             return json.dumps(results)
         except Exception as e:
@@ -209,6 +232,7 @@ class MythicTools:
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_all_commands_for_payloadtype tool for: {payload}")
             results =  await mythic.get_all_commands_for_payloadtype(self.client, payload, attr)
             return json.dumps(results)
         except Exception as e:
@@ -248,6 +272,7 @@ class MythicTools:
         """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call create() first.")
+        logger.debug(f"🛠️ Calling create_payload tool for: {payload_type_name}, filename: {filename}")
         resp = await mythic.create_payload(
             self.client,
             payload_type_name=payload_type_name,
@@ -277,6 +302,7 @@ class MythicTools:
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling issue_task_and_waitfor_task_output tool for command: {command} on callback_display_id: {callback_display_id}")
             results = await mythic.issue_task_and_waitfor_task_output(mythic=self.client, command_name=command, parameters=parameters, callback_display_id=callback_display_id, timeout=timeout) #token_id=token_id
             if results is None:
                 return "No results returned from task."
@@ -305,6 +331,7 @@ class MythicTools:
         """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
         return json.dumps(resp)
     
@@ -313,19 +340,65 @@ class MythicTools:
 
         This tool retrieves all output generated by a specific Mythic task, including standard output, error messages, and any other relevant information produced during the execution of the task.
 
+        The response_text field will be automatically decoded from base64 if possible, making it easier for the LLM to process.
+
         Args:
             task_id: The Mythic task ID to retrieve output for.
         Returns:
-            str: JSON string containing all output for the specified task ID.
+            str: JSON string containing all output for the specified task ID, with response_text decoded from base64.
         """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {task_id}")
         resp = await mythic.get_all_task_output_by_id(mythic=self.client, task_display_id=task_id)
+
+        # Decode base64 response_text fields for easier LLM processing
+        if isinstance(resp, list):
+            for item in resp:
+                if isinstance(item, dict) and "response_text" in item:
+                    try:
+                        # Try to decode base64
+                        decoded_bytes = base64.b64decode(item["response_text"])
+                        # Try to decode as UTF-8 text
+                        decoded_text = decoded_bytes.decode('utf-8')
+                        item["response_text"] = decoded_text
+                        logger.debug(f"Successfully decoded base64 response_text for task output {item.get('id', 'unknown')}")
+                    except (Exception, UnicodeDecodeError) as e:
+                        # If decode fails, keep the original base64 string
+                        logger.debug(f"Failed to decode base64 response_text for task output {item.get('id', 'unknown')}: {e}")
+                        pass
+
         return json.dumps(resp)
     
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug("🛠️ Calling get_operations tool")
         resp = await mythic.get_operations(mythic=self.client)
         return json.dumps(resp)
+    
+# Create a main function with arguments so that I can test the methods in this class manually
+if __name__ == "__main__":
+    import argparse
+    import asyncio
+
+    parser = argparse.ArgumentParser(description="Test MythicTools class methods.")
+    parser.add_argument("agent_task_id", type=str, help="The Mythic agent task ID to initialize the client.")
+    parser.add_argument("method", type=str, help="The method to test (e.g., get_payload_names, get_all_active_callbacks).")
+    args = parser.parse_args()
+
+    async def main():
+        if "RABBITMQ_PASSWORD" not in os.environ or "RABBITMQ_HOST" not in os.environ:
+            print("Error: RABBITMQ_PASSWORD and RABBITMQ_HOST environment variables must be set.")
+            return
+        mythic_tools = MythicTools(agent_task_id=args.agent_task_id)
+        await mythic_tools.login()
+        method = getattr(mythic_tools, args.method, None)
+        if method and asyncio.iscoroutinefunction(method):
+            result = await method()
+            print(f"Result from {args.method}:\n{result}")
+        else:
+            print(f"Method {args.method} not found or is not asynchronous.")
+
+    asyncio.run(main())
