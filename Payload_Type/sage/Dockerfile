@@ -6,8 +6,9 @@ COPY [".", "."]
 
 ## Install dependencies
 RUN apt update
-RUN apt install -y python3 python3-pip git
-RUN pip3 install uv
+#RUN apt install -y python3 python3-pip git
+RUN apt install -y python3 pipx git
+RUN pipx install uv
 
 ## Mythic MCP
 RUN git clone https://github.com/xpn/mythic_mcp /opt/mythic_mcp
