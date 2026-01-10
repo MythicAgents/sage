@@ -11,8 +11,11 @@ from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage, BaseMessage, AnyMessage
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.outputs import ChatGeneration, LLMResult
 from mythic_container.logging import logger
 from typing import Any
+from uuid import UUID
 from .mythic_tools import MythicTools
 from .tool_cache import ToolCache
 
@@ -27,6 +30,11 @@ from langchain.tools import ToolRuntime
 from langgraph.errors import GraphRecursionError
 import operator
 
+def _max_seq_reducer(a: int, b: int) -> int:
+    """Reducer that always takes the maximum sequence value to prevent collisions."""
+    return max(a or 0, b or 0)
+
+
 class SageState(MessagesState):
     count: int
     remaining_steps: RemainingSteps
@@ -36,6 +44,124 @@ class SageState(MessagesState):
     generalist_messages: Annotated[list[AnyMessage], operator.add]
     mythic_operator_messages: Annotated[list[AnyMessage], operator.add]
     mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
+    _message_seq: Annotated[int, _max_seq_reducer]  # Global sequence counter with max reducer
+
+
+def _get_seq(msg: AnyMessage) -> int:
+    """Get sequence number from message, defaulting to 0 for untagged messages."""
+    return msg.additional_kwargs.get("_seq", 0)
+
+
+def _tag_msg(msg: AnyMessage, seq: int) -> AnyMessage:
+    """Tag a message with a sequence number for ordering."""
+    if "_seq" not in msg.additional_kwargs:
+        msg.additional_kwargs["_seq"] = seq
+    return msg
+
+
+def _msg_id(msg: AnyMessage) -> str:
+    """Generate unique ID for deduplication based on sequence + type + key content."""
+    seq = _get_seq(msg)
+    msg_type = type(msg).__name__
+    # For ToolMessages, include tool_call_id to distinguish different tool results
+    if isinstance(msg, ToolMessage):
+        return f"{msg_type}:{seq}:{getattr(msg, 'tool_call_id', '')}"
+    # For AIMessages, include tool_call IDs (if any) to distinguish tool-calling messages
+    if isinstance(msg, AIMessage):
+        tool_calls = getattr(msg, 'tool_calls', None) or []
+        if tool_calls:
+            # Use tool call IDs for uniqueness - critical for messages with no text content
+            tool_ids = ",".join(tc.get('id', '') for tc in tool_calls)
+            return f"{msg_type}:{seq}:tools:{tool_ids}"
+        content_preview = str(msg.content)[:50] if msg.content else ""
+        return f"{msg_type}:{seq}:{hash(content_preview)}"
+    # For HumanMessages, distinguish delegated tasks from real user input
+    # This ensures we don't deduplicate away the delegated version (which has _delegated_to)
+    if isinstance(msg, HumanMessage):
+        delegated_to = msg.additional_kwargs.get("_delegated_to", "")
+        if delegated_to:
+            return f"{msg_type}:{seq}:delegated:{delegated_to}"
+    return f"{msg_type}:{seq}"
+
+
+class MessageCaptureCallback(AsyncCallbackHandler):
+    """Callback handler that captures all messages during agent execution.
+
+    This captures AIMessages from LLM calls and ToolMessages from tool executions,
+    ensuring we see ALL messages including the first tool-calling AIMessage that
+    LangChain's react agent "consumes" during its internal loop.
+    """
+
+    def __init__(self, agent_name: str):
+        self.agent_name = agent_name
+        self.captured_messages: list[AnyMessage] = []
+        self._tool_call_to_name: dict[str, str] = {}  # Map tool_call_id to tool name
+
+    def clear(self):
+        """Clear captured messages for reuse."""
+        self.captured_messages = []
+        self._tool_call_to_name = {}
+
+    async def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Capture AIMessage after each LLM call."""
+        try:
+            logger.debug(f"📨 [Callback:{self.agent_name}] on_llm_end called with {len(response.generations)} generation(s)")
+            # LLMResult contains generations which are lists of ChatGeneration
+            for generation_list in response.generations:
+                for generation in generation_list:
+                    # Check if it's a ChatGeneration with a message
+                    if isinstance(generation, ChatGeneration) and hasattr(generation, 'message') and generation.message:
+                        msg = generation.message
+                        if isinstance(msg, AIMessage):
+                            # Tag with agent name for display
+                            msg.name = self.agent_name
+                            self.captured_messages.append(msg)
+
+                            # Track tool calls for later matching with ToolMessages
+                            for tc in getattr(msg, 'tool_calls', []) or []:
+                                tc_id = tc.get('id')
+                                tc_name = tc.get('name')
+                                if tc_id and tc_name:
+                                    self._tool_call_to_name[tc_id] = tc_name
+
+                            logger.debug(f"📨 [Callback:{self.agent_name}] Captured AIMessage: "
+                                       f"content={str(msg.content)[:50]!r}, "
+                                       f"tool_calls={len(getattr(msg, 'tool_calls', []) or [])}")
+                    else:
+                        # Log what we got if it's not a ChatGeneration
+                        logger.debug(f"📨 [Callback:{self.agent_name}] Got generation type: {type(generation).__name__}")
+        except Exception as e:
+            logger.warning(f"⚠️  [Callback:{self.agent_name}] Error in on_llm_end: {e}", exc_info=True)
+
+    async def on_tool_end(
+        self,
+        output: Any,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Capture ToolMessage after each tool execution."""
+        try:
+            # The output might be a ToolMessage or raw output
+            if isinstance(output, ToolMessage):
+                output.name = output.name or self._tool_call_to_name.get(output.tool_call_id, "unknown_tool")
+                self.captured_messages.append(output)
+                logger.debug(f"📨 [Callback:{self.agent_name}] Captured ToolMessage: "
+                           f"tool={output.name}, tool_call_id={output.tool_call_id}")
+            # If it's a string or other output, we'll get it via the agent's return value
+        except Exception as e:
+            logger.warning(f"⚠️  [Callback:{self.agent_name}] Error in on_tool_end: {e}")
+
 
 class Model:
     """A class to represent an LLM model with its configuration for use with Mythic commands.
@@ -77,7 +203,11 @@ class Model:
         self.verbose = False
         self.mythic_client = None
         self.tool_manager = None
-        self.counter = 0
+        self._shown_messages = set()  # Track shown message IDs for deduplication
+        self._message_seq = 1  # Sequence counter for message ordering (starts at 1, 0 reserved for system)
+        self._current_turn_prompt_seq = -1  # Track current turn's user prompt (skip in output, Mythic echoes it)
+        self._is_first_turn = True  # Track if this is the first turn (show user prompt only on Turn 1)
+        logger.debug(f"🆕 Model.__init__: _is_first_turn initialized to {self._is_first_turn}")
         self.messages = []
         self.agent_task_id = agent_task_id
         self.task_id = task_id
@@ -91,11 +221,11 @@ class Model:
         conn = aiosqlite.connect(db_path, check_same_thread=False)
         self.memory = AsyncSqliteSaver(conn)
         self.system_message = SystemMessage(content=system_prompt)
-        #if system_prompt:
-        #    self.messages.insert(0, SystemMessage(content=system_prompt))
+        _tag_msg(self.system_message, 0)  # System message gets sequence 0
         self.state = {
             "messages": self.messages,          # legacy combined channel
-            "count": self.counter,
+            "count": 0,  # Legacy field, not used for output tracking
+            "_message_seq": self._message_seq,  # Shared sequence counter
             "supervisor_messages": [self.system_message],
             "generalist_messages": [],
             "mythic_operator_messages": [],
@@ -116,6 +246,14 @@ class Model:
         self.llm = self._get_base_chat_model()
         if not self.llm:
             raise ValueError("Failed to initialize the BaseChatModel with the provided configuration.")
+
+    def _next_seq(self) -> int:
+        """Get next sequence number and increment counter. Also syncs to state."""
+        seq = self._message_seq
+        self._message_seq += 1
+        self.state["_message_seq"] = self._message_seq
+        logger.debug(f"🔢 Model._next_seq: returned seq={seq}, state now has _message_seq={self._message_seq}")
+        return seq
 
     def _get_base_chat_model(self) -> BaseChatModel | None:
         """Initialize and return the BaseChatModel based on provider and model."""
@@ -421,11 +559,106 @@ class Model:
                     cleaned_channel.append(msg)
             channel = cleaned_channel
 
-            result = await agent_runnable.ainvoke({"messages": channel}, config)
+            # Create callback handler to capture ALL messages during agent execution
+            # This captures the first AIMessage (with tool_calls) that LangChain's react agent
+            # would otherwise "consume" during its internal tool execution loop
+            callback_handler = MessageCaptureCallback(agent_name=node_name)
+
+            # Merge callback into config - handle both list and CallbackManager types
+            invoke_config = dict(config) if config else {}
+            existing_callbacks = invoke_config.get("callbacks")
+            if existing_callbacks is None:
+                invoke_config["callbacks"] = [callback_handler]
+            elif isinstance(existing_callbacks, list):
+                invoke_config["callbacks"] = existing_callbacks + [callback_handler]
+            else:
+                # existing_callbacks is a CallbackManager - just use our callback
+                # The outer config callbacks will still be called at the graph level
+                invoke_config["callbacks"] = [callback_handler]
+
+            result = await agent_runnable.ainvoke({"messages": channel}, invoke_config)
             updated_channel = result.get("messages", channel)
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
-            new_messages_from_agent = updated_channel[original_channel_length:]
+            returned_messages = updated_channel[original_channel_length:]
+
+            # Merge captured messages (from callback) with returned messages
+            # The callback captures ALL messages including the first tool-calling AIMessage
+            # that LangChain's react agent doesn't return
+            captured = callback_handler.captured_messages
+            logger.info(f"🎯 [{node_name}] Callback captured {len(captured)} messages, agent returned {len(returned_messages)}")
+
+            # Build a unified message list:
+            # - Use captured messages as the primary source (they're in chronological order)
+            # - Add any returned messages that weren't captured (rare, but possible)
+            #
+            # Deduplication: For AIMessages, match by tool_call IDs if present; for ToolMessages, match by tool_call_id
+            seen_tool_call_ids: set[str] = set()  # AIMessage tool_call IDs
+            seen_tool_result_ids: set[str] = set()  # ToolMessage tool_call_ids
+
+            # First pass: collect IDs from captured messages
+            for msg in captured:
+                if isinstance(msg, AIMessage):
+                    for tc in getattr(msg, 'tool_calls', []) or []:
+                        tc_id = tc.get('id')
+                        if tc_id:
+                            seen_tool_call_ids.add(tc_id)
+                elif isinstance(msg, ToolMessage):
+                    tc_id = getattr(msg, 'tool_call_id', None)
+                    if tc_id:
+                        seen_tool_result_ids.add(tc_id)
+
+            # Add any returned messages that weren't captured (shouldn't happen often)
+            new_messages_from_agent = list(captured)
+            for msg in returned_messages:
+                is_duplicate = False
+                if isinstance(msg, AIMessage):
+                    tool_calls = getattr(msg, 'tool_calls', []) or []
+                    if tool_calls:
+                        # Check if all tool_call IDs are already seen
+                        msg_tc_ids = {tc.get('id') for tc in tool_calls if tc.get('id')}
+                        if msg_tc_ids and msg_tc_ids.issubset(seen_tool_call_ids):
+                            is_duplicate = True
+                elif isinstance(msg, ToolMessage):
+                    tc_id = getattr(msg, 'tool_call_id', None)
+                    if tc_id and tc_id in seen_tool_result_ids:
+                        is_duplicate = True
+
+                if not is_duplicate:
+                    new_messages_from_agent.append(msg)
+                    logger.debug(f"➕ [{node_name}] Added non-captured message: {type(msg).__name__}")
+
+            # Tag new messages with sequence numbers for chronological ordering
+            # Compute from max of existing messages to avoid collisions with handoff-created messages
+            max_seq = 0
+            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages"]:
+                for existing_msg in state.get(ch_key, []):
+                    seq = _get_seq(existing_msg)
+                    if seq > max_seq:
+                        max_seq = seq
+            # Also check the new messages we're about to tag (some may already have seq from elsewhere)
+            for msg in new_messages_from_agent:
+                seq = _get_seq(msg)
+                if seq > max_seq:
+                    max_seq = seq
+            next_seq = max_seq + 1
+            logger.debug(f"🔢 [{node_name}] Computed next_seq={next_seq} from max_seq={max_seq}")
+            for msg in new_messages_from_agent:
+                if "_seq" not in msg.additional_kwargs:
+                    _tag_msg(msg, next_seq)
+                    next_seq += 1
+            # Update Model's counter to stay in sync
+            self._message_seq = next_seq
+            self.state["_message_seq"] = next_seq
+
+            # Debug: log what messages we got from the agent
+            logger.info(f"📦 [{node_name}] returned {len(new_messages_from_agent)} new messages:")
+            for idx, msg in enumerate(new_messages_from_agent):
+                msg_type = type(msg).__name__
+                tool_calls = getattr(msg, 'tool_calls', None) or []
+                content_preview = str(msg.content)[:50] if msg.content else "(empty)"
+                logger.info(f"  [{idx}] {msg_type}: content='{content_preview}', tool_calls={len(tool_calls)}")
+            force_flush_all_handlers()
 
             update: dict[str, Any] = {
                 state_key: new_messages_from_agent,  # Only new messages for operator.add
@@ -436,22 +669,24 @@ class Model:
             # back to the Supervisor's channel AND to the calling agent's channel (if worker-to-worker handoff)
             if node_name != "Supervisor" and state_key != "supervisor_messages":
                 if new_messages_from_agent:
-                    # Filter to only include substantive responses (AIMessages with actual content)
-                    # Skip empty messages, tool calls without results, etc.
+                    # Filter to only include substantive responses
+                    # Include AIMessages with text content OR tool_calls (for visibility)
+                    # Include ToolMessages except handoff confirmations
                     substantive_messages = []
                     for msg in new_messages_from_agent:
                         if isinstance(msg, AIMessage):
-                            # Include if it has text content or is the final response
+                            has_tool_calls = bool(getattr(msg, 'tool_calls', None))
+                            has_text_content = False
                             if isinstance(msg.content, str) and msg.content.strip():
-                                substantive_messages.append(msg)
+                                has_text_content = True
                             elif isinstance(msg.content, list):
-                                # Check if list has text content
-                                has_text = any(
+                                has_text_content = any(
                                     item.get("type") == "text" and item.get("text", "").strip()
                                     for item in msg.content if isinstance(item, dict)
                                 )
-                                if has_text:
-                                    substantive_messages.append(msg)
+                            # Include if has text OR has tool_calls (so tool requests are visible)
+                            if has_text_content or has_tool_calls:
+                                substantive_messages.append(msg)
                         elif isinstance(msg, ToolMessage):
                             # Include tool results that aren't just handoff confirmations
                             if not msg.name or not msg.name.startswith("transfer_to_"):
@@ -459,10 +694,13 @@ class Model:
 
                     if substantive_messages:
                         # Create a header message to show which agent responded
+                        # Mark with _is_completion_header for semantic filtering (vs string matching)
                         response_header = AIMessage(
                             content=f"[{node_name} completed task]",
-                            name=node_name
+                            name=node_name,
+                            additional_kwargs={"_is_completion_header": True}
                         )
+                        _tag_msg(response_header, self._next_seq())
 
                         # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
                         update["supervisor_messages"] = [response_header] + substantive_messages
@@ -902,7 +1140,7 @@ class Model:
             elif m.get("type") == "tool_use":
                 tool_name = m.get('name', '')
                 logger.info(f"  ✅ Processing tool_use: name={tool_name}, id={m.get('id', '')}")
-                result += f"🛠️[{m.get('id', '')}> Name: '{tool_name}', Arguments: '{m.get('input', '')}'\n"
+                result += f"🛠️[{m.get('id', '')}> Tool Request: '{tool_name}', Args: '{m.get('input', '')}'\n"
             else:
                 logger.warning(f"  ❓ Unknown message type: {m.get('type', 'unknown')}")
                 result += f"❓> Unknown message type: {m.get('type', 'unknown')} with content: {m}\n"
@@ -914,72 +1152,103 @@ class Model:
         """
         Generate a string representation of the model's messages for Mythic output.
         :param resp: The response containing messages
-        :param skip_counter: If True, show all messages regardless of counter (used for recursion recovery)
+        :param skip_counter: If True, show all messages regardless of shown tracking (used for recursion recovery)
         :return: A string containing the messages formatted for Mythic.
         """
 
         return_message = ""
+        logger.debug(f"🎯 _generate_mythic_output: _is_first_turn={self._is_first_turn}, _current_turn_prompt_seq={self._current_turn_prompt_seq}")
+
         # check that the messages key is in the resp or throw an error
         if "messages" not in resp:
             raise ValueError("No messages found in the response from the graph invocation.")
 
+        # Sort by sequence number for chronological order
+        messages = sorted(resp["messages"], key=lambda m: _get_seq(m))
+
         # Track the current active agent by looking at handoff tool messages
         current_agent = "Supervisor"  # Start with supervisor
 
-        # When skip_counter is True, we want to show all messages from the beginning
-        # This is used when recovering from recursion errors to show full context
-        start_index = 0 if skip_counter else self.counter
+        logger.info(f"_generate_mythic_output: Processing {len(messages)} total messages, skip_counter={skip_counter}, already_shown={len(self._shown_messages)}")
 
-        logger.info(f"_generate_mythic_output: Processing {len(resp['messages'])} total messages, starting from index {start_index}, skip_counter={skip_counter}")
-
-        for i, message in enumerate(resp["messages"]):
-            # print(f"Processing message {i}: {message}")
-            if i < start_index:
+        for i, message in enumerate(messages):
+            # Use message ID for deduplication - skip messages already shown
+            mid = _msg_id(message)
+            if not skip_counter and mid in self._shown_messages:
                 continue
+            self._shown_messages.add(mid)
+
             if isinstance(message, HumanMessage):
-                return_message += f"👤> {message.content}\n"
+                # Skip empty HumanMessages (can happen from framework artifacts)
+                content = str(message.content).strip() if message.content else ""
+                if not content:
+                    continue
+
+                # Check if this is a delegated task (not real user input)
+                delegated_to = message.additional_kwargs.get("_delegated_to")
+                msg_seq = _get_seq(message)
+
+                if delegated_to:
+                    # Delegated tasks always shown with special icon
+                    return_message += f"📋[Task → {delegated_to}]> {content}\n"
+                elif not self._is_first_turn and msg_seq == self._current_turn_prompt_seq:
+                    # Skip current turn's user prompt on Turn 2+ (Mythic UI already echoes it)
+                    logger.debug(f"Skipping current turn's user prompt (seq={msg_seq}, _is_first_turn={self._is_first_turn}): {content[:50]}...")
+                    continue
+                else:
+                    # Regular user prompt (show on Turn 1, or for historical context)
+                    logger.debug(f"Showing user prompt (seq={msg_seq}, _is_first_turn={self._is_first_turn}): {content[:50]}...")
+                    return_message += f"👤> {content}\n"
             elif isinstance(message, AIMessage):
-                is_last_message = i == len(resp["messages"]) - 1
+                is_last_message = i == len(messages) - 1
 
                 # Debug: log message attributes to see what's available
                 agent_name = getattr(message, 'name', None) or current_agent
                 tool_calls = getattr(message, 'tool_calls', None) or []
                 has_tool_calls = len(tool_calls) > 0
 
-                # Separate logic for text vs tool calls:
-                # - Text content: ALWAYS show (all AI responses throughout conversation)
-                # - Tool calls: Only show when verbose is ON
+                # Extract text content for analysis
+                text_content = ""
+                if isinstance(message.content, str):
+                    text_content = message.content.strip()
+                elif isinstance(message.content, list):
+                    for item in message.content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_content += item.get("text", "").strip() + " "
+                    text_content = text_content.strip()
+
+                # Determine what to show based on verbose mode
                 show_tool_calls = self.verbose
 
+                # Non-verbose filtering for AI messages:
+                # 1. Skip "[Agent completed task]" type messages (framework artifacts)
+                # 2. Skip intermediate "thinking" messages (messages that only precede tool calls)
+                # 3. Only show substantive final responses
+                # Use semantic flag (_is_completion_header) instead of string matching for robustness
+                is_completion_header = message.additional_kwargs.get("_is_completion_header", False)
+                is_thinking_before_tool = has_tool_calls and text_content  # Has both text and tools (intermediate)
+
+                # In non-verbose mode, skip:
+                # - Completion header messages (framework artifacts)
+                # - Messages that are just tool call invocations with narration
+                skip_in_non_verbose = not self.verbose and (is_completion_header or is_thinking_before_tool)
+
                 logger.info(f"📝 AIMessage #{i}: is_last={is_last_message}, verbose={self.verbose}, "
-                           f"show_tools={show_tool_calls}, "
-                           f"agent={agent_name}, content_type={type(message.content).__name__}, "
-                           f"content_is_list={isinstance(message.content, list)}, "
-                           f"content_len={len(message.content) if isinstance(message.content, list) else 'N/A'}, "
-                           f"has_tool_calls={has_tool_calls}, tool_calls_count={len(tool_calls)}")
+                           f"agent={agent_name}, has_text={bool(text_content)}, "
+                           f"has_tool_calls={has_tool_calls}, is_completion_header={is_completion_header}, "
+                           f"skip_in_non_verbose={skip_in_non_verbose}")
                 force_flush_all_handlers()
 
-                # ALWAYS display text content from AI messages (responses, thinking, etc.)
-                # regardless of verbose mode - users want to see AI reasoning
-                if isinstance(message.content, str):
-                    if message.content:
-                        return_message += f"🤖[{agent_name}]> {message.content}\n"
-                    else:
-                        # Skip empty messages that have no tool_calls (they're usually framework artifacts)
-                        # Only log a warning if this is the last message and it's truly empty
-                        if not has_tool_calls and is_last_message:
-                            logger.warning(f"Last message #{i} has no content and no tool_calls - skipping display")
-                elif isinstance(message.content, list):
-                    if len(message.content) > 0:
-                        # Process list content - extract only TEXT blocks, skip tool_use
-                        # (tool_use in content is the Anthropic format, we handle tool_calls separately below)
-                        logger.info(f"  ➡️  Processing content list for message #{i} (extracting text only)")
-                        force_flush_all_handlers()
-                        for item in message.content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text = item.get("text", "")
-                                if text:
-                                    return_message += f"🤖[{agent_name}]> {text}\n"
+                if skip_in_non_verbose:
+                    logger.debug(f"  ⏭️  Skipping AI message in non-verbose mode: completion_header={is_completion_header}, thinking_before_tool={is_thinking_before_tool}")
+                    # Still process tool calls if verbose
+                    pass
+                else:
+                    # Show text content
+                    if text_content:
+                        return_message += f"🤖[{agent_name}]> {text_content}\n"
+                    elif not has_tool_calls and is_last_message:
+                        logger.warning(f"Last message #{i} has no content and no tool_calls - skipping display")
 
                 # Display tool_calls ONLY when verbose mode is ON
                 if show_tool_calls and has_tool_calls:
@@ -989,26 +1258,26 @@ class Model:
                         tool_id = tool_call.get('id', 'unknown')
                         tool_args = tool_call.get('args', {})
                         logger.info(f"    ✅ Tool call: name={tool_name}, id={tool_id}")
-                        return_message += f"🛠️[{tool_id}]> Name: '{tool_name}', Arguments: '{tool_args}'\n"
+                        return_message += f"🛠️[{agent_name}:{tool_id}]> Tool Request: '{tool_name}', Args: '{tool_args}'\n"
                     force_flush_all_handlers()
                 elif not show_tool_calls and has_tool_calls:
-                    logger.info(f"  ⏭️  Skipping {len(tool_calls)} tool_calls (verbose=False)")
-                    force_flush_all_handlers()
+                    logger.debug(f"  ⏭️  Skipping {len(tool_calls)} tool_calls (verbose=False)")
             elif isinstance(message, SystemMessage):
                 pass
             elif isinstance(message, ToolMessage):
-                # Check if this is a handoff tool message to track which agent is active
-                if message.name and message.name.startswith("transfer_to_"):
-                    agent_name = message.name.replace("transfer_to_", "")
-                    current_agent = agent_name
-                    logger.debug(f"Agent handoff detected: now using {current_agent}")
-
+                # Display tool response BEFORE updating current_agent for handoffs
+                # This ensures the calling agent (e.g., Supervisor) is shown, not the target
                 if self.verbose:
-                    return_message += f"🛠️[{message.tool_call_id}]> {message.content}\n"
+                    return_message += f"🔧[{current_agent}:{message.tool_call_id}]> Tool Response: {message.content}\n"
+
+                # Check if this is a handoff tool message to track which agent is active
+                # Update AFTER display so the next messages use the new agent
+                if message.name and message.name.startswith("transfer_to_"):
+                    target_agent = message.name.replace("transfer_to_", "")
+                    current_agent = target_agent
+                    logger.debug(f"Agent handoff detected: now using {current_agent}")
             else:
                 return_message += f"❓> Unknown message type: {type(message)} with content: {message}\n"
-            
-            self.counter += 1
 
         return return_message
 
@@ -1148,11 +1417,20 @@ class Model:
         # the full conversation history from the graph's checkpointing mechanism
         #self._cleanup_dangling_tool_calls()
 
-        self.state["supervisor_messages"].append(HumanMessage(content=prompt))
+        user_msg = HumanMessage(content=prompt)
+        user_msg_seq = self._next_seq()
+        _tag_msg(user_msg, user_msg_seq)
+        self.state["supervisor_messages"].append(user_msg)
+
+        # Track the current turn's user prompt sequence so we can skip showing it
+        # in output (Mythic UI already echoes the user's input for interactive tasks)
+        self._current_turn_prompt_seq = user_msg_seq
 
         try:
             # Use default recursion limit - RemainingSteps will handle graceful termination
+            logger.debug(f"🚀 Before ainvoke: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
             resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25})
+            logger.debug(f"📥 After ainvoke: resp._message_seq={resp.get('_message_seq')}")
 
             # Merge updated channel values back into self.state
             for ch in [
@@ -1164,15 +1442,51 @@ class Model:
                 if ch in resp:
                     self.state[ch] = resp[ch]
 
-            # Build synthetic unified messages list for legacy formatting logic
+            # CRITICAL: Sync sequence counter back from graph state
+            # Without this, the Model's counter gets out of sync with messages created
+            # during graph execution (e.g., in handoff tools), causing sequence collisions
+            if "_message_seq" in resp:
+                self._message_seq = resp["_message_seq"]
+                self.state["_message_seq"] = resp["_message_seq"]
+                logger.debug(f"📊 Synced _message_seq from graph: {self._message_seq}")
+
+            # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
-            for ch in [
-                "supervisor_messages",
-                "generalist_messages",
-                "mythic_operator_messages",
-                "mythic_payload_messages",
-            ]:
-                all_messages.extend(self.state.get(ch, []))
+            seen_ids = set()
+            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages"]:
+                ch_msgs = self.state.get(ch, [])
+                logger.info(f"📊 Channel {ch}: {len(ch_msgs)} messages")
+                for idx, msg in enumerate(ch_msgs):
+                    mid = _msg_id(msg)
+                    msg_type = type(msg).__name__
+                    seq = _get_seq(msg)
+                    tool_calls = len(getattr(msg, 'tool_calls', None) or [])
+                    if mid not in seen_ids:
+                        all_messages.append(msg)
+                        seen_ids.add(mid)
+                        logger.debug(f"  [{idx}] ADDED {msg_type} seq={seq} tools={tool_calls} id={mid[:50]}")
+                    else:
+                        logger.debug(f"  [{idx}] SKIP (dup) {msg_type} seq={seq} tools={tool_calls} id={mid[:50]}")
+            force_flush_all_handlers()
+
+            # Sort by sequence number for chronological order
+            # Secondary sort: when sequences are equal, HumanMessages before AIMessages
+            # This ensures delegated tasks appear before the agent's response
+            def _sort_key(m):
+                seq = _get_seq(m)
+                # Priority: HumanMessage=0, ToolMessage=1, AIMessage=2, other=3
+                if isinstance(m, HumanMessage):
+                    type_priority = 0
+                elif isinstance(m, ToolMessage):
+                    type_priority = 1
+                elif isinstance(m, AIMessage):
+                    type_priority = 2
+                else:
+                    type_priority = 3
+                return (seq, type_priority)
+
+            all_messages.sort(key=_sort_key)
+            logger.info(f"📊 Merged total: {len(all_messages)} unique messages")
 
             synthetic_resp = {
                 "messages": all_messages,
@@ -1182,12 +1496,14 @@ class Model:
             # Check if we got a recursion summary request or handback from specialist
             if synthetic_resp.get("recursion_summary_requested", False):
                 logger.info("Recursion limit approached - user continuation requested")
-                # Use the counter-based approach - it tracks which messages have been shown
-                return self._generate_mythic_output(synthetic_resp, skip_counter=False)
+                result = self._generate_mythic_output(synthetic_resp, skip_counter=False)
+                self._is_first_turn = False
+                return result
             elif synthetic_resp.get("recursion_handback", False):
                 logger.info("Recursion handback received from specialist agent")
-                # Use the counter-based approach - it tracks which messages have been shown
-                return self._generate_mythic_output(synthetic_resp, skip_counter=False)
+                result = self._generate_mythic_output(synthetic_resp, skip_counter=False)
+                self._is_first_turn = False
+                return result
         except GraphRecursionError as e:
             # Catch recursion limit error and return progress made so far
             logger.warning(f"Recursion limit hit: {e}")
@@ -1195,7 +1511,7 @@ class Model:
             # First, log what's currently in self.state
             current_msg_count = len(self.state.get("messages", []))
             logger.info(f"Current state has {current_msg_count} messages before checkpoint collection")
-            logger.info(f"Current counter value: {self.counter}")
+            logger.info(f"Already shown {len(self._shown_messages)} messages")
 
             # Get the latest state from the checkpoint to show all progress
             # The graph execution stopped, but checkpointer has saved all messages
@@ -1307,12 +1623,16 @@ class Model:
             # Don't reset counter - it already tracks which messages have been shown
             resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
 
-            # Use skip_counter=False to respect the counter and show only new messages
+            # Use skip_counter=False to respect the shown tracking and show only new messages
             # This prevents showing messages that were already displayed before recursion limit
-            logger.info(f"Returning recursion summary from counter position {self.counter}")
+            logger.info(f"Returning recursion summary, {len(self._shown_messages)} messages already shown")
             return self._generate_mythic_output(resp, skip_counter=False)
 
-        return self._generate_mythic_output(synthetic_resp)
+        # Generate output FIRST, then mark turn complete
+        result = self._generate_mythic_output(synthetic_resp)
+        # Mark first turn complete - subsequent turns won't show user prompt (Mythic echoes it)
+        self._is_first_turn = False
+        return result
 
     async def handle_continuation_response(self, response: str) -> str:
         """
@@ -1393,7 +1713,7 @@ class Model:
                     resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
 
                     # Don't reset counter - show only new messages to avoid duplicates
-                    logger.info(f"Recursion limit hit again, returning from counter position {self.counter}")
+                    logger.info(f"Recursion limit hit again, {len(self._shown_messages)} messages already shown")
                     return self._generate_mythic_output(resp, skip_counter=False)
             else:
                 raise ValueError("No graph defined for the model.")
@@ -1454,7 +1774,7 @@ class Model:
                     resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
 
                     # Don't reset counter - show only new messages to avoid duplicates
-                    logger.info(f"Recursion limit hit again, returning from counter position {self.counter}")
+                    logger.info(f"Recursion limit hit again, {len(self._shown_messages)} messages already shown")
                     return self._generate_mythic_output(resp, skip_counter=False)
             else:
                 raise ValueError("No graph defined for the model.")
@@ -1617,19 +1937,37 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         runtime: ToolRuntime,
         handoff_instruction: Annotated[str, "Explicit task or question for the target agent"],
     ) -> Command:
+        # Compute sequence from max of existing messages in all channels
+        # This is more reliable than state._message_seq which may not persist across checkpoints
+        max_seq = 0
+        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "messages"]:
+            for msg in runtime.state.get(ch_key, []):
+                seq = _get_seq(msg)
+                if seq > max_seq:
+                    max_seq = seq
+        current_seq = max_seq + 1
+        logger.debug(f"🔄 Handoff to {agent_name}: computed next seq={current_seq} (max in channels was {max_seq})")
+
         # ToolMessage confirming delegation
         acknowledgment = ToolMessage(
             content=f"Delegated to {agent_name} with instruction: {handoff_instruction}",
             name=name,
             tool_call_id=runtime.tool_call_id,
         )
+        _tag_msg(acknowledgment, current_seq)
+        current_seq += 1
 
         # HumanMessage representing the actual task for the target agent
+        # Mark as delegated so it displays differently from real user input
         injected_human = HumanMessage(content=handoff_instruction)
+        injected_human.additional_kwargs["_delegated_to"] = agent_name
+        _tag_msg(injected_human, current_seq)
+        current_seq += 1
 
         # With operator.add reducer, only provide NEW messages to append
         update_state = {**runtime.state}
         update_state["messages"] = [acknowledgment, injected_human]
+        update_state["_message_seq"] = current_seq  # Update sequence in state
 
         # Inject into target channel (only new messages with operator.add)
         if target_channel_key:
