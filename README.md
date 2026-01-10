@@ -34,7 +34,7 @@ sudo cat .env | grep MYTHIC_ADMIN_PASSWORD
 
 Sage uses the following **CASE SENSITIVE** settings/keys to determine how to interact with models:
 
-- `provider` - Who is providing the model (e.g., OpenAI or Amazon Bedrock)? 
+- `provider` - Who is providing the model (e.g., Anthropic, Amazon Bedrock, LiteLLM, OpenAI, etc.)? 
 - `model` - The model string that the provider uses to determine which model to use for inference (e.g., `gpt-4o-mini` or `us.anthropic.claude-3-5-sonnet-20241022-v2:0`)
 - `API_ENDPOINT` - Where to send HTTP request for the model provider (e.g. `https://api.openai.com/v1` or `http://127.0.0.1:11434/v1`)
   - This key is not used for Amazon Bedrock calls and can be left blank
@@ -85,9 +85,7 @@ Example [model strings](https://docs.anthropic.com/en/docs/about-claude/models/a
 - `claude-3-7-sonnet-latest`
 - `claude-sonnet-4-20250514`
 
-### Bedrock
-
-> **__NOTE:__** Only Anthropic Claude is supported at this time
+### AWS Bedrock
 
 **You must have an AWS account that has Bedrock permissions AND have access to the desired model in your bedrock configuration**
 
@@ -106,9 +104,11 @@ Example model strings to us with Bedrock:
 
 ### OpenAI
 
-Sage can interact with any OpenAI API capable application (e.g., ollama, OpenWeb UI, or LiteLLM)
+Sage can interact with any OpenAI API capable application (e.g., ollama, OpenWeb UI, LM Studio, or LiteLLM)
 
-In order to interact with OpenAI's API, you must set the following:
+> Provide a fake API key for providers like LM Studio because it is required to use the OpenAI library
+
+In order to interact with OpenAI's API, you must set the following: Es
 
 - API_KEY (e.g., `sk-az1RLw7XUWGXGUBcSgsNT5BlbkFJdbGbUgbbk7BUG9y6ezzb`)
 - API_ENDPOINT (e.g. `https://api.openai.com/v1`)
@@ -125,7 +125,72 @@ Alternatively create a Docker compose file with
 
 In order to interact with an ollama, you must set the following:
 
+- Provider: `OpenAI`
+- Model: `qwen3:1.7b` (Model must support tools)
 - API_ENDPOINT (e.g., `http://127.0.0.1:11434/v1`)
+- API_KEY: `dummy-ollama-key`
+
+## Custom SSL Certificates
+
+If your LLM provider requires custom SSL/TLS certificates (e.g., corporate proxy with custom CA, self-signed certificates, or internal certificate authorities), Sage supports loading a custom certificate bundle by setting the `SSL_CERT_FILE` environment variable.
+
+### Setup
+
+1. Create your certificate bundle in PEM format containing all required CA certificates:
+   ```bash
+   cat root-ca.pem intermediate-ca.pem > bundle.pem
+   ```
+
+2. Place the certificate bundle in the Sage certs directory:
+   - **Local development**: `Payload_Type/sage/certs/bundle.pem`
+   - **Mythic deployment**: `mythic/InstalledServices/sage/Payload_Type/sage/certs/bundle.pem`
+
+3. Restart the Sage container:
+   ```bash
+   sudo ./mythic-cli start sage
+   ```
+
+### Verification
+
+When Sage starts with a custom certificate bundle, you'll see this message in the container logs:
+```
+[SAGE] Using custom SSL certificate bundle: /Mythic/certs/bundle.pem
+```
+
+If no certificate bundle is found, Sage will use system default certificates:
+```
+[SAGE] No custom SSL certificate bundle found, using system defaults
+```
+
+### Certificate Bundle Format
+
+The certificate bundle must be in PEM format with one or more certificates:
+
+```
+-----BEGIN CERTIFICATE-----
+MIIDXTCCAkWgAwIBAgIJAKJ... (Base64-encoded certificate)
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIDXTCCAkWgAwIBAgIJAKJ... (Another certificate if needed)
+-----END CERTIFICATE-----
+```
+
+### Troubleshooting
+
+**Issue**: `SSL: CERTIFICATE_VERIFY_FAILED` errors when connecting to LLM provider
+
+**Solution**:
+1. Verify your certificate bundle is in PEM format
+2. Ensure it contains all required CA certificates (root and intermediate)
+3. Check file permissions (must be readable by the Sage container)
+4. Verify the certificate path in Sage startup logs
+
+**Issue**: Certificate bundle not detected
+
+**Solution**:
+1. Verify file is named exactly `bundle.pem` (case-sensitive)
+2. Verify file is in `Payload_Type/sage/certs/` directory
+3. Restart the Sage container after adding the certificate
 
 ## Model Context Protocol (MCP)
 
@@ -149,6 +214,7 @@ For example, to connect to the built-in Mythic MCP server, you must have `uv`, `
 > **__NOTE:__** MYTHIC MCP IS ALREADY INSTALLED IN THE CONTAINER AT /Mythic/mcp/mythic
 
 ## Run Sage Locally
+
 Use the following commands to run the Sage container from the command line without using Docker (typicall for testing and troubleshooting):
 
 > **NOTE: Replace the RabbitMQ password with the one from the `.env` file in the root Mythic folder**
@@ -161,6 +227,46 @@ export RABBITMQ_HOST="127.0.0.1"
 export RABBITMQ_PASSWORD="K5SHkn1fk2pcT0YkQxTTMgO5gFwjiQ"
 python3 main.py
 ```
+
+## Phoenix Observability
+
+Sage includes integrated observability and tracing powered by [Phoenix](https://github.com/Arize-ai/phoenix) from Arize AI. Phoenix provides real-time monitoring, visualization, and debugging of LLM interactions.
+
+### What is Phoenix?
+
+Phoenix is an open-source observability platform designed specifically for LLM applications. It captures detailed traces of:
+- LLM requests and responses
+- Token usage and costs
+- Latency and performance metrics
+- Tool/function calls
+- Multi-agent workflows
+
+### Features
+
+- **Real-time Tracing**: Monitor LLM calls as they happen across all Sage sessions
+- **Performance Analytics**: Track token usage, response times, and model behavior
+- **Multi-Agent Visibility**: Visualize the Sage supervisor and specialist agent interactions
+- **No Configuration Required**: Phoenix launches automatically when Sage starts
+
+### Accessing Phoenix
+
+Phoenix automatically starts when Sage launches and is accessible at:
+- **URL**: `http://127.0.0.1:6006`
+- No authentication required for local development
+
+### Data Storage
+
+Phoenix stores trace data locally at:
+- **Location**: `Payload_Type/sage/.phoenix/`
+- **Database**: `phoenix.db` (SQLite)
+- **Note**: This directory is excluded from version control but preserved in the repository structure
+
+All LLM traces, spans, and observability data are stored in this local database and can be viewed through the Phoenix web interface.
+
+### Learn More
+
+- **GitHub**: [https://github.com/Arize-ai/phoenix](https://github.com/Arize-ai/phoenix)
+- **Documentation**: [https://docs.arize.com/phoenix](https://docs.arize.com/phoenix)
 
 ## Known Limitations
 

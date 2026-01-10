@@ -25,12 +25,17 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 from langgraph.errors import GraphRecursionError
+import operator
 
 class SageState(MessagesState):
     count: int
     remaining_steps: RemainingSteps
     recursion_summary_requested: bool
     recursion_handback: bool
+    supervisor_messages: Annotated[list[AnyMessage], operator.add]
+    generalist_messages: Annotated[list[AnyMessage], operator.add]
+    mythic_operator_messages: Annotated[list[AnyMessage], operator.add]
+    mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
 
 class Model:
     """A class to represent an LLM model with its configuration for use with Mythic commands.
@@ -86,9 +91,19 @@ class Model:
         conn = aiosqlite.connect(db_path, check_same_thread=False)
         self.memory = AsyncSqliteSaver(conn)
         self.system_message = SystemMessage(content=system_prompt)
-        if system_prompt:
-            self.messages.insert(0, SystemMessage(content=system_prompt))
-        self.state = {"messages": self.messages, "count": self.counter}
+        #if system_prompt:
+        #    self.messages.insert(0, SystemMessage(content=system_prompt))
+        self.state = {
+            "messages": self.messages,          # legacy combined channel
+            "count": self.counter,
+            "supervisor_messages": [self.system_message],
+            "generalist_messages": [],
+            "mythic_operator_messages": [],
+            "mythic_payload_messages": [],
+            "recursion_summary_requested": False,
+            "recursion_handback": False,
+        }
+        # Note: LangChain instrumentation is initialized globally in main.py
         # Note: remaining_steps and recursion_summary_requested will be managed by LangGraph
         if config:
             self.config = RunnableConfig(
@@ -98,19 +113,51 @@ class Model:
                     if k not in ["thread_id"]  # Remove thread_id if present
                 }
             )
-        logger.debug(f"Initializing Model with provider={provider}, model={model}")
-        #logger.debug(f"Initializing Model with provider={provider}, model={model}, config={self.config}")
-        if provider.lower() == "bedrock":
-            region = config["configurable"].get("region") if config and config.get("configurable") else "us-east-1"
-            aws_access_key_id = config["configurable"].get("aws_access_key_id") if config and config.get("configurable") else None
-            aws_secret_access_key = config["configurable"].get("aws_secret_access_key") if config and config.get("configurable") else None
-            aws_session_token = config["configurable"].get("aws_session_token") if config and config.get("configurable") else None
-            self.llm = init_chat_model(model_provider=provider, model=model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
-        elif self.config and config.get("configurable") and config["configurable"].get("base_url"):
-            self.llm = init_chat_model(model_provider=provider, model=model, api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None, base_url=config["configurable"]["base_url"])
-        else:
-            self.llm = init_chat_model(model_provider=provider, model=model, api_key=config["configurable"]["api_key"] if config and config.get("configurable") else None)
+        self.llm = self._get_base_chat_model()
+        if not self.llm:
+            raise ValueError("Failed to initialize the BaseChatModel with the provided configuration.")
 
+    def _get_base_chat_model(self) -> BaseChatModel | None:
+        """Initialize and return the BaseChatModel based on provider and model."""
+        ensure_logger_initialized()
+        if not self.config:
+            logger.error("Model configuration is missing a config.")
+            return None
+        elif not self.config.get("configurable"):
+            logger.error("Model configuration is missing 'configurable' settings.")
+            return None
+        else:
+            cfg = self.config.get("configurable")
+        if self.provider.lower() == "bedrock" and cfg is not None:
+            # Set region to cfg.get("region") if it exists, else default to "us-east-1"
+            region = cfg.get("region")
+            if region is None:
+                region = "us-east-1"
+            aws_access_key_id = cfg.get("aws_access_key_id")
+            if aws_access_key_id is None:
+                logger.error("Bedrock model configuration is missing 'aws_access_key_id'.")
+                return None
+            aws_secret_access_key = cfg.get("aws_secret_access_key")
+            if aws_secret_access_key is None:
+                logger.error("Bedrock model configuration is missing 'aws_secret_access_key'.")
+                return None
+            aws_session_token = cfg.get("aws_session_token")
+            if aws_session_token is None:
+                logger.error("Bedrock model configuration is missing 'aws_session_token'.")
+                return None
+            logger.debug(f"Initializing Bedrock model with provider={self.provider}, model={self.model}, aws_region={region}")
+            return init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
+        elif cfg is not None and cfg.get("api_key"):
+            if cfg.get("base_url"):
+                logger.debug(f"Initializing model with provider={self.provider}, model={self.model}, base_url={cfg.get('base_url')}")
+                return init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"))
+            else:
+                logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and api_key")
+                return init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"))
+        else:
+            logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and no api_key")
+            return init_chat_model(model_provider=self.provider, model=self.model)
+        
     async def _fetch_dynamic_data(self):
         """Fetch dynamic data from Mythic APIs for use in agent prompts."""
         ensure_logger_initialized()
@@ -221,10 +268,10 @@ class Model:
             # Build and compile the graph
             self.graph = (
             StateGraph(SageState)
-            .add_node(self._supervisor_agent())
-            .add_node(self._generalist_agent())
-            .add_node(self._mythic_operator_agent())
-            .add_node(self._mythic_payload_agent())
+            .add_node("Supervisor", self._supervisor_agent())
+            .add_node("Generalist", self._generalist_agent())
+            .add_node("Mythic_Operator", self._mythic_operator_agent())
+            .add_node("Mythic_Payload", self._mythic_payload_agent())
             .add_edge(START, "Supervisor")
             .add_edge("Generalist", "Supervisor")
             .add_edge("Mythic_Operator", "Supervisor")
@@ -332,6 +379,120 @@ class Model:
         """
         await self.tool_cache.invalidate(tool_name, params)
 
+    def _wrap_create_agent(self, agent_runnable, state_key: str, node_name: str):
+        """
+        Wrap a create_agent runnable so it only sees & updates its own message list
+        while keeping a global 'messages' list for tool compatibility.
+
+        CRITICAL: Worker agents (non-Supervisor) will copy their responses back to the
+        Supervisor's channel so the Supervisor can see what work was completed.
+        """
+        async def _ainvoke(state: SageState | dict, config=None):
+            if isinstance(state, dict):
+                channel = state.get(state_key)
+                if channel is None:
+                    channel = []
+                    state[state_key] = channel
+            else:
+                channel = getattr(state, state_key, []) or []
+
+            # Store original channel length to detect new messages
+            original_channel_length = len(channel)
+
+            # Ensure at least one message (Anthropic Bedrock requires non-empty messages list)
+            if len(channel) == 0:
+                channel.append(SystemMessage(content=f"{node_name} context start"))
+
+            # Remove orphan tool_result blocks
+            seen_tool_use_ids = set()
+            cleaned_channel = []
+            for msg in channel:
+                if isinstance(msg, AIMessage):
+                    for tc in (getattr(msg, "tool_calls", None) or []):
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            seen_tool_use_ids.add(tc_id)
+                    cleaned_channel.append(msg)
+                elif isinstance(msg, ToolMessage):
+                    tc_id = getattr(msg, "tool_call_id", None)
+                    if tc_id and tc_id in seen_tool_use_ids:
+                        cleaned_channel.append(msg)
+                else:
+                    cleaned_channel.append(msg)
+            channel = cleaned_channel
+
+            result = await agent_runnable.ainvoke({"messages": channel}, config)
+            updated_channel = result.get("messages", channel)
+
+            # With operator.add reducer, we only pass the NEW messages, not the full list
+            new_messages_from_agent = updated_channel[original_channel_length:]
+
+            update: dict[str, Any] = {
+                state_key: new_messages_from_agent,  # Only new messages for operator.add
+                "messages": new_messages_from_agent,  # keep legacy/global mirror
+            }
+
+            # CRITICAL FIX: If this is a worker agent (not Supervisor), copy its response
+            # back to the Supervisor's channel AND to the calling agent's channel (if worker-to-worker handoff)
+            if node_name != "Supervisor" and state_key != "supervisor_messages":
+                if new_messages_from_agent:
+                    # Filter to only include substantive responses (AIMessages with actual content)
+                    # Skip empty messages, tool calls without results, etc.
+                    substantive_messages = []
+                    for msg in new_messages_from_agent:
+                        if isinstance(msg, AIMessage):
+                            # Include if it has text content or is the final response
+                            if isinstance(msg.content, str) and msg.content.strip():
+                                substantive_messages.append(msg)
+                            elif isinstance(msg.content, list):
+                                # Check if list has text content
+                                has_text = any(
+                                    item.get("type") == "text" and item.get("text", "").strip()
+                                    for item in msg.content if isinstance(item, dict)
+                                )
+                                if has_text:
+                                    substantive_messages.append(msg)
+                        elif isinstance(msg, ToolMessage):
+                            # Include tool results that aren't just handoff confirmations
+                            if not msg.name or not msg.name.startswith("transfer_to_"):
+                                substantive_messages.append(msg)
+
+                    if substantive_messages:
+                        # Create a header message to show which agent responded
+                        response_header = AIMessage(
+                            content=f"[{node_name} completed task]",
+                            name=node_name
+                        )
+
+                        # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
+                        update["supervisor_messages"] = [response_header] + substantive_messages
+                        logger.info(f"✅ Copied {len(substantive_messages)} substantive messages from {node_name} to Supervisor channel")
+
+                        # ALSO copy to calling agent channel if this was a worker-to-worker handoff
+                        calling_agent = state.get("_last_calling_agent")
+                        if calling_agent and calling_agent != "Supervisor":
+                            channel_map = {
+                                "Mythic_Operator": "mythic_operator_messages",
+                                "Mythic_Payload": "mythic_payload_messages",
+                                "Generalist": "generalist_messages",
+                            }
+                            calling_agent_channel_key = channel_map.get(calling_agent)
+                            if calling_agent_channel_key:
+                                # With operator.add, only provide the new messages to append
+                                update[calling_agent_channel_key] = [response_header] + substantive_messages
+                                logger.info(f"✅ Copied {len(substantive_messages)} substantive messages from {node_name} to {calling_agent} channel (worker-to-worker handoff)")
+
+                        force_flush_all_handlers()
+                    else:
+                        logger.debug(f"⏭️  No substantive messages from {node_name} to copy to Supervisor")
+
+            for flag in ("recursion_summary_requested", "recursion_handback"):
+                if flag in result:
+                    update[flag] = result[flag]
+            return update
+        _ainvoke.__name__ = node_name
+        return _ainvoke
+    
     # Agent definitions
     def _generalist_agent(self):
         name = "Generalist"
@@ -353,13 +514,19 @@ class Model:
 
         Your goal is to assist the user effectively and efficiently, ensuring they leave the interaction with the information or guidance they need.
         """
+        if not self.state["generalist_messages"]:
+            self.state["generalist_messages"].append(SystemMessage(content=prompt.strip()))
         tools = []
-        return create_agent(
-            model=self.llm,
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for Mythic Operator Agent.")
+        agent = create_agent(
+            model=llm,
             tools=tools,
             name=name,
             system_prompt=prompt,
         )
+        return self._wrap_create_agent(agent, "generalist_messages", name)
     
     def _mythic_operator_agent(self):
         name = "Mythic_Operator" # Note: name must match the agent_name in _create_handoff_tool and cannot have spaces
@@ -387,6 +554,26 @@ class Model:
         - Provide updates on the status of operations and any relevant information to the operator.
         - Ensure that all actions taken within Mythic are logged and traceable.
         - **CRITICAL**: Monitor the remaining_steps value to prevent hitting recursion limits during complex operations.
+        - **IMPORTANT**: You have access to the Mythic_Payload agent for creating new payloads when needed.
+
+        **When to Delegate to Mythic_Payload Agent:**
+        You should use the `transfer_to_Mythic_Payload` tool when:
+        - Privilege escalation requires a new payload with elevated permissions
+        - Lateral movement requires deploying a payload to a different host
+        - The operator explicitly requests payload creation or modification
+        - You need a specialized payload type that doesn't exist yet
+        - Creating a service binary, DLL, or other executable for persistence or execution
+
+        **Example Scenarios:**
+        1. **Privilege Escalation**: "I need to escalate privileges on callback 13"
+           - Check existing callbacks and determine approach
+           - If you need a new service binary or exploit payload → delegate to Mythic_Payload
+           - Once payload is created → use it in your privilege escalation commands
+
+        2. **Lateral Movement**: "Move laterally to host 192.168.1.50"
+           - Determine target OS and architecture
+           - Delegate to Mythic_Payload to create appropriate payload for target
+           - Once payload is ready → use WMI/PSExec/SSH commands to deploy it
 
         Guidelines:
         - Always confirm the operator's intent before executing any critical commands.
@@ -394,6 +581,7 @@ class Model:
         - Maintain a clear and professional tone in all communications.
         - Prioritize accuracy and efficiency in executing tasks.
         - If a command is unclear or outside your scope, ask for clarification or suggest consulting another agent.
+        - When delegating to Mythic_Payload, provide clear requirements: payload type, target OS/architecture, and intended use case.
 
         **CRITICAL: Check Existing Task History BEFORE Issuing New Commands:**
         Before issuing ANY new commands, you MUST follow this workflow:
@@ -432,9 +620,13 @@ class Model:
         - For complex multi-step tasks (like comprehensive reconnaissance), break them into phases
         - Complete the most critical information gathering first
         - If approaching recursion limit, prioritize getting essential results over comprehensive coverage
+
+        **IMPORTANT**: When a command has a parameter type of "File" (e.g., "type": "File"), you must pass in the Mythic file UUID (not the filename).
         {commands_text}
         Your goal is to assist the human operator effectively while managing system resources responsibly.
         """
+        if not self.state["mythic_operator_messages"]:
+            self.state["mythic_operator_messages"].append(SystemMessage(content=prompt.strip()))
         # Tools
         if self.mythic_client is not None:
             mythic_tools = self.mythic_client.get_tools([
@@ -443,19 +635,32 @@ class Model:
                 "issue_task_and_waitfor_task_output",
                 "get_task_history_for_callback",
                 "get_all_task_output_by_task_id",
+                "upload_file_by_file_uuid",
+                "get_all_uploaded_files",
                 "get_operations",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
-            tools = mythic_tools + [handback_tool]
+
+            # Add handoff to Mythic_Payload for payload creation needs
+            transfer_to_payload = _create_handoff_tool(
+                agent_name="Mythic_Payload",
+                description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload."
+            )
+
+            tools = mythic_tools + [handback_tool, transfer_to_payload]
         else:
             raise ValueError("Mythic client not initialized for Mythic Operator Agent.")
-        return create_agent(
-            model=self.llm,
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for Mythic Operator Agent.")
+        agent = create_agent(
+            model=llm,
             tools=tools,
             name=name,
             system_prompt=prompt,
         )
+        return self._wrap_create_agent(agent, "mythic_operator_messages", name)
 
     def _mythic_payload_agent(self):
         name = "Mythic_Payload"
@@ -512,6 +717,8 @@ class Model:
 
         If a user attempts to confuse Mythic agents with AI agents, correct them immediately (e.g., "Mythic agents are C2 implants, not AI systems like me.").
         """
+        if not self.state["mythic_payload_messages"]:
+            self.state["mythic_payload_messages"].append(SystemMessage(content=prompt.strip()))
         # Tools
         if self.mythic_client:
             mythic_tools = self.mythic_client.get_tools([
@@ -525,12 +732,18 @@ class Model:
             tools = mythic_tools + [handback_tool]
         else:
             raise ValueError("Mythic client not initialized for Mythic Payload Agent.")
-        return create_agent(
-            model=self.llm,
+        
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for Mythic Operator Agent.")
+        
+        agent = create_agent(
+            model=llm,
             tools=tools,
             name=name,
             system_prompt=prompt,
         )
+        return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
     def _supervisor_agent(self):
         name = "Supervisor"
@@ -551,6 +764,33 @@ class Model:
             - Providing clear and concise updates to the user about the status of tasks.
             - **CRITICAL**: Monitoring the remaining_steps value to detect when approaching the recursion limit.
 
+            **CRITICAL: Understanding User Input Context:**
+            When you receive a new user message, carefully evaluate whether it is:
+
+            1. **Task Continuation** (e.g., "continue", "keep going", "yes")
+               - Look for the most recent Progress Handback or agent response in your message history
+               - Extract what work was completed and what remains to be done
+               - Generate a NEW handoff_instruction that tells the agent to continue from where it left off
+               - Example: If Mythic_Operator reported "Completed enumeration, still need privilege escalation",
+                 your instruction should be "Continue privilege escalation based on the enumeration results you gathered"
+
+            2. **Task Redirection** (e.g., "Try using the payload agent to create X", "Instead do Y")
+               - The user is issuing a DIFFERENT task that may supersede or replace the previous one
+               - Select the appropriate agent based on this NEW task
+               - Generate a handoff_instruction based on the NEW task objective, NOT the old one
+               - Example: If user says "Try using the payload agent to create an apollo service binary" after
+                 working on privilege escalation, delegate to Mythic_Payload with instruction
+                 "Create an apollo service binary payload"
+
+            3. **Clarification or Meta-comment** (e.g., "What's the status?", "Why did that fail?")
+               - User is asking about current state, not requesting new work
+               - Provide a summary based on recent agent outputs
+               - Do NOT delegate unless explicitly requested
+
+            **Key Rule:** Always base your handoff_instruction on the MOST RECENT user intent, not the original
+            task from several messages ago. When continuing a task, incorporate context from the agent's
+            progress summary into your instruction.
+
             **Recursion Limit Management:**
             - You have access to a `remaining_steps` value that shows how many more operations can be performed.
             - When remaining_steps is 3 or fewer, you MUST use the `request_continuation` tool.
@@ -561,19 +801,51 @@ class Model:
               3. Include the specialist's findings in your summary to the user
             - This allows the user to decide whether to continue, stop, or redirect the task.
 
+            **CRITICAL: Recognizing Task Completion:**
+            When you see a message like "[AgentName completed task]" followed by the agent's results:
+            1. **Check if the original user request has been fulfilled**
+               - Did the agent provide the requested information/action?
+               - Is there a concrete result (payload created, command executed, question answered)?
+            2. **If YES - Task is complete:**
+               - **USE THE `respond_to_user` TOOL** with a summary of what was accomplished
+               - **DO NOT delegate again** - the task is done
+               - Include relevant details from the agent's response (IDs, filenames, results)
+               - Example: Call respond_to_user with "✅ Payload created successfully. UUID: abc-123, Filename: apollo.bin"
+            3. **If NO - More work needed:**
+               - Only then use transfer_to_* tools to delegate to another agent OR the same agent with refined instructions
+               - Clearly explain what additional work is required
+
+            **Common mistake to avoid:**
+            ❌ BAD: Agent creates payload → You see "[Mythic_Payload completed task]" → You call transfer_to_Mythic_Payload again
+            ✅ GOOD: Agent creates payload → You see "[Mythic_Payload completed task]" with payload details → You call respond_to_user with the results
+
+            **Tool Selection Rules:**
+            - Use `transfer_to_*` tools ONLY when you need an agent to DO work
+            - Use `respond_to_user` tool when agents have FINISHED work and you're ready to tell the user
+            - Use `request_continuation` tool only when approaching recursion limits
+
             When interacting with the agents:
             - Clearly specify the task, context, and expected output.
             - Use structured communication to ensure clarity and avoid misunderstandings.
             - Handle any errors or unexpected behavior by reassigning tasks or consulting other agents.
+            - When using any transfer_to_* tool, ALWAYS supply a concise handoff_instruction telling the target agent exactly what to do next (no pronouns, be explicit).
+            - **CRITICAL**: When user says "continue" after a handback, construct your handoff_instruction by combining:
+              1. The original task goal
+              2. What the agent already completed (from the handback summary)
+              3. What still needs to be done (from "Remaining Tasks" in the handback)
 
             When responding to the user:
             - Summarize the progress and results of all agents.
             - Provide actionable insights or next steps based on the outputs of the agents.
             - Maintain a professional and concise tone.
             - Always check remaining_steps before delegating to other agents.
+            - **If you see completion messages from agents with successful results, respond to the user instead of delegating again.**
 
             Always prioritize efficiency, accuracy, and clarity in your management and communication.
         """
+        if not self.state["supervisor_messages"]:
+            self.state["supervisor_messages"].append(SystemMessage(content=prompt.strip()))
+
         # Handoffs
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
@@ -584,11 +856,14 @@ class Model:
                 agent_name="Mythic_Operator",
                 description="Assign task to a mythic operator agent.",
             )
-        
+
         assign_to_mythic_payload_agent = _create_handoff_tool(
                 agent_name="Mythic_Payload",
                 description="Assign task to a mythic payload agent.",
             )
+
+        # Completion tool - use when task is done
+        respond_to_user_tool = _create_respond_to_user_tool()
 
         # Recursion limit management tool
         request_continuation_tool = _create_recursion_summary_tool()
@@ -598,15 +873,20 @@ class Model:
             assign_to_generalist_agent,
             assign_to_mythic_operator_agent,
             assign_to_mythic_payload_agent,
+            respond_to_user_tool,
             request_continuation_tool,
         ]
 
-        return create_agent(
-            model=self.llm,
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for Mythic Operator Agent.")
+        agent = create_agent(
+            model=llm,
             tools=tools,
             name=name,
             system_prompt=prompt,
         )
+        return self._wrap_create_agent(agent, "supervisor_messages", name)
 
     def _process_ai_content_list(self, content_list, agent_name=None):
         """Helper method to process AI message content lists"""
@@ -798,13 +1078,58 @@ class Model:
         else:
             logger.info("No dangling tool calls found - state is clean")
 
+    def _sanitize_messages(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
+            """
+            Remove orphan ToolMessages (tool_result) whose tool_call_id was never
+            introduced by a preceding AIMessage.tool_calls in this sequence.
+            """
+            seen_tool_use_ids = set()
+            cleaned = []
+            for m in msgs:
+                if isinstance(m, AIMessage):
+                    for tc in (getattr(m, "tool_calls", None) or []):
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            seen_tool_use_ids.add(tc_id)
+                    cleaned.append(m)
+                elif isinstance(m, ToolMessage):
+                    tc_id = getattr(m, "tool_call_id", None)
+                    if tc_id and tc_id in seen_tool_use_ids:
+                        cleaned.append(m)
+                    # else drop orphan
+                elif isinstance(m, (HumanMessage, SystemMessage)):
+                    cleaned.append(m)
+                # ignore other types silently
+            return cleaned
+
+    def _render_combined(self, messages):
+        out = ""
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                out += f"👤> {m.content}\n"
+            elif isinstance(m, AIMessage):
+                out += f"🤖[{getattr(m,'name','Agent')}]> {m.content if isinstance(m.content,str) else ''}\n"
+        return out
+    
     async def invoke(self, prompt: str) -> str:
         """
         Invoke the model with a prompt and return the response.
         :param prompt: The prompt to send to the model.
         :return: The model's response as a string.
         """
+        if not self.graph:
+            raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
         logger.debug(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
+
+        # Ensure per-agent channels exist
+        for ch in [
+            "supervisor_messages",
+            "generalist_messages",
+            "mythic_operator_messages",
+            "mythic_payload_messages",
+        ]:
+            if ch not in self.state:
+                self.state[ch] = []
 
         if "messages" not in self.state:
             self.state["messages"] = []
@@ -816,139 +1141,178 @@ class Model:
         if "recursion_summary_requested" in self.state:
             logger.debug("Resetting recursion_summary_requested flag before invocation")
             self.state["recursion_summary_requested"] = False
-        if "recursion_handback" in self.state:
-            logger.debug("Resetting recursion_handback flag before invocation")
-            self.state["recursion_handback"] = False
 
         # CRITICAL: Clean up any dangling tool_use blocks before adding the user's message
         # This prevents Anthropic API errors when resuming from recursion limit
         # Note: We don't load from checkpoint here because self.state already contains
         # the full conversation history from the graph's checkpointing mechanism
-        self._cleanup_dangling_tool_calls()
+        #self._cleanup_dangling_tool_calls()
 
-        self.state["messages"].append(HumanMessage(content=prompt))
+        self.state["supervisor_messages"].append(HumanMessage(content=prompt))
 
-        if self.graph:
+        try:
+            # Use default recursion limit - RemainingSteps will handle graceful termination
+            resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25})
+
+            # Merge updated channel values back into self.state
+            for ch in [
+                "supervisor_messages",
+                "generalist_messages",
+                "mythic_operator_messages",
+                "mythic_payload_messages",
+            ]:
+                if ch in resp:
+                    self.state[ch] = resp[ch]
+
+            # Build synthetic unified messages list for legacy formatting logic
+            all_messages = []
+            for ch in [
+                "supervisor_messages",
+                "generalist_messages",
+                "mythic_operator_messages",
+                "mythic_payload_messages",
+            ]:
+                all_messages.extend(self.state.get(ch, []))
+
+            synthetic_resp = {
+                "messages": all_messages,
+                "recursion_summary_requested": resp.get("recursion_summary_requested", False),
+                "recursion_handback": resp.get("recursion_handback", False),
+            }
+            # Check if we got a recursion summary request or handback from specialist
+            if synthetic_resp.get("recursion_summary_requested", False):
+                logger.info("Recursion limit approached - user continuation requested")
+                # Use the counter-based approach - it tracks which messages have been shown
+                return self._generate_mythic_output(synthetic_resp, skip_counter=False)
+            elif synthetic_resp.get("recursion_handback", False):
+                logger.info("Recursion handback received from specialist agent")
+                # Use the counter-based approach - it tracks which messages have been shown
+                return self._generate_mythic_output(synthetic_resp, skip_counter=False)
+        except GraphRecursionError as e:
+            # Catch recursion limit error and return progress made so far
+            logger.warning(f"Recursion limit hit: {e}")
+
+            # First, log what's currently in self.state
+            current_msg_count = len(self.state.get("messages", []))
+            logger.info(f"Current state has {current_msg_count} messages before checkpoint collection")
+            logger.info(f"Current counter value: {self.counter}")
+
+            # Get the latest state from the checkpoint to show all progress
+            # The graph execution stopped, but checkpointer has saved all messages
+            thread_id = f"{self.agent_task_id}-{self.task_id}"
+            config = RunnableConfig(configurable={"thread_id": thread_id})
+
+            # Collect all messages from parent and nested agent checkpoints
+            all_messages = []
+            checkpoint_count = 0
             try:
-                # Use default recursion limit - RemainingSteps will handle graceful termination
-                resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25})
+                # Get all checkpoints for this thread (including nested agents)
+                # LangGraph stores nested agent states with namespace prefixes
+                async for checkpoint_tuple in self.memory.alist(config, limit=200):
+                    checkpoint_count += 1
+                    if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                        ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
+                        checkpoint_id = checkpoint_tuple.checkpoint.get("id", "unknown")
 
-                # Check if we got a recursion summary request or handback from specialist
-                if resp.get("recursion_summary_requested", False):
-                    logger.info("Recursion limit approached - user continuation requested")
-                    # Use the counter-based approach - it tracks which messages have been shown
-                    return self._generate_mythic_output(resp, skip_counter=False)
-                elif resp.get("recursion_handback", False):
-                    logger.info("Recursion handback received from specialist agent")
-                    # Use the counter-based approach - it tracks which messages have been shown
-                    return self._generate_mythic_output(resp, skip_counter=False)
+                        logger.info(f"Checkpoint {checkpoint_count}: namespace='{ns}', id={checkpoint_id}")
 
-            except GraphRecursionError as e:
-                # Catch recursion limit error and return progress made so far
-                logger.warning(f"Recursion limit hit: {e}")
+                        nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                        if "messages" in nested_state:
+                            nested_messages = nested_state["messages"]
+                            logger.info(f"  Found {len(nested_messages)} messages in this checkpoint")
 
-                # First, log what's currently in self.state
-                current_msg_count = len(self.state.get("messages", []))
-                logger.info(f"Current state has {current_msg_count} messages before checkpoint collection")
-                logger.info(f"Current counter value: {self.counter}")
+                            # Log message types for debugging
+                            msg_types = [type(m).__name__ for m in nested_messages]
+                            logger.info(f"  Message types: {msg_types}")
 
-                # Get the latest state from the checkpoint to show all progress
-                # The graph execution stopped, but checkpointer has saved all messages
-                thread_id = f"{self.agent_task_id}-{self.task_id}"
-                config = RunnableConfig(configurable={"thread_id": thread_id})
+                            # Add messages that aren't already in all_messages (avoid duplicates)
+                            for msg in nested_messages:
+                                if msg not in all_messages:
+                                    all_messages.append(msg)
 
-                # Collect all messages from parent and nested agent checkpoints
-                all_messages = []
-                checkpoint_count = 0
-                try:
-                    # Get all checkpoints for this thread (including nested agents)
-                    # LangGraph stores nested agent states with namespace prefixes
-                    async for checkpoint_tuple in self.memory.alist(config, limit=200):
-                        checkpoint_count += 1
-                        if checkpoint_tuple and checkpoint_tuple.checkpoint:
-                            ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
-                            checkpoint_id = checkpoint_tuple.checkpoint.get("id", "unknown")
+                logger.info(f"Total checkpoints examined: {checkpoint_count}")
+                logger.info(f"Total unique messages collected: {len(all_messages)}")
 
-                            logger.info(f"Checkpoint {checkpoint_count}: namespace='{ns}', id={checkpoint_id}")
+                if all_messages:
+                    self.state["messages"] = all_messages
+                    logger.info(f"Updated state with {len(all_messages)} messages from checkpoints")
+                else:
+                    logger.warning("No messages found in any checkpoint!")
 
-                            nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
-                            if "messages" in nested_state:
-                                nested_messages = nested_state["messages"]
-                                logger.info(f"  Found {len(nested_messages)} messages in this checkpoint")
+            except Exception as checkpoint_error:
+                logger.warning(f"Could not retrieve checkpoint after recursion limit: {checkpoint_error}")
 
-                                # Log message types for debugging
-                                msg_types = [type(m).__name__ for m in nested_messages]
-                                logger.info(f"  Message types: {msg_types}")
+            # Ask the LLM to summarize the progress made so far
+            # Include recent context from the conversation for the summary
+            recent_messages = recent_messages = self.state["messages"][-10:] if len(self.state["messages"]) > 10 else self.state["messages"]
+            summary_prompt = HumanMessage(content="""Based on the conversation so far, provide a brief summary of:
+                1. What tasks have been completed
+                2. What information has been gathered
+                3. What still needs to be done
 
-                                # Add messages that aren't already in all_messages (avoid duplicates)
-                                for msg in nested_messages:
-                                    if msg not in all_messages:
-                                        all_messages.append(msg)
+                Keep it concise (3-5 bullet points).""")
 
-                    logger.info(f"Total checkpoints examined: {checkpoint_count}")
-                    logger.info(f"Total unique messages collected: {len(all_messages)}")
+            # Create a summary request with context
+            try:
+                summary_messages_raw = recent_messages + [summary_prompt]
+                # Build merged view of ALL agent channels for better context
+                merged = []
+                for ch in [
+                    "supervisor_messages",
+                    "generalist_messages",
+                    "mythic_operator_messages",
+                    "mythic_payload_messages",
+                ]:
+                    merged.extend(self.state.get(ch, []))
+                if merged:  # prefer merged if it has data
+                    summary_messages_raw = merged[-15:] + [summary_prompt]
 
-                    if all_messages:
-                        self.state["messages"] = all_messages
-                        logger.info(f"Updated state with {len(all_messages)} messages from checkpoints")
-                    else:
-                        logger.warning("No messages found in any checkpoint!")
+                summary_messages = self._sanitize_messages(summary_messages_raw)
 
-                except Exception as checkpoint_error:
-                    logger.warning(f"Could not retrieve checkpoint after recursion limit: {checkpoint_error}")
+                # Ensure at least one SystemMessage (Anthropic Bedrock safer)
+                if not any(isinstance(m, SystemMessage) for m in summary_messages):
+                    summary_messages.insert(0, SystemMessage(content="You are a summarizer. Produce concise bullet points."))
 
-                # Ask the LLM to summarize the progress made so far
-                # Include recent context from the conversation for the summary
-                recent_messages = self.state["messages"][-10:] if len(self.state["messages"]) > 10 else self.state["messages"]
-                summary_prompt = HumanMessage(content="""Based on the conversation so far, provide a brief summary of:
-                    1. What tasks have been completed
-                    2. What information has been gathered
-                    3. What still needs to be done
+                # Final guard: must not be empty
+                if not summary_messages:
+                    summary_messages = [SystemMessage(content="You are a summarizer."), summary_prompt]
+                logger.debug(f"Summary invoke sending {len(summary_messages)} messages: {[type(m).__name__ for m in summary_messages]}")
+                summary_resp = await self.llm.ainvoke(summary_messages)
+                summary_text = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
+            except Exception as summary_error:
+                logger.warning(f"Could not generate summary: {summary_error}")
+                summary_text = "Multiple reconnaissance and information gathering tasks were in progress."
 
-                    Keep it concise (3-5 bullet points).""")
+            # Create continuation message with LLM-generated summary
+            continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached**
 
-                # Create a summary request with context
-                try:
-                    summary_messages = recent_messages + [summary_prompt]
-                    summary_resp = await self.llm.ainvoke(summary_messages)
-                    summary_text = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
-                except Exception as summary_error:
-                    logger.warning(f"Could not generate summary: {summary_error}")
-                    summary_text = "Multiple reconnaissance and information gathering tasks were in progress."
+**Progress Summary:**
+{summary_text}
 
-                # Create continuation message with LLM-generated summary
-                continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached**
+**Status:** Hit the system's iteration limit of 25 steps. All work has been preserved in the conversation history.
 
-                    **Progress Summary:**
-                    {summary_text}
+**Your Options:**
+• Reply **"continue"** to increase the limit and keep going from where we left off
+• Reply **"stop"** to end the current task
+• Provide specific instructions to redirect the approach
 
-                    **Status:** Hit the system's iteration limit of 25 steps. All work has been preserved in the conversation history.
+**What would you like to do?**"""
+            )
 
-                    **Your Options:**
-                    • Reply **"continue"** to increase the limit and keep going from where we left off
-                    • Reply **"stop"** to end the current task
-                    • Provide specific instructions to redirect the approach
+            # Add continuation message to state
+            self.state["messages"].append(continuation_message)
+            self.state["recursion_summary_requested"] = True
 
-                    **What would you like to do?**"""
-                )
+            # Return only NEW messages since last output (avoid duplicates)
+            # Don't reset counter - it already tracks which messages have been shown
+            resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
 
-                # Add continuation message to state
-                self.state["messages"].append(continuation_message)
-                self.state["recursion_summary_requested"] = True
+            # Use skip_counter=False to respect the counter and show only new messages
+            # This prevents showing messages that were already displayed before recursion limit
+            logger.info(f"Returning recursion summary from counter position {self.counter}")
+            return self._generate_mythic_output(resp, skip_counter=False)
 
-                # Return only NEW messages since last output (avoid duplicates)
-                # Don't reset counter - it already tracks which messages have been shown
-                resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
-
-                # Use skip_counter=False to respect the counter and show only new messages
-                # This prevents showing messages that were already displayed before recursion limit
-                logger.info(f"Returning recursion summary from counter position {self.counter}")
-                return self._generate_mythic_output(resp, skip_counter=False)
-
-        else:
-            raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
-
-        return self._generate_mythic_output(resp)
+        return self._generate_mythic_output(synthetic_resp)
 
     async def handle_continuation_response(self, response: str) -> str:
         """
@@ -1133,13 +1497,51 @@ def _create_summarize_handback_tool():
         # Mark that we've had a recursion handback from a specialist
         updated_state = {**runtime.state, "recursion_handback": True}
 
+        # CRITICAL FIX: Copy handback summary to supervisor_messages so Supervisor
+        # knows where the worker left off when user says "continue"
+        # With operator.add reducer, only provide the NEW message to append
+        updated_state["supervisor_messages"] = [tool_message]
+
+        # Also update global messages for legacy compatibility (only new message)
+        updated_state["messages"] = [tool_message]
+
         return Command(
-            goto="Supervisor",
-            update={**updated_state, "messages": runtime.state["messages"] + [tool_message]},
+            goto="__end__",              # stop graph, wait for user
+            update=updated_state,
             graph=Command.PARENT,
         )
 
     return summarize_and_handback
+
+def _create_respond_to_user_tool():
+    """
+    Create a tool that allows the Supervisor to explicitly indicate it's done
+    delegating and wants to respond directly to the user with final results.
+    """
+    @tool("respond_to_user")
+    def respond_to_user(
+        runtime: ToolRuntime,
+        final_response: Annotated[str, "The final synthesized response to provide to the user"],
+    ) -> Command:
+        """Call this when the task is complete and you want to respond to the user with final results. DO NOT delegate again after calling this."""
+
+        # Create a final AI message with the response
+        response_message = AIMessage(
+            content=final_response,
+            name="Supervisor"
+        )
+
+        update_state = {**runtime.state}
+        update_state["messages"] = [response_message]
+        update_state["supervisor_messages"] = [response_message]
+
+        return Command(
+            goto="__end__",  # Explicitly end the graph
+            update=update_state,
+            graph=Command.PARENT,
+        )
+
+    return respond_to_user
 
 def _create_recursion_summary_tool():
     """
@@ -1175,11 +1577,15 @@ def _create_recursion_summary_tool():
         )
 
         # Mark that we've requested a recursion summary - this will help detect the response
-        updated_state = {**runtime.state, "recursion_summary_requested": True}
+        update_state = {**runtime.state}
+        # With operator.add, only provide NEW messages to append
+        update_state["messages"] = [tool_message]
+        update_state["supervisor_messages"] = [tool_message]
+        update_state["recursion_summary_requested"] = True
 
         return Command(
             goto="__end__",  # End the graph execution and wait for user input
-            update={**updated_state, "messages": runtime.state["messages"] + [tool_message]},
+            update=update_state,
             graph=Command.PARENT,
         )
 
@@ -1196,20 +1602,60 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
     :return: A tool function that performs the handoff.
     """
     name = f"transfer_to_{agent_name}"
-    description = description or f"Ask {agent_name} for help."
+    description = description or f"Delegate a task to {agent_name}. Provide a clear instruction."
+
+    channel_map = {
+        "Supervisor": "supervisor_messages",
+        "Generalist": "generalist_messages",
+        "Mythic_Operator": "mythic_operator_messages",
+        "Mythic_Payload": "mythic_payload_messages",
+    }
+    target_channel_key = channel_map.get(agent_name)
 
     @tool(name, description=description)
     def handoff_tool(
         runtime: ToolRuntime,
+        handoff_instruction: Annotated[str, "Explicit task or question for the target agent"],
     ) -> Command:
-        tool_message = ToolMessage(
-            content=f"Successfully transferred to {agent_name}",
+        # ToolMessage confirming delegation
+        acknowledgment = ToolMessage(
+            content=f"Delegated to {agent_name} with instruction: {handoff_instruction}",
             name=name,
             tool_call_id=runtime.tool_call_id,
         )
+
+        # HumanMessage representing the actual task for the target agent
+        injected_human = HumanMessage(content=handoff_instruction)
+
+        # With operator.add reducer, only provide NEW messages to append
+        update_state = {**runtime.state}
+        update_state["messages"] = [acknowledgment, injected_human]
+
+        # Inject into target channel (only new messages with operator.add)
+        if target_channel_key:
+            update_state[target_channel_key] = [acknowledgment, injected_human]
+
+        # CRITICAL: Track who is calling this agent so responses can be copied back
+        # Store the calling agent's name in state for response routing
+        # We need to detect the current agent from the message history
+        current_agent = None
+        for channel_name, channel_key in channel_map.items():
+            if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
+                # Check if this channel has recent activity (last message is not too old)
+                # This is a heuristic - the agent that just called a tool is the calling agent
+                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages"]:
+                    # Simple approach: assume the tool was called from whichever non-target channel exists
+                    if channel_name != agent_name:
+                        current_agent = channel_name
+                        break
+
+        # Store calling agent info for response routing
+        update_state["_last_calling_agent"] = current_agent
+        update_state["_last_target_agent"] = agent_name
+
         return Command(
             goto=agent_name,
-            update={**runtime.state, "messages": runtime.state["messages"] + [tool_message]},
+            update=update_state,
             graph=Command.PARENT,
         )
 

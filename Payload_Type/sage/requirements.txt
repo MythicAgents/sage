@@ -1,10 +1,20 @@
 langchain==1.0.3
 langchain-core==1.0.3
+langchain-mcp-adapters==0.1.13
 langchain-anthropic==1.0.2
 langchain-aws==1.0.0
 langchain-openai==1.0.2
+langchain-google-genai==4.1.2
+langchain-groq==1.1.1
+langchain-ollama==1.0.1
+langchain-xai==1.1.0
 langgraph==1.0.2
 langgraph-checkpoint-sqlite==3.0.0
 langsmith
 mythic
 mythic-container
+# There's a bug with aiosqlite 0.22.0 in langraph
+# https://github.com/langchain-ai/langgraph/issues/6583
+aiosqlite==0.21.0
+arize-phoenix
+opentelemetry-instrumentation-langchain

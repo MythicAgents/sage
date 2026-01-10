@@ -101,23 +101,23 @@ class MythicTools:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_all_active_callbacks tool")
         resp = await mythic.get_all_active_callbacks(self.client)
-        return json.dumps(resp)
+        return json.dumps(resp, sort_keys=True)
 
     async def get_all_payload_info(self) -> str:
         """ Get information about ALL payload types in Mythic. """
         query = """
             query PayloadInfo {
-                payloadtype {
+                payloadtype(where: { name: { _neq: "sage" } }) {
                     agent_type
                     name
                     supported_os
                     buildparameters {
-                        id
-                        name
-                        parameter_type
-                        choices
-                        default_value
-                        description
+                    id
+                    name
+                    parameter_type
+                    choices
+                    default_value
+                    description
                     }
                 }
             }
@@ -127,7 +127,7 @@ class MythicTools:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug("🛠️ Calling get_all_payload_info tool")
             results = await mythic.execute_custom_query(self.client, query,)
-            return json.dumps(results)
+            return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error executing query: {e}"
         
@@ -135,7 +135,7 @@ class MythicTools:
         """Get a list of all payload type names."""
         query = """
             query SagePayloadNames {
-                payloadtype {
+                payloadtype(where: { name: { _neq: "sage" } }) {
                     name
                 }
             }
@@ -174,7 +174,7 @@ class MythicTools:
 
         query = """
             query PayloadC2Profiles {
-                payloadtypec2profile(where: {payloadtype: {name: {_eq: "merlin"}}}) {
+                payloadtypec2profile(where: {payloadtype: {name: {_eq: "PLACEHOLDER"}}}) {
                     payloadtype {
                     name
                     }
@@ -194,12 +194,13 @@ class MythicTools:
                 }
             }
         """
+        query = query.replace("PLACEHOLDER", payload)
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling get_c2_profiles_for_payload tool for: {payload}")
             results = await mythic.execute_custom_query(self.client, query,)
-            return json.dumps(results)
+            return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error executing query: {e}"
 
@@ -234,7 +235,7 @@ class MythicTools:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling get_all_commands_for_payloadtype tool for: {payload}")
             results =  await mythic.get_all_commands_for_payloadtype(self.client, payload, attr)
-            return json.dumps(results)
+            return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
 
@@ -247,7 +248,8 @@ class MythicTools:
         build_parameters: Annotated[List[dict[str,str]], "List of build parameters where each dict contains 'name' and 'value' keys"],
         description: str = "",
     ) -> str:
-        """Create a new payload with the specified parameters.
+        """Create a new Mythic payload (also known as a Mythic agent) with the specified parameters.
+        Returns the created payload information as a JSON string.
 
         Args:
             payload_type_name: The name of the payload type (e.g., 'sage', 'apollo').
@@ -270,6 +272,18 @@ class MythicTools:
         Returns:
             str: JSON string containing the created payload information.
         """
+        # uuid is the Payload UUID not to be confused with the Mythic file UUID
+        custom_attributes = """
+        build_phase
+        uuid
+        build_stdout
+        build_stderr
+        build_message
+        id
+        filemetum {
+            agent_file_id
+        }
+        """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call create() first.")
         logger.debug(f"🛠️ Calling create_payload tool for: {payload_type_name}, filename: {filename}")
@@ -282,11 +296,14 @@ class MythicTools:
             build_parameters=build_parameters,
             description=description,
             include_all_commands= True,  # Include all commands in the payload
+            custom_return_attributes=custom_attributes,
         )
-        return json.dumps(resp)
+        return json.dumps(resp, sort_keys=True)
 
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
-        """Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
+        """
+        Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
+        **IMPORTANT**: When a command has a parameter type of "File" (e.g., "type": "File"), you must pass in the Mythic file UUID (not the filename).
 
         Args:
             command: The command name to execute from the "cmd" field from the get_all_commands_for_payloadtype tool. Validate the agent's operating system and the supported_os match.
@@ -333,7 +350,7 @@ class MythicTools:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
-        return json.dumps(resp)
+        return json.dumps(resp, sort_keys=True)
     
     async def get_all_task_output_by_task_id(self, task_id: Annotated[int, "The Mythic task ID to retrieve output for"]) -> str:
         """Get all output associated with a specific Mythic task ID.
@@ -368,15 +385,92 @@ class MythicTools:
                         logger.debug(f"Failed to decode base64 response_text for task output {item.get('id', 'unknown')}: {e}")
                         pass
 
-        return json.dumps(resp)
+        return json.dumps(resp, sort_keys=True)
     
+    async def get_all_uploaded_files(self) -> str:
+        """
+        Get a list of all files uploaded to Mythic.
+        Uploaded files can include, but not limited to, additional tools, scripts, or binaries that operators have uploaded for use with Mythic agents.
+        Excludes files downloaded by Mythic agents, screenshots, and Mythic payload files.
+        Call the download_file() method to download a specific file by its Mythic file UUID.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug("🛠️ Calling get_all_uploaded_files tool")
+        resp = mythic.get_all_uploaded_files(mythic=self.client)
+        data = [item async for item in resp]
+        return json.dumps(data, sort_keys=True)
+
+    async def upload_file_by_file_uuid(
+            self,
+            command: Annotated[str, "The name of the command for a Mythic agent that has upload functionality, typically the \"upload\" command, to execute on the target agent"], 
+            parameters: Annotated[str|dict, "Parameters for the upload command"], 
+            file_uuid: Annotated[str, "The Mythic file UUID to upload to the target agent"], 
+            callback_display_id: Annotated[int, "The callback_display_id of the target agent to upload the file to"],
+            token_id: Annotated[int | None, "Optional token ID for authentication"] = None, 
+            timeout: Annotated[int | None, "Optional timeout for the upload operation"] = None,
+            ) -> str:
+        """Upload a file stored in Mythic to a specific Mythic agent by the Mythic file UUID.
+
+        This tool uploads a file, identified by its Mythic file UUID, to a specified Mythic agent. The file will be transferred to the agent associated with the provided callback_display_id.
+
+        **IMPORTANT**: The command's parameter must be of type "File" (e.g., "type": "File"). DO NOT USE PARAMETER TYPE "STRING" TO UPLOAD FILES.
+        For the Merlin agent, use the "upload" command with the "file" parameter set to the Mythic file UUID and the "path" parameter set to the destination path and file name on the target system.
+        
+        Args:
+            command: The name of the command for a Mythic agent that has upload functionality, typically the "upload" command.
+            parameters: Parameters a Mythic agent's upload command.
+            file_uuid: The Mythic file UUID to upload to the target agent.
+            callback_display_id: The callback_display_id of the target agent to upload the file to.
+            token_id: Optional token ID for authentication.
+            timeout: Optional timeout for the upload operation.
+        Returns:
+            str: Command output (binary output coerced to string) after the upload operation."""
+        
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling upload_file_by_file_id tool for file ID {file_uuid} and callback_display_id {callback_display_id}")
+        file = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
+        if file is None or len(file) == 0:
+            raise Exception(f"Failed to download file with UUID: {file_uuid}")
+        resp = await self.issue_task_and_waitfor_task_output(
+            command=command,
+            parameters=parameters,
+            callback_display_id=callback_display_id,
+            token_id=token_id,
+            timeout=timeout
+        ) 
+        return resp
+
+    async def download_file(self, file_uuid: Annotated[str, "The Mythic file UUID of the file to download from Mythic"]) -> str:
+        # Not sure what I'm going to use this for because I don't want to send the file data back to the LLM
+        """Download a file from Mythic by its Mythic file UUID.
+
+        This tool downloads a file stored in Mythic, identified by its Mythic file UUID. 
+        The file content is returned as a base64-encoded string.
+
+        Args:
+            file_uuid: The Mythic file UUID to download the file for.
+        Returns:
+            str: Base64-encoded string of the downloaded file content.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling download_file tool for file UUID: {file_uuid}")
+        file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
+        if file_content is None:
+            raise Exception(f"Failed to download file with UUID: {file_uuid}")
+        # Encode the binary content to base64 string for easier transport
+        encoded_content = base64.b64encode(file_content).decode('utf-8')
+        return encoded_content
+
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_operations tool")
         resp = await mythic.get_operations(mythic=self.client)
-        return json.dumps(resp)
+        return json.dumps(resp, sort_keys=True)
     
 # Create a main function with arguments so that I can test the methods in this class manually
 if __name__ == "__main__":

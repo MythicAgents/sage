@@ -11,3 +11,10 @@ sage.db*
 .claude/
 tasks/
 .env
+
+# Phoenix observability directory - ignore contents but keep structure
+Payload_Type/sage/.phoenix/*
+!Payload_Type/sage/.phoenix/.keep
+
+# SSL certificate bundles - exclude from version control
+Payload_Type/sage/certs/*.pem
