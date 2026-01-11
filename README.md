@@ -195,6 +195,286 @@ MIIDXTCCAkWgAwIBAgIJAKJ... (Another certificate if needed)
 2. Verify file is in `Payload_Type/sage/certs/` directory
 3. Restart the Sage container after adding the certificate
 
+## Multi-Agent Architecture
+
+Sage uses a multi-agent system built with LangGraph to intelligently route and execute tasks. The system consists of a Supervisor agent that coordinates multiple specialist agents, each with their own expertise and tools.
+
+### Architecture Overview
+
+```
+                                    ┌─────────────────────┐
+                                    │                     │
+                                    │    User / Mythic    │
+                                    │      Operator       │
+                                    │                     │
+                                    └──────────┬──────────┘
+                                               │
+                                               ▼
+                         ┌─────────────────────────────────────┐
+                         │                                     │
+                         │      Supervisor Agent (Router)      │
+                         │                                     │
+                         │  - Analyzes user intent             │
+                         │  - Routes to appropriate agent      │
+                         │  - Monitors progress & results      │
+                         │  - Integrates responses             │
+                         │                                     │
+                         └──────┬──────────┬──────────┬──────────┬────────┘
+                                │          │          │          │
+                ┌───────────────┘          │          │          └─────────────┐
+                │                          │          │                        │
+                ▼                          ▼          ▼                        ▼
+   ┌────────────────────────┐ ┌────────────────────────┐ ┌────────────────────────┐
+   │                        │ │                        │ │                        │
+   │  Generalist Agent      │ │ Mythic_Operator Agent  │ │ Mythic_Payload Agent   │
+   │                        │ │                        │ │                        │
+   │ - General questions    │ │ - Callback management  │ │ - Payload creation     │
+   │ - Explanations         │ │ - Task execution       │ │ - Build configuration  │
+   │ - Advice & planning    │ │ - Reconnaissance       │ │ - C2 profile selection │
+   │ - No Mythic tools      │ │ - File operations      │ │ - Compatibility checks │
+   │                        │ │ - Mythic API calls     │ │                        │
+   │                        │ │                        │ │                        │
+   └────────────────────────┘ └───────────┬────────────┘ └────────────────────────┘
+                                          │
+                                          │ Can delegate to
+                                          ▼
+                             ┌────────────────────────┐
+                             │                        │
+                             │  Mythic_Payload Agent  │
+                             │  (for lateral movement,│
+                             │   privilege escalation)│
+                             │                        │
+                             └────────────────────────┘
+
+   ┌────────────────────────┐
+   │                        │
+   │  MCP_Manager Agent     │
+   │                        │
+   │ - External MCP tools   │
+   │ - Web fetching         │
+   │ - Third-party APIs     │
+   │ - Custom integrations  │
+   │                        │
+   └────────────────────────┘
+```
+
+### Agents
+
+#### 1. Supervisor Agent
+**Role**: Task Router & Coordinator
+
+The Supervisor is the entry point for all user requests. It analyzes the user's intent and delegates work to the appropriate specialist agent.
+
+**Responsibilities**:
+- Parse and understand user requests
+- Route tasks to specialist agents based on expertise
+- Monitor agent progress and recursion limits
+- Integrate results from multiple agents
+- Decide when tasks are complete vs. need continuation
+- Handle agent handbacks when approaching recursion limits
+
+**Key Behaviors**:
+- Uses `transfer_to_*` tools to delegate to specialist agents
+- Uses `respond_to_user` tool when work is complete
+- Uses `request_continuation` tool when hitting recursion limits
+- Recognizes task completion markers like `[AgentName completed task]`
+
+#### 2. Generalist Agent
+**Role**: General Knowledge & Explanations
+
+Handles general questions and queries that don't require Mythic-specific operations.
+
+**Responsibilities**:
+- Answer general questions (technology, concepts, best practices)
+- Provide explanations and summaries
+- Handle open-ended or creative queries
+- Offer guidance and recommendations
+
+**Tools**: None (pure language model reasoning)
+
+**Example Tasks**:
+- "Explain how lateral movement works in red teaming"
+- "What are the differences between Apollo and Poseidon agents?"
+- "Suggest a reconnaissance strategy for a Windows domain"
+
+#### 3. Mythic_Operator Agent
+**Role**: Mythic Operations & Execution
+
+The primary operational agent for all Mythic C2 activities. Has direct access to Mythic API tools.
+
+**Responsibilities**:
+- Manage callbacks and agents
+- Execute commands on compromised hosts via `issue_task_and_waitfor_task_output`
+- Query task history and retrieve results
+- Perform reconnaissance and enumeration
+- Upload files and manage artifacts
+- **Check existing task history BEFORE issuing new commands** (avoids duplicate work)
+- Monitor recursion limits and use `summarize_and_handback` when needed
+- Delegate to Mythic_Payload agent for payload creation needs
+
+**Tools**:
+- `get_all_active_callbacks` - List available agents/callbacks
+- `get_all_commands_for_payloadtype` - Get command documentation
+- `issue_task_and_waitfor_task_output` - Execute commands on callbacks
+- `get_task_history_for_callback` - Review previous tasks
+- `get_all_task_output_by_task_id` - Retrieve task results
+- `upload_file_by_file_uuid` - Upload files to Mythic
+- `get_all_uploaded_files` - List uploaded files
+- `get_operations` - Get operation details
+- `transfer_to_Mythic_Payload` - Delegate payload creation
+- `summarize_and_handback` - Return control to Supervisor
+
+**Example Tasks**:
+- "List all active callbacks"
+- "Run whoami on callback 5"
+- "Do host-based reconnaissance on the domain controller"
+- "Upload this script and execute it"
+
+**Critical Workflow**: Before issuing new commands, the agent:
+1. Gets active callbacks
+2. Checks task history to see what's already been run
+3. Reviews existing output from past tasks
+4. Only issues NEW commands if the data doesn't already exist
+
+#### 4. Mythic_Payload Agent
+**Role**: Payload Creation & Configuration
+
+Specializes in creating Mythic payloads (C2 agents/implants) for deployment.
+
+**Responsibilities**:
+- Create payloads for specific target systems (OS, architecture)
+- Configure C2 profiles (HTTP, WebSocket, DNS, etc.)
+- Validate compatibility between payload types, OS, and C2 profiles
+- Provide payload UUIDs and build details
+- Suggest payload types based on target environment
+
+**Tools**:
+- `get_payload_names` - List installed payload types
+- `create_payload` - Build a new payload
+- `get_all_payload_info` - Query payload details
+- `get_c2_profiles_for_payload` - Get supported C2 profiles
+- `summarize_and_handback` - Return control to Supervisor
+
+**Example Tasks**:
+- "Create an Apollo payload for Windows with HTTP"
+- "Build a Poseidon agent for Linux lateral movement"
+- "What payload types support DNS C2?"
+
+**When to Use**: The Mythic_Operator agent delegates to this agent when:
+- Privilege escalation requires a new payload
+- Lateral movement needs a different payload
+- User explicitly requests payload creation
+- Specialized payloads needed (service binaries, DLLs, etc.)
+
+#### 5. MCP_Manager Agent
+**Role**: External Tool Integration via MCP
+
+Handles tasks that require external tools provided by connected MCP (Model Context Protocol) servers. MCP servers extend Sage's capabilities beyond built-in Mythic functionality.
+
+**Responsibilities**:
+- Execute tools from connected MCP servers
+- Interpret and summarize tool results
+- Handle tool errors gracefully
+- Provide guidance on connecting MCP servers when none are available
+- Monitor recursion limits and use `summarize_and_handback` when needed
+
+**Tools**:
+- Dynamic tools provided by connected MCP servers
+- `summarize_and_handback` - Return control to Supervisor
+
+**MCP Server Capabilities** (when connected):
+- Web fetching and HTTP requests
+- File system operations (on Mythic server)
+- Database queries
+- Third-party API integrations
+- Custom tools specific to connected servers
+
+**Example Tasks**:
+- "Fetch the contents of https://example.com/config.json"
+- "Query the external database for user records"
+- "Call the webhook API with this data"
+
+**Important Notes**:
+- MCP_Manager is only used for EXTERNAL tools not provided by other agents
+- Mythic operations (callbacks, tasks, payloads) should use Mythic_Operator or Mythic_Payload agents
+- Requires MCP servers to be connected via the `mcp-connect` command
+- Use `mcp-list` command to see available MCP tools
+
+**Routing Priority**: The Supervisor prefers built-in agents (Mythic_Operator, Mythic_Payload, Generalist) over MCP_Manager when they have relevant capabilities. MCP_Manager is used only when the task requires capabilities that other agents cannot provide.
+
+### Message Flow & Channel Isolation
+
+Each agent operates in its own **message channel** to prevent context pollution and optimize token usage:
+
+- `supervisor_messages` - Supervisor's view of the conversation
+- `generalist_messages` - Generalist's isolated context
+- `mythic_operator_messages` - Mythic_Operator's isolated context
+- `mythic_payload_messages` - Mythic_Payload's isolated context
+- `mcp_manager_messages` - MCP_Manager's isolated context
+
+**Key Concepts**:
+
+1. **Explicit Handoffs**: When Supervisor delegates, it creates:
+   - A `ToolMessage` acknowledging the transfer
+   - A `HumanMessage` with the task (tagged with `_delegated_to` metadata)
+
+2. **Response Copying**: Worker agent responses are copied to `supervisor_messages` so the Supervisor can see results
+
+3. **Sequence Numbering**: All messages tagged with `_seq` for chronological ordering across channels
+
+4. **Deduplication**: Messages have unique IDs (`_msg_id`) to prevent duplicate display
+
+5. **Completion Headers**: Worker agents add completion markers (filtered in non-verbose mode)
+
+**Example Flow**:
+```
+User: "List callbacks and run whoami on callback 5"
+  ↓
+Supervisor analyzes → identifies Mythic operation → calls transfer_to_Mythic_Operator
+  ↓
+Mythic_Operator receives task in mythic_operator_messages channel
+  ↓
+Mythic_Operator calls get_all_active_callbacks tool
+  ↓
+Mythic_Operator calls issue_task_and_waitfor_task_output("whoami", callback_id=5)
+  ↓
+Mythic_Operator response copied to supervisor_messages
+  ↓
+Supervisor sees completion → calls respond_to_user with results
+  ↓
+User sees formatted output
+```
+
+### Recursion Limit Management
+
+Complex multi-step operations may hit LangGraph's recursion limit. The recursion limit is set to 25 calls before it is triggered as a safety mechanism to prevent run away agents. Sage handles this gracefully:
+
+1. **Worker Agent Monitoring**: Agents check `remaining_steps` before major operations
+2. **Handback Tool**: When `remaining_steps <= 4`, agents use `summarize_and_handback` to return control
+3. **Progress Summaries**: Include completed work, key findings, and remaining tasks
+4. **User Continuation**: Supervisor asks user if they want to continue
+5. **Context Preservation**: All state stored in `sage.db` checkpoint system
+
+**Example Handback**:
+```
+🤖[Mythic_Operator]> Progress Handback: Completed reconnaissance on 3 hosts (gathered system info,
+running processes, network config). Remaining: privilege escalation and lateral movement to
+identified targets.
+
+🤖[Supervisor]> We've hit the operation complexity limit. Would you like me to continue with
+privilege escalation?
+```
+
+### Verbose Mode
+
+By default, Sage shows concise output. Enable verbose mode to see:
+- Individual tool calls with arguments
+- Tool responses with full data
+- Agent reasoning and intermediate steps
+- Completion headers and internal messages
+
+Set `verbose=true` in the `chat` or `query` command parameters.
+
 ## Commands
 
 Sage provides the following Mythic commands for interacting with AI models and MCP servers.
