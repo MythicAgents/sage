@@ -4,7 +4,7 @@
     <img src="Sage.png">
 </p>
 
-Sage is an interface to AI and LLMs as a Mythic callback. This Mythic agent itself does not have any AI or LLM capabilities but instead interacts with selected 3rd part services. You must obtain access permissions and credentials for the prospective model provider you plan to use.
+Sage is a virtual Mythic agent that that uses an AI agentic system to operate Mythic and Mythic agents running on compromised hosts. Sage does not run on a compromised host, it runs entirely in the Sage container. Sage leverages external AI model providers (e.g., Anthropic, Ollama, OpenAI) for inference and requires API keys for the selected provider.
 
 ## Getting Started
 
@@ -35,9 +35,11 @@ sudo cat .env | grep MYTHIC_ADMIN_PASSWORD
 Sage uses the following **CASE SENSITIVE** settings/keys to determine how to interact with models:
 
 - `provider` - Who is providing the model (e.g., Anthropic, Amazon Bedrock, LiteLLM, OpenAI, etc.)? 
+  - Many model providers (e.g., LiteLLM, Ollama, LM Studio) use the OpenAI API spec; select OpenAI in this case
 - `model` - The model string that the provider uses to determine which model to use for inference (e.g., `gpt-4o-mini` or `us.anthropic.claude-3-5-sonnet-20241022-v2:0`)
 - `API_ENDPOINT` - Where to send HTTP request for the model provider (e.g. `https://api.openai.com/v1` or `http://127.0.0.1:11434/v1`)
   - This key is not used for Amazon Bedrock calls and can be left blank
+  - Can be left blank if using standard API for OpenAI or Anthropic
 - `API_KEY` - The API key needed to authenticate to the model provider (e.g., `sk-az1RLw7XUWGXGUBcSgsNT5BlbkFJdbGbUgbbk7BUG9y6ezzb`)
 - Amazon Bedrock
   - `AWS_ACCESS_KEY_ID`
@@ -78,29 +80,30 @@ Sage is a _different_ kind of Mythic agent because it is not an agent that runs 
 
 In order to interact with Anthropic, you must set the following values:
 
-- API_KEY (e.g., `sk-ant-api03-abc123XYZ456_DEF789ghi0JKLmno1PQRsTu2vWXyz34AB56CDef78GHIjk9LMN_OPQRSTUVWXYZabcdef0123456789-ABCDEFG`)
-
-Example [model strings](https://docs.anthropic.com/en/docs/about-claude/models/all-models) to us with Anthropic:
-
-- `claude-3-7-sonnet-latest`
-- `claude-sonnet-4-20250514`
+- `provider` : `Anthropic`
+- `model` : `claude-sonnet-4-5-20250929` or `claude-sonnet-4-5`
+  - Example [model strings](https://docs.anthropic.com/en/docs/about-claude/models/all-models) to us with Anthropic
+- `API_ENDPOINT` : Leave blank
+- `API_KEY` :  `sk-ant-api03-abc123XYZ456_DEF789ghi0JKLmno1PQRsTu2vWXyz34AB56CDef78GHIjk9LMN_OPQRSTUVWXYZabcdef0123456789-ABCDEFG`)
 
 ### AWS Bedrock
 
 **You must have an AWS account that has Bedrock permissions AND have access to the desired model in your bedrock configuration**
 
+> **__NOTE:__**: From the aws cli, run the following command to get your AWS secrets: `aws sts get-session-token`
+
 In order to interact with Amazon Bedrock, you must set the following values:
 
-- AWS_ACCESS_KEY_ID
-- AWS_SECRET_ACCESS_KEY
-- AWS_SESSION_TOKEN
-- AWS_DEFAULT_REGION
-
-From the aws cli, run the following command to get your secrets: `aws sts get-session-token`
-
-Example model strings to us with Bedrock:
-
-- `us.anthropic.claude-3-5-sonnet-20241022-v2:0`
+- `provider` : `Bedrock`
+- `model` : `us.anthropic.claude-3-5-sonnet-20241022-v2:0`
+  - Example [model strings](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
+  - The first part is the inference [region](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html) (e.g., `us` or `global`)
+- `API_ENDPOINT` : Leave blank
+- `API_KEY` : Leave blank
+- `AWS_ACCESS_KEY_ID` : `AKIAI44QH8DHBEXAMPLE`
+- `AWS_SECRET_ACCESS_KEY` : `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`
+- `AWS_SESSION_TOKEN` : `IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZVERYLONGSTRINGEXAMPLE`
+- `AWS_DEFAULT_REGION` : `us-east-1`
 
 ### OpenAI
 
@@ -110,12 +113,11 @@ Sage can interact with any OpenAI API capable application (e.g., ollama, OpenWeb
 
 In order to interact with OpenAI's API, you must set the following: Es
 
-- API_KEY (e.g., `sk-az1RLw7XUWGXGUBcSgsNT5BlbkFJdbGbUgbbk7BUG9y6ezzb`)
-- API_ENDPOINT (e.g. `https://api.openai.com/v1`)
-
-Example model strings to use with OpenAI
-
-- `gpt-4o-mini`
+- `provider` : `OpenAI`
+- `model` : `gpt-4o-mini`
+  - [model strings](https://platform.openai.com/docs/models)
+- `API_KEY` : `sk-az1RLw7XUWGXGUBcSgsNT5BlbkFJdbGbUgbbk7BUG9y6ezzb`
+- `API_ENDPOINT` : OPTIONAL or `https://api.openai.com/v1`
 
 #### ollama
 
@@ -125,14 +127,15 @@ Alternatively create a Docker compose file with
 
 In order to interact with an ollama, you must set the following:
 
-- Provider: `OpenAI`
-- Model: `qwen3:1.7b` (Model must support tools)
-- API_ENDPOINT (e.g., `http://127.0.0.1:11434/v1`)
-- API_KEY: `dummy-ollama-key`
+- `provider`: `OpenAI`
+- `model`: `qwen3:1.7b`
+  - The selected model must support tools
+- `API_ENDPOINT`: `http://127.0.0.1:11434/v1`
+- `API_KEY`: `dummy-ollama-key`
 
 ## Custom SSL Certificates
 
-If your LLM provider requires custom SSL/TLS certificates (e.g., corporate proxy with custom CA, self-signed certificates, or internal certificate authorities), Sage supports loading a custom certificate bundle by setting the `SSL_CERT_FILE` environment variable.
+If your LLM provider requires custom SSL/TLS certificates (e.g., corporate proxy with custom CA, self-signed certificates, or internal certificate authorities), Sage supports loading a custom certificate bundle by setting the `SSL_CERT_FILE` environment variable. This can be useful for an internally hosted LiteLLM instance.
 
 ### Setup
 
@@ -228,6 +231,76 @@ export RABBITMQ_PASSWORD="K5SHkn1fk2pcT0YkQxTTMgO5gFwjiQ"
 python3 main.py
 ```
 
+## Conversation State & Persistence
+
+Sage maintains conversation state and history using a SQLite database that enables multi-turn conversations and recovery from interruptions.
+
+### What is sage.db?
+
+`sage.db` is a SQLite database used by LangGraph's checkpoint system to persist conversation state. It stores complete conversation histories, agent states, and message flows across all Sage interactions.
+
+### What Does sage.db Store?
+
+The database contains:
+- **Conversation Messages**: All user inputs (HumanMessage), AI responses (AIMessage), and tool execution results (ToolMessage)
+- **Multi-Agent State**: Isolated message channels for each specialist agent (Supervisor, Generalist, Mythic_Operator, Mythic_Payload)
+- **Message Sequences**: Ordering information to maintain conversation flow across agent handoffs
+- **Graph State**: Agent counters, recursion limits, and workflow state
+- **Thread Identifiers**: Unique conversation threads based on Mythic task IDs
+
+### Thread Identification
+
+Each conversation is identified by a unique thread ID composed of:
+```
+thread_id = f"{agent_task_id}-{task_id}"
+```
+
+Where:
+- `agent_task_id`: Mythic's AgentTaskID for the specific callback interaction
+- `task_id`: Mythic's Task.ID for the specific command issued
+
+This ensures each Sage task maintains its own isolated conversation context.
+
+### Use Cases
+
+The checkpoint system enables:
+1. **Conversation Continuity**: Multi-turn conversations where context is preserved across multiple commands
+2. **Recursion Recovery**: When complex tasks hit recursion limits, state is preserved and can be resumed with "continue"
+3. **Agent Handoffs**: Supervisor can delegate to specialist agents while maintaining conversation history
+4. **Progress Tracking**: Complete audit trail of what agents have done and decided during task execution
+
+### Data Location
+
+- **Local development**: `Payload_Type/sage/sage.db`
+- **Mythic deployment**: `mythic/InstalledServices/sage/Payload_Type/sage/sage.db`
+- **Note**: This file is excluded from version control but preserved in the repository structure
+
+### Privacy Considerations
+
+The `sage.db` file contains:
+- Complete conversation histories with your LLM interactions
+- Task details and responses from Mythic API calls
+- Tool execution results and agent reasoning
+
+This data persists across Sage container restarts and may contain sensitive operational information. Consider the database contents when sharing the Sage directory or backing up data.
+
+### Maintenance
+
+The database grows over time as conversations accumulate. If you need to clear conversation history:
+
+```bash
+# Stop the Sage container first
+sudo ./mythic-cli stop sage
+
+# Remove the database file
+rm mythic/InstalledServices/sage/Payload_Type/sage/sage.db
+
+# Restart Sage (database will be recreated)
+sudo ./mythic-cli start sage
+```
+
+**Note**: Deleting sage.db removes all conversation history but does not affect Sage's ability to function. A new database will be created automatically on startup.
+
 ## Phoenix Observability
 
 Sage includes integrated observability and tracing powered by [Phoenix](https://github.com/Arize-ai/phoenix) from Arize AI. Phoenix provides real-time monitoring, visualization, and debugging of LLM interactions.
@@ -267,6 +340,21 @@ All LLM traces, spans, and observability data are stored in this local database 
 
 - **GitHub**: [https://github.com/Arize-ai/phoenix](https://github.com/Arize-ai/phoenix)
 - **Documentation**: [https://docs.arize.com/phoenix](https://docs.arize.com/phoenix)
+
+## LangSmith
+
+> LangSmith Observability gives you complete visibility into agent behavior with tracing, real-time monitoring, alerting, and high-level insights into usage.
+
+Sage uses LangChain and therefore you can also use [LangSmith](https://www.langchain.com/langsmith/observability) to view AI agent system traces.
+
+To use LangSmith, export the following environment variables before Sage is started:
+
+```
+export LANGSMITH_TRACING=true
+export LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+export LANGSMITH_PROJECT=Sage
+export LANGSMITH_API_KEY=lsv2_pt_example_langsmith_api_key
+```
 
 ## Known Limitations
 
