@@ -195,26 +195,215 @@ MIIDXTCCAkWgAwIBAgIJAKJ... (Another certificate if needed)
 2. Verify file is in `Payload_Type/sage/certs/` directory
 3. Restart the Sage container after adding the certificate
 
-## Model Context Protocol (MCP)
+## Commands
 
-Sage can connect to Stdio MCP servers and use the provided tools/functions with interacting with a model using the `mcp-connect` command.
+Sage provides the following Mythic commands for interacting with AI models and MCP servers.
 
-> **__NOTE:__** StdIO MCP servers must be running in the same location as Sage container
+### chat
 
-Stdio MCP server require Sage to launch the process and then connect to the child process. If you are using the Sage Docker container, everything you need to run for the MCP server must be in the container. Alternatively, you can run Sage locally on the same host Mythic is running as and connect that way.
+Multi-turn interactive chat session with an AI model. Supports back-and-forth conversation with context preserved across messages. New chats means a brand new context.
 
-For example, to connect to the built-in Mythic MCP server, you must have `uv`, `python3`, and the source code in the container. For this MCP server, the `command` would be `uv` and you would create one `argument` for each of these:
+```
+chat -prompt <prompt>
+```
 
-- `--directory`
-- `/Mythic/mcp/mythic` - The location where Mythic MCP server source code is
-- `run`
-- `main.py`
-- `mythic_admin` - The Mythic username to connect to the API with
-- `SuperSecretPassword` - The password for the Mythic User to connect to the API with
-- `192.168.1.100` - Mythic's IP address; Don't use the loopback if your running Sage in a container
-- `7443` - The port that Mythic is listening on
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prompt` | Yes | The prompt to send to the model |
+| `tools` | No | Enable tool use (default: true) |
+| `verbose` | No | Show verbose output of all messages (default: false) |
+| `provider` | No | Override the model provider |
+| `model` | No | Override the model |
+| `API_ENDPOINT` | No | Override the API endpoint |
+| `API_KEY` | No | Override the API key |
+| `AWS_ACCESS_KEY_ID` | No | AWS credentials for Bedrock |
+| `AWS_SECRET_ACCESS_KEY` | No | AWS credentials for Bedrock |
+| `AWS_SESSION_TOKEN` | No | AWS credentials for Bedrock |
+| `AWS_DEFAULT_REGION` | No | AWS region for Bedrock |
 
-> **__NOTE:__** MYTHIC MCP IS ALREADY INSTALLED IN THE CONTAINER AT /Mythic/mcp/mythic
+**Example:**
+```
+chat -prompt "Tell me about active callbacks in Mythic"
+```
+
+### query
+
+Send a single query to a model and receive a single response. Unlike `chat`, this does not maintain conversation history.
+
+```
+query -prompt <prompt>
+```
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prompt` | Yes | The prompt to send to the model |
+| `tools` | No | Enable tool use (default: true) |
+| `verbose` | No | Show verbose output (default: false) |
+| `provider` | No | Override the model provider |
+| `model` | No | Override the model |
+| `API_ENDPOINT` | No | Override the API endpoint |
+| `API_KEY` | No | Override the API key |
+| `AWS_*` | No | AWS credentials for Bedrock |
+
+**Example:**
+```
+query -prompt "What is the capital of France?"
+```
+
+### list
+
+List all available models for the configured provider.
+
+```
+list
+```
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `provider` | No | Override the model provider |
+| `API_ENDPOINT` | No | Override the API endpoint |
+| `API_KEY` | No | Override the API key |
+
+**Example:**
+```
+list
+```
+
+> **Note:** Listing models for Bedrock is not currently supported. Use the AWS CLI instead.
+
+### mcp-connect
+
+Connect to an MCP (Model Context Protocol) server. Supports STDIO, SSE, and Streamable HTTP transports.
+
+```
+mcp-connect -name <server_name> -connection_type <stdio|sse|streamable_http> [options]
+```
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `name` | Yes | Unique name for the MCP server connection |
+| `connection_type` | Yes | Type of connection: `stdio`, `sse`, or `streamable_http` |
+| `command` | STDIO | Command to execute for STDIO MCP server |
+| `arguments` | STDIO | Array of command arguments |
+| `cwd` | No | Working directory for STDIO command |
+| `url` | SSE/HTTP | URL for SSE or HTTP streaming connection |
+| `headers` | No | HTTP headers (format: `Key: Value`) |
+| `timeout` | No | Connection timeout in seconds (default: 30) |
+| `sse_read_timeout` | No | SSE read timeout in seconds (default: 300) |
+| `terminate_on_close` | No | Terminate HTTP connection on close (default: true) |
+| `ssl_verify` | No | Verify SSL certificates (default: true) |
+
+**Examples:**
+
+STDIO connection to Mythic MCP server:
+```
+mcp-connect -name mythic -connection_type stdio -command uv -arguments --directory -arguments /Mythic/mcp/mythic -arguments run -arguments main.py -arguments mythic_admin -arguments SuperSecretPassword -arguments 192.168.1.100 -arguments 7443
+```
+
+SSE connection:
+```
+mcp-connect -name myserver -connection_type sse -url https://example.com/mcp/sse
+```
+
+SSE connection without SSL verification (development only):
+```
+mcp-connect -name myserver -connection_type sse -url https://example.com/mcp/sse -ssl_verify false
+```
+
+### mcp-disconnect
+
+Disconnect from a connected MCP server.
+
+```
+mcp-disconnect -name <server_name>
+```
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `name` | Yes | Name of the MCP server to disconnect |
+
+**Example:**
+```
+mcp-disconnect -name mythic
+```
+
+### mcp-list
+
+List all connected MCP servers and their available tools with descriptions and parameters.
+
+```
+mcp-list
+```
+
+**Example Output:**
+```
+Connected MCP Servers: 1
+Total Tools Available: 5
+==================================================
+
+Server: mythic
+  Connection Type: stdio
+  Tools: 5
+  Available Tools:
+    - list_callbacks
+      Description: List all callbacks in Mythic
+      Parameters:
+        - include_archived (boolean): Include archived callbacks
+    - create_task
+      Description: Create a new task for a callback
+      Parameters:
+        - callback_id* (string): The callback ID
+        - command* (string): The command to execute
+```
+
+### mcp-call
+
+Directly invoke an MCP tool with specified arguments.
+
+> **NOTE**: MCP tool names and arguments are shown after using the `mcp-connect` or `mcp-list` commands
+
+```
+mcp-call -tool <tool_name> [-server <server_name>] -args <key> -args <value> ...
+```
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `tool` | Yes | Name of the MCP tool to invoke |
+| `server` | No | Server name (required if multiple servers have the same tool names) |
+| `args` | No | Tool arguments as alternating key-value pairs |
+
+**Examples:**
+
+Call a tool with no arguments:
+```
+mcp-call -tool list_callbacks
+```
+
+Call a tool with arguments:
+```
+mcp-call -tool get_callback -args callback_id -args 123
+```
+
+Call a tool on a specific server (when tool name conflicts exist):
+```
+mcp-call -tool search -server mythic -args query -args "admin"
+```
+
+> **Note:** Use `mcp-list` to see available tools and their parameter names. Required parameters are marked with `*`.
+
+### exit
+
+Internal Mythic command for callback table functionality. Does nothing when executed directly.
+
+```
+exit
+```
 
 ## Run Sage Locally
 

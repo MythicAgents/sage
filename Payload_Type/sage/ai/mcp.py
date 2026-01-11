@@ -1,16 +1,56 @@
 import asyncio
 import logging
+import traceback
+import warnings
 from datetime import timedelta
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+import httpx
 from mcp import ClientSession
 from langchain_mcp_adapters.tools import load_mcp_tools, convert_mcp_tool_to_langchain_tool
 from langchain_mcp_adapters.sessions import Connection, StdioConnection, SSEConnection, StreamableHttpConnection, create_session
 from langchain_core.tools import BaseTool
 
 from mythic_container.logging import logger
+
+
+# Filter to suppress noisy SSE ping messages from MCP libraries
+class SSEPingFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress "Unknown SSE event: ping" messages
+        if "Unknown SSE event: ping" in record.getMessage():
+            # Uncomment below to log at DEBUG level instead of suppressing entirely
+            # logger.debug(f"[MCP SSE] {record.getMessage()}")
+            return False
+        return True
+
+# Apply filter to root logger and all MCP/SSE-related loggers
+_sse_filter = SSEPingFilter()
+for logger_name in [
+    "",  # root logger
+    "mcp",
+    "mcp.client",
+    "mcp.client.sse",
+    "mcp.client.streamable_http",
+    "langchain_mcp_adapters",
+    "httpx",
+    "httpx_sse",
+    "httpcore",
+    "anyio",
+]:
+    logging.getLogger(logger_name).addFilter(_sse_filter)
+
+# Also suppress as a warning in case it's emitted that way
+warnings.filterwarnings("ignore", message=".*Unknown SSE event.*")
+
+
+def _create_insecure_httpx_client(**kwargs) -> httpx.AsyncClient:
+    """Create an httpx client that skips SSL verification (for development/testing only)"""
+    # Remove verify from kwargs if present, we're forcing it to False
+    kwargs.pop('verify', None)
+    return httpx.AsyncClient(verify=False, **kwargs)
 
 
 class ConnectionType(Enum):
@@ -38,6 +78,8 @@ class MCPConnectionConfig:
     sse_read_timeout: Optional[float] = None
     # For Streamable HTTP specific
     terminate_on_close: Optional[bool] = None
+    # SSL verification (set to False to disable - NOT recommended for production)
+    ssl_verify: Optional[bool] = True
     # Additional connection parameters
     session_kwargs: Optional[Dict[str, Any]] = None
     extra_params: Optional[Dict[str, Any]] = None
@@ -53,16 +95,46 @@ class MCPServerManager:
         self.configs: Dict[str, MCPConnectionConfig] = {}
         self._session_contexts: Dict[str, Any] = {}
     
-    async def connect_server(self, config: MCPConnectionConfig) -> bool:
+    async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
         Connect to an MCP server based on the provided configuration
-        
+
         Args:
             config: MCPConnectionConfig object containing connection details
-            
+
         Returns:
-            bool: True if connection successful, False otherwise
+            tuple: (success: bool, error_message: Optional[str])
         """
+        # Set up a temporary exception handler to capture background task errors
+        captured_exceptions: List[str] = []
+        loop = asyncio.get_event_loop()
+        original_handler = loop.get_exception_handler()
+
+        def capture_exception_handler(loop, context):
+            """Temporary exception handler to capture background task errors"""
+            exc = context.get('exception')
+            if exc:
+                # Extract meaningful error from the background task exception
+                exc_str = str(exc)
+                exc_type = type(exc).__name__
+                # Check if it's an SSL/connection error
+                if any(kw in exc_str for kw in ['SSL', 'certificate', 'ConnectError', 'Connection']):
+                    captured_exceptions.append(f"{exc_type}: {exc_str}")
+                elif isinstance(exc, BaseExceptionGroup):
+                    # Try to extract from exception group
+                    for nested in exc.exceptions:
+                        nested_str = str(nested)
+                        if any(kw in nested_str for kw in ['SSL', 'certificate', 'ConnectError', 'Connection']):
+                            captured_exceptions.append(f"{type(nested).__name__}: {nested_str}")
+            # Call original handler if it exists
+            if original_handler:
+                original_handler(loop, context)
+            else:
+                # Default behavior: log the exception
+                logger.debug(f"Background task exception captured: {context.get('message', 'Unknown')}")
+
+        loop.set_exception_handler(capture_exception_handler)
+
         try:
             if config.name in self.sessions:
                 logger.warning(f"Server '{config.name}' already connected. Disconnecting first.")
@@ -90,7 +162,13 @@ class MCPServerManager:
             elif config.connection_type == ConnectionType.SSE:
                 if not config.url:
                     raise ValueError("SSE connection requires 'url' parameter")
-                
+
+                # Use insecure client if SSL verification is disabled
+                client_factory = None
+                if config.ssl_verify is False:
+                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
+                    client_factory = _create_insecure_httpx_client
+
                 sse_connection: SSEConnection = {
                     "transport": "sse",
                     "url": config.url,
@@ -98,14 +176,20 @@ class MCPServerManager:
                     "timeout": config.timeout or 5.0,
                     "sse_read_timeout": config.sse_read_timeout or 300.0,
                     "session_kwargs": config.session_kwargs,
-                    "httpx_client_factory": None
+                    "httpx_client_factory": client_factory
                 }
                 connection = sse_connection
-                
+
             elif config.connection_type == ConnectionType.STREAMABLE_HTTP:
                 if not config.url:
                     raise ValueError("Streamable HTTP connection requires 'url' parameter")
-                
+
+                # Use insecure client if SSL verification is disabled
+                client_factory = None
+                if config.ssl_verify is False:
+                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
+                    client_factory = _create_insecure_httpx_client
+
                 streamable_connection: StreamableHttpConnection = {
                     "transport": "streamable_http",
                     "url": config.url,
@@ -114,7 +198,7 @@ class MCPServerManager:
                     "sse_read_timeout": timedelta(seconds=config.sse_read_timeout or 300),
                     "terminate_on_close": config.terminate_on_close if config.terminate_on_close is not None else True,
                     "session_kwargs": config.session_kwargs,
-                    "httpx_client_factory": None
+                    "httpx_client_factory": client_factory
                 }
                 connection = streamable_connection
                 
@@ -123,10 +207,23 @@ class MCPServerManager:
             
             # Use the create_session context manager
             session_context = create_session(connection)
-            session = await session_context.__aenter__()
-            
+            try:
+                session = await session_context.__aenter__()
+            except BaseException as enter_exc:
+                logger.debug(f"Exception during __aenter__: {type(enter_exc).__name__}: {enter_exc}")
+                raise
+
             # Initialize the session
-            await session.initialize()
+            try:
+                await session.initialize()
+            except BaseException as init_exc:
+                logger.debug(f"Exception during initialize: {type(init_exc).__name__}: {init_exc}")
+                # Try to clean up the session context
+                try:
+                    await session_context.__aexit__(type(init_exc), init_exc, init_exc.__traceback__)
+                except Exception:
+                    pass  # Ignore cleanup errors
+                raise init_exc
             
             # Store the session and connection info
             self.sessions[config.name] = session
@@ -138,44 +235,72 @@ class MCPServerManager:
             await self._load_tools_for_server(config.name)
             
             logger.info(f"Successfully connected to MCP server '{config.name}'")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server '{config.name}': {e}")
-            return False
-    
+            return (True, None)
+
+        except BaseException as e:
+            # Log full traceback for debugging
+            logger.error(f"Failed to connect to MCP server '{config.name}':\n{traceback.format_exc()}")
+
+            # Build error message - prioritize captured background exceptions (SSL errors etc)
+            if captured_exceptions:
+                error_msg = captured_exceptions[0]
+            else:
+                # Just use the exception directly
+                error_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+            return (False, error_msg)
+
+        finally:
+            # Always restore the original exception handler
+            loop.set_exception_handler(original_handler)
+
     async def disconnect_server(self, server_name: str) -> bool:
         """
         Disconnect from an MCP server
-        
+
         Args:
             server_name: Name of the server to disconnect
-            
+
         Returns:
             bool: True if disconnection successful, False otherwise
         """
         try:
             if server_name in self.sessions:
-                # Exit the session context
-                session_context = self._session_contexts[server_name]
-                await session_context.__aexit__(None, None, None)
-                
-                # Clean up stored references
-                del self.sessions[server_name]
-                del self.connections[server_name]
-                del self.configs[server_name]
-                del self._session_contexts[server_name]
-                
+                # Try to gracefully exit the session context
+                # Note: This may fail if called from a different task than where it was created
+                # due to anyio's cancel scope restrictions
+                session_context = self._session_contexts.get(server_name)
+                if session_context:
+                    try:
+                        await session_context.__aexit__(None, None, None)
+                    except RuntimeError as e:
+                        if "cancel scope" in str(e).lower() or "different task" in str(e).lower():
+                            # This is expected when disconnecting from a different task
+                            # The session will be cleaned up when garbage collected
+                            logger.warning(f"Could not gracefully close session for '{server_name}' (cross-task context manager). Resources will be cleaned up on garbage collection.")
+                        else:
+                            raise
+
+                # Clean up stored references regardless of context exit success
+                if server_name in self.sessions:
+                    del self.sessions[server_name]
+                if server_name in self.connections:
+                    del self.connections[server_name]
+                if server_name in self.configs:
+                    del self.configs[server_name]
+                if server_name in self._session_contexts:
+                    del self._session_contexts[server_name]
+
                 # Remove tools for this server
                 if server_name in self.tools:
                     del self.tools[server_name]
-                
+
                 logger.info(f"Disconnected from MCP server '{server_name}'")
                 return True
             else:
                 logger.warning(f"Server '{server_name}' not found in connections")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Failed to disconnect from MCP server '{server_name}': {e}")
             return False
@@ -185,34 +310,31 @@ class MCPServerManager:
         try:
             session = self.sessions[server_name]
             connection = self.connections[server_name]
-            
+
             # Use the langchain_mcp_adapters function to load and convert tools
             langchain_tools = await load_mcp_tools(session, connection=connection)
-            
-            # Check for tool name conflicts with existing tools
-            unique_tools = []
+
+            # Check for tool name conflicts with existing tools (warn but don't exclude)
             existing_tool_names = self._get_all_existing_tool_names()
             conflicts_found = 0
-            
+
             for tool in langchain_tools:
                 if tool.name in existing_tool_names:
-                    logger.error(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Excluding this tool.")
+                    logger.warning(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Use server_name parameter to disambiguate.")
                     conflicts_found += 1
-                else:
-                    unique_tools.append(tool)
-                    existing_tool_names.add(tool.name)
-            
-            self.tools[server_name] = unique_tools
-            
+
+            # Store ALL tools for this server (including ones with conflicting names)
+            self.tools[server_name] = langchain_tools
+
             if conflicts_found > 0:
-                logger.warning(f"Loaded {len(unique_tools)} tools from server '{server_name}' ({conflicts_found} tools excluded due to name conflicts)")
+                logger.warning(f"Loaded {len(langchain_tools)} tools from server '{server_name}' ({conflicts_found} tools have name conflicts with other servers)")
             else:
-                logger.info(f"Loaded {len(unique_tools)} tools from server '{server_name}'")
-            
+                logger.info(f"Loaded {len(langchain_tools)} tools from server '{server_name}'")
+
         except Exception as e:
             logger.error(f"Failed to load tools for server '{server_name}': {e}")
             self.tools[server_name] = []
-    
+
     def _get_all_existing_tool_names(self) -> set:
         """Get a set of all existing tool names from all connected servers"""
         existing_names = set()
@@ -220,6 +342,20 @@ class MCPServerManager:
             for tool in server_tools:
                 existing_names.add(tool.name)
         return existing_names
+
+    def get_servers_with_tool(self, tool_name: str) -> List[str]:
+        """Get list of server names that have a tool with the given name"""
+        servers = []
+        for server_name, tools in self.tools.items():
+            for tool in tools:
+                if tool.name == tool_name:
+                    servers.append(server_name)
+                    break
+        return servers
+
+    def has_tool_conflict(self, tool_name: str) -> bool:
+        """Check if a tool name exists on multiple servers"""
+        return len(self.get_servers_with_tool(tool_name)) > 1
     
     def get_all_tools(self) -> List[BaseTool]:
         """
@@ -294,21 +430,31 @@ class MCPServerManager:
             for name in self.sessions.keys():
                 await self._load_tools_for_server(name)
     
-    async def get_tool_by_name(self, tool_name: str) -> Optional[BaseTool]:
+    async def get_tool_by_name(self, tool_name: str, server_name: Optional[str] = None) -> Optional[BaseTool]:
         """
-        Get a specific tool by name from any connected server
-        
+        Get a specific tool by name, optionally from a specific server
+
         Args:
             tool_name: Name of the tool to find
-            
+            server_name: Optional server name to limit search to
+
         Returns:
             The BaseTool instance if found, None otherwise
         """
-        for tools in self.tools.values():
-            for tool in tools:
+        if server_name:
+            # Search only the specified server
+            server_tools = self.tools.get(server_name, [])
+            for tool in server_tools:
                 if tool.name == tool_name:
                     return tool
-        return None
+            return None
+        else:
+            # Search all servers, return first match
+            for tools in self.tools.values():
+                for tool in tools:
+                    if tool.name == tool_name:
+                        return tool
+            return None
     
     def get_tools_summary(self) -> Dict[str, Any]:
         """
@@ -364,6 +510,7 @@ def create_stdio_config(name: str, command: str, args: List[str] | None,
 
 def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None,
                      timeout: float | None = None, sse_read_timeout: float | None = None,
+                     ssl_verify: bool | None = True,
                      session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for SSE MCP connection"""
     return MCPConnectionConfig(
@@ -373,6 +520,7 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
         headers=headers,
         timeout=timeout,
         sse_read_timeout=sse_read_timeout,
+        ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
         extra_params=kwargs
     )
@@ -381,6 +529,7 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
 def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] | None = None,
                                  timeout: float | None = None, sse_read_timeout: float | None = None,
                                  terminate_on_close: bool | None = None,
+                                 ssl_verify: bool | None = True,
                                  session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for Streamable HTTP MCP connection"""
     return MCPConnectionConfig(
@@ -391,6 +540,7 @@ def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] |
         timeout=timeout,
         sse_read_timeout=sse_read_timeout,
         terminate_on_close=terminate_on_close,
+        ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
         extra_params=kwargs
     )

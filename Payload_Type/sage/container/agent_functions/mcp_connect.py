@@ -107,8 +107,18 @@ class MCPConnectArguments(TaskArguments):
             parameter_group_info=[ParameterGroupInfo(required=False, ui_position=10)]
         )
 
+        ssl_verify = CommandParameter(
+            name="ssl_verify",
+            display_name="SSL Verify",
+            cli_name="ssl_verify",
+            type=ParameterType.Boolean,
+            description="[SSE/HTTP] Verify SSL certificates (set to false to skip verification - NOT recommended for production)",
+            default_value=True,
+            parameter_group_info=[ParameterGroupInfo(required=False, ui_position=11)]
+        )
+
         # Add all the parameters
-        self.args = [name, connection_type, command, arguments, cwd, url, headers, timeout, sse_read_timeout, terminate_on_close]
+        self.args = [name, connection_type, command, arguments, cwd, url, headers, timeout, sse_read_timeout, terminate_on_close, ssl_verify]
 
     async def parse_arguments(self):
         if len(self.command_line) == 0:
@@ -228,12 +238,17 @@ class MCPConnectCommand(CommandBase):
                     return response
                 sse_read_timeout = float(sse_read_timeout_arg)
 
+                ssl_verify = taskData.args.get_arg("ssl_verify")
+                if ssl_verify is None:
+                    ssl_verify = True
+
                 config = create_sse_config(
                     name=name,
                     url=url,
                     headers=headers_dict,
                     timeout=timeout,
                     sse_read_timeout=sse_read_timeout,
+                    ssl_verify=ssl_verify,
                     session_kwargs=None
                 )
 
@@ -280,6 +295,10 @@ class MCPConnectCommand(CommandBase):
                         return response
                     terminate_on_close = terminate_on_close_arg
 
+                ssl_verify = taskData.args.get_arg("ssl_verify")
+                if ssl_verify is None:
+                    ssl_verify = True
+
                 config = create_streamable_http_config(
                     name=name,
                     url=url,
@@ -287,6 +306,7 @@ class MCPConnectCommand(CommandBase):
                     timeout=timeout,
                     sse_read_timeout=sse_read_timeout,
                     terminate_on_close=terminate_on_close,
+                    ssl_verify=ssl_verify,
                     session_kwargs=None
                 )
 
@@ -296,28 +316,80 @@ class MCPConnectCommand(CommandBase):
                 return response
 
             # Attempt to connect
-
-            success = await MCPManager.connect_server(config)
+            success, error_msg = await MCPManager.connect_server(config)
 
             if success:
                 # Get server info and tools
                 server_info = MCPManager.get_server_info(name)
                 tools = MCPManager.get_tools_by_server(name)
 
-                result_message = f"✅ Successfully connected to MCP server '{name}'\n"
+                result_message = f"Successfully connected to MCP server '{name}'\n"
                 result_message += f"Connection Type: {connection_type.value}\n"
                 result_message += f"Tools Available: {len(tools)}\n"
-                
+
                 if tools:
                     result_message += "\nAvailable Tools:\n"
                     for tool in tools:
-                        result_message += f"  • {tool.name}: {tool.description}\n"
-                
+                        result_message += f"  - {tool.name}\n"
+                        if tool.description:
+                            # Truncate long descriptions
+                            desc = tool.description[:200] + "..." if len(tool.description) > 200 else tool.description
+                            result_message += f"    Description: {desc}\n"
+
+                        # Try multiple ways to get parameter schema
+                        properties = {}
+                        required = []
+
+                        # Method 1: Use tool.args property (returns dict directly)
+                        if hasattr(tool, 'args') and tool.args:
+                            properties = tool.args
+                            # args doesn't include required info, try to get from args_schema
+                            if hasattr(tool, 'args_schema') and tool.args_schema:
+                                try:
+                                    if hasattr(tool.args_schema, 'model_json_schema'):
+                                        schema = tool.args_schema.model_json_schema()
+                                    elif hasattr(tool.args_schema, 'schema'):
+                                        schema = tool.args_schema.schema()
+                                    else:
+                                        schema = {}
+                                    required = schema.get('required', [])
+                                except Exception:
+                                    pass
+
+                        # Method 2: Try args_schema directly if args didn't work
+                        if not properties and hasattr(tool, 'args_schema') and tool.args_schema:
+                            try:
+                                if hasattr(tool.args_schema, 'model_json_schema'):
+                                    schema = tool.args_schema.model_json_schema()
+                                elif hasattr(tool.args_schema, 'schema'):
+                                    schema = tool.args_schema.schema()
+                                else:
+                                    schema = {}
+                                properties = schema.get('properties', {})
+                                required = schema.get('required', [])
+                            except Exception:
+                                pass
+
+                        if properties:
+                            result_message += f"    Parameters:\n"
+                            for param_name, param_info in properties.items():
+                                if isinstance(param_info, dict):
+                                    param_type = param_info.get('type', 'any')
+                                    param_desc = param_info.get('description', '')
+                                else:
+                                    param_type = str(param_info)
+                                    param_desc = ''
+                                req_marker = "*" if param_name in required else ""
+                                result_message += f"      - {param_name}{req_marker} ({param_type})"
+                                if param_desc:
+                                    result_message += f": {param_desc[:100]}"
+                                result_message += "\n"
+
                 logger.info(f"Successfully connected to MCP server '{name}' with {len(tools)} tools")
-                
+
             else:
                 response.Success = False
-                response.Error = f"Failed to connect to MCP server '{name}'. Check server configuration and availability."
+                response.Error = f"Failed to connect to MCP server '{name}': {error_msg}"
                 return response
 
         except Exception as e:
@@ -344,4 +416,5 @@ class MCPConnectCommand(CommandBase):
         if not resp.Success:
             logger.error(f"Failed to update callback for task {taskData.Task.ID}: {resp.Error}")
 
+        response.Completed = True
         return response

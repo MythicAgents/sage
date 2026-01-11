@@ -18,6 +18,7 @@ from typing import Any
 from uuid import UUID
 from .mythic_tools import MythicTools
 from .tool_cache import ToolCache
+from ai.mcp import MCPManager
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -44,6 +45,7 @@ class SageState(MessagesState):
     generalist_messages: Annotated[list[AnyMessage], operator.add]
     mythic_operator_messages: Annotated[list[AnyMessage], operator.add]
     mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
+    mcp_manager_messages: Annotated[list[AnyMessage], operator.add]
     _message_seq: Annotated[int, _max_seq_reducer]  # Global sequence counter with max reducer
 
 
@@ -230,6 +232,7 @@ class Model:
             "generalist_messages": [],
             "mythic_operator_messages": [],
             "mythic_payload_messages": [],
+            "mcp_manager_messages": [],
             "recursion_summary_requested": False,
             "recursion_handback": False,
         }
@@ -410,10 +413,12 @@ class Model:
             .add_node("Generalist", self._generalist_agent())
             .add_node("Mythic_Operator", self._mythic_operator_agent())
             .add_node("Mythic_Payload", self._mythic_payload_agent())
+            .add_node("MCP_Manager", self._mcp_manager_agent())
             .add_edge(START, "Supervisor")
             .add_edge("Generalist", "Supervisor")
             .add_edge("Mythic_Operator", "Supervisor")
             .add_edge("Mythic_Payload", "Supervisor")
+            .add_edge("MCP_Manager", "Supervisor")
             .compile(checkpointer=self.memory, name="Sage")
         )
 
@@ -631,7 +636,7 @@ class Model:
             # Tag new messages with sequence numbers for chronological ordering
             # Compute from max of existing messages to avoid collisions with handoff-created messages
             max_seq = 0
-            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages"]:
+            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
                 for existing_msg in state.get(ch_key, []):
                     seq = _get_seq(existing_msg)
                     if seq > max_seq:
@@ -713,6 +718,7 @@ class Model:
                                 "Mythic_Operator": "mythic_operator_messages",
                                 "Mythic_Payload": "mythic_payload_messages",
                                 "Generalist": "generalist_messages",
+                                "MCP_Manager": "mcp_manager_messages",
                             }
                             calling_agent_channel_key = channel_map.get(calling_agent)
                             if calling_agent_channel_key:
@@ -983,6 +989,87 @@ class Model:
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
+    def _mcp_manager_agent(self):
+        name = "MCP_Manager"
+
+        # Build connected servers info for prompt
+        servers_text = ""
+        connected = MCPManager.get_connected_servers()
+        if connected:
+            summary = MCPManager.get_tools_summary()
+            servers_text = f"\n**Currently Connected MCP Servers:** {len(connected)}\n"
+            for server_name in connected:
+                server_info = summary.get("server_summaries", {}).get(server_name, {})
+                tool_count = server_info.get("tool_count", 0)
+                tool_names = server_info.get("tool_names", [])
+                tools_preview = ', '.join(tool_names[:5])
+                if len(tool_names) > 5:
+                    tools_preview += '...'
+                servers_text += f"- {server_name}: {tool_count} tools ({tools_preview})\n"
+        else:
+            servers_text = "\n**No MCP servers currently connected.** Inform the user to use `mcp-connect` command first.\n"
+
+        prompt = f"""
+        You are an MCP (Model Context Protocol) Manager Agent responsible for interacting with external tools
+        provided by connected MCP servers.
+
+        MCP servers extend Sage's capabilities by providing specialized tools for tasks like:
+        - Web fetching and API interactions
+        - File system operations
+        - Database queries
+        - Custom integrations
+
+        {servers_text}
+
+        **Your Responsibilities:**
+        - Execute MCP tool calls when delegated tasks that require MCP capabilities
+        - Interpret tool results and provide clear summaries
+        - Handle tool errors gracefully and suggest alternatives
+        - If no MCP servers are connected, inform the user how to connect one using the `mcp-connect` command
+
+        **Guidelines:**
+        - Always check which tools are available before attempting to use them
+        - Provide context about what each tool does when using it
+        - If a tool call fails, explain the error and suggest next steps
+        - Monitor remaining_steps and use summarize_and_handback when approaching limits (4 or fewer remaining)
+
+        **Available MCP Tools:**
+        Your tools come from connected MCP servers. Tool availability depends on which servers are connected.
+        Use the tools naturally based on the task requirements.
+
+        **Recursion Limit Management:**
+        - You have access to a `remaining_steps` value that shows how many more operations can be performed.
+        - When remaining_steps is 4 or fewer, you MUST use the `summarize_and_handback` tool instead of continuing.
+        - In your summary, include what you've accomplished and what still needs to be done.
+        """
+
+        if not self.state["mcp_manager_messages"]:
+            self.state["mcp_manager_messages"].append(SystemMessage(content=prompt.strip()))
+
+        # Get MCP tools
+        mcp_tools = MCPManager.get_all_tools()
+
+        # Add handback tool for recursion limit management
+        handback_tool = _create_summarize_handback_tool()
+
+        tools = mcp_tools + [handback_tool]
+
+        # Handle case when no MCP tools available
+        if not mcp_tools:
+            logger.warning("MCP_Manager agent initialized with no MCP tools available")
+
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for MCP Manager Agent.")
+
+        agent = create_agent(
+            model=llm,
+            tools=tools,
+            name=name,
+            system_prompt=prompt,
+        )
+        return self._wrap_create_agent(agent, "mcp_manager_messages", name)
+
     def _supervisor_agent(self):
         name = "Supervisor"
         prompt = """
@@ -991,8 +1078,16 @@ class Model:
             You have access to the following agents, each with their own expertise:
 
             1. **Generalist Agent**: Handles general inquiries and tasks that do not fit for other agents.
-            2. **Mythic Operator Agent**: Handles prompts or tasks issued to Mythic from a human operator interacting with Mythic and to take actions within Mythic.
+            2. **Mythic Operator Agent**: Handles ALL Mythic C2 operations including callbacks, agents, tasks, files, and reconnaissance. Has native tools for get_all_active_callbacks, issue_task, get_task_history, etc.
             3. **Mythic Payload Agent**: Helps create Mythic payloads within the C2 framework.
+            4. **MCP Manager Agent**: Handles tasks requiring EXTERNAL tools from connected MCP servers (web fetching, external APIs, third-party integrations). Only use for capabilities NOT provided by other agents.
+
+            **CRITICAL: Agent Routing Priority:**
+            Always prefer built-in agents over MCP_Manager when they have relevant capabilities:
+            - Callbacks, agents, tasks, commands, files in Mythic → **Mythic_Operator** (NOT MCP_Manager)
+            - Payload creation, C2 profiles, build options → **Mythic_Payload** (NOT MCP_Manager)
+            - General questions, explanations, advice → **Generalist**
+            - ONLY use MCP_Manager for external/third-party tools that other agents cannot handle
 
             Your responsibilities include:
             - Understanding the user's high-level goals and breaking them into smaller, manageable tasks.
@@ -1087,17 +1182,22 @@ class Model:
         # Handoffs
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
-            description="Assign task to a generalist agent.",
+            description="Assign task to Generalist for general questions, explanations, advice, and tasks that don't require Mythic operations or external tools.",
         )
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
                 agent_name="Mythic_Operator",
-                description="Assign task to a mythic operator agent.",
+                description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of MCP_Manager.",
             )
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
                 agent_name="Mythic_Payload",
-                description="Assign task to a mythic payload agent.",
+                description="Assign task to Mythic Payload for creating Mythic payloads, configuring C2 profiles, and build options.",
+            )
+
+        assign_to_mcp_manager_agent = _create_handoff_tool(
+                agent_name="MCP_Manager",
+                description="Assign task to MCP Manager ONLY for external third-party tools from connected MCP servers (web fetching, external APIs, non-Mythic integrations). Do NOT use for Mythic operations - use Mythic_Operator instead.",
             )
 
         # Completion tool - use when task is done
@@ -1111,6 +1211,7 @@ class Model:
             assign_to_generalist_agent,
             assign_to_mythic_operator_agent,
             assign_to_mythic_payload_agent,
+            assign_to_mcp_manager_agent,
             respond_to_user_tool,
             request_continuation_tool,
         ]
@@ -1396,6 +1497,7 @@ class Model:
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
+            "mcp_manager_messages",
         ]:
             if ch not in self.state:
                 self.state[ch] = []
@@ -1438,6 +1540,7 @@ class Model:
                 "generalist_messages",
                 "mythic_operator_messages",
                 "mythic_payload_messages",
+                "mcp_manager_messages",
             ]:
                 if ch in resp:
                     self.state[ch] = resp[ch]
@@ -1453,7 +1556,7 @@ class Model:
             # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
             seen_ids = set()
-            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages"]:
+            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"📊 Channel {ch}: {len(ch_msgs)} messages")
                 for idx, msg in enumerate(ch_msgs):
@@ -1578,6 +1681,7 @@ class Model:
                     "generalist_messages",
                     "mythic_operator_messages",
                     "mythic_payload_messages",
+                    "mcp_manager_messages",
                 ]:
                     merged.extend(self.state.get(ch, []))
                 if merged:  # prefer merged if it has data
@@ -1929,6 +2033,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         "Generalist": "generalist_messages",
         "Mythic_Operator": "mythic_operator_messages",
         "Mythic_Payload": "mythic_payload_messages",
+        "MCP_Manager": "mcp_manager_messages",
     }
     target_channel_key = channel_map.get(agent_name)
 
@@ -1940,7 +2045,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         # Compute sequence from max of existing messages in all channels
         # This is more reliable than state._message_seq which may not persist across checkpoints
         max_seq = 0
-        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "messages"]:
+        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "messages"]:
             for msg in runtime.state.get(ch_key, []):
                 seq = _get_seq(msg)
                 if seq > max_seq:
@@ -1981,7 +2086,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
             if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
                 # Check if this channel has recent activity (last message is not too old)
                 # This is a heuristic - the agent that just called a tool is the calling agent
-                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages"]:
+                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
                     # Simple approach: assume the tool was called from whichever non-target channel exists
                     if channel_name != agent_name:
                         current_agent = channel_name
