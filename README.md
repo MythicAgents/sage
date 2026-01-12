@@ -6,6 +6,8 @@
 
 Sage is a virtual Mythic agent that that uses an AI agentic system to operate Mythic and Mythic agents running on compromised hosts. Sage does not run on a compromised host, it runs entirely in the Sage container. Sage leverages external AI model providers (e.g., Anthropic, Ollama, OpenAI) for inference and requires API keys for the selected provider.
 
+**WARNING: DO NOT USE THIS IN A PRODUCTION ENVIRONMENT BECAUSE THERE ARE CURRENTLY NO CONTROLS OR HUMAN-IN-LOOP FOR COMMANDS ISSUED TO MYTHIC AGENTS**
+
 ## Getting Started
 
 > **__NOTE:__** REQUIRES MYTHIC v3.3.1-rc57 OR LATER
@@ -830,5 +832,7 @@ export LANGSMITH_API_KEY=lsv2_pt_example_langsmith_api_key
 This project is still early in development and new features and capabilities will be added. Currently, some known limitations are:
 
 - There's no file upload functionality
+- No Human-in-the-loop to prevent issuing commands that could negatively impact production networks
+- There is no context management and the context window can get full causing errors
 - Chat sessions are not stream based
 - Bedrock provider is limited to Anthropic Claude
