@@ -18,3 +18,4 @@ Payload_Type/sage/.phoenix/*
 
 # SSL certificate bundles - exclude from version control
 Payload_Type/sage/certs/*.pem
+Payload_Type/sage/sage.log
