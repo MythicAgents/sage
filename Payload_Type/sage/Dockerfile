@@ -1,21 +1,22 @@
-FROM itsafeaturemythic/mythic_go_base:latest
+FROM python:3.13-slim-bookworm AS builder
 
-WORKDIR /Mythic
+COPY ["requirements.txt", "requirements.txt"]
+RUN apt-get -y update && \
+    apt-get -y upgrade && \
+    apt-get install --no-install-recommends \
+      software-properties-common apt-utils make build-essential libssl-dev zlib1g-dev libbz2-dev \
+      xz-utils tk-dev libffi-dev liblzma-dev libsqlite3-dev protobuf-compiler \
+      binutils-aarch64-linux-gnu libc-dev-arm64-cross -y
+RUN python3 -m pip wheel --wheel-dir /wheels -r requirements.txt
+
+FROM python:3.13-slim-bookworm
+
+COPY --from=builder /wheels /wheels
+
+RUN pip install --no-cache /wheels/*
+
+WORKDIR /Mythic/
 
 COPY [".", "."]
 
-## Install dependencies
-RUN apt update
-RUN apt install -y python3 python3-pip git
-RUN pip3 install uv
-
-## Setup mythic mcp
-WORKDIR /Mythic/mcp/mythic
-RUN uv venv
-RUN uv pip install gql[aiohttp,websockets] fastmcp mythic
-
-# Build the container
-WORKDIR /Mythic/container
-RUN go build -o /sage
-
-CMD ["/sage"]
+CMD ["python3", "main.py"]

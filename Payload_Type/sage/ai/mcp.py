@@ -1,0 +1,546 @@
+import asyncio
+import logging
+import traceback
+import warnings
+from datetime import timedelta
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+import httpx
+from mcp import ClientSession
+from langchain_mcp_adapters.tools import load_mcp_tools, convert_mcp_tool_to_langchain_tool
+from langchain_mcp_adapters.sessions import Connection, StdioConnection, SSEConnection, StreamableHttpConnection, create_session
+from langchain_core.tools import BaseTool
+
+from mythic_container.logging import logger
+
+
+# Filter to suppress noisy SSE ping messages from MCP libraries
+class SSEPingFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress "Unknown SSE event: ping" messages
+        if "Unknown SSE event: ping" in record.getMessage():
+            # Uncomment below to log at DEBUG level instead of suppressing entirely
+            # logger.debug(f"[MCP SSE] {record.getMessage()}")
+            return False
+        return True
+
+# Apply filter to root logger and all MCP/SSE-related loggers
+_sse_filter = SSEPingFilter()
+for logger_name in [
+    "",  # root logger
+    "mcp",
+    "mcp.client",
+    "mcp.client.sse",
+    "mcp.client.streamable_http",
+    "langchain_mcp_adapters",
+    "httpx",
+    "httpx_sse",
+    "httpcore",
+    "anyio",
+]:
+    logging.getLogger(logger_name).addFilter(_sse_filter)
+
+# Also suppress as a warning in case it's emitted that way
+warnings.filterwarnings("ignore", message=".*Unknown SSE event.*")
+
+
+def _create_insecure_httpx_client(**kwargs) -> httpx.AsyncClient:
+    """Create an httpx client that skips SSL verification (for development/testing only)"""
+    # Remove verify from kwargs if present, we're forcing it to False
+    kwargs.pop('verify', None)
+    return httpx.AsyncClient(verify=False, **kwargs)
+
+
+class ConnectionType(Enum):
+    STDIO = "stdio"
+    SSE = "sse"
+    STREAMABLE_HTTP = "streamable_http"
+
+
+@dataclass
+class MCPConnectionConfig:
+    """Configuration for MCP server connection"""
+    name: str
+    connection_type: ConnectionType
+    # For STDIO connections
+    command: Optional[str] = None
+    args: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
+    cwd: Optional[str] = None
+    encoding: Optional[str] = None
+    encoding_error_handler: Optional[str] = None
+    # For SSE and Streamable HTTP connections
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    timeout: Optional[float] = None
+    sse_read_timeout: Optional[float] = None
+    # For Streamable HTTP specific
+    terminate_on_close: Optional[bool] = None
+    # SSL verification (set to False to disable - NOT recommended for production)
+    ssl_verify: Optional[bool] = True
+    # Additional connection parameters
+    session_kwargs: Optional[Dict[str, Any]] = None
+    extra_params: Optional[Dict[str, Any]] = None
+
+
+class MCPServerManager:
+    """Manages multiple MCP server connections and their tools"""
+    
+    def __init__(self):
+        self.sessions: Dict[str, ClientSession] = {}
+        self.connections: Dict[str, Connection] = {}
+        self.tools: Dict[str, List[BaseTool]] = {}
+        self.configs: Dict[str, MCPConnectionConfig] = {}
+        self._session_contexts: Dict[str, Any] = {}
+    
+    async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
+        """
+        Connect to an MCP server based on the provided configuration
+
+        Args:
+            config: MCPConnectionConfig object containing connection details
+
+        Returns:
+            tuple: (success: bool, error_message: Optional[str])
+        """
+        # Set up a temporary exception handler to capture background task errors
+        captured_exceptions: List[str] = []
+        loop = asyncio.get_event_loop()
+        original_handler = loop.get_exception_handler()
+
+        def capture_exception_handler(loop, context):
+            """Temporary exception handler to capture background task errors"""
+            exc = context.get('exception')
+            if exc:
+                # Extract meaningful error from the background task exception
+                exc_str = str(exc)
+                exc_type = type(exc).__name__
+                # Check if it's an SSL/connection error
+                if any(kw in exc_str for kw in ['SSL', 'certificate', 'ConnectError', 'Connection']):
+                    captured_exceptions.append(f"{exc_type}: {exc_str}")
+                elif isinstance(exc, BaseExceptionGroup):
+                    # Try to extract from exception group
+                    for nested in exc.exceptions:
+                        nested_str = str(nested)
+                        if any(kw in nested_str for kw in ['SSL', 'certificate', 'ConnectError', 'Connection']):
+                            captured_exceptions.append(f"{type(nested).__name__}: {nested_str}")
+            # Call original handler if it exists
+            if original_handler:
+                original_handler(loop, context)
+            else:
+                # Default behavior: log the exception
+                logger.debug(f"Background task exception captured: {context.get('message', 'Unknown')}")
+
+        loop.set_exception_handler(capture_exception_handler)
+
+        try:
+            if config.name in self.sessions:
+                logger.warning(f"Server '{config.name}' already connected. Disconnecting first.")
+                await self.disconnect_server(config.name)
+            
+            # Create connection config as dictionary (TypedDict)
+            connection: Connection
+            
+            if config.connection_type == ConnectionType.STDIO:
+                if not config.command:
+                    raise ValueError("STDIO connection requires 'command' parameter")
+                
+                stdio_connection: StdioConnection = {
+                    "transport": "stdio",
+                    "command": config.command,
+                    "args": config.args or [],
+                    "env": config.env,
+                    "cwd": config.cwd,
+                    "encoding": config.encoding or "utf-8",
+                    "encoding_error_handler": "strict",
+                    "session_kwargs": config.session_kwargs
+                }
+                connection = stdio_connection
+                
+            elif config.connection_type == ConnectionType.SSE:
+                if not config.url:
+                    raise ValueError("SSE connection requires 'url' parameter")
+
+                # Use insecure client if SSL verification is disabled
+                client_factory = None
+                if config.ssl_verify is False:
+                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
+                    client_factory = _create_insecure_httpx_client
+
+                sse_connection: SSEConnection = {
+                    "transport": "sse",
+                    "url": config.url,
+                    "headers": config.headers,
+                    "timeout": config.timeout or 5.0,
+                    "sse_read_timeout": config.sse_read_timeout or 300.0,
+                    "session_kwargs": config.session_kwargs,
+                    "httpx_client_factory": client_factory
+                }
+                connection = sse_connection
+
+            elif config.connection_type == ConnectionType.STREAMABLE_HTTP:
+                if not config.url:
+                    raise ValueError("Streamable HTTP connection requires 'url' parameter")
+
+                # Use insecure client if SSL verification is disabled
+                client_factory = None
+                if config.ssl_verify is False:
+                    logger.warning(f"SSL verification disabled for MCP server '{config.name}' - NOT recommended for production")
+                    client_factory = _create_insecure_httpx_client
+
+                streamable_connection: StreamableHttpConnection = {
+                    "transport": "streamable_http",
+                    "url": config.url,
+                    "headers": config.headers,
+                    "timeout": timedelta(seconds=config.timeout or 30),
+                    "sse_read_timeout": timedelta(seconds=config.sse_read_timeout or 300),
+                    "terminate_on_close": config.terminate_on_close if config.terminate_on_close is not None else True,
+                    "session_kwargs": config.session_kwargs,
+                    "httpx_client_factory": client_factory
+                }
+                connection = streamable_connection
+                
+            else:
+                raise ValueError(f"Unsupported connection type: {config.connection_type}")
+            
+            # Use the create_session context manager
+            session_context = create_session(connection)
+            try:
+                session = await session_context.__aenter__()
+            except BaseException as enter_exc:
+                logger.debug(f"Exception during __aenter__: {type(enter_exc).__name__}: {enter_exc}")
+                raise
+
+            # Initialize the session
+            try:
+                await session.initialize()
+            except BaseException as init_exc:
+                logger.debug(f"Exception during initialize: {type(init_exc).__name__}: {init_exc}")
+                # Try to clean up the session context
+                try:
+                    await session_context.__aexit__(type(init_exc), init_exc, init_exc.__traceback__)
+                except Exception:
+                    pass  # Ignore cleanup errors
+                raise init_exc
+            
+            # Store the session and connection info
+            self.sessions[config.name] = session
+            self.connections[config.name] = connection
+            self.configs[config.name] = config
+            self._session_contexts[config.name] = session_context
+            
+            # Load and convert tools
+            await self._load_tools_for_server(config.name)
+            
+            logger.info(f"Successfully connected to MCP server '{config.name}'")
+            return (True, None)
+
+        except BaseException as e:
+            # Log full traceback for debugging
+            logger.error(f"Failed to connect to MCP server '{config.name}':\n{traceback.format_exc()}")
+
+            # Build error message - prioritize captured background exceptions (SSL errors etc)
+            if captured_exceptions:
+                error_msg = captured_exceptions[0]
+            else:
+                # Just use the exception directly
+                error_msg = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+            return (False, error_msg)
+
+        finally:
+            # Always restore the original exception handler
+            loop.set_exception_handler(original_handler)
+
+    async def disconnect_server(self, server_name: str) -> bool:
+        """
+        Disconnect from an MCP server
+
+        Args:
+            server_name: Name of the server to disconnect
+
+        Returns:
+            bool: True if disconnection successful, False otherwise
+        """
+        try:
+            if server_name in self.sessions:
+                # Try to gracefully exit the session context
+                # Note: This may fail if called from a different task than where it was created
+                # due to anyio's cancel scope restrictions
+                session_context = self._session_contexts.get(server_name)
+                if session_context:
+                    try:
+                        await session_context.__aexit__(None, None, None)
+                    except RuntimeError as e:
+                        if "cancel scope" in str(e).lower() or "different task" in str(e).lower():
+                            # This is expected when disconnecting from a different task
+                            # The session will be cleaned up when garbage collected
+                            logger.warning(f"Could not gracefully close session for '{server_name}' (cross-task context manager). Resources will be cleaned up on garbage collection.")
+                        else:
+                            raise
+
+                # Clean up stored references regardless of context exit success
+                if server_name in self.sessions:
+                    del self.sessions[server_name]
+                if server_name in self.connections:
+                    del self.connections[server_name]
+                if server_name in self.configs:
+                    del self.configs[server_name]
+                if server_name in self._session_contexts:
+                    del self._session_contexts[server_name]
+
+                # Remove tools for this server
+                if server_name in self.tools:
+                    del self.tools[server_name]
+
+                logger.info(f"Disconnected from MCP server '{server_name}'")
+                return True
+            else:
+                logger.warning(f"Server '{server_name}' not found in connections")
+                return False
+
+        except Exception as e:
+            logger.error(f"Failed to disconnect from MCP server '{server_name}': {e}")
+            return False
+    
+    async def _load_tools_for_server(self, server_name: str):
+        """Load and convert MCP tools for a specific server"""
+        try:
+            session = self.sessions[server_name]
+            connection = self.connections[server_name]
+
+            # Use the langchain_mcp_adapters function to load and convert tools
+            langchain_tools = await load_mcp_tools(session, connection=connection)
+
+            # Check for tool name conflicts with existing tools (warn but don't exclude)
+            existing_tool_names = self._get_all_existing_tool_names()
+            conflicts_found = 0
+
+            for tool in langchain_tools:
+                if tool.name in existing_tool_names:
+                    logger.warning(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Use server_name parameter to disambiguate.")
+                    conflicts_found += 1
+
+            # Store ALL tools for this server (including ones with conflicting names)
+            self.tools[server_name] = langchain_tools
+
+            if conflicts_found > 0:
+                logger.warning(f"Loaded {len(langchain_tools)} tools from server '{server_name}' ({conflicts_found} tools have name conflicts with other servers)")
+            else:
+                logger.info(f"Loaded {len(langchain_tools)} tools from server '{server_name}'")
+
+        except Exception as e:
+            logger.error(f"Failed to load tools for server '{server_name}': {e}")
+            self.tools[server_name] = []
+
+    def _get_all_existing_tool_names(self) -> set:
+        """Get a set of all existing tool names from all connected servers"""
+        existing_names = set()
+        for server_tools in self.tools.values():
+            for tool in server_tools:
+                existing_names.add(tool.name)
+        return existing_names
+
+    def get_servers_with_tool(self, tool_name: str) -> List[str]:
+        """Get list of server names that have a tool with the given name"""
+        servers = []
+        for server_name, tools in self.tools.items():
+            for tool in tools:
+                if tool.name == tool_name:
+                    servers.append(server_name)
+                    break
+        return servers
+
+    def has_tool_conflict(self, tool_name: str) -> bool:
+        """Check if a tool name exists on multiple servers"""
+        return len(self.get_servers_with_tool(tool_name)) > 1
+    
+    def get_all_tools(self) -> List[BaseTool]:
+        """
+        Get all tools from all connected MCP servers
+        
+        Returns:
+            List of all LangChain BaseTool instances
+        """
+        all_tools = []
+        for server_tools in self.tools.values():
+            all_tools.extend(server_tools)
+        return all_tools
+    
+    def get_tools_by_server(self, server_name: str) -> List[BaseTool]:
+        """
+        Get tools from a specific server
+        
+        Args:
+            server_name: Name of the server
+            
+        Returns:
+            List of LangChain BaseTool instances for the specified server
+        """
+        return self.tools.get(server_name, [])
+    
+    def get_connected_servers(self) -> List[str]:
+        """
+        Get list of all connected server names
+        
+        Returns:
+            List of connected server names
+        """
+        return list(self.sessions.keys())
+    
+    def get_server_info(self, server_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get information about a specific server
+        
+        Args:
+            server_name: Name of the server
+            
+        Returns:
+            Dictionary containing server information or None if not found
+        """
+        if server_name not in self.sessions:
+            return None
+        
+        config = self.configs[server_name]
+        tools_count = len(self.tools.get(server_name, []))
+        
+        return {
+            "name": server_name,
+            "connection_type": config.connection_type.value,
+            "config": config,
+            "tools_count": tools_count,
+            "connected": True
+        }
+    
+    async def refresh_tools(self, server_name: Optional[str] = None):
+        """
+        Refresh tools for a specific server or all servers
+        
+        Args:
+            server_name: Name of server to refresh, or None for all servers
+        """
+        if server_name:
+            if server_name in self.sessions:
+                await self._load_tools_for_server(server_name)
+            else:
+                logger.warning(f"Server '{server_name}' not connected")
+        else:
+            for name in self.sessions.keys():
+                await self._load_tools_for_server(name)
+    
+    async def get_tool_by_name(self, tool_name: str, server_name: Optional[str] = None) -> Optional[BaseTool]:
+        """
+        Get a specific tool by name, optionally from a specific server
+
+        Args:
+            tool_name: Name of the tool to find
+            server_name: Optional server name to limit search to
+
+        Returns:
+            The BaseTool instance if found, None otherwise
+        """
+        if server_name:
+            # Search only the specified server
+            server_tools = self.tools.get(server_name, [])
+            for tool in server_tools:
+                if tool.name == tool_name:
+                    return tool
+            return None
+        else:
+            # Search all servers, return first match
+            for tools in self.tools.values():
+                for tool in tools:
+                    if tool.name == tool_name:
+                        return tool
+            return None
+    
+    def get_tools_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of all tools across all servers
+        
+        Returns:
+            Dictionary with summary information
+        """
+        total_tools = 0
+        server_summaries = {}
+        
+        for server_name, tools in self.tools.items():
+            tool_names = [tool.name for tool in tools]
+            server_summaries[server_name] = {
+                "tool_count": len(tools),
+                "tool_names": tool_names
+            }
+            total_tools += len(tools)
+        
+        return {
+            "total_tools": total_tools,
+            "connected_servers": len(self.sessions),
+            "server_summaries": server_summaries
+        }
+    
+    async def close_all_connections(self):
+        """Close all MCP server connections"""
+        server_names = list(self.sessions.keys())
+        for server_name in server_names:
+            await self.disconnect_server(server_name)
+
+MCPManager = MCPServerManager()
+
+# Convenience functions to create connection configs
+def create_stdio_config(name: str, command: str, args: List[str] | None, 
+                       env: Dict[str, str] | None, cwd: str | None,
+                       encoding: str | None, encoding_error_handler: str | None,
+                       session_kwargs: Dict[str, Any] | None, **kwargs) -> MCPConnectionConfig:
+    """Create a configuration for STDIO MCP connection"""
+    return MCPConnectionConfig(
+        name=name,
+        connection_type=ConnectionType.STDIO,
+        command=command,
+        args=args,
+        env=env,
+        cwd=cwd,
+        encoding=encoding,
+        encoding_error_handler=encoding_error_handler,
+        session_kwargs=session_kwargs,
+        extra_params=kwargs
+    )
+
+
+def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None,
+                     timeout: float | None = None, sse_read_timeout: float | None = None,
+                     ssl_verify: bool | None = True,
+                     session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
+    """Create a configuration for SSE MCP connection"""
+    return MCPConnectionConfig(
+        name=name,
+        connection_type=ConnectionType.SSE,
+        url=url,
+        headers=headers,
+        timeout=timeout,
+        sse_read_timeout=sse_read_timeout,
+        ssl_verify=ssl_verify,
+        session_kwargs=session_kwargs,
+        extra_params=kwargs
+    )
+
+
+def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] | None = None,
+                                 timeout: float | None = None, sse_read_timeout: float | None = None,
+                                 terminate_on_close: bool | None = None,
+                                 ssl_verify: bool | None = True,
+                                 session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
+    """Create a configuration for Streamable HTTP MCP connection"""
+    return MCPConnectionConfig(
+        name=name,
+        connection_type=ConnectionType.STREAMABLE_HTTP,
+        url=url,
+        headers=headers,
+        timeout=timeout,
+        sse_read_timeout=sse_read_timeout,
+        terminate_on_close=terminate_on_close,
+        ssl_verify=ssl_verify,
+        session_kwargs=session_kwargs,
+        extra_params=kwargs
+    )
