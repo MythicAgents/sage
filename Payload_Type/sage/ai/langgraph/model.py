@@ -1732,6 +1732,67 @@ class Model:
             logger.info(f"Returning recursion summary, {len(self._shown_messages)} messages already shown")
             return self._generate_mythic_output(resp, skip_counter=False)
 
+        except Exception as e:
+            # Catch any other errors (API errors, context limit exceeded, etc.)
+            logger.error(f"Error during graph execution: {e}", exc_info=True)
+
+            # Collect partial work from state/checkpoints
+            thread_id = f"{self.agent_task_id}-{self.task_id}"
+            config = RunnableConfig(configurable={"thread_id": thread_id})
+
+            all_messages = []
+            try:
+                # Try to get messages from checkpoint
+                checkpoint = await self.memory.aget_tuple(config)
+                if checkpoint and checkpoint.checkpoint:
+                    saved_state = checkpoint.checkpoint.get("channel_values", {})
+
+                    # Merge all agent channels
+                    for ch in ["messages", "supervisor_messages", "generalist_messages",
+                               "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
+                        if ch in saved_state:
+                            ch_messages = saved_state[ch]
+                            for msg in ch_messages:
+                                if msg not in all_messages:
+                                    all_messages.append(msg)
+
+                    logger.info(f"Collected {len(all_messages)} messages from checkpoint after error")
+            except Exception as checkpoint_error:
+                logger.warning(f"Could not retrieve checkpoint after error: {checkpoint_error}")
+
+            # If we couldn't get checkpoint messages, use what's in current state
+            if not all_messages:
+                all_messages = self.state.get("messages", [])
+                logger.info(f"Using {len(all_messages)} messages from current state")
+
+            # Create error message that includes partial work
+            error_msg = str(e)
+            error_type = type(e).__name__
+
+            error_message = AIMessage(content=f"""❌ **Error: {error_type}**
+
+**Error Details:**
+{error_msg}
+
+**Partial Work Preserved:**
+The conversation history below shows all work completed before the error occurred. This has been saved and you can continue from here.
+
+**Next Steps:**
+• Review the conversation history to see what was accomplished
+• Adjust your approach (e.g., use a smaller scope, different model, or break into smaller tasks)
+• Try again with modified parameters
+"""
+            )
+
+            # Add error message to state
+            all_messages.append(error_message)
+            self.state["messages"] = all_messages
+
+            # Return partial work + error
+            resp = {"messages": all_messages}
+            logger.info(f"Returning error with {len(all_messages)} messages of partial work")
+            return self._generate_mythic_output(resp, skip_counter=False)
+
         # Generate output FIRST, then mark turn complete
         result = self._generate_mythic_output(synthetic_resp)
         # Mark first turn complete - subsequent turns won't show user prompt (Mythic echoes it)
