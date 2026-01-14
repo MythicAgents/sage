@@ -1,0 +1,6 @@
+__pycache__
+.phoenix
+.env
+sage.d*
+sage.log
+certs/bundle.pem
