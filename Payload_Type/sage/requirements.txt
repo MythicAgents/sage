@@ -17,5 +17,6 @@ mythic-container==0.6.12
 # There's a bug with aiosqlite 0.22.0 in langraph
 # https://github.com/langchain-ai/langgraph/issues/6583
 aiosqlite==0.21.0
-arize-phoenix
-opentelemetry-instrumentation-langchain
+arize-phoenix==13.3.0
+opentelemetry-instrumentation-langchain==0.52.4
+opentelemetry-semantic-conventions-ai==0.4.13
