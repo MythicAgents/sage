@@ -14,6 +14,12 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import ChatGeneration, LLMResult
 from mythic_container.logging import logger
+from mythic_container.MythicRPC import (
+    MythicRPCResponseCreateMessage,
+    SendMythicRPCResponseCreate,
+    MythicRPCTaskUpdateMessage,
+    SendMythicRPCTaskUpdate
+)
 from typing import Any
 from uuid import UUID
 from .mythic_tools import MythicTools
@@ -30,6 +36,112 @@ from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 from langgraph.errors import GraphRecursionError
 import operator
+
+def _fix_payload_empty_content(payload: dict) -> dict:
+    """Fix OpenAI-format payload dicts to prevent Bedrock blank text field errors.
+
+    When litellm converts OpenAI format to Bedrock/Anthropic format, it adds
+    {"type": "text", "text": ""} blocks to assistant messages that have
+    tool_calls but null/empty content. Bedrock rejects these blank text fields.
+
+    This function operates on the DICT-level payload (after LangChain's message
+    conversion), right before it's sent to the OpenAI client / litellm proxy.
+    """
+    if "messages" not in payload:
+        return payload
+
+    for msg in payload["messages"]:
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            content = msg.get("content")
+            # Case 1: content is None or empty string — litellm will add blank text block
+            if content is None or content == "" or content == []:
+                msg["content"] = "."
+            # Case 2: content is a list with empty text blocks
+            elif isinstance(content, list):
+                for block in content:
+                    if (isinstance(block, dict) and
+                            block.get("type") == "text" and
+                            not block.get("text", "").strip()):
+                        block["text"] = "."
+        # Also fix non-assistant messages with blank text blocks in list content
+        elif isinstance(msg.get("content"), list):
+            msg["content"] = [
+                block for block in msg["content"]
+                if not (isinstance(block, dict) and
+                        block.get("type") == "text" and
+                        not block.get("text", "").strip())
+            ] or msg["content"]  # fallback to original if all blocks removed
+
+    return payload
+
+
+_bedrock_patch_applied = False
+
+def _apply_bedrock_patch():
+    """Patch _convert_message_to_dict at MODULE level in langchain_openai.
+
+    This is a module-level function (not a class method), so patching the
+    module attribute reliably intercepts ALL calls. The function is referenced
+    inline in _get_request_payload's list comprehension, which uses the module
+    global, so replacing langchain_openai.chat_models.base._convert_message_to_dict
+    catches every invocation regardless of class hierarchy or instance copying.
+    """
+    global _bedrock_patch_applied
+    if _bedrock_patch_applied:
+        return
+
+    try:
+        import langchain_openai.chat_models.base as openai_base
+        original_convert = openai_base._convert_message_to_dict
+    except (ImportError, AttributeError):
+        return
+
+    def _patched_convert_message_to_dict(message, *args, **kwargs):
+        result = original_convert(message, *args, **kwargs)
+        # Fix: Bedrock rejects blank text fields in ANY message content.
+        # Litellm converts empty strings to [{"type":"text","text":""}] for Bedrock.
+        # This affects assistant messages (with or without tool_calls) and can
+        # affect any role where content is empty or contains blank text blocks.
+        if isinstance(result, dict):
+            role = result.get("role", "")
+            content = result.get("content")
+
+            # Case 1: content is None or empty string
+            if content is None or (isinstance(content, str) and not content.strip()):
+                if role == "assistant":
+                    result["content"] = result["content"]  # keep None for tool_calls (OpenAI expects it)
+                    # But if there are tool_calls, None is fine for OpenAI but litellm adds blank text
+                    if result.get("tool_calls"):
+                        result["content"] = "."
+                    elif content == "":
+                        # Empty string with no tool_calls — litellm converts to blank text block
+                        result["content"] = "."
+                        logger.debug(f"BEDROCK_FIX: Replaced empty assistant content with '.'")
+
+            # Case 2: content is a list with blank text blocks
+            elif isinstance(content, list):
+                for block in content:
+                    if (isinstance(block, dict) and
+                            block.get("type") == "text" and
+                            not block.get("text", "").strip()):
+                        block["text"] = "."
+                        logger.debug(f"BEDROCK_FIX: Replaced blank text block with '.' in {role} message")
+        return result
+
+    # Patch the module-level function
+    openai_base._convert_message_to_dict = _patched_convert_message_to_dict
+    _bedrock_patch_applied = True
+    logger.info("Applied Bedrock empty content fix to _convert_message_to_dict")
+
+
+def _patch_model_for_bedrock(model: BaseChatModel) -> BaseChatModel:
+    """Apply the Bedrock fix and return the model unchanged."""
+    _apply_bedrock_patch()
+    return model
+
 
 def _max_seq_reducer(a: int, b: int) -> int:
     """Reducer that always takes the maximum sequence value to prevent collisions."""
@@ -92,12 +204,16 @@ class MessageCaptureCallback(AsyncCallbackHandler):
     This captures AIMessages from LLM calls and ToolMessages from tool executions,
     ensuring we see ALL messages including the first tool-calling AIMessage that
     LangChain's react agent "consumes" during its internal loop.
+
+    Now also streams messages to Mythic in real-time as they're captured.
     """
 
-    def __init__(self, agent_name: str):
+    def __init__(self, agent_name: str, stream_func=None, format_func=None):
         self.agent_name = agent_name
         self.captured_messages: list[AnyMessage] = []
         self._tool_call_to_name: dict[str, str] = {}  # Map tool_call_id to tool name
+        self._stream_func = stream_func  # Function to stream formatted messages to Mythic
+        self._format_func = format_func  # Function to format messages for streaming
 
     def clear(self):
         """Clear captured messages for reuse."""
@@ -113,7 +229,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Capture AIMessage after each LLM call."""
+        """Capture AIMessage after each LLM call and stream it immediately."""
         try:
             logger.debug(f"📨 [Callback:{self.agent_name}] on_llm_end called with {len(response.generations)} generation(s)")
             # LLMResult contains generations which are lists of ChatGeneration
@@ -137,6 +253,23 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                             logger.debug(f"📨 [Callback:{self.agent_name}] Captured AIMessage: "
                                        f"content={str(msg.content)[:50]!r}, "
                                        f"tool_calls={len(getattr(msg, 'tool_calls', []) or [])}")
+
+                            # Stream message immediately to Mythic
+                            # Filter: Suppress Supervisor text-only messages (no tool_calls).
+                            # These are stray acknowledgments/continuations that leak into
+                            # the UI after a specialist has already streamed its response.
+                            # The Supervisor communicates intentionally via respond_to_user tool.
+                            should_stream = True
+                            if self.agent_name == "Supervisor":
+                                has_tool_calls = bool(getattr(msg, 'tool_calls', None))
+                                if not has_tool_calls:
+                                    logger.debug(f"📨 [Callback:Supervisor] Suppressing text-only message from streaming (no tool_calls)")
+                                    should_stream = False
+
+                            if should_stream and self._stream_func and self._format_func:
+                                formatted = self._format_func(msg, agent_name=self.agent_name)
+                                if formatted:
+                                    await self._stream_func(formatted)
                     else:
                         # Log what we got if it's not a ChatGeneration
                         logger.debug(f"📨 [Callback:{self.agent_name}] Got generation type: {type(generation).__name__}")
@@ -152,7 +285,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Capture ToolMessage after each tool execution."""
+        """Capture ToolMessage after each tool execution and stream it immediately."""
         try:
             # The output might be a ToolMessage or raw output
             if isinstance(output, ToolMessage):
@@ -160,6 +293,12 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                 self.captured_messages.append(output)
                 logger.debug(f"📨 [Callback:{self.agent_name}] Captured ToolMessage: "
                            f"tool={output.name}, tool_call_id={output.tool_call_id}")
+
+                # Stream message immediately to Mythic
+                if self._stream_func and self._format_func:
+                    formatted = self._format_func(output, agent_name=self.agent_name)
+                    if formatted:
+                        await self._stream_func(formatted)
             # If it's a string or other output, we'll get it via the agent's return value
         except Exception as e:
             logger.warning(f"⚠️  [Callback:{self.agent_name}] Error in on_tool_end: {e}")
@@ -203,13 +342,10 @@ class Model:
         self.model = model
         self.graph = None
         self.verbose = False
+        self.is_interactive = False
         self.mythic_client = None
         self.tool_manager = None
-        self._shown_messages = set()  # Track shown message IDs for deduplication
         self._message_seq = 1  # Sequence counter for message ordering (starts at 1, 0 reserved for system)
-        self._current_turn_prompt_seq = -1  # Track current turn's user prompt (skip in output, Mythic echoes it)
-        self._is_first_turn = True  # Track if this is the first turn (show user prompt only on Turn 1)
-        logger.debug(f"🆕 Model.__init__: _is_first_turn initialized to {self._is_first_turn}")
         self.messages = []
         self.agent_task_id = agent_task_id
         self.task_id = task_id
@@ -269,6 +405,8 @@ class Model:
             return None
         else:
             cfg = self.config.get("configurable")
+
+        llm = None
         if self.provider.lower() == "bedrock" and cfg is not None:
             # Set region to cfg.get("region") if it exists, else default to "us-east-1"
             region = cfg.get("region")
@@ -287,17 +425,24 @@ class Model:
                 logger.error("Bedrock model configuration is missing 'aws_session_token'.")
                 return None
             logger.debug(f"Initializing Bedrock model with provider={self.provider}, model={self.model}, aws_region={region}")
-            return init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
+            llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
         elif cfg is not None and cfg.get("api_key"):
             if cfg.get("base_url"):
                 logger.debug(f"Initializing model with provider={self.provider}, model={self.model}, base_url={cfg.get('base_url')}")
-                return init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"))
+                llm = init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"))
             else:
                 logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and api_key")
-                return init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"))
+                llm = init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"))
         else:
             logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and no api_key")
-            return init_chat_model(model_provider=self.provider, model=self.model)
+            llm = init_chat_model(model_provider=self.provider, model=self.model)
+
+        # Patch model to strip empty text blocks before every LLM call.
+        # This catches blank content blocks inside LangChain's internal react loop
+        # where our _sanitize_messages can't reach.
+        if llm is not None:
+            llm = _patch_model_for_bedrock(llm)
+        return llm
         
     async def _fetch_dynamic_data(self):
         """Fetch dynamic data from Mythic APIs for use in agent prompts."""
@@ -379,6 +524,186 @@ class Model:
             self._c2_profiles = [{"name": "http", "description": "HTTP/S C2 Profile"}]
             self._cached_commands = {}
             self._dynamic_data_loaded = True
+
+    async def _stream_message_to_mythic(self, formatted_message: str) -> bool:
+        """
+        Stream a formatted message chunk to the Mythic task.
+
+        Args:
+            formatted_message: Pre-formatted message string (e.g., "🤖[Agent]> response")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            resp = await SendMythicRPCResponseCreate(
+                MythicRPCResponseCreateMessage(
+                    self.task_id,
+                    formatted_message.encode()
+                )
+            )
+            if not resp.Success:
+                logger.error(f"Failed to stream message to task {self.task_id}: {resp.Error}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Exception streaming to task {self.task_id}: {e}")
+            return False
+
+    async def _process_stream_event(self, event: dict[str, Any]) -> None:
+        """
+        Process a streaming event from graph.astream() and stream messages to Mythic.
+
+        NOTE: AIMessages and ToolMessages are now streamed immediately by MessageCaptureCallback
+        during agent execution. This method only needs to stream HumanMessages (handoff messages)
+        that are created by handoff tools and not captured by the callback.
+
+        Args:
+            event: Dictionary containing node name as key and updated state as value
+                  Example: {"Supervisor": {"supervisor_messages": [...]}}
+        """
+        # Extract node name and state from event
+        # Events are formatted as: {node_name: updated_state_dict}
+        for node_name, state_update in event.items():
+            if node_name in ["__start__", "__end__"]:
+                continue  # Skip internal nodes
+
+            # Extract new messages from state update
+            new_messages = await self._extract_new_messages_from_event(state_update)
+
+            for msg in new_messages:
+                # Stream HumanMessages (handoff/delegation messages)
+                if isinstance(msg, HumanMessage):
+                    formatted = self._format_message_for_streaming(msg, agent_name=node_name)
+                    if formatted:
+                        await self._stream_message_to_mythic(formatted)
+                # Stream AIMessages from respond_to_user tool (Supervisor's intentional responses).
+                # These are NOT streamed by the callback (which suppresses Supervisor text-only messages)
+                # but should be shown since the Supervisor explicitly chose to respond.
+                # respond_to_user sets name="Supervisor" and has actual content.
+                elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if content.strip() and content.strip() != ".":
+                        formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
+                        if formatted:
+                            await self._stream_message_to_mythic(formatted)
+
+    async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
+        """
+        Extract messages from a stream event's state update.
+
+        LangGraph events only contain the NEW messages added by that node,
+        so we can stream everything without deduplication logic.
+        """
+        new_messages = []
+
+        # Check all message channels
+        for channel_name in [
+            "supervisor_messages",
+            "generalist_messages",
+            "mythic_operator_messages",
+            "mythic_payload_messages",
+            "mcp_manager_messages"
+        ]:
+            if channel_name in state_update:
+                messages = state_update[channel_name]
+                if not isinstance(messages, list):
+                    continue
+
+                # Add all messages from this event (they're all new)
+                new_messages.extend(messages)
+
+        # Sort by sequence number to maintain chronological order
+        new_messages.sort(key=lambda m: m.additional_kwargs.get("_seq", 0))
+
+        return new_messages
+
+    def _format_message_for_streaming(self, message: BaseMessage, agent_name: str = None) -> str:
+        """
+        Format a single message for streaming output.
+
+        This is a streamlined version of _generate_mythic_output() logic that handles
+        one message at a time instead of batching.
+
+        Args:
+            message: The message to format
+            agent_name: The name of the agent/node that produced this message (from stream event)
+
+        Returns:
+            Formatted string with emoji prefix, or empty string if message should be skipped
+        """
+        # Skip system messages
+        if isinstance(message, SystemMessage):
+            return ""
+
+        # Format based on message type
+        if isinstance(message, HumanMessage):
+            # Get content
+            content = str(message.content).strip() if message.content else ""
+            if not content:
+                return ""  # Skip empty messages
+
+            # Check if this is a DELEGATED task (agent handoff)
+            delegated_to = message.additional_kwargs.get("_delegated_to")
+
+            if delegated_to:
+                # Show agent handoffs: "📋[Task → Mythic_Operator]> Query active callbacks"
+                return f"📋[Task → {delegated_to}]> {content}\n"
+            else:
+                # User prompts: Show for non-interactive tasks, skip for interactive tasks
+                # - Non-interactive (first turn): Mythic doesn't echo the prompt, so we show it
+                # - Interactive (subsequent turns): Mythic echoes it, so we skip to avoid duplication
+                if self.is_interactive:
+                    return ""  # Skip - Mythic already shows it
+                else:
+                    return f"👤> {content}\n"  # Show it
+
+        elif isinstance(message, AIMessage):
+            # Handle AIMessages with content and/or tool calls
+            output = ""
+
+            # Get agent name from message or parameter (matches existing format)
+            msg_agent_name = getattr(message, 'name', None) or agent_name or "AI"
+
+            # Extract text content
+            text_content = ""
+            if isinstance(message.content, str):
+                text_content = message.content.strip()
+            elif isinstance(message.content, list):
+                for block in message.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_content += block.get("text", "").strip() + " "
+                text_content = text_content.strip()
+
+            # Show text content with agent name in brackets (matches existing format)
+            if text_content:
+                output += f"🤖[{msg_agent_name}]> {text_content}\n"
+
+            # Show tool calls with agent name and tool ID in brackets (only in verbose mode)
+            if self.verbose and hasattr(message, "tool_calls") and message.tool_calls:
+                for tc in message.tool_calls:
+                    tool_name = tc.get("name", "unknown")
+                    tool_args = tc.get("args", {})
+                    tool_id = tc.get("id", "unknown")
+                    output += f"🛠️[{msg_agent_name}:{tool_id}]> Tool Request: '{tool_name}', Args: '{tool_args}'\n"
+
+            return output
+
+        elif isinstance(message, ToolMessage):
+            # Show tool execution results (only in verbose mode)
+            if not self.verbose:
+                return ""
+            tool_id = message.tool_call_id or "unknown"
+            content = str(message.content)
+
+            # Use agent_name from the event (which node produced this ToolMessage)
+            display_agent = agent_name or "unknown"
+            return f"🔧[{display_agent}:{tool_id}]> Tool Response: {content}\n"
+
+        else:
+            # Unknown message type
+            logger.warning(f"Unknown message type for streaming: {type(message)}")
+            return ""
 
     async def initialize(self):
         """ Initialize the model's graph and Mythic client."""
@@ -567,7 +892,12 @@ class Model:
             # Create callback handler to capture ALL messages during agent execution
             # This captures the first AIMessage (with tool_calls) that LangChain's react agent
             # would otherwise "consume" during its internal tool execution loop
-            callback_handler = MessageCaptureCallback(agent_name=node_name)
+            # Pass streaming functions so messages are streamed immediately as they're captured
+            callback_handler = MessageCaptureCallback(
+                agent_name=node_name,
+                stream_func=self._stream_message_to_mythic,
+                format_func=self._format_message_for_streaming
+            )
 
             # Merge callback into config - handle both list and CallbackManager types
             invoke_config = dict(config) if config else {}
@@ -581,7 +911,9 @@ class Model:
                 # The outer config callbacks will still be called at the graph level
                 invoke_config["callbacks"] = [callback_handler]
 
-            result = await agent_runnable.ainvoke({"messages": channel}, invoke_config)
+            # Sanitize messages before invoking agent to prevent "multiple non-consecutive system messages" error
+            sanitized_channel = self._sanitize_messages(channel)
+            result = await agent_runnable.ainvoke({"messages": sanitized_channel}, invoke_config)
             updated_channel = result.get("messages", channel)
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
@@ -615,6 +947,15 @@ class Model:
 
             # Add any returned messages that weren't captured (shouldn't happen often)
             new_messages_from_agent = list(captured)
+
+            # Build content hash set for captured AIMessages (for deduplication of messages without tool calls)
+            captured_ai_content_hashes = set()
+            for msg in captured:
+                if isinstance(msg, AIMessage):
+                    # Hash the content for comparison
+                    content_str = str(msg.content) if msg.content else ""
+                    captured_ai_content_hashes.add(hash(content_str))
+
             for msg in returned_messages:
                 is_duplicate = False
                 if isinstance(msg, AIMessage):
@@ -624,6 +965,12 @@ class Model:
                         msg_tc_ids = {tc.get('id') for tc in tool_calls if tc.get('id')}
                         if msg_tc_ids and msg_tc_ids.issubset(seen_tool_call_ids):
                             is_duplicate = True
+                    else:
+                        # For AIMessages without tool calls, check content hash
+                        content_str = str(msg.content) if msg.content else ""
+                        if hash(content_str) in captured_ai_content_hashes:
+                            is_duplicate = True
+                            logger.debug(f"🔁 [{node_name}] Skipping duplicate AIMessage (same content as captured)")
                 elif isinstance(msg, ToolMessage):
                     tc_id = getattr(msg, 'tool_call_id', None)
                     if tc_id and tc_id in seen_tool_result_ids:
@@ -1167,8 +1514,18 @@ class Model:
               2. What the agent already completed (from the handback summary)
               3. What still needs to be done (from "Remaining Tasks" in the handback)
 
+            **CRITICAL: Streaming Output Context:**
+            All specialist agent responses are streamed DIRECTLY to the user in real-time as they are generated.
+            The user has ALREADY SEEN the specialist's full output by the time you receive control back.
+            Therefore:
+            - Do NOT repeat, summarize, paraphrase, or extend the specialist's response in your own text.
+            - Do NOT continue lists, add options, or append to the specialist's output.
+            - When a specialist has finished and you need to respond, use the `respond_to_user` tool.
+            - If the specialist's response fully answers the user's question, call `respond_to_user` with a brief acknowledgment only.
+            - Your direct text output (without a tool call) is also streamed — any stray text you generate will appear to the user as extra output after the specialist's response.
+
             When responding to the user:
-            - Summarize the progress and results of all agents.
+            - Use the `respond_to_user` tool for all final responses.
             - Provide actionable insights or next steps based on the outputs of the agents.
             - Maintain a professional and concise tone.
             - Always check remaining_steps before delegating to other agents.
@@ -1249,139 +1606,6 @@ class Model:
         force_flush_all_handlers()
         return result
 
-    def _generate_mythic_output(self, resp, skip_counter=False) -> str:
-        """
-        Generate a string representation of the model's messages for Mythic output.
-        :param resp: The response containing messages
-        :param skip_counter: If True, show all messages regardless of shown tracking (used for recursion recovery)
-        :return: A string containing the messages formatted for Mythic.
-        """
-
-        return_message = ""
-        logger.debug(f"🎯 _generate_mythic_output: _is_first_turn={self._is_first_turn}, _current_turn_prompt_seq={self._current_turn_prompt_seq}")
-
-        # check that the messages key is in the resp or throw an error
-        if "messages" not in resp:
-            raise ValueError("No messages found in the response from the graph invocation.")
-
-        # Sort by sequence number for chronological order
-        messages = sorted(resp["messages"], key=lambda m: _get_seq(m))
-
-        # Track the current active agent by looking at handoff tool messages
-        current_agent = "Supervisor"  # Start with supervisor
-
-        logger.info(f"_generate_mythic_output: Processing {len(messages)} total messages, skip_counter={skip_counter}, already_shown={len(self._shown_messages)}")
-
-        for i, message in enumerate(messages):
-            # Use message ID for deduplication - skip messages already shown
-            mid = _msg_id(message)
-            if not skip_counter and mid in self._shown_messages:
-                continue
-            self._shown_messages.add(mid)
-
-            if isinstance(message, HumanMessage):
-                # Skip empty HumanMessages (can happen from framework artifacts)
-                content = str(message.content).strip() if message.content else ""
-                if not content:
-                    continue
-
-                # Check if this is a delegated task (not real user input)
-                delegated_to = message.additional_kwargs.get("_delegated_to")
-                msg_seq = _get_seq(message)
-
-                if delegated_to:
-                    # Delegated tasks always shown with special icon
-                    return_message += f"📋[Task → {delegated_to}]> {content}\n"
-                elif not self._is_first_turn and msg_seq == self._current_turn_prompt_seq:
-                    # Skip current turn's user prompt on Turn 2+ (Mythic UI already echoes it)
-                    logger.debug(f"Skipping current turn's user prompt (seq={msg_seq}, _is_first_turn={self._is_first_turn}): {content[:50]}...")
-                    continue
-                else:
-                    # Regular user prompt (show on Turn 1, or for historical context)
-                    logger.debug(f"Showing user prompt (seq={msg_seq}, _is_first_turn={self._is_first_turn}): {content[:50]}...")
-                    return_message += f"👤> {content}\n"
-            elif isinstance(message, AIMessage):
-                is_last_message = i == len(messages) - 1
-
-                # Debug: log message attributes to see what's available
-                agent_name = getattr(message, 'name', None) or current_agent
-                tool_calls = getattr(message, 'tool_calls', None) or []
-                has_tool_calls = len(tool_calls) > 0
-
-                # Extract text content for analysis
-                text_content = ""
-                if isinstance(message.content, str):
-                    text_content = message.content.strip()
-                elif isinstance(message.content, list):
-                    for item in message.content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text_content += item.get("text", "").strip() + " "
-                    text_content = text_content.strip()
-
-                # Determine what to show based on verbose mode
-                show_tool_calls = self.verbose
-
-                # Non-verbose filtering for AI messages:
-                # 1. Skip "[Agent completed task]" type messages (framework artifacts)
-                # 2. Skip intermediate "thinking" messages (messages that only precede tool calls)
-                # 3. Only show substantive final responses
-                # Use semantic flag (_is_completion_header) instead of string matching for robustness
-                is_completion_header = message.additional_kwargs.get("_is_completion_header", False)
-                is_thinking_before_tool = has_tool_calls and text_content  # Has both text and tools (intermediate)
-
-                # In non-verbose mode, skip:
-                # - Completion header messages (framework artifacts)
-                # - Messages that are just tool call invocations with narration
-                skip_in_non_verbose = not self.verbose and (is_completion_header or is_thinking_before_tool)
-
-                logger.info(f"📝 AIMessage #{i}: is_last={is_last_message}, verbose={self.verbose}, "
-                           f"agent={agent_name}, has_text={bool(text_content)}, "
-                           f"has_tool_calls={has_tool_calls}, is_completion_header={is_completion_header}, "
-                           f"skip_in_non_verbose={skip_in_non_verbose}")
-                force_flush_all_handlers()
-
-                if skip_in_non_verbose:
-                    logger.debug(f"  ⏭️  Skipping AI message in non-verbose mode: completion_header={is_completion_header}, thinking_before_tool={is_thinking_before_tool}")
-                    # Still process tool calls if verbose
-                    pass
-                else:
-                    # Show text content
-                    if text_content:
-                        return_message += f"🤖[{agent_name}]> {text_content}\n"
-                    elif not has_tool_calls and is_last_message:
-                        logger.warning(f"Last message #{i} has no content and no tool_calls - skipping display")
-
-                # Display tool_calls ONLY when verbose mode is ON
-                if show_tool_calls and has_tool_calls:
-                    logger.info(f"  ➡️  Processing {len(tool_calls)} tool_calls for message #{i}")
-                    for tool_call in tool_calls:
-                        tool_name = tool_call.get('name', 'unknown')
-                        tool_id = tool_call.get('id', 'unknown')
-                        tool_args = tool_call.get('args', {})
-                        logger.info(f"    ✅ Tool call: name={tool_name}, id={tool_id}")
-                        return_message += f"🛠️[{agent_name}:{tool_id}]> Tool Request: '{tool_name}', Args: '{tool_args}'\n"
-                    force_flush_all_handlers()
-                elif not show_tool_calls and has_tool_calls:
-                    logger.debug(f"  ⏭️  Skipping {len(tool_calls)} tool_calls (verbose=False)")
-            elif isinstance(message, SystemMessage):
-                pass
-            elif isinstance(message, ToolMessage):
-                # Display tool response BEFORE updating current_agent for handoffs
-                # This ensures the calling agent (e.g., Supervisor) is shown, not the target
-                if self.verbose:
-                    return_message += f"🔧[{current_agent}:{message.tool_call_id}]> Tool Response: {message.content}\n"
-
-                # Check if this is a handoff tool message to track which agent is active
-                # Update AFTER display so the next messages use the new agent
-                if message.name and message.name.startswith("transfer_to_"):
-                    target_agent = message.name.replace("transfer_to_", "")
-                    current_agent = target_agent
-                    logger.debug(f"Agent handoff detected: now using {current_agent}")
-            else:
-                return_message += f"❓> Unknown message type: {type(message)} with content: {message}\n"
-
-        return return_message
-
     def _cleanup_dangling_tool_calls(self):
         """
         Clean up ANY dangling tool_use blocks throughout the entire conversation state.
@@ -1450,10 +1674,13 @@ class Model:
 
     def _sanitize_messages(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
             """
-            Remove orphan ToolMessages (tool_result) whose tool_call_id was never
-            introduced by a preceding AIMessage.tool_calls in this sequence.
+            Sanitize message list for LLM invocation:
+            1. Remove orphan ToolMessages whose tool_call_id was never introduced by a preceding AIMessage
+            2. Keep only the FIRST SystemMessage, remove all others (prevents "multiple non-consecutive system messages" error)
+            Note: Bedrock blank text field fix is handled at the payload level by _patch_model_for_bedrock.
             """
             seen_tool_use_ids = set()
+            seen_system_message = False
             cleaned = []
             for m in msgs:
                 if isinstance(m, AIMessage):
@@ -1467,10 +1694,78 @@ class Model:
                     if tc_id and tc_id in seen_tool_use_ids:
                         cleaned.append(m)
                     # else drop orphan
-                elif isinstance(m, (HumanMessage, SystemMessage)):
+                elif isinstance(m, SystemMessage):
+                    # Only keep the first SystemMessage
+                    if not seen_system_message:
+                        cleaned.append(m)
+                        seen_system_message = True
+                    # else drop additional system messages
+                elif isinstance(m, HumanMessage):
                     cleaned.append(m)
                 # ignore other types silently
             return cleaned
+
+    def _fix_message_sequence_for_bedrock(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
+        """
+        Validate and fix message sequences for strict LLM provider requirements.
+
+        Some providers (like AWS Bedrock) require that every AIMessage with tool_calls
+        is IMMEDIATELY followed by ToolMessage(s) with matching tool_call_ids.
+
+        After rebuilding agent channels, this requirement might be violated because
+        messages from different timepoints get mixed together.
+
+        Strategy: Remove tool_calls from AIMessages that don't have immediate
+        ToolMessage responses. This preserves the text content (which describes
+        what was done) while removing the structured metadata that causes validation errors.
+
+        This is provider-agnostic and safe because:
+        - Text content usually describes tool usage
+        - ToolMessages still exist in history showing results
+        - Only structured metadata is removed
+        """
+        fixed = []
+
+        for i, msg in enumerate(msgs):
+            if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # Get the tool_call IDs from this message
+                tool_call_ids = set(tc.get('id') for tc in msg.tool_calls if tc.get('id'))
+
+                # Check if next message(s) are ToolMessages with matching IDs
+                has_immediate_results = False
+                if i + 1 < len(msgs):
+                    next_msg = msgs[i + 1]
+                    if isinstance(next_msg, ToolMessage):
+                        # Check if tool_call_id matches any of our tool_calls
+                        if hasattr(next_msg, 'tool_call_id') and next_msg.tool_call_id in tool_call_ids:
+                            has_immediate_results = True
+
+                if not has_immediate_results:
+                    # Strip tool_calls from this AIMessage
+                    msg_copy = msg.copy()
+                    msg_copy.tool_calls = []
+
+                    # Only include if it has text content
+                    has_content = False
+                    if isinstance(msg_copy.content, str) and msg_copy.content.strip():
+                        has_content = True
+                    elif isinstance(msg_copy.content, list) and any(
+                        block.get('type') == 'text' and block.get('text', '').strip()
+                        for block in msg_copy.content if isinstance(block, dict)
+                    ):
+                        has_content = True
+
+                    if has_content:
+                        fixed.append(msg_copy)
+                    # If no content, skip this message entirely
+                else:
+                    # Has immediate tool results, keep as-is
+                    fixed.append(msg)
+            else:
+                # Not an AIMessage with tool_calls, keep as-is
+                fixed.append(msg)
+
+        return fixed
 
     def _render_combined(self, messages):
         out = ""
@@ -1480,13 +1775,143 @@ class Model:
             elif isinstance(m, AIMessage):
                 out += f"🤖[{getattr(m,'name','Agent')}]> {m.content if isinstance(m.content,str) else ''}\n"
         return out
-    
-    async def invoke(self, prompt: str) -> str:
+
+    async def _generate_per_agent_summaries(self) -> str:
+        """
+        Generate summaries from each participating agent about their own work.
+        Returns formatted string with per-agent summaries.
+        """
+        agent_channels = {
+            "Supervisor": "supervisor_messages",
+            "Mythic_Operator": "mythic_operator_messages",
+            "Mythic_Payload": "mythic_payload_messages",
+            "Generalist": "generalist_messages",
+            "MCP_Manager": "mcp_manager_messages"
+        }
+
+        summaries = []
+
+        for agent_name, channel_name in agent_channels.items():
+            channel_messages = self.state.get(channel_name, [])
+
+            # Skip if channel is empty or only has system/handoff messages
+            # Count substantive messages (AIMessages with content or tool calls, ToolMessages)
+            substantive_count = sum(1 for msg in channel_messages
+                                   if isinstance(msg, (AIMessage, ToolMessage)))
+
+            if substantive_count == 0:
+                logger.debug(f"Skipping {agent_name} - no substantive work done")
+                continue
+
+            logger.info(f"Generating summary for {agent_name} ({substantive_count} substantive messages)")
+
+            # Create agent-specific summary prompt with strong anti-hallucination instructions
+            summary_prompt = HumanMessage(content=f"""You are {agent_name}. Review YOUR complete conversation history above and summarize YOUR work.
+
+CRITICAL: Only reference information that ACTUALLY appears in the messages above. DO NOT make up, infer, or hallucinate ANY data. If you executed a tool, cite the EXACT results from the ToolMessage.
+
+1. **Tools Called**: What tools/functions did YOU execute? (Include tool call IDs if visible)
+2. **Data Gathered**: What SPECIFIC information did YOU collect? (Quote exact callback IDs, hostnames, usernames from tool outputs)
+3. **Tasks Incomplete**: What tasks were YOU working on that are NOT yet complete?
+
+Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions based on messages in YOUR conversation history above.""")
+
+            try:
+                # Use ALL agent's channel messages + summary prompt for full context
+                # CRITICAL: Use ALL messages, not just last 20, to avoid missing earlier tool results
+                # Safety limit: cap at 150 messages to avoid token limits (should be plenty for 25-step recursion)
+                max_messages = 150
+                if len(channel_messages) > max_messages:
+                    logger.warning(f"{agent_name} has {len(channel_messages)} messages, using last {max_messages} for summary")
+                    summary_messages_raw = channel_messages[-max_messages:] + [summary_prompt]
+                else:
+                    summary_messages_raw = channel_messages + [summary_prompt]
+
+                summary_messages = self._sanitize_messages(summary_messages_raw)
+
+                logger.info(f"Summary context for {agent_name}: {len(summary_messages)} messages (from {len(channel_messages)} channel messages)")
+
+                # DEBUG: Log the actual message content being passed to summary LLM
+                logger.info(f"DEBUG: Dumping {agent_name} channel messages for summary generation:")
+                for idx, msg in enumerate(summary_messages[:20]):  # First 20 messages for debugging
+                    msg_type = type(msg).__name__
+                    content_preview = str(msg.content)[:200] if hasattr(msg, 'content') else "N/A"
+                    logger.info(f"  [{idx}] {msg_type}: {content_preview}...")
+                if len(summary_messages) > 20:
+                    logger.info(f"  ... ({len(summary_messages) - 20} more messages)")
+
+                # Ensure system message
+                if not any(isinstance(m, SystemMessage) for m in summary_messages):
+                    summary_messages.insert(0, SystemMessage(content=f"You are {agent_name}, a specialized agent. Summarize YOUR work concisely."))
+
+                if not summary_messages:
+                    continue
+
+                logger.debug(f"Invoking {agent_name} for summary with {len(summary_messages)} messages")
+
+                # CRITICAL: Remove tool_calls from AIMessages for summary generation
+                # Bedrock requires tool_calls to have corresponding tool_results immediately after
+                # But for summarization, we only need the text content, not the tool calls
+                # ALSO: Filter out messages with empty content (Bedrock rejects blank content)
+                cleaned_summary_messages = []
+                for msg in summary_messages:
+                    if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        # Create a copy without tool_calls
+                        msg_copy = msg.copy()
+                        msg_copy.tool_calls = []
+
+                        # Check if message has actual text content
+                        has_content = False
+                        if isinstance(msg_copy.content, str) and msg_copy.content.strip():
+                            has_content = True
+                        elif isinstance(msg_copy.content, list) and any(
+                            block.get('type') == 'text' and block.get('text', '').strip()
+                            for block in msg_copy.content if isinstance(block, dict)
+                        ):
+                            has_content = True
+
+                        # Only append if message has actual content (not just tool calls)
+                        if has_content:
+                            cleaned_summary_messages.append(msg_copy)
+                    else:
+                        cleaned_summary_messages.append(msg)
+
+                # Use LLM without tools for summary generation (Bedrock requires this)
+                # Create a version of the LLM with no tool bindings
+                llm_without_tools = self.llm
+                if hasattr(self.llm, 'bind_tools'):
+                    try:
+                        llm_without_tools = self.llm.bind_tools([])
+                    except Exception:
+                        # If bind_tools fails, just use the original LLM
+                        pass
+
+                summary_resp = await llm_without_tools.ainvoke(cleaned_summary_messages)
+
+                # DEBUG: Log the generated summary
+                logger.info(f"DEBUG: {agent_name} generated summary: {summary_resp.content[:500]}...")
+                summary_content = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
+
+                summaries.append(f"**{agent_name}:**\n{summary_content}")
+
+            except Exception as e:
+                logger.warning(f"Could not generate summary for {agent_name}: {e}")
+                summaries.append(f"**{agent_name}:** Work in progress (summary generation failed)")
+
+        if not summaries:
+            return "No agent summaries available - work may have just started."
+
+        return "\n\n".join(summaries)
+
+    async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
         """
         Invoke the model with a prompt and return the response.
         :param prompt: The prompt to send to the model.
+        :param is_interactive: Whether this is an interactive task (subsequent turn in conversation).
         :return: The model's response as a string.
         """
+        # Store for use in streaming formatter
+        self.is_interactive = is_interactive
         if not self.graph:
             raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
         logger.debug(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
@@ -1504,6 +1929,15 @@ class Model:
 
         if "messages" not in self.state:
             self.state["messages"] = []
+
+        # Check if we're responding to a recursion limit continuation request
+        # If so, delegate to handle_continuation_response() instead of normal flow
+        was_recursion_requested = self.state.get("recursion_summary_requested", False)
+        if was_recursion_requested:
+            logger.info(f"Detected continuation response: '{prompt}' - delegating to handle_continuation_response()")
+            # Reset the flag before handling
+            self.state["recursion_summary_requested"] = False
+            return await self.handle_continuation_response(prompt)
 
         # CRITICAL: Reset recursion flags before each invocation
         # Without this, the graph sees stale flags from previous runs and
@@ -1524,34 +1958,80 @@ class Model:
         _tag_msg(user_msg, user_msg_seq)
         self.state["supervisor_messages"].append(user_msg)
 
-        # Track the current turn's user prompt sequence so we can skip showing it
-        # in output (Mythic UI already echoes the user's input for interactive tasks)
-        self._current_turn_prompt_seq = user_msg_seq
+        # Manually stream the user prompt for non-interactive tasks
+        # (Interactive tasks have Mythic echo the prompt, so we skip)
+        if not is_interactive:
+            formatted_prompt = self._format_message_for_streaming(user_msg, agent_name=None)
+            if formatted_prompt:
+                await self._stream_message_to_mythic(formatted_prompt)
 
         try:
             # Use default recursion limit - RemainingSteps will handle graceful termination
-            logger.debug(f"🚀 Before ainvoke: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
-            resp = await self.graph.ainvoke(self.state, {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25})
-            logger.debug(f"📥 After ainvoke: resp._message_seq={resp.get('_message_seq')}")
+            logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
-            # Merge updated channel values back into self.state
-            for ch in [
-                "supervisor_messages",
-                "generalist_messages",
-                "mythic_operator_messages",
-                "mythic_payload_messages",
-                "mcp_manager_messages",
-            ]:
-                if ch in resp:
-                    self.state[ch] = resp[ch]
+            # Stream graph execution and process events incrementally
+            async for event in self.graph.astream(
+                self.state,
+                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25}
+            ):
+                # DEBUG: Log what's IN the event
+                for node_name, state_update in event.items():
+                    if node_name not in ["__start__", "__end__"]:
+                        channel_keys = list(state_update.keys()) if isinstance(state_update, dict) else []
+                        logger.debug(f"DEBUG: Event from node '{node_name}' has channels: {channel_keys}")
+                        if "mythic_operator_messages" in channel_keys:
+                            logger.debug(f"  mythic_operator_messages has {len(state_update['mythic_operator_messages'])} messages")
 
-            # CRITICAL: Sync sequence counter back from graph state
-            # Without this, the Model's counter gets out of sync with messages created
-            # during graph execution (e.g., in handoff tools), causing sequence collisions
-            if "_message_seq" in resp:
-                self._message_seq = resp["_message_seq"]
-                self.state["_message_seq"] = resp["_message_seq"]
-                logger.debug(f"📊 Synced _message_seq from graph: {self._message_seq}")
+                # Check for recursion_handback flag in the event BEFORE processing further.
+                # When a specialist calls summarize_and_handback, the flag appears in the
+                # stream event. We must break immediately to prevent the Supervisor from
+                # running another turn and ignoring the handback.
+                handback_detected = False
+                for node_name, state_update in event.items():
+                    if isinstance(state_update, dict) and state_update.get("recursion_handback"):
+                        logger.info(f"Handback detected in event from node '{node_name}' — stopping astream to wait for user")
+                        self.state["recursion_handback"] = True
+                        handback_detected = True
+                if handback_detected:
+                    # Stream any messages from this event before breaking
+                    await self._process_stream_event(event)
+                    break
+
+                # Process each streaming event and stream messages to Mythic
+                await self._process_stream_event(event)
+
+                # Update self.state with new values from event
+                for node_name, state_update in event.items():
+                    if node_name in ["__start__", "__end__"]:
+                        continue
+                    for ch in [
+                        "supervisor_messages",
+                        "generalist_messages",
+                        "mythic_operator_messages",
+                        "mythic_payload_messages",
+                        "mcp_manager_messages",
+                        "_message_seq"
+                    ]:
+                        if ch in state_update:
+                            if ch == "_message_seq":
+                                self._message_seq = state_update[ch]
+                                self.state[ch] = state_update[ch]
+                            else:
+                                # Append new messages to state (operator.add behavior)
+                                if ch not in self.state:
+                                    self.state[ch] = []
+
+                                # DEBUG: Log what we're extending
+                                old_len = len(self.state[ch])
+                                self.state[ch].extend(state_update[ch])
+                                new_len = len(self.state[ch])
+                                if new_len > old_len:
+                                    logger.debug(f"  Extended {ch}: {old_len} -> {new_len} messages")
+
+            logger.debug(f"📥 After astream: self.state._message_seq={self.state.get('_message_seq')}")
+
+            # Create resp variable for compatibility with downstream code
+            resp = self.state
 
             # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
@@ -1599,117 +2079,202 @@ class Model:
             # Check if we got a recursion summary request or handback from specialist
             if synthetic_resp.get("recursion_summary_requested", False):
                 logger.info("Recursion limit approached - user continuation requested")
-                result = self._generate_mythic_output(synthetic_resp, skip_counter=False)
-                self._is_first_turn = False
-                return result
+                return ""  # All output already streamed to Mythic
             elif synthetic_resp.get("recursion_handback", False):
                 logger.info("Recursion handback received from specialist agent")
-                result = self._generate_mythic_output(synthetic_resp, skip_counter=False)
-                self._is_first_turn = False
-                return result
+                return ""  # All output already streamed to Mythic
         except GraphRecursionError as e:
             # Catch recursion limit error and return progress made so far
             logger.warning(f"Recursion limit hit: {e}")
 
-            # First, log what's currently in self.state
-            current_msg_count = len(self.state.get("messages", []))
-            logger.info(f"Current state has {current_msg_count} messages before checkpoint collection")
-            logger.info(f"Already shown {len(self._shown_messages)} messages")
+            # CRITICAL: When recursion limit hits, astream() only yielded events for COMPLETED nodes.
+            # The current node (e.g., Mythic_Operator) was terminated mid-execution, so its messages
+            # are NOT in self.state. We MUST restore from checkpoint to get partial progress.
 
-            # Get the latest state from the checkpoint to show all progress
-            # The graph execution stopped, but checkpointer has saved all messages
             thread_id = f"{self.agent_task_id}-{self.task_id}"
             config = RunnableConfig(configurable={"thread_id": thread_id})
 
-            # Collect all messages from parent and nested agent checkpoints
-            all_messages = []
-            checkpoint_count = 0
+            # DEBUG: Log what's in self.state BEFORE checkpoint recovery
+            logger.info(f"DEBUG: In-memory state BEFORE checkpoint recovery:")
+            for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
+                ch_msgs = self.state.get(ch, [])
+                logger.info(f"  {ch}: {len(ch_msgs)} messages")
+
+            # DEBUG: List ALL checkpoints to understand structure
+            logger.info(f"DEBUG: Listing ALL checkpoints for thread_id='{thread_id}':")
+            checkpoint_list_count = 0
             try:
-                # Get all checkpoints for this thread (including nested agents)
-                # LangGraph stores nested agent states with namespace prefixes
-                async for checkpoint_tuple in self.memory.alist(config, limit=200):
-                    checkpoint_count += 1
+                async for cp_tuple in self.memory.alist(config, limit=50):
+                    checkpoint_list_count += 1
+                    if cp_tuple and cp_tuple.checkpoint:
+                        ns = cp_tuple.metadata.get("checkpoint_ns", "")
+                        cp_id = cp_tuple.checkpoint.get("id", "unknown")
+                        channel_values = cp_tuple.checkpoint.get("channel_values", {})
+                        channel_keys = list(channel_values.keys())
+
+                        # Show message counts for each channel
+                        channel_info = {}
+                        for key, value in channel_values.items():
+                            if isinstance(value, list):
+                                channel_info[key] = len(value)
+                            else:
+                                channel_info[key] = f"{type(value).__name__}"
+
+                        logger.info(f"  Checkpoint #{checkpoint_list_count}: namespace='{ns}', id={cp_id[:20]}..., channels={channel_info}")
+            except Exception as e:
+                logger.warning(f"Could not list checkpoints: {e}")
+
+            logger.info(f"Found {checkpoint_list_count} total checkpoints for this thread")
+
+            # CRITICAL FIX: Most recent checkpoints only have 'messages', not agent-specific channels.
+            # Agent channels (mythic_operator_messages, etc.) are only in earlier checkpoints
+            # from before the node started executing. We need to:
+            # 1. Get global 'messages' from LATEST checkpoint (has all accumulated messages)
+            # 2. Get agent-specific channels from checkpoint that has them (usually earlier)
+
+            latest_messages = None
+            best_agent_state = {}
+            try:
+                async for checkpoint_tuple in self.memory.alist(config, limit=50):
                     if checkpoint_tuple and checkpoint_tuple.checkpoint:
-                        ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
-                        checkpoint_id = checkpoint_tuple.checkpoint.get("id", "unknown")
+                        channel_values = checkpoint_tuple.checkpoint.get("channel_values", {})
 
-                        logger.info(f"Checkpoint {checkpoint_count}: namespace='{ns}', id={checkpoint_id}")
+                        # Get global messages from first checkpoint (latest)
+                        if latest_messages is None and "messages" in channel_values:
+                            latest_messages = channel_values["messages"]
+                            logger.info(f"Found latest 'messages' channel with {len(latest_messages)} messages")
 
-                        nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
-                        if "messages" in nested_state:
-                            nested_messages = nested_state["messages"]
-                            logger.info(f"  Found {len(nested_messages)} messages in this checkpoint")
+                        # Look for agent-specific channels
+                        for channel_name in ["supervisor_messages", "mythic_operator_messages",
+                                            "mythic_payload_messages", "generalist_messages",
+                                            "mcp_manager_messages"]:
+                            if channel_name in channel_values:
+                                current_len = len(channel_values[channel_name]) if isinstance(channel_values[channel_name], list) else 0
+                                existing_len = len(best_agent_state.get(channel_name, [])) if isinstance(best_agent_state.get(channel_name), list) else 0
 
-                            # Log message types for debugging
-                            msg_types = [type(m).__name__ for m in nested_messages]
-                            logger.info(f"  Message types: {msg_types}")
+                                # Keep the version with more messages
+                                if current_len > existing_len:
+                                    best_agent_state[channel_name] = channel_values[channel_name]
+                                    logger.info(f"Found better {channel_name} with {current_len} messages")
 
-                            # Add messages that aren't already in all_messages (avoid duplicates)
-                            for msg in nested_messages:
-                                if msg not in all_messages:
-                                    all_messages.append(msg)
+                # Now restore the best versions we found
+                if latest_messages:
+                    self.state["messages"] = latest_messages
+                    logger.info(f"Restored messages: {len(latest_messages)} messages from latest checkpoint")
 
-                logger.info(f"Total checkpoints examined: {checkpoint_count}")
-                logger.info(f"Total unique messages collected: {len(all_messages)}")
+                    # Check if agent channels already have substantive content (from previous recursion limit)
+                    # If they do, DON'T rebuild from checkpoint - preserve the existing content
+                    channels_need_rebuild = False
+                    for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
+                              "generalist_messages", "mcp_manager_messages"]:
+                        existing = self.state.get(ch, [])
+                        substantive_count = sum(1 for msg in existing if isinstance(msg, (AIMessage, ToolMessage)))
 
-                if all_messages:
-                    self.state["messages"] = all_messages
-                    logger.info(f"Updated state with {len(all_messages)} messages from checkpoints")
-                else:
-                    logger.warning("No messages found in any checkpoint!")
+                        if substantive_count == 0:
+                            # Channel is empty or only has system/human messages
+                            channels_need_rebuild = True
+                            break
+
+                    if channels_need_rebuild:
+                        # CRITICAL: Rebuild agent-specific channels from global messages
+                        # The global messages channel has ALL the work, but agent channels don't
+                        # because the node hasn't returned yet. Reconstruct them from message metadata.
+                        logger.info("Rebuilding agent-specific channels from global messages...")
+
+                        # Initialize channels if not already present
+                        for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
+                                  "generalist_messages", "mcp_manager_messages"]:
+                            if ch not in self.state:
+                                self.state[ch] = []
+                    else:
+                        logger.info("Agent channels already have content from previous run - skipping rebuild to preserve state")
+                        # Still need to ensure channels exist
+                        for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
+                                  "generalist_messages", "mcp_manager_messages"]:
+                            if ch not in self.state:
+                                self.state[ch] = []
+                        # Skip the message sorting below
+                        channels_need_rebuild = False
+
+                    # Sort messages into their respective channels based on metadata
+                    if channels_need_rebuild:
+                        for msg in latest_messages:
+                            # Check message.name attribute (set by MessageCaptureCallback)
+                            agent_name = getattr(msg, 'name', None)
+
+                            # Also check _delegated_to in additional_kwargs (for handoff messages)
+                            delegated_to = msg.additional_kwargs.get('_delegated_to') if hasattr(msg, 'additional_kwargs') else None
+
+                            # Map agent names to channels
+                            if agent_name == "Supervisor" or delegated_to == "Supervisor":
+                                if msg not in self.state["supervisor_messages"]:
+                                    self.state["supervisor_messages"].append(msg)
+                            elif agent_name == "Mythic_Operator" or delegated_to == "Mythic_Operator":
+                                if msg not in self.state["mythic_operator_messages"]:
+                                    self.state["mythic_operator_messages"].append(msg)
+                            elif agent_name == "Mythic_Payload" or delegated_to == "Mythic_Payload":
+                                if msg not in self.state["mythic_payload_messages"]:
+                                    self.state["mythic_payload_messages"].append(msg)
+                            elif agent_name == "Generalist" or delegated_to == "Generalist":
+                                if msg not in self.state["generalist_messages"]:
+                                    self.state["generalist_messages"].append(msg)
+                            elif agent_name == "MCP_Manager" or delegated_to == "MCP_Manager":
+                                if msg not in self.state["mcp_manager_messages"]:
+                                    self.state["mcp_manager_messages"].append(msg)
+
+                        # Log rebuilt channel sizes
+                        for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
+                                  "generalist_messages", "mcp_manager_messages"]:
+                            logger.info(f"Rebuilt {ch}: {len(self.state[ch])} messages")
+
+                        # CRITICAL: Validate and fix message sequences for Bedrock compatibility
+                        # Bedrock requires that every AIMessage with tool_calls is IMMEDIATELY
+                        # followed by ToolMessage(s) with matching tool_call_ids
+                        # After rebuilding channels, this requirement might be violated
+                        logger.info("Validating message sequences for LLM provider compatibility...")
+                        for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
+                                  "generalist_messages", "mcp_manager_messages"]:
+                            self.state[ch] = self._fix_message_sequence_for_bedrock(self.state[ch])
+
+                if not latest_messages:
+                    logger.warning("No latest messages found in checkpoints!")
+                    # Fall back to best agent state if available
+                    for channel_name, channel_data in best_agent_state.items():
+                        self.state[channel_name] = channel_data
+                        logger.info(f"Restored {channel_name}: {len(channel_data)} messages from best checkpoint (fallback)")
 
             except Exception as checkpoint_error:
                 logger.warning(f"Could not retrieve checkpoint after recursion limit: {checkpoint_error}")
 
-            # Ask the LLM to summarize the progress made so far
-            # Include recent context from the conversation for the summary
-            recent_messages = recent_messages = self.state["messages"][-10:] if len(self.state["messages"]) > 10 else self.state["messages"]
-            summary_prompt = HumanMessage(content="""Based on the conversation so far, provide a brief summary of:
-                1. What tasks have been completed
-                2. What information has been gathered
-                3. What still needs to be done
+            # DEBUG: Log what's in self.state AFTER checkpoint recovery
+            logger.info(f"DEBUG: In-memory state AFTER checkpoint recovery:")
+            for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
+                ch_msgs = self.state.get(ch, [])
+                logger.info(f"  {ch}: {len(ch_msgs)} messages")
 
-                Keep it concise (3-5 bullet points).""")
+                # Sample mythic_operator_messages
+                if ch == "mythic_operator_messages" and len(ch_msgs) > 0:
+                    logger.info(f"  DEBUG: Sampling first 5 {ch} messages:")
+                    for idx, msg in enumerate(ch_msgs[:5]):
+                        msg_type = type(msg).__name__
+                        content_preview = str(msg.content)[:150] if hasattr(msg, 'content') else "N/A"
+                        logger.info(f"    [{idx}] {msg_type}: {content_preview}...")
 
-            # Create a summary request with context
-            try:
-                summary_messages_raw = recent_messages + [summary_prompt]
-                # Build merged view of ALL agent channels for better context
-                merged = []
-                for ch in [
-                    "supervisor_messages",
-                    "generalist_messages",
-                    "mythic_operator_messages",
-                    "mythic_payload_messages",
-                    "mcp_manager_messages",
-                ]:
-                    merged.extend(self.state.get(ch, []))
-                if merged:  # prefer merged if it has data
-                    summary_messages_raw = merged[-15:] + [summary_prompt]
+            # Generate per-agent summaries for accurate state capture
+            # Each agent that did work summarizes its own work
+            agent_summaries = await self._generate_per_agent_summaries()
 
-                summary_messages = self._sanitize_messages(summary_messages_raw)
+            # Create continuation message with per-agent summaries
+            summary_text = agent_summaries if agent_summaries else "Work in progress across multiple agents."
 
-                # Ensure at least one SystemMessage (Anthropic Bedrock safer)
-                if not any(isinstance(m, SystemMessage) for m in summary_messages):
-                    summary_messages.insert(0, SystemMessage(content="You are a summarizer. Produce concise bullet points."))
-
-                # Final guard: must not be empty
-                if not summary_messages:
-                    summary_messages = [SystemMessage(content="You are a summarizer."), summary_prompt]
-                logger.debug(f"Summary invoke sending {len(summary_messages)} messages: {[type(m).__name__ for m in summary_messages]}")
-                summary_resp = await self.llm.ainvoke(summary_messages)
-                summary_text = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
-            except Exception as summary_error:
-                logger.warning(f"Could not generate summary: {summary_error}")
-                summary_text = "Multiple reconnaissance and information gathering tasks were in progress."
-
-            # Create continuation message with LLM-generated summary
             continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached**
 
-**Progress Summary:**
+**Progress by Agent:**
 {summary_text}
 
-**Status:** Hit the system's iteration limit of 25 steps. All work has been preserved in the conversation history.
+**Status:** Hit the system's iteration limit of 25 steps. All work and context have been preserved in each agent's conversation history.
 
 **Your Options:**
 • Reply **"continue"** to increase the limit and keep going from where we left off
@@ -1720,17 +2285,20 @@ class Model:
             )
 
             # Add continuation message to state
+            # CRITICAL: Add to BOTH messages AND supervisor_messages so Supervisor can see the summary
+            continuation_message_seq = self._next_seq()
+            _tag_msg(continuation_message, continuation_message_seq)
             self.state["messages"].append(continuation_message)
+            self.state["supervisor_messages"].append(continuation_message)
             self.state["recursion_summary_requested"] = True
 
-            # Return only NEW messages since last output (avoid duplicates)
-            # Don't reset counter - it already tracks which messages have been shown
-            resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
+            # Stream the continuation message to Mythic
+            formatted_continuation = self._format_message_for_streaming(continuation_message, agent_name="System")
+            if formatted_continuation:
+                await self._stream_message_to_mythic(formatted_continuation)
 
-            # Use skip_counter=False to respect the shown tracking and show only new messages
-            # This prevents showing messages that were already displayed before recursion limit
-            logger.info(f"Returning recursion summary, {len(self._shown_messages)} messages already shown")
-            return self._generate_mythic_output(resp, skip_counter=False)
+            logger.info(f"Returning recursion summary with continuation prompt")
+            return ""  # All output already streamed to Mythic
 
         except Exception as e:
             # Catch any other errors (API errors, context limit exceeded, etc.)
@@ -1788,16 +2356,16 @@ The conversation history below shows all work completed before the error occurre
             all_messages.append(error_message)
             self.state["messages"] = all_messages
 
-            # Return partial work + error
-            resp = {"messages": all_messages}
-            logger.info(f"Returning error with {len(all_messages)} messages of partial work")
-            return self._generate_mythic_output(resp, skip_counter=False)
+            # Stream the error message to Mythic
+            formatted_error = self._format_message_for_streaming(error_message, agent_name="System")
+            if formatted_error:
+                await self._stream_message_to_mythic(formatted_error)
 
-        # Generate output FIRST, then mark turn complete
-        result = self._generate_mythic_output(synthetic_resp)
-        # Mark first turn complete - subsequent turns won't show user prompt (Mythic echoes it)
-        self._is_first_turn = False
-        return result
+            # Re-raise the exception so chat.py can handle setting response.Success = False
+            # The error message has already been streamed to the user
+            raise
+
+        return ""  # All output already streamed to Mythic
 
     async def handle_continuation_response(self, response: str) -> str:
         """
@@ -1819,50 +2387,93 @@ The conversation history below shows all work completed before the error occurre
         if response.lower().strip() in ["continue", "yes", "keep going"]:
             # Increase recursion limit and continue
             logger.info("User requested to continue - increasing recursion limit")
-            self.state["messages"].append(HumanMessage(content="Please continue with the previous task."))
+
+            # Add continuation message to supervisor channel (not the literal "continue" user typed)
+            # Make it explicit that this is a continuation building on prior work
+            continuation_msg = HumanMessage(content="""Review the progress summary above and continue with the task from where we left off.
+
+IMPORTANT:
+- DO NOT repeat any work that was already completed
+- Build upon the information and results already gathered
+- Reference previous tool outputs instead of re-running the same tools
+- Focus on the remaining tasks identified in the summary
+
+Continue now.""")
+            continuation_msg_seq = self._next_seq()
+            _tag_msg(continuation_msg, continuation_msg_seq)
+            self.state["supervisor_messages"].append(continuation_msg)
+            self.state["messages"].append(continuation_msg)
+
+            # Stream the continuation instruction to show what we're telling the LLM
+            # (Always stream this, even for interactive tasks, because it's our replacement message)
+            formatted = self._format_message_for_streaming(continuation_msg, agent_name=None)
+            if formatted:
+                await self._stream_message_to_mythic(formatted)
 
             if self.graph:
                 try:
-                    resp = await self.graph.ainvoke(self.state, {
-                        "configurable": {"thread_id": thread_id},
-                        "recursion_limit": 50  # Increased limit for continuation
-                    })
+                    # Stream continuation with increased recursion limit
+                    async for event in self.graph.astream(
+                        self.state,
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+                    ):
+                        await self._process_stream_event(event)
 
-                    # Check again for recursion summary request
-                    if resp.get("recursion_summary_requested", False):
-                        return self._generate_mythic_output(resp)
+                        # Update state with new values from event (extend for lists, assign for scalars)
+                        for node_name, state_update in event.items():
+                            if node_name in ["__start__", "__end__"]:
+                                continue
+                            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
+                                      "mythic_payload_messages", "mcp_manager_messages", "_message_seq"]:
+                                if ch in state_update:
+                                    if ch == "_message_seq":
+                                        self._message_seq = state_update[ch]
+                                        self.state[ch] = state_update[ch]
+                                    else:
+                                        if ch not in self.state:
+                                            self.state[ch] = []
+                                        self.state[ch].extend(state_update[ch])
+                            # Check for recursion flags
+                            if "recursion_summary_requested" in state_update:
+                                self.state["recursion_summary_requested"] = state_update["recursion_summary_requested"]
+                            if "recursion_handback" in state_update:
+                                self.state["recursion_handback"] = state_update["recursion_handback"]
+
+                    # Check if recursion summary was requested during streaming
+                    if self.state.get("recursion_summary_requested", False):
+                        return ""  # All output already streamed to Mythic
 
                 except GraphRecursionError as e:
                     # Hit recursion limit again even with increased limit
                     logger.warning(f"Recursion limit hit again: {e}")
 
-                    # Get checkpoint state including nested agents
-                    all_messages = []
+                    # Restore from checkpoint (same reason as first recursion hit)
+                    logger.info(f"Restoring from checkpoint after second recursion limit:")
                     try:
-                        checkpoint = await self.memory.aget_tuple(config)
-                        if checkpoint and checkpoint.checkpoint:
-                            saved_state = checkpoint.checkpoint.get("channel_values", {})
-                            if "messages" in saved_state:
-                                all_messages.extend(saved_state["messages"])
-
-                        # Get nested agent checkpoints too
-                        async for checkpoint_tuple in self.memory.alist(config, limit=100):
+                        async for checkpoint_tuple in self.memory.alist(config, limit=1):
                             if checkpoint_tuple and checkpoint_tuple.checkpoint:
-                                ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
-                                if ns and ("Mythic_Operator" in ns or "Mythic_Payload" in ns or "Generalist" in ns):
-                                    nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
-                                    if "messages" in nested_state:
-                                        for msg in nested_state["messages"]:
-                                            if msg not in all_messages:
-                                                all_messages.append(msg)
-
-                        if all_messages:
-                            self.state["messages"] = all_messages
+                                nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                                for channel_name in ["messages", "supervisor_messages", "generalist_messages",
+                                                    "mythic_operator_messages", "mythic_payload_messages",
+                                                    "mcp_manager_messages", "_message_seq"]:
+                                    if channel_name in nested_state:
+                                        self.state[channel_name] = nested_state[channel_name]
+                                        if channel_name != "_message_seq":
+                                            logger.info(f"  Restored {channel_name}: {len(nested_state[channel_name])} messages")
+                                if "_message_seq" in nested_state:
+                                    self._message_seq = nested_state["_message_seq"]
                     except Exception as checkpoint_error:
                         logger.warning(f"Could not retrieve checkpoint: {checkpoint_error}")
 
+                    # Generate per-agent summaries
+                    agent_summaries = await self._generate_per_agent_summaries()
+                    summary_text = agent_summaries if agent_summaries else "Work in progress."
+
                     # Generate summary again
-                    continuation_message = AIMessage(content="""🔄 **Recursion Limit Reached Again**
+                    continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached Again**
+
+**Progress by Agent:**
+{summary_text}
 
 **Status:** Hit the increased iteration limit. The task appears to be very complex or open-ended.
 
@@ -1873,78 +2484,143 @@ The conversation history below shows all work completed before the error occurre
 
 **What would you like to do?**""")
 
+                    # Add to BOTH messages AND supervisor_messages so Supervisor can see it
+                    continuation_message_seq = self._next_seq()
+                    _tag_msg(continuation_message, continuation_message_seq)
                     self.state["messages"].append(continuation_message)
+                    self.state["supervisor_messages"].append(continuation_message)
                     self.state["recursion_summary_requested"] = True
-                    resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
 
-                    # Don't reset counter - show only new messages to avoid duplicates
-                    logger.info(f"Recursion limit hit again, {len(self._shown_messages)} messages already shown")
-                    return self._generate_mythic_output(resp, skip_counter=False)
+                    # Stream the continuation message to Mythic
+                    formatted_continuation = self._format_message_for_streaming(continuation_message, agent_name="System")
+                    if formatted_continuation:
+                        await self._stream_message_to_mythic(formatted_continuation)
+
+                    logger.info(f"Recursion limit hit again, streaming continuation prompt")
+                    return ""  # All output already streamed to Mythic
             else:
                 raise ValueError("No graph defined for the model.")
 
         elif response.lower().strip() in ["stop", "no", "end", "quit"]:
             # User wants to stop
             logger.info("User requested to stop the task")
-            return "✅ Task stopped as requested. The session remains active for new tasks."
+            stop_message = AIMessage(content="✅ Task stopped as requested. The session remains active for new tasks.")
+            self.state["messages"].append(stop_message)
+
+            # Stream the stop confirmation
+            formatted = self._format_message_for_streaming(stop_message, agent_name="System")
+            if formatted:
+                await self._stream_message_to_mythic(formatted)
+
+            return ""  # All output already streamed
 
         else:
             # User provided new instructions or redirection
             logger.info("User provided new instructions for continuation")
-            self.state["messages"].append(HumanMessage(content=response))
+
+            # Add user's custom instruction to supervisor channel
+            redirect_msg = HumanMessage(content=response)
+            redirect_msg_seq = self._next_seq()
+            _tag_msg(redirect_msg, redirect_msg_seq)
+            self.state["supervisor_messages"].append(redirect_msg)
+            self.state["messages"].append(redirect_msg)
+
+            # Stream the custom instruction (always show since it's explicit redirection)
+            formatted = self._format_message_for_streaming(redirect_msg, agent_name=None)
+            if formatted:
+                await self._stream_message_to_mythic(formatted)
 
             if self.graph:
                 try:
-                    resp = await self.graph.ainvoke(self.state, {
-                        "configurable": {"thread_id": thread_id},
-                        "recursion_limit": 25  # Reset to default for new task direction
-                    })
+                    # Stream new task direction with default recursion limit
+                    async for event in self.graph.astream(
+                        self.state,
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+                    ):
+                        await self._process_stream_event(event)
 
-                    # Check for recursion summary request
-                    if resp.get("recursion_summary_requested", False):
-                        return self._generate_mythic_output(resp)
+                        # Update state with new values from event (extend for lists, assign for scalars)
+                        for node_name, state_update in event.items():
+                            if node_name in ["__start__", "__end__"]:
+                                continue
+                            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
+                                      "mythic_payload_messages", "mcp_manager_messages", "_message_seq"]:
+                                if ch in state_update:
+                                    if ch == "_message_seq":
+                                        self._message_seq = state_update[ch]
+                                        self.state[ch] = state_update[ch]
+                                    else:
+                                        if ch not in self.state:
+                                            self.state[ch] = []
+                                        self.state[ch].extend(state_update[ch])
+                            # Check for recursion flags
+                            if "recursion_summary_requested" in state_update:
+                                self.state["recursion_summary_requested"] = state_update["recursion_summary_requested"]
+                            if "recursion_handback" in state_update:
+                                self.state["recursion_handback"] = state_update["recursion_handback"]
+
+                    # Check if recursion summary was requested during streaming
+                    if self.state.get("recursion_summary_requested", False):
+                        return ""  # All output already streamed to Mythic
 
                 except GraphRecursionError as e:
                     # Handle recursion error for new direction too
                     logger.warning(f"Recursion limit hit on redirect: {e}")
 
-                    # Get checkpoint state including nested agents
-                    all_messages = []
+                    # Restore from checkpoint (same reason as first recursion hit)
+                    logger.info(f"Restoring from checkpoint after redirect recursion limit:")
                     try:
-                        checkpoint = await self.memory.aget_tuple(config)
-                        if checkpoint and checkpoint.checkpoint:
-                            saved_state = checkpoint.checkpoint.get("channel_values", {})
-                            if "messages" in saved_state:
-                                all_messages.extend(saved_state["messages"])
-
-                        # Get nested agent checkpoints too
-                        async for checkpoint_tuple in self.memory.alist(config, limit=100):
+                        async for checkpoint_tuple in self.memory.alist(config, limit=1):
                             if checkpoint_tuple and checkpoint_tuple.checkpoint:
-                                ns = checkpoint_tuple.metadata.get("checkpoint_ns", "")
-                                if ns and ("Mythic_Operator" in ns or "Mythic_Payload" in ns or "Generalist" in ns):
-                                    nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
-                                    if "messages" in nested_state:
-                                        for msg in nested_state["messages"]:
-                                            if msg not in all_messages:
-                                                all_messages.append(msg)
-
-                        if all_messages:
-                            self.state["messages"] = all_messages
+                                nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+                                for channel_name in ["messages", "supervisor_messages", "generalist_messages",
+                                                    "mythic_operator_messages", "mythic_payload_messages",
+                                                    "mcp_manager_messages", "_message_seq"]:
+                                    if channel_name in nested_state:
+                                        self.state[channel_name] = nested_state[channel_name]
+                                        if channel_name != "_message_seq":
+                                            logger.info(f"  Restored {channel_name}: {len(nested_state[channel_name])} messages")
+                                if "_message_seq" in nested_state:
+                                    self._message_seq = nested_state["_message_seq"]
                     except Exception as checkpoint_error:
                         logger.warning(f"Could not retrieve checkpoint: {checkpoint_error}")
 
-                    continuation_message = AIMessage(content="🔄 Hit recursion limit again. Reply 'continue' to proceed or 'stop' to end.")
-                    self.state["messages"].append(continuation_message)
-                    self.state["recursion_summary_requested"] = True
-                    resp = {"messages": self.state["messages"], "recursion_summary_requested": True}
+                    # Generate per-agent summaries
+                    agent_summaries = await self._generate_per_agent_summaries()
+                    summary_text = agent_summaries if agent_summaries else "Work in progress."
 
-                    # Don't reset counter - show only new messages to avoid duplicates
-                    logger.info(f"Recursion limit hit again, {len(self._shown_messages)} messages already shown")
-                    return self._generate_mythic_output(resp, skip_counter=False)
+                    continuation_message = AIMessage(content=f"""🔄 **Recursion Limit Reached (Redirect)**
+
+**Progress by Agent:**
+{summary_text}
+
+**Status:** Hit the iteration limit while pursuing the redirected task.
+
+**Your Options:**
+• Reply **"continue"** to keep going with an increased limit
+• Reply **"stop"** to end and review progress
+• Provide more specific instructions
+
+**What would you like to do?**""")
+
+                    # Add to BOTH messages AND supervisor_messages so Supervisor can see it
+                    continuation_message_seq = self._next_seq()
+                    _tag_msg(continuation_message, continuation_message_seq)
+                    self.state["messages"].append(continuation_message)
+                    self.state["supervisor_messages"].append(continuation_message)
+                    self.state["recursion_summary_requested"] = True
+
+                    # Stream the continuation message to Mythic
+                    formatted_continuation = self._format_message_for_streaming(continuation_message, agent_name="System")
+                    if formatted_continuation:
+                        await self._stream_message_to_mythic(formatted_continuation)
+
+                    logger.info(f"Recursion limit hit again, streaming continuation prompt")
+                    return ""  # All output already streamed to Mythic
             else:
                 raise ValueError("No graph defined for the model.")
 
-        return self._generate_mythic_output(resp)
+        return ""  # All output already streamed to Mythic
 
 def _create_summarize_handback_tool():
     """

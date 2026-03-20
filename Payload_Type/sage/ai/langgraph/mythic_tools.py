@@ -204,6 +204,81 @@ class MythicTools:
         except Exception as e:
             return f"Error executing query: {e}"
 
+    async def get_all_command_names_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
+        """Get all available command names for a specific payload type (agent).
+        
+        This tool retrieves all command names available for a given payload type.
+
+        Args:
+            payload: The name of the payload type (e.g., 'sage', 'apollo', 'poseidon')
+        Returns:
+            str: JSON string containing all commands and their detailed information
+        """
+        query = """
+            query SageCommandNames {
+                command(where: {payloadtype: {name: {_eq: "PLACEHOLDER"}}}) {
+                    cmd
+                    description
+                }
+            }
+        """
+        query = query.replace("PLACEHOLDER", payload)
+        attr = """
+        cmd
+        description
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_all_command_names_for_payloadtype tool for: {payload}")
+            results =  await mythic.execute_custom_query(self.client, query)
+            return json.dumps(results, sort_keys=True)
+        except Exception as e:
+            return f"Error getting commands for payload type {payload}: {e}"
+
+    async def get_all_command_args_for_payloadtype(
+            self, 
+            payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"],
+            command: Annotated[str, "The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')"]) -> str:
+        """Get all of a command's arguments for a specific payload type (agent).
+        
+        This tool retrieves all information about a command's arguments available for a given payload type.
+
+        Args:
+            payload: The name of the payload type (e.g., 'sage', 'apollo', 'poseidon')
+            command: The name of the command to get its arguments (e.g., 'ls', 'pwd', 'whoami')
+        Returns:
+            str: JSON string containing all commands and their detailed information
+        """
+        query = """
+            query SageCommandArgs {
+                command(where: {cmd: {_eq: "COMMAND"}, payloadtype: {name: {_eq: "PAYLOAD"}}}) {
+                    cmd
+                    commandparameters {
+                    cli_name
+                    name
+                    type
+                    description
+                    default_value
+                    choices
+                    required
+                    }
+                    help_cmd
+                    needs_admin
+                }
+            }
+        """
+        query = query.replace("COMMAND", command).replace("PAYLOAD", payload)
+ 
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_all_command_args_for_payloadtype tool for: {payload}")
+            results =  await mythic.execute_custom_query(self.client, query)
+            return json.dumps(results, sort_keys=True)
+        except Exception as e:
+            return f"Error getting command {command} args for payload type {payload}: {e}"
+    
     async def get_all_commands_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
         """Get all available commands for a specific payload type (agent).
         
