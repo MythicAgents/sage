@@ -253,20 +253,45 @@ class ChatCommand(CommandBase):
             await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ParentTaskID, UpdateStatus="LLM Processing..."))
         else:
             await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
-        llm_resp = await llm.invoke(prompt)
-        llm_resp += "\n👤> "  # Add the user prompt to the response for context
 
-        id = response.TaskID if not taskData.Task.IsInteractiveTask else taskData.Task.ParentTaskID
-        resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(id, llm_resp.encode()))
-        if not resp.Success:
+        # Invoke LLM (streaming happens internally within invoke())
+        try:
+            await llm.invoke(prompt, is_interactive=taskData.Task.IsInteractiveTask)
+        except Exception as e:
+            # Error occurred - update task status and stream error to UI
             response.Success = False
-            response.Error = resp.Error
+            response.Error = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"LLM invocation failed: {response.Error}")
+
+            # Update task status to show error (not stuck on "LLM Processing...")
+            id = response.TaskID if not taskData.Task.IsInteractiveTask else taskData.Task.ParentTaskID
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=id, UpdateStatus="error"))
+
+            # Stream error message to task output so user can see it
+            error_msg = f"\n❌> Error: {response.Error}\n"
+            resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(id, error_msg.encode()))
+            if not resp.Success:
+                logger.error(f"Failed to stream error message to task: {resp.Error}")
+
+            # Add prompt indicator so user knows they can retry
+            resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(id, "\n👤> ".encode()))
+            if not resp.Success:
+                logger.error(f"Failed to add prompt indicator after error: {resp.Error}")
+
             return response
+
+        # Add user prompt indicator for next turn
+        id = response.TaskID if not taskData.Task.IsInteractiveTask else taskData.Task.ParentTaskID
+        resp = await SendMythicRPCResponseCreate(
+            MythicRPCResponseCreateMessage(id, "\n👤> ".encode())
+        )
+        if not resp.Success:
+            logger.error(f"Failed to add prompt indicator: {resp.Error}")
 
         # Not checking for success or errors because this is just a callback to update the last checkin time
         resp = await SendMythicRPCCallbackUpdate(
             MythicRPCCallbackUpdateMessage(
-                TaskID=id, 
+                TaskID=id,
                 UpdateLastCheckinTime=True,
                 UpdateLastCheckinTimeViaC2Profile=""
             )
