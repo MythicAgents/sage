@@ -4,7 +4,7 @@ import container # DO NOT REMOVE THIS IMPORT - This is needed to register the Pa
 import os
 import phoenix as px
 from phoenix.otel import register
-from opentelemetry.instrumentation.langchain import LangchainInstrumentor
+from openinference.instrumentation.langchain import LangChainInstrumentor
 
 # Configure SSL certificate bundle if present
 cert_bundle_path = os.path.join(os.path.dirname(__file__), "certs", "bundle.pem")
@@ -24,6 +24,6 @@ tracer_provider = register(
     auto_instrument=False,  # We manually instrument LangChain below
     batch=False,
 )
-LangchainInstrumentor(tracer_provider).instrument(skip_dep_check=True)
+LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
 mythic_container.mythic_service.start_and_run_forever()
