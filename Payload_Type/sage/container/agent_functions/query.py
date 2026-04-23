@@ -199,12 +199,7 @@ class QueryCommand(CommandBase):
             llm.set_verbose(True)
 
         await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
-        llm_resp = await llm.invoke(prompt)
-        
-        resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(taskData.Task.ID, llm_resp.encode()))
-        if not resp.Success:
-            response.Success = False
-            response.Error = resp.Error
+        await llm.invoke(prompt)
 
         resp = await SendMythicRPCCallbackUpdate(
             MythicRPCCallbackUpdateMessage(

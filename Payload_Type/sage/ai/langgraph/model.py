@@ -255,16 +255,15 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                        f"tool_calls={len(getattr(msg, 'tool_calls', []) or [])}")
 
                             # Stream message immediately to Mythic
-                            # Filter: Suppress Supervisor text-only messages (no tool_calls).
-                            # These are stray acknowledgments/continuations that leak into
-                            # the UI after a specialist has already streamed its response.
-                            # The Supervisor communicates intentionally via respond_to_user tool.
+                            # Filter: Suppress ALL Supervisor messages from streaming.
+                            # The Supervisor is an internal orchestration component — users
+                            # interact with specialist agents only. Without this, the Supervisor's
+                            # AIMessage (which contains both text AND tool_calls like respond_to_user)
+                            # would leak duplicate content to the user.
                             should_stream = True
                             if self.agent_name == "Supervisor":
-                                has_tool_calls = bool(getattr(msg, 'tool_calls', None))
-                                if not has_tool_calls:
-                                    logger.debug(f"📨 [Callback:Supervisor] Suppressing text-only message from streaming (no tool_calls)")
-                                    should_stream = False
+                                logger.debug(f"📨 [Callback:Supervisor] Suppressing Supervisor message from streaming (internal orchestrator)")
+                                should_stream = False
 
                             if should_stream and self._stream_func and self._format_func:
                                 formatted = self._format_func(msg, agent_name=self.agent_name)
@@ -536,10 +535,14 @@ class Model:
             True if successful, False otherwise
         """
         try:
+            encoded = formatted_message.encode()
+            if not encoded:
+                logger.warning(f"⚠️  Skipping empty response to Mythic task {self.task_id} (would cause 'Response must have actual bytes' error)")
+                return False
             resp = await SendMythicRPCResponseCreate(
                 MythicRPCResponseCreateMessage(
                     self.task_id,
-                    formatted_message.encode()
+                    encoded
                 )
             )
             if not resp.Success:
@@ -577,16 +580,13 @@ class Model:
                     formatted = self._format_message_for_streaming(msg, agent_name=node_name)
                     if formatted:
                         await self._stream_message_to_mythic(formatted)
-                # Stream AIMessages from respond_to_user tool (Supervisor's intentional responses).
-                # These are NOT streamed by the callback (which suppresses Supervisor text-only messages)
-                # but should be shown since the Supervisor explicitly chose to respond.
-                # respond_to_user sets name="Supervisor" and has actual content.
+                # Supervisor AIMessages (from respond_to_user tool) are intentionally NOT streamed.
+                # The Supervisor is an internal orchestration component — the user interacts with
+                # specialist agents (Generalist, Mythic_Operator, etc.) whose responses are already
+                # streamed in real-time. The respond_to_user tool still functions for graph control
+                # flow (goto="__end__") but its content is suppressed from user-facing output.
                 elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
-                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                    if content.strip() and content.strip() != ".":
-                        formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
-                        if formatted:
-                            await self._stream_message_to_mythic(formatted)
+                    logger.debug(f"📨 [Stream] Suppressing Supervisor respond_to_user message from user output")
 
     async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
         """
@@ -1436,6 +1436,15 @@ class Model:
             - General questions, explanations, advice → **Generalist**
             - ONLY use MCP_Manager for external/third-party tools that other agents cannot handle
 
+            **CRITICAL: NO Autonomous Task Generation (SAFETY/OPSEC):**
+            You must ONLY delegate tasks that the operator EXPLICITLY requested. NEVER generate your own
+            operational objectives, reconnaissance plans, or C2 commands. Specifically:
+            - **Greetings, small talk, or general questions** → Delegate to Generalist, then call `respond_to_user`. Done. Do NOT follow up with operational tasks.
+            - **NEVER autonomously decide** to check callbacks, run reconnaissance, escalate privileges, or perform any C2 operation unless the operator explicitly asked for it.
+            - **NEVER chain tasks** beyond what was requested. If the operator says "hello", the ONLY correct action is greeting them — not checking operational status, not reviewing callbacks, not suggesting next steps for active implants.
+            - **The operator controls all offensive actions.** Your role is to route their explicit requests to the right agent, NOT to anticipate or initiate operations on their behalf.
+            - If an agent returns results and the operator's original request is satisfied, call `respond_to_user` immediately. Do NOT use those results to generate follow-up operational tasks.
+
             Your responsibilities include:
             - Understanding the user's high-level goals and breaking them into smaller, manageable tasks.
             - Assigning tasks to the appropriate agent based on their expertise.
@@ -1520,9 +1529,9 @@ class Model:
             Therefore:
             - Do NOT repeat, summarize, paraphrase, or extend the specialist's response in your own text.
             - Do NOT continue lists, add options, or append to the specialist's output.
-            - When a specialist has finished and you need to respond, use the `respond_to_user` tool.
-            - If the specialist's response fully answers the user's question, call `respond_to_user` with a brief acknowledgment only.
-            - Your direct text output (without a tool call) is also streamed — any stray text you generate will appear to the user as extra output after the specialist's response.
+            - When a specialist has finished and you need to respond, use the `respond_to_user` tool to end the graph.
+            - **IMPORTANT**: Your `respond_to_user` content is NOT shown to the user — it only controls graph termination. The specialist's streamed response IS the user-facing output. Do not put important information in respond_to_user that the user needs to see.
+            - Your direct text output (without a tool call) is also streamed — any stray text you generate will appear to the user as extra output after the specialist's response. Avoid generating text without a tool call.
 
             When responding to the user:
             - Use the `respond_to_user` tool for all final responses.
@@ -1703,6 +1712,14 @@ class Model:
                 elif isinstance(m, HumanMessage):
                     cleaned.append(m)
                 # ignore other types silently
+
+            # Ensure conversation doesn't end with an AIMessage.
+            # Bedrock rejects "assistant message prefill" — the conversation must end
+            # with a user message. This happens when worker agent responses (AIMessages)
+            # are copied back to the Supervisor's channel before re-invocation.
+            if cleaned and isinstance(cleaned[-1], AIMessage):
+                cleaned.append(HumanMessage(content="Based on the above, decide your next action."))
+
             return cleaned
 
     def _fix_message_sequence_for_bedrock(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
