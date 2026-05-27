@@ -17,4 +17,5 @@ mythic==0.2.10
 mythic-container==0.6.16
 aiosqlite==0.22.1
 arize-phoenix==13.17.0
+arize-phoenix-evals==2.11.0
 openinference-instrumentation-langchain==0.1.61
