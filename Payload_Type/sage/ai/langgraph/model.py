@@ -1409,6 +1409,17 @@ class Model:
         Your tools come from connected MCP servers. Tool availability depends on which servers are connected.
         Use the tools naturally based on the task requirements.
 
+        **BloodHound / Attack-Path Analysis (graph-reasoning loop):**
+        You own BloodHound graph queries via the BloodHound MCP server (e.g. graph_analysis, adcs_info,
+        cypher_query, file_upload). Two rules:
+        - PRECHECK: if the task needs BloodHound but no `bloodhound` server appears in the connected list
+          above, do NOT fail silently. Call get_ttp_guidance("stand up bloodhound") and relay the concrete
+          standup steps, then ask the operator to connect it with the `mcp-connect` command and retry.
+        - When connected, run the loop: call get_ttp_guidance("bloodhound attack path loop") for the
+          workflow. Typically: ingest the SharpHound collection (file_upload) → data_quality →
+          graph_analysis / adcs_info / cypher_query to identify the path → report the path AND your
+          reasoning back so the Supervisor can route the next hop to Mythic_Operator.
+
         **Recursion Limit Management:**
         - You have access to a `remaining_steps` value that shows how many more operations can be performed.
         - When remaining_steps is 4 or fewer, you MUST use the `summarize_and_handback` tool instead of continuing.
@@ -1424,7 +1435,17 @@ class Model:
         # Add handback tool for recursion limit management
         handback_tool = _create_summarize_handback_tool()
 
-        tools = mcp_tools + [handback_tool]
+        # Sage TTP knowledge tools (read-only local files) so MCP_Manager can self-serve
+        # BloodHound standup guidance + the attack-path-loop playbook.
+        ttp_tools = []
+        if self.mythic_client is not None:
+            ttp_tools = self.mythic_client.get_tools([
+                "get_ttp_guidance",
+                "get_ttp_full_reference",
+                "list_ttp_categories",
+            ])
+
+        tools = mcp_tools + ttp_tools + [handback_tool]
 
         # Handle case when no MCP tools available
         if not mcp_tools:
@@ -1460,6 +1481,7 @@ class Model:
             - Payload creation, C2 profiles, build options → **Mythic_Payload** (NOT MCP_Manager)
             - General questions, explanations, advice → **Generalist**
             - ONLY use MCP_Manager for external/third-party tools that other agents cannot handle
+            - BloodHound / attack-path graph analysis (shortest path, ADCS ESC paths, Cypher) → **MCP_Manager** (the BloodHound MCP). The autonomous solve is a loop: Mythic_Operator collects (SharpHound) → MCP_Manager reasons over the graph → Mythic_Operator executes the chosen hop → repeat. Run this loop ONLY when the operator EXPLICITLY requested an autonomous solve / path-walk — it does not override the no-autonomous-generation rule above.
 
             **CRITICAL: NO Autonomous Task Generation (SAFETY/OPSEC):**
             You must ONLY delegate tasks that the operator EXPLICITLY requested. NEVER generate your own

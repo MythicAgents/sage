@@ -724,6 +724,118 @@ class MythicTools:
         except Exception as e:
             return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
 
+    def _run_sandbox_sync(self, command: list[str], image: str, timeout: int,
+                          mem_limit: str, pids_limit: int, work_size: str) -> dict:
+        """Blocking sandbox run (offloaded via asyncio.to_thread). Returns a result dict.
+
+        All isolation is applied here at create time: no privileges, all caps dropped,
+        no-new-privileges, read-only rootfs, size-capped tmpfs work dir, network disabled,
+        mem/pids caps, non-root user, hard timeout + force-remove. See Plans/SANDBOX_DESIGN.md.
+        """
+        import docker
+        from docker.errors import ImageNotFound
+
+        client = docker.from_env()
+        # Ensure the sandbox image exists; build from container/sandbox/ on first use.
+        try:
+            client.images.get(image)
+        except ImageNotFound:
+            # __file__ = .../sage/ai/langgraph/mythic_tools.py -> up 3 dirs = .../sage/
+            sage_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            sandbox_ctx = os.path.join(sage_root, "container", "sandbox")
+            logger.info(f"Building sandbox image '{image}' from {sandbox_ctx} (first use)")
+            client.images.build(path=sandbox_ctx, tag=image, rm=True)
+
+        container = client.containers.run(
+            image=image,
+            command=command,
+            detach=True,
+            network_disabled=True,
+            read_only=True,
+            tmpfs={"/sandbox/work": f"size={work_size},uid=10001"},
+            working_dir="/sandbox/work",
+            user="10001",
+            mem_limit=mem_limit,
+            pids_limit=pids_limit,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+            auto_remove=False,
+        )
+        timed_out = False
+        exit_code = -1
+        try:
+            try:
+                result = container.wait(timeout=timeout)
+                exit_code = result.get("StatusCode", -1)
+            except Exception:
+                # docker-py raises on wait timeout (ReadTimeout/ConnectionError) -> kill it
+                timed_out = True
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", "replace")
+            stderr = container.logs(stdout=False, stderr=True).decode("utf-8", "replace")
+        finally:
+            try:
+                container.remove(force=True)  # ephemeral — never leave it behind
+            except Exception:
+                pass
+
+        cap = 20000  # truncate large output before it reaches the LLM
+        return {
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stdout": stdout[:cap],
+            "stderr": stderr[:cap],
+            "truncated": len(stdout) > cap or len(stderr) > cap,
+        }
+
+    async def sandbox_exec(
+        self,
+        code_or_command: Annotated[str, "The code or shell command to run in the isolated sandbox."],
+        language: Annotated[str, "'shell' (sh -c) or 'python' (python3 -c). Default 'shell'."] = "shell",
+        timeout: Annotated[int | None, "Wall-clock timeout in seconds; default 30, clamped to 1-120."] = None,
+    ) -> str:
+        """Run untrusted code in an isolated, ephemeral sandbox container, returning stdout/stderr/exit.
+
+        The code runs in a throwaway `sage-sandbox` container with NO access to the Sage container's
+        filesystem (Mythic tokens, sage.db, TTP files), NO host mounts, NO network, dropped capabilities,
+        a read-only rootfs + small tmpfs work dir, memory/pid caps, a non-root user, and a hard timeout.
+        Use this for ad-hoc parsing/scripting that should NOT run in the Sage container or on the host.
+
+        # HITL: guarded  (code execution — supervised mode must gate this; Phase 2 reads this tag)
+
+        Args:
+            code_or_command: The code/command to execute.
+            language: 'shell' or 'python'.
+            timeout: Seconds (default 30, max 120).
+        Returns:
+            str: JSON {status, exit_code, stdout, stderr, timed_out, truncated} or {status:error,...}.
+        """
+        try:
+            import docker  # noqa: F401  (lazy: module must import even when the SDK is absent)
+        except ImportError:
+            return json.dumps({"status": "error", "error": "docker SDK not installed in the Sage container; add 'docker' to requirements and rebuild."}, sort_keys=True)
+
+        timeout = 30 if timeout is None else max(1, min(int(timeout), 120))
+        if language == "python":
+            command = ["python3", "-c", code_or_command]
+        elif language == "shell":
+            command = ["sh", "-c", code_or_command]
+        else:
+            return json.dumps({"status": "error", "error": f"unsupported language '{language}'; use 'shell' or 'python'."}, sort_keys=True)
+
+        logger.debug(f"🛠️ Calling sandbox_exec (language={language}, timeout={timeout}s)")
+        try:
+            result = await asyncio.to_thread(
+                self._run_sandbox_sync, command, "sage-sandbox:latest", timeout, "512m", 256, "128m"
+            )
+            result["status"] = "ok"
+            return json.dumps(result, sort_keys=True)
+        except Exception as e:
+            return json.dumps({"status": "error", "error": f"sandbox execution failed: {e}"}, sort_keys=True)
+
 # Create a main function with arguments so that I can test the methods in this class manually
 if __name__ == "__main__":
     import argparse
