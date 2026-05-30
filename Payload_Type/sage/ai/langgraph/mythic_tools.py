@@ -9,6 +9,11 @@ from mythic_container.logging import logger
 from langchain.tools import tool, BaseTool
 from langchain_core.tools import StructuredTool
 
+try:
+    from . import ttp_library
+except ImportError:  # allow running this module directly for manual testing
+    import ttp_library
+
 class MythicTools:
     """A class to manage Mythic API tools for LangChain agents.
 
@@ -546,7 +551,179 @@ class MythicTools:
         logger.debug("🛠️ Calling get_operations tool")
         resp = await mythic.get_operations(mythic=self.client)
         return json.dumps(resp, sort_keys=True)
-    
+
+    async def _resolve_payload_type(self, callback_display_id: int) -> str | None:
+        """Best-effort lookup of a callback's Mythic payload type name (e.g. 'apollo').
+
+        Returns None if it can't be resolved; TTP guidance still works without it,
+        just without the agent-specific execution join.
+        """
+        if self.client is None:
+            return None
+        try:
+            callbacks = await mythic.get_all_active_callbacks(self.client)
+            for cb in callbacks or []:
+                if cb.get("display_id") == callback_display_id or cb.get("id") == callback_display_id:
+                    payload = cb.get("payload")
+                    if isinstance(payload, dict):
+                        ptype = payload.get("payloadtype")
+                        if isinstance(ptype, dict) and ptype.get("name"):
+                            return ptype["name"]
+                    return cb.get("payload_type") or cb.get("payloadtype")
+        except Exception as e:
+            logger.debug(f"Could not resolve payload type for callback {callback_display_id}: {e}")
+        return None
+
+    async def get_ttp_guidance(
+        self,
+        goal: Annotated[str, "The tradecraft goal in plain language, e.g. 'enumerate the domain', 'dump LSASS', 'abuse a GPO', 'request an ADCS cert'."],
+        callback_display_id: Annotated[int, "The callback_display_id of the agent you intend to run the tradecraft on. Used to tailor execution guidance to that Mythic agent."],
+    ) -> str:
+        """Get C2-agnostic tradecraft guidance for a goal, joined to how the target agent runs it.
+
+        This is the FIRST tool to consult before reaching for a specific offensive tool. It
+        matches your goal to Sage's TTP knowledge library and returns the tool's frontmatter
+        (including `common_args` and `usage_examples`) plus the prose guidance UP TO the
+        "## Full Reference" section, along with an `execution_on_agent` hint describing how the
+        callback's Mythic agent runs that binary type.
+
+        Progressive disclosure: rely on `common_args` and `usage_examples` first. Only call
+        `get_ttp_full_reference(slug)` when you need an uncommon flag, exact output format, or
+        version-specific behavior the guidance doesn't cover.
+
+        Args:
+            goal: Plain-language tradecraft goal.
+            callback_display_id: Target agent's callback_display_id (tailors execution guidance).
+        Returns:
+            str: JSON with matched slug, frontmatter, guidance prose, execution_on_agent, and
+                 whether a Full Reference is available.
+        """
+        logger.debug(f"🛠️ Calling get_ttp_guidance tool (goal={goal!r}, callback={callback_display_id})")
+        matches = ttp_library.match_goal(goal)
+        if not matches:
+            categories = ttp_library.list_categories()
+            return json.dumps({
+                "status": "no_match",
+                "goal": goal,
+                "available_categories": sorted(categories.keys()),
+                "hint": "Call list_ttp_categories for the full catalog, or restate the goal using tradecraft terms.",
+            }, sort_keys=True)
+
+        slug, _score = matches[0]
+        frontmatter, body = ttp_library.load_ttp(slug)
+        payload_type = await self._resolve_payload_type(callback_display_id)
+        agent_frontmatter, _ = ttp_library.load_mythic_agent(payload_type)
+        if agent_frontmatter:
+            execution = ttp_library.execution_hint(frontmatter, agent_frontmatter)
+        elif payload_type:
+            execution = (f"No capability file for Mythic agent '{payload_type}' under mythic_agents/. "
+                         f"Use get_all_commands_for_payloadtype('{payload_type}') to discover its command surface.")
+        else:
+            execution = ("Could not resolve the callback's payload type. Use get_all_active_callbacks "
+                         "then get_all_commands_for_payloadtype to map execution.")
+
+        return json.dumps({
+            "slug": slug,
+            "alternatives": [s for s, _ in matches[1:]],
+            "payload_type": payload_type,
+            "frontmatter": frontmatter,
+            "guidance": ttp_library.guidance_body(body),
+            "execution_on_agent": execution,
+            "full_reference_available": ttp_library._FULL_REFERENCE_HEADING in (body or ""),
+            "next": "Use common_args + usage_examples first; call get_ttp_full_reference(slug) only for uncommon flags, output format, or version specifics.",
+        }, sort_keys=True)
+
+    async def get_ttp_full_reference(
+        self,
+        slug: Annotated[str, "The TTP slug (filename without .md), e.g. 'sharphound', returned as 'slug' by get_ttp_guidance."],
+    ) -> str:
+        """Get the full '## Full Reference' section for a TTP (comprehensive args, output, versions).
+
+        Call this only after get_ttp_guidance when its `common_args`/`usage_examples` don't cover
+        the flag, output format, or version-specific behavior you need. This is the deep, expensive
+        tier of the progressive-disclosure pattern.
+
+        Args:
+            slug: The TTP slug returned by get_ttp_guidance.
+        Returns:
+            str: JSON with the full reference text, or a not_found / no_full_reference status.
+        """
+        logger.debug(f"🛠️ Calling get_ttp_full_reference tool (slug={slug!r})")
+        frontmatter, body = ttp_library.load_ttp(slug)
+        if body is None:
+            available = [s for s, _, _ in ttp_library.iter_ttps()]
+            return json.dumps({"status": "not_found", "slug": slug, "available_ttps": available}, sort_keys=True)
+        reference = ttp_library.full_reference(body)
+        if not reference:
+            return json.dumps({
+                "status": "no_full_reference",
+                "slug": slug,
+                "note": "This TTP has no Full Reference yet; rely on common_args and usage_examples from get_ttp_guidance.",
+            }, sort_keys=True)
+        return json.dumps({"slug": slug, "full_reference": reference}, sort_keys=True)
+
+    async def list_ttp_categories(self) -> str:
+        """List Sage's TTP knowledge library grouped by category.
+
+        Use this to discover what tradecraft Sage has structured guidance for before forming a
+        plan. Each category lists the tools (slug + name) available under it.
+
+        Returns:
+            str: JSON mapping each category to a list of {slug, name}, or an empty status.
+        """
+        logger.debug("🛠️ Calling list_ttp_categories tool")
+        categories = ttp_library.list_categories()
+        if not categories:
+            return json.dumps({
+                "status": "empty",
+                "note": "No TTP files present yet at Payload_Type/sage/ttps/.",
+            }, sort_keys=True)
+        return json.dumps(categories, sort_keys=True)
+
+    async def ensure_tool_uploaded(
+        self,
+        binary_filename: Annotated[str, "The tool binary filename, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
+    ) -> str:
+        """Ensure a tool binary is in Mythic's file store, uploading it from the tools/ drop zone if needed.
+
+        Workflow: (1) check Mythic's file store by name; (2) if absent, look for the file in the
+        operator drop zone at Payload_Type/sage/tools/<binary_filename>; (3) if found, register it
+        with Mythic via register_file. Returns the Mythic file UUID to pass as the File parameter of
+        a subsequent issue_task_and_waitfor_task_output call (e.g. assembly_file for inline_assembly).
+
+        Args:
+            binary_filename: The tool binary filename (matches a TTP's binary_filename).
+        Returns:
+            str: JSON with status and, when available, the Mythic file UUID.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling ensure_tool_uploaded tool (binary={binary_filename!r})")
+        # 1. Already in Mythic's file store?
+        try:
+            existing = await mythic.get_latest_uploaded_file_by_name(self.client, filename=binary_filename)
+            if existing:
+                uuid = existing.get("agent_file_id") or existing.get("id")
+                if uuid:
+                    return json.dumps({"status": "already_present", "binary_filename": binary_filename, "file_uuid": uuid}, sort_keys=True)
+        except Exception as e:
+            logger.debug(f"get_latest_uploaded_file_by_name failed for {binary_filename}: {e}")
+        # 2. Operator drop zone
+        local_path = ttp_library.TOOLS_DIR / binary_filename
+        if not local_path.is_file():
+            return json.dumps({
+                "status": "missing",
+                "binary_filename": binary_filename,
+                "note": f"Not in Mythic's file store and not found at tools/{binary_filename}. "
+                        f"Operator must drop the binary into Payload_Type/sage/tools/ or upload it to Mythic first.",
+            }, sort_keys=True)
+        # 3. Register the local file with Mythic
+        try:
+            file_uuid = await mythic.register_file(self.client, filename=binary_filename, contents=local_path.read_bytes())
+            return json.dumps({"status": "uploaded", "binary_filename": binary_filename, "file_uuid": file_uuid}, sort_keys=True)
+        except Exception as e:
+            return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
+
 # Create a main function with arguments so that I can test the methods in this class manually
 if __name__ == "__main__":
     import argparse

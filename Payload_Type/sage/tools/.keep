@@ -1,0 +1,3 @@
+# Operator drop zone for tool binaries (SharpHound.exe, Rubeus.exe, etc.).
+# Contents are gitignored; this .keep preserves the directory and mount point.
+# Sage auto-uploads from here to Mythic via ensure_tool_uploaded().

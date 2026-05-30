@@ -12,10 +12,16 @@ sage.db*
 .claude/
 tasks/
 .env
+.mcp.json
+.envrc
 
 # Phoenix observability directory - ignore contents but keep structure
 Payload_Type/sage/.phoenix/*
 !Payload_Type/sage/.phoenix/.keep
+
+# Operator tool binary drop zone - ignore contents but keep structure
+Payload_Type/sage/tools/*
+!Payload_Type/sage/tools/.keep
 
 # SSL certificate bundles - exclude from version control
 Payload_Type/sage/certs/*.pem

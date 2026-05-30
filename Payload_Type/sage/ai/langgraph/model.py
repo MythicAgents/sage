@@ -1213,6 +1213,27 @@ class Model:
         - If approaching recursion limit, prioritize getting essential results over comprehensive coverage
 
         **IMPORTANT**: When a command has a parameter type of "File" (e.g., "type": "File"), you must pass in the Mythic file UUID (not the filename).
+
+        **Tradecraft Knowledge Library (consult BEFORE reaching for offensive tools):**
+        Sage ships a C2-agnostic library of offensive tradecraft (TTPs) and how each Mythic agent runs it.
+        Use it with this progressive-disclosure loop instead of guessing tool names or arguments:
+
+        1. **list_ttp_categories** — when planning, to see what tradecraft Sage has structured guidance for.
+        2. **get_ttp_guidance(goal, callback_display_id)** — the primary call. Pass a plain-language goal
+           (e.g. "enumerate the domain", "dump LSASS", "abuse a GPO", "request an ADCS cert") and the target
+           callback. It returns the matched tool's `common_args` + `usage_examples` and an `execution_on_agent`
+           hint describing exactly how THAT agent runs the binary type (e.g. Apollo runs .NET assemblies via
+           `inline_assembly`; it has no BOF runner, so it falls back to a native command). Build your
+           `issue_task_and_waitfor_task_output` call from `common_args` and `usage_examples` first.
+        3. **get_ttp_full_reference(slug)** — call ONLY when `common_args`/`usage_examples` don't cover an
+           uncommon flag, the exact output format, or version-specific behavior. It is the deep, expensive tier.
+        4. **ensure_tool_uploaded(binary_filename)** — when the guidance says a binary must be in Mythic's file
+           store, call this to get its file UUID (it uploads from the operator drop zone if needed), then pass
+           the UUID as the command's File parameter.
+
+        Narrate the decision at each branch (which TTP you chose and why) — this reasoning is the operator's
+        audit trail. Prefer an agent's native command over uploading a GhostPack assembly when both achieve
+        the same tradecraft (it is quieter), as the execution hint will note.
         {commands_text}
         Your goal is to assist the human operator effectively while managing system resources responsibly.
         """
@@ -1229,6 +1250,10 @@ class Model:
                 "upload_file_by_file_uuid",
                 "get_all_uploaded_files",
                 "get_operations",
+                "get_ttp_guidance",
+                "get_ttp_full_reference",
+                "list_ttp_categories",
+                "ensure_tool_uploaded",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
