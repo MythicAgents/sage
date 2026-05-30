@@ -1883,8 +1883,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             try:
                 # Use ALL agent's channel messages + summary prompt for full context
                 # CRITICAL: Use ALL messages, not just last 20, to avoid missing earlier tool results
-                # Safety limit: cap at 150 messages to avoid token limits (should be plenty for 25-step recursion)
-                max_messages = 150
+                # Safety limit to avoid token limits in the summary call. Raised alongside the
+                # recursion bump (T1.4: 150 -> 250) so long autonomous solves don't drop early tool results.
+                max_messages = 250
                 if len(channel_messages) > max_messages:
                     logger.warning(f"{agent_name} has {len(channel_messages)} messages, using last {max_messages} for summary")
                     summary_messages_raw = channel_messages[-max_messages:] + [summary_prompt]
@@ -2030,13 +2031,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 await self._stream_message_to_mythic(formatted_prompt)
 
         try:
-            # Use default recursion limit - RemainingSteps will handle graceful termination
+            # Recursion limit raised to 75 (T1.4) for multi-hop autonomous solves (e.g. the GOAD
+            # Trust Walker is many agent hops); RemainingSteps + handback still terminate gracefully.
             logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
             # Stream graph execution and process events incrementally
             async for event in self.graph.astream(
                 self.state,
-                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 25}
+                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 75}
             ):
                 # DEBUG: Log what's IN the event
                 for node_name, state_update in event.items():
@@ -2476,10 +2478,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream continuation with increased recursion limit
+                    # Stream continuation with raised recursion limit (T1.4: 50 -> 75)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
                     ):
                         await self._process_stream_event(event)
 
@@ -2596,10 +2598,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream new task direction with default recursion limit
+                    # Stream new task direction with raised recursion limit (T1.4: 25 -> 75)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
                     ):
                         await self._process_stream_event(event)
 
@@ -2827,7 +2829,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
     :return: A tool function that performs the handoff.
     """
     name = f"transfer_to_{agent_name}"
-    description = description or f"Delegate a task to {agent_name}. Provide a clear instruction."
+    description = description or f"Delegate a task to {agent_name}. Provide a single 'handoff_instruction' argument containing the complete task."
 
     channel_map = {
         "Supervisor": "supervisor_messages",
@@ -2841,7 +2843,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
     @tool(name, description=description)
     def handoff_tool(
         runtime: ToolRuntime,
-        handoff_instruction: Annotated[str, "Explicit task or question for the target agent"],
+        handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.' This is the ONLY argument for this tool — do not invent positional or placeholder argument names (e.g. a, b, c)."],
     ) -> Command:
         # Compute sequence from max of existing messages in all channels
         # This is more reliable than state._message_seq which may not persist across checkpoints
