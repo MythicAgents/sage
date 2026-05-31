@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import datetime
 import yaml
 
 # Stdlib logger only — this module stays dependency-free so it can be unit-tested
@@ -38,6 +39,26 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 _FULL_REFERENCE_HEADING = "## Full Reference"
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert YAML date/datetime values to ISO strings.
+
+    YAML safe_load turns unquoted dates like `last_updated: 2026-05-29` into
+    datetime.date objects, which json.dumps cannot serialize. Frontmatter flows into
+    tool responses (get_ttp_guidance) and the LangGraph state checkpoint, so we
+    sanitize at parse time to guarantee it is always JSON-serializable.
+    (datetime is a subclass of date — check it first.)
+    """
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
 def parse_markdown(text: str) -> tuple[dict[str, Any], str]:
     """Split a markdown doc into (frontmatter dict, body str). No frontmatter -> ({}, text)."""
     match = _FRONTMATTER_RE.match(text)
@@ -46,7 +67,7 @@ def parse_markdown(text: str) -> tuple[dict[str, Any], str]:
     frontmatter = yaml.safe_load(match.group(1)) or {}
     if not isinstance(frontmatter, dict):
         frontmatter = {}
-    return frontmatter, match.group(2)
+    return _json_safe(frontmatter), match.group(2)
 
 
 def load_ttp(slug: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -115,17 +136,38 @@ def _haystack(slug: str, frontmatter: dict[str, Any]) -> str:
     return " ".join(str(p) for p in parts).lower()
 
 
+_NAME_MATCH_BONUS = 100
+
+
 def match_goal(goal: str, limit: int = 3) -> list[tuple[str, int]]:
-    """Rank TTPs by keyword overlap with the goal text. Returns [(slug, score), ...] desc."""
-    tokens = {t for t in re.split(r"\W+", goal.lower()) if len(t) > 2}
+    """Rank TTPs by keyword overlap with the goal text. Returns [(slug, score), ...] desc.
+
+    A TTP the goal *explicitly names* (its slug or name appears as a goal token, or its
+    multi-word name appears verbatim in the goal) gets a decisive bonus. Without this,
+    keyword counting alone lets a tool that merely *mentions* another in its tags/examples
+    (e.g. RustHound's `sharphound-alternative` tag) tie or beat the named tool — and stable
+    sort then favors whichever sorts first alphabetically. The bonus makes "run SharpHound"
+    return the `sharphound` TTP, not `rusthound`.
+    """
+    goal_lower = goal.lower()
+    tokens = {t for t in re.split(r"\W+", goal_lower) if len(t) > 2}
     scored: list[tuple[str, int]] = []
     for slug, frontmatter, _ in iter_ttps():
         if not frontmatter:
             continue
         haystack = _haystack(slug, frontmatter)
         score = sum(1 for token in tokens if token in haystack)
-        if score:
-            scored.append((slug, score))
+        if not score:
+            continue
+        name = str(frontmatter.get("name", "")).lower()
+        named = (
+            slug.lower() in tokens
+            or (name and name in tokens)
+            or (name and len(name) > 3 and name in goal_lower)
+        )
+        if named:
+            score += _NAME_MATCH_BONUS
+        scored.append((slug, score))
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[:limit]
 

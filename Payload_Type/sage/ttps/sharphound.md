@@ -1,6 +1,7 @@
 ---
 name: SharpHound
 category: recon
+recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [ad-enumeration, attack-path-mapping]
 tradecraft_tags: [bloodhound, acl, foreign-trust, kerberoast-discovery]
 mitre_attack:
@@ -14,6 +15,15 @@ source:
   maintained: true
 binary_type: .net-assembly
 binary_filename: SharpHound.exe
+# Pinned, tamper-evident binary source for Sage's download_tool self-provisioning flow.
+# archive_sha256 verified against SpecterOps' official .sha256 sidecar on 2026-05-31.
+# Bump url+version+archive_sha256 together when upgrading; never unpin.
+binary_download:
+  url: https://github.com/SpecterOps/SharpHound/releases/download/v2.13.0/SharpHound_v2.13.0_windows_x86.zip
+  version: v2.13.0
+  archive: zip
+  archive_sha256: e5966ad22b90da86a0ab70e31750ce92da159d18d2a834e6d3c7f146c1f6d453
+  extract_member: SharpHound.exe
 supported_os: [windows]
 architecture: [x64, x86]
 privilege_required: domain-user

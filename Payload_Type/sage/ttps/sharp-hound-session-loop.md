@@ -1,6 +1,7 @@
 ---
 name: SharpHound Session Loop Collection
 category: recon
+recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [session-collection, active-sessions, user-hunting, unconstrained-delegation-prep]
 tradecraft_tags: [sharphound, sessions, bloodhound, user-hunting, unconstrained-delegation, loop]
 mitre_attack:

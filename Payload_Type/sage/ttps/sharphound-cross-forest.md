@@ -1,6 +1,7 @@
 ---
 name: SharpHound Cross-Forest Collection
 category: recon
+recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [cross-forest, trust-enumeration, attack-path-mapping]
 tradecraft_tags: [bloodhound, cross-forest, trusts, foreign-principals, attack-path]
 mitre_attack:

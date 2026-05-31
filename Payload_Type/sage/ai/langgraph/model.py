@@ -1225,11 +1225,23 @@ class Model:
            hint describing exactly how THAT agent runs the binary type (e.g. Apollo runs .NET assemblies via
            `inline_assembly`; it has no BOF runner, so it falls back to a native command). Build your
            `issue_task_and_waitfor_task_output` call from `common_args` and `usage_examples` first.
+           If the response includes a `recommendation` block, the tradecraft pairs with an MCP capability
+           (e.g. the BloodHound MCP) that isn't connected — relay it to the operator as a SUGGESTION
+           ("this would help here; want me to walk you through connecting it?"). Never auto-connect; the
+           operator decides. The block is omitted automatically when the capability is already connected.
         3. **get_ttp_full_reference(slug)** — call ONLY when `common_args`/`usage_examples` don't cover an
            uncommon flag, the exact output format, or version-specific behavior. It is the deep, expensive tier.
         4. **ensure_tool_uploaded(binary_filename)** — when the guidance says a binary must be in Mythic's file
            store, call this to get its file UUID (it uploads from the operator drop zone if needed), then pass
            the UUID as the command's File parameter.
+        5. **download_tool(binary_filename)** — if ensure_tool_uploaded returns status "missing" AND the TTP has a
+           pinned `binary_download` block, this fetches the binary from its pinned, hash-verified source into the
+           tools/ drop zone. It downloads a binary from the internet, so you MUST GET EXPLICIT OPERATOR APPROVAL
+           FIRST: do NOT call download_tool yet — instead hand back to the Supervisor (summarize_and_handback)
+           with a clear approval request stating the tool, version, and source URL from the TTP's binary_download
+           block, so the Supervisor can ask the operator. Only after the operator approves in a follow-up message
+           may you call download_tool, then call ensure_tool_uploaded again to register it. Never call
+           download_tool without that explicit approval.
 
         Narrate the decision at each branch (which TTP you chose and why) — this reasoning is the operator's
         audit trail. Prefer an agent's native command over uploading a GhostPack assembly when both achieve
@@ -1254,6 +1266,7 @@ class Model:
                 "get_ttp_full_reference",
                 "list_ttp_categories",
                 "ensure_tool_uploaded",
+                "download_tool",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
@@ -1419,6 +1432,11 @@ class Model:
           workflow. Typically: ingest the SharpHound collection (file_upload) → data_quality →
           graph_analysis / adcs_info / cypher_query to identify the path → report the path AND your
           reasoning back so the Supervisor can route the next hop to Mythic_Operator.
+        - INGEST BRIDGE: the BloodHound `file_upload` tool needs an absolute on-disk PATH, but
+          collections arrive as a Mythic file artifact (a file UUID from a `download` task, NOT a
+          path). When you are handed a Mythic file UUID to ingest, FIRST call
+          `stage_file_to_disk(file_uuid)` to materialize it to a local path, then pass that returned
+          path to `file_upload`. Do not ask the operator for a path — stage it yourself.
 
         **Recursion Limit Management:**
         - You have access to a `remaining_steps` value that shows how many more operations can be performed.
@@ -1443,6 +1461,7 @@ class Model:
                 "get_ttp_guidance",
                 "get_ttp_full_reference",
                 "list_ttp_categories",
+                "stage_file_to_disk",
             ])
 
         tools = mcp_tools + ttp_tools + [handback_tool]
@@ -1479,9 +1498,11 @@ class Model:
             Always prefer built-in agents over MCP_Manager when they have relevant capabilities:
             - Callbacks, agents, tasks, commands, files in Mythic → **Mythic_Operator** (NOT MCP_Manager)
             - Payload creation, C2 profiles, build options → **Mythic_Payload** (NOT MCP_Manager)
-            - General questions, explanations, advice → **Generalist**
+            - General questions, explanations, advice with NO tradecraft/TTP/tooling angle → **Generalist**. The Generalist has NO TTP, Mythic, or tool access — it will FABRICATE generic answers if asked about tools. NEVER route tradecraft/TTP/tool questions (SharpHound, BloodHound, "consult the X TTP", "summarize the collection approach", tool availability, how to run/stage/download a tool) to Generalist.
+            - Consulting a TTP, checking tool availability, or how to run / stage / download an offensive tool (even when phrased as "summarize" or "explain") → **Mythic_Operator** (it owns get_ttp_guidance, ensure_tool_uploaded, download_tool). This is the agent that consults real TTP data; the Generalist cannot.
             - ONLY use MCP_Manager for external/third-party tools that other agents cannot handle
             - BloodHound / attack-path graph analysis (shortest path, ADCS ESC paths, Cypher) → **MCP_Manager** (the BloodHound MCP). The autonomous solve is a loop: Mythic_Operator collects (SharpHound) → MCP_Manager reasons over the graph → Mythic_Operator executes the chosen hop → repeat. Run this loop ONLY when the operator EXPLICITLY requested an autonomous solve / path-walk — it does not override the no-autonomous-generation rule above.
+            - **Relay operator approvals.** When the operator grants an approval mid-conversation (e.g. "Approved: download SharpHound..."), include that approval VERBATIM in your handoff instruction to the receiving agent (e.g. "The operator has APPROVED the SharpHound download — proceed: call download_tool then ensure_tool_uploaded"). Do NOT make the agent re-ask for an approval the operator already gave.
 
             **CRITICAL: NO Autonomous Task Generation (SAFETY/OPSEC):**
             You must ONLY delegate tasks that the operator EXPLICITLY requested. NEVER generate your own

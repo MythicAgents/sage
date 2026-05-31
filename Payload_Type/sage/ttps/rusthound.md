@@ -1,6 +1,7 @@
 ---
 name: RustHound
 category: recon
+recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [ad-enumeration, attack-path-mapping, bloodhound-collector]
 tradecraft_tags: [bloodhound, rust, cross-platform, ad-enumeration, sharphound-alternative]
 mitre_attack:

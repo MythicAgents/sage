@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 import asyncio
 import base64
 from typing import Annotated, List, Dict, TypedDict
@@ -544,6 +545,47 @@ class MythicTools:
         encoded_content = base64.b64encode(file_content).decode('utf-8')
         return encoded_content
 
+    async def stage_file_to_disk(
+        self,
+        file_uuid: Annotated[str, "The Mythic file UUID to materialize to local disk (e.g. a downloaded SharpHound ZIP)."],
+        filename: Annotated[str, "Optional filename for the staged file (basename only). Defaults to <uuid>.zip."] = "",
+    ) -> str:
+        """Materialize a Mythic file artifact to a local path on the Sage host.
+
+        Some local consumers need an on-disk file rather than bytes — notably the BloodHound
+        MCP's `file_upload`, which takes an absolute filesystem PATH, not raw content. This
+        downloads the file bytes from Mythic by UUID and writes them into Sage's staging
+        directory, returning the absolute path. Sage and its stdio MCP servers share a
+        filesystem (the MCP is spawned by Sage in the same container/host), so the returned
+        path is directly readable by file_upload. Does NOT send file bytes to the LLM.
+
+        Args:
+            file_uuid: The Mythic file UUID (e.g. from a `download` task result).
+            filename: Optional basename for the staged file; defaults to <uuid>.zip.
+        Returns:
+            str: JSON with status, the absolute local path, and byte count.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling stage_file_to_disk for file UUID: {file_uuid}")
+        try:
+            file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
+        except Exception as e:
+            return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
+        if file_content is None:
+            return json.dumps({"status": "error", "file_uuid": file_uuid,
+                               "error": "Mythic returned no content for this file UUID."}, sort_keys=True)
+        staging_dir = Path("/tmp/sage_file_staging")
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = os.path.basename(filename) if filename else f"{file_uuid}.zip"
+        target = staging_dir / safe_name
+        try:
+            target.write_bytes(file_content)
+        except Exception as e:
+            return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
+        return json.dumps({"status": "staged", "file_uuid": file_uuid,
+                           "path": str(target), "bytes": len(file_content)}, sort_keys=True)
+
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
         if self.client is None:
@@ -622,7 +664,7 @@ class MythicTools:
             execution = ("Could not resolve the callback's payload type. Use get_all_active_callbacks "
                          "then get_all_commands_for_payloadtype to map execution.")
 
-        return json.dumps({
+        result = {
             "slug": slug,
             "alternatives": [s for s, _ in matches[1:]],
             "payload_type": payload_type,
@@ -631,7 +673,31 @@ class MythicTools:
             "execution_on_agent": execution,
             "full_reference_available": ttp_library._FULL_REFERENCE_HEADING in (body or ""),
             "next": "Use common_args + usage_examples first; call get_ttp_full_reference(slug) only for uncommon flags, output format, or version specifics.",
-        }, sort_keys=True)
+        }
+        # Proactive capability recommendation: if this tradecraft pairs with an MCP that isn't
+        # currently connected, surface a suggestion for the operator (they decide; never auto-connect).
+        # Suppressed when the MCP is already connected, so it never nags.
+        recommends = frontmatter.get("recommends_mcp") if isinstance(frontmatter, dict) else None
+        if recommends:
+            connected = None
+            try:
+                from ai.mcp import MCPManager
+                servers = MCPManager.get_connected_servers() or []
+                connected = any(str(recommends).lower() in str(s).lower() for s in servers)
+            except Exception:
+                connected = None  # best-effort; if we can't tell, still recommend
+            if connected is not True:
+                result["recommendation"] = {
+                    "capability": recommends,
+                    "connected": (bool(connected) if connected is not None else None),
+                    "message": (
+                        f"This tradecraft pairs with the '{recommends}' MCP, which is not currently connected. "
+                        f"It would let Sage reason over the collected data as an attack graph (shortest paths, "
+                        f"ADCS ESC, Cypher). Recommend it to the operator as a SUGGESTION — do not auto-connect. "
+                        f"For bloodhound, call get_ttp_guidance('stand up bloodhound') for the standup + mcp-connect steps."
+                    ),
+                }
+        return json.dumps(result, sort_keys=True)
 
     async def get_ttp_full_reference(
         self,
@@ -715,12 +781,109 @@ class MythicTools:
                 "status": "missing",
                 "binary_filename": binary_filename,
                 "note": f"Not in Mythic's file store and not found at tools/{binary_filename}. "
-                        f"Operator must drop the binary into Payload_Type/sage/tools/ or upload it to Mythic first.",
+                        f"Operator must drop the binary into Payload_Type/sage/tools/ or upload it to Mythic first. "
+                        f"If this tool's TTP has a pinned binary_download block, you may call "
+                        f"download_tool(binary_filename) FIRST (with operator approval) to fetch it into tools/, "
+                        f"then call ensure_tool_uploaded again.",
             }, sort_keys=True)
         # 3. Register the local file with Mythic
         try:
             file_uuid = await mythic.register_file(self.client, filename=binary_filename, contents=local_path.read_bytes())
             return json.dumps({"status": "uploaded", "binary_filename": binary_filename, "file_uuid": file_uuid}, sort_keys=True)
+        except Exception as e:
+            return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
+
+    async def download_tool(
+        self,
+        binary_filename: Annotated[str, "The tool binary filename to fetch from its pinned TTP source, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
+    ) -> str:
+        """Download a tool binary from its pinned TTP source into the tools/ drop zone.
+
+        Finds the TTP whose frontmatter binary_filename matches, reads its pinned
+        `binary_download` block (url + archive_sha256 + extract_member), downloads the
+        archive, VERIFIES the sha256 (tamper-evidence) BEFORE extracting, then extracts
+        the named member into the tools/ drop zone. Does NOT upload to Mythic — call
+        ensure_tool_uploaded(binary_filename) afterward to register it with Mythic.
+
+        REQUIRES PRIOR OPERATOR APPROVAL: this fetches a binary from the internet. The
+        agent must ask the operator and receive explicit approval before calling this.
+
+        Args:
+            binary_filename: The tool binary filename (matches a TTP's binary_filename).
+        Returns:
+            str: JSON with a "status" key describing the outcome.
+        """
+        import hashlib, io, zipfile
+        logger.debug(f"🛠️ Calling download_tool tool (binary={binary_filename!r})")
+        # 1. Find the TTP carrying this binary_filename. Multiple TTPs may share the same
+        #    binary_filename; prefer the one that actually pins a binary_download block.
+        meta = None
+        matched_any = False
+        for _slug, frontmatter, _body in ttp_library.iter_ttps():
+            if frontmatter.get("binary_filename") == binary_filename:
+                matched_any = True
+                if isinstance(frontmatter.get("binary_download"), dict):
+                    meta = frontmatter
+                    break
+        if meta is None:
+            if matched_any:
+                return json.dumps({"status": "no_download_metadata", "binary_filename": binary_filename,
+                                   "note": "A TTP declares this binary but none pins a binary_download block."}, sort_keys=True)
+            return json.dumps({"status": "no_ttp", "binary_filename": binary_filename,
+                               "note": "No TTP declares this binary_filename."}, sort_keys=True)
+        # 2. Pinned download block (guaranteed a dict by the selection above)
+        dl = meta["binary_download"]
+        url = dl.get("url")
+        archive_sha256 = dl.get("archive_sha256")
+        extract_member = dl.get("extract_member")
+        archive = dl.get("archive")
+        if not url or not archive_sha256:
+            return json.dumps({"status": "invalid_download_metadata", "binary_filename": binary_filename,
+                               "note": "binary_download requires both url and archive_sha256."}, sort_keys=True)
+        target = ttp_library.TOOLS_DIR / binary_filename
+        # 3. Idempotent: already in the drop zone
+        if target.is_file():
+            return json.dumps({"status": "already_present", "binary_filename": binary_filename,
+                               "path": str(target)}, sort_keys=True)
+        # 4. Download (blocking -> offload to a thread)
+        def _fetch(u):
+            import requests
+            r = requests.get(u, timeout=120)
+            r.raise_for_status()
+            return r.content
+        try:
+            content = await asyncio.to_thread(_fetch, url)
+        except Exception as e:
+            return json.dumps({"status": "download_failed", "binary_filename": binary_filename,
+                               "url": url, "error": str(e)}, sort_keys=True)
+        # 5. Verify sha256 BEFORE writing anything to disk (tamper-evidence)
+        actual = hashlib.sha256(content).hexdigest()
+        if actual.lower() != str(archive_sha256).lower():
+            return json.dumps({"status": "hash_mismatch", "binary_filename": binary_filename,
+                               "expected": archive_sha256, "actual": actual}, sort_keys=True)
+        # 6. Extract/write into the drop zone
+        try:
+            ttp_library.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+            is_zip = (archive == "zip") or str(url).lower().endswith(".zip")
+            if is_zip:
+                if not extract_member:
+                    return json.dumps({"status": "invalid_download_metadata", "binary_filename": binary_filename,
+                                       "note": "archive is zip but extract_member is missing."}, sort_keys=True)
+                with zipfile.ZipFile(io.BytesIO(content)) as z:
+                    names = z.namelist()
+                    if extract_member not in names:
+                        return json.dumps({"status": "member_not_found", "binary_filename": binary_filename,
+                                           "extract_member": extract_member, "available": names}, sort_keys=True)
+                    data = z.read(extract_member)
+                # Security: ignore any path components in the member name (zip-traversal guard);
+                # write only to TOOLS_DIR/<basename>.
+                target = ttp_library.TOOLS_DIR / os.path.basename(extract_member)
+                target.write_bytes(data)
+            else:
+                target.write_bytes(content)
+            return json.dumps({"status": "downloaded", "binary_filename": binary_filename,
+                               "path": str(target), "version": dl.get("version"),
+                               "sha256_verified": True}, sort_keys=True)
         except Exception as e:
             return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
 

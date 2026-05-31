@@ -1,6 +1,7 @@
 ---
 name: bloodhound-python
 category: recon
+recommends_mcp: bloodhound  # pairs with the BloodHound MCP for graph-reasoned attack-path analysis
 subcategories: [ad-enumeration, attack-path-mapping, bloodhound-collector]
 tradecraft_tags: [bloodhound, python, linux-side, ad-enumeration, attack-path, impacket]
 mitre_attack:

@@ -123,7 +123,7 @@ Then re-query from the new node; paths invisible before often appear.
 ## Worked example (illustrative — GOAD public range)
 Mapping the loop onto the GOAD "Trust Walker" arc (public training range; names only, no creds):
 1. COLLECT as `samwell.tarly` on CASTELBLACK → SharpHound `-c All`.
-2. INGEST → `file_upload`; `data_quality` confirms ACL/GPO/Trust edges present.
+2. INGEST → the collection comes back as a Mythic file artifact (a file UUID from the `download` task), but `file_upload` needs an on-disk PATH. MCP_Manager first calls `stage_file_to_disk(file_uuid)` to materialize it locally, then `file_upload(<staged path>)`; `data_quality` confirms ACL/GPO/Trust edges present.
 3. REASON → `graph_analysis` surfaces GenericWrite on GPO `STARKWALLPAPER` → SYSTEM on WINTERFELL; `adcs_info` flags `ESC1` on ESSOS-CA; `cypher_query` shows the `Spys` foreign-group LAPS edge.
 4. ACT → `sharpgpoabuse` (GPO hop) → `nanodump`/native dump for jon.snow → `rubeus` constrained delegation → walk `Spys` to `laps-abuse` on BRAAVOS → `certify` ESC1 → DA essos.
 5. ASSESS → after each credential gain, re-collect/re-query; the path to cross-forest DA appears once the foreign-group edge is in the graph.
