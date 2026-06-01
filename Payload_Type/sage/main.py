@@ -31,6 +31,16 @@ else:
 
 os.environ["PHOENIX_WORKING_DIR"] = "./.phoenix"
 
+# Cap span attribute value size BEFORE the tracer provider is built (register() reads
+# OTel SpanLimits from env at SDK init). With register(batch=False) each span exports
+# individually over OTLP gRPC, and the OpenInference LangChain instrumentor stores the FULL
+# prompt/output in span attributes. On heavy turns a single prompt is 168K+ tokens (~1MB+),
+# which exceeds gRPC's default 4MB receive limit → the exporter fails with RESOURCE_EXHAUSTED
+# and the span is DROPPED (we lose visibility on exactly the heaviest steps). Truncating each
+# attribute value to 128KB keeps every span well under the gRPC limit so traces keep exporting
+# during a context blowup — at the cost of truncated (not dropped) large inputs/outputs.
+os.environ.setdefault("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "131072")  # 128 KB per attribute value
+
 px.launch_app(use_temp_dir=False)
 
 # Initialize global LangChain instrumentation for Phoenix tracing

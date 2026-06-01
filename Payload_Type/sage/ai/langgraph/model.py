@@ -6,6 +6,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt import tools_condition
 from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
+from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware
 from langgraph.types import Command
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -214,11 +215,50 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         self._tool_call_to_name: dict[str, str] = {}  # Map tool_call_id to tool name
         self._stream_func = stream_func  # Function to stream formatted messages to Mythic
         self._format_func = format_func  # Function to format messages for streaming
+        # Track run_ids for SummarizationMiddleware's internal model.invoke calls.
+        # Those produce a summary AIMessage that must NOT be captured or streamed:
+        # capturing it would leak the summary to Mythic as fake agent output and
+        # inject it into the persisted channel. Populated in on_chat_model_start/
+        # on_llm_start when metadata lc_source == "summarization"; consumed in on_llm_end.
+        self._summarization_run_ids: set = set()
 
     def clear(self):
         """Clear captured messages for reuse."""
         self.captured_messages = []
         self._tool_call_to_name = {}
+        self._summarization_run_ids = set()
+
+    async def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Flag SummarizationMiddleware's internal model call so its summary AIMessage is dropped."""
+        if metadata and metadata.get("lc_source") == "summarization":
+            self._summarization_run_ids.add(run_id)
+            logger.debug(f"📨 [Callback:{self.agent_name}] Flagging summarization run_id={run_id} (chat_model_start)")
+
+    async def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Defensive twin of on_chat_model_start for models that surface as bare LLM runs."""
+        if metadata and metadata.get("lc_source") == "summarization":
+            self._summarization_run_ids.add(run_id)
+            logger.debug(f"📨 [Callback:{self.agent_name}] Flagging summarization run_id={run_id} (llm_start)")
 
     async def on_llm_end(
         self,
@@ -230,6 +270,11 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Capture AIMessage after each LLM call and stream it immediately."""
+        # Drop SummarizationMiddleware's internal summary call: never capture or stream it.
+        if run_id in self._summarization_run_ids:
+            self._summarization_run_ids.discard(run_id)
+            logger.debug(f"📨 [Callback:{self.agent_name}] Dropping summarization summary AIMessage for run_id={run_id}")
+            return
         try:
             logger.debug(f"📨 [Callback:{self.agent_name}] on_llm_end called with {len(response.generations)} generation(s)")
             # LLMResult contains generations which are lists of ChatGeneration
@@ -348,6 +393,12 @@ class Model:
         self.messages = []
         self.agent_task_id = agent_task_id
         self.task_id = task_id
+        # Cooperative kill switch. The exit command marks the parent task completed and removes
+        # the session dict entry, but the running invoke()/astream coroutine holds its own ref to
+        # this Model and keeps issuing tasks. request_stop() sets this flag; every graph.astream
+        # loop checks it between super-steps and breaks, so an operator `exit`/stop actually
+        # terminates a running chat session (at the next step boundary) instead of running away.
+        self._stop_requested = False
         # Initialize dynamic data cache
         self._payload_names = None
         self._c2_profiles = None
@@ -1083,6 +1134,46 @@ class Model:
             return update
         _ainvoke.__name__ = node_name
         return _ainvoke
+
+    def _context_middleware(self) -> list:
+        """Bounded-context middleware for every create_agent.
+        Strategy: ClearToolUsesEdit does the cheap, routine bounding every step (no LLM call);
+        SummarizationMiddleware is a SAFETY NET that only fires on genuine context overflow.
+        Note: the per-call floor (system prompt + tool schemas) is ~75k tokens, so the summarization
+        trigger MUST sit well above it (we run bedrock-claude-4-6-sonnet via LiteLLM, ~200k context) —
+        a trigger near the floor makes summarization fire every step and thrash (~10s/call) for no gain."""
+        # Protect routing/handoff tool results from clearing — they drive graph control.
+        _PROTECTED_TOOLS = (
+            "summarize_and_handback", "request_continuation", "respond_to_user",
+            "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
+            "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
+        )
+        mw = [
+            ContextEditingMiddleware(
+                edits=[ClearToolUsesEdit(
+                    trigger=50000,
+                    # keep is a lab-tunable knob: higher = fewer re-fetches (less churn) but more
+                    # retained context/call. Raised 3→5 after the 2026-06-01 trace showed the agent
+                    # re-fetching cleared task output (task 301 x3, 296 x2). Re-measure tokens/call
+                    # after a fresh run before tuning further.
+                    keep=5,
+                    clear_tool_inputs=False,
+                    exclude_tools=_PROTECTED_TOOLS,
+                    placeholder="[earlier tool output elided to conserve context. Do NOT re-fetch it unless you need a specific detail from THIS task — re-fetching cleared output just re-fills the context you are trying to save.]",
+                )],
+                token_count_method="approximate",
+            ),
+        ]
+        summ_model = self._get_base_chat_model()
+        if summ_model is not None:
+            mw.append(SummarizationMiddleware(
+                model=summ_model,
+                # Safety net only — sits well above the ~75k system-prompt+tool-schema floor so it does
+                # not fire every step. Raised from 55000 (which thrashed) after trace evidence. ~200k ctx.
+                trigger=("tokens", 150000),
+                keep=("messages", 12),
+            ))
+        return mw
     
     # Agent definitions
     def _generalist_agent(self):
@@ -1116,6 +1207,7 @@ class Model:
             tools=tools,
             name=name,
             system_prompt=prompt,
+            middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "generalist_messages", name)
     
@@ -1173,6 +1265,31 @@ class Model:
         - Prioritize accuracy and efficiency in executing tasks.
         - If a command is unclear or outside your scope, ask for clarification or suggest consulting another agent.
         - When delegating to Mythic_Payload, provide clear requirements: payload type, target OS/architecture, and intended use case.
+
+        **HARD CONSTRAINT — NO OFFLINE WORK:** You operate ONLY through the Mythic C2 agent and have NO offline
+        tooling. NEVER kerberoast-to-crack, NEVER AS-REP-roast-to-crack, NEVER dump-and-crack, and NEVER ask the
+        operator to crack a hash offline. If get_ttp_guidance returns an offline-crack technique, do NOT execute
+        it — re-query for an in-memory, graph-driven primitive (GPO abuse, constrained/unconstrained delegation,
+        ACL abuse, ADCS ESC, LAPS read) that advances the BloodHound-discovered path. Strongly prefer in-memory
+        C# and BOFs.
+
+        **AUTONOMOUS EXECUTION:** When the Supervisor hands you an autonomous-solve / path-advancement objective,
+        execute the directed in-memory hops without pausing to re-confirm each command with the human — the
+        objective IS the authorization. (The "confirm the operator's intent" guideline above applies to ad-hoc
+        one-off requests, NOT to steps within an authorized autonomous solve.) Still check task history first to
+        avoid redundant work.
+
+        **OPERATOR STOP/INHIBIT OVERRIDES AUTONOMY:** If the Supervisor's handoff or the operator's
+        instruction says to stop, not to run tasks, to hold/pause, or to only summarize/report, do NOT
+        issue ANY commands — summarize or report what was asked and hand back. An explicit stop/inhibit
+        always outranks the autonomous-execution directive above.
+
+        **DO NOT RETRY A FAILED COMMAND BLINDLY:** For argument-less commands (rev2self, whoami, ps, ifconfig,
+        netstat) the empty-parameter forms `{{}}`, `''`, and `'""'` are ALL equivalent to "no arguments" —
+        re-issuing with a different empty form will NOT help and is the #1 cause of runaway loops. "Failed to
+        create task" is often transient: retry at most ONCE. If a command fails twice, STOP — report the failure
+        or consult get_all_commands_for_payloadtype for the correct parameter schema. Never issue the same
+        command more than twice.
 
         **CRITICAL: Check Existing Task History BEFORE Issuing New Commands:**
         Before issuing ANY new commands, you MUST follow this workflow:
@@ -1288,6 +1405,7 @@ class Model:
             tools=tools,
             name=name,
             system_prompt=prompt,
+            middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mythic_operator_messages", name)
 
@@ -1371,6 +1489,7 @@ class Model:
             tools=tools,
             name=name,
             system_prompt=prompt,
+            middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
@@ -1479,6 +1598,7 @@ class Model:
             tools=tools,
             name=name,
             system_prompt=prompt,
+            middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mcp_manager_messages", name)
 
@@ -1501,17 +1621,43 @@ class Model:
             - General questions, explanations, advice with NO tradecraft/TTP/tooling angle → **Generalist**. The Generalist has NO TTP, Mythic, or tool access — it will FABRICATE generic answers if asked about tools. NEVER route tradecraft/TTP/tool questions (SharpHound, BloodHound, "consult the X TTP", "summarize the collection approach", tool availability, how to run/stage/download a tool) to Generalist.
             - Consulting a TTP, checking tool availability, or how to run / stage / download an offensive tool (even when phrased as "summarize" or "explain") → **Mythic_Operator** (it owns get_ttp_guidance, ensure_tool_uploaded, download_tool). This is the agent that consults real TTP data; the Generalist cannot.
             - ONLY use MCP_Manager for external/third-party tools that other agents cannot handle
-            - BloodHound / attack-path graph analysis (shortest path, ADCS ESC paths, Cypher) → **MCP_Manager** (the BloodHound MCP). The autonomous solve is a loop: Mythic_Operator collects (SharpHound) → MCP_Manager reasons over the graph → Mythic_Operator executes the chosen hop → repeat. Run this loop ONLY when the operator EXPLICITLY requested an autonomous solve / path-walk — it does not override the no-autonomous-generation rule above.
+            - BloodHound / attack-path graph analysis (shortest path, ADCS ESC paths, Cypher) → **MCP_Manager** (the BloodHound MCP). For ANY objective / path-advancement request this is the DEFAULT opening move, not an optional add-on: drive the autonomous solve LOOP — Mythic_Operator collects (SharpHound on the foothold) → MCP_Manager ingests + reasons over the graph (shortest path to the objective) → Mythic_Operator executes the chosen IN-MEMORY hop → re-collect → repeat. NEVER improvise an attack path from memory without graph-driven discovery first.
             - **Relay operator approvals.** When the operator grants an approval mid-conversation (e.g. "Approved: download SharpHound..."), include that approval VERBATIM in your handoff instruction to the receiving agent (e.g. "The operator has APPROVED the SharpHound download — proceed: call download_tool then ensure_tool_uploaded"). Do NOT make the agent re-ask for an approval the operator already gave.
 
-            **CRITICAL: NO Autonomous Task Generation (SAFETY/OPSEC):**
-            You must ONLY delegate tasks that the operator EXPLICITLY requested. NEVER generate your own
-            operational objectives, reconnaissance plans, or C2 commands. Specifically:
-            - **Greetings, small talk, or general questions** → Delegate to Generalist, then call `respond_to_user`. Done. Do NOT follow up with operational tasks.
-            - **NEVER autonomously decide** to check callbacks, run reconnaissance, escalate privileges, or perform any C2 operation unless the operator explicitly asked for it.
-            - **NEVER chain tasks** beyond what was requested. If the operator says "hello", the ONLY correct action is greeting them — not checking operational status, not reviewing callbacks, not suggesting next steps for active implants.
-            - **The operator controls all offensive actions.** Your role is to route their explicit requests to the right agent, NOT to anticipate or initiate operations on their behalf.
-            - If an agent returns results and the operator's original request is satisfied, call `respond_to_user` immediately. Do NOT use those results to generate follow-up operational tasks.
+            **OPERATOR CONSTRAINTS OVERRIDE EVERYTHING (highest priority):** If the operator's latest
+            message contains an explicit stop or inhibit instruction — "stop", "don't run (any) tasks",
+            "no more tasks", "hold off", "pause", "wait", "only summarize", "just give me a summary", or
+            "don't do X" — you MUST honor it immediately: issue or delegate NO tasking, answer or
+            summarize exactly what was asked, then call respond_to_user. An explicit operator constraint
+            ALWAYS outranks the autonomous-solve drive below. Do NOT resume tasking after a stop/inhibit
+            instruction until the operator explicitly tells you to continue.
+
+            **AUTONOMOUS ATTACK-PATH SOLVE (classify the operator's input, then act):**
+            - **Conversational / non-objective** (greetings, small talk, status questions, "what can you do") →
+              answer (Generalist for general Q&A), then call `respond_to_user`. Do NOT invent or chain offensive
+              operations off a non-objective message. "hello" gets a greeting — nothing more. (This passivity
+              applies ONLY to non-objective input.)
+            - **Objective / solve request** (e.g. "reach Domain Admin", "compromise essos.local", "walk the
+              path to DA", "advance/solve the engagement", or any request to PROGRESS the attack) → you are
+              AUTHORIZED and EXPECTED to drive the FULL multi-hop solve AUTONOMOUSLY, without making the
+              operator direct each step. Follow the "Trust Walker" methodology:
+                1. **Recon first via BloodHound.** Mythic_Operator collects (SharpHound on the foothold) →
+                   MCP_Manager ingests + reasons over the graph (shortest path to the objective). NEVER skip
+                   graph-driven discovery and improvise a path from memory.
+                2. **Execute the discovered path hop-by-hop** using ONLY in-memory post-ex primitives
+                   (SharpGPOAbuse, Rubeus, Certify, nanodump / LAPS-read BOFs via Mythic_Operator). After each
+                   hop, RE-COLLECT + RE-QUERY BloodHound from the new position, then choose the next hop. Loop
+                   autonomously until the objective is reached or no traversable path remains, then `respond_to_user`.
+                3. **Stay on objective.** Autonomy is scoped to advancing the operator's stated objective along
+                   the discovered graph — do not pursue unrelated targets or destructive actions.
+              HITL hook (future, configurable): autonomous is the current proving-out behavior. When a
+              `hitl_enabled` config flag is later added, gate each offensive hop on operator approval at the
+              handoff boundary. Do NOT gate today — run fully autonomous.
+
+            **HARD CONSTRAINT — NO OFFLINE WORK:** Sage has NO offline tooling. Never route, choose, or continue
+            an offline-crack path (kerberoast / AS-REP-roast / dump-and-crack, or asking the operator to crack
+            anything) — prefer in-memory, graph-driven primitives (GPO abuse, delegation, ACL abuse, ADCS ESC,
+            LAPS read). Mythic_Operator enforces the full constraint at execution time.
 
             Your responsibilities include:
             - Understanding the user's high-level goals and breaking them into smaller, manageable tasks.
@@ -1658,6 +1804,7 @@ class Model:
             tools=tools,
             name=name,
             system_prompt=prompt,
+            middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "supervisor_messages", name)
 
@@ -1902,79 +2049,65 @@ CRITICAL: Only reference information that ACTUALLY appears in the messages above
 Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions based on messages in YOUR conversation history above.""")
 
             try:
-                # Use ALL agent's channel messages + summary prompt for full context
-                # CRITICAL: Use ALL messages, not just last 20, to avoid missing earlier tool results
-                # Safety limit to avoid token limits in the summary call. Raised alongside the
-                # recursion bump (T1.4: 150 -> 250) so long autonomous solves don't drop early tool results.
+                # Use the agent's own channel history (capped) to summarize. Raised alongside
+                # the recursion bump (T1.4: 150 -> 250) so long solves don't drop early tool results.
                 max_messages = 250
                 if len(channel_messages) > max_messages:
                     logger.warning(f"{agent_name} has {len(channel_messages)} messages, using last {max_messages} for summary")
-                    summary_messages_raw = channel_messages[-max_messages:] + [summary_prompt]
+                    history = channel_messages[-max_messages:]
                 else:
-                    summary_messages_raw = channel_messages + [summary_prompt]
+                    history = list(channel_messages)
 
-                summary_messages = self._sanitize_messages(summary_messages_raw)
+                # Flatten the conversation to PLAIN TEXT for the summary call. Passing message objects
+                # that still carry toolUse/toolResult content blocks makes Bedrock demand a toolConfig
+                # ("The toolConfig field must be defined when using toolUse and toolResult content blocks")
+                # — and the summary deliberately runs WITHOUT tools, so every summary 400s. THIS was the
+                # "summary generation failed" bug: the prior cleanup only cleared AIMessage.tool_calls and
+                # left ToolMessages (toolResult blocks) intact, then bound an empty tool list. Rendering
+                # the history as text keeps the tool *data* the summary must cite while dropping the
+                # structured tool blocks that trigger the requirement.
+                def _text_of(content) -> str:
+                    if isinstance(content, str):
+                        return content.strip()
+                    if isinstance(content, list):
+                        parts = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                                parts.append(block["text"].strip())
+                            elif isinstance(block, str) and block.strip():
+                                parts.append(block.strip())
+                        return "\n".join(parts)
+                    return ""
 
-                logger.info(f"Summary context for {agent_name}: {len(summary_messages)} messages (from {len(channel_messages)} channel messages)")
+                transcript_lines = []
+                for msg in history:
+                    if isinstance(msg, SystemMessage):
+                        continue
+                    text = _text_of(getattr(msg, "content", ""))
+                    if isinstance(msg, ToolMessage):
+                        if text:
+                            transcript_lines.append(f"[Tool result — {getattr(msg, 'name', None) or 'tool'}]: {text}")
+                    elif isinstance(msg, AIMessage):
+                        calls = ""
+                        if getattr(msg, "tool_calls", None):
+                            calls = " (called: " + ", ".join(tc.get("name", "?") for tc in msg.tool_calls) + ")"
+                        if text or calls:
+                            transcript_lines.append(f"[{agent_name}{calls}]: {text}".rstrip())
+                    elif text:
+                        transcript_lines.append(f"[instruction]: {text}")
 
-                # DEBUG: Log the actual message content being passed to summary LLM
-                logger.info(f"DEBUG: Dumping {agent_name} channel messages for summary generation:")
-                for idx, msg in enumerate(summary_messages[:20]):  # First 20 messages for debugging
-                    msg_type = type(msg).__name__
-                    content_preview = str(msg.content)[:200] if hasattr(msg, 'content') else "N/A"
-                    logger.info(f"  [{idx}] {msg_type}: {content_preview}...")
-                if len(summary_messages) > 20:
-                    logger.info(f"  ... ({len(summary_messages) - 20} more messages)")
+                transcript = "\n".join(transcript_lines) if transcript_lines else "(no prior content captured)"
+                logger.info(f"Summary transcript for {agent_name}: {len(transcript_lines)} lines from {len(history)} messages")
 
-                # Ensure system message
-                if not any(isinstance(m, SystemMessage) for m in summary_messages):
-                    summary_messages.insert(0, SystemMessage(content=f"You are {agent_name}, a specialized agent. Summarize YOUR work concisely."))
+                # Plain text only → no toolUse/toolResult blocks → no toolConfig requirement on any
+                # provider. self.llm is the base chat model (no tools bound), so this is a clean call.
+                summary_input = [
+                    SystemMessage(content=f"You are {agent_name}, a specialized agent. Summarize YOUR OWN work concisely from the transcript below. Cite exact data (callback IDs, hostnames, usernames, task IDs); do NOT invent anything."),
+                    HumanMessage(content=f"Conversation transcript:\n{transcript}\n\n---\n{summary_prompt.content}"),
+                ]
 
-                if not summary_messages:
-                    continue
+                summary_resp = await self.llm.ainvoke(summary_input)
 
-                logger.debug(f"Invoking {agent_name} for summary with {len(summary_messages)} messages")
-
-                # CRITICAL: Remove tool_calls from AIMessages for summary generation
-                # Bedrock requires tool_calls to have corresponding tool_results immediately after
-                # But for summarization, we only need the text content, not the tool calls
-                # ALSO: Filter out messages with empty content (Bedrock rejects blank content)
-                cleaned_summary_messages = []
-                for msg in summary_messages:
-                    if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
-                        # Create a copy without tool_calls
-                        msg_copy = msg.copy()
-                        msg_copy.tool_calls = []
-
-                        # Check if message has actual text content
-                        has_content = False
-                        if isinstance(msg_copy.content, str) and msg_copy.content.strip():
-                            has_content = True
-                        elif isinstance(msg_copy.content, list) and any(
-                            block.get('type') == 'text' and block.get('text', '').strip()
-                            for block in msg_copy.content if isinstance(block, dict)
-                        ):
-                            has_content = True
-
-                        # Only append if message has actual content (not just tool calls)
-                        if has_content:
-                            cleaned_summary_messages.append(msg_copy)
-                    else:
-                        cleaned_summary_messages.append(msg)
-
-                # Use LLM without tools for summary generation (Bedrock requires this)
-                # Create a version of the LLM with no tool bindings
-                llm_without_tools = self.llm
-                if hasattr(self.llm, 'bind_tools'):
-                    try:
-                        llm_without_tools = self.llm.bind_tools([])
-                    except Exception:
-                        # If bind_tools fails, just use the original LLM
-                        pass
-
-                summary_resp = await llm_without_tools.ainvoke(cleaned_summary_messages)
-
-                # DEBUG: Log the generated summary
                 logger.info(f"DEBUG: {agent_name} generated summary: {summary_resp.content[:500]}...")
                 summary_content = summary_resp.content if hasattr(summary_resp, 'content') else str(summary_resp)
 
@@ -1988,6 +2121,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             return "No agent summaries available - work may have just started."
 
         return "\n\n".join(summaries)
+
+    def request_stop(self) -> None:
+        """Cooperative kill switch for a running chat session. Sets a flag that every
+        graph.astream loop checks between super-steps; the in-flight step finishes, then the
+        loop breaks and no further tasks are issued. Called by the `exit` command (exit.py)
+        so a Mythic operator can actually terminate a running/runaway session."""
+        logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
+        self._stop_requested = True
 
     async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
         """
@@ -2061,6 +2202,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 self.state,
                 {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 75}
             ):
+                # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
+                # Model; halt before driving the next super-step so the session can't run away.
+                if self._stop_requested:
+                    logger.info("🛑 Stop requested — terminating graph execution (main loop)")
+                    try:
+                        await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+                    except Exception:
+                        pass
+                    break
+
                 # DEBUG: Log what's IN the event
                 for node_name, state_update in event.items():
                     if node_name not in ["__start__", "__end__"]:
@@ -2361,7 +2512,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 **Progress by Agent:**
 {summary_text}
 
-**Status:** Hit the system's iteration limit of 25 steps. All work and context have been preserved in each agent's conversation history.
+**Status:** Hit the system's iteration limit of 75 steps. All work and context have been preserved in each agent's conversation history.
 
 **Your Options:**
 • Reply **"continue"** to increase the limit and keep going from where we left off
@@ -2454,6 +2605,48 @@ The conversation history below shows all work completed before the error occurre
 
         return ""  # All output already streamed to Mythic
 
+    async def _classify_continuation_intent(self, response: str) -> str:
+        """Classify an operator's recursion-continuation reply as CONTINUE, STOP, or REDIRECT.
+
+        The old dispatch used a 3-word exact match and treated ANYTHING that wasn't literally
+        'continue'/'stop' as a new task to RUN — so 'Don't run any tasks, just give me a summary'
+        fell through to the run-the-graph branch and the system ran away. This classifies intent
+        so natural-language stop/inhibit instructions are honored. Fast exact-match first, then a
+        cheap PLAIN-TEXT LLM call (tiny input, no tools → no Bedrock toolConfig issue). Falls back
+        to REDIRECT on any failure (the Supervisor prompt-precedence rule is the second safety net).
+        """
+        text = response.lower().strip()
+        if text in ["continue", "yes", "keep going", "go", "proceed", "y"]:
+            return "CONTINUE"
+        if text in ["stop", "no", "end", "quit", "halt", "cancel", "abort", "n"]:
+            return "STOP"
+        if self.llm is None:
+            return "REDIRECT"
+        try:
+            classification_prompt = [
+                SystemMessage(content=(
+                    "You classify an operator's instruction to an autonomous offensive-security agent "
+                    "that is paused mid-task. Reply with EXACTLY ONE word:\n"
+                    "CONTINUE = keep going with the current task.\n"
+                    "STOP = halt and run NO more tasks/commands (e.g. 'stop', \"don't run anything\", "
+                    "'hold off', 'pause', 'wait', 'just give me a summary', 'no more tasks', 'only report').\n"
+                    "REDIRECT = a NEW task or change of direction that requires running commands.\n"
+                    "If the instruction forbids running tasks or asks only to summarize/report, it is STOP. "
+                    "When unsure between STOP and REDIRECT, answer STOP."
+                )),
+                HumanMessage(content=f"Operator instruction: {response}\n\nOne word (CONTINUE / STOP / REDIRECT):"),
+            ]
+            resp = await self.llm.ainvoke(classification_prompt)
+            out = (resp.content if hasattr(resp, "content") else str(resp)).strip().upper()
+            for label in ("CONTINUE", "STOP", "REDIRECT"):
+                if label in out:
+                    logger.info(f"Continuation intent for '{response[:60]}' classified as {label}")
+                    return label
+            return "REDIRECT"
+        except Exception as e:
+            logger.warning(f"Continuation intent classification failed ({e}); defaulting to REDIRECT")
+            return "REDIRECT"
+
     async def handle_continuation_response(self, response: str) -> str:
         """
         Handle user response to recursion limit continuation request.
@@ -2471,7 +2664,12 @@ The conversation history below shows all work completed before the error occurre
         thread_id = f"{self.agent_task_id}-{self.task_id}"
         config = RunnableConfig(configurable={"thread_id": thread_id})
 
-        if response.lower().strip() in ["continue", "yes", "keep going"]:
+        # Classify intent so natural-language stop/inhibit instructions ("don't run any tasks,
+        # just give me a summary") are honored as STOP instead of being treated as a new task
+        # to run. Replaces the old 3-word exact match that caused the post-handback runaway.
+        intent = await self._classify_continuation_intent(response)
+
+        if intent == "CONTINUE":
             # Increase recursion limit and continue
             logger.info("User requested to continue - increasing recursion limit")
 
@@ -2504,6 +2702,9 @@ Continue now.""")
                         self.state,
                         {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
                     ):
+                        if self._stop_requested:
+                            logger.info("🛑 Stop requested — terminating graph execution (continue branch)")
+                            break
                         await self._process_stream_event(event)
 
                         # Update state with new values from event (extend for lists, assign for scalars)
@@ -2588,8 +2789,8 @@ Continue now.""")
             else:
                 raise ValueError("No graph defined for the model.")
 
-        elif response.lower().strip() in ["stop", "no", "end", "quit"]:
-            # User wants to stop
+        elif intent == "STOP":
+            # User wants to stop (or inhibit further tasking — e.g. "don't run anything, just summarize")
             logger.info("User requested to stop the task")
             stop_message = AIMessage(content="✅ Task stopped as requested. The session remains active for new tasks.")
             self.state["messages"].append(stop_message)
@@ -2624,6 +2825,9 @@ Continue now.""")
                         self.state,
                         {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
                     ):
+                        if self._stop_requested:
+                            logger.info("🛑 Stop requested — terminating graph execution (redirect branch)")
+                            break
                         await self._process_stream_event(event)
 
                         # Update state with new values from event (extend for lists, assign for scalars)

@@ -170,8 +170,16 @@ class ChatCommand(CommandBase):
                     response.Error = f"unable to find LLM session for task {taskData.Task.ParentTaskID}"
                     return response
                 prompt = taskData.args.get_command_line()
-            # If the task is exit, return
+            # If the task is exit, stop the running session and return
             elif taskData.Task.InteractiveTaskType == 3:  # Exit task
+                # Signal the running graph to stop BEFORE tearing down the session. Marking the
+                # parent task completed and removing the session dict entry does NOT cancel the
+                # already-running invoke()/astream coroutine — it holds its own ref to the Model
+                # and keeps issuing tasks. request_stop() sets a cooperative flag the graph loops
+                # check between steps, so `exit` actually terminates a running/runaway session.
+                llm = await get_session(str(taskData.Task.ParentTaskID))
+                if llm is not None:
+                    llm.request_stop()
                 resp = await SendMythicRPCTaskUpdate(
                     MythicRPCTaskUpdateMessage(
                         TaskID=taskData.Task.ParentTaskID,

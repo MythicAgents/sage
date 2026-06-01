@@ -15,6 +15,28 @@ try:
 except ImportError:  # allow running this module directly for manual testing
     import ttp_library
 
+
+# Well-known Apollo/Mythic signatures for command failures that arrive as task OUTPUT
+# (not as raised exceptions). Used by the issue_task circuit breaker to count agent-side
+# failures so the LLM cannot blindly re-issue a failing command. Conservative on purpose —
+# only unambiguous failure phrases, to avoid miscounting legitimate command output.
+_TASK_FAILURE_SIGNATURES = (
+    "failed to parse arguments",
+    "don't match any parameters",
+    "invalid values",
+    "failed to create task",
+    "takes no command line arguments",
+)
+
+
+def _is_task_failure_output(output: str) -> bool:
+    """True if task output contains a known agent-side command-failure signature."""
+    if not output:
+        return False
+    low = output.lower()
+    return any(sig in low for sig in _TASK_FAILURE_SIGNATURES)
+
+
 class MythicTools:
     """A class to manage Mythic API tools for LangChain agents.
 
@@ -38,6 +60,13 @@ class MythicTools:
         logger.debug(f"Initializing MythicAPIClient with task ID: {agent_task_id}")
         self.agent_task_id = agent_task_id
         self.client = None
+        # Circuit breaker for repeated identical task failures. Keyed by
+        # (command, callback_display_id, normalized_params); incremented on each failed
+        # issue_task_and_waitfor_task_output, reset on success. Prevents the agent from
+        # burning the recursion budget by re-issuing a failing command with cosmetic
+        # parameter permutations — the cause of the 2.47M-token context explosion on
+        # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
+        self._task_failure_counts: dict[tuple, int] = {}
 
     async def login(self):
         """Create the Mythic API client connection asynchronously."""
@@ -379,6 +408,20 @@ class MythicTools:
             include_all_commands= True,  # Include all commands in the payload
             custom_return_attributes=custom_attributes,
         )
+        # Surface the Agent File ID (the Mythic *file* UUID) at the top level so the model does not
+        # confuse it with the Payload UUID. File tools (upload_file_by_file_uuid, download_file) need
+        # `agent_file_id` from filemetum — NOT the top-level `uuid`, which identifies the payload.
+        if isinstance(resp, dict):
+            filemetum = resp.get("filemetum")
+            if isinstance(filemetum, list):
+                filemetum = filemetum[0] if filemetum else None
+            resp["agent_file_id"] = filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None
+            resp["payload_uuid"] = resp.get("uuid")
+            resp["_uuid_help"] = (
+                "Pass 'agent_file_id' (the Mythic file UUID) to upload_file_by_file_uuid / download_file. "
+                "'payload_uuid' (a.k.a. 'uuid') identifies the payload, NOT the file — do not pass it to file tools. "
+                "If 'agent_file_id' is null, the build did not produce a file (check build_phase / build_stderr)."
+            )
         return json.dumps(resp, sort_keys=True)
 
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
@@ -397,16 +440,53 @@ class MythicTools:
         """
         if timeout is None:
             timeout = 300  # Default timeout of 5 minutes
+
+        # Normalize "no arguments" to an empty string. Trace evidence (2026-06-01) shows
+        # argument-less Apollo commands (rev2self, whoami) SUCCEED with parameters="" but
+        # FAIL with parameters={} ("rev2self takes no command line arguments") because an
+        # empty dict serializes to a non-empty argument. Collapse every empty form to "".
+        if parameters is None or parameters == {} or (
+            isinstance(parameters, str) and parameters.strip() in ("", "{}", '""', "''")
+        ):
+            parameters = ""
+
+        # Circuit breaker: refuse to re-issue a command that has already failed repeatedly
+        # with the same (normalized) parameters on the same callback. Without this, a
+        # transient "Failed to create task" or a parse error sends the model into an
+        # unbounded retry loop (cosmetic param permutations) that explodes context and
+        # exhausts the recursion limit.
+        fail_key = (
+            command,
+            callback_display_id,
+            json.dumps(parameters, sort_keys=True) if isinstance(parameters, (dict, list)) else str(parameters),
+        )
+        if self._task_failure_counts.get(fail_key, 0) >= 2:
+            return (
+                f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
+                f"failed {self._task_failure_counts[fail_key]} times. Do NOT re-issue it with cosmetically different "
+                f"empty parameters ({{}}, '', '\"\"' are all equivalent to 'no arguments'). The parameter format is "
+                f"likely wrong or the failure is environmental. Report this to the operator, consult "
+                f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
+            )
+
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling issue_task_and_waitfor_task_output tool for command: {command} on callback_display_id: {callback_display_id}")
             results = await mythic.issue_task_and_waitfor_task_output(mythic=self.client, command_name=command, parameters=parameters, callback_display_id=callback_display_id, timeout=timeout) #token_id=token_id
             if results is None:
+                self._task_failure_counts.pop(fail_key, None)
                 return "No results returned from task."
+            results_str = str(results)
+            # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
+            # them toward the circuit breaker so blind retries are still capped.
+            if _is_task_failure_output(results_str):
+                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
             else:
-                return str(results)
+                self._task_failure_counts.pop(fail_key, None)
+            return results_str
         except Exception as e:
+            self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
             return f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
 
     async def get_task_history_for_callback(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to retrieve task history for"]) -> str:
@@ -482,9 +562,36 @@ class MythicTools:
         data = [item async for item in resp]
         return json.dumps(data, sort_keys=True)
 
+    async def _get_file_metadata(self, file_uuid: str) -> dict | None:
+        """Look up filemeta for a Mythic file by its agent_file_id WITHOUT downloading the bytes.
+
+        Returns the filemeta dict (agent_file_id, complete, deleted, is_payload, filename_utf8,
+        chunks_received, total_chunks) or None if no file row matches the UUID. Used as a cheap
+        pre-flight check so we don't pull multi-MB files into the agent process just to validate them.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        query = """
+            query FileMetaByUuid($uuid: String!) {
+                filemeta(where: { agent_file_id: { _eq: $uuid } }, limit: 1) {
+                    agent_file_id
+                    complete
+                    deleted
+                    is_payload
+                    filename_utf8
+                    chunks_received
+                    total_chunks
+                }
+            }
+        """
+        logger.debug(f"🛠️ Looking up file metadata for agent_file_id: {file_uuid}")
+        resp = await mythic.execute_custom_query(self.client, query, variables={"uuid": file_uuid})
+        rows = resp.get("filemeta") if isinstance(resp, dict) else None
+        return rows[0] if rows else None
+
     async def upload_file_by_file_uuid(
             self,
-            command: Annotated[str, "The name of the command for a Mythic agent that has upload functionality, typically the \"upload\" command, to execute on the target agent"], 
+            command: Annotated[str, "The name of the command for a Mythic agent that has upload functionality, typically the \"upload\" command, to execute on the target agent"],
             parameters: Annotated[str|dict, "Parameters for the upload command"], 
             file_uuid: Annotated[str, "The Mythic file UUID to upload to the target agent"], 
             callback_display_id: Annotated[int, "The callback_display_id of the target agent to upload the file to"],
@@ -497,11 +604,17 @@ class MythicTools:
 
         **IMPORTANT**: The command's parameter must be of type "File" (e.g., "type": "File"). DO NOT USE PARAMETER TYPE "STRING" TO UPLOAD FILES.
         For the Merlin agent, use the "upload" command with the "file" parameter set to the Mythic file UUID and the "path" parameter set to the destination path and file name on the target system.
-        
+
+        **IMPORTANT — which UUID:** `file_uuid` must be the Mythic *file* UUID, i.e. the `agent_file_id`
+        returned by create_payload (surfaced as the top-level `agent_file_id` field), NOT the payload's
+        `uuid` (the Payload UUID). They are different values; passing the Payload UUID will fail because no
+        downloadable file has that UUID. For a freshly built payload, also confirm its build_phase is
+        "success" before uploading — a payload that errored during build has no file bytes to send.
+
         Args:
             command: The name of the command for a Mythic agent that has upload functionality, typically the "upload" command.
             parameters: Parameters a Mythic agent's upload command.
-            file_uuid: The Mythic file UUID to upload to the target agent.
+            file_uuid: The Mythic file UUID (agent_file_id) to upload to the target agent.
             callback_display_id: The callback_display_id of the target agent to upload the file to.
             token_id: Optional token ID for authentication.
             timeout: Optional timeout for the upload operation.
@@ -510,10 +623,29 @@ class MythicTools:
         
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
-        logger.debug(f"🛠️ Calling upload_file_by_file_id tool for file ID {file_uuid} and callback_display_id {callback_display_id}")
-        file = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
-        if file is None or len(file) == 0:
-            raise Exception(f"Failed to download file with UUID: {file_uuid}")
+        logger.debug(f"🛠️ Calling upload_file_by_file_uuid tool for file UUID {file_uuid} and callback_display_id {callback_display_id}")
+        # Pre-flight validation via a lightweight metadata lookup instead of downloading the
+        # (potentially multi-MB) file just to discard the bytes. Mythic transfers the file
+        # server-side from the file_uuid in `parameters`, so the agent never needs the bytes here.
+        meta = await self._get_file_metadata(file_uuid)
+        if meta is None:
+            raise Exception(
+                f"No Mythic file has agent_file_id '{file_uuid}'. If you got this UUID from "
+                f"create_payload, use the 'agent_file_id' field (the Mythic file UUID), NOT the "
+                f"payload 'uuid' (the Payload UUID) — they are different values."
+            )
+        if meta.get("deleted"):
+            raise Exception(
+                f"Mythic file '{file_uuid}' ({meta.get('filename_utf8')}) is marked deleted "
+                f"and cannot be uploaded."
+            )
+        if not meta.get("complete"):
+            raise Exception(
+                f"Mythic file '{file_uuid}' ({meta.get('filename_utf8')}) is not complete "
+                f"({meta.get('chunks_received')}/{meta.get('total_chunks')} chunks received). "
+                f"If this is a freshly built payload, its build may have errored or is still "
+                f"running — verify the payload's build_phase is 'success' before uploading."
+            )
         resp = await self.issue_task_and_waitfor_task_output(
             command=command,
             parameters=parameters,
@@ -539,8 +671,23 @@ class MythicTools:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling download_file tool for file UUID: {file_uuid}")
         file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
-        if file_content is None:
-            raise Exception(f"Failed to download file with UUID: {file_uuid}")
+        if file_content is None or len(file_content) == 0:
+            meta = await self._get_file_metadata(file_uuid)
+            if meta is None:
+                raise Exception(
+                    f"No Mythic file has agent_file_id '{file_uuid}'. Make sure you used the file's "
+                    f"'agent_file_id', not a Payload UUID."
+                )
+            if not meta.get("complete"):
+                raise Exception(
+                    f"Mythic file '{file_uuid}' ({meta.get('filename_utf8')}) is not complete "
+                    f"({meta.get('chunks_received')}/{meta.get('total_chunks')} chunks) — its source "
+                    f"task/build may have errored or is still running."
+                )
+            raise Exception(
+                f"Failed to download file '{file_uuid}' ({meta.get('filename_utf8')}); "
+                f"deleted={meta.get('deleted')}."
+            )
         # Encode the binary content to base64 string for easier transport
         encoded_content = base64.b64encode(file_content).decode('utf-8')
         return encoded_content
