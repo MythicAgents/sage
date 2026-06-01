@@ -110,9 +110,20 @@ class ChatArguments(TaskArguments):
             description="[OPTIONAL] The AWS Region (AWS_DEFAULT_REGION) to use for Bedrock",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=10)]
         )
+        # Mode (HITL)
+        mode = CommandParameter(
+            name="mode",
+            display_name="Mode",
+            cli_name="mode",
+            type=ParameterType.ChooseOne,
+            choices=["auto", "supervised"],
+            default_value="auto",
+            description="auto = run unattended; supervised = require operator approve/deny on guarded tool calls",
+            parameter_group_info=[ParameterGroupInfo(required=False, ui_position=11)]
+        )
 
         # Add all the parameters
-        self.args = [provider, model, prompt, tools, verbose, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region]
+        self.args = [provider, model, prompt, tools, verbose, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region, mode]
 
     async def parse_arguments(self):
         if len(self.command_line) == 0:
@@ -222,6 +233,7 @@ class ChatCommand(CommandBase):
             
             tools = taskData.args.get_arg("tools")
             verbose = taskData.args.get_arg("verbose")
+            mode = taskData.args.get_arg("mode") or "auto"
 
             # These can be None as they are optional
             api_endpoint = get_secret(taskData=taskData, key="API_ENDPOINT")
@@ -249,7 +261,7 @@ class ChatCommand(CommandBase):
                     config["configurable"]["aws_session_token"] = aws_session_token
                 if aws_region is not None:
                     config["configurable"]["region"] = aws_region
-            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID)
+            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode)
             await llm.initialize()
             if verbose:
                 llm.set_verbose(True)

@@ -6,7 +6,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt import tools_condition
 from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
-from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware
+from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware, HumanInTheLoopMiddleware, InterruptOnConfig, AgentMiddleware
 from langgraph.types import Command
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -21,9 +21,10 @@ from mythic_container.MythicRPC import (
     MythicRPCTaskUpdateMessage,
     SendMythicRPCTaskUpdate
 )
-from typing import Any
+from typing import Any, Literal
+from typing_extensions import NotRequired
 from uuid import UUID
-from .mythic_tools import MythicTools
+from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
 from ai.mcp import MCPManager
 
@@ -149,9 +150,94 @@ def _max_seq_reducer(a: int, b: int) -> int:
     return max(a or 0, b or 0)
 
 
+# HITL approve/deny: DEFAULT-DENY. Only an explicit, exact-match approval word approves; every other
+# input — empty, "no", "deny", "stop", ambiguous, anything unrecognized — denies. This is a safety
+# boundary for an autonomous OFFENSIVE agent: a misclassification that approves a destructive call is
+# exactly the failure supervised mode exists to prevent, so we never use an LLM tiebreak to UPGRADE to
+# approve. Deliberately NOT _classify_continuation_intent (that is continue/stop semantics, not approve/deny).
+_HITL_APPROVE_WORDS = frozenset({"approve", "approved", "yes", "y", "ok", "okay", "go", "proceed"})
+
+
+def _hitl_is_approved(text: str) -> bool:
+    """True only if the operator reply is an exact-match approval token (case-insensitive). Default-deny."""
+    if not text:
+        return False
+    return text.strip().lower() in _HITL_APPROVE_WORDS
+
+
+def _collect_hitl_action_requests(snapshot) -> list:
+    """Return the pending HumanInTheLoop action_requests for a graph snapshot, counted ONCE.
+
+    The middleware requires EXACTLY one resume decision per hanging tool call. `snapshot.interrupts`
+    already aggregates interrupts across tasks, and `snapshot.tasks[].interrupts` repeats the same
+    objects — unioning them double-counts (the 2026-06-01 task-598 bug: "Number of human decisions (2)
+    does not match number of hanging tool calls (1)"). Use the aggregated list when present, fall back
+    to per-task only when it is empty, and dedupe defensively by interrupt id.
+    """
+    interrupt_objs = list(getattr(snapshot, "interrupts", None) or ())
+    if not interrupt_objs:
+        for task in (getattr(snapshot, "tasks", None) or ()):
+            interrupt_objs.extend(getattr(task, "interrupts", None) or ())
+    seen = set()
+    action_requests: list = []
+    for itr in interrupt_objs:
+        iid = getattr(itr, "id", None)
+        key = iid if iid is not None else id(itr)
+        if key in seen:
+            continue
+        seen.add(key)
+        val = getattr(itr, "value", None)
+        if isinstance(val, dict) and isinstance(val.get("action_requests"), list):
+            action_requests.extend(val["action_requests"])
+    return action_requests
+
+
+class _OperatorStopRequested(Exception):
+    """Raised INSIDE an agent's create_agent loop when the operator kill-switch fired.
+
+    The outer graph.astream only checks Model._stop_requested between top-level super-steps
+    (Supervisor↔specialist handoffs). A specialist mid-turn — e.g. Mythic_Operator looping over
+    many tool calls, or blocked in issue_task_and_waitfor_task_output — never yields to that check,
+    so `exit` appeared to do nothing until the whole turn finished (task-626: exit issued twice, no
+    stop, manual kill; the log shows request_stop DID fire). This exception, raised by
+    _StopCheckMiddleware at each model/tool boundary inside the agent, breaks out promptly; the outer
+    invoke() try/except catches it and ends the session cleanly.
+    """
+
+
+class _StopCheckMiddleware(AgentMiddleware):
+    """Honors the operator kill-switch at every model call and every tool call inside an agent.
+
+    Closes over the owning Model so it can read the live _stop_requested flag. Checking before each
+    model call (before_model) and before each tool executes (awrap_tool_call) means a stop takes
+    effect at the next boundary within the agent turn, not just at top-level handoffs. (Limitation:
+    a tool already blocked mid-await — e.g. a 300s issue_task wait — still finishes before the next
+    boundary check; hard-cancel of an in-flight tool is a separate future enhancement.)
+    """
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    def before_model(self, state, runtime):
+        if getattr(self._model, "_stop_requested", False):
+            raise _OperatorStopRequested()
+        return None
+
+    async def awrap_tool_call(self, request, handler):
+        if getattr(self._model, "_stop_requested", False):
+            raise _OperatorStopRequested()
+        return await handler(request)
+
+    def wrap_tool_call(self, request, handler):
+        if getattr(self._model, "_stop_requested", False):
+            raise _OperatorStopRequested()
+        return handler(request)
+
+
 class SageState(MessagesState):
     count: int
     remaining_steps: RemainingSteps
+    mode: NotRequired[Literal["auto", "supervised"]]
     recursion_summary_requested: bool
     recursion_handback: bool
     supervisor_messages: Annotated[list[AnyMessage], operator.add]
@@ -374,7 +460,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "auto"):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -384,6 +470,7 @@ class Model:
         """
         self.provider = provider
         self.model = model
+        self.mode = mode if mode in ("auto", "supervised") else "auto"
         self.graph = None
         self.verbose = False
         self.is_interactive = False
@@ -413,6 +500,7 @@ class Model:
         self.state = {
             "messages": self.messages,          # legacy combined channel
             "count": 0,  # Legacy field, not used for output tracking
+            "mode": self.mode,
             "_message_seq": self._message_seq,  # Shared sequence counter
             "supervisor_messages": [self.system_message],
             "generalist_messages": [],
@@ -1149,6 +1237,9 @@ class Model:
             "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
         )
         mw = [
+            # Kill-switch honored INSIDE each agent loop (not just at top-level handoffs) — see
+            # _StopCheckMiddleware / task-626. Listed first so it gates before the model call.
+            _StopCheckMiddleware(self),
             ContextEditingMiddleware(
                 edits=[ClearToolUsesEdit(
                     trigger=50000,
@@ -1172,6 +1263,16 @@ class Model:
                 # not fire every step. Raised from 55000 (which thrashed) after trace evidence. ~200k ctx.
                 trigger=("tokens", 150000),
                 keep=("messages", 12),
+            ))
+        # HITL (supervised mode only): gate guarded tool calls behind an operator approve/deny
+        # interrupt. AUTO mode appends nothing here, so its behavior is byte-identical to before.
+        if getattr(self, "mode", "auto") == "supervised":
+            mw.append(HumanInTheLoopMiddleware(
+                interrupt_on={
+                    t: InterruptOnConfig(allowed_decisions=["approve", "reject"])
+                    for t in GUARDED_TOOLS
+                },
+                description_prefix="Sage supervised mode — approve or deny this guarded tool call",
             ))
         return mw
     
@@ -1547,10 +1648,20 @@ class Model:
         - PRECHECK: if the task needs BloodHound but no `bloodhound` server appears in the connected list
           above, do NOT fail silently. Call get_ttp_guidance("stand up bloodhound") and relay the concrete
           standup steps, then ask the operator to connect it with the `mcp-connect` command and retry.
+        - CHECK BEFORE COLLECTING (idempotence): BloodHound data PERSISTS across turns and tasks. Before
+          asking for a new SharpHound collection or re-ingesting, FIRST query the existing graph (e.g.
+          domain_info, or a quick cypher_query node count for the target domain). If the graph is ALREADY
+          POPULATED for the target domain and not stale, SKIP collection/ingest entirely and query what is
+          already there. Only collect when the graph is empty or known-stale for the domain you need. Do
+          NOT re-run SharpHound just because a new turn started.
+        - ON "CONTINUE" / RESUME: you are resuming an in-progress solve, NOT starting over. Re-read the
+          task history and the existing graph to see what is already done (collection complete? path
+          already identified?) and continue from there. Never re-do completed collection or re-identify a
+          path you already found.
         - When connected, run the loop: call get_ttp_guidance("bloodhound attack path loop") for the
-          workflow. Typically: ingest the SharpHound collection (file_upload) → data_quality →
-          graph_analysis / adcs_info / cypher_query to identify the path → report the path AND your
-          reasoning back so the Supervisor can route the next hop to Mythic_Operator.
+          workflow. Typically (only when collection is actually needed): ingest the SharpHound collection
+          (file_upload) → data_quality → graph_analysis / adcs_info / cypher_query to identify the path →
+          report the path AND your reasoning back so the Supervisor can route the next hop to Mythic_Operator.
         - INGEST BRIDGE: the BloodHound `file_upload` tool needs an absolute on-disk PATH, but
           collections arrive as a Mythic file artifact (a file UUID from a `download` task, NOT a
           path). When you are handed a Mythic file UUID to ingest, FIRST call
@@ -1644,6 +1755,11 @@ class Model:
                 1. **Recon first via BloodHound.** Mythic_Operator collects (SharpHound on the foothold) →
                    MCP_Manager ingests + reasons over the graph (shortest path to the objective). NEVER skip
                    graph-driven discovery and improvise a path from memory.
+                   IDEMPOTENCE: BloodHound data PERSISTS across turns/tasks. Before routing a NEW SharpHound
+                   collection — especially on "continue"/resume — FIRST ask MCP_Manager whether the graph
+                   already has data for the target domain. If it does and it is fresh, SKIP collection and go
+                   straight to graph-querying. Only collect when the graph is empty/stale, or after a hop that
+                   actually changed the environment. Do NOT re-run SharpHound just because the task resumed.
                 2. **Execute the discovered path hop-by-hop** using ONLY in-memory post-ex primitives
                    (SharpGPOAbuse, Rubeus, Certify, nanodump / LAPS-read BOFs via Mythic_Operator). After each
                    hop, RE-COLLECT + RE-QUERY BloodHound from the new position, then choose the next hop. Loop
@@ -2130,6 +2246,146 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
 
+    async def _hitl_interrupt_pending(self, thread_id: str) -> bool:
+        """True if the graph for this thread is paused on a HumanInTheLoopMiddleware interrupt.
+
+        Detected via the checkpointer: aget_state surfaces pending interrupts on the StateSnapshot
+        (top-level .interrupts and per-task .interrupts). Only relevant in supervised mode; auto mode
+        never installs the middleware so this stays False and the path below is never taken.
+        """
+        if getattr(self, "mode", "auto") != "supervised" or not self.graph:
+            return False
+        try:
+            snapshot = await self.graph.aget_state({"configurable": {"thread_id": thread_id}})
+        except Exception as e:
+            logger.warning(f"HITL: aget_state failed for thread {thread_id} ({e}); treating as no pending interrupt")
+            return False
+        if getattr(snapshot, "interrupts", None):
+            return True
+        for task in (getattr(snapshot, "tasks", None) or ()):
+            if getattr(task, "interrupts", None):
+                return True
+        return False
+
+    async def handle_hitl_resume(self, response: str, thread_id: str) -> str:
+        """Resume a graph paused on a guarded-tool approval interrupt with a DEFAULT-DENY decision map.
+
+        Reads the pending interrupt to learn how many tool calls were interrupted (the middleware
+        requires exactly one decision per interrupted tool call, else it raises ValueError), classifies
+        the operator reply with _hitl_is_approved (default-deny), writes one audit line per decision, then
+        resumes via Command(resume={"decisions": [...]}) on the SAME thread_id. The middleware re-executes
+        the tool node on resume (replay-safe: the real side effect runs only after the resume value is read),
+        so we add NO side effects here beyond the audit log.
+        """
+        config = RunnableConfig(configurable={"thread_id": thread_id})
+        snapshot = await self.graph.aget_state(config)
+
+        # Collect the pending HITLRequest action_requests, counted ONCE (single authoritative source +
+        # dedupe). Unioning snapshot.interrupts with snapshot.tasks[].interrupts double-counts and breaks
+        # the middleware's one-decision-per-hanging-tool-call check (task-598 ValueError).
+        action_requests = _collect_hitl_action_requests(snapshot)
+
+        approved = _hitl_is_approved(response)
+        decision_word = "approve" if approved else "deny"
+
+        # One audit line + one Decision per interrupted tool call.
+        decisions: list[dict] = []
+        if action_requests:
+            for ar in action_requests:
+                tool_name = ar.get("name", "unknown") if isinstance(ar, dict) else "unknown"
+                tool_args = ar.get("args", {}) if isinstance(ar, dict) else {}
+                self._write_hitl_audit(tool_name, tool_args, decision_word)
+                if approved:
+                    decisions.append({"type": "approve"})
+                else:
+                    decisions.append({"type": "reject",
+                                      "message": f"[DENIED by operator] {tool_name} was not executed."})
+        else:
+            # No structured action_requests recovered — still resume default-deny safely with a single
+            # decision so the graph does not hang. Audit it as an unknown-tool deny/approve.
+            self._write_hitl_audit("unknown", {}, decision_word)
+            if approved:
+                decisions.append({"type": "approve"})
+            else:
+                decisions.append({"type": "reject", "message": "[DENIED by operator]"})
+
+        logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
+
+        # Resume the paused graph with the decision payload the installed middleware expects.
+        async for event in self.graph.astream(
+            Command(resume={"decisions": decisions}),
+            {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
+        ):
+            if self._stop_requested:
+                logger.info("🛑 Stop requested — terminating graph execution (HITL resume)")
+                break
+            # A subsequent guarded tool call in the same supervised run interrupts again — surface
+            # the next approve/deny prompt and pause rather than silently halting.
+            if isinstance(event, dict) and "__interrupt__" in event:
+                await self._surface_hitl_interrupt(event)
+                break
+            await self._process_stream_event(event)
+
+        return ""
+
+    def _write_hitl_audit(self, tool: str, args: dict, decision: str) -> None:
+        """Append one JSON line to MEMORY/audit.jsonl recording an approve/deny decision. Best-effort:
+        a failure to write the audit log must never crash the resume path."""
+        try:
+            from pathlib import Path
+            from datetime import datetime, timezone
+            audit_dir = Path("MEMORY")
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "operator": getattr(self, "operator", None) or "unknown",
+                "tool": tool,
+                "args": args,
+                "decision": "approve" if decision == "approve" else "deny",
+                "mode": "supervised",
+            }
+            with (audit_dir / "audit.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+        except Exception as e:
+            logger.warning(f"HITL: failed to write audit line ({e})")
+
+    async def _surface_hitl_interrupt(self, event: dict) -> bool:
+        """If an astream event carries a HumanInTheLoopMiddleware approval interrupt, stream a clear
+        approve/deny prompt to the operator and return True. The graph stays paused (checkpointed) so
+        the operator's next message resumes it via handle_hitl_resume. Without this, supervised mode
+        halts on the raw tool-call request with no prompt (the 2026-06-01 task-595 symptom: 'stop had
+        no text back to the user, last text showing as the tool call request')."""
+        interrupts = event.get("__interrupt__") if isinstance(event, dict) else None
+        if not interrupts:
+            return False
+        lines = []
+        for itr in interrupts:
+            val = getattr(itr, "value", None)
+            if isinstance(val, dict):
+                for ar in (val.get("action_requests") or []):
+                    if isinstance(ar, dict):
+                        name = ar.get("name", "a guarded tool")
+                        args = ar.get("args", {})
+                        try:
+                            args_str = json.dumps(args, default=str, sort_keys=True)
+                        except Exception:
+                            args_str = str(args)
+                        lines.append(f"  • `{name}`  {args_str[:400]}")
+        body = "\n".join(lines) if lines else "  • (a guarded tool call)"
+        msg = (
+            "⏸️ **Approval required — supervised mode**\n\n"
+            "Sage wants to run the following guarded action(s):\n"
+            f"{body}\n\n"
+            "Reply **`approve`** to run it, or **`deny`** to skip it. "
+            "Anything other than an explicit approval is treated as a denial."
+        )
+        try:
+            await self._stream_message_to_mythic(msg)
+        except Exception as e:
+            logger.warning(f"HITL: failed to stream approval prompt ({e})")
+        logger.info(f"HITL interrupt surfaced to operator ({len(lines)} action(s)); awaiting approve/deny")
+        return True
+
     async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
         """
         Invoke the model with a prompt and return the response.
@@ -2156,6 +2412,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         if "messages" not in self.state:
             self.state["messages"] = []
+
+        thread_id = f"{self.agent_task_id}-{self.task_id}"
+        if await self._hitl_interrupt_pending(thread_id):
+            logger.info(f"HITL interrupt pending on thread {thread_id} — routing operator reply to approve/deny resume")
+            return await self.handle_hitl_resume(prompt, thread_id)
 
         # Check if we're responding to a recursion limit continuation request
         # If so, delegate to handle_continuation_response() instead of normal flow
@@ -2198,6 +2459,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
             # Stream graph execution and process events incrementally
+            hitl_interrupted = False
             async for event in self.graph.astream(
                 self.state,
                 {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 75}
@@ -2210,6 +2472,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
                     except Exception:
                         pass
+                    break
+
+                # HITL: in supervised mode a guarded tool call interrupts here. The outer graph
+                # (which holds the checkpointer) emits a clean __interrupt__ event; surface the
+                # approve/deny prompt and pause — the graph state is checkpointed for resume.
+                if isinstance(event, dict) and "__interrupt__" in event:
+                    await self._surface_hitl_interrupt(event)
+                    hitl_interrupted = True
                     break
 
                 # DEBUG: Log what's IN the event
@@ -2268,6 +2538,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
             logger.debug(f"📥 After astream: self.state._message_seq={self.state.get('_message_seq')}")
 
+            # HITL: a guarded tool call paused the graph for operator approval. The approve/deny prompt
+            # was already streamed; return cleanly (do NOT merge the proposed tool-call AIMessage as the
+            # final answer). The operator's next message resumes via handle_hitl_resume.
+            if hitl_interrupted:
+                return ""
+
             # Create resp variable for compatibility with downstream code
             resp = self.state
 
@@ -2321,6 +2597,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             elif synthetic_resp.get("recursion_handback", False):
                 logger.info("Recursion handback received from specialist agent")
                 return ""  # All output already streamed to Mythic
+        except _OperatorStopRequested:
+            # Kill-switch fired inside an agent turn (finer-grained than the between-super-steps
+            # check). End the session cleanly instead of surfacing it as an error.
+            logger.info("🛑 Operator stop honored inside agent loop — terminating session")
+            try:
+                await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+            except Exception:
+                pass
+            return ""
         except GraphRecursionError as e:
             # Catch recursion limit error and return progress made so far
             logger.warning(f"Recursion limit hit: {e}")

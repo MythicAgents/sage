@@ -20,6 +20,10 @@ except ImportError:  # allow running this module directly for manual testing
 # (not as raised exceptions). Used by the issue_task circuit breaker to count agent-side
 # failures so the LLM cannot blindly re-issue a failing command. Conservative on purpose —
 # only unambiguous failure phrases, to avoid miscounting legitimate command output.
+# Breaker signatures: SPECIFIC, unambiguous Apollo/Mythic tasking-layer failures. Kept narrow on
+# purpose — these feed the issue_task circuit breaker, where a false positive on a SUCCESSFUL command
+# (whose output merely quotes one of these strings as data) would wrongly count toward a STOP and
+# block legitimate tasking. Do NOT add generic phrases here (see _READ_FAILURE_SIGNATURES).
 _TASK_FAILURE_SIGNATURES = (
     "failed to parse arguments",
     "don't match any parameters",
@@ -28,13 +32,49 @@ _TASK_FAILURE_SIGNATURES = (
     "takes no command line arguments",
 )
 
+# Read-guard signatures: the breaker set PLUS broader runtime-execution failures (the no-progress
+# re-read spiral on 2026-06-01 was a .NET assembly exception + a jump_wmi traceback). These are scoped
+# to the get_all_task_output_by_task_id re-read clamp ONLY — never to the breaker — because the broader
+# phrases ("unexpected error", "traceback...") can appear as legitimate DATA in a successful task's
+# output; the worst case here is merely a clamped 2nd re-read of one task, not a blocked command.
+_READ_FAILURE_SIGNATURES = _TASK_FAILURE_SIGNATURES + (
+    "exception has been thrown by the target of an invocation",
+    "unexpected error",
+    "traceback (most recent call last)",
+)
+
 
 def _is_task_failure_output(output: str) -> bool:
-    """True if task output contains a known agent-side command-failure signature."""
+    """True if task output contains a known agent-side command-failure signature (breaker scope)."""
     if not output:
         return False
     low = output.lower()
     return any(sig in low for sig in _TASK_FAILURE_SIGNATURES)
+
+
+def _is_failed_read_output(output: str) -> bool:
+    """True if task output looks like a (re-read) failure — broader than the breaker scope. Used only
+    by the get_all_task_output_by_task_id no-progress clamp."""
+    if not output:
+        return False
+    low = output.lower()
+    return any(sig in low for sig in _READ_FAILURE_SIGNATURES)
+
+
+# HITL: single source of truth for which MythicTools methods are state-changing/offensive and
+# therefore gated in supervised mode. Read-only get_*/list_*/download_file/ensure_tool_uploaded and
+# the routing/transfer/respond tools are intentionally absent (free). model.py imports this set to
+# build the HumanInTheLoopMiddleware interrupt_on map. Note: file_upload is a BloodHound MCP tool
+# (not a MythicTools method) — included by name so supervised mode also gates it if/when connected.
+GUARDED_TOOLS: set[str] = {
+    "issue_task_and_waitfor_task_output",
+    "upload_file_by_file_uuid",
+    "create_payload",
+    "download_tool",
+    "stage_file_to_disk",
+    "sandbox_exec",
+    "file_upload",
+}
 
 
 class MythicTools:
@@ -67,6 +107,13 @@ class MythicTools:
         # parameter permutations — the cause of the 2.47M-token context explosion on
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
+        # No-progress guard: count how many times each task_id has been fetched and come back FAILED
+        # this session. On the 2nd+ failed re-read we return a short escalation directive instead of the
+        # full (unchanged) failed output — the 2026-06-01 e45ae3d3 recursion death was the agent
+        # re-reading a statically-failed task (Rubeus dcsync / jump_wmi) 3x at ~240K tokens/call until
+        # the 75-step budget was exhausted. First failed fetch returns the full output so the agent sees
+        # the error once. This is independent of the issue_task circuit breaker (do not touch that).
+        self._failed_read_counts: dict[int, int] = {}
 
     async def login(self):
         """Create the Mythic API client connection asynchronously."""
@@ -132,6 +179,7 @@ class MythicTools:
         Returns:
             str: JSON string containing the agent's detailed information.
         """
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_all_active_callbacks tool")
@@ -140,6 +188,7 @@ class MythicTools:
 
     async def get_all_payload_info(self) -> str:
         """ Get information about ALL payload types in Mythic. """
+        # HITL: free
         query = """
             query PayloadInfo {
                 payloadtype(where: { name: { _neq: "sage" } }) {
@@ -168,6 +217,7 @@ class MythicTools:
         
     async def get_payload_names(self) -> List[str]:
         """Get a list of all payload type names."""
+        # HITL: free
         query = """
             query SagePayloadNames {
                 payloadtype(where: { name: { _neq: "sage" } }) {
@@ -184,6 +234,7 @@ class MythicTools:
 
     async def get_c2_profile_names(self) -> List[dict[str, str]]:
         """Get a list of all C2 profile names."""
+        # HITL: free
         query = """
             query C2ProfileNames {
                 c2profile {
@@ -206,6 +257,7 @@ class MythicTools:
         Returns:
             str: JSON string containing C2 profile information for the specified payload type.
         """
+        # HITL: free
 
         query = """
             query PayloadC2Profiles {
@@ -249,6 +301,7 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
+        # HITL: free
         query = """
             query SageCommandNames {
                 command(where: {payloadtype: {name: {_eq: "PLACEHOLDER"}}}) {
@@ -285,6 +338,7 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
+        # HITL: free
         query = """
             query SageCommandArgs {
                 command(where: {cmd: {_eq: "COMMAND"}, payloadtype: {name: {_eq: "PAYLOAD"}}}) {
@@ -325,6 +379,7 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
+        # HITL: free
         attr = """
         cmd
         commandparameters {
@@ -382,6 +437,7 @@ class MythicTools:
         Returns:
             str: JSON string containing the created payload information.
         """
+        # HITL: guarded
         # uuid is the Payload UUID not to be confused with the Mythic file UUID
         custom_attributes = """
         build_phase
@@ -438,6 +494,7 @@ class MythicTools:
         Returns:
             str: Command output (binary output coerced to string).
         """
+        # HITL: guarded
         if timeout is None:
             timeout = 300  # Default timeout of 5 minutes
 
@@ -507,6 +564,7 @@ class MythicTools:
         Returns:
             str: JSON string containing the task history for the specified agent.
         """
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
@@ -525,6 +583,7 @@ class MythicTools:
         Returns:
             str: JSON string containing all output for the specified task ID, with response_text decoded from base64.
         """
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {task_id}")
@@ -546,7 +605,24 @@ class MythicTools:
                         logger.debug(f"Failed to decode base64 response_text for task output {item.get('id', 'unknown')}: {e}")
                         pass
 
-        return json.dumps(resp, sort_keys=True)
+        result = json.dumps(resp, sort_keys=True)
+        # No-progress guard (see __init__): clamp repeated re-reads of a statically-FAILED task.
+        # Uses the BROADER read-scope check (not the breaker's) — see _READ_FAILURE_SIGNATURES.
+        if _is_failed_read_output(result):
+            count = self._failed_read_counts.get(task_id, 0) + 1
+            self._failed_read_counts[task_id] = count
+            if count >= 2:
+                return (
+                    f"STOP RE-READING — task {task_id} FAILED and its output is unchanged from your "
+                    f"earlier fetch this session (re-read {count}x). The command did not succeed; re-reading "
+                    f"it just refills context and wastes a step. Either try a DIFFERENT command/technique, or "
+                    f"report this failure to the operator. Do not re-fetch this task again."
+                )
+        else:
+            # A later SUCCESSful fetch of the same task_id clears the failed-read counter so a genuinely
+            # changed/succeeded task is never clamped.
+            self._failed_read_counts.pop(task_id, None)
+        return result
     
     async def get_all_uploaded_files(self) -> str:
         """
@@ -555,6 +631,7 @@ class MythicTools:
         Excludes files downloaded by Mythic agents, screenshots, and Mythic payload files.
         Call the download_file() method to download a specific file by its Mythic file UUID.
         """
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_all_uploaded_files tool")
@@ -620,6 +697,7 @@ class MythicTools:
             timeout: Optional timeout for the upload operation.
         Returns:
             str: Command output (binary output coerced to string) after the upload operation."""
+        # HITL: guarded
         
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
@@ -656,7 +734,6 @@ class MythicTools:
         return resp
 
     async def download_file(self, file_uuid: Annotated[str, "The Mythic file UUID of the file to download from Mythic"]) -> str:
-        # Not sure what I'm going to use this for because I don't want to send the file data back to the LLM
         """Download a file from Mythic by its Mythic file UUID.
 
         This tool downloads a file stored in Mythic, identified by its Mythic file UUID. 
@@ -667,6 +744,8 @@ class MythicTools:
         Returns:
             str: Base64-encoded string of the downloaded file content.
         """
+        # HITL: free
+        # Not sure what I'm going to use this for because I don't want to send the file data back to the LLM
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling download_file tool for file UUID: {file_uuid}")
@@ -712,6 +791,7 @@ class MythicTools:
         Returns:
             str: JSON with status, the absolute local path, and byte count.
         """
+        # HITL: guarded
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling stage_file_to_disk for file UUID: {file_uuid}")
@@ -735,6 +815,7 @@ class MythicTools:
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_operations tool")
@@ -787,6 +868,7 @@ class MythicTools:
             str: JSON with matched slug, frontmatter, guidance prose, execution_on_agent, and
                  whether a Full Reference is available.
         """
+        # HITL: free
         logger.debug(f"🛠️ Calling get_ttp_guidance tool (goal={goal!r}, callback={callback_display_id})")
         matches = ttp_library.match_goal(goal)
         if not matches:
@@ -861,6 +943,7 @@ class MythicTools:
         Returns:
             str: JSON with the full reference text, or a not_found / no_full_reference status.
         """
+        # HITL: free
         logger.debug(f"🛠️ Calling get_ttp_full_reference tool (slug={slug!r})")
         frontmatter, body = ttp_library.load_ttp(slug)
         if body is None:
@@ -884,6 +967,7 @@ class MythicTools:
         Returns:
             str: JSON mapping each category to a list of {slug, name}, or an empty status.
         """
+        # HITL: free
         logger.debug("🛠️ Calling list_ttp_categories tool")
         categories = ttp_library.list_categories()
         if not categories:
@@ -909,6 +993,7 @@ class MythicTools:
         Returns:
             str: JSON with status and, when available, the Mythic file UUID.
         """
+        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ensure_tool_uploaded tool (binary={binary_filename!r})")
@@ -960,6 +1045,7 @@ class MythicTools:
         Returns:
             str: JSON with a "status" key describing the outcome.
         """
+        # HITL: guarded
         import hashlib, io, zipfile
         logger.debug(f"🛠️ Calling download_tool tool (binary={binary_filename!r})")
         # 1. Find the TTP carrying this binary_filename. Multiple TTPs may share the same

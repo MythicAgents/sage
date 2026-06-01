@@ -14,7 +14,43 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sage
-from ai.langgraph.model import Model  # noqa: E402
+from ai.langgraph.model import Model, _StopCheckMiddleware, _OperatorStopRequested  # noqa: E402
+import pytest  # noqa: E402
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+class _Mdl:
+    def __init__(self, stop):
+        self._stop_requested = stop
+
+
+def test_stopcheck_before_model_raises_when_stop_requested():
+    mw = _StopCheckMiddleware(_Mdl(True))
+    with pytest.raises(_OperatorStopRequested):
+        mw.before_model({}, None)
+
+
+def test_stopcheck_before_model_passes_when_not_stopped():
+    mw = _StopCheckMiddleware(_Mdl(False))
+    assert mw.before_model({}, None) is None
+
+
+def test_stopcheck_tool_call_raises_when_stop_requested():
+    mw = _StopCheckMiddleware(_Mdl(True))
+    async def _handler(req):
+        return "ran"
+    with pytest.raises(_OperatorStopRequested):
+        _run(mw.awrap_tool_call("req", _handler))
+
+
+def test_stopcheck_tool_call_runs_when_not_stopped():
+    mw = _StopCheckMiddleware(_Mdl(False))
+    async def _handler(req):
+        return "ran"
+    assert _run(mw.awrap_tool_call("req", _handler)) == "ran"
 
 
 def _bare_model() -> Model:
