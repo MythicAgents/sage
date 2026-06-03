@@ -1311,7 +1311,6 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            system_prompt=prompt,
             middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "generalist_messages", name)
@@ -1362,7 +1361,6 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            system_prompt=prompt,
             middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mythic_operator_messages", name)
@@ -1399,7 +1397,6 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            system_prompt=prompt,
             middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
@@ -1445,7 +1442,6 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            system_prompt=prompt,
             middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "mcp_manager_messages", name)
@@ -1497,6 +1493,12 @@ class Model:
         llm = self._get_base_chat_model()
         if not llm:
             raise ValueError("Failed to initialize the BaseChatModel for Mythic Operator Agent.")
+        # NOTE: unlike the worker agents, the Supervisor's channel is pre-seeded with
+        # self.system_message (the overarching "You are Sage" prompt) at build time, so the
+        # `if not self.state["supervisor_messages"]` guard above is False and supervisor.md is
+        # NEVER appended to the channel. supervisor.md therefore MUST come from create_agent's
+        # system_prompt — removing it (as for the workers) drops the Supervisor's routing prompt
+        # entirely and it loops. This is NOT a duplicate: the channel has only self.system_message.
         agent = create_agent(
             model=llm,
             tools=tools,
