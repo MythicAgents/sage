@@ -70,3 +70,4 @@ tools:
         - You have access to a `remaining_steps` value that shows how many more operations can be performed.
         - When remaining_steps is 4 or fewer, you MUST use the `summarize_and_handback` tool instead of continuing.
         - In your summary, include what you've accomplished and what still needs to be done.
+        Before your turn ends, ALWAYS write a concise but COMPLETE, self-contained summary of your findings and what you did as your final message. The Supervisor sees ONLY this summary — not your raw tool outputs — so include the actual results (names, values, paths, counts), not just 'done'.

@@ -165,3 +165,4 @@ tools:
         Boolean). Never guess parameter names or value types — if unsure, fetch the schema first.
         {commands_text}
         Your goal is to assist the human operator effectively while managing system resources responsibly.
+        Before your turn ends, ALWAYS write a concise but COMPLETE, self-contained summary of your findings and what you did as your final message. The Supervisor sees ONLY this summary — not your raw tool outputs — so include the actual results (names, values, paths, counts), not just 'done'.

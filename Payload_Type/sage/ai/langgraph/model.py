@@ -739,13 +739,19 @@ class Model:
                     formatted = self._format_message_for_streaming(msg, agent_name=node_name)
                     if formatted:
                         await self._stream_message_to_mythic(formatted)
-                # Supervisor AIMessages (from respond_to_user tool) are intentionally NOT streamed.
-                # The Supervisor is an internal orchestration component — the user interacts with
-                # specialist agents (Generalist, Mythic_Operator, etc.) whose responses are already
-                # streamed in real-time. The respond_to_user tool still functions for graph control
-                # flow (goto="__end__") but its content is suppressed from user-facing output.
+                # Supervisor AIMessages are normally internal routing/orchestration messages and
+                # are suppressed. The respond_to_user tool tags its final report so this path can
+                # stream exactly one closing executive summary after the specialist live stream.
                 elif isinstance(msg, AIMessage) and getattr(msg, 'name', None) == "Supervisor":
-                    logger.debug(f"📨 [Stream] Suppressing Supervisor respond_to_user message from user output")
+                    if msg.additional_kwargs.get("_is_final_report"):
+                        # Keep the agent prefix first (nothing before it); the "Final Report" header
+                        # goes AFTER the prefix: 🤖[Supervisor]> 📊 **Final Report**\n<content>
+                        report_msg = msg.model_copy(update={"content": f"📊 **Final Report**\n{msg.content}"})
+                        formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
+                        if formatted:
+                            await self._stream_message_to_mythic(f"\n\n{formatted}")
+                    else:
+                        logger.debug(f"📨 [Stream] Suppressing Supervisor respond_to_user message from user output")
 
     async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
         """
@@ -1214,9 +1220,65 @@ class Model:
                         )
                         _tag_msg(response_header, self._next_seq())
 
+                        def _message_text_content(msg: BaseMessage) -> str:
+                            if isinstance(msg.content, str):
+                                return msg.content
+                            if isinstance(msg.content, list):
+                                return "\n".join(
+                                    item.get("text", "")
+                                    for item in msg.content
+                                    if isinstance(item, dict)
+                                    and item.get("type") == "text"
+                                    and item.get("text", "").strip()
+                                )
+                            return ""
+
+                        worker_text_parts = []
+                        for msg in substantive_messages:
+                            if isinstance(msg, AIMessage):
+                                msg_text = _message_text_content(msg).strip()
+                                if msg_text:
+                                    worker_text_parts.append(msg_text)
+                        summary_text = "\n\n".join(worker_text_parts).strip()
+
+                        tool_contents = [
+                            msg.content
+                            for msg in new_messages_from_agent
+                            if isinstance(msg, ToolMessage)
+                            and isinstance(msg.content, str)
+                            and (not msg.name or not msg.name.startswith("transfer_to_"))
+                        ]
+                        joined_tool_contents = "\n\n".join(tool_contents)
+
+                        if not summary_text and self.llm is not None:
+                            truncated_tool_contents = joined_tool_contents[:12000]
+                            synthesis_prompt = (
+                                "You are condensing a sub-agent's work for the orchestrator. From the tool results below, "
+                                "write a concise, SELF-CONTAINED summary of the concrete findings (include actual "
+                                "names/values/results, not just 'done'). 5-10 sentences. Tool results:\n"
+                                f"{truncated_tool_contents}"
+                            )
+                            try:
+                                resp = await self.llm.ainvoke(synthesis_prompt)
+                                resp_content = resp.content if hasattr(resp, 'content') else str(resp)
+                                summary_text = (resp_content or "").strip()
+                            except Exception as e:
+                                logger.debug(f"⚠️  Summary synthesis failed for {node_name}: {e}")
+                                summary_text = ""
+
+                        if not summary_text:
+                            preview = joined_tool_contents[:1500].strip()
+                            if preview:
+                                summary_text = f"[summary synthesis unavailable — raw tool output preview]\n{preview}"
+                            else:
+                                summary_text = "[summary synthesis unavailable — raw tool output preview]\n[no tool output captured]"
+
+                        summary_ai_msg = AIMessage(content=summary_text, name=node_name)
+                        _tag_msg(summary_ai_msg, self._next_seq())
+
                         # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
-                        update["supervisor_messages"] = [response_header] + capped_messages
-                        logger.info(f"✅ Copied {len(substantive_messages)} substantive messages from {node_name} to Supervisor channel")
+                        update["supervisor_messages"] = [response_header, summary_ai_msg]
+                        logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(summary_text)} chars)")
 
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
                         calling_agent = state.get("_last_calling_agent")
@@ -2837,19 +2899,22 @@ def _create_summarize_handback_tool():
 def _create_respond_to_user_tool():
     """
     Create a tool that allows the Supervisor to explicitly indicate it's done
-    delegating and wants to respond directly to the user with final results.
+    delegating and wants to deliver the user-facing final report: a complete,
+    well-formatted markdown synthesis of concrete specialist findings (names,
+    values, IPs, paths, counts), not raw JSON and not a thin acknowledgment.
     """
     @tool("respond_to_user")
     def respond_to_user(
         runtime: ToolRuntime,
-        final_response: Annotated[str, "The final synthesized response to provide to the user"],
+        final_response: Annotated[str, "The complete, user-facing final report: a well-formatted markdown synthesis of the concrete findings discovered by the specialists (names, values, IPs, paths, counts), formatted for a human operator, not raw JSON, not a thin \"task complete\"."],
     ) -> Command:
-        """Call this when the task is complete and you want to respond to the user with final results. DO NOT delegate again after calling this."""
+        """Call this when the task is complete and you want to deliver the user-facing final synthesized report. The final_response must be complete, well-formatted markdown containing the concrete findings from specialists (names, values, IPs, paths, counts), not raw JSON and not a thin acknowledgment. DO NOT delegate again after calling this."""
 
         # Create a final AI message with the response
         response_message = AIMessage(
             content=final_response,
-            name="Supervisor"
+            name="Supervisor",
+            additional_kwargs={"_is_final_report": True},
         )
 
         update_state = {**runtime.state}
