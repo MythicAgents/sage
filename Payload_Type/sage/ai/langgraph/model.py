@@ -41,6 +41,24 @@ from langchain.tools import ToolRuntime
 from langgraph.errors import GraphRecursionError
 import operator
 
+SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
+
+def _cap_message_for_copy(msg, cap=SUPERVISOR_COPY_TOOL_RESULT_CAP):
+    """Return a copied ToolMessage with oversized string content capped for cross-agent channel copies.
+
+    Non-ToolMessage messages, non-string ToolMessage content, and ToolMessages at
+    or below the cap are returned unchanged with the same object identity.
+    """
+    if not isinstance(msg, ToolMessage) or not isinstance(msg.content, str) or len(msg.content) <= cap:
+        return msg
+
+    original_len = len(msg.content)
+    preview = (
+        msg.content[:cap]
+        + f"\n…[truncated {original_len - cap} of {original_len} chars — full result retained in the executing agent's channel]"
+    )
+    return msg.model_copy(update={"content": preview})
+
 def _fix_payload_empty_content(payload: dict) -> dict:
     """Fix OpenAI-format payload dicts to prevent Bedrock blank text field errors.
 
@@ -1186,6 +1204,7 @@ class Model:
                                 substantive_messages.append(msg)
 
                     if substantive_messages:
+                        capped_messages = [_cap_message_for_copy(m) for m in substantive_messages]
                         # Create a header message to show which agent responded
                         # Mark with _is_completion_header for semantic filtering (vs string matching)
                         response_header = AIMessage(
@@ -1196,7 +1215,7 @@ class Model:
                         _tag_msg(response_header, self._next_seq())
 
                         # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
-                        update["supervisor_messages"] = [response_header] + substantive_messages
+                        update["supervisor_messages"] = [response_header] + capped_messages
                         logger.info(f"✅ Copied {len(substantive_messages)} substantive messages from {node_name} to Supervisor channel")
 
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
@@ -1211,7 +1230,7 @@ class Model:
                             calling_agent_channel_key = channel_map.get(calling_agent)
                             if calling_agent_channel_key:
                                 # With operator.add, only provide the new messages to append
-                                update[calling_agent_channel_key] = [response_header] + substantive_messages
+                                update[calling_agent_channel_key] = [response_header] + capped_messages
                                 logger.info(f"✅ Copied {len(substantive_messages)} substantive messages from {node_name} to {calling_agent} channel (worker-to-worker handoff)")
 
                         force_flush_all_handlers()
