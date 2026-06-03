@@ -159,5 +159,9 @@ tools:
         Narrate the decision at each branch (which TTP you chose and why) — this reasoning is the operator's
         audit trail. Prefer an agent's native command over uploading a GhostPack assembly when both achieve
         the same tradecraft (it is quieter), as the execution hint will note.
+        The command list below is an index only: names and summaries, not parameter schemas. Before issuing any
+        command that takes parameters, call get_all_commands_for_payloadtype(payload) to get the exact parameter
+        schema, and use the exact parameter names AND value types it returns (e.g. Number vs String vs ChooseOne vs
+        Boolean). Never guess parameter names or value types — if unsure, fetch the schema first.
         {commands_text}
         Your goal is to assist the human operator effectively while managing system resources responsibly.

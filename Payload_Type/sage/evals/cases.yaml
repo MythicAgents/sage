@@ -1,5 +1,5 @@
 sage_cb: 15
-apollo_cb: 18
+apollo_cb: 20
 default_timeout: 240
 forbid:
   - traceback
@@ -16,19 +16,19 @@ cases:
       - CASTELBLACK
   - id: whoami_cb17
     category: apollo-recon
-    prompt: "On callback 18, what is the current user context and domain?"
+    prompt: "On callback 20, what is the current user context and domain?"
     expect_all:
       - samwell.tarly
       - NORTH
   - id: domain_controllers
     category: apollo-recon
-    prompt: "On callback 18, list the domain controllers for the NORTH domain."
+    prompt: "On callback 20, list the domain controllers for the NORTH domain."
     expect_any:
       - WINTERFELL
       - winterfell
   - id: domain_users
     category: apollo-recon
-    prompt: "On callback 18, enumerate domain user accounts in the NORTH domain."
+    prompt: "On callback 20, enumerate domain user accounts in the NORTH domain."
     expect_any:
       - jon.snow
       - robb.stark
@@ -36,7 +36,7 @@ cases:
       - eddard
   - id: shares
     category: apollo-recon
-    prompt: "On callback 18, enumerate accessible network shares."
+    prompt: "On callback 20, enumerate accessible network shares."
     expect_any:
       - SYSVOL
       - NETLOGON

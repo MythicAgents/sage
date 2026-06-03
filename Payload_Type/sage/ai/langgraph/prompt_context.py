@@ -16,8 +16,6 @@ needs a deliberate security model + context contract — see Plans/PROMPT_FORMAT
 Phase-3 ISA. For now the provider set is fixed and code-reviewed.
 """
 
-import json
-
 try:  # match model.py's logger so warnings surface in Sage logs
     from mythic_container.logging import logger
 except Exception:  # pragma: no cover - fallback for standalone/unit-test contexts
@@ -27,14 +25,59 @@ except Exception:  # pragma: no cover - fallback for standalone/unit-test contex
 from ai.mcp import MCPManager
 
 
+def _one_line_description(description) -> str:
+    if description is None:
+        return ""
+    text = " ".join(str(description).replace("\r", " ").replace("\n", " ").split())
+    if len(text) > 80:
+        text = text[:77].rstrip() + "..."
+    return text
+
+
+def _command_index_line(entry, description=None) -> str:
+    command = None
+    if isinstance(entry, dict):
+        command = entry.get("cmd") or entry.get("command") or entry.get("name")
+        description = entry.get("description", description)
+    else:
+        command = entry
+
+    if command is None:
+        command = entry
+
+    command_text = str(command)
+    description_text = _one_line_description(description)
+    if description_text:
+        return f"- {command_text}: {description_text}"
+    return f"- {command_text}"
+
+
+def _command_entries(commands):
+    if isinstance(commands, dict):
+        for key in ("commands", "command"):
+            value = commands.get(key)
+            if isinstance(value, list):
+                return [(entry, None) for entry in value]
+        return [
+            (name, detail.get("description", "") if isinstance(detail, dict) else "")
+            for name, detail in commands.items()
+        ]
+    if isinstance(commands, list):
+        return [(entry, None) for entry in commands]
+    return [(commands, None)]
+
+
 def commands_text(model) -> str:
-    """``{commands_text}`` (Mythic_Operator): available Mythic commands per pre-loaded payload, as JSON."""
+    """``{commands_text}`` (Mythic_Operator): compact command index per pre-loaded payload."""
     text = ""
     if model._cached_commands:
         for payload_name, commands in model._cached_commands.items():
-            commands_json = json.dumps(commands, indent=2) if isinstance(commands, (dict, list)) else str(commands)
-            text += f"\n### Available Commands for '{payload_name}' Payload:\n{commands_json}\n"
-        text += "\n**Note:** Use the get_all_commands_for_payloadtype tool if you need commands for other payload types or want to refresh this data.\n"
+            lines = []
+            for entry, description in _command_entries(commands):
+                lines.append(_command_index_line(entry, description))
+            commands_index = "\n".join(lines)
+            text += f"\n### Available Commands for '{payload_name}' Payload (index — names + summaries):\n{commands_index}\n"
+        text += "\n**Note:** This is an index only. Before issuing any command that takes parameters, call get_all_commands_for_payloadtype('<payload>') to retrieve the exact parameter schema. Use it also for payloads not listed here.\n"
     return text
 
 

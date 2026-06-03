@@ -50,38 +50,45 @@ class FakeModel:
 # --------------------------------------------------------------------------- #
 
 NOTE_TAIL = (
-    "\n**Note:** Use the get_all_commands_for_payloadtype tool if you need "
-    "commands for other payload types or want to refresh this data.\n"
+    "\n**Note:** This is an index only. Before issuing any command that takes "
+    "parameters, call get_all_commands_for_payloadtype('<payload>') to retrieve "
+    "the exact parameter schema. Use it also for payloads not listed here.\n"
 )
 
 
 def test_commands_text_populated_dict_and_list_shapes():
-    """dict-shaped and list-shaped commands both json.dumps(indent=2); Note tail appended."""
+    """dict-shaped and list-shaped commands both render as a compact one-line index; Note tail appended."""
     cached = {
-        "apollo": {"shell": {"description": "run a shell command"}},  # dict shape
-        "poseidon": ["ls", "cat", "whoami"],                          # list shape
+        "apollo": {"shell": {"description": "run a shell command"}},  # dict: name -> detail
+        "poseidon": ["ls", "cat", "whoami"],                          # list of names
     }
     model = FakeModel(cached_commands=cached)
 
-    expected = ""
-    for payload_name, commands in cached.items():
-        commands_json = json.dumps(commands, indent=2)  # both are dict/list
-        expected += f"\n### Available Commands for '{payload_name}' Payload:\n{commands_json}\n"
-    expected += NOTE_TAIL
+    expected = (
+        "\n### Available Commands for 'apollo' Payload (index — names + summaries):\n"
+        "- shell: run a shell command\n"
+        "\n### Available Commands for 'poseidon' Payload (index — names + summaries):\n"
+        "- ls\n- cat\n- whoami\n"
+        + NOTE_TAIL
+    )
 
     result = prompt_context.commands_text(model)
     assert result == expected
-    # Sanity: the JSON really was indent=2 (multi-line), not a compact dump.
-    assert '\n  "shell"' in result
+    # Sanity: it is a compact index, NOT an indented JSON dump.
+    assert '\n  "shell"' not in result
+    assert "- shell: run a shell command" in result
     assert result.endswith(NOTE_TAIL)
 
 
 def test_commands_text_non_dict_or_list_uses_str_fallback():
-    """A scalar command value falls back to str(commands), not json.dumps."""
-    cached = {"raw": 12345}  # not a dict/list -> str()
+    """A scalar command value falls back to its string form as the command name in the index."""
+    cached = {"raw": 12345}  # not a dict/list -> scalar treated as the command name
     model = FakeModel(cached_commands=cached)
 
-    expected = "\n### Available Commands for 'raw' Payload:\n12345\n" + NOTE_TAIL
+    expected = (
+        "\n### Available Commands for 'raw' Payload (index — names + summaries):\n"
+        "- 12345\n" + NOTE_TAIL
+    )
     assert prompt_context.commands_text(model) == expected
 
 
