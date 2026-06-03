@@ -36,16 +36,6 @@ class QueryArguments(TaskArguments):
             description="The prompt to send to the model for inference",
             parameter_group_info=[ParameterGroupInfo(required=True, ui_position=0)]
         )
-        # Tools
-        tools = CommandParameter(
-            name="tools",
-            display_name="Tools",
-            cli_name="tools",
-            type=ParameterType.Boolean,
-            default_value=True,
-            description="Use tools to enhance the model's capabilities",
-            parameter_group_info=[ParameterGroupInfo(required=False,ui_position=1)]
-        )
         # Verbose
         verbose = CommandParameter(
             name="verbose",
@@ -112,7 +102,7 @@ class QueryArguments(TaskArguments):
         )
 
         # Add all the parameters
-        self.args = [provider, model, prompt, tools, verbose, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region]
+        self.args = [provider, model, prompt, verbose, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region]
 
     async def parse_arguments(self):
         if len(self.command_line) == 0:
@@ -164,7 +154,6 @@ class QueryCommand(CommandBase):
             response.Error = "the 'prompt' argument must be provided and must not be blank"
             return response
         
-        tools = taskData.args.get_arg("tools")
         verbose = taskData.args.get_arg("verbose")
 
         # These can be None as they are optional

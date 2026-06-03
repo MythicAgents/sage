@@ -54,7 +54,7 @@ FIXTURES = {
 # Expected frontmatter `name` and `tools` length per agent.
 EXPECTED_META = {
     "generalist": ("Generalist", 0),
-    "mythic_operator": ("Mythic_Operator", 15),
+    "mythic_operator": ("Mythic_Operator", 16),
     "mythic_payload": ("Mythic_Payload", 5),
     "mcp_manager": ("MCP_Manager", 5),
     "supervisor": ("Supervisor", 6),
@@ -206,7 +206,7 @@ def test_missing_key_placeholder_falls_back_to_raw_body(tmp_path, monkeypatch, c
 # ---------------------------------------------------------------------------
 def test_filter_keeps_frontmatter_set_drops_others_and_preserves_order():
     fm_tools = prompt_loader.get_prompt_tools("mythic_operator")
-    assert len(fm_tools) == 15
+    assert len(fm_tools) == 16
 
     # Build candidates: every frontmatter tool, reordered, plus one interloper not in
     # frontmatter ("rogue_tool"). Reversing proves order follows CANDIDATES, not frontmatter.
@@ -221,7 +221,7 @@ def test_filter_keeps_frontmatter_set_drops_others_and_preserves_order():
     assert "rogue_tool_not_in_frontmatter" not in kept_names
     # Kept exactly the frontmatter set (as a set).
     assert set(kept_names) == set(fm_tools)
-    assert len(kept_names) == 15
+    assert len(kept_names) == 16
     # Order is the CANDIDATE order (reversed frontmatter, with rogue removed) — not
     # the frontmatter order.
     assert kept_names == list(reversed(fm_tools))

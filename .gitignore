@@ -26,3 +26,4 @@ Payload_Type/sage/tools/*
 # SSL certificate bundles - exclude from version control
 Payload_Type/sage/certs/*.pem
 Payload_Type/sage/sage.log
+Payload_Type/sage/evals/results/

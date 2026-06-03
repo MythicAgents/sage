@@ -1312,6 +1312,7 @@ class Model:
                 "get_all_commands_for_payloadtype",
                 "issue_task_and_waitfor_task_output",
                 "get_task_history_for_callback",
+                "check_callback_alive",
                 "get_all_task_output_by_task_id",
                 "upload_file_by_file_uuid",
                 "get_all_uploaded_files",

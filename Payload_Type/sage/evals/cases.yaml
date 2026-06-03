@@ -1,0 +1,85 @@
+sage_cb: 15
+apollo_cb: 18
+default_timeout: 240
+forbid:
+  - traceback
+  - failed to create task
+  - recursion limit
+  - i cannot
+  - i'm sorry, but
+cases:
+  - id: list_callbacks
+    category: sage
+    prompt: "List all active callbacks, including host, user, and integrity level for each."
+    expect_all:
+      - samwell.tarly
+      - CASTELBLACK
+  - id: whoami_cb17
+    category: apollo-recon
+    prompt: "On callback 18, what is the current user context and domain?"
+    expect_all:
+      - samwell.tarly
+      - NORTH
+  - id: domain_controllers
+    category: apollo-recon
+    prompt: "On callback 18, list the domain controllers for the NORTH domain."
+    expect_any:
+      - WINTERFELL
+      - winterfell
+  - id: domain_users
+    category: apollo-recon
+    prompt: "On callback 18, enumerate domain user accounts in the NORTH domain."
+    expect_any:
+      - jon.snow
+      - robb.stark
+      - samwell
+      - eddard
+  - id: shares
+    category: apollo-recon
+    prompt: "On callback 18, enumerate accessible network shares."
+    expect_any:
+      - SYSVOL
+      - NETLOGON
+      - C$
+      - ADMIN$
+  - id: bh_domains
+    category: bloodhound
+    prompt: "Using BloodHound, list all the domains it currently knows about."
+    expect_any:
+      - NORTH
+      - SEVENKINGDOMS
+      - ESSOS
+      - .local
+  - id: shortest_path_da
+    category: bloodhound
+    prompt: "Using BloodHound, query the attack graph for the shortest path from samwell.tarly to the Domain Admins group in NORTH and REPORT the path (edges/nodes). Do NOT execute or run any tasks on any callback — this is a read-only graph query."
+    expect_any:
+      - GenericWrite
+      - GPO
+      - STARKWALLPAPER
+      - Domain Admins
+  - id: gpo_abuse
+    category: bloodhound
+    prompt: "Using BloodHound, query the graph for which GPO samwell.tarly has GenericWrite (or other abusable control) over, and REPORT it. Do NOT execute anything — read-only graph query only."
+    expect_any:
+      - STARKWALLPAPER
+      - GPO
+      - GenericWrite
+  - id: kerberoastable
+    category: bloodhound
+    prompt: "Using BloodHound, list kerberoastable accounts (users with a Service Principal Name) in the domain."
+    expect_any:
+      - SPN
+      - kerberoast
+      - ServicePrincipalName
+      - "@"
+  - id: adcs_templates
+    category: bloodhound
+    prompt: "Using BloodHound, query for vulnerable AD CS certificate templates (ESC1-ESC8) and REPORT any findings. Do NOT execute or run tasks — read-only graph query only."
+    expect_any:
+      - ESC
+      - template
+      - ADCS
+      - certificate
+      - CA
+

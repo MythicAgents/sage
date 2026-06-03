@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import asyncio
 import base64
+from datetime import datetime, timezone
+import re
 from typing import Annotated, List, Dict, TypedDict
 from mythic import mythic, mythic_classes
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
@@ -42,6 +44,319 @@ _READ_FAILURE_SIGNATURES = _TASK_FAILURE_SIGNATURES + (
     "unexpected error",
     "traceback (most recent call last)",
 )
+
+
+_CALLBACK_LIVENESS_QUERY = """
+    query cbinfo($ids:[Int!]) {
+      callback(where: {display_id: {_in: $ids}}) {
+        display_id active last_checkin
+        c2profileparametersinstances(where: {c2profileparameter: {name: {_in: ["callback_interval","callback_jitter"]}}}) { value c2profileparameter { name } }
+        tasks(order_by: {id: desc}, limit: 40) { command_name original_params status completed timestamp status_timestamp_processed }
+      }
+    }
+"""
+
+
+def _parse_mythic_datetime(value: str | None) -> datetime | None:
+    """Parse Mythic's UTC-ish ISO timestamps without raising."""
+
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    candidates = [raw]
+    if raw.endswith("Z"):
+        candidates.append(raw[:-1] + "+00:00")
+    if "." in raw:
+        head, tail = raw.split(".", 1)
+        offset = ""
+        fraction = tail
+        for marker in ("+", "-"):
+            if marker in tail:
+                fraction, offset = tail.split(marker, 1)
+                offset = marker + offset
+                break
+        candidates.append(head + "." + fraction[:6] + offset)
+
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _parse_int(value: str | int | None) -> int | None:
+    """Parse an integer-ish value without raising."""
+
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_first_int(value: object) -> int | None:
+    """Extract the first integer token from a value without raising."""
+
+    match = re.search(r"-?\d+", str(value))
+    if match is None:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_sleep_interval(original_params: object) -> int | None:
+    """Parse a sleep interval from Mythic sleep task params without raising."""
+
+    if original_params is None:
+        return None
+    if isinstance(original_params, dict):
+        if "interval" in original_params:
+            return _extract_first_int(original_params.get("interval"))
+        return None
+
+    raw = str(original_params).strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "interval" in parsed:
+            interval = _extract_first_int(parsed.get("interval"))
+            if interval is not None:
+                return interval
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return _extract_first_int(raw)
+
+
+def _task_timestamp_sort_key(task_with_index: tuple[int, dict]) -> tuple[int, datetime, int]:
+    """Sort newest parsed task timestamps first, using original order for ties/missing timestamps."""
+
+    index, task = task_with_index
+    parsed = _parse_mythic_datetime(task.get("timestamp") if isinstance(task, dict) else None)
+    if parsed is None:
+        return (0, datetime.min.replace(tzinfo=timezone.utc), -index)
+    return (1, parsed, -index)
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    """Return a short approximate human duration for large gaps."""
+
+    if seconds is None or seconds < 3600:
+        return ""
+    total_minutes = int(seconds // 60)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f" (≈{hours}h{minutes}m)"
+
+
+def _format_seconds(value: float | int | None) -> str:
+    if value is None:
+        return "unknown"
+    if float(value).is_integer():
+        return f"{int(value)}"
+    return f"{float(value):.1f}"
+
+
+def _compute_liveness(
+    *,
+    display_id: int,
+    last_checkin: str | None,
+    callback_interval: str | int | None,
+    callback_jitter: str | int | None,
+    tasks: list[dict],
+    now: datetime | None = None,
+) -> dict:
+    """Compute callback liveness from check-in time, effective sleep, jitter, and recent tasks."""
+
+    now_utc = now or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    effective_sleep_seconds = _parse_int(callback_interval)
+    sleep_source = "c2_profile" if effective_sleep_seconds is not None else "unknown"
+    safe_tasks = [task for task in tasks if isinstance(task, dict)] if isinstance(tasks, list) else []
+    sleep_tasks = [
+        (index, task)
+        for index, task in enumerate(safe_tasks)
+        if task.get("command_name") == "sleep"
+    ]
+    for _, task in sorted(sleep_tasks, key=_task_timestamp_sort_key, reverse=True):
+        sleep_interval = _parse_sleep_interval(task.get("original_params"))
+        if sleep_interval is not None:
+            effective_sleep_seconds = sleep_interval
+            sleep_source = "sleep_task"
+            break
+
+    jitter_pct = _parse_int(callback_jitter)
+    if jitter_pct is None:
+        jitter_pct = 0
+
+    max_expected_gap = None
+    if effective_sleep_seconds is not None:
+        max_expected_gap = effective_sleep_seconds * (1 + jitter_pct / 100)
+
+    if effective_sleep_seconds == 0 or effective_sleep_seconds is None:
+        threshold_seconds = 180
+    else:
+        threshold_seconds = 5 * max_expected_gap + max(30, effective_sleep_seconds)
+
+    parsed_last_checkin = _parse_mythic_datetime(last_checkin)
+    if parsed_last_checkin is None:
+        reason = f"callback {display_id} has no usable last_checkin; liveness is uncertain"
+        return {
+            "display_id": display_id,
+            "status": "uncertain",
+            "alive": False,
+            "last_checkin": last_checkin,
+            "seconds_since_checkin": None,
+            "effective_sleep_seconds": effective_sleep_seconds,
+            "sleep_source": sleep_source,
+            "jitter_pct": jitter_pct,
+            "threshold_seconds": threshold_seconds,
+            "queued_since_checkin": 0,
+            "suspect_crash_task": None,
+            "reason": reason,
+        }
+
+    seconds_since_checkin = (now_utc - parsed_last_checkin).total_seconds()
+    queued_since_checkin = 0
+    for task in safe_tasks:
+        status = str(task.get("status") or "").lower()
+        if "submitted" not in status and "processing" not in status:
+            continue
+        task_timestamp = _parse_mythic_datetime(task.get("timestamp"))
+        if task_timestamp is not None and task_timestamp > parsed_last_checkin:
+            queued_since_checkin += 1
+
+    dead_by_gap = seconds_since_checkin > threshold_seconds
+    suspect_crash_task = None
+    if dead_by_gap and queued_since_checkin > 0:
+        candidates: list[tuple[datetime, int, dict]] = []
+        for index, task in enumerate(safe_tasks):
+            status = str(task.get("status") or "").lower()
+            executed = task.get("completed") is True or any(
+                marker in status for marker in ("success", "completed", "error")
+            )
+            if not executed:
+                continue
+            task_timestamp = _parse_mythic_datetime(task.get("timestamp"))
+            if task_timestamp is None:
+                continue
+            if task_timestamp <= parsed_last_checkin:
+                candidates.append((task_timestamp, -index, task))
+            elif (task_timestamp - parsed_last_checkin).total_seconds() <= 5:
+                candidates.append((task_timestamp, -index, task))
+        if candidates:
+            suspect_crash_task = max(candidates, key=lambda item: (item[0], item[1]))[2].get("command_name")
+
+    if not dead_by_gap:
+        status = "alive"
+    elif suspect_crash_task is not None and queued_since_checkin > 0:
+        status = "likely_crashed"
+    else:
+        status = "dead"
+
+    interval_text = "unknown" if effective_sleep_seconds is None else f"{effective_sleep_seconds}s"
+    max_gap_text = _format_seconds(max_expected_gap)
+    threshold_text = _format_seconds(threshold_seconds)
+    gap_text = _format_seconds(seconds_since_checkin)
+    reason = (
+        f"no checkin for {gap_text}s{_format_duration(seconds_since_checkin)}; "
+        f"interval {interval_text}, jitter {jitter_pct}% → dead threshold "
+        f"5×{max_gap_text}s+{_format_seconds(max(30, effective_sleep_seconds) if effective_sleep_seconds else 180)}s="
+        f"{threshold_text}s"
+    )
+    if status in ("dead", "likely_crashed"):
+        reason += f"; {queued_since_checkin} tasks queued since"
+        if suspect_crash_task is not None:
+            reason += f"; last executed before silence: {suspect_crash_task!r} — possible crash"
+    else:
+        reason += "; within threshold"
+
+    return {
+        "display_id": display_id,
+        "status": status,
+        "alive": status == "alive",
+        "last_checkin": last_checkin,
+        "seconds_since_checkin": seconds_since_checkin,
+        "effective_sleep_seconds": effective_sleep_seconds,
+        "sleep_source": sleep_source,
+        "jitter_pct": jitter_pct,
+        "threshold_seconds": threshold_seconds,
+        "queued_since_checkin": queued_since_checkin,
+        "suspect_crash_task": suspect_crash_task,
+        "reason": reason,
+    }
+
+
+async def assess_callback_liveness(client, display_id: int, *, now: datetime | None = None) -> dict:
+    """Fetch callback timing data from Mythic and compute a liveness verdict."""
+
+    logger.debug(f"🛠️ Calling assess_callback_liveness for callback_display_id: {display_id}")
+    try:
+        resp = await mythic.execute_custom_query(client, _CALLBACK_LIVENESS_QUERY, variables={"ids": [display_id]})
+        callbacks = resp.get("callback") if isinstance(resp, dict) else None
+        if not isinstance(callbacks, list) or not callbacks:
+            result = _compute_liveness(
+                display_id=display_id,
+                last_checkin=None,
+                callback_interval=None,
+                callback_jitter=None,
+                tasks=[],
+                now=now,
+            )
+            result["reason"] = f"callback {display_id} not found in Mythic"
+            return result
+
+        callback = callbacks[0] if isinstance(callbacks[0], dict) else {}
+        profile_values: dict[str, object] = {}
+        profile_instances = callback.get("c2profileparametersinstances")
+        if isinstance(profile_instances, list):
+            for instance in profile_instances:
+                if not isinstance(instance, dict):
+                    continue
+                parameter = instance.get("c2profileparameter")
+                if not isinstance(parameter, dict):
+                    continue
+                name = parameter.get("name")
+                if name in ("callback_interval", "callback_jitter"):
+                    profile_values[name] = instance.get("value")
+
+        tasks = callback.get("tasks")
+        if not isinstance(tasks, list):
+            tasks = []
+
+        return _compute_liveness(
+            display_id=display_id,
+            last_checkin=callback.get("last_checkin"),
+            callback_interval=profile_values.get("callback_interval"),
+            callback_jitter=profile_values.get("callback_jitter"),
+            tasks=tasks,
+            now=now,
+        )
+    except Exception as e:
+        result = _compute_liveness(
+            display_id=display_id,
+            last_checkin=None,
+            callback_interval=None,
+            callback_jitter=None,
+            tasks=[],
+            now=now,
+        )
+        result["reason"] = f"could not assess callback {display_id} liveness: {e}"
+        return result
 
 
 def _is_task_failure_output(output: str) -> bool:
@@ -570,6 +885,18 @@ class MythicTools:
         logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
         return json.dumps(resp, sort_keys=True)
+
+    async def check_callback_alive(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to assess for liveness"]) -> str:
+        """Determine whether a callback is alive, dead, or likely crashed, using its last check-in vs its effective sleep interval (NOT Mythic's 'active' flag, which is unreliable). Use this before re-tasking a callback that has gone silent, or after issuing a command that may have crashed the agent."""
+        # HITL: free
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling check_callback_alive tool on callback_display_id: {callback_display_id}")
+        result = await assess_callback_liveness(self.client, callback_display_id)
+        status = result.get("status", "uncertain")
+        suspect = result.get("suspect_crash_task")
+        suspect_text = f" (suspect: {suspect!r})" if suspect else ""
+        return f"callback {callback_display_id} status={status}{suspect_text} — {result.get('reason', '')}"
     
     async def get_all_task_output_by_task_id(self, task_id: Annotated[int, "The Mythic task ID to retrieve output for"]) -> str:
         """Get all output associated with a specific Mythic task ID.
