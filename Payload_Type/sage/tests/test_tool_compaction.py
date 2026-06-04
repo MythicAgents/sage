@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
@@ -13,7 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sag
 from ai.langgraph.model import (  # noqa: E402
     _COMPACTION_PROTECTED_TOOLS,
     _ToolResultCompactionMiddleware,
+    _ToolSchemaSlimMiddleware,
     _compact_tool_result_str,
+    _slim_tool_description,
     _transform_content,
 )
 
@@ -32,6 +35,34 @@ def _large_json(rows: int = 250) -> str:
         {"name": f"principal-{i}", "sid": f"S-1-5-21-{i}"}
         for i in range(rows)
     ])
+
+
+class _FakeModelRequest:
+    def __init__(self, tools):
+        self.tools = tools
+        self.override_calls = []
+
+    def override(self, **overrides):
+        self.override_calls.append(overrides)
+        clone = _FakeModelRequest(overrides.get("tools", self.tools))
+        clone.override_calls = self.override_calls
+        return clone
+
+
+def _structured_tool_with_google_docstring():
+    def sample_tool(target: str, limit: int = 5) -> str:
+        """Run a sample operation.
+
+        Args:
+            target: Target identifier.
+            limit: Maximum number of results.
+
+        Returns:
+            Operation result.
+        """
+        return target
+
+    return StructuredTool.from_function(sample_tool)
 
 
 def test_small_str_under_trigger_returned_unchanged():
@@ -220,3 +251,124 @@ def test_middleware_does_not_swallow_handler_exception():
         asyncio.run(mw.awrap_tool_call(_request("cypher_query"), async_handler))
     with pytest.raises(RuntimeError, match="boom"):
         mw.wrap_tool_call(_request("cypher_query"), sync_handler)
+
+
+def test_slim_tool_description_drops_google_args_and_returns_block():
+    desc = """Run a query.
+
+Args:
+    query: Cypher query text.
+    limit: Maximum rows.
+
+Returns:
+    Query rows.
+"""
+
+    result = _slim_tool_description(desc)
+
+    assert result == "Run a query."
+    assert "query:" not in result
+    assert "Returns:" not in result
+
+
+def test_slim_tool_description_without_section_header_is_unchanged():
+    desc = "Run a query.\n\nThis description has no duplicated parameter section."
+
+    result = _slim_tool_description(desc)
+
+    assert result == desc
+
+
+def test_slim_tool_description_only_args_block_returns_original():
+    desc = """Args:
+    query: Cypher query text.
+"""
+
+    result = _slim_tool_description(desc)
+
+    assert result == desc
+
+
+def test_slim_tool_description_preserves_notes_section():
+    desc = """Run a query.
+
+Notes:
+    This note is load-bearing.
+"""
+
+    result = _slim_tool_description(desc)
+
+    assert result == desc
+    assert "Notes:" in result
+
+
+def test_schema_slim_middleware_awrap_slims_structured_tool_without_mutating_source():
+    mw = _ToolSchemaSlimMiddleware(model=object())
+    source_tool = _structured_tool_with_google_docstring()
+    original_description = source_tool.description
+    request = _FakeModelRequest([source_tool])
+    seen = {}
+
+    async def handler(slimmed_request):
+        seen["request"] = slimmed_request
+        return slimmed_request
+
+    result = asyncio.run(mw.awrap_model_call(request, handler))
+
+    assert result is seen["request"]
+    assert result is not request
+    assert request.override_calls
+    slimmed_tool = result.tools[0]
+    assert slimmed_tool is not source_tool
+    assert slimmed_tool.description == "Run a sample operation."
+    assert "target:" not in slimmed_tool.description
+    assert source_tool.description == original_description
+    assert "Args:" in source_tool.description
+
+
+def test_schema_slim_middleware_slims_dict_tool_on_copy_without_mutating_source():
+    mw = _ToolSchemaSlimMiddleware(model=object())
+    source_tool = {
+        "type": "function",
+        "function": {
+            "name": "generic_function",
+            "description": "Run a function.\n\nArgs:\n    value: Input value.\n",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    request = _FakeModelRequest([source_tool])
+
+    def handler(slimmed_request):
+        return slimmed_request
+
+    result = mw.wrap_model_call(request, handler)
+
+    assert result is not request
+    assert result.tools[0] is not source_tool
+    assert result.tools[0]["function"]["description"] == "Run a function."
+    assert source_tool["function"]["description"] == "Run a function.\n\nArgs:\n    value: Input value.\n"
+
+
+def test_schema_slim_middleware_noop_does_not_call_override_and_returns_same_request():
+    mw = _ToolSchemaSlimMiddleware(model=object())
+    request = _FakeModelRequest([{"description": "Already slim."}])
+
+    def handler(slimmed_request):
+        return slimmed_request
+
+    result = mw.wrap_model_call(request, handler)
+
+    assert result is request
+    assert request.override_calls == []
+
+
+def test_schema_slim_middleware_handler_exception_propagates():
+    mw = _ToolSchemaSlimMiddleware(model=object())
+    source_tool = _structured_tool_with_google_docstring()
+    request = _FakeModelRequest([source_tool])
+
+    def handler(slimmed_request):
+        raise RuntimeError("handler exploded")
+
+    with pytest.raises(RuntimeError, match="handler exploded"):
+        mw.wrap_model_call(request, handler)

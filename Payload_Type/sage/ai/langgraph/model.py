@@ -1,4 +1,6 @@
+import copy
 import json
+import re
 import aiosqlite
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
@@ -59,6 +61,25 @@ def _stringify_toon_cell(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _slim_tool_description(desc: Any) -> Any:
+    try:
+        if not desc or not isinstance(desc, str):
+            return desc
+        match = re.search(
+            r"^[^\S\r\n]*(?:Args|Arguments|Returns|Return|Raises|Yields|Examples|Example|Attributes):[^\S\r\n]*$",
+            desc,
+            re.MULTILINE,
+        )
+        if not match:
+            return desc
+        slim = desc[:match.start()].rstrip()
+        if not slim:
+            return desc
+        return slim
+    except Exception:
+        return desc
 
 
 def _encode_toon_table(data: Any) -> str | None:
@@ -152,6 +173,52 @@ def _transform_content(content: Any) -> Any:
                 transformed.append(item)
         return transformed
     return content
+
+
+def _digest_cleared_tool_content(name, content) -> str:
+    try:
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            text = str(content)
+        orig_len = len(text)
+        preview = " ".join(text[:140].split())
+        return f"[cleared {name or 'tool'} result · {orig_len} chars] {preview}…"[:180]
+    except Exception:
+        return f"[cleared {name or 'tool'} result]"
+
+
+class _DigestToolUsesEdit(ClearToolUsesEdit):
+    """Like ClearToolUsesEdit but preserves a compact breadcrumb for cleared tool results."""
+
+    def apply(self, messages, *, count_tokens) -> None:
+        from langchain_core.messages import ToolMessage
+
+        originals = {}
+        for m in messages:
+            if isinstance(m, ToolMessage) and not (
+                    m.response_metadata.get("context_editing", {}).get("cleared")):
+                originals[m.tool_call_id] = (m.name, m.content)
+        super().apply(messages, count_tokens=count_tokens)
+        if not originals:
+            return
+        for i, m in enumerate(messages):
+            if (isinstance(m, ToolMessage)
+                    and m.content == self.placeholder
+                    and m.response_metadata.get("context_editing", {}).get("cleared")
+                    and m.tool_call_id in originals):
+                name, orig_content = originals[m.tool_call_id]
+                try:
+                    digest = _digest_cleared_tool_content(name, orig_content)
+                    messages[i] = m.model_copy(update={"content": digest})
+                except Exception:
+                    pass
 
 
 def _cap_message_for_copy(msg, cap=SUPERVISOR_COPY_TOOL_RESULT_CAP):
@@ -427,6 +494,69 @@ class _ToolResultCompactionMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request, handler):
         result = handler(request)  # handler exceptions propagate (not caught)
         return self._compact_result(request, result)
+
+
+class _ToolSchemaSlimMiddleware(AgentMiddleware):
+    """Trims duplicated Google-docstring sections from per-call tool schemas without
+    mutating source tools. Parameter details remain in each tool's JSON schema."""
+
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    def _slim_dict_tool(self, t):
+        function = t.get("function")
+        if isinstance(function, dict):
+            desc = function.get("description")
+            if isinstance(desc, str):
+                slim = _slim_tool_description(desc)
+                if slim != desc:
+                    new_tool = copy.deepcopy(t)
+                    new_tool["function"]["description"] = slim
+                    return new_tool
+        desc = t.get("description")
+        if isinstance(desc, str):
+            slim = _slim_tool_description(desc)
+            if slim != desc:
+                new_tool = copy.deepcopy(t)
+                new_tool["description"] = slim
+                return new_tool
+        return t
+
+    def _slim_request(self, request):
+        try:
+            tools = getattr(request, "tools", None)
+            if not tools:
+                return request
+            new_tools = []
+            changed_count = 0
+            for t in tools:
+                if isinstance(t, dict):
+                    slimmed = self._slim_dict_tool(t)
+                    new_tools.append(slimmed)
+                    if slimmed is not t:
+                        changed_count += 1
+                    continue
+                desc = getattr(t, "description", None)
+                if isinstance(desc, str):
+                    slim = _slim_tool_description(desc)
+                    if slim != desc:
+                        new_tools.append(t.model_copy(update={"description": slim}))
+                        changed_count += 1
+                        continue
+                new_tools.append(t)
+            if changed_count == 0:
+                return request
+            logger.info(f"✂️ [schema-slim] trimmed {changed_count} tool descriptions")
+            return request.override(tools=new_tools)
+        except Exception:
+            return request
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._slim_request(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._slim_request(request))
 
 
 class SageState(MessagesState):
@@ -1501,8 +1631,10 @@ class Model:
             # Cap oversized tool results BEFORE the context-editing size trigger evaluates them,
             # at the awrap_tool_call seam that provably fires (unlike the v1 tool wrapper).
             _ToolResultCompactionMiddleware(self),
+            # Trim duplicated docstring Args:/Returns: blocks from tool schemas to cut the per-call floor.
+            _ToolSchemaSlimMiddleware(self),
             ContextEditingMiddleware(
-                edits=[ClearToolUsesEdit(
+                edits=[_DigestToolUsesEdit(
                     trigger=50000,
                     # keep is a lab-tunable knob: higher = fewer re-fetches (less churn) but more
                     # retained context/call. Raised 3→5 after the 2026-06-01 trace showed the agent
