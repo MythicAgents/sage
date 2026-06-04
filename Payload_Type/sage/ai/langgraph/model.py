@@ -42,6 +42,117 @@ from langgraph.errors import GraphRecursionError
 import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
+_TOON_SENTINEL = "⟦TOON "
+_TRUNCATION_MARKER = "[truncated"
+_COMPACTION_PROTECTED_TOOLS = frozenset((
+    "summarize_and_handback", "request_continuation", "respond_to_user",
+    "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
+    "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
+))
+
+
+def _is_scalar_tool_value(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _stringify_toon_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _encode_toon_table(data: Any) -> str | None:
+    if not isinstance(data, list) or not data:
+        return None
+    if not all(isinstance(row, dict) for row in data):
+        return None
+    if not all(_is_scalar_tool_value(value) for row in data for value in row.values()):
+        return None
+
+    keys = []
+    for row in data:
+        for key in row:
+            if key not in keys:
+                keys.append(key)
+
+    rows = []
+    for row in data:
+        cells = [_stringify_toon_cell(row.get(key)) for key in keys]
+        if any("\t" in cell or "\n" in cell for cell in cells):
+            return None
+        rows.append("\t".join(cells))
+
+    key_header = "\t".join(str(key) for key in keys)
+    header = f"⟦TOON rows={len(data)} keys={key_header}⟧"
+    return "\n".join([header, *rows])
+
+
+def _cap_compacted_tool_result(chosen: str, *, ceiling: int) -> str:
+    if chosen.startswith(_TOON_SENTINEL):
+        lines = chosen.split("\n")
+        header = lines[0]
+        rows = lines[1:]
+        kept = []
+        for row in rows:
+            candidate = "\n".join([header, *kept, row])
+            if len(candidate) > ceiling:
+                break
+            kept.append(row)
+        body = "\n".join([header, *kept])
+        return (
+            body
+            + f"\n[truncated: showing {len(kept)} of {len(rows)} rows — re-query narrower for the rest]"
+        )
+
+    head = chosen[:ceiling]
+    return (
+        head
+        + f"\n[truncated: {len(head)} of {len(chosen)} chars — full result not retained; re-query narrower]"
+    )
+
+
+def _compact_tool_result_str(s: str, *, trigger: int = 4000, ceiling: int = 16000) -> str:
+    try:
+        if len(s) <= trigger:
+            return s
+        if s.startswith(_TOON_SENTINEL) or _TRUNCATION_MARKER in s:
+            return s
+
+        chosen = s
+        try:
+            data = json.loads(s)
+        except Exception:
+            data = None
+        else:
+            toon = _encode_toon_table(data)
+            if toon is not None and len(toon) < len(s):
+                chosen = toon
+            else:
+                compact_json = json.dumps(data, separators=(",", ":"), sort_keys=True)
+                chosen = compact_json if len(compact_json) < len(s) else s
+
+        if len(chosen) > ceiling:
+            return _cap_compacted_tool_result(chosen, ceiling=ceiling)
+        return chosen
+    except Exception:
+        return s
+
+
+def _transform_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return _compact_tool_result_str(content)
+    if isinstance(content, list):
+        transformed = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                new_item = dict(item)
+                new_item["text"] = _compact_tool_result_str(item["text"])
+                transformed.append(new_item)
+            else:
+                transformed.append(item)
+        return transformed
+    return content
+
 
 def _cap_message_for_copy(msg, cap=SUPERVISOR_COPY_TOOL_RESULT_CAP):
     """Return a copied ToolMessage with oversized string content capped for cross-agent channel copies.
@@ -252,6 +363,70 @@ class _StopCheckMiddleware(AgentMiddleware):
         if getattr(self._model, "_stop_requested", False):
             raise _OperatorStopRequested()
         return handler(request)
+
+
+def _tool_name_from_request(request: Any) -> str:
+    """Extract the tool name from a langgraph ToolCallRequest (dataclass with
+    tool_call: ToolCall TypedDict {'name': str}, tool: BaseTool | None). Never raises."""
+    try:
+        tool_call = getattr(request, "tool_call", None)
+        if isinstance(tool_call, dict):
+            try:
+                name = tool_call["name"]
+            except Exception:
+                name = None
+            if isinstance(name, str) and name:
+                return name
+        tool = getattr(request, "tool", None)
+        name = getattr(tool, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        name = getattr(request, "name", None)
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    return ""
+
+
+class _ToolResultCompactionMiddleware(AgentMiddleware):
+    """Caps oversized tool RESULTS at the proven awrap_tool_call seam (fires on every tool call
+    inside create_agent), so large structured results (BloodHound cypher ~131k, Mythic blobs 57-76k)
+    don't flood the worker's per-call prompt. Reuses the densify/cap encoder (_transform_content).
+    Skips protected control-flow tools. Passes Command / non-ToolMessage results through untouched.
+    Never breaks a tool call: try/except around the COMPACTION only -> returns the original result;
+    a handler's own exception is NOT caught here and propagates normally."""
+
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    def _compact_result(self, request, result):
+        try:
+            if not isinstance(result, ToolMessage):
+                return result  # Command (handoff) etc. -> untouched
+            name = _tool_name_from_request(request)
+            if name in _COMPACTION_PROTECTED_TOOLS:
+                return result
+            new_content = _transform_content(result.content)  # handles str + list-of-blocks
+            if new_content is result.content or new_content == result.content:
+                return result
+            try:
+                before = len(result.content) if isinstance(result.content, str) else None
+                logger.info(f"🗜️ [compaction] fired tool={name} -> capped (before_chars={before})")
+            except Exception:
+                pass
+            return result.model_copy(update={"content": new_content})
+        except Exception:
+            return result
+
+    async def awrap_tool_call(self, request, handler):
+        result = await handler(request)  # handler exceptions propagate (not caught)
+        return self._compact_result(request, result)
+
+    def wrap_tool_call(self, request, handler):
+        result = handler(request)  # handler exceptions propagate (not caught)
+        return self._compact_result(request, result)
 
 
 class SageState(MessagesState):
@@ -1323,6 +1498,9 @@ class Model:
             # Kill-switch honored INSIDE each agent loop (not just at top-level handoffs) — see
             # _StopCheckMiddleware / task-626. Listed first so it gates before the model call.
             _StopCheckMiddleware(self),
+            # Cap oversized tool results BEFORE the context-editing size trigger evaluates them,
+            # at the awrap_tool_call seam that provably fires (unlike the v1 tool wrapper).
+            _ToolResultCompactionMiddleware(self),
             ContextEditingMiddleware(
                 edits=[ClearToolUsesEdit(
                     trigger=50000,
