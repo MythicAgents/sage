@@ -17,6 +17,33 @@ try:
 except ImportError:  # allow running this module directly for manual testing
     import ttp_library
 
+try:
+    from .footprint import footprint
+except ImportError:
+    from footprint import footprint
+
+
+def _summarize_footprint(axes: dict) -> str:
+    axes_total = sum(axes.values())
+    parts = []
+    if axes.get("new_beacon", 0) >= 2:
+        parts.append("plants a new beacon")
+    if axes.get("lateral_hop", 0) >= 2:
+        parts.append("moves laterally to a remote host")
+    if axes.get("new_process", 0) >= 2:
+        parts.append("spawns a process")
+    if axes.get("disk_artifact", 0) >= 2:
+        parts.append("writes a file to disk")
+    if axes.get("flagged_tool", 0) >= 1:
+        parts.append("may run a flagged tool")
+    if axes.get("network_signature", 0) >= 2:
+        parts.append("network-visible")
+    if axes.get("reversibility", 0) >= 2:
+        parts.append("hard to clean up")
+    if not parts:
+        parts.append("low footprint")
+    return f"footprint {axes_total}: " + "; ".join(parts)
+
 
 # Well-known Apollo/Mythic signatures for command failures that arrive as task OUTPUT
 # (not as raised exceptions). Used by the issue_task circuit breaker to count agent-side
@@ -385,6 +412,7 @@ GUARDED_TOOLS: set[str] = {
     "issue_task_and_waitfor_task_output",
     "upload_file_by_file_uuid",
     "create_payload",
+    "delete_payload",
     "download_tool",
     "stage_file_to_disk",
     "sandbox_exec",
@@ -422,6 +450,7 @@ class MythicTools:
         # parameter permutations — the cause of the 2.47M-token context explosion on
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
+        self._artifact_ledger: list[dict] = []
         # No-progress guard: count how many times each task_id has been fetched and come back FAILED
         # this session. On the 2nd+ failed re-read we return a short escalation directive instead of the
         # full (unchanged) failed output — the 2026-06-01 e45ae3d3 recursion death was the agent
@@ -450,6 +479,9 @@ class MythicTools:
 
         Do not use the LangChain @tool decorator because it will cause a conflict with 'self' argument in class methods
         """
+
+        if "get_task_history_for_callback" in method_names and "list_open_artifacts" not in method_names:
+            method_names = [*method_names, "list_open_artifacts"]
 
         tools = []
         for method_name in method_names:
@@ -529,6 +561,15 @@ class MythicTools:
             return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error executing query: {e}"
+
+    async def get_all_payloads(self) -> str:
+        """Get information about all payloads currently registered (already built) with Mythic."""
+        # HITL: free
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call create() first.")
+        logger.debug("🛠️ Calling get_all_payloads tool")
+        resp = await mythic.get_all_payloads(self.client)
+        return json.dumps(resp, sort_keys=True)
         
     async def get_payload_names(self) -> List[str]:
         """Get a list of all payload type names."""
@@ -606,6 +647,247 @@ class MythicTools:
         except Exception as e:
             return f"Error executing query: {e}"
 
+    async def get_callback_c2_config(self, display_id: Annotated[int, "The callback display_id to inspect for configured C2 values"]) -> str:
+        """Get the actual configured C2 parameter values for a live callback, not just the C2 schema.
+
+        Args:
+            display_id: The callback display_id to inspect.
+        Returns:
+            str: JSON string containing callback host/user and configured C2 values such as callback_host, callback_port, and post_uri.
+        """
+        # HITL: free
+        query = """
+            query CB($id: Int!) {
+              callback(where: {display_id: {_eq: $id}}) {
+                display_id host user
+                c2profileparametersinstances {
+                  value instance_name
+                  c2profileparameter { name }
+                  c2profile { name }
+                }
+              }
+            }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_callback_c2_config tool for callback display_id: {display_id}")
+            results = await mythic.execute_custom_query(self.client, query, variables={"id": display_id})
+            callbacks = results.get("callback", []) if isinstance(results, dict) else []
+            if not callbacks:
+                return json.dumps({"callback": None, "c2_parameters": []}, sort_keys=True)
+            callback = callbacks[0]
+            c2_parameters = []
+            for instance in callback.get("c2profileparametersinstances", []):
+                c2_parameters.append({
+                    "c2profile": (instance.get("c2profile") or {}).get("name"),
+                    "parameter_name": (instance.get("c2profileparameter") or {}).get("name"),
+                    "value": instance.get("value"),
+                })
+            return json.dumps({
+                "callback": {
+                    "display_id": callback.get("display_id"),
+                    "host": callback.get("host"),
+                    "user": callback.get("user"),
+                },
+                "c2_parameters": c2_parameters,
+            }, sort_keys=True)
+        except Exception as e:
+            return f"Error executing query: {e}"
+
+    async def get_payload_c2_config(self, payload_uuid: Annotated[str, "The Mythic payload UUID to inspect for configured C2 values and file reference"]) -> str:
+        """Get the actual configured C2 parameter values and file reference for an existing built payload.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to inspect.
+        Returns:
+            str: JSON string containing payload metadata, file reference, and configured C2 values.
+        """
+        # HITL: free
+        custom_attributes = """
+        uuid
+        file_id
+        filemetum {
+            agent_file_id
+            filename_utf8
+            id
+        }
+        c2profileparametersinstances {
+            value
+            c2profileparameter { name }
+            c2profile { name }
+        }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_payload_c2_config tool for payload_uuid: {payload_uuid}")
+            payload = await mythic.get_payload_by_uuid(
+                self.client,
+                payload_uuid=payload_uuid,
+                custom_return_attributes=custom_attributes,
+            )
+            c2_parameters = []
+            for instance in payload.get("c2profileparametersinstances", []):
+                c2_parameters.append({
+                    "c2profile": (instance.get("c2profile") or {}).get("name"),
+                    "parameter_name": (instance.get("c2profileparameter") or {}).get("name"),
+                    "value": instance.get("value"),
+                })
+            filemetum = payload.get("filemetum")
+            if isinstance(filemetum, list):
+                filemetum = filemetum[0] if filemetum else None
+            return json.dumps({
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "file_id": payload.get("file_id"),
+                "agent_file_id": filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None,
+                "filemetum": filemetum,
+                "c2_parameters": c2_parameters,
+            }, sort_keys=True)
+        except Exception as e:
+            return f"Error getting payload C2 config for {payload_uuid}: {e}"
+
+    async def download_payload(self, payload_uuid: Annotated[str, "The Mythic payload UUID to download/reuse"]) -> str:
+        """Download a built payload for reuse and return the Mythic file reference to redeploy it.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to download/reuse.
+        Returns:
+            str: JSON string containing the payload UUID, filename, Mythic agent_file_id, and downloaded byte count.
+        """
+        # HITL: free
+        custom_attributes = """
+        uuid
+        file_id
+        filemetum {
+            agent_file_id
+            filename_utf8
+            id
+        }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling download_payload tool for payload_uuid: {payload_uuid}")
+            payload = await mythic.get_payload_by_uuid(
+                self.client,
+                payload_uuid=payload_uuid,
+                custom_return_attributes=custom_attributes,
+            )
+            payload_bytes = await mythic.download_payload(self.client, payload_uuid=payload_uuid)
+            filemetum = payload.get("filemetum")
+            if isinstance(filemetum, list):
+                filemetum = filemetum[0] if filemetum else None
+            return json.dumps({
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "file_id": payload.get("file_id"),
+                "agent_file_id": filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None,
+                "filemetum": filemetum,
+                "downloaded_bytes": len(payload_bytes) if payload_bytes is not None else 0,
+                "reuse_instruction": "Use agent_file_id with upload_file_by_file_uuid to redeploy this existing payload.",
+            }, sort_keys=True)
+        except Exception as e:
+            return f"Error downloading payload {payload_uuid}: {e}"
+
+    async def delete_payload(
+        self,
+        payload_uuid: Annotated[str, "The Mythic payload UUID to soft-delete"],
+        confirm_delete_successful: Annotated[bool, "Required to delete a successful payload with zero callbacks"] = False,
+    ) -> str:
+        """Safely soft-delete a junk Mythic payload after verifying it has no callbacks.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to soft-delete.
+            confirm_delete_successful: Set True only when intentionally deleting a successful payload with zero callbacks.
+        Returns:
+            str: JSON string describing whether the payload was deleted or refused, and why.
+        """
+        # HITL: guarded
+        preflight_query = """
+            query PayloadDeletePreflight($uuid: String!) {
+              payload(where: {uuid: {_eq: $uuid}}) {
+                id
+                uuid
+                build_phase
+                deleted
+                payloadtype { name }
+              }
+              callback_aggregate(where: {payload: {uuid: {_eq: $uuid}}}) {
+                aggregate { count }
+              }
+            }
+        """
+        mutation = """
+            mutation SoftDeletePayload($uuid: String!) {
+              updatePayload(payload_uuid: $uuid, deleted: true) {
+                status
+                error
+              }
+            }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling delete_payload tool for payload_uuid: {payload_uuid}")
+            variables = {"uuid": payload_uuid}
+            preflight = await mythic.execute_custom_query(self.client, preflight_query, variables=variables)
+            payloads = preflight.get("payload", []) if isinstance(preflight, dict) else []
+            if len(payloads) != 1:
+                return json.dumps({
+                    "deleted": False,
+                    "payload_uuid": payload_uuid,
+                    "reason": "refused: payload not found",
+                }, sort_keys=True)
+
+            payload = payloads[0]
+            aggregate = ((preflight.get("callback_aggregate") or {}).get("aggregate") or {}) if isinstance(preflight, dict) else {}
+            callback_count = int(aggregate.get("count") or 0)
+            build_phase = payload.get("build_phase")
+            build_phase_normalized = str(build_phase or "").lower()
+            base_result = {
+                "deleted": False,
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "build_phase": build_phase,
+                "callback_count": callback_count,
+                "already_deleted": payload.get("deleted"),
+                "payload_type": (payload.get("payloadtype") or {}).get("name"),
+            }
+
+            if payload.get("deleted") is True:
+                base_result["reason"] = "no action: payload is already deleted"
+                return json.dumps(base_result, sort_keys=True)
+            if callback_count >= 1:
+                base_result["reason"] = "refused: payload has produced one or more callbacks"
+                return json.dumps(base_result, sort_keys=True)
+            if build_phase_normalized == "success" and not confirm_delete_successful:
+                base_result["reason"] = "refused: successful payloads with zero callbacks require confirm_delete_successful=True"
+                base_result["requires_confirmation"] = True
+                return json.dumps(base_result, sort_keys=True)
+            if build_phase_normalized != "error" and not (build_phase_normalized == "success" and confirm_delete_successful):
+                base_result["reason"] = "refused: only build_phase='error' payloads are deleted by default; build_phase='success' requires explicit confirmation"
+                return json.dumps(base_result, sort_keys=True)
+
+            mutation_result = await mythic.execute_custom_query(self.client, mutation, variables=variables)
+            update_result = mutation_result.get("updatePayload", {}) if isinstance(mutation_result, dict) else {}
+            status = update_result.get("status")
+            base_result["mutation"] = "updatePayload(deleted=true)"
+            base_result["mutation_status"] = status
+            if status == "success":
+                base_result["deleted"] = True
+                base_result["reason"] = "soft-deleted payload after safety checks passed"
+            else:
+                base_result["reason"] = f"delete mutation failed: {update_result.get('error') or 'unknown error'}"
+            return json.dumps(base_result, sort_keys=True)
+        except Exception as e:
+            return json.dumps({
+                "deleted": False,
+                "payload_uuid": payload_uuid,
+                "reason": f"error while deleting payload: {e}",
+            }, sort_keys=True)
+
     async def get_all_command_names_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
         """Get all available command names for a specific payload type (agent).
         
@@ -665,6 +947,7 @@ class MythicTools:
                     description
                     default_value
                     choices
+                    parameter_group_name
                     required
                     }
                     help_cmd
@@ -704,6 +987,7 @@ class MythicTools:
         description
         default_value
         choices
+        parameter_group_name
         required
         }
         description
@@ -715,6 +999,22 @@ class MythicTools:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling get_all_commands_for_payloadtype tool for: {payload}")
             results =  await mythic.get_all_commands_for_payloadtype(self.client, payload, attr)
+            try:
+                if isinstance(results, list):
+                    for _cmd in results:
+                        if not isinstance(_cmd, dict):
+                            continue
+                        _name = _cmd.get("cmd") or ""
+                        _schema = _cmd.get("commandparameters") or []
+                        # Carry command-level needs_admin into the schema so footprint sees Mythic-native risk.
+                        if isinstance(_schema, list) and _cmd.get("needs_admin"):
+                            _schema = [*_schema, {"needs_admin": True}]
+                        _fp = footprint(_name, {}, _schema if isinstance(_schema, list) else [], None)
+                        _ax = _fp["axes"]
+                        _cmd["footprint"] = _ax
+                        _cmd["footprint_summary"] = _summarize_footprint(_ax)
+            except Exception:
+                pass
             return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
@@ -795,6 +1095,63 @@ class MythicTools:
             )
         return json.dumps(resp, sort_keys=True)
 
+    async def _action_footprint(self, command, params, callback_display_id) -> dict | None:
+        try:
+            if not (
+                (isinstance(params, dict) and params)
+                or (isinstance(params, str) and params.strip())
+            ):
+                return None
+            payload_type = await self._resolve_payload_type(callback_display_id)
+            schema = []
+            if payload_type:
+                cached = getattr(self, "_cmd_schema_cache", {}).get((payload_type, command))
+                if isinstance(cached, list):
+                    schema = cached
+            return footprint(command, params, schema, None)
+        except Exception:
+            return None
+
+    def _ledger_record(self, command, callback_display_id, params, fp) -> None:
+        try:
+            if fp is None:
+                return
+            axes = fp["axes"]
+            if axes["disk_artifact"] < 1 and axes["new_beacon"] < 1:
+                return
+
+            artifact = None
+            if axes["disk_artifact"] >= 1:
+                known_ext = (
+                    ".exe", ".dll", ".ps1", ".bat", ".cmd", ".sh", ".so", ".dylib",
+                    ".zip", ".7z", ".rar", ".txt", ".log", ".json", ".csv", ".xml",
+                    ".yaml", ".yml", ".config", ".conf", ".bin", ".dat", ".out",
+                    ".kirbi", ".ccache", ".dmp", ".dump", ".psm1", ".vbs", ".js",
+                    ".hta", ".msi", ".sys", ".scr", ".lnk", ".aspx", ".jsp", ".php",
+                    ".py",
+                )
+                values = params.values() if isinstance(params, dict) else [params]
+                for value in values:
+                    text = str(value).strip()
+                    if re.search(r"[/\\]", text) or text.lower().endswith(known_ext):
+                        artifact = text
+                        break
+            if axes["new_beacon"] >= 1:
+                artifact = f"beacon via {command}"
+                if isinstance(params, dict) and params.get("host"):
+                    artifact += f" on host {params.get('host')}"
+
+            self._artifact_ledger.append({
+                "command": command,
+                "callback": callback_display_id,
+                "artifact": artifact,
+                "footprint": axes,
+                "total": fp["total"],
+                "cleaned": False,
+            })
+        except Exception:
+            return
+
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
         """
         Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
@@ -841,11 +1198,41 @@ class MythicTools:
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
 
+        # Deterministic pre-flight: catch name/group/ChooseOne errors with an actionable correction
+        # instead of burning a Mythic round-trip + a circuit-breaker count on an opaque error.
+        if isinstance(parameters, dict) and parameters:
+            _validation_error = await self._validate_command_parameters(command, parameters, callback_display_id)
+            if _validation_error:
+                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
+                return _validation_error
+
+        _fp = await self._action_footprint(command, parameters, callback_display_id)
+        self._ledger_record(command, callback_display_id, parameters, _fp)
+
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling issue_task_and_waitfor_task_output tool for command: {command} on callback_display_id: {callback_display_id}")
-            results = await mythic.issue_task_and_waitfor_task_output(mythic=self.client, command_name=command, parameters=parameters, callback_display_id=callback_display_id, timeout=timeout) #token_id=token_id
+            # The Mythic lib's own `timeout` does not reliably fire — its waitfor subscription can
+            # block indefinitely when a task never reaches a terminal state (the documented
+            # "waitfor poller hang" that wedges the whole agent graph). Wrap it in an asyncio hard
+            # ceiling so the await can ALWAYS be cancelled and we surface a timeout instead of hanging.
+            try:
+                results = await asyncio.wait_for(
+                    mythic.issue_task_and_waitfor_task_output(
+                        mythic=self.client, command_name=command, parameters=parameters,
+                        callback_display_id=callback_display_id, timeout=timeout,
+                    ),  # token_id=token_id
+                    timeout=timeout + 20,
+                )
+            except asyncio.TimeoutError:
+                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
+                return (
+                    f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
+                    f"{callback_display_id}. The task was issued but did not return output in time "
+                    f"(the agent may be slow/long-running, or unresponsive). Use check_callback_alive "
+                    f"and get_task_history_for_callback to check status; do NOT blindly re-issue."
+                )
             if results is None:
                 self._task_failure_counts.pop(fail_key, None)
                 return "No results returned from task."
@@ -856,10 +1243,48 @@ class MythicTools:
                 self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
             else:
                 self._task_failure_counts.pop(fail_key, None)
+            # Reactive AV/Defender hint: a remote-exec/lateral command that was issued but failed at the
+            # EXECUTION layer (not arg-format) on a Windows host is a classic .NET-beacon-quarantined signal.
+            # Surface Merlin (Go) as the actionable alternative so the agent doesn't re-permute Apollo args.
+            _EXEC_LAT_CMDS = {"jump_wmi", "jump_psexec", "wmiexecute", "execute_assembly", "inline_assembly", "shinject", "spawn", "inject"}
+            if command in _EXEC_LAT_CMDS and _is_task_failure_output(results_str):
+                _low = results_str.lower()
+                if ("failed to execute" in _low) or ("wmi" in _low and "fail" in _low) or ("access is denied" in _low) or ("service" in _low and "fail" in _low):
+                    results_str += (
+                        "\n\n[SAGE HINT] This command was issued and failed at the EXECUTION layer (not an "
+                        "argument-format error). On a Defender/EDR-protected Windows host this commonly means the "
+                        "Apollo (.NET) beacon was quarantined. Do NOT re-permute these arguments. Consider building a "
+                        "Merlin (Go) payload for this host (distinct EDR signature) and delivering it on the next hop — "
+                        "see the Mythic_Payload agent's Defender/EDR evasion doctrine."
+                    )
+                    logger.info(f"🛡️ ARGVAL av_hint command={command} callback={callback_display_id}")
+            try:
+                if _fp:
+                    _ax = _fp["axes"]
+                    if _fp["total"] >= 4 or _ax["new_beacon"] >= 3 or _ax["disk_artifact"] >= 2:
+                        _adv = f"\n\n[SAGE OPSEC] footprint total={_fp['total']} axes={_ax}."
+                        if _ax["new_beacon"] >= 3:
+                            _adv += (" You are planting a NEW beacon. If your goal is to RUN a tool/command on the"
+                                     " target, prefer remote execution (upload the tool, execute it in place, write"
+                                     " output to a file, download the file, then delete it) — it avoids a persistent"
+                                     " new beacon and is quieter. Plant a beacon only if you need ongoing access or"
+                                     " network reach on that host that you cannot obtain remotely; state that"
+                                     " justification when you do.")
+                        if _ax["disk_artifact"] >= 1 or _ax["new_beacon"] >= 1:
+                            _adv += " This action was recorded to the artifact ledger — clean it up at sub-goal completion (list_open_artifacts)."
+                        results_str = str(results_str) + _adv
+                        logger.info(f"🛡️ OPSEC annotated command={command} footprint_total={_fp['total']} axes={_ax}")
+            except Exception:
+                pass
             return results_str
         except Exception as e:
             self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
             return f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+
+    async def list_open_artifacts(self) -> str:
+        """List artifacts this run has created (files dropped, beacons planted) that have NOT been cleaned up, so you can remove them at sub-goal completion for OPSEC. Returns a JSON list."""
+        # HITL: free
+        return json.dumps([e for e in self._artifact_ledger if not e.get("cleaned")], default=str)
 
     async def get_task_history_for_callback(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to retrieve task history for"]) -> str:
         """Get the task history of commands issued for a specific agent (callback).
@@ -1170,6 +1595,187 @@ class MythicTools:
         except Exception as e:
             logger.debug(f"Could not resolve payload type for callback {callback_display_id}: {e}")
         return None
+
+    async def _validate_command_parameters(self, command, parameters, callback_display_id):
+        """Pre-flight: validate a dict of params against the command's parameter-group schema.
+        Returns None when OK (or when validation cannot be performed -> FAIL OPEN), else an
+        actionable correction string the agent can act on without a wasted Mythic round-trip."""
+        try:
+            if not isinstance(parameters, dict) or not parameters:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=not_a_dict")
+                return None
+            if self.client is None:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_client")
+                return None
+            payload_type = await self._resolve_payload_type(callback_display_id)
+            if not payload_type:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_payload_type")
+                return None
+            if not hasattr(self, "_cmd_schema_cache"):
+                self._cmd_schema_cache = {}
+
+            cache_key = (payload_type, command)
+            if cache_key not in self._cmd_schema_cache:
+                query = f"""
+                    query CmdParamSchema {{
+                      command(where: {{payloadtype: {{name: {{_eq: "{payload_type}"}}}}, cmd: {{_eq: "{command}"}}}}) {{
+                        cmd
+                        commandparameters {{ name cli_name type parameter_group_name required choices }}
+                      }}
+                    }}
+                """
+                try:
+                    result = await mythic.execute_custom_query(self.client, query)
+                    commands = result.get("command") if isinstance(result, dict) else None
+                    if not commands:
+                        self._cmd_schema_cache[cache_key] = None
+                        logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
+                        return None
+                    self._cmd_schema_cache[cache_key] = commands[0].get("commandparameters")
+                except Exception:
+                    self._cmd_schema_cache[cache_key] = None
+                    logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
+                    return None
+
+            param_list = self._cmd_schema_cache.get(cache_key)
+            if not param_list:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
+                return None
+
+            groups = {}
+            valid_names = set()
+            valid_cli = set()
+            for param in param_list:
+                if not isinstance(param, dict):
+                    continue
+                group_name = param.get("parameter_group_name") or "Default"
+                groups.setdefault(group_name, []).append(param)
+                if param.get("name"):
+                    valid_names.add(param.get("name"))
+                if param.get("cli_name"):
+                    valid_cli.add(param.get("cli_name"))
+
+            if not groups:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
+                return None
+
+            alias_hints = {
+                "computer": "host",
+                "remote_host": "host",
+                "target": "host",
+                "payload": "Payload",
+                "service_name": "remote_service_name",
+                "servicename": "remote_service_name",
+            }
+            supplied = set(parameters.keys())
+
+            def _param_label(param: dict) -> str:
+                label = str(param.get("name") or param.get("cli_name") or "")
+                attrs = []
+                if param.get("required"):
+                    attrs.append("required")
+                if param.get("type") and param.get("type") != "String":
+                    attrs.append(str(param.get("type")))
+                if attrs:
+                    label += f"({', '.join(attrs)})"
+                return label
+
+            def _format_groups() -> str:
+                return "; ".join(
+                    f"group '{group_name}': {', '.join(_param_label(param) for param in params)}"
+                    for group_name, params in groups.items()
+                )
+
+            unknown = supplied - valid_names - valid_cli
+            if unknown:
+                logger.info(f"🛡️ ARGVAL rejected mode=A command={command} payload_type={payload_type} unknown={sorted(unknown)}")
+                unknown_list = sorted((str(key) for key in unknown), key=str.lower)
+                hint_parts = []
+                for key in unknown_list:
+                    suggestion = alias_hints.get(key)
+                    if suggestion:
+                        hint_parts.append(f"'{key}' should likely be '{suggestion}'")
+                hint_text = f" Suggested fixes: {'; '.join(hint_parts)}." if hint_parts else ""
+                return (
+                    f"Invalid parameters for command '{command}': unknown key(s): {', '.join(unknown_list)}."
+                    f"{hint_text} Valid parameters are {_format_groups()}."
+                )
+
+            covering = []
+            for group_name, params in groups.items():
+                keys = set()
+                for param in params:
+                    if param.get("name"):
+                        keys.add(param.get("name"))
+                    if param.get("cli_name"):
+                        keys.add(param.get("cli_name"))
+                if supplied.issubset(keys):
+                    covering.append(group_name)
+
+            if not covering:
+                logger.info(f"🛡️ ARGVAL rejected mode=B command={command} payload_type={payload_type}")
+                guidance = ""
+                if command in ("inline_assembly", "execute_assembly"):
+                    guidance = (
+                        " For a freshly-uploaded file use the 'New Assembly' group: "
+                        "{assembly_file, assembly_arguments}; for an already-registered assembly use "
+                        "the 'Default' group: {assembly_name, assembly_arguments} — never both."
+                    )
+                return (
+                    f"Invalid parameter group mix for command '{command}'. Pick exactly ONE parameter group. "
+                    f"Available groups: {_format_groups()}.{guidance}"
+                )
+
+            selected_group = covering[0]
+            selected_params = groups[selected_group]
+            missing = []
+            for param in selected_params:
+                if not param.get("required"):
+                    continue
+                name = param.get("name")
+                cli_name = param.get("cli_name")
+                if name not in supplied and (not cli_name or cli_name not in supplied):
+                    missing.append(str(name or cli_name))
+            if missing:
+                logger.info(f"🛡️ ARGVAL rejected mode=required command={command} group={selected_group} missing={missing}")
+                return f"parameter group '{selected_group}' requires: {', '.join(missing)}"
+
+            for supplied_key in supplied:
+                param = next(
+                    (
+                        item for item in selected_params
+                        if item.get("name") == supplied_key or item.get("cli_name") == supplied_key
+                    ),
+                    None,
+                )
+                if not param or param.get("type") != "ChooseOne":
+                    continue
+                val = str(parameters[supplied_key])
+                choices = param.get("choices")
+                if isinstance(choices, list) and choices and val not in choices:
+                    logger.info(f"🛡️ ARGVAL rejected mode=C command={command} param={param.get('name')}")
+                    return (
+                        f"Parameter '{param.get('name')}' for command '{command}' is a ChooseOne and must be "
+                        f"one of: {', '.join(str(choice) for choice in choices)}"
+                    )
+                if (
+                    not choices
+                    and re.fullmatch(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", val)
+                ):
+                    logger.info(f"🛡️ ARGVAL rejected mode=C command={command} param={param.get('name')}")
+                    return (
+                        f"Parameter '{param.get('name')}' for command '{command}' is a ChooseOne whose value must be the "
+                        f"selectable DISPLAY STRING (e.g. for a payload selector: \"<filename> - <description> - <uuid>\" as "
+                        f"returned by get_all_payloads), NOT a bare UUID. You passed a bare UUID."
+                    )
+            logger.info(f"🛡️ ARGVAL validated command={command} payload_type={payload_type} group={selected_group}")
+            return None
+        except Exception as e:
+            try:
+                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=exception:{e}")
+            except Exception:
+                pass
+            return None
 
     async def get_ttp_guidance(
         self,

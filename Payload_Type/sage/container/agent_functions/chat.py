@@ -15,7 +15,7 @@ class ChatArguments(TaskArguments):
             cli_name="provider",
             type=ParameterType.String,
             description="The model provider to interact with (e.g. Anthropic, Bedrock, OpenAI)",
-            parameter_group_info=[ParameterGroupInfo(required=False,ui_position=3)]
+            parameter_group_info=[ParameterGroupInfo(required=False,ui_position=1)]
         )
 
         # Model
@@ -45,6 +45,26 @@ class ChatArguments(TaskArguments):
             default_value=False,
             description="Show verbose output of all User & AI messages",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=2)]
+        )
+        # Autonomous Solve
+        autonomous_solve = CommandParameter(
+            name="autonomous_solve",
+            display_name="Autonomous Solve",
+            cli_name="autonomous_solve",
+            type=ParameterType.Boolean,
+            default_value=False,
+            description="DEMO ONLY: turn an objective into a self-directed multi-hop attack-path solve (Trust Walker). Never enable for evals/normal ops.",
+            parameter_group_info=[ParameterGroupInfo(required=False, ui_position=3)]
+        )
+        # Max Steps
+        max_steps = CommandParameter(
+            name="max_steps",
+            display_name="Max Steps",
+            cli_name="max_steps",
+            type=ParameterType.Number,
+            default_value=200,
+            description="Global cap on model steps for this run; halts a runaway loop. 0 = unlimited.",
+            parameter_group_info=[ParameterGroupInfo(required=False, ui_position=4)]
         )
         # API Endpoint
         api_endpoint = CommandParameter(
@@ -113,7 +133,7 @@ class ChatArguments(TaskArguments):
         )
 
         # Add all the parameters
-        self.args = [provider, model, prompt, verbose, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region, mode]
+        self.args = [provider, model, prompt, verbose, autonomous_solve, max_steps, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region, mode]
 
     async def parse_arguments(self):
         if len(self.command_line) == 0:
@@ -223,6 +243,9 @@ class ChatCommand(CommandBase):
             
             verbose = taskData.args.get_arg("verbose")
             mode = taskData.args.get_arg("mode") or "auto"
+            autonomous_solve = taskData.args.get_arg("autonomous_solve") or False
+            max_steps = taskData.args.get_arg("max_steps")
+            max_steps = int(max_steps) if max_steps not in (None, "") else 200
 
             # These can be None as they are optional
             api_endpoint = get_secret(taskData=taskData, key="API_ENDPOINT")
@@ -250,7 +273,7 @@ class ChatCommand(CommandBase):
                     config["configurable"]["aws_session_token"] = aws_session_token
                 if aws_region is not None:
                     config["configurable"]["region"] = aws_region
-            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode)
+            llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode, autonomous_solve=autonomous_solve, max_steps=max_steps)
             await llm.initialize()
             if verbose:
                 llm.set_verbose(True)

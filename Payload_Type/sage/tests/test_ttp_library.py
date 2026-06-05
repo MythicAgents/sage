@@ -62,17 +62,18 @@ def test_match_goal():
     assert ttp_library.match_goal("enumerate the active directory domain"), "expected matches"
 
 
-def test_execution_hint_join():
+def test_per_agent_files_retired():
+    # The per-agent mythic_agents/*.md files were RETIRED 2026-06-05 (sage-tradecraft-doctrine ISC-13):
+    # Sage operates ANY agent by SELF-DESCRIBING enumeration (get_all_commands_for_payloadtype now
+    # surfaces parameter groups + footprint), not hand-written per-agent cheat-sheets. This guards the
+    # retirement: load_mythic_agent degrades to (None, None) and the execution_hint join no-ops, so
+    # get_ttp_guidance falls back to its "use get_all_commands_for_payloadtype" enumeration path.
+    assert ttp_library.load_mythic_agent("apollo") == (None, None)
+    assert ttp_library.load_mythic_agent("merlin") == (None, None)
+    # The technique-keyed ttps/ library STAYS (this is the legitimate residual).
     ttp_fm, _ = ttp_library.load_ttp("sharphound")
-    agent_fm, _ = ttp_library.load_mythic_agent("apollo")
-    hint = ttp_library.execution_hint(ttp_fm, agent_fm)
-    assert "inline_assembly" in hint
-    assert "file store" in hint.lower()  # .net-assembly requires upload on Apollo
-
-    # nanodump is a BOF; Apollo has no BOF runner -> fallback path
-    bof_fm, _ = ttp_library.load_ttp("nanodump")
-    bof_hint = ttp_library.execution_hint(bof_fm, agent_fm)
-    assert "cannot run" in bof_hint.lower() or "fallback" in bof_hint.lower()
+    assert ttp_fm, "technique-keyed ttps/ library must remain"
+    assert ttp_library.execution_hint(ttp_fm, None) == ""
 
 
 if __name__ == "__main__":

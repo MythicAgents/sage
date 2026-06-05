@@ -89,6 +89,33 @@ def load_prompt(name: str, **subs) -> str:
     return rendered.strip()
 
 
+def load_autonomous_overlay(role: str) -> str:
+    """Return the autonomous-solve overlay section for a supported agent role."""
+    _, body = _split_frontmatter(_read("demo_autonomous_solve"))
+    match_prefix = f"## Append to {role}"
+    lines = body.splitlines()
+    start_index = None
+
+    for i, line in enumerate(lines):
+        if line.strip().startswith(match_prefix):
+            start_index = i + 1
+            break
+
+    if start_index is None:
+        raise ValueError(f"autonomous_solve overlay section for role '{role}' was not found")
+
+    section_lines = []
+    for line in lines[start_index:]:
+        if line.strip().startswith("## "):
+            break
+        section_lines.append(line)
+
+    section = "\n".join(section_lines).strip()
+    if not section:
+        raise ValueError(f"autonomous_solve overlay section for role '{role}' is empty")
+    return section
+
+
 def load_prompt_meta(name: str) -> dict:
     """Return just the frontmatter dict for a prompt file."""
     meta, _ = _split_frontmatter(_read(name))

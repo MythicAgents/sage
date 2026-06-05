@@ -176,6 +176,241 @@ class MythicAPIClient:
             return json.dumps(results)
         except Exception as e:
             return f"Error executing query: {e}"
+
+    @mythic_tool
+    async def get_callback_c2_config(self, display_id: int) -> str:
+        """Get the actual configured C2 parameter values for a live callback, not just the C2 schema.
+
+        Args:
+            display_id: The callback display_id to inspect.
+        Returns:
+            str: JSON string containing callback host/user and configured C2 values such as callback_host, callback_port, and post_uri.
+        """
+        query = """
+        query CB($id: Int!) {
+          callback(where: {display_id: {_eq: $id}}) {
+            display_id host user
+            c2profileparametersinstances {
+              value instance_name
+              c2profileparameter { name }
+              c2profile { name }
+            }
+          }
+        }
+        """
+        variables = {"id": display_id}
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            results = await mythic.execute_custom_query(self.client, query, variables)
+            callbacks = results.get("callback", []) if isinstance(results, dict) else []
+            if not callbacks:
+                return json.dumps({"callback": None, "c2_parameters": []})
+            callback = callbacks[0]
+            c2_parameters = []
+            for instance in callback.get("c2profileparametersinstances", []):
+                c2_parameters.append({
+                    "c2profile": (instance.get("c2profile") or {}).get("name"),
+                    "parameter_name": (instance.get("c2profileparameter") or {}).get("name"),
+                    "value": instance.get("value"),
+                })
+            return json.dumps({
+                "callback": {
+                    "display_id": callback.get("display_id"),
+                    "host": callback.get("host"),
+                    "user": callback.get("user"),
+                },
+                "c2_parameters": c2_parameters,
+            })
+        except Exception as e:
+            return f"Error executing query: {e}"
+
+    @mythic_tool
+    async def get_payload_c2_config(self, payload_uuid: str) -> str:
+        """Get the actual configured C2 parameter values and file reference for an existing built payload.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to inspect.
+        Returns:
+            str: JSON string containing payload metadata, file reference, and configured C2 values.
+        """
+        custom_attributes = """
+        uuid
+        file_id
+        filemetum {
+            agent_file_id
+            filename_utf8
+            id
+        }
+        c2profileparametersinstances {
+            value
+            c2profileparameter { name }
+            c2profile { name }
+        }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            payload = await mythic.get_payload_by_uuid(
+                self.client,
+                payload_uuid=payload_uuid,
+                custom_return_attributes=custom_attributes,
+            )
+            c2_parameters = []
+            for instance in payload.get("c2profileparametersinstances", []):
+                c2_parameters.append({
+                    "c2profile": (instance.get("c2profile") or {}).get("name"),
+                    "parameter_name": (instance.get("c2profileparameter") or {}).get("name"),
+                    "value": instance.get("value"),
+                })
+            filemetum = payload.get("filemetum")
+            if isinstance(filemetum, list):
+                filemetum = filemetum[0] if filemetum else None
+            return json.dumps({
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "file_id": payload.get("file_id"),
+                "agent_file_id": filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None,
+                "filemetum": filemetum,
+                "c2_parameters": c2_parameters,
+            })
+        except Exception as e:
+            return f"Error getting payload C2 config for {payload_uuid}: {e}"
+
+    @mythic_tool
+    async def download_payload(self, payload_uuid: str) -> str:
+        """Download a built payload for reuse and return the Mythic file reference to redeploy it.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to download/reuse.
+        Returns:
+            str: JSON string containing the payload UUID, filename, Mythic agent_file_id, and downloaded byte count.
+        """
+        custom_attributes = """
+        uuid
+        file_id
+        filemetum {
+            agent_file_id
+            filename_utf8
+            id
+        }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            payload = await mythic.get_payload_by_uuid(
+                self.client,
+                payload_uuid=payload_uuid,
+                custom_return_attributes=custom_attributes,
+            )
+            payload_bytes = await mythic.download_payload(self.client, payload_uuid=payload_uuid)
+            filemetum = payload.get("filemetum")
+            if isinstance(filemetum, list):
+                filemetum = filemetum[0] if filemetum else None
+            return json.dumps({
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "file_id": payload.get("file_id"),
+                "agent_file_id": filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None,
+                "filemetum": filemetum,
+                "downloaded_bytes": len(payload_bytes) if payload_bytes is not None else 0,
+                "reuse_instruction": "Use agent_file_id with upload_file_by_file_uuid to redeploy this existing payload.",
+            })
+        except Exception as e:
+            return f"Error downloading payload {payload_uuid}: {e}"
+
+    @mythic_tool
+    async def delete_payload(self, payload_uuid: str, confirm_delete_successful: bool = False) -> str:
+        """Safely soft-delete a junk Mythic payload after verifying it has no callbacks.
+
+        Args:
+            payload_uuid: The Mythic payload UUID to soft-delete.
+            confirm_delete_successful: Set True only when intentionally deleting a successful payload with zero callbacks.
+        Returns:
+            str: JSON string describing whether the payload was deleted or refused, and why.
+        """
+        # HITL: guarded
+        preflight_query = """
+        query PayloadDeletePreflight($uuid: String!) {
+          payload(where: {uuid: {_eq: $uuid}}) {
+            id
+            uuid
+            build_phase
+            deleted
+            payloadtype { name }
+          }
+          callback_aggregate(where: {payload: {uuid: {_eq: $uuid}}}) {
+            aggregate { count }
+          }
+        }
+        """
+        mutation = """
+        mutation SoftDeletePayload($uuid: String!) {
+          updatePayload(payload_uuid: $uuid, deleted: true) {
+            status
+            error
+          }
+        }
+        """
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            variables = {"uuid": payload_uuid}
+            preflight = await mythic.execute_custom_query(self.client, preflight_query, variables)
+            payloads = preflight.get("payload", []) if isinstance(preflight, dict) else []
+            if len(payloads) != 1:
+                return json.dumps({
+                    "deleted": False,
+                    "payload_uuid": payload_uuid,
+                    "reason": "refused: payload not found",
+                }, sort_keys=True)
+
+            payload = payloads[0]
+            aggregate = ((preflight.get("callback_aggregate") or {}).get("aggregate") or {}) if isinstance(preflight, dict) else {}
+            callback_count = int(aggregate.get("count") or 0)
+            build_phase = payload.get("build_phase")
+            build_phase_normalized = str(build_phase or "").lower()
+            base_result = {
+                "deleted": False,
+                "payload_uuid": payload.get("uuid"),
+                "filename": payload.get("filename"),
+                "build_phase": build_phase,
+                "callback_count": callback_count,
+                "already_deleted": payload.get("deleted"),
+                "payload_type": (payload.get("payloadtype") or {}).get("name"),
+            }
+
+            if payload.get("deleted") is True:
+                base_result["reason"] = "no action: payload is already deleted"
+                return json.dumps(base_result, sort_keys=True)
+            if callback_count >= 1:
+                base_result["reason"] = "refused: payload has produced one or more callbacks"
+                return json.dumps(base_result, sort_keys=True)
+            if build_phase_normalized == "success" and not confirm_delete_successful:
+                base_result["reason"] = "refused: successful payloads with zero callbacks require confirm_delete_successful=True"
+                base_result["requires_confirmation"] = True
+                return json.dumps(base_result, sort_keys=True)
+            if build_phase_normalized != "error" and not (build_phase_normalized == "success" and confirm_delete_successful):
+                base_result["reason"] = "refused: only build_phase='error' payloads are deleted by default; build_phase='success' requires explicit confirmation"
+                return json.dumps(base_result, sort_keys=True)
+
+            mutation_result = await mythic.execute_custom_query(self.client, mutation, variables)
+            update_result = mutation_result.get("updatePayload", {}) if isinstance(mutation_result, dict) else {}
+            status = update_result.get("status")
+            base_result["mutation"] = "updatePayload(deleted=true)"
+            base_result["mutation_status"] = status
+            if status == "success":
+                base_result["deleted"] = True
+                base_result["reason"] = "soft-deleted payload after safety checks passed"
+            else:
+                base_result["reason"] = f"delete mutation failed: {update_result.get('error') or 'unknown error'}"
+            return json.dumps(base_result, sort_keys=True)
+        except Exception as e:
+            return json.dumps({
+                "deleted": False,
+                "payload_uuid": payload_uuid,
+                "reason": f"error while deleting payload: {e}",
+            }, sort_keys=True)
     
     @mythic_tool
     async def get_all_payloads(self) -> str:
@@ -484,6 +719,79 @@ class MythicAPIClient:
                     logger.error(f"Error executing get_c2_profiles_for_payload: {e}")
                     return f"Error executing tool: {str(e)}"
             return get_c2_profiles_for_payload
+        elif name == "get_callback_c2_config":
+            @tool
+            async def get_callback_c2_config(display_id: int) -> str:
+                """Get the actual configured C2 parameter values for a live callback, not just the C2 schema.
+
+                Args:
+                    display_id: The callback display_id to inspect.
+                Returns:
+                    str: JSON string containing callback host/user and configured C2 values such as callback_host, callback_port, and post_uri.
+                """
+                try:
+                    result = await self.execute_tool("get_callback_c2_config", display_id=display_id)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing get_callback_c2_config: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return get_callback_c2_config
+        elif name == "get_payload_c2_config":
+            @tool
+            async def get_payload_c2_config(payload_uuid: str) -> str:
+                """Get the actual configured C2 parameter values and file reference for an existing built payload.
+
+                Args:
+                    payload_uuid: The Mythic payload UUID to inspect.
+                Returns:
+                    str: JSON string containing payload metadata, file reference, and configured C2 values.
+                """
+                try:
+                    result = await self.execute_tool("get_payload_c2_config", payload_uuid=payload_uuid)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing get_payload_c2_config: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return get_payload_c2_config
+        elif name == "download_payload":
+            @tool
+            async def download_payload(payload_uuid: str) -> str:
+                """Download a built payload for reuse and return the Mythic file reference to redeploy it.
+
+                Args:
+                    payload_uuid: The Mythic payload UUID to download/reuse.
+                Returns:
+                    str: JSON string containing the payload UUID, filename, Mythic agent_file_id, and downloaded byte count.
+                """
+                try:
+                    result = await self.execute_tool("download_payload", payload_uuid=payload_uuid)
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing download_payload: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return download_payload
+        elif name == "delete_payload":
+            @tool
+            async def delete_payload(payload_uuid: str, confirm_delete_successful: bool = False) -> str:
+                """Safely soft-delete a junk Mythic payload after verifying it has no callbacks.
+
+                Args:
+                    payload_uuid: The Mythic payload UUID to soft-delete.
+                    confirm_delete_successful: Set True only when intentionally deleting a successful payload with zero callbacks.
+                Returns:
+                    str: JSON string describing whether the payload was deleted or refused, and why.
+                """
+                try:
+                    result = await self.execute_tool(
+                        "delete_payload",
+                        payload_uuid=payload_uuid,
+                        confirm_delete_successful=confirm_delete_successful,
+                    )
+                    return str(result)
+                except Exception as e:
+                    logger.error(f"Error executing delete_payload: {e}")
+                    return f"Error executing tool: {str(e)}"
+            return delete_payload
         elif name == "get_all_payload_info":
             @tool
             async def get_all_payload_info() -> str:
@@ -692,4 +1000,3 @@ class MythicAPIManager:
 
 # Global manager instance
 mythic_manager = MythicAPIManager()
-

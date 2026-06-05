@@ -28,7 +28,7 @@ from typing_extensions import NotRequired
 from uuid import UUID
 from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
-from .prompt_loader import load_prompt, filter_tools_by_frontmatter
+from .prompt_loader import load_prompt, filter_tools_by_frontmatter, load_autonomous_overlay
 from . import prompt_context
 from ai.mcp import MCPManager
 
@@ -417,6 +417,16 @@ class _StopCheckMiddleware(AgentMiddleware):
         self._model = model
 
     def before_model(self, state, runtime):
+        self._model._global_step_count = getattr(self._model, "_global_step_count", 0) + 1
+        if (getattr(self._model, "_max_steps", 0)
+                and self._model._global_step_count > self._model._max_steps
+                and not getattr(self._model, "_stop_requested", False)):
+            self._model._global_step_limit_hit = True
+            self._model._stop_requested = True
+            logger.warning(
+                f"🛑 Global step limit ({self._model._max_steps}) reached after "
+                f"{self._model._global_step_count} model steps — halting to prevent a runaway loop."
+            )
         if getattr(self._model, "_stop_requested", False):
             raise _OperatorStopRequested()
         return None
@@ -785,7 +795,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "auto"):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "auto", autonomous_solve: bool = False, max_steps: int = 200):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -796,6 +806,7 @@ class Model:
         self.provider = provider
         self.model = model
         self.mode = mode if mode in ("auto", "supervised") else "auto"
+        self._autonomous_solve = bool(autonomous_solve)
         self.graph = None
         self.verbose = False
         self.is_interactive = False
@@ -811,6 +822,9 @@ class Model:
         # loop checks it between super-steps and breaks, so an operator `exit`/stop actually
         # terminates a running chat session (at the next step boundary) instead of running away.
         self._stop_requested = False
+        self._max_steps = int(max_steps) if max_steps else 0  # 0 = unlimited
+        self._global_step_count = 0
+        self._global_step_limit_hit = False
         # Initialize dynamic data cache
         self._payload_names = None
         self._c2_profiles = None
@@ -856,6 +870,23 @@ class Model:
         self.state["_message_seq"] = self._message_seq
         logger.debug(f"🔢 Model._next_seq: returned seq={seq}, state now has _message_seq={self._message_seq}")
         return seq
+
+    def _apply_autonomous_overlay(self, prompt: str, role: str) -> str:
+        """Append the DEMO-ONLY autonomous-solve overlay for `role` when enabled.
+
+        When self._autonomous_solve is False (default) the prompt is returned
+        UNCHANGED (literal early return - byte identity matters). When enabled,
+        the role's overlay section is appended; an empty section raises (fail loud).
+        """
+        if not self._autonomous_solve:
+            return prompt
+        section = load_autonomous_overlay(role)
+        if not section.strip():
+            raise ValueError(
+                f"autonomous_solve enabled but overlay section for role '{role}' is empty"
+            )
+        logger.debug(f"_apply_autonomous_overlay: applied autonomous-solve overlay for role '{role}'")
+        return prompt + "\n\n" + section
 
     def _get_base_chat_model(self) -> BaseChatModel | None:
         """Initialize and return the BaseChatModel based on provider and model."""
@@ -1693,6 +1724,7 @@ class Model:
         commands_text = prompt_context.commands_text(self)
 
         prompt = load_prompt("mythic_operator", commands_text=commands_text)
+        prompt = self._apply_autonomous_overlay(prompt, "Mythic_Operator")
         if not self.state["mythic_operator_messages"]:
             self.state["mythic_operator_messages"].append(SystemMessage(content=prompt))
         # Tools
@@ -1719,7 +1751,7 @@ class Model:
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
                 agent_name="Mythic_Payload",
-                description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload."
+                description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload. Always include the source/reference callback display_id in handoff_instruction so Mythic_Payload can inherit working C2 config, e.g. 'inherit C2 config from reference callback 22'."
             )
 
             tools = mythic_tools + [handback_tool, transfer_to_payload]
@@ -1752,7 +1784,12 @@ class Model:
                 "get_payload_names",
                 "create_payload",
                 "get_all_payload_info",
+                "get_all_payloads",
                 "get_c2_profiles_for_payload",
+                "get_callback_c2_config",
+                "get_payload_c2_config",
+                "download_payload",
+                "delete_payload",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
@@ -1821,6 +1858,7 @@ class Model:
     def _supervisor_agent(self):
         name = "Supervisor"
         prompt = load_prompt("supervisor")
+        prompt = self._apply_autonomous_overlay(prompt, "Supervisor")
         if not self.state["supervisor_messages"]:
             self.state["supervisor_messages"].append(SystemMessage(content=prompt))
 
@@ -2270,7 +2308,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # Resume the paused graph with the decision payload the installed middleware expects.
         async for event in self.graph.astream(
             Command(resume={"decisions": decisions}),
-            {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
+            {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
         ):
             if self._stop_requested:
                 logger.info("🛑 Stop requested — terminating graph execution (HITL resume)")
@@ -2418,7 +2456,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             hitl_interrupted = False
             async for event in self.graph.astream(
                 self.state,
-                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 75}
+                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 150}
             ):
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
                 # Model; halt before driving the next super-step so the session can't run away.
@@ -2556,9 +2594,20 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except _OperatorStopRequested:
             # Kill-switch fired inside an agent turn (finer-grained than the between-super-steps
             # check). End the session cleanly instead of surfacing it as an error.
-            logger.info("🛑 Operator stop honored inside agent loop — terminating session")
+            if getattr(self, "_global_step_limit_hit", False):
+                stop_message = (
+                    f"\n🛑> Halted: global step limit ({self._max_steps}) reached; "
+                    "the run may be looping without progress.\n"
+                )
+                logger.info(
+                    f"🛑 Global step limit stop honored inside agent loop after "
+                    f"{self._global_step_count} model steps"
+                )
+            else:
+                stop_message = "\n🛑> Session stopped by operator.\n"
+                logger.info("🛑 Operator stop honored inside agent loop — terminating session")
             try:
-                await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+                await self._stream_message_to_mythic(stop_message)
             except Exception:
                 pass
             return ""
@@ -2941,7 +2990,7 @@ Continue now.""")
                     # Stream continuation with raised recursion limit (T1.4: 50 -> 75)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (continue branch)")
@@ -3064,7 +3113,7 @@ Continue now.""")
                     # Stream new task direction with raised recursion limit (T1.4: 25 -> 75)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 75}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (redirect branch)")
