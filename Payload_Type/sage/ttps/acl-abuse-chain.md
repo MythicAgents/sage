@@ -70,19 +70,35 @@ a target, this document maps the edge type to the appropriate exploitation techn
 | BloodHound Edge | Target Type | Exploitation Path | Primary Tool |
 |----------------|-------------|------------------|--------------|
 | `GenericAll` | User | Whisker (shadow cred) OR password reset | Whisker preferred |
-| `GenericAll` | Group | Add self to group | PowerView / AD cmdlets |
+| `GenericAll` | Group | Add self/member to group over LDAP | **StandIn** `--group --ntaccount --add` (non-PS, Apollo inline-assembly) · impacket-dacledit (Linux/ticket) · PowerView only if already loaded |
 | `GenericAll` | Computer | Whisker (shadow cred) OR RBCD via StandIn | Whisker preferred |
 | `GenericAll` | GPO | Modify GPO for code exec / local admin | SharpGPOAbuse |
 | `GenericWrite` | User | Whisker (shadow cred) OR SPN set for delegation | Whisker preferred |
 | `GenericWrite` | Computer | Whisker (shadow cred) OR msDS-AllowedToDelegateTo | Whisker preferred |
-| `WriteDACL` | Any | Grant self GenericAll → then act | PowerView Add-DomainObjectAcl |
-| `WriteOwner` | Any | Take ownership → WriteDACL → GenericAll | PowerView Set-DomainObjectOwner |
-| `AddSelf` | Group | Add self to group | Net group or PowerView |
-| `AddMember` | Group | Add any principal to group | PowerView |
+| `WriteDACL` | Any | Grant self GenericAll → then act | **impacket-dacledit** / **StandIn** (non-PS) · PowerView Add-DomainObjectAcl only if loaded |
+| `WriteOwner` | Any | Take ownership → WriteDACL → GenericAll | **impacket-owneredit** / **StandIn** (non-PS) · PowerView Set-DomainObjectOwner only if loaded |
+| `AddSelf` | Group | Add self to group | **StandIn** `--group --ntaccount --add` (non-PS) · Net group · PowerView if loaded |
+| `AddMember` | Group | Add any principal to group | **StandIn** `--group --ntaccount --add` (non-PS) · PowerView if loaded |
 | `ForceChangePassword` | User | Reset password (NOISY — prefer Whisker) | Set-DomainUserPassword |
 | `Owns` | Any | Same as WriteOwner | PowerView |
 | `AllExtendedRights` | User | Whisker OR password reset | Whisker preferred |
 | `GenericAll` | Domain | DCSync rights self-grant | lsadump::dcsync / apollo dcsync |
+
+## Non-PowerShell execution (OPSEC-scoped / inline-assembly only)
+
+When PowerShell is out of scope (autonomous solve runs scoped to in-memory .NET assemblies + BOFs, no
+`powershell`/`powershell_import`), PowerView is NOT available — do not route group/ACL writes through it.
+Use the non-PowerShell equivalents:
+
+| Operation | Non-PowerShell tool | Syntax |
+|-----------|--------------------|--------|
+| Add a principal to a group (GenericAll/AddSelf/AddMember on group) | **StandIn** (Apollo inline-assembly) | `StandIn.exe --group "Domain Admins" --ntaccount "DOMAIN\User" --add` — see `ttps/standin.md` |
+| Write/modify a DACL (WriteDACL/WriteOwner → grant rights) | **impacket-dacledit** / **StandIn** (Linux foothold w/ ticket, or Apollo) | `dacledit.py -action write -rights FullControl -principal attacker -target-dn <DN> domain/user -k` |
+| Read/verify an object's DACL before acting | **SharpObjectACL** (read-only) | `SharpObjectACL.exe -target "<DN>"` |
+
+StandIn is the primary final-hop tool for adding a controlled account to `Domain Admins` over LDAP from
+the current Kerberos context — it does not touch PowerShell. SharpObjectACL only *reads* DACLs; it cannot
+write — pair it with StandIn/impacket-dacledit for the write.
 
 ## Why Whisker Is Usually Preferred
 

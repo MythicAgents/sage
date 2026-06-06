@@ -18,6 +18,11 @@ except ImportError:  # allow running this module directly for manual testing
     import ttp_library
 
 try:
+    from . import command_builder
+except ImportError:  # allow running this module directly for manual testing
+    import command_builder
+
+try:
     from .footprint import footprint
 except ImportError:
     from footprint import footprint
@@ -1241,6 +1246,59 @@ class MythicTools:
         except Exception:
             return
 
+    def _apply_task_result_class(self, fail_key, result_class: str) -> str:
+        attempts = self._task_failure_counts.get(fail_key, 0)
+        decision = command_builder.breaker_decision(result_class, attempts)
+        if decision == "reset":
+            self._task_failure_counts.pop(fail_key, None)
+        elif decision == "stop":
+            self._task_failure_counts[fail_key] = max(attempts, 2)
+        else:
+            self._task_failure_counts[fail_key] = attempts + 1
+        return decision
+
+    def _format_task_stop(
+        self,
+        fail_key,
+        command: str,
+        callback_display_id: int,
+        result_class: str,
+        reason: str,
+        repair_hint: str | None = None,
+    ) -> str:
+        if result_class == command_builder.ResultClass.GENUINE.value:
+            return f"genuine failure — not retrying: {reason}"
+        if result_class == command_builder.ResultClass.CONSTRUCTION.value:
+            hint = f" {repair_hint}" if repair_hint else ""
+            return (
+                f"STOP — construction failure for command '{command}' on callback "
+                f"{callback_display_id}; not retrying identical parameters.{hint}"
+            )
+        count = self._task_failure_counts.get(fail_key, 2)
+        return (
+            f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
+            f"failed {count} times. Do NOT re-issue it "
+            f"with cosmetically different empty parameters ({{}}, '', '\"\"' are all equivalent to 'no arguments'). "
+            f"The failure appears transient but has hit the bounded retry cap. Report this to the operator, check "
+            f"callback/task status, or choose a different approach. Last failure: {reason}"
+        )
+
+    async def _construction_repair_hint(self, command, parameters, callback_display_id, fallback: str = "") -> str | None:
+        try:
+            if not isinstance(parameters, dict) or not parameters:
+                return fallback or None
+            param_schema = await self._fetch_command_schema(command, callback_display_id)
+            if not param_schema:
+                return fallback or None
+            resolved = command_builder.resolve_params(param_schema, parameters, command=command)
+            if resolved.repair:
+                return f"Repair hint: {resolved.repair}"
+            if resolved.notes:
+                return f"Resolver notes: {resolved.notes}"
+            return fallback or None
+        except Exception:
+            return fallback or None
+
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
         """
         Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
@@ -1268,6 +1326,22 @@ class MythicTools:
         ):
             parameters = ""
 
+        # If the model passed parameters as a JSON OBJECT string (e.g. '{"command": "gpupdate /force"}'),
+        # parse it to a dict so the deterministic resolver below applies. Otherwise a string-form param with
+        # prior-key names bypasses the resolver (isinstance dict == False) and reaches Mythic literally — which
+        # is exactly how {"command": ...} got stringified into a "'{\"command\":' is not recognized" failure.
+        # Only JSON objects are parsed; bare command-lines ("gpupdate /force") and dash-strings ("-path /x")
+        # do not start with "{" and pass through unchanged for Mythic's own CLI parsing.
+        if isinstance(parameters, str):
+            _stripped = parameters.strip()
+            if _stripped.startswith("{") and _stripped.endswith("}"):
+                try:
+                    _parsed = json.loads(_stripped)
+                    if isinstance(_parsed, dict):
+                        parameters = _parsed
+                except (ValueError, TypeError):
+                    pass
+
         # Circuit breaker: refuse to re-issue a command that has already failed repeatedly
         # with the same (normalized) parameters on the same callback. Without this, a
         # transient "Failed to create task" or a parse error sends the model into an
@@ -1287,12 +1361,65 @@ class MythicTools:
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
 
-        # Deterministic pre-flight: catch name/group/ChooseOne errors with an actionable correction
-        # instead of burning a Mythic round-trip + a circuit-breaker count on an opaque error.
+        # Deterministic pre-flight: first repair prior-key names and group mixes against the
+        # live schema, then keep the existing validator as the conservative hard stop.
         if isinstance(parameters, dict) and parameters:
+            try:
+                param_schema = await self._fetch_command_schema(command, callback_display_id)
+                if param_schema:
+                    original_parameters = dict(parameters)
+                    resolved = command_builder.resolve_params(param_schema, parameters, command=command)
+                    if resolved.ok:
+                        parameters = resolved.params
+                        if parameters != original_parameters:
+                            logger.debug(
+                                f"🛡️ ARGRES command={command} group={resolved.group} "
+                                f"params={sorted(parameters.keys())} notes={resolved.notes}"
+                            )
+                            fail_key = (
+                                command,
+                                callback_display_id,
+                                json.dumps(parameters, sort_keys=True),
+                            )
+                            if self._task_failure_counts.get(fail_key, 0) >= 2:
+                                return (
+                                    f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
+                                    f"failed {self._task_failure_counts[fail_key]} times. Do NOT re-issue it with cosmetically different "
+                                    f"empty parameters ({{}}, '', '\"\"' are all equivalent to 'no arguments'). The parameter format is "
+                                    f"likely wrong or the failure is environmental. Report this to the operator, consult "
+                                    f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
+                                )
+                    else:
+                        result_class = command_builder.classify_result(command, resolved.repair or "")
+                        decision = self._apply_task_result_class(fail_key, result_class)
+                        if decision == "stop":
+                            return self._format_task_stop(
+                                fail_key,
+                                command,
+                                callback_display_id,
+                                result_class,
+                                resolved.repair or f"Invalid parameters for command '{command}'.",
+                                resolved.repair,
+                            )
+                        return resolved.repair or f"Invalid parameters for command '{command}'."
+            except Exception as e:
+                try:
+                    logger.info(f"🛡️ ARGRES failed_open command={command} reason=exception:{e}")
+                except Exception:
+                    pass
             _validation_error = await self._validate_command_parameters(command, parameters, callback_display_id)
             if _validation_error:
-                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
+                result_class = command_builder.classify_result(command, _validation_error)
+                decision = self._apply_task_result_class(fail_key, result_class)
+                if decision == "stop":
+                    return self._format_task_stop(
+                        fail_key,
+                        command,
+                        callback_display_id,
+                        result_class,
+                        _validation_error,
+                        _validation_error,
+                    )
                 return _validation_error
 
         _fp = await self._action_footprint(command, parameters, callback_display_id)
@@ -1315,23 +1442,61 @@ class MythicTools:
                     timeout=timeout + 20,
                 )
             except asyncio.TimeoutError:
-                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
-                return (
+                timeout_result = (
                     f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
                     f"{callback_display_id}. The task was issued but did not return output in time "
                     f"(the agent may be slow/long-running, or unresponsive). Use check_callback_alive "
                     f"and get_task_history_for_callback to check status; do NOT blindly re-issue."
                 )
+                result_class = command_builder.classify_result(command, timeout_result)
+                decision = self._apply_task_result_class(fail_key, result_class)
+                if decision == "stop":
+                    return self._format_task_stop(
+                        fail_key,
+                        command,
+                        callback_display_id,
+                        result_class,
+                        timeout_result,
+                    )
+                return timeout_result
             if results is None:
-                self._task_failure_counts.pop(fail_key, None)
+                result_class = command_builder.classify_result(command, "No output returned from task.")
+                decision = self._apply_task_result_class(fail_key, result_class)
+                if decision == "stop":
+                    return self._format_task_stop(
+                        fail_key,
+                        command,
+                        callback_display_id,
+                        result_class,
+                        "No results returned from task.",
+                    )
                 return "No results returned from task."
             results_str = str(results)
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
-            if _is_task_failure_output(results_str):
-                self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
-            else:
-                self._task_failure_counts.pop(fail_key, None)
+            result_class = command_builder.classify_result(command, results_str)
+            decision = self._apply_task_result_class(fail_key, result_class)
+            if result_class == command_builder.ResultClass.CONSTRUCTION.value:
+                repair_hint = await self._construction_repair_hint(command, parameters, callback_display_id, results_str)
+                if decision == "stop":
+                    return self._format_task_stop(
+                        fail_key,
+                        command,
+                        callback_display_id,
+                        result_class,
+                        results_str,
+                        repair_hint,
+                    )
+                if repair_hint:
+                    results_str += f"\n\n[SAGE REPAIR] {repair_hint}"
+            elif decision == "stop":
+                return self._format_task_stop(
+                    fail_key,
+                    command,
+                    callback_display_id,
+                    result_class,
+                    results_str,
+                )
             # Reactive AV/Defender hint: a remote-exec/lateral command that was issued but failed at the
             # EXECUTION layer (not arg-format) on a Windows host is a classic .NET-beacon-quarantined signal.
             # Surface Merlin (Go) as the actionable alternative so the agent doesn't re-permute Apollo args.
@@ -1367,8 +1532,18 @@ class MythicTools:
                 pass
             return results_str
         except Exception as e:
-            self._task_failure_counts[fail_key] = self._task_failure_counts.get(fail_key, 0) + 1
-            return f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
+            result_class = command_builder.classify_result(command, error_result, str(e))
+            decision = self._apply_task_result_class(fail_key, result_class)
+            if decision == "stop":
+                return self._format_task_stop(
+                    fail_key,
+                    command,
+                    callback_display_id,
+                    result_class,
+                    error_result,
+                )
+            return error_result
 
     async def list_open_artifacts(self) -> str:
         """List artifacts this run has created (files dropped, beacons planted) that have NOT been cleaned up, so you can remove them at sub-goal completion for OPSEC. Returns a JSON list."""
@@ -1826,6 +2001,48 @@ class MythicTools:
             logger.debug(f"Could not resolve payload type for callback {callback_display_id}: {e}")
         return None
 
+    async def _fetch_command_schema(self, command, callback_display_id):
+        """Resolve the parameter-group schema for `command` on the callback's payload type.
+
+        Single in-module schema source shared by the resolver pre-flight and
+        `_validate_command_parameters`. Reuses the same `command(...) { commandparameters {...} }`
+        query that backs `get_all_commands_for_payloadtype`, lazily populating `self._cmd_schema_cache`
+        keyed by (payload_type, command). Returns the list of param dicts, or None when the schema
+        cannot be fetched (no client / no payload type / no schema / query error) so callers FAIL OPEN
+        and fall through to today's behavior byte-identically. Never raises."""
+        try:
+            if self.client is None:
+                return None
+            payload_type = await self._resolve_payload_type(callback_display_id)
+            if not payload_type:
+                return None
+            if not hasattr(self, "_cmd_schema_cache"):
+                self._cmd_schema_cache = {}
+
+            cache_key = (payload_type, command)
+            if cache_key not in self._cmd_schema_cache:
+                query = f"""
+                    query CmdParamSchema {{
+                      command(where: {{payloadtype: {{name: {{_eq: "{payload_type}"}}}}, cmd: {{_eq: "{command}"}}}}) {{
+                        cmd
+                        commandparameters {{ name cli_name type parameter_group_name required choices default_value }}
+                      }}
+                    }}
+                """
+                try:
+                    result = await mythic.execute_custom_query(self.client, query)
+                    commands = result.get("command") if isinstance(result, dict) else None
+                    if not commands:
+                        self._cmd_schema_cache[cache_key] = None
+                    else:
+                        self._cmd_schema_cache[cache_key] = commands[0].get("commandparameters")
+                except Exception:
+                    self._cmd_schema_cache[cache_key] = None
+
+            return self._cmd_schema_cache.get(cache_key)
+        except Exception:
+            return None
+
     async def _validate_command_parameters(self, command, parameters, callback_display_id):
         """Pre-flight: validate a dict of params against the command's parameter-group schema.
         Returns None when OK (or when validation cannot be performed -> FAIL OPEN), else an
@@ -1837,37 +2054,8 @@ class MythicTools:
             if self.client is None:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_client")
                 return None
-            payload_type = await self._resolve_payload_type(callback_display_id)
-            if not payload_type:
-                logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_payload_type")
-                return None
-            if not hasattr(self, "_cmd_schema_cache"):
-                self._cmd_schema_cache = {}
 
-            cache_key = (payload_type, command)
-            if cache_key not in self._cmd_schema_cache:
-                query = f"""
-                    query CmdParamSchema {{
-                      command(where: {{payloadtype: {{name: {{_eq: "{payload_type}"}}}}, cmd: {{_eq: "{command}"}}}}) {{
-                        cmd
-                        commandparameters {{ name cli_name type parameter_group_name required choices }}
-                      }}
-                    }}
-                """
-                try:
-                    result = await mythic.execute_custom_query(self.client, query)
-                    commands = result.get("command") if isinstance(result, dict) else None
-                    if not commands:
-                        self._cmd_schema_cache[cache_key] = None
-                        logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
-                        return None
-                    self._cmd_schema_cache[cache_key] = commands[0].get("commandparameters")
-                except Exception:
-                    self._cmd_schema_cache[cache_key] = None
-                    logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
-                    return None
-
-            param_list = self._cmd_schema_cache.get(cache_key)
+            param_list = await self._fetch_command_schema(command, callback_display_id)
             if not param_list:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
                 return None
