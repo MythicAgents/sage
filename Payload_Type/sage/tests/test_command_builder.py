@@ -234,15 +234,26 @@ def test_file_vs_registered_filename_selects_exact_group():
         _param("arguments", "New File", required=False),
     ]
 
+    # A registered name on the registered selector resolves to the Default group.
     registered = resolve_params(schema, {"filename": "Rubeus.exe", "arguments": "klist"}, command="execute_assembly")
-    uploaded = resolve_params(schema, {"file": "agent-file-uuid", "arguments": "klist"}, command="execute_assembly")
-
     assert registered.ok is True
     assert registered.group == "Default"
     assert registered.params == {"filename": "Rubeus.exe", "arguments": "klist"}
-    assert uploaded.ok is True
-    assert uploaded.group == "New File"
-    assert uploaded.params == {"file": "agent-file-uuid", "arguments": "klist"}
+
+    # A reference placed on the File/upload arg is REROUTED to the registered selector + Default group. Sage
+    # references already-registered tools; routing a registered ref through the "New File" upload group (esp.
+    # with a UUID) selects the wrong group and crashes Merlin / misbehaves on Apollo. Regression guard for the
+    # cb41 (merlin `file`+UUID) / cb44 (apollo `assembly_file`+UUID) bug.
+    rerouted = resolve_params(schema, {"file": "Rubeus.exe", "arguments": "klist"}, command="execute_assembly")
+    assert rerouted.ok is True
+    assert rerouted.group == "Default"
+    assert rerouted.params == {"filename": "Rubeus.exe", "arguments": "klist"}
+    assert any("rerouted" in note for note in rerouted.notes)
+
+    # Even a UUID on the upload arg must NOT select the "New File"/upload (crash) path — it reroutes to the
+    # registered selector (and then fails choice validation with a repair hint pointing at registered names).
+    uuid_ref = resolve_params(schema, {"file": "39a20f95-4065-4cdd-9084-ce88c1d132fc"}, command="execute_assembly")
+    assert uuid_ref.group != "New File"
 
 
 def test_classify_parameter_group_mismatch_as_construction():

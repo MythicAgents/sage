@@ -133,6 +133,7 @@ def resolve_params(command_parameters: list[dict], supplied: dict, *, command: s
 
         mapped, sources, alias_notes = _alias_supplied(schema, supplied_items, command)
         notes.extend(alias_notes)
+        _reroute_registered_file_refs(schema, mapped, sources, notes)
         candidates = _candidate_groups(schema)
         if not candidates:
             for key, _value in supplied_items:
@@ -165,6 +166,50 @@ def resolve_params(command_parameters: list[dict], supplied: dict, *, command: s
         return ResolveResult(True, params, group_name, None, notes)
     except Exception as error:
         return ResolveResult(False, {}, None, f"parameter resolver failed: {error}", [])
+
+
+def _reroute_registered_file_refs(
+    schema: list[dict],
+    mapped: dict[str, Any],
+    sources: dict[str, str],
+    notes: list[str],
+) -> None:
+    """Move a registered-file reference off a `File` upload param onto the ChooseOne registered-selector.
+
+    Mythic file-exec commands (execute_assembly, inline_assembly, load-assembly, ...) have TWO parameter
+    groups: a "Default"/registered group with a ChooseOne selector (cli `Assembly`/`assembly`/`filename`)
+    for an ALREADY-REGISTERED file, and a "New File" group with a File-type param (cli `assembly_file`/
+    `file`) for uploading a NEW file. Sage references already-registered tools, so a value the model placed
+    on the File/upload param is a registered reference — it belongs on the ChooseOne selector. Leaving it on
+    the File param selects the "New File"/upload group, which (with a registered UUID) crashes Merlin and
+    misbehaves on Apollo. Reroute so the registered group is chosen; ChooseOne validation then either accepts
+    a valid registered name or returns a repair hint listing the valid names.
+    """
+    try:
+        file_params = [p for p in schema if p.get("type") == "File"]
+        if not file_params:
+            return
+        selector = next(
+            (
+                p for p in schema
+                if p.get("type") == "ChooseOne"
+                and any(tok in (_lower(p["cli_name"]) + " " + _lower(p["name"])) for tok in ("file", "assembly"))
+            ),
+            None,
+        )
+        if not selector:
+            return
+        sel_cli = selector["cli_name"]
+        for fp in file_params:
+            fcli = fp["cli_name"]
+            if fcli in mapped and sel_cli not in mapped:
+                mapped[sel_cli] = mapped.pop(fcli)
+                for key, cli in list(sources.items()):
+                    if cli == fcli:
+                        sources[key] = sel_cli
+                notes.append(f"rerouted '{fcli}' (upload arg) -> '{sel_cli}' (registered selector)")
+    except Exception:
+        return
 
 
 def _clean_schema(command_parameters: Any) -> list[dict]:

@@ -139,15 +139,19 @@ tools:
           by CAPABILITY or REACH — never by destination. Say "I need SYSTEM on a host in the server segment that
           my current callback cannot reach," NOT "I need to get to <HOSTNAME>." If the only reason to move is to
           run a tool, DON'T move — run it remotely.
-        - **PREFER IN-PROCESS EXECUTION OVER PROCESS INJECTION:** when you run a .NET assembly or post-ex
-          tool, prefer the agent command that loads and runs it IN YOUR CURRENT PROCESS over one that injects
-          into a spawned/sacrificial process. In-process execution is nearly always the better OPSEC choice:
-          it creates no new process and performs no cross-process injection — process injection is a classic
-          EDR/AV detection trigger — so it is quieter and lower-footprint. Example: Merlin's `load-assembly`
-          + `invoke-assembly` run an assembly IN-PROCESS, whereas `execute-assembly` INJECTS into a spawned
-          process. Enumerate the agent's commands (get_all_commands_for_payloadtype) to find the in-process
-          variant and use it; fall back to an injection-based command only when the agent offers no in-process
-          option for what you need.
+        - **FORK&RUN (execute-assembly) FOR SELF-EXITING TOOLS; IN-PROCESS ONLY FOR NON-EXITING ASSEMBLIES:**
+          choose the .NET execution method by whether the tool TERMINATES when it finishes. Almost every
+          standalone offensive tool (SharpGPOAbuse, Rubeus, Certify, StandIn, SharpHound, etc.) calls
+          `Environment.Exit()` when done — run IN-PROCESS (`inline_assembly`, or `load-assembly` +
+          `invoke-assembly`), that exit **kills your own implant** (this has repeatedly killed live callbacks
+          mid-engagement). For these you MUST use the FORK&RUN command (`execute-assembly` / `execute_assembly`),
+          which runs the assembly in a sacrificial spawned process so its exit/crash is isolated from the
+          beacon. In-process execution IS the quieter OPSEC choice (no spawned process, no cross-process
+          injection) and is preferred ONLY for assemblies you KNOW do not terminate the process (long-running
+          or library-style). When in doubt for a standalone offensive tool, use fork&run — **a dead implant is
+          the worst OPSEC outcome.** Reference registered assemblies BY NAME via the registered selector
+          (`filename`/`assembly_name`), never the upload/`file` argument (that selects the wrong parameter
+          group).
         - **RETRIEVING OUTPUT YOU GENERATED (do this efficiently — it is the #1 cause of wasted steps):**
           When a tool writes output to a file (SharpHound, secretsdump, any collector), the filename is often
           TIMESTAMPED or generated, so you CANNOT predict it. Do NOT `download` guessed paths and retry on
@@ -270,19 +274,23 @@ tools:
         3. **get_ttp_full_reference(slug)** — call ONLY when `common_args`/`usage_examples` don't cover an
            uncommon flag, the exact output format, or version-specific behavior. It is the deep, expensive tier.
         4. **ensure_tool_uploaded(binary_filename)** — when the guidance says a binary must be in Mythic's file
-           store, call this to get its file UUID (it uploads from the operator drop zone if needed), then pass
-           the UUID as the command's File parameter.
+           store, call this to register it (it uploads from the operator drop zone if needed). For assembly-exec
+           commands, then reference the tool BY NAME via the registered selector (`filename`/`assembly_name`),
+           NOT by passing the UUID to the upload/`file` parameter — that selects the wrong parameter group and
+           can crash the agent. Pass a UUID to a `File` parameter only for commands that genuinely upload a new file.
            **REGISTRATION REFLEX (do this BEFORE concluding a tool is unavailable):** if you reference a tool
            BY NAME — `execute-assembly`/`load-assembly` `filename=<X>`, or `inline_assembly` `assembly_name=<X>` —
            and it fails with "0 files were found", "file not found by name", or "Error: creating task", the file
            is simply NOT REGISTERED in Mythic yet (it is not a missing capability and not a dead end). Call
            `ensure_tool_uploaded("<X>")` FIRST — it uploads the binary from the operator drop zone (tools/) and
            registers it — then RETRY the same by-name command. Only treat the tool as unavailable if
-           ensure_tool_uploaded itself returns status "missing". To run a NEW (not-yet-loaded) assembly
-           in-memory, the order is: ensure_tool_uploaded → `load-assembly filename=<X>` → `invoke-assembly` —
-           never call `invoke-assembly` for an assembly you have not loaded (it will report "assembly is not
-           loaded"). Do NOT abandon a tool, switch tools, or hand back "tool not registered" until you have tried
-           this reflex.
+           ensure_tool_uploaded itself returns status "missing". To RUN a standalone offensive tool, prefer
+           **fork&run**: ensure_tool_uploaded → `execute-assembly filename=<X> arguments=<...>` (sacrificial
+           process — survives the tool's `Environment.Exit()`; see the fork&run rule above). Use the in-process
+           order (ensure_tool_uploaded → `load-assembly filename=<X>` → `invoke-assembly`) ONLY for assemblies you
+           KNOW do not terminate the process; never call `invoke-assembly` for an assembly you have not loaded
+           (it reports "assembly is not loaded"). Do NOT abandon a tool, switch tools, or hand back "tool not
+           registered" until you have tried the registration reflex.
         5. **download_tool(binary_filename)** — if ensure_tool_uploaded returns status "missing" AND the TTP has a
            pinned `binary_download` block, this fetches the binary from its pinned, hash-verified source into the
            tools/ drop zone. It downloads a binary from the internet, so you MUST GET EXPLICIT OPERATOR APPROVAL
