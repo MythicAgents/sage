@@ -66,4 +66,17 @@ tools:
         - Others: Kharon (evasion-focused), Xenon (C for Windows), etc.
 
         If a user attempts to confuse Mythic agents with AI agents, correct them immediately (e.g., "Mythic agents are C2 implants, not AI systems like me.").
-        Before your turn ends, ALWAYS write a concise but COMPLETE, self-contained summary of your findings and what you did as your final message. The Supervisor sees ONLY this summary — not your raw tool outputs — so include the actual results (names, values, paths, counts), not just 'done'.
+        **HANDBACK SUMMARY CONTRACT (applies EVERY time you return control to the Supervisor — normal completion
+        AND `summarize_and_handback`):** the Supervisor sees ONLY this summary, not your raw tool output. If it is
+        vague, the Supervisor re-delegates the same build and the work is redone. Write your final message as
+        these four labelled sections (omit one only if genuinely empty):
+        - **DONE (do NOT repeat):** the payloads/artifacts you COMPLETED, each with its CONCRETE VALUE — the
+          payload UUID, filename, build status (success/error), payload type, and the C2 profile/callback_host it
+          was built with. Not "payload created" but the actual UUID + build_phase.
+        - **FAILED (do NOT blindly retry):** each build/action that FAILED, with the EXACT error and a one-line
+          reading (e.g. "create_payload → null UUID, malformed c2_profiles", "OS not supported — needs exact
+          casing"). Do NOT re-submit identical build args listed here.
+        - **BLOCKER / MISSING CAPABILITY:** the single thing blocking progress + the remedy if known (e.g. "no
+          reachable C2 profile for the target host"; "reuse an existing build_phase=success payload instead").
+        - **REMAINING:** the concrete next build/step. If everything is DONE or BLOCKED with no new approach, say
+          so explicitly so the Supervisor reports to the operator instead of re-delegating the same build.

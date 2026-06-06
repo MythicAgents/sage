@@ -458,6 +458,10 @@ class MythicTools:
         # the 75-step budget was exhausted. First failed fetch returns the full output so the agent sees
         # the error once. This is independent of the issue_task circuit breaker (do not touch that).
         self._failed_read_counts: dict[int, int] = {}
+        # Completed-task output cache: a COMPLETED task's output is immutable, so cache it (keyed by
+        # task_display_id) so re-reads of the same finished task don't re-fetch its (often large) output.
+        # Only populated for completed tasks — a running task's output still changes and is never cached.
+        self._task_output_cache: dict[int, str] = {}
 
     async def login(self):
         """Create the Mythic API client connection asynchronously."""
@@ -532,6 +536,61 @@ class MythicTools:
         logger.debug("🛠️ Calling get_all_active_callbacks tool")
         resp = await mythic.get_all_active_callbacks(self.client)
         return json.dumps(resp, sort_keys=True)
+
+    async def list_callbacks(self) -> str:
+        """SLIM callback status — ONE cheap query returning, per active callback, only the minimum needed
+        to answer 'is there a new callback?' and 'is each one still alive?': {id, agent, user, host,
+        integrity, status, secs_since_checkin}. It is ~8x smaller than get_all_active_callbacks AND folds in
+        computed liveness (same logic as check_callback_alive), so for routine situational awareness it
+        replaces BOTH. Use get_all_active_callbacks ONLY when you need full host detail (pid, process_name,
+        IPs, external_ip); use check_callback_alive for a deep single-callback crash assessment."""
+        # HITL: free
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug("🛠️ Calling list_callbacks (slim)")
+        query = """
+            query slimcb {
+              callback(where: {active: {_eq: true}}, order_by: {display_id: asc}) {
+                display_id last_checkin user host integrity_level
+                payload { payloadtype { name } }
+                c2profileparametersinstances(where: {c2profileparameter: {name: {_in: ["callback_interval","callback_jitter"]}}}) { value c2profileparameter { name } }
+              }
+            }
+        """
+        try:
+            resp = await mythic.execute_custom_query(self.client, query)
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e)}, sort_keys=True)
+        callbacks = resp.get("callback", []) if isinstance(resp, dict) else []
+        out = []
+        for cb in callbacks:
+            if not isinstance(cb, dict):
+                continue
+            profile: dict[str, object] = {}
+            for inst in (cb.get("c2profileparametersinstances") or []):
+                if not isinstance(inst, dict):
+                    continue
+                p = inst.get("c2profileparameter")
+                if isinstance(p, dict) and p.get("name") in ("callback_interval", "callback_jitter"):
+                    profile[p["name"]] = inst.get("value")
+            live = _compute_liveness(
+                display_id=cb.get("display_id"),
+                last_checkin=cb.get("last_checkin"),
+                callback_interval=profile.get("callback_interval"),
+                callback_jitter=profile.get("callback_jitter"),
+                tasks=[],
+            )
+            agent = ((cb.get("payload") or {}).get("payloadtype") or {}).get("name")
+            out.append({
+                "id": cb.get("display_id"),
+                "agent": agent,
+                "user": cb.get("user"),
+                "host": cb.get("host"),
+                "integrity": cb.get("integrity_level"),
+                "status": live.get("status"),
+                "secs_since_checkin": live.get("seconds_since_checkin"),
+            })
+        return json.dumps(out, default=str, sort_keys=True)
 
     async def get_all_payload_info(self) -> str:
         """ Get information about ALL payload types in Mythic. """
@@ -1068,32 +1127,62 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call create() first.")
         logger.debug(f"🛠️ Calling create_payload tool for: {payload_type_name}, filename: {filename}")
-        resp = await mythic.create_payload(
-            self.client,
-            payload_type_name=payload_type_name,
-            filename=filename,
-            operating_system=operating_system,
-            c2_profiles=c2_profiles,
-            build_parameters=build_parameters,
-            description=description,
-            include_all_commands= True,  # Include all commands in the payload
-            custom_return_attributes=custom_attributes,
-        )
-        # Surface the Agent File ID (the Mythic *file* UUID) at the top level so the model does not
-        # confuse it with the Payload UUID. File tools (upload_file_by_file_uuid, download_file) need
-        # `agent_file_id` from filemetum — NOT the top-level `uuid`, which identifies the payload.
-        if isinstance(resp, dict):
-            filemetum = resp.get("filemetum")
-            if isinstance(filemetum, list):
-                filemetum = filemetum[0] if filemetum else None
-            resp["agent_file_id"] = filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None
-            resp["payload_uuid"] = resp.get("uuid")
-            resp["_uuid_help"] = (
-                "Pass 'agent_file_id' (the Mythic file UUID) to upload_file_by_file_uuid / download_file. "
-                "'payload_uuid' (a.k.a. 'uuid') identifies the payload, NOT the file — do not pass it to file tools. "
-                "If 'agent_file_id' is null, the build did not produce a file (check build_phase / build_stderr)."
+        try:
+            matched_os, supported_os = await self._resolve_supported_os(payload_type_name, operating_system)
+            if matched_os is not None:
+                operating_system = matched_os
+            elif supported_os:
+                return json.dumps({
+                    "status": "error",
+                    "tool": "create_payload",
+                    "payload_type_name": payload_type_name,
+                    "error": f"operating_system '{operating_system}' is not supported by payload type '{payload_type_name}'.",
+                    "hint": f"Use one of this payload type's exact supported_os values (case-sensitive): {supported_os}.",
+                }, sort_keys=True)
+            resp = await mythic.create_payload(
+                self.client,
+                payload_type_name=payload_type_name,
+                filename=filename,
+                operating_system=operating_system,
+                c2_profiles=c2_profiles,
+                build_parameters=build_parameters,
+                description=description,
+                include_all_commands= True,  # Include all commands in the payload
+                custom_return_attributes=custom_attributes,
             )
-        return json.dumps(resp, sort_keys=True)
+            # Surface the Agent File ID (the Mythic *file* UUID) at the top level so the model does not
+            # confuse it with the Payload UUID. File tools (upload_file_by_file_uuid, download_file) need
+            # `agent_file_id` from filemetum — NOT the top-level `uuid`, which identifies the payload.
+            if isinstance(resp, dict):
+                filemetum = resp.get("filemetum")
+                if isinstance(filemetum, list):
+                    filemetum = filemetum[0] if filemetum else None
+                resp["agent_file_id"] = filemetum.get("agent_file_id") if isinstance(filemetum, dict) else None
+                resp["payload_uuid"] = resp.get("uuid")
+                resp["_uuid_help"] = (
+                    "Pass 'agent_file_id' (the Mythic file UUID) to upload_file_by_file_uuid / download_file. "
+                    "'payload_uuid' (a.k.a. 'uuid') identifies the payload, NOT the file — do not pass it to file tools. "
+                    "If 'agent_file_id' is null, the build did not produce a file (check build_phase / build_stderr)."
+                )
+            return json.dumps(resp, sort_keys=True)
+        except Exception as e:
+            logger.debug(f"create_payload failed for {payload_type_name}/{filename}: {e}")
+            return json.dumps({
+                "status": "error",
+                "tool": "create_payload",
+                "payload_type_name": payload_type_name,
+                "filename": filename,
+                "error": str(e),
+                "hint": (
+                    "The Mythic payload build/creation failed (no payload UUID was produced). This is "
+                    "usually a malformed argument, NOT a transient error — do NOT re-submit identical "
+                    "parameters. Verify: (1) c2_profiles has a valid 'c2_profile' name and the required "
+                    "'c2_profile_parameters' (e.g. callback_host/callback_port) for this payload type — use "
+                    "get_c2_profiles_for_payload to confirm; (2) build_parameters names/values are valid for "
+                    "this payload type; (3) payload_type_name and operating_system are correct. Consider "
+                    "reusing an existing working payload (get_all_payloads / download_payload) instead of building anew."
+                ),
+            }, sort_keys=True)
 
     async def _action_footprint(self, command, params, callback_display_id) -> dict | None:
         try:
@@ -1339,6 +1428,10 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {task_id}")
+        # A completed task's output is immutable — serve a prior fetch from cache instead of re-fetching it.
+        if task_id in self._task_output_cache:
+            logger.debug(f"task {task_id} output served from completed-task cache")
+            return self._task_output_cache[task_id]
         resp = await mythic.get_all_task_output_by_id(mythic=self.client, task_display_id=task_id)
 
         # Decode base64 response_text fields for easier LLM processing
@@ -1374,8 +1467,30 @@ class MythicTools:
             # A later SUCCESSful fetch of the same task_id clears the failed-read counter so a genuinely
             # changed/succeeded task is never clamped.
             self._failed_read_counts.pop(task_id, None)
+            # Cache the output if the task is COMPLETED (its output is then immutable) so subsequent
+            # re-reads return instantly without re-fetching. Running tasks are never cached.
+            try:
+                if await self._is_task_completed(task_id):
+                    self._task_output_cache[task_id] = result
+            except Exception:
+                pass
         return result
-    
+
+    async def _is_task_completed(self, task_display_id: int) -> bool:
+        """True if the Mythic task is in a terminal (completed) state — gates completed-task output caching."""
+        if self.client is None:
+            return False
+        try:
+            r = await mythic.execute_custom_query(
+                self.client,
+                "query tc($id:Int!){ task(where:{display_id:{_eq:$id}}){ completed } }",
+                variables={"id": task_display_id},
+            )
+            rows = r.get("task", []) if isinstance(r, dict) else []
+            return bool(rows and rows[0].get("completed"))
+        except Exception:
+            return False
+
     async def get_all_uploaded_files(self) -> str:
         """
         Get a list of all files uploaded to Mythic.
@@ -1390,6 +1505,31 @@ class MythicTools:
         resp = mythic.get_all_uploaded_files(mythic=self.client)
         data = [item async for item in resp]
         return json.dumps(data, sort_keys=True)
+
+    async def _resolve_supported_os(self, payload_type_name: str, operating_system: str):
+        """Resolve operating_system to the payload type's exact supported_os casing.
+        Returns a (matched_os, supported_list) tuple:
+          - (None, None)            -> could not determine (no client / query failed / empty) -> caller fails OPEN
+          - (None, [..])           -> supported list known but NO case-insensitive match -> caller errors with options
+          - ("Windows", [..])      -> the exact Mythic casing to use
+        """
+        if self.client is None:
+            return None, None
+        try:
+            q = "query OS($n: String!){ payloadtype(where: {name: {_eq: $n}}){ supported_os } }"
+            resp = await mythic.execute_custom_query(self.client, q, variables={"n": payload_type_name})
+            rows = resp.get("payloadtype") if isinstance(resp, dict) else None
+            if not rows:
+                return None, None
+            supported = rows[0].get("supported_os") or []
+            if not isinstance(supported, list) or not supported:
+                return None, None
+            for os_val in supported:
+                if str(os_val).lower() == str(operating_system).lower():
+                    return os_val, supported
+            return None, supported
+        except Exception:
+            return None, None
 
     async def _get_file_metadata(self, file_uuid: str) -> dict | None:
         """Look up filemeta for a Mythic file by its agent_file_id WITHOUT downloading the bytes.
@@ -1417,6 +1557,45 @@ class MythicTools:
         resp = await mythic.execute_custom_query(self.client, query, variables={"uuid": file_uuid})
         rows = resp.get("filemeta") if isinstance(resp, dict) else None
         return rows[0] if rows else None
+
+    async def _latest_download_for_callback(
+        self,
+        callback_display_id: int,
+        name_contains: str = "zip",
+    ) -> dict | None:
+        """Resolve the most-recent COMPLETE, non-deleted file DOWNLOADED FROM the agent on the given
+        callback. Returns a dict with agent_file_id / filename_utf8 / timestamp, or None if no match.
+        `name_contains` is an optional case-insensitive filename substring filter ("" disables it).
+        The join (callback.display_id -> task -> filemeta) was verified against live Mythic."""
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        query = """
+        query LatestDownload($cbid: Int!) {
+            filemeta(
+                where: {
+                    is_download_from_agent: {_eq: true},
+                    complete: {_eq: true},
+                    deleted: {_eq: false},
+                    task: {callback: {display_id: {_eq: $cbid}}}
+                },
+                order_by: {id: desc}, limit: 10
+            ) {
+                agent_file_id
+                filename_utf8
+                timestamp
+            }
+        }
+    """
+        resp = await mythic.execute_custom_query(self.client, query, variables={"cbid": int(callback_display_id)})
+        rows = resp.get("filemeta") if isinstance(resp, dict) else None
+        if not rows:
+            return None
+        needle = (name_contains or "").lower()
+        for row in rows:  # rows are newest-first (id desc)
+            fn = row.get("filename_utf8") or ""
+            if not needle or needle in str(fn).lower():
+                return row
+        return None
 
     async def upload_file_by_file_uuid(
             self,
@@ -1525,28 +1704,77 @@ class MythicTools:
 
     async def stage_file_to_disk(
         self,
-        file_uuid: Annotated[str, "The Mythic file UUID to materialize to local disk (e.g. a downloaded SharpHound ZIP)."],
-        filename: Annotated[str, "Optional filename for the staged file (basename only). Defaults to <uuid>.zip."] = "",
+        file_uuid: Annotated[str, "The Mythic file UUID to materialize. Optional if callback_display_id is given."] = "",
+        callback_display_id: Annotated[int | None, "If set (and file_uuid empty), resolve the MOST RECENT completed file downloaded from this callback (e.g. a just-downloaded SharpHound ZIP) and stage that. This is the reliable path right after a `download`, because the download task output does not expose the file UUID."] = None,
+        filename: Annotated[str, "Optional basename for the staged file (basename only). Defaults to the source filename or <uuid>.zip."] = "",
+        name_contains: Annotated[str, "When resolving by callback, only match files whose name contains this substring (case-insensitive). Defaults to 'zip'; pass '' to match any download."] = "zip",
     ) -> str:
         """Materialize a Mythic file artifact to a local path on the Sage host.
 
         Some local consumers need an on-disk file rather than bytes — notably the BloodHound
         MCP's `file_upload`, which takes an absolute filesystem PATH, not raw content. This
-        downloads the file bytes from Mythic by UUID and writes them into Sage's staging
-        directory, returning the absolute path. Sage and its stdio MCP servers share a
-        filesystem (the MCP is spawned by Sage in the same container/host), so the returned
-        path is directly readable by file_upload. Does NOT send file bytes to the LLM.
+        downloads the file bytes from Mythic by UUID, or resolves the latest completed
+        agent-download for a callback display_id when the UUID is unavailable, and writes
+        them into Sage's staging directory, returning the absolute path. Sage and its stdio
+        MCP servers share a filesystem (the MCP is spawned by Sage in the same container/host),
+        so the returned path is directly readable by file_upload. Does NOT send file bytes to
+        the LLM.
 
         Args:
-            file_uuid: The Mythic file UUID (e.g. from a `download` task result).
-            filename: Optional basename for the staged file; defaults to <uuid>.zip.
+            file_uuid: The Mythic file UUID. Optional if callback_display_id is given.
+            callback_display_id: Resolve the most recent completed agent-download from this callback.
+            filename: Optional basename for the staged file; defaults to source filename or <uuid>.zip.
+            name_contains: Optional case-insensitive source filename substring for callback resolution.
         Returns:
-            str: JSON with status, the absolute local path, and byte count.
+            str: JSON with status, source metadata, the absolute local path, and byte count.
         """
         # HITL: guarded
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling stage_file_to_disk for file UUID: {file_uuid}")
+        row = None
+        source_filename = ""
+        timestamp = ""
+        if file_uuid:
+            resolved_by = "uuid"
+        elif callback_display_id is not None:
+            row = await self._latest_download_for_callback(callback_display_id, name_contains)
+            if row is None:
+                # Event-driven wait: instead of fixed-interval polling, wake on each NEW completed
+                # agent-download and re-check the callback-scoped raw query (which stays the resolver).
+                # Bounded by the subscription timeout. The subscription only signals "something new
+                # landed, re-check"; _latest_download_for_callback does the callback-scoped resolution.
+                try:
+                    async for _new in mythic.subscribe_new_downloaded_files(
+                        self.client, custom_return_attributes="id", timeout=30
+                    ):
+                        row = await self._latest_download_for_callback(callback_display_id, name_contains)
+                        if row is not None:
+                            break
+                except asyncio.TimeoutError:
+                    pass
+                except Exception as e:
+                    # Fail-soft: if the subscription is unavailable, fall back to a brief raw-query poll.
+                    logger.debug(f"subscribe_new_downloaded_files wait failed ({e}); falling back to poll")
+                    for _ in range(3):
+                        await asyncio.sleep(2)
+                        row = await self._latest_download_for_callback(callback_display_id, name_contains)
+                        if row is not None:
+                            break
+                if row is None:
+                    # Final check: a file may have completed during subscription setup (cursor=now race).
+                    row = await self._latest_download_for_callback(callback_display_id, name_contains)
+            if row is None:
+                return json.dumps({"status": "error", "callback_display_id": callback_display_id,
+                                   "error": "No completed agent-download found on this callback. Run the Mythic `download` command for the collection first, then stage."}, sort_keys=True)
+            file_uuid = row["agent_file_id"]
+            source_filename = row.get("filename_utf8") or ""
+            timestamp = row.get("timestamp") or ""
+            if not filename:
+                filename = os.path.basename(source_filename)
+            resolved_by = "callback:" + str(callback_display_id)
+        else:
+            return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
         try:
             file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
         except Exception as e:
@@ -1562,8 +1790,10 @@ class MythicTools:
             target.write_bytes(file_content)
         except Exception as e:
             return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
-        return json.dumps({"status": "staged", "file_uuid": file_uuid,
-                           "path": str(target), "bytes": len(file_content)}, sort_keys=True)
+        logger.info(f"🛠️ staged_for_ingest file_uuid={file_uuid} filename={safe_name} path={target} bytes={len(file_content)} resolved_by={resolved_by}")
+        return json.dumps({"status": "staged", "file_uuid": file_uuid, "filename": safe_name,
+                           "path": str(target), "bytes": len(file_content), "resolved_by": resolved_by,
+                           "source_filename": source_filename, "timestamp": timestamp}, sort_keys=True)
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""

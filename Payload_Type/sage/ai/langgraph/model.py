@@ -44,6 +44,7 @@ from langgraph.errors import GraphRecursionError
 import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
+_AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
 _TOON_SENTINEL = "⟦TOON "
 _TRUNCATION_MARKER = "[truncated"
 _COMPACTION_PROTECTED_TOOLS = frozenset((
@@ -1414,8 +1415,49 @@ class Model:
 
             # Sanitize messages before invoking agent to prevent "multiple non-consecutive system messages" error
             sanitized_channel = self._sanitize_messages(channel)
-            result = await agent_runnable.ainvoke({"messages": sanitized_channel}, invoke_config)
-            updated_channel = result.get("messages", channel)
+
+            # Autonomous keep-going: in an autonomous solve, the Mythic_Operator must not yield control to the
+            # Supervisor by accident (a react agent ends its turn whenever the LLM emits no tool call). If the
+            # Operator finishes a react run WITHOUT an explicit yield (no recursion_handback flag, no transfer_*/
+            # summarize_and_handback tool call), re-invoke it with a continuation nudge — bounded by a cap — so the
+            # only ways out are an explicit handback, a cross-agent transfer, or the cap. Base mode and every other
+            # agent are unaffected (the loop runs exactly once and breaks immediately = current behavior).
+            _autonomous_operator = bool(self._autonomous_solve) and node_name == "Mythic_Operator"
+            _continue_count = 0
+            _agent_input = sanitized_channel
+            while True:
+                result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
+                updated_channel = result.get("messages", channel)
+                if not _autonomous_operator:
+                    break
+                if result.get("recursion_handback"):
+                    break  # explicit handback — let upstream flag handling end/route
+                _new_msgs = updated_channel[original_channel_length:]
+                _explicit_yield = any(
+                    isinstance(m, AIMessage) and any(
+                        ((tc.get("name") or "").startswith("transfer_to_")) or ((tc.get("name") or "") in ("summarize_and_handback", "handback_to_supervisor"))
+                        for tc in (getattr(m, "tool_calls", None) or [])
+                    )
+                    for m in _new_msgs
+                )
+                if _explicit_yield:
+                    break  # cross-agent transfer or explicit handback already routed
+                _last_ai = next((m for m in reversed(_new_msgs) if isinstance(m, AIMessage)), None)
+                _finished_plainly = _last_ai is not None and not (getattr(_last_ai, "tool_calls", None))
+                if _finished_plainly and _continue_count < _AUTONOMOUS_OPERATOR_CONTINUE_CAP:
+                    _continue_count += 1
+                    _nudge = HumanMessage(content=(
+                        "[autonomous-continue] You ended your turn without reaching the objective and without an explicit "
+                        "handback. Per the autonomous-solve overlay you must NOT stop after a sub-goal — execute the NEXT "
+                        "action from your own REMAINING list now. To hand off you MUST call a tool (a plain stop just loops "
+                        "you back here): call `handback_to_supervisor(reason, summary)` when the next step needs another "
+                        "agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or the objective is complete — the "
+                        "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
+                        "limit (it pauses for the operator). Do not stop silently."
+                    ))
+                    _agent_input = self._sanitize_messages(list(updated_channel) + [_nudge])
+                    continue
+                break
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
             returned_messages = updated_channel[original_channel_length:]
@@ -1651,10 +1693,17 @@ class Model:
         a trigger near the floor makes summarization fire every step and thrash (~10s/call) for no gain."""
         # Protect routing/handoff tool results from clearing — they drive graph control.
         _PROTECTED_TOOLS = (
-            "summarize_and_handback", "request_continuation", "respond_to_user",
+            "summarize_and_handback", "handback_to_supervisor", "request_continuation", "respond_to_user",
             "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
             "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
         )
+        # Static, run-constant schema the Mythic_Operator needs constantly — protect its tool output from the
+        # DIGEST so it is fetched ONCE per payload type and kept, not elided-and-re-fetched (run 2058: 16×).
+        # NOT added to compaction protection on purpose: the >4k compaction cap (~16k ceiling) keeps the
+        # retained copy bounded instead of flooding every call with the full ~30k schema. The cheap
+        # names+summaries index already lives un-trimmed in the prompt ({commands_text}); this keeps the
+        # on-demand PARAMETER schema from being re-fetched.
+        _STATIC_SCHEMA_TOOLS = ("get_all_commands_for_payloadtype",)
         mw = [
             # Kill-switch honored INSIDE each agent loop (not just at top-level handoffs) — see
             # _StopCheckMiddleware / task-626. Listed first so it gates before the model call.
@@ -1673,7 +1722,7 @@ class Model:
                     # after a fresh run before tuning further.
                     keep=5,
                     clear_tool_inputs=False,
-                    exclude_tools=_PROTECTED_TOOLS,
+                    exclude_tools=_PROTECTED_TOOLS + _STATIC_SCHEMA_TOOLS,
                     placeholder="[earlier tool output elided to conserve context. Do NOT re-fetch it unless you need a specific detail from THIS task — re-fetching cleared output just re-fills the context you are trying to save.]",
                 )],
                 token_count_method="approximate",
@@ -1730,11 +1779,10 @@ class Model:
         # Tools
         if self.mythic_client is not None:
             mythic_tools = self.mythic_client.get_tools([
-                "get_all_active_callbacks",
+                "list_callbacks",
                 "get_all_commands_for_payloadtype",
                 "issue_task_and_waitfor_task_output",
                 "get_task_history_for_callback",
-                "check_callback_alive",
                 "get_all_task_output_by_task_id",
                 "upload_file_by_file_uuid",
                 "get_all_uploaded_files",
@@ -1744,9 +1792,13 @@ class Model:
                 "list_ttp_categories",
                 "ensure_tool_uploaded",
                 "download_tool",
+                "stage_file_to_disk",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
+            # Explicit autonomous handback to the Supervisor (routes to Supervisor, does NOT end the run) —
+            # the continue-loop consumes plain turn-ends, so this is the Operator's path to cross-agent routing.
+            handback_to_supervisor_tool = _create_handback_to_supervisor_tool()
 
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
@@ -1754,7 +1806,7 @@ class Model:
                 description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload. Always include the source/reference callback display_id in handoff_instruction so Mythic_Payload can inherit working C2 config, e.g. 'inherit C2 config from reference callback 22'."
             )
 
-            tools = mythic_tools + [handback_tool, transfer_to_payload]
+            tools = mythic_tools + [handback_tool, handback_to_supervisor_tool, transfer_to_payload]
             tools = filter_tools_by_frontmatter("mythic_operator", tools)
         else:
             raise ValueError("Mythic client not initialized for Mythic Operator Agent.")
@@ -3254,6 +3306,43 @@ def _create_summarize_handback_tool():
         )
 
     return summarize_and_handback
+
+
+def _create_handback_to_supervisor_tool():
+    """
+    Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
+    to another agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or finalize. This is the
+    explicit autonomous handback path: with the keep-going continue-loop a plain turn-end no longer reaches
+    the Supervisor, so the Operator MUST call this to hand off across agents. Distinct from
+    summarize_and_handback (which ends the run and waits for the user at the recursion limit).
+    """
+    @tool("handback_to_supervisor")
+    def handback_to_supervisor(
+        runtime: ToolRuntime,
+        reason: Annotated[str, "Why you are handing back NOW: the capability/agent needed next (e.g. 'BloodHound ingestion -> route to MCP_Manager', 'payload build -> Mythic_Payload') or that the objective is complete."],
+        summary: Annotated[str, "Structured DONE / FAILED / BLOCKER / REMAINING summary with concrete values (hashes, SIDs, file UUIDs, exact errors)."],
+    ) -> Command:
+        """Yield control to the Supervisor WITHOUT ending the run so it can route to another agent
+        (MCP_Manager for BloodHound graph work, Mythic_Payload for builds) or finalize the objective.
+        Call this the moment the NEXT step needs a capability you do not own, or the objective is reached.
+        Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only."""
+        msg = ToolMessage(
+            content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}",
+            name="handback_to_supervisor",
+            tool_call_id=runtime.tool_call_id,
+        )
+        updated_state = {**runtime.state}
+        updated_state["supervisor_messages"] = [msg]
+        updated_state["messages"] = [msg]
+        updated_state["_last_calling_agent"] = "Mythic_Operator"
+        return Command(
+            goto="Supervisor",
+            update=updated_state,
+            graph=Command.PARENT,
+        )
+
+    return handback_to_supervisor
+
 
 def _create_respond_to_user_tool():
     """
