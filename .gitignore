@@ -27,3 +27,6 @@ Payload_Type/sage/tools/*
 Payload_Type/sage/certs/*.pem
 Payload_Type/sage/sage.log
 Payload_Type/sage/evals/results/
+
+# Sage durable engagement-state ledger (runtime state — never commit)
+.sage_engagement/

@@ -443,6 +443,72 @@ class _StopCheckMiddleware(AgentMiddleware):
         return handler(request)
 
 
+# Imperative directive paired with the observed-state block. A bare status LIST is informational; the
+# operator can still favor an overlay checklist that lists an already-achieved hop. This makes the
+# instruction explicit ("ACHIEVED = DONE, do NOT re-issue"). Shared by the per-turn middleware injection
+# and the continue-loop nudge so both speak with one voice.
+_ENGAGEMENT_STATE_DIRECTIVE = (
+    "The ENGAGEMENT STATE above is authoritative. Any hop whose effect is listed as ACHIEVED is "
+    "DONE — do NOT re-issue it (the gate will only SKIP it, wasting steps). If a hop is achieved "
+    "but its expected follow-on did not occur (e.g. no new callback returned), that is a SEPARATE "
+    "blocker — report it and move on; do NOT re-run the achieved primitive. Advance to the next "
+    "viable hop from the observed state, or call respond_to_user with the blocker if no traversable "
+    "hop remains."
+)
+
+
+class _EngagementStateMiddleware(AgentMiddleware):
+    """Inject a FRESH observed engagement-state block into the operator's per-turn model context on
+    EVERY model call (flag-gated, autonomous-only, fail-open).
+
+    This is the per-turn fix for the mis-wired continue-loop-only injection: the 156x re-proposal of
+    already-achieved hops happens INSIDE a single react run (many model calls, each ending in a tool
+    call), so the `=== ENGAGEMENT STATE` block must be visible at each model call — not only when the
+    operator ends a turn plainly (the rare path the continue-loop nudge covered). Injection is via
+    `request.override(messages=...)`, which is EPHEMERAL for this call only — it is NOT a graph-state
+    update, so the block never accumulates (otherwise 156 calls would append 156 state messages).
+    """
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+        self._last_rendered = None  # for change-only logging (proof-of-injection without log spam)
+
+    def _augment(self, request):
+        try:
+            rendered = self._model._render_engagement_state_for_injection()
+            if not rendered:
+                return request
+            # Proof-of-injection log, deduped to fire only when the observed state CHANGES (a hop newly
+            # achieved, or the first injection). This is the reliable observation surface: the injected
+            # block rides at the TAIL of a ~300KB+ prompt, past Phoenix's 128KB span-attr truncation, so
+            # it would not show in spans or Mythic task output. A handful of greppable lines instead.
+            if rendered != self._last_rendered:
+                self._last_rendered = rendered
+                _first = rendered.splitlines()[0] if rendered else ""
+                logger.info(f"🧭 [engagement-state] injected into operator per-turn context | {_first}")
+            return request.override(messages=list(request.messages) + [HumanMessage(content=rendered)])
+        except Exception:
+            return request  # fail-open: never break a model call over the state block
+
+    def wrap_model_call(self, request, handler):
+        augmented = self._augment(request)
+        if augmented is request:
+            return handler(request)
+        try:
+            return handler(augmented)
+        except Exception:
+            return handler(request)  # fail-open: a bad injection must never abort the turn
+
+    async def awrap_model_call(self, request, handler):
+        augmented = self._augment(request)
+        if augmented is request:
+            return await handler(request)
+        try:
+            return await handler(augmented)
+        except Exception:
+            return await handler(request)  # fail-open: a bad injection must never abort the turn
+
+
 def _tool_name_from_request(request: Any) -> str:
     """Extract the tool name from a langgraph ToolCallRequest (dataclass with
     tool_call: ToolCall TypedDict {'name': str}, tool: BaseTool | None). Never raises."""
@@ -1446,7 +1512,7 @@ class Model:
                 _finished_plainly = _last_ai is not None and not (getattr(_last_ai, "tool_calls", None))
                 if _finished_plainly and _continue_count < _AUTONOMOUS_OPERATOR_CONTINUE_CAP:
                     _continue_count += 1
-                    _nudge = HumanMessage(content=(
+                    _base_nudge_text = (
                         "[autonomous-continue] You ended your turn without reaching the objective and without an explicit "
                         "handback. Per the autonomous-solve overlay you must NOT stop after a sub-goal — execute the NEXT "
                         "action from your own REMAINING list now. To hand off you MUST call a tool (a plain stop just loops "
@@ -1454,7 +1520,34 @@ class Model:
                         "agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or the objective is complete — the "
                         "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
                         "limit (it pauses for the operator). Do not stop silently."
-                    ))
+                    )
+                    # Engagement-state-aware nudge (flag-gated, fail-open): when the engagement gate is
+                    # enabled, prepend a FRESH rendered snapshot of the observed engagement state plus a
+                    # "don't re-propose achieved hops" directive. This stops the Operator from re-issuing
+                    # already-achieved hops dozens of times (which the gate would only SKIP, burning the
+                    # step budget). With the flag OFF this is a byte-for-byte no-op (plain base nudge).
+                    _nudge_text = _base_nudge_text
+                    try:
+                        try:
+                            from . import mythic_tools as _mt
+                        except ImportError:
+                            import mythic_tools as _mt
+                        if bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
+                            _rendered_state = None
+                            try:
+                                _state = await self._build_current_engagement_state()
+                                if _state is not None:
+                                    try:
+                                        from . import engagement_state as _es
+                                    except ImportError:
+                                        import engagement_state as _es
+                                    _rendered_state = _es.render_engagement_state(_state)
+                            except Exception:
+                                _rendered_state = None  # fail-open to the plain base nudge
+                            _nudge_text = self._autonomous_nudge_content(_base_nudge_text, _rendered_state)
+                    except Exception:
+                        _nudge_text = _base_nudge_text  # fail-open: never break the continue-loop
+                    _nudge = HumanMessage(content=_nudge_text)
                     _agent_input = self._sanitize_messages(list(updated_channel) + [_nudge])
                     continue
                 break
@@ -1684,7 +1777,99 @@ class Model:
         _ainvoke.__name__ = node_name
         return _ainvoke
 
-    def _context_middleware(self) -> list:
+    async def _build_current_engagement_state(self):
+        """Best-effort build of the current EngagementState the same way the gate does.
+
+        Returns an ``engagement_state.EngagementState`` or ``None`` on ANY error — never raises.
+        Mirrors ``MythicTools._engagement_gate``: reconcile live footholds (fail-open to []) and
+        snapshot the recorded hops. Graph facts are intentionally skipped (optional).
+        """
+        try:
+            mythic_client = self.mythic_client
+            if mythic_client is None:
+                return None
+            try:
+                from . import access_reconciler, engagement_state
+            except ImportError:
+                import access_reconciler
+                import engagement_state
+
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+
+            try:
+                footholds = await access_reconciler.reconcile_access(mythic_client, now)
+            except Exception:
+                footholds = []  # fail-open: state without footholds is still useful
+
+            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+
+            try:
+                objective = mythic_client._engagement_objective()
+            except Exception:
+                objective = "sage-engagement"
+
+            return engagement_state.EngagementState(
+                objective=objective,
+                footholds=footholds,
+                hops=hops,
+            )
+        except Exception:
+            return None
+
+    def _render_engagement_state_for_injection(self) -> str | None:
+        """Cheap, synchronous, in-memory render of the observed engagement state for PER-TURN injection
+        by `_EngagementStateMiddleware`. Returns None — and the middleware injects nothing — when:
+        the gate is off, this is not an autonomous solve, there is no mythic_client, or there is no
+        observed state yet. NO network: reads the in-memory incremental hop ledger (the anti-loop
+        signal) plus the footholds the gate cached. Never raises (caller also guards)."""
+        try:
+            if not bool(getattr(self, "_autonomous_solve", False)):
+                return None
+            try:
+                from . import mythic_tools as _mt
+            except ImportError:
+                import mythic_tools as _mt
+            if not bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
+                return None
+            mythic_client = getattr(self, "mythic_client", None)
+            if mythic_client is None:
+                return None
+            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+            footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
+            if not hops and not footholds:
+                return None
+            try:
+                from . import engagement_state as _es
+            except ImportError:
+                import engagement_state as _es
+            try:
+                objective = mythic_client._engagement_objective()
+            except Exception:
+                objective = "sage-engagement"
+            state = _es.EngagementState(objective=objective, footholds=footholds, hops=hops)
+            rendered = _es.render_engagement_state(state)
+            if not rendered:
+                return None
+            # Pair the observed-state block with the imperative directive so the per-turn injection is
+            # an instruction ("ACHIEVED = DONE"), not just a status list the operator can talk past.
+            return f"{rendered}\n\n{_ENGAGEMENT_STATE_DIRECTIVE}"
+        except Exception:
+            return None
+
+    def _autonomous_nudge_content(self, base_nudge_text: str, rendered_state: str | None) -> str:
+        """Compose the autonomous-continue nudge, optionally prefixed with observed state.
+
+        When ``rendered_state`` is falsy (gate off, or building/rendering failed) the base nudge is
+        returned UNCHANGED — byte-for-byte. Otherwise the rendered engagement-state block and the
+        "don't re-issue achieved hops" directive are PREPENDED so the Operator advances from the
+        observed state instead of re-proposing already-achieved hops.
+        """
+        if not rendered_state:
+            return base_nudge_text
+        return f"{rendered_state}\n\n{_ENGAGEMENT_STATE_DIRECTIVE}\n\n{base_nudge_text}"
+
+    def _context_middleware(self, inject_engagement_state: bool = False) -> list:
         """Bounded-context middleware for every create_agent.
         Strategy: ClearToolUsesEdit does the cheap, routine bounding every step (no LLM call);
         SummarizationMiddleware is a SAFETY NET that only fires on genuine context overflow.
@@ -1747,6 +1932,11 @@ class Model:
                 },
                 description_prefix="Sage supervised mode — approve or deny this guarded tool call",
             ))
+        # Per-turn engagement-state injection (Mythic_Operator only, autonomous + gate-on, fail-open).
+        # Appended LAST so it is the INNERMOST wrapper: the rendered block is added AFTER all the
+        # context-editing/summarization middleware run, so it is never trimmed before reaching the model.
+        if inject_engagement_state:
+            mw.append(_EngagementStateMiddleware(self))
         return mw
     
     # Agent definitions
@@ -1798,7 +1988,7 @@ class Model:
             handback_tool = _create_summarize_handback_tool()
             # Explicit autonomous handback to the Supervisor (routes to Supervisor, does NOT end the run) —
             # the continue-loop consumes plain turn-ends, so this is the Operator's path to cross-agent routing.
-            handback_to_supervisor_tool = _create_handback_to_supervisor_tool()
+            handback_to_supervisor_tool = _create_handback_to_supervisor_tool(self.mythic_client)
 
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
@@ -1817,7 +2007,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(inject_engagement_state=True),
         )
         return self._wrap_create_agent(agent, "mythic_operator_messages", name)
 
@@ -3308,7 +3498,37 @@ def _create_summarize_handback_tool():
     return summarize_and_handback
 
 
-def _create_handback_to_supervisor_tool():
+def _build_esl_summary(mythic_client) -> str:
+    if mythic_client is None:
+        return ""
+    hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+    achieved = [
+        hop for hop in hops
+        if str(getattr(hop, "status", "")).casefold() == "achieved"
+    ]
+    if not achieved:
+        return ""
+
+    lines = ["📊 **Engagement State Ledger (ESL)**"]
+    for hop in achieved[-8:]:
+        technique = str(getattr(hop, "technique", "") or "unknown")
+        effect = str(getattr(hop, "effect", "") or getattr(hop, "target", "") or "")
+        status = str(getattr(hop, "status", "") or "")
+        evidence = getattr(hop, "evidence", {}) or {}
+        preview = ""
+        if isinstance(evidence, dict):
+            preview = str(evidence.get("result_preview") or evidence.get("task_id") or "")[:80]
+        detail = f"{technique} -> {effect} ({status})"
+        if preview:
+            detail += f": {preview}"
+        lines.append(detail)
+    cached_footholds = getattr(mythic_client, "_engagement_footholds", None)
+    if cached_footholds is not None:
+        lines.append(f"live footholds observed: {len(cached_footholds)}")
+    return "\n".join(lines[:12])
+
+
+def _create_handback_to_supervisor_tool(mythic_client=None):
     """
     Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
     to another agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or finalize. This is the
@@ -3326,8 +3546,21 @@ def _create_handback_to_supervisor_tool():
         (MCP_Manager for BloodHound graph work, Mythic_Payload for builds) or finalize the objective.
         Call this the moment the NEXT step needs a capability you do not own, or the objective is reached.
         Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only."""
+        esl = ""
+        try:
+            try:
+                from . import mythic_tools as _mt
+            except ImportError:
+                import mythic_tools as _mt
+        except ImportError:
+            _mt = None
+        if _mt is not None and getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False):
+            try:
+                esl = _build_esl_summary(mythic_client)
+            except Exception:
+                esl = ""  # fail-open: never break handback
         msg = ToolMessage(
-            content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}",
+            content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}" + (f"\n\n{esl}" if esl else ""),
             name="handback_to_supervisor",
             tool_call_id=runtime.tool_call_id,
         )

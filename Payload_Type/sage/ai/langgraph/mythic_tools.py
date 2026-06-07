@@ -1,6 +1,28 @@
 import os
+ENGAGEMENT_GATE_ENABLED = os.environ.get("SAGE_ENGAGEMENT_GATE", "").lower() in ("1", "true", "yes")
+# Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
+# code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
+# Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
+SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
 import json
+import re as _re_mod
 from pathlib import Path
+
+
+def _engagement_state_dir() -> str:
+    """Directory for the durable per-engagement ledger. Defaults next to sage.db's cwd (the same
+    persistence guarantees as the operational checkpointer); SAGE_ENGAGEMENT_STATE_DIR overrides."""
+    override = os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip()
+    if override:
+        return override
+    return os.path.join(os.getcwd(), ".sage_engagement")
+
+
+def _engagement_ledger_file(engagement_id: str | None = None) -> str:
+    """Absolute path to the JSON ledger for an engagement key. Sanitizes the key to a safe filename."""
+    key = (engagement_id or SAGE_ENGAGEMENT_ID or "default").strip() or "default"
+    safe = _re_mod.sub(r"[^A-Za-z0-9._-]", "_", key)[:128]
+    return os.path.join(_engagement_state_dir(), f"engagement_{safe}.json")
 import asyncio
 import base64
 from datetime import datetime, timezone
@@ -456,6 +478,19 @@ class MythicTools:
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
         self._artifact_ledger: list[dict] = []
+        self._engagement_hops: list = []
+        self._pending_engagement_hop = None
+        # Live footholds cache (populated by the gate after reconcile) so the per-turn state render in
+        # model.py can show footholds without an extra network round-trip on every model call.
+        self._engagement_footholds: list = []
+        # Durable cross-run resume: load the per-engagement hop ledger from disk so a fresh MythicTools
+        # (rebuilt per solve) inherits already-achieved hops across runs/restarts. Gate-on only; never
+        # raises (fail-open to an empty ledger). With the gate off we never touch disk.
+        if ENGAGEMENT_GATE_ENABLED:
+            try:
+                self._load_engagement_ledger()
+            except Exception:
+                pass
         # No-progress guard: count how many times each task_id has been fetched and come back FAILED
         # this session. On the 2nd+ failed re-read we return a short escalation directive instead of the
         # full (unchanged) failed output — the 2026-06-01 e45ae3d3 recursion death was the agent
@@ -1313,6 +1348,14 @@ class MythicTools:
         Returns:
             str: Command output (binary output coerced to string).
         """
+        if ENGAGEMENT_GATE_ENABLED:
+            try:
+                _gate_result = await self._engagement_gate(command, parameters, callback_display_id)
+            except Exception:
+                _gate_result = None  # fail-open: any gate error => proceed normally
+            if _gate_result is not None:
+                return _gate_result
+
         # HITL: guarded
         if timeout is None:
             timeout = 300  # Default timeout of 5 minutes
@@ -1530,6 +1573,11 @@ class MythicTools:
                         logger.info(f"🛡️ OPSEC annotated command={command} footprint_total={_fp['total']} axes={_ax}")
             except Exception:
                 pass
+            if ENGAGEMENT_GATE_ENABLED:
+                try:
+                    self._record_engagement_success(results_str)
+                except Exception:
+                    pass  # fail-open: recording must never break the issue path
             return results_str
         except Exception as e:
             error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
@@ -1544,6 +1592,156 @@ class MythicTools:
                     error_result,
                 )
             return error_result
+
+    async def _engagement_gate(self, command, parameters, callback_display_id) -> str | None:
+        self._pending_engagement_hop = None
+        try:
+            try:
+                from . import access_reconciler, engagement_state, intent_classifier
+            except ImportError:
+                import access_reconciler
+                import engagement_state
+                import intent_classifier
+        except Exception:
+            return None
+
+        classified = intent_classifier.classify_tool_call(command, parameters)
+        if classified is None:
+            return None
+
+        technique, target_key = classified
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            footholds = await access_reconciler.reconcile_access(self, now)
+        except Exception:
+            footholds = []
+
+        # Cache the reconciled footholds so the per-turn state render (model.py) can show them without
+        # an extra reconcile round-trip on every model call. Best-effort; never blocks the gate.
+        try:
+            self._engagement_footholds = list(footholds)
+        except Exception:
+            pass
+
+        # Host-scoped techniques (e.g. lsass-dump) usually carry no host in the tool args — the
+        # target host is the callback's own host. Rebind the target from the matching foothold so
+        # the precondition (system-or-admin:<host>) resolves instead of false-DEFERing on an empty host.
+        if not target_key:
+            cb_host = next(
+                (f.host for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)),
+                "",
+            )
+            if cb_host:
+                rebind = intent_classifier.classify_tool_call(command, parameters, callback_host=cb_host)
+                if rebind is not None:
+                    technique, target_key = rebind
+
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(),
+            footholds=footholds,
+            hops=list(self._engagement_hops),
+        )
+        decision, reason = engagement_state.gate_decision(technique, target_key, state)
+        if decision == engagement_state.GateDecision.SKIP:
+            self._pending_engagement_hop = None
+            return f"[engagement-gate] skipped: {reason}"
+        if decision == engagement_state.GateDecision.DEFER:
+            self._pending_engagement_hop = None
+            return f"[engagement-gate] deferred: {reason}"
+
+        self._pending_engagement_hop = (technique, target_key, now)
+        return None
+
+    def _engagement_objective(self) -> str:
+        return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
+
+    def _record_engagement_success(self, results_str) -> None:
+        pending = self._pending_engagement_hop
+        try:
+            if pending is None:
+                return
+            if _is_task_failure_output(results_str):
+                return
+            try:
+                from . import engagement_state
+            except ImportError:
+                import engagement_state
+            technique, target_key, now = pending
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(),
+                footholds=[],
+                hops=list(self._engagement_hops),
+            )
+            updated = engagement_state.record_hop_result(
+                state,
+                technique,
+                target_key,
+                "achieved",
+                {"source": "issue_task", "result_preview": str(results_str)[:200]},
+                now,
+            )
+            self._engagement_hops = updated.hops
+            # Write-through to the durable per-engagement ledger so the hop survives runs/restarts.
+            try:
+                self._persist_engagement_ledger()
+            except Exception:
+                pass  # fail-open: persistence must never break the issue path
+        finally:
+            self._pending_engagement_hop = None
+
+    def _engagement_ledger_path(self) -> str:
+        """Path to this engagement's durable JSON hop ledger (per-engagement, not per-solve)."""
+        return _engagement_ledger_file(SAGE_ENGAGEMENT_ID)
+
+    def _load_engagement_ledger(self) -> None:
+        """Load the durable hop ledger from disk into self._engagement_hops. Fail-open: any error
+        (missing file, bad JSON, unreadable) leaves the in-memory ledger untouched. NO LLM inference."""
+        path = self._engagement_ledger_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return
+        items = payload.get("hops") if isinstance(payload, dict) else payload
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        loaded = engagement_state.hops_from_dicts(items)
+        if loaded:
+            self._engagement_hops = loaded
+            # Make durable resume LOUD, not silent: a loaded "achieved" hop will be SKIPped by the gate
+            # with NO live re-verification of the AD effect, so the operator must SEE what was resumed
+            # (and from when) to catch stale state after a lab redeploy. Use a fresh SAGE_ENGAGEMENT_ID
+            # per engagement; clear the ledger dir on redeploy.
+            _updated = payload.get("updated") if isinstance(payload, dict) else "?"
+            _achieved = sum(1 for h in loaded if getattr(h, "status", "") == "achieved")
+            logger.info(
+                f"🗃️ [engagement-state] resumed {len(loaded)} hop(s) ({_achieved} achieved) from durable "
+                f"ledger key={SAGE_ENGAGEMENT_ID} updated={_updated} path={path} — these will be trusted "
+                f"as DONE (no live re-verification). Use a fresh SAGE_ENGAGEMENT_ID after a lab redeploy."
+            )
+
+    def _persist_engagement_ledger(self) -> None:
+        """Atomically write the current hop ledger to the durable per-engagement JSON. Fail-open."""
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        path = self._engagement_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "engagement_id": SAGE_ENGAGEMENT_ID,
+            "objective": self._engagement_objective(),
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "hops": engagement_state.hops_to_dicts(self._engagement_hops),
+        }
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, default=str)
+        os.replace(tmp, path)  # atomic on POSIX — never leaves a half-written ledger
 
     async def list_open_artifacts(self) -> str:
         """List artifacts this run has created (files dropped, beacons planted) that have NOT been cleaned up, so you can remove them at sub-goal completion for OPSEC. Returns a JSON list."""
