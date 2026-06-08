@@ -60,39 +60,73 @@ class EngagementState:
         return effects
 
     def satisfied_predicates(self) -> set[str]:
-        """Return predicates satisfied by achieved hops and live footholds."""
-        predicates = self.achieved_effects()
-        for foothold in self.footholds:
-            if not getattr(foothold, "alive", False):
-                continue
-
-            predicates.add("live-foothold:*")
-            host = _normalize_key(getattr(foothold, "host", ""))
-            forest = _normalize_key(getattr(foothold, "forest", ""))
-            identity_domain = _identity_domain(getattr(foothold, "identity", ""))
-            integrity = _normalize_key(getattr(foothold, "integrity", ""))
-
-            if forest:
-                predicates.add(f"live-foothold:{forest}")
-                predicates.add(f"authenticated:{forest}")
-            if identity_domain:
-                predicates.add(f"authenticated:{identity_domain}")
-            if host:
-                predicates.add(f"live-host:{host}")
-            if host and integrity in _ADMIN_INTEGRITY:
-                predicates.add(f"system-or-admin:{host}")
-                predicates.add(f"admin:{host}")
-            if host and integrity == "system":
-                predicates.add(f"system:{host}")
-        for graph_fact in self.graph_facts:
-            predicate = _normalize_predicate(getattr(graph_fact, "predicate", ""))
-            if predicate:
-                predicates.add(predicate)
-        return predicates
+        """Return predicates satisfied by achieved hops AND live footholds/graph facts, plus logical
+        implications (e.g. da/ea on a domain implies that domain's replication rights)."""
+        return _expand_implications(self.achieved_effects() | foothold_predicates(self))
 
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
         return _normalize_predicate(predicate) in self.satisfied_predicates()
+
+
+def foothold_predicates(state: "EngagementState") -> set[str]:
+    """Predicates derived ONLY from live footholds and graph facts — NOT from hops.
+
+    This is the independent-evidence set used to corroborate a durable (loaded-from-disk) achieved hop:
+    a hop must not corroborate itself, so corroboration consults live signal only."""
+    predicates: set[str] = set()
+    for foothold in getattr(state, "footholds", []) or []:
+        if not getattr(foothold, "alive", False):
+            continue
+        predicates.add("live-foothold:*")
+        host = _normalize_key(getattr(foothold, "host", ""))
+        forest = _normalize_key(getattr(foothold, "forest", ""))
+        identity_domain = _identity_domain(getattr(foothold, "identity", ""))
+        integrity = _normalize_key(getattr(foothold, "integrity", ""))
+        if forest:
+            predicates.add(f"live-foothold:{forest}")
+            predicates.add(f"authenticated:{forest}")
+        if identity_domain:
+            predicates.add(f"authenticated:{identity_domain}")
+        if host:
+            predicates.add(f"live-host:{host}")
+        if host and integrity in _ADMIN_INTEGRITY:
+            predicates.add(f"system-or-admin:{host}")
+            predicates.add(f"admin:{host}")
+        if host and integrity == "system":
+            predicates.add(f"system:{host}")
+    for graph_fact in getattr(state, "graph_facts", []) or []:
+        predicate = _normalize_predicate(getattr(graph_fact, "predicate", ""))
+        if predicate:
+            predicates.add(predicate)
+    return predicates
+
+
+# Effect implications: holding one effect logically grants others, so a precondition can be satisfied without
+# a separate hop. A Domain/Enterprise Admin can replicate the directory (DCSync), so da:/ea: on a domain
+# satisfies that domain's ds-replication-rights precondition — the over-DEFER fix for the parent DCSync after a
+# SID-history climb (you are DA on the parent via a forged ticket, with no separate replication grant).
+_DA_EFFECT_PREFIXES = ("da:", "ea:")
+
+
+def _expand_implications(predicates: set[str]) -> set[str]:
+    """Augment a satisfied-predicate set with logically-implied predicates. Pure; never raises."""
+    expanded = set(predicates)
+    for predicate in predicates:
+        for prefix in _DA_EFFECT_PREFIXES:
+            if predicate.startswith(prefix):
+                domain = predicate[len(prefix):].strip()
+                if domain:
+                    expanded.add(f"ds-replication-rights:{domain}")
+    return expanded
+
+
+def corroborate_effect(effect: str, state: "EngagementState") -> bool:
+    """Best-effort live corroboration of a durable hop's effect: True iff an INDEPENDENT live signal
+    (a foothold-derived or graph-derived predicate) supports the effect. This is the deterministic,
+    no-network verifier shipped now. The per-technique read-probe path (engagement_state.verify_effect
+    fed by a live query) is the documented follow-up that plugs into the same seam in gate_decision."""
+    return _normalize_predicate(effect) in foothold_predicates(state)
 
 
 class GateDecision(str, Enum):
@@ -138,10 +172,28 @@ TECHNIQUE_MODEL: dict[str, dict] = {
             "partial_any": ["get_changes", "get_changes_all", "get_changes_in_filtered_set", "ace_present"],
         },
     },
+    # DCSync of a SPECIFIC user's secret (e.g. a SMALL COUNCIL member, to forge their REAL TGT for the
+    # cross-forest LAPS read). Distinct from the domain krbtgt DCSync so the gate does not SKIP it once the
+    # krbtgt is dumped. Target is "user@domain"; effect is that user's creds; needs replication rights
+    # (which da:/ea: on the domain imply).
+    "dcsync-user": {
+        "target_type": "user",
+        "effect": "creds:{target}",
+        "preconditions": ["ds-replication-rights:{domain}"],
+        "verify": {
+            "achieved_all": ["credentials_dumped"],
+            "partial_any": ["domain_hashes_dumped", "secretsdump_connected", "user_hash_present"],
+        },
+    },
     "dcsync": {
         "target_type": "domain",
+        # DCSync is a REMOTE replication request to the target DC — it needs replication rights + a network
+        # position (a live foothold ANYWHERE), NOT a foothold inside the target domain. Requiring
+        # live-foothold:{domain} false-DEFERred the parent DCSync after a SID-history climb (you hold DA on the
+        # parent via a forged ticket but have no callback in it). Replication rights are satisfied either by an
+        # explicit grant (dcsync-rights-grant) OR implied by da:/ea: on the domain (see _expand_implications).
         "effect": "krbtgt-hash:{domain}",
-        "preconditions": ["ds-replication-rights:{domain}", "live-foothold:{domain}"],
+        "preconditions": ["ds-replication-rights:{domain}", "live-foothold:*"],
         "verify": {
             "achieved_all": ["krbtgt_hash_present"],
             "partial_any": ["domain_hashes_dumped", "secretsdump_connected"],
@@ -154,6 +206,23 @@ TECHNIQUE_MODEL: dict[str, dict] = {
         "verify": {
             "achieved_any": ["domain_admin", "ticket_valid"],
             "member_of_contains": ["domain admins"],
+            "partial_any": ["ticket_forged", "tgt_present"],
+        },
+    },
+    # Intra-forest child→parent (forest-root) escalation via an ExtraSIDs / SID-history golden ticket.
+    # Forged from the CHILD krbtgt we already hold (precondition krbtgt-hash:{domain} = the child domain),
+    # injecting the root Enterprise Admins SID; it yields DA over the forest ROOT (effect da:{parent}).
+    # This MUST be a distinct technique+effect from a plain child golden ticket: otherwise the classifier
+    # labels a SID-history climb "golden-ticket" on the child with effect da:{child} — which is already
+    # achieved — and the gate SKIPs it, silently blocking the child→parent hop (the essos-solve bug, 2026-06-07).
+    # No SID filtering applies WITHIN a forest, so there is no graph-ACL precondition here.
+    "sid-history-escalation": {
+        "target_type": "domain",
+        "effect": "da:{parent}",
+        "preconditions": ["krbtgt-hash:{domain}"],
+        "verify": {
+            "achieved_any": ["domain_admin", "ticket_valid"],
+            "member_of_contains": ["domain admins", "enterprise admins"],
             "partial_any": ["ticket_forged", "tgt_present"],
         },
     },
@@ -174,9 +243,20 @@ def gate_decision(technique: str, target: str, state: EngagementState) -> tuple[
             return GateDecision.PROCEED, "technique not modeled — fail-open"
 
         effect = _technique_effect(technique, target)
-        evidence = _effect_evidence(state, effect)
-        if evidence is not None:
-            return GateDecision.SKIP, f"effect already achieved: {effect}; evidence={evidence}"
+        achieved_hop = _effect_hop(state, effect)
+        durable_unconfirmed = False
+        if achieved_hop is not None:
+            provenance = _hop_provenance(achieved_hop)
+            # A run-provenance hop (achieved THIS process) is trustworthy → hard-SKIP (preserves the
+            # within-run 604→0 loop fix). A durable hop (loaded from disk) is only trusted when an
+            # INDEPENDENT live signal corroborates it; otherwise we must NOT silently skip a possibly
+            # stale belief (the redeploy footgun) — fall through and let the operator re-verify by doing.
+            if provenance != "durable" or corroborate_effect(effect, state):
+                tag = "durable+corroborated" if provenance == "durable" else "run"
+                return GateDecision.SKIP, (
+                    f"effect already achieved ({tag}): {effect}; evidence={dict(getattr(achieved_hop, 'evidence', {}))}"
+                )
+            durable_unconfirmed = True
 
         preconditions = _technique_preconditions(technique, target)
         # Belief: unknown ≠ false. Only DEFER on a precondition the state can AFFIRMATIVELY
@@ -190,7 +270,13 @@ def gate_decision(technique: str, target: str, state: EngagementState) -> tuple[
         if missing:
             return GateDecision.DEFER, f"missing precondition(s): {', '.join(missing)}"
 
-        return GateDecision.PROCEED, f"preconditions met for {technique} on {target}"
+        proceed_reason = f"preconditions met for {technique} on {target}"
+        if durable_unconfirmed:
+            proceed_reason += (
+                " [durable belief NOT corroborated by live signal — proceeding to re-verify by execution "
+                "rather than silently skip a possibly-stale hop]"
+            )
+        return GateDecision.PROCEED, proceed_reason
     except Exception as exc:
         return GateDecision.PROCEED, f"gate failed — fail-open: {exc}"
 
@@ -288,6 +374,68 @@ def verify_effect(technique: str, target: str, probe_result: dict) -> str:
     return "failed"
 
 
+def _effect_hop(state: EngagementState, effect: str) -> "Hop | None":
+    """Return the achieved Hop whose satisfied_effects include `effect`, else None.
+    Like _effect_evidence but returns the hop so the caller can read provenance."""
+    normalized_effect = _normalize_predicate(effect)
+    for hop in state.hops:
+        if _text(getattr(hop, "status", "")).casefold() != "achieved":
+            continue
+        effects = {_normalize_predicate(item) for item in getattr(hop, "satisfied_effects", [])}
+        if normalized_effect in effects:
+            return hop
+    return None
+
+
+def _hop_provenance(hop: "Hop") -> str:
+    """'durable' if the hop was loaded from the cross-run ledger, else 'run' (achieved this process).
+    Default 'run' when unset so pre-existing/in-run hops keep their trustworthy hard-SKIP behavior."""
+    evidence = getattr(hop, "evidence", {}) or {}
+    if isinstance(evidence, dict) and _normalize_key(evidence.get("provenance")) == "durable":
+        return "durable"
+    return "run"
+
+
+def _parse_iso(value: Any):
+    """Parse an ISO-8601 timestamp to an aware datetime (assume UTC if naive). None on failure."""
+    from datetime import datetime, timezone
+    text = _text(value).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def filter_hops_by_ttl(hops: Any, now: str, ttl_hours: float) -> tuple[list, int]:
+    """Drop hops older than ttl_hours relative to `now`. Returns (kept_hops, dropped_count).
+    ttl_hours<=0 (or unparseable now) disables expiry — all hops kept. Never raises."""
+    hops_list = list(hops or [])
+    try:
+        if not ttl_hours or float(ttl_hours) <= 0:
+            return hops_list, 0
+        now_dt = _parse_iso(now)
+        if now_dt is None:
+            return hops_list, 0
+        from datetime import timedelta
+        cutoff = now_dt - timedelta(hours=float(ttl_hours))
+        kept = []
+        dropped = 0
+        for hop in hops_list:
+            ts = _parse_iso(getattr(hop, "timestamp", ""))
+            if ts is not None and ts < cutoff:
+                dropped += 1
+            else:
+                kept.append(hop)
+        return kept, dropped
+    except Exception:
+        return hops_list, 0
+
+
 def _effect_evidence(state: EngagementState, effect: str) -> dict | None:
     normalized_effect = _normalize_predicate(effect)
     for hop in state.hops:
@@ -320,12 +468,19 @@ def _instantiate(template: str, target: str, model: dict) -> str:
     target_text = _normalize_key(target)
     target_type = model.get("target_type")
     host = target_text
-    domain = target_text if target_type == "domain" else _domain_from_host(target_text)
+    if target_type == "domain":
+        domain = target_text
+    elif target_type == "user":
+        # target is "user@domain"; the domain is what backs replication-rights preconditions.
+        domain = target_text.split("@", 1)[1] if "@" in target_text else "*"
+    else:
+        domain = _domain_from_host(target_text)
     values = {
         "target": target_text,
         "host": host,
         "forest": domain,
         "domain": domain,
+        "parent": _parent_domain(domain),
         "principal": target_text,
     }
     return _normalize_predicate(template.format(**values))
@@ -336,6 +491,16 @@ def _domain_from_host(target: str) -> str:
     if len(parts) > 2:
         return ".".join(parts[1:])
     return "*"
+
+
+def _parent_domain(target: str) -> str:
+    """The parent (forest-root-ward) domain of an FQDN: strip the leftmost label when there are >2 labels
+    (north.sevenkingdoms.local → sevenkingdoms.local); a 2-label root returns itself. Backs the {parent}
+    template var for the SID-history child→parent escalation effect (da:{parent})."""
+    parts = [part for part in _normalize_key(target).split(".") if part]
+    if len(parts) > 2:
+        return ".".join(parts[1:])
+    return _normalize_key(target)
 
 
 def _same_hop(hop: Hop, technique: str, target: str) -> bool:
@@ -441,7 +606,17 @@ def render_engagement_state(state: EngagementState) -> str:
             effect = _render_value(getattr(hop, "effect", "")) or "(no effect recorded)"
             sort_key = (_normalize_key(technique), _normalize_key(target), _normalize_key(effect))
             if status == "achieved":
-                achieved_hops.append((sort_key, f"- {technique} → {target}: {effect}"))
+                # Mark a durable (loaded-from-disk) belief that no live signal corroborates, so the
+                # operator treats it as a hint to re-check rather than ground truth after a redeploy.
+                suffix = ""
+                try:
+                    if _hop_provenance(hop) == "durable" and not corroborate_effect(
+                        getattr(hop, "effect", ""), state
+                    ):
+                        suffix = " (durable, unverified — re-check if AD changed)"
+                except Exception:
+                    suffix = ""
+                achieved_hops.append((sort_key, f"- {technique} → {target}: {effect}{suffix}"))
             elif status in {"failed", "blocked"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 

@@ -4,25 +4,38 @@ ENGAGEMENT_GATE_ENABLED = os.environ.get("SAGE_ENGAGEMENT_GATE", "").lower() in 
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
 SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
+# Durable-hop TTL (hours). A loaded "achieved" hop older than this is dropped at load so a stale belief
+# (e.g. after a GOAD redeploy) cannot suppress a real hop. Default 0 = disabled (no expiry). The gate
+# also refuses to SILENTLY hard-SKIP a durable hop unless live footholds corroborate it — TTL is the
+# cheap first line; corroboration is the second.
+def _engagement_hop_ttl_hours() -> float:
+    try:
+        return float(os.environ.get("SAGE_ENGAGEMENT_HOP_TTL_HOURS", "0") or 0)
+    except (ValueError, TypeError):
+        return 0.0
 import json
 import re as _re_mod
 from pathlib import Path
 
 
+def _engagement_ledger_mod():
+    """The shared ledger module — single source of truth for the ledger path/IO, used by BOTH this agent
+    and the operator-facing `engagement` Mythic command so they never drift onto different files."""
+    try:
+        from . import engagement_ledger
+    except ImportError:  # when ai/langgraph is on sys.path directly (tests, some runtimes)
+        import engagement_ledger
+    return engagement_ledger
+
+
 def _engagement_state_dir() -> str:
-    """Directory for the durable per-engagement ledger. Defaults next to sage.db's cwd (the same
-    persistence guarantees as the operational checkpointer); SAGE_ENGAGEMENT_STATE_DIR overrides."""
-    override = os.environ.get("SAGE_ENGAGEMENT_STATE_DIR", "").strip()
-    if override:
-        return override
-    return os.path.join(os.getcwd(), ".sage_engagement")
+    """Directory for the durable per-engagement ledger (delegated). SAGE_ENGAGEMENT_STATE_DIR overrides."""
+    return _engagement_ledger_mod().state_dir()
 
 
 def _engagement_ledger_file(engagement_id: str | None = None) -> str:
-    """Absolute path to the JSON ledger for an engagement key. Sanitizes the key to a safe filename."""
-    key = (engagement_id or SAGE_ENGAGEMENT_ID or "default").strip() or "default"
-    safe = _re_mod.sub(r"[^A-Za-z0-9._-]", "_", key)[:128]
-    return os.path.join(_engagement_state_dir(), f"engagement_{safe}.json")
+    """Absolute path to the JSON ledger for an engagement key (delegated to the shared module)."""
+    return _engagement_ledger_mod().ledger_path(engagement_id or SAGE_ENGAGEMENT_ID)
 import asyncio
 import base64
 from datetime import datetime, timezone
@@ -478,6 +491,20 @@ class MythicTools:
         # 2026-06-01 (rev2self issued 7x, whoami 4x, all failing).
         self._task_failure_counts: dict[tuple, int] = {}
         self._artifact_ledger: list[dict] = []
+        # Recent get_ttp_guidance goals — anti-cycle guard so the agent can't loop re-querying guidance
+        # instead of executing (the 2026-06-07 BRAAVOS-LAPS run did this ~7×).
+        self._ttp_guidance_goals: list[str] = []
+        # Recon re-read guard: a "task epoch" bumped each time a real command is issued, plus a per-(tool,
+        # target, epoch) call counter. Re-polling unchanged recon (get_task_history_for_callback ran 98× in
+        # the 2026-06-07 run, list_callbacks 29×) burns the recursion budget without progress; the guard
+        # returns a curt "stop re-reading, act" after repeats within an epoch, and resets when a command runs.
+        self._recon_epoch: int = 0
+        self._recon_call_log: dict[tuple, int] = {}
+        # Mythic display_id + callback display_id of the most recently issued task — attached to an engagement
+        # hop's evidence so the operator (and `state show`) can trace each achieved effect back to the exact
+        # task AND the callback that proved it.
+        self._last_issued_task_display_id = None
+        self._last_issued_callback_id = None
         self._engagement_hops: list = []
         self._pending_engagement_hop = None
         # Live footholds cache (populated by the gate after reconcile) so the per-turn state render in
@@ -588,6 +615,9 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling list_callbacks (slim)")
+        guard = self._recon_reread_guard("list_callbacks", "all")
+        if guard:
+            return json.dumps({"status": "unchanged", "note": guard}, sort_keys=True)
         query = """
             query slimcb {
               callback(where: {active: {_eq: true}}, order_by: {display_id: asc}) {
@@ -1356,6 +1386,11 @@ class MythicTools:
             if _gate_result is not None:
                 return _gate_result
 
+        # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
+        # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
+        # REPEATED reads within one epoch).
+        self._recon_epoch += 1
+
         # HITL: guarded
         if timeout is None:
             timeout = 300  # Default timeout of 5 minutes
@@ -1477,13 +1512,26 @@ class MythicTools:
             # "waitfor poller hang" that wedges the whole agent graph). Wrap it in an asyncio hard
             # ceiling so the await can ALWAYS be cancelled and we surface a timeout instead of hanging.
             try:
-                results = await asyncio.wait_for(
-                    mythic.issue_task_and_waitfor_task_output(
+                # Split issue + wait (faithful to mythic.issue_task_and_waitfor_task_output) so we can capture
+                # the Mythic task display_id for engagement-hop evidence. The whole thing stays under the
+                # asyncio hard ceiling so the poller-hang protection is unchanged.
+                self._last_issued_callback_id = callback_display_id
+                self._last_issued_task_display_id = None
+
+                async def _issue_and_wait():
+                    task = await mythic.issue_task(
                         mythic=self.client, command_name=command, parameters=parameters,
-                        callback_display_id=callback_display_id, timeout=timeout,
-                    ),  # token_id=token_id
-                    timeout=timeout + 20,
-                )
+                        callback_display_id=callback_display_id, wait_for_complete=True, timeout=timeout,
+                    )  # token_id=token_id
+                    tdid = task.get("display_id") if isinstance(task, dict) else None
+                    if tdid is None:
+                        raise Exception("Failed to create task")
+                    self._last_issued_task_display_id = tdid
+                    return await mythic.waitfor_for_task_output(
+                        mythic=self.client, task_display_id=tdid, timeout=timeout,
+                    )
+
+                results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
             except asyncio.TimeoutError:
                 timeout_result = (
                     f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
@@ -1660,13 +1708,48 @@ class MythicTools:
         try:
             if pending is None:
                 return
-            if _is_task_failure_output(results_str):
-                return
             try:
-                from . import engagement_state
+                from . import credential_artifacts, engagement_state
             except ImportError:
+                import credential_artifacts
                 import engagement_state
             technique, target_key, now = pending
+
+            # Verify-on-record: credential-dump techniques only record `achieved` when the output
+            # actually contains a usable secret (a real NTLM/AES/RC4 key) — not merely because the
+            # task lacked a known failure signature. An 8439 DS_DRA_BAD_DN DCSync "succeeds" at the
+            # Mythic layer but returns no key; recording it `achieved` was the false-achieved ledger
+            # bug that made the agent forge with a placeholder key. Non-credential techniques keep the
+            # legacy behavior (record `achieved` unless the output is a known failure signature).
+            status = "achieved"
+            extra: dict = {}
+            if technique in credential_artifacts.CREDENTIAL_TECHNIQUES:
+                probe = credential_artifacts.extract_credential_probe(results_str)
+                verdict = engagement_state.verify_effect(technique, target_key, probe)
+                status = "achieved" if verdict == "achieved" else "failed"
+                extra = {
+                    "verified_on_record": True,
+                    "verify_verdict": verdict,
+                    "artifact_present": bool(probe.get("credentials_dumped")),
+                }
+                if status != "achieved":
+                    # Stickiness (do not regress durable resume): a no-key re-probe must NOT downgrade a
+                    # prior VERIFIED achieved (real key in evidence). A legacy/false achieved (no real-key
+                    # evidence) MAY still be overwritten — that is cleanup of the false-achieved bug.
+                    if self._prior_verified_credential_hop(technique, target_key) is not None:
+                        logger.info(
+                            f"🔒 [verify-on-record] {technique} {target_key}: re-probe found no key, but a "
+                            f"prior VERIFIED achieved (real key) exists — keeping it, not downgrading."
+                        )
+                        return
+                    logger.warning(
+                        f"🔒 [verify-on-record] {technique} {target_key}: NO usable key in task output "
+                        f"(verdict={verdict}) — recording FAILED, not achieved (prevents placeholder forgery)."
+                    )
+            elif _is_task_failure_output(results_str):
+                # Legacy non-credential path: a known failure signature means no hop is recorded.
+                return
+
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(),
                 footholds=[],
@@ -1676,8 +1759,11 @@ class MythicTools:
                 state,
                 technique,
                 target_key,
-                "achieved",
-                {"source": "issue_task", "result_preview": str(results_str)[:200]},
+                status,
+                {"source": "issue_task", "provenance": "run", "result_preview": str(results_str)[:200],
+                 "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                 "callback_id": getattr(self, "_last_issued_callback_id", None),
+                 **extra},
                 now,
             )
             self._engagement_hops = updated.hops
@@ -1688,6 +1774,24 @@ class MythicTools:
                 pass  # fail-open: persistence must never break the issue path
         finally:
             self._pending_engagement_hop = None
+
+    def _prior_verified_credential_hop(self, technique, target_key):
+        """The existing hop for (technique, target_key) that is `achieved` with a REAL key in evidence
+        (artifact_present True), else None. A legacy false-achieved (no such evidence) returns None so a
+        verified-failed re-probe can overwrite it — the stickiness rule is 'verified-with-key beats no-key',
+        never blind last-writer-wins."""
+        tech = str(technique).casefold()
+        tgt = str(target_key).casefold()
+        for h in self._engagement_hops:
+            if str(getattr(h, "technique", "")).casefold() != tech:
+                continue
+            if str(getattr(h, "target", "")).casefold() != tgt:
+                continue
+            if str(getattr(h, "status", "")).casefold() != "achieved":
+                continue
+            if (getattr(h, "evidence", {}) or {}).get("artifact_present") is True:
+                return h
+        return None
 
     def _engagement_ledger_path(self) -> str:
         """Path to this engagement's durable JSON hop ledger (per-engagement, not per-solve)."""
@@ -1710,18 +1814,38 @@ class MythicTools:
         except ImportError:
             import engagement_state
         loaded = engagement_state.hops_from_dicts(items)
+        # Tag every loaded hop with 'durable' provenance: the gate will NOT silently hard-SKIP a durable
+        # hop unless live footholds corroborate it (run-provenance hops keep the trustworthy hard-SKIP).
+        for _h in loaded:
+            try:
+                if isinstance(getattr(_h, "evidence", None), dict):
+                    _h.evidence["provenance"] = "durable"
+                else:
+                    _h.evidence = {"provenance": "durable"}
+            except Exception:
+                pass
+        # Expire stale beliefs by TTL (cheap first line against a post-redeploy stale ledger).
+        ttl = _engagement_hop_ttl_hours()
+        _dropped = 0
+        if ttl > 0:
+            from datetime import datetime, timezone
+            loaded, _dropped = engagement_state.filter_hops_by_ttl(
+                loaded, datetime.now(timezone.utc).isoformat(), ttl
+            )
         if loaded:
             self._engagement_hops = loaded
-            # Make durable resume LOUD, not silent: a loaded "achieved" hop will be SKIPped by the gate
-            # with NO live re-verification of the AD effect, so the operator must SEE what was resumed
-            # (and from when) to catch stale state after a lab redeploy. Use a fresh SAGE_ENGAGEMENT_ID
-            # per engagement; clear the ledger dir on redeploy.
+            # Make durable resume LOUD, not silent: a loaded "achieved" hop is a BELIEF, not verified
+            # live, so the operator must SEE what was resumed (and from when). Durable hops are
+            # corroborated by live footholds before any hard-SKIP, and shown as "(durable, unverified)"
+            # in the per-turn state when not corroborated. Use a fresh SAGE_ENGAGEMENT_ID per engagement.
             _updated = payload.get("updated") if isinstance(payload, dict) else "?"
             _achieved = sum(1 for h in loaded if getattr(h, "status", "") == "achieved")
+            _ttl_note = f" ttl={ttl}h dropped={_dropped}" if ttl > 0 else " ttl=disabled"
             logger.info(
                 f"🗃️ [engagement-state] resumed {len(loaded)} hop(s) ({_achieved} achieved) from durable "
-                f"ledger key={SAGE_ENGAGEMENT_ID} updated={_updated} path={path} — these will be trusted "
-                f"as DONE (no live re-verification). Use a fresh SAGE_ENGAGEMENT_ID after a lab redeploy."
+                f"ledger key={SAGE_ENGAGEMENT_ID} updated={_updated}{_ttl_note} path={path} — durable beliefs "
+                f"are corroborated by live footholds before any SKIP (never silently). Fresh "
+                f"SAGE_ENGAGEMENT_ID after a lab redeploy."
             )
 
     def _persist_engagement_ledger(self) -> None:
@@ -1770,6 +1894,9 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
+        guard = self._recon_reread_guard("get_task_history_for_callback", callback_display_id)
+        if guard:
+            return json.dumps({"status": "unchanged", "note": guard, "callback_display_id": callback_display_id}, sort_keys=True)
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
         return json.dumps(resp, sort_keys=True)
 
@@ -2475,7 +2602,71 @@ class MythicTools:
                         f"For bloodhound, call get_ttp_guidance('stand up bloodhound') for the standup + mcp-connect steps."
                     ),
                 }
+        # Anti-cycle guard: re-querying guidance for the same goal is not progress. If the agent has asked
+        # for near-identical guidance repeatedly, it is stuck planning instead of executing — tell it to act.
+        cycle_warning = self._record_and_check_guidance_cycle(goal)
+        if cycle_warning:
+            result["cycle_warning"] = cycle_warning
         return json.dumps(result, sort_keys=True)
+
+    def _record_and_check_guidance_cycle(self, goal: str) -> str | None:
+        """Track recent get_ttp_guidance goals; return an escalating nudge when the agent re-queries
+        near-identical guidance instead of executing. In-memory per MythicTools; never raises."""
+        try:
+            stop = {"the", "and", "for", "with", "using", "over", "from", "into", "via", "then",
+                    "that", "this", "use", "get", "run", "now", "please", "onto", "off"}
+
+            def _words(g: str) -> set[str]:
+                toks = "".join(c.lower() if c.isalnum() else " " for c in str(g)).split()
+                return {w for w in toks if len(w) > 2 and w not in stop}
+
+            current = _words(goal)
+            if not current:
+                return None
+            # Containment (overlap / smaller set), not Jaccard: the observed loop re-phrased the same core
+            # goal ("read LAPS password … context") with varying extra words, which dilutes Jaccard below a
+            # useful threshold. Containment catches "same core, reworded".
+            similar = 0
+            for prior in self._ttp_guidance_goals:
+                pw = _words(prior)
+                smaller = min(len(current), len(pw))
+                if smaller and len(current & pw) / smaller >= 0.6:
+                    similar += 1
+            self._ttp_guidance_goals.append(goal)
+            if len(self._ttp_guidance_goals) > 12:
+                self._ttp_guidance_goals = self._ttp_guidance_goals[-12:]
+            if similar >= 2:  # this is the 3rd+ near-identical guidance request
+                return (
+                    f"You have requested near-identical guidance ~{similar + 1} times for this goal. "
+                    "Re-querying guidance is NOT progress and is burning the step/time budget. STOP planning: "
+                    "ISSUE the next concrete command now, or call handback_to_supervisor with a CONCRETE named "
+                    "blocker (the specific capability/credential/context you lack). Do NOT call get_ttp_guidance "
+                    "again for this goal."
+                )
+            return None
+        except Exception:
+            return None
+
+    def _recon_reread_guard(self, tool: str, key) -> str | None:
+        """Detect redundant recon re-reads within the current task epoch (no command issued since the last
+        read of this target). Returns an escalating STOP-re-reading nudge after repeated identical calls,
+        else None. The epoch resets on each issued command, so a legitimate post-action re-read is allowed."""
+        try:
+            k = (tool, str(key), self._recon_epoch)
+            n = self._recon_call_log.get(k, 0) + 1
+            self._recon_call_log[k] = n
+            if len(self._recon_call_log) > 256:  # bound memory across a long solve
+                self._recon_call_log = {kk: vv for kk, vv in self._recon_call_log.items() if kk[2] >= self._recon_epoch - 1}
+            if n >= 3:  # 3rd+ identical read with no intervening command
+                return (
+                    f"⚠️ You have called {tool} for the same target {n}× with NO new command issued since — the "
+                    "data is UNCHANGED. Re-reading recon is NOT progress and is burning the step budget. STOP "
+                    "re-reading: ISSUE the next concrete command now, or handback_to_supervisor with a concrete "
+                    "named blocker. Act on the data you already have."
+                )
+            return None
+        except Exception:
+            return None
 
     async def get_ttp_full_reference(
         self,

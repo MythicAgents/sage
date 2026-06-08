@@ -37,7 +37,24 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
                 return ("rbcd-standin", _flag_value(parsed, "target").casefold())
 
         if "lsadump::dcsync" in combined_cf or (_apollo_dcsync(command_text, tokens, token_set)):
-            return ("dcsync", _domain_value(parsed).casefold())
+            domain = _domain_value(parsed).casefold()
+            user = _flag_value(parsed, "user").casefold()
+            # DCSyncing a SPECIFIC non-krbtgt principal (to recover THAT user's key, e.g. a SMALL COUNCIL
+            # member for cross-forest LAPS) is a DISTINCT op from the domain krbtgt DCSync. Without this they
+            # both collapse to ("dcsync", domain) → krbtgt-hash:{domain}, so once the krbtgt is dumped the gate
+            # wrongly SKIPs every user DCSync (the 2026-06-07 lord.varys block).
+            if user and user != "krbtgt":
+                return ("dcsync-user", f"{user}@{domain}")
+            return ("dcsync", domain)
+
+        if ("kerberos::golden" in combined_cf or "golden" in token_set) and (
+            _has_flag(parsed, "sids") or _has_flag(parsed, "sidhistory")
+        ):
+            # ExtraSIDs / SID-history golden ticket = intra-forest child→parent climb. `/domain` is the
+            # CHILD we forge FROM (we hold its krbtgt); `/sids` carries the parent Enterprise Admins SID.
+            # Classified distinctly so the gate models effect da:{parent}, not a duplicate child da:{domain}
+            # (which would already be achieved → wrongly SKIPped).
+            return ("sid-history-escalation", _domain_value(parsed).casefold())
 
         if "kerberos::golden" in combined_cf or "golden" in token_set:
             return ("golden-ticket", _domain_value(parsed).casefold())
@@ -133,9 +150,12 @@ def _flag_value(parsed: dict[str, Any], flag: str) -> str:
         token_cf = token_text.casefold()
         for prefix in prefixes:
             if token_cf.startswith(prefix):
-                return _strip_quotes(token_text[len(prefix):])
+                # rstrip trailing JSON-structural chars: a raw mimikatz command inside a {"Commands":[...]}
+                # list tokenizes the last flag as e.g. `/user:krbtgt"]` — a value never legitimately ends in
+                # these, so stripping them is safe and avoids misreading krbtgt as a distinct user.
+                return _strip_quotes(token_text[len(prefix):]).rstrip("\"]},'")
         if token_cf in names and index + 1 < len(tokens):
-            return _strip_quotes(_text(tokens[index + 1]))
+            return _strip_quotes(_text(tokens[index + 1])).rstrip("\"]},'")
     return ""
 
 

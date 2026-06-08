@@ -2550,7 +2550,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # Resume the paused graph with the decision payload the installed middleware expects.
         async for event in self.graph.astream(
             Command(resume={"decisions": decisions}),
-            {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
+            {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
         ):
             if self._stop_requested:
                 logger.info("🛑 Stop requested — terminating graph execution (HITL resume)")
@@ -2690,15 +2690,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 await self._stream_message_to_mythic(formatted_prompt)
 
         try:
-            # Recursion limit raised to 75 (T1.4) for multi-hop autonomous solves (e.g. the GOAD
-            # Trust Walker is many agent hops); RemainingSteps + handback still terminate gracefully.
+            # Recursion limit 250 for multi-hop autonomous solves (e.g. the GOAD Trust Walker is many agent
+            # hops — foothold→essos DA exceeded 150); RemainingSteps + handback still terminate gracefully,
+            # and the global step cap (_max_steps, default 200 / 300 via the solve driver) backstops runaways.
             logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
             # Stream graph execution and process events incrementally
             hitl_interrupted = False
             async for event in self.graph.astream(
                 self.state,
-                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 150}
+                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 250}
             ):
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
                 # Model; halt before driving the next super-step so the session can't run away.
@@ -3044,7 +3045,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 **Progress by Agent:**
 {summary_text}
 
-**Status:** Hit the system's iteration limit of 75 steps. All work and context have been preserved in each agent's conversation history.
+**Status:** Hit the system's iteration limit of 250 steps. All work and context have been preserved in each agent's conversation history.
 
 **Your Options:**
 • Reply **"continue"** to increase the limit and keep going from where we left off
@@ -3229,10 +3230,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream continuation with raised recursion limit (T1.4: 50 -> 75)
+                    # Stream continuation with raised recursion limit (250)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (continue branch)")
@@ -3352,10 +3353,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream new task direction with raised recursion limit (T1.4: 25 -> 75)
+                    # Stream new task direction with raised recursion limit (250)
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
+                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (redirect branch)")

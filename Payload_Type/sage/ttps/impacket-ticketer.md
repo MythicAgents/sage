@@ -63,7 +63,7 @@ common_args:
     description: Username to forge the ticket for
     typical_values: ["administrator"]
     required: true
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # impacket-ticketer
@@ -80,6 +80,8 @@ ticketer.py creates a forged Kerberos ticket in ccache format usable with impack
 ## How Sage uses this
 Infrastructure-side Python tool. For Windows-side Golden/Silver Ticket forgery, Sage
 uses Mimikatz `kerberos::golden` (via Apollo's native `mimikatz` command) or Rubeus.
+When using Mimikatz, include `/ptt` for in-memory use; omitting `/ptt` writes the
+forged ticket to `ticket.kirbi` in the current working directory.
 
 ## Apollo-specific note
 Python/Linux only. For Windows-side ticket forgery use Mimikatz or Rubeus.

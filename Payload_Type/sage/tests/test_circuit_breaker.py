@@ -6,9 +6,13 @@ re-issued them in an unbounded loop. These tests pin the two fixes:
   1. empty params ({}, '', '""', None) normalize to ""
   2. a command that fails twice is short-circuited on the 3rd identical attempt
 Run: cd Payload_Type/sage && python3 -m pytest tests/test_circuit_breaker.py -q
+
+The issue path was split (issue_task + waitfor_for_task_output) so a hop can capture its Mythic
+task display_id; these tests mock that split via `_split_issue`.
 """
 import asyncio
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +28,23 @@ def _make_tools() -> MythicTools:
     return mt
 
 
+@contextmanager
+def _split_issue(output, on_issue=None):
+    """Patch the split issue path. `on_issue(parameters)` fires when a task is 'issued' (counters/capture);
+    `output` is the task output (a str, or a zero-arg callable returning a str for stateful tests)."""
+    async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+        if on_issue is not None:
+            on_issue(parameters)
+        return {"display_id": 4242}
+
+    async def fake_waitfor(mythic, task_display_id, timeout=None):
+        return output() if callable(output) else output
+
+    with patch.object(mythic_tools.mythic, "issue_task", fake_issue_task), \
+         patch.object(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor):
+        yield
+
+
 def test_is_task_failure_output_signatures():
     assert _is_task_failure_output("[-] failed to parse arguments for rev2self")
     assert _is_task_failure_output("Error issuing command: Failed to create task")
@@ -34,13 +55,8 @@ def test_is_task_failure_output_signatures():
 
 def test_empty_params_normalized_to_empty_string():
     seen = {}
-
-    async def fake_issue(mythic, command_name, parameters, callback_display_id, timeout):
-        seen["parameters"] = parameters
-        return "ok"
-
     mt = _make_tools()
-    with patch.object(mythic_tools.mythic, "issue_task_and_waitfor_task_output", fake_issue):
+    with _split_issue("ok", on_issue=lambda p: seen.__setitem__("parameters", p)):
         for empty in ({}, "", "{}", '""', None):
             seen.clear()
             asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", empty, 11))
@@ -49,13 +65,9 @@ def test_empty_params_normalized_to_empty_string():
 
 def test_circuit_breaker_trips_after_two_failures():
     calls = {"n": 0}
-
-    async def always_fails(mythic, command_name, parameters, callback_display_id, timeout):
-        calls["n"] += 1
-        return "[-] failed to parse arguments for rev2self: rev2self takes no command line arguments."
-
+    fail = "[-] failed to parse arguments for rev2self: rev2self takes no command line arguments."
     mt = _make_tools()
-    with patch.object(mythic_tools.mythic, "issue_task_and_waitfor_task_output", always_fails):
+    with _split_issue(fail, on_issue=lambda p: calls.__setitem__("n", calls["n"] + 1)):
         r1 = asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", {}, 11))
         r2 = asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", "", 11))   # same after normalization
         r3 = asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", '""', 11))  # same after normalization
@@ -66,12 +78,8 @@ def test_circuit_breaker_trips_after_two_failures():
 
 def test_success_resets_failure_counter():
     state = {"fail": True}
-
-    async def flaky(mythic, command_name, parameters, callback_display_id, timeout):
-        return "Error: Failed to create task" if state["fail"] else "Reverted identity"
-
     mt = _make_tools()
-    with patch.object(mythic_tools.mythic, "issue_task_and_waitfor_task_output", flaky):
+    with _split_issue(lambda: "Error: Failed to create task" if state["fail"] else "Reverted identity"):
         asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", "", 11))  # fail -> count 1
         state["fail"] = False
         asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", "", 11))  # success -> reset
@@ -82,11 +90,8 @@ def test_success_resets_failure_counter():
 
 
 def test_different_commands_tracked_independently():
-    async def always_fails(mythic, command_name, parameters, callback_display_id, timeout):
-        return "[-] failed to parse arguments"
-
     mt = _make_tools()
-    with patch.object(mythic_tools.mythic, "issue_task_and_waitfor_task_output", always_fails):
+    with _split_issue("[-] failed to parse arguments"):
         asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", "", 11))
         asyncio.run(mt.issue_task_and_waitfor_task_output("rev2self", "", 11))
         # whoami is a different key — must NOT be blocked by rev2self's failures.

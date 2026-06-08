@@ -67,7 +67,50 @@ the LAPS attribute directly via LDAP (PowerView or native ADSI) to retrieve the 
 admin password without touching LSASS on the target.
 
 This is one of the most stealthy lateral movement paths: no LSASS access, no binary
-upload to the target, just one LDAP query.
+upload to the target, just one LDAP query — PROVIDED the query runs as a principal that can read it.
+
+## Execution context — the silent-failure trap (CRITICAL)
+
+`ms-Mcs-AdmPwd` / `msLAPS-Password` are CONFIDENTIAL attributes. AD returns them ONLY to a caller that holds
+`ReadLAPSPassword` (or GenericAll/equivalent) on that computer object. If the identity running your LDAP/ADSI
+query lacks that right, the query SUCCEEDS and returns the computer object **with the non-confidential attrs
+(e.g. `ms-mcs-admpwdexpirationtime`) but WITHOUT the password** — and no error.
+
+> An object that comes back with `ms-mcs-admpwdexpirationtime` but NO `ms-mcs-admpwd` means your QUERY
+> CONTEXT is wrong — NOT that LAPS is absent. Fix the identity. Do NOT keep re-issuing the same read or
+> blindly permuting ticket-cache LUIDs.
+
+Run the read AS a principal that holds the right:
+1. Identify a principal with the edge (BloodHound `ReadLAPSPassword`). It is often a GROUP, and membership
+   can be transitive / cross-forest (a foreign-group membership).
+2. Obtain a ticket/token for that principal and APPLY it into the query's execution context (`make_token`
+   for a password/hash; or forge → `ticket_cache_add`/PTT for a ticket), THEN run the LDAP read in that
+   context (e.g. `execute_assembly`/`powerpick` once the ticket is in the calling thread's cache).
+
+## Cross-forest LAPS via a foreign-group membership (GOAD: BRAAVOS)
+
+`SPYS@ESSOS` holds `ReadLAPSPassword` on `BRAAVOS.ESSOS.LOCAL`, and `SMALL COUNCIL@SEVENKINGDOMS` is
+`MemberOf SPYS@ESSOS` (a legit foreign-group membership — survives SID filtering). So to read BRAAVOS LAPS you
+must authenticate to ESSOS AS a `SMALL COUNCIL` member, carrying that member's REAL group memberships.
+
+> **CRITICAL — use the member's REAL ticket, NOT a forged golden ticket.** A golden ticket forged for
+> `cersei.lannister` carries only the SIDs you put in it; it does NOT carry her authentic
+> `SMALL COUNCIL@SEVENKINGDOMS` membership, and you CANNOT inject `SPYS@ESSOS` as an ExtraSID / SID-history —
+> SID filtering on the FOREST trust strips foreign ExtraSIDs (that filtering is exactly why the legit
+> foreign-group membership is the only path). The cross-forest referral grants `SPYS@ESSOS` (→ ReadLAPSPassword)
+> ONLY when the PAC carries the genuine `SMALL COUNCIL` membership — i.e. when you authenticate as the REAL
+> cersei. Forging a golden ticket here is the #1 way this hop silently fails.
+
+1. You hold `da:sevenkingdoms.local` → **DCSync the member's REAL key** (you are DA there):
+   `mimikatz lsadump::dcsync /domain:sevenkingdoms.local /user:cersei.lannister` → take her AES256/NTLM.
+2. Request her **REAL TGT** (carries her authentic SMALL COUNCIL membership from the DC):
+   `Rubeus asktgt /user:cersei.lannister /domain:sevenkingdoms.local /aes256:<her-key> /nowrap`.
+3. Request the **cross-forest referral** / service ticket to the ESSOS DC LDAP with that TGT:
+   `Rubeus asktgs /service:ldap/meereen.essos.local /dc:meereen.essos.local /ticket:<cersei-TGT> /ptt` — the
+   trust maps her `SMALL COUNCIL@SEVENKINGDOMS` membership to `SPYS@ESSOS` → ReadLAPSPassword.
+4. Read `ms-mcs-admpwd` of `CN=BRAAVOS,OU=Laps,DC=essos,DC=local` IN that ticket context (run the LDAP/ADSI
+   query under the applied ticket — a sacrificial process / `make_token`-equivalent, not the default token).
+   The plaintext now returns → local admin on BRAAVOS → continue to ADCS / GoldenCert.
 
 ## LAPS Variants
 

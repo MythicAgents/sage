@@ -34,7 +34,10 @@ opsec_notes: |
   appears in DC logs for the forged service access. However, the service account's NT hash
   must be known. The ticket is limited to a single service on a single host.
   PAC validation by the service is the primary detection method — services that strictly
-  validate PAC signatures will reject forged tickets.
+  validate PAC signatures will reject forged tickets. With Mimikatz silver-ticket syntax
+  (`kerberos::golden /target /service ...`), include `/ptt` for in-memory injection; if
+  `/ptt` is omitted, Mimikatz writes the forged ticket to `ticket.kirbi` in the current
+  working directory.
 gotchas: |
   Requires the service account's NT hash (not the domain krbtgt). For computer accounts
   (CIFS on a workstation), need the machine account hash (from Mimikatz or DCSync for
@@ -45,7 +48,7 @@ gotchas: |
 related_ttps: [mimikatz, rubeus, impacket-ticketer, pass-the-ticket, constrained-delegation-abuse]
 alternatives: [golden-ticket, pass-the-ticket, s4u-chain]
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # Silver Ticket
@@ -78,6 +81,9 @@ Prerequisite: Service account NT hash (for machine account: $COMPUTER$ hash)
    kerberos::golden /user:Administrator /domain:DOMAIN \
      /sid:S-1-5-21-... /target:TARGET.DOMAIN \
      /service:cifs /rc4:<hash> /ptt
+
+   OPSEC: omit `/ptt` only when you intentionally want Mimikatz to write
+   `ticket.kirbi`; use `/ticket:<path>` only for deliberate file output.
 
 3. Access the service as Administrator without domain contact
 ```

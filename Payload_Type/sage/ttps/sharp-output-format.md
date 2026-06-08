@@ -28,7 +28,7 @@ gotchas: |
 related_ttps: [post-exploitation-playbook, lateral-movement-decision, goadabuse-reference]
 alternatives: []
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # Sage Output and Reporting Reference
@@ -141,7 +141,8 @@ krbtgt HASH (north.sevenkingdoms.local):
 
 PERSISTENCE OPTIONS (requires operator approval):
 1. Golden Ticket: valid ~10h, survives single krbtgt rotation
-   → Mimikatz kerberos::golden /krbtgt:[HASH] ...
+   → Mimikatz kerberos::golden /krbtgt:[HASH] ... /ptt
+   → OPSEC: without /ptt, Mimikatz writes ticket.kirbi to the current directory
    
 2. Certificate persistence (more durable):
    → ForgeCert with CA key (requires CA compromise) → survives password changes

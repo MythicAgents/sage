@@ -37,7 +37,10 @@ opsec_notes: |
   (LUID) and will be used for subsequent Kerberos authentication. No DC event until the
   ticket is actually used. Apollo's `ticket_cache_add` command is the native path; Rubeus
   `ptt` is the assembly path. Key consideration: ticket scope is per-logon-session (LUID)
-  — inject into the correct session.
+  — inject into the correct session. Avoid accidental Mimikatz disk artifacts: Mimikatz
+  `kerberos::golden` writes `ticket.kirbi` unless `/ptt` is supplied, and
+  `kerberos::list /export` / `sekurlsa::tickets /export` write `.kirbi` files into the
+  current working directory.
 gotchas: |
   Injected tickets are valid only until their expiration time — TGTs default to 10 hours.
   The ticket grants access to services within the scope of what it was issued for.
@@ -47,7 +50,7 @@ gotchas: |
 related_ttps: [rubeus, mimikatz, certify, whisker, constrained-delegation-abuse]
 alternatives: []
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # Pass-the-Ticket
@@ -79,7 +82,8 @@ transparently by all subsequent Kerberos authentications from that session.
 Tickets are obtained via:
 - Rubeus asktgt (NT hash / AES key / certificate)
 - Rubeus monitor / dump (from running logon sessions)
-- Mimikatz sekurlsa::tickets /export
+- Mimikatz `sekurlsa::tickets /export` or `kerberos::list /export` (writes `.kirbi`
+  files to cwd; use only when disk export is intentional)
 - After delegation abuse (S4U2proxy results)
 - After unconstrained delegation capture
 

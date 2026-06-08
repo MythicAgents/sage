@@ -36,7 +36,9 @@ opsec_notes: |
   to fully invalidate; DCs cache the previous krbtgt for backward compatibility). Use
   reasonable ticket lifetimes (10 hours — default) rather than 10-year tickets, which are
   trivially detectable. ExtraSIDs golden tickets for cross-forest escalation generate
-  unusual PAC content detectable by MDI.
+  unusual PAC content detectable by MDI. With Mimikatz, always include `/ptt` when the
+  goal is immediate in-memory use: without `/ptt`, `kerberos::golden` writes `ticket.kirbi`
+  to the current working directory; `/ticket:<path>` is only for intentional disk output.
 gotchas: |
   Requires the krbtgt account's NT hash — obtainable only via DCSync (DA+), NTDS.dit
   extraction, or shadow credentials on the krbtgt account (unusual). The golden ticket
@@ -47,7 +49,7 @@ gotchas: |
 related_ttps: [mimikatz, rubeus, impacket-ticketer, impacket-secretsdump, sid-history-abuse]
 alternatives: [silver-ticket, certificate-persistence, dcsync-to-maintain-access]
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-06-08
 ---
 
 # Golden Ticket
@@ -77,9 +79,18 @@ Seatbelt: OSInfo (shows domain SID)
 Mimikatz: kerberos::golden /user:Administrator /domain:DOMAIN \
   /sid:S-1-5-21-... /krbtgt:<krbtgt-hash> /ptt
 
+# OPSEC: omitting /ptt writes ticket.kirbi to cwd. Use /ticket:<path> only
+# when a reusable .kirbi artifact is explicitly required.
+
 # Verify:
 klist     (shows injected TGT)
 ```
+
+## Disk Artifact Warning
+
+Mimikatz `kerberos::golden` defaults to saving a forged `.kirbi` file when `/ptt` is not present.
+For C2-driven workflows, Sage should default to `/ptt` and inject the TGT into the selected
+logon session or sacrificial LUID. File output belongs only in explicit operator-approved cases.
 
 ## Golden Ticket vs Silver Ticket vs Certificate Persistence
 
