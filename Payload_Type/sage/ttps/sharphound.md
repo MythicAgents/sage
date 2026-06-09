@@ -68,8 +68,13 @@ common_args:
     typical_values: [north.sevenkingdoms.local, essos.local]
   -o:
     name: --OutputDirectory
-    description: Where to write the output ZIP
-    typical_values: ['C:\\Windows\\Temp']
+    description: >-
+      Where to write the output ZIP. Use a directory you can BOTH write AND list/read back as the
+      current (often non-admin) user — your own profile temp (%TEMP% = C:\Users\<you>\AppData\Local\Temp)
+      or C:\Users\Public. NEVER C:\Windows\Temp — a non-admin can WRITE there but CANNOT list/read it
+      back, so `ls` returns Access Denied and `download` returns "does not exist" even though the ZIP is
+      present, and you strand your own collection.
+    typical_values: ['C:\\Users\\Public', 'C:\\Users\\<you>\\AppData\\Local\\Temp']
   --ZipFilename:
     description: Custom name for output ZIP (helps with OPSEC — avoid 'BloodHound')
     typical_values: ["sysreport.zip", "out.zip"]

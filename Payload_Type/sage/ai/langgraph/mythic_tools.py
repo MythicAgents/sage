@@ -2359,9 +2359,18 @@ class MythicTools:
         except Exception as e:
             return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
         logger.info(f"🛠️ staged_for_ingest file_uuid={file_uuid} filename={safe_name} path={target} bytes={len(file_content)} resolved_by={resolved_by}")
-        return json.dumps({"status": "staged", "file_uuid": file_uuid, "filename": safe_name,
+        return json.dumps({"status": "staged_NOT_ingested", "file_uuid": file_uuid, "filename": safe_name,
                            "path": str(target), "bytes": len(file_content), "resolved_by": resolved_by,
-                           "source_filename": source_filename, "timestamp": timestamp}, sort_keys=True)
+                           "source_filename": source_filename, "timestamp": timestamp,
+                           "next_action": (
+                               "This file is ONLY staged to the Sage host filesystem — it is NOT in BloodHound yet. "
+                               "Staging is NOT ingestion. The NEXT step is to INGEST it via the BloodHound MCP tool "
+                               f"file_upload(info_type='upload', file_path='{target}'). If you do not have file_upload, "
+                               "hand this staged path to the agent that owns the BloodHound MCP and have it ingest. "
+                               "Then VERIFY ingestion with domain_info(info_type='list') and confirm the expected "
+                               "domain(s) now appear. Do NOT run another collection — re-collecting will NOT add data; "
+                               "the file you just staged already holds everything your current access can enumerate."),
+                           }, sort_keys=True)
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
@@ -2528,6 +2537,11 @@ class MythicTools:
             if self.client is None:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_client")
                 return None
+
+            # payload_type is referenced only in the ARGVAL log lines below; resolve it ONCE here so
+            # those f-strings never raise NameError. A missing binding made every validation path throw
+            # and fail OPEN — silently disabling all parameter validation.
+            payload_type = await self._resolve_payload_type(callback_display_id)
 
             param_list = await self._fetch_command_schema(command, callback_display_id)
             if not param_list:

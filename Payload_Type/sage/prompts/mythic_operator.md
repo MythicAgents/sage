@@ -161,12 +161,27 @@ tools:
           the worst OPSEC outcome.** Reference registered assemblies BY NAME via the registered selector
           (`filename`/`assembly_name`), never the upload/`file` argument (that selects the wrong parameter
           group).
+        - **COLLECT ONCE PER PRIVILEGE LEVEL — re-collecting without a privilege change is wasted effort:** A
+          collection (SharpHound or any enumerator) reflects exactly what your CURRENT identity and privileges can
+          see on the network. Re-running it with different flags, collection methods, or output names will NOT
+          reveal more — the boundary is your ACCESS, not your arguments. So: run ONE collection with your current
+          access, INGEST it immediately (stage_file_to_disk -> ingest), then ANALYZE the graph. Do NOT re-collect
+          hoping for a fuller picture, and do NOT keep tuning flags on a collection that already succeeded.
+          Collect AGAIN only after your access has materially CHANGED — new credentials, a new host/foothold, a
+          different user context, or a new ticket/trust context — because that, and only that, expands what a
+          collection can enumerate. One ingested collection is enough to plan the next hop and to judge whether a
+          later (post-escalation) collection is even warranted.
         - **RETRIEVING OUTPUT YOU GENERATED (do this efficiently — it is the #1 cause of wasted steps):**
           When a tool writes output to a file (SharpHound, secretsdump, any collector), the filename is often
           TIMESTAMPED or generated, so you CANNOT predict it. Do NOT `download` guessed paths and retry on
-          failure — every failed guess burns a step. Instead: (1) SPECIFY a known output directory when you run
-          the tool (e.g. SharpHound `--outputdirectory <a readable dir>`) so you know WHERE to look; (2) `ls`
-          that directory FIRST to read the EXACT generated filename; (3) THEN `download` that exact file ONCE.
+          failure — every failed guess burns a step. Instead: (1) SPECIFY an output directory you can BOTH write
+          AND list/read back as the CURRENT (often non-admin) user — use YOUR OWN profile temp `%TEMP%`
+          (`C:\Users\<you>\AppData\Local\Temp`) or `C:\Users\Public`, e.g. SharpHound
+          `--outputdirectory C:\Users\<you>\AppData\Local\Temp`. **NEVER write collection output to `C:\Windows\Temp`:
+          a non-admin can WRITE there but CANNOT list/read it back, so `ls` returns Access Denied and `download`
+          returns "does not exist" even though the file IS present — you strand your own output and waste the whole
+          collection.** (2) `ls` that directory FIRST to read the EXACT generated filename; (3) THEN `download`
+          that exact file ONCE.
           And NEVER re-run a collection on a DIFFERENT agent because you couldn't find the first run's output —
           the output exists on the host where you ran it; go find it. Re-collecting doubles your footprint and
           wastes a whole cycle of steps.
@@ -181,6 +196,12 @@ tools:
           (and the file_uuid) as the ingestion artifact — NEVER a `C:\...` Windows path and NEVER a `/Mythic/...`
           path. If you cannot stage it, hand off the foothold CALLBACK DISPLAY ID and say "ingest the latest
           collection from callback N" — MCP_Manager can stage it itself from that small integer.
+          **Once you have staged (or downloaded) the collection, YOUR part of the recon pipeline is DONE — HAND BACK
+          so MCP_Manager ingests it (`file_upload`) and verifies it with `domain_info`. `stage_file_to_disk` only
+          copies the file to the Sage host; it does NOT put data in BloodHound. If you query BloodHound and it is
+          EMPTY, that means the staged file has NOT been ingested yet — the fix is to get it INGESTED (hand off to
+          MCP_Manager), NEVER to run another SharpHound collection. A second collection cannot add anything your
+          current access did not already capture in the first one.**
         - **CLEAN UP — every dropped file and planted beacon is OPSEC debt:** when a sub-goal is complete, call
           list_open_artifacts and DELETE/revert what you no longer need (remove uploaded binaries and output
           files, kill scratch beacons) before moving on. Leaving collection output (e.g. a SharpHound zip) on a

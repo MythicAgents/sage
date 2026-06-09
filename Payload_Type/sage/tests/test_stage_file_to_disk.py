@@ -147,7 +147,8 @@ def test_stage_file_to_disk_with_uuid_stages_and_reports_filename(monkeypatch):
 
     result = json.loads(asyncio.run(_client().stage_file_to_disk(file_uuid="abc")))
 
-    assert result["status"] == "staged"
+    assert result["status"] == "staged_NOT_ingested"  # staging != ingestion: fail-loud so the agent ingests next
+    assert "file_upload" in result["next_action"]  # next step is BloodHound ingest, not another collection
     assert result["file_uuid"] == "abc"
     assert result["filename"] == "abc.zip"
     assert result["resolved_by"] == "uuid"
@@ -167,7 +168,8 @@ def test_stage_file_to_disk_with_callback_resolves_uuid_and_stages(monkeypatch):
 
     result = json.loads(asyncio.run(_client().stage_file_to_disk(callback_display_id=28)))
 
-    assert result["status"] == "staged"
+    assert result["status"] == "staged_NOT_ingested"  # staging != ingestion: fail-loud so the agent ingests next
+    assert "file_upload" in result["next_action"]  # next step is BloodHound ingest, not another collection
     assert result["file_uuid"] == "resolved-uuid"
     assert result["filename"] == "essos_collection.zip"
     assert result["resolved_by"].startswith("callback:")
@@ -224,7 +226,8 @@ def test_stage_file_to_disk_callback_subscription_event_resolves_and_stages(monk
 
     result = json.loads(asyncio.run(_client().stage_file_to_disk(callback_display_id=28)))
 
-    assert result["status"] == "staged"
+    assert result["status"] == "staged_NOT_ingested"  # staging != ingestion: fail-loud so the agent ingests next
+    assert "file_upload" in result["next_action"]  # next step is BloodHound ingest, not another collection
     assert result["file_uuid"] == "event-resolved-uuid"
     assert result["filename"] == "event_collection.zip"
     assert result["resolved_by"].startswith("callback:")
