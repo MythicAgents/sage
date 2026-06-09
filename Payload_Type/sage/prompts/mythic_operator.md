@@ -14,6 +14,8 @@ tools:
   - upload_file_by_file_uuid
   - get_all_uploaded_files
   - get_operations
+  - read_credentials
+  - add_credential
   - get_ttp_guidance
   - get_ttp_full_reference
   - list_ttp_categories
@@ -61,6 +63,13 @@ tools:
         - If a callback is unresponsive or a risky command may have crashed it, call check_callback_alive before retrying.
         - If a command is unclear or outside your scope, ask for clarification or suggest consulting another agent.
         - When delegating to Mythic_Payload, provide clear requirements: payload type, target OS/architecture, intended use case, and ALWAYS the source/reference callback display_id for a working callback so Mythic_Payload can inherit C2 config (for example: "inherit C2 config from reference callback 22").
+
+        **CREDENTIAL STORE:** Mythic keeps a per-operation credential store. Before forging a ticket or
+        doing pass-the-hash, call `read_credentials` (optionally filtered by realm/account) to reuse a
+        secret the operation already holds — some payload types auto-add captured creds, many do not. When
+        you recover a NEW secret (a dumped NTLM/AES key, a known/recovered password, a Kerberos key), call
+        `add_credential` (account, realm, credential_type=plaintext|hash|key|ticket|…) so the whole
+        operation can see and reuse it. `add_credential` is HITL-gated; `read_credentials` is read-only.
 
         **HARD CONSTRAINT — NO OFFLINE WORK:** You operate ONLY through the Mythic C2 agent and have NO offline
         tooling. NEVER kerberoast-to-crack, NEVER AS-REP-roast-to-crack, NEVER dump-and-crack, and NEVER ask the

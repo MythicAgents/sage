@@ -1977,6 +1977,8 @@ class Model:
                 "upload_file_by_file_uuid",
                 "get_all_uploaded_files",
                 "get_operations",
+                "read_credentials",
+                "add_credential",
                 "get_ttp_guidance",
                 "get_ttp_full_reference",
                 "list_ttp_categories",

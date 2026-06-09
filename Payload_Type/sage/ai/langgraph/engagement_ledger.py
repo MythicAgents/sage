@@ -26,11 +26,17 @@ def state_dir() -> str:
     return os.path.join(os.getcwd(), ".sage_engagement")
 
 
+# Ledger filename prefix. Named `state_` (the operator-facing `state` command) and keyed per Mythic
+# OPERATION — e.g. `state_Operation_Chimera_1.json`. (Was `engagement_<SAGE_ENGAGEMENT_ID>` pre-2026-06-08;
+# clean break, old files orphaned/untouched.)
+_LEDGER_PREFIX = "state_"
+
+
 def ledger_path(engagement_id: str | None = None) -> str:
-    """Absolute path to the JSON ledger for an engagement key (sanitized to a safe filename)."""
+    """Absolute path to the JSON ledger for an engagement/operation key (sanitized to a safe filename)."""
     key = (engagement_id or default_engagement_id() or "default").strip() or "default"
     safe = _FILENAME_SAFE.sub("_", key)[:128]
-    return os.path.join(state_dir(), f"engagement_{safe}.json")
+    return os.path.join(state_dir(), f"{_LEDGER_PREFIX}{safe}.json")
 
 
 def load(engagement_id: str | None = None) -> dict:
@@ -73,8 +79,8 @@ def list_engagements() -> list[str]:
     out: list[str] = []
     try:
         for name in os.listdir(state_dir()):
-            if name.startswith("engagement_") and name.endswith(".json"):
-                out.append(name[len("engagement_"):-len(".json")])
+            if name.startswith(_LEDGER_PREFIX) and name.endswith(".json"):
+                out.append(name[len(_LEDGER_PREFIX):-len(".json")])
     except OSError:
         pass
     return sorted(out)

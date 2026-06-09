@@ -457,6 +457,7 @@ GUARDED_TOOLS: set[str] = {
     "stage_file_to_disk",
     "sandbox_exec",
     "file_upload",
+    "add_credential",
 }
 
 
@@ -507,6 +508,13 @@ class MythicTools:
         self._last_issued_callback_id = None
         self._engagement_hops: list = []
         self._pending_engagement_hop = None
+        # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
+        # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
+        # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
+        # serializes that one-time resolve+reload so two concurrent gate calls can't both reload and stomp
+        # an appended hop.
+        self._engagement_key: str | None = None
+        self._engagement_key_lock = asyncio.Lock()
         # Live footholds cache (populated by the gate after reconcile) so the per-turn state render in
         # model.py can show footholds without an extra network round-trip on every model call.
         self._engagement_footholds: list = []
@@ -1657,6 +1665,10 @@ class MythicTools:
         if classified is None:
             return None
 
+        # Resolve the durable-ledger key from the current Mythic operation (and reload the ledger under
+        # it) before the first gated decision — __init__ loaded under 'default' with no client yet.
+        await self._ensure_engagement_key()
+
         technique, target_key = classified
         now = datetime.now(timezone.utc).isoformat()
         try:
@@ -1793,9 +1805,65 @@ class MythicTools:
                 return h
         return None
 
+    def _eng_key(self) -> str:
+        """The active durable-ledger key: the operation-resolved key once known, else the explicit
+        SAGE_ENGAGEMENT_ID (env/test override or 'default')."""
+        return self._engagement_key or SAGE_ENGAGEMENT_ID
+
+    async def _ensure_engagement_key(self) -> None:
+        """Resolve the durable-ledger key from the current Mythic operation the first time it's needed,
+        then reload the ledger under that key. No-op if already resolved, if SAGE_ENGAGEMENT_ID is an
+        explicit override (!= 'default'), or if resolution fails (keeps the 'default' key). The
+        resolve+reload is serialized under a lock so concurrent gate calls can't double-reload. Fail-open."""
+        if self._engagement_key is not None:
+            return
+        if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
+            self._engagement_key = SAGE_ENGAGEMENT_ID   # explicit override wins; pin it, never query
+            return
+        async with self._engagement_key_lock:
+            if self._engagement_key is not None:        # another coroutine resolved while we waited
+                return
+            try:
+                try:
+                    from . import operation_context
+                except ImportError:
+                    import operation_context
+                key = await operation_context.resolve_operation_key(self.client)
+            except Exception:
+                key = None
+            if key:
+                self._engagement_key = key
+                # __init__ loaded under the 'default' key (no client yet); reload under the operation key.
+                try:
+                    self._load_engagement_ledger()
+                except Exception:
+                    pass
+                self._notice_legacy_ledgers()
+
+    _legacy_notice_done = False
+
+    def _notice_legacy_ledgers(self) -> None:
+        """One-time INFO if pre-rename `engagement_*.json` ledgers are present but unused — the clean break
+        makes them invisible to `list_engagements`, so surface that they exist rather than letting it look
+        like data vanished. Best-effort; never raises."""
+        if MythicTools._legacy_notice_done:
+            return
+        try:
+            directory = _engagement_state_dir()
+            legacy = [n for n in os.listdir(directory) if n.startswith("engagement_") and n.endswith(".json")]
+            if legacy:
+                MythicTools._legacy_notice_done = True
+                logger.info(
+                    f"🗃️ [engagement-state] {len(legacy)} legacy engagement_*.json ledger(s) present but NOT "
+                    f"loaded (clean break to state_<operation>_<id>.json): {legacy[:5]} in {directory}. They are "
+                    f"untouched; set SAGE_ENGAGEMENT_ID=<name> to force a specific ledger key if you need one."
+                )
+        except Exception:
+            pass
+
     def _engagement_ledger_path(self) -> str:
-        """Path to this engagement's durable JSON hop ledger (per-engagement, not per-solve)."""
-        return _engagement_ledger_file(SAGE_ENGAGEMENT_ID)
+        """Path to this engagement's durable JSON hop ledger (keyed per Mythic operation, not per-solve)."""
+        return _engagement_ledger_file(self._eng_key())
 
     def _load_engagement_ledger(self) -> None:
         """Load the durable hop ledger from disk into self._engagement_hops. Fail-open: any error
@@ -1843,7 +1911,7 @@ class MythicTools:
             _ttl_note = f" ttl={ttl}h dropped={_dropped}" if ttl > 0 else " ttl=disabled"
             logger.info(
                 f"🗃️ [engagement-state] resumed {len(loaded)} hop(s) ({_achieved} achieved) from durable "
-                f"ledger key={SAGE_ENGAGEMENT_ID} updated={_updated}{_ttl_note} path={path} — durable beliefs "
+                f"ledger key={self._eng_key()} updated={_updated}{_ttl_note} path={path} — durable beliefs "
                 f"are corroborated by live footholds before any SKIP (never silently). Fresh "
                 f"SAGE_ENGAGEMENT_ID after a lab redeploy."
             )
@@ -1857,7 +1925,7 @@ class MythicTools:
         path = self._engagement_ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
-            "engagement_id": SAGE_ENGAGEMENT_ID,
+            "engagement_id": self._eng_key(),
             "objective": self._engagement_objective(),
             "updated": datetime.now(timezone.utc).isoformat(),
             "hops": engagement_state.hops_to_dicts(self._engagement_hops),
@@ -2303,6 +2371,87 @@ class MythicTools:
         logger.debug("🛠️ Calling get_operations tool")
         resp = await mythic.get_operations(mythic=self.client)
         return json.dumps(resp, sort_keys=True)
+
+    async def read_credentials(self, realm: str = "", account: str = "") -> str:
+        """Read credentials from Mythic's credential store for the current operation.
+
+        Many payload types (e.g. Apollo) auto-add captured credentials to this store, but not all do —
+        read it BEFORE forging tickets / pass-the-hash to reuse a secret the operation already holds.
+        Optionally filter by `realm` (domain) and/or `account` (username) — case-insensitive substring.
+        Returns account, realm, type, the secret value, and any comment. Read-only.
+        """
+        # HITL: free (read-only)
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        logger.debug(f"🛠️ Calling read_credentials tool (realm={realm!r}, account={account!r})")
+        op_id = None
+        try:
+            try:
+                from . import operation_context
+            except ImportError:
+                import operation_context
+            resolved = await operation_context.resolve_operation(self.client)
+            op_id = resolved[0] if resolved else None
+        except Exception:
+            op_id = None
+        if op_id is not None:
+            query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
+                     "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
+                     "{ id account realm type credential_text comment timestamp } }")
+            variables = {"op": op_id}
+        else:
+            query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
+                     "order_by: {id: desc}, limit: 200) "
+                     "{ id account realm type credential_text comment timestamp } }")
+            variables = None
+        try:
+            resp = await mythic.execute_custom_query(self.client, query, variables=variables)
+        except Exception as e:
+            return f"Failed to read credentials: {e}"
+        creds = (resp or {}).get("credential") or []
+        r_cf, a_cf = (realm or "").strip().casefold(), (account or "").strip().casefold()
+        if r_cf:
+            creds = [c for c in creds if r_cf in str(c.get("realm") or "").casefold()]
+        if a_cf:
+            creds = [c for c in creds if a_cf in str(c.get("account") or "").casefold()]
+        if not creds:
+            scope = f" for operation {op_id}" if op_id is not None else ""
+            return f"No credentials in the Mythic store{scope} (matching the given filters)."
+        lines = [f"{len(creds)} credential(s) in the Mythic store:"]
+        for c in creds:
+            line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "
+                    f"type={c.get('type') or '-'} credential={c.get('credential_text') or '-'}")
+            if c.get("comment"):
+                line += f" comment={c.get('comment')}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def add_credential(self, credential: str, account: str = "", realm: str = "",
+                             credential_type: str = "plaintext", comment: str = "") -> str:
+        """Add a credential to Mythic's credential store for the current operation.
+
+        Use after recovering a secret (a dumped hash, a cracked/known password, a Kerberos key) so it is
+        recorded where the whole operation can see and reuse it — many payload types do NOT auto-add.
+        `credential_type` is one of: plaintext, hash, key, ticket, certificate, token, cookie, hex
+        (default plaintext). `account` = username, `realm` = domain. State-changing (HITL-gated).
+        """
+        # HITL: guarded (mutates the Mythic credential store)
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        if not (credential or "").strip():
+            return "add_credential requires a non-empty `credential` value."
+        logger.debug(f"🛠️ Calling add_credential tool (account={account!r}, realm={realm!r}, type={credential_type!r})")
+        try:
+            result = await mythic.create_credential(
+                self.client, credential=credential, account=account, realm=realm,
+                comment=comment, credential_type=(credential_type or "plaintext"),
+            )
+        except Exception as e:
+            return f"Failed to add credential: {e}"
+        if (result or {}).get("status") == "success":
+            return (f"Added credential to the Mythic store (id={result.get('id')}): "
+                    f"account={account or '-'} realm={realm or '-'} type={credential_type or 'plaintext'}.")
+        return f"add_credential did not succeed: {result}"
 
     async def _resolve_payload_type(self, callback_display_id: int) -> str | None:
         """Best-effort lookup of a callback's Mythic payload type name (e.g. 'apollo').

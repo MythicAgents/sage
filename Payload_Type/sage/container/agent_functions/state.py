@@ -19,11 +19,59 @@ from mythic_container.MythicRPC import (
 )
 from mythic_container.logging import logger
 
-from ai.langgraph import engagement_ledger
+import os
+
+from mythic import mythic
+from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
+
+from ai.langgraph import engagement_ledger, operation_context
 try:
     from ai.langgraph import engagement_state as _es
 except Exception:  # rendering is best-effort; the detail view below does not depend on it
     _es = None
+
+
+async def _state_mythic_client(taskData):
+    """Build a Mythic GraphQL client for this command the SAME way the agent does (an API token scoped to
+    this task's operator/operation) so the durable-UUID resolution matches. Returns None on any failure."""
+    try:
+        resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=taskData.Task.AgentTaskID))
+        if not getattr(resp, "Success", False):
+            return None
+        ip = os.environ.get("NGINX_HOST", "127.0.0.1")
+        port = int(os.environ.get("NGINX_PORT", 7443))
+        ssl = os.environ.get("NGINX_SSL", "true").lower() in ("true", "1", "yes")
+        return await mythic.login(apitoken=resp.APIToken, server_ip=ip, server_port=port, ssl=ssl)
+    except Exception:
+        return None
+
+
+async def _resolve_engagement_id(taskData) -> str:
+    """The durable-ledger key for this `state` invocation, matching the agent's precedence:
+    explicit `engagement` arg > explicit SAGE_ENGAGEMENT_ID env (!= 'default') > the current Mythic
+    OPERATION incl. its durable UUID (read/created via Mythic, same as the agent) > the operation
+    name+id from taskData.Callback (no uuid, best-effort) > 'default'."""
+    arg = (taskData.args.get_arg("engagement") or "").strip()
+    if arg:
+        return arg
+    env = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip()
+    if env and env != "default":
+        return env
+    # Resolve the full operation key WITH the durable uuid (identical to the agent's _ensure_engagement_key).
+    try:
+        client = await _state_mythic_client(taskData)
+        if client is not None:
+            key = await operation_context.resolve_operation_key(client)
+            if key:
+                return key
+    except Exception:
+        pass
+    # Fallback (no Mythic client): operation name+id without the durable uuid, then 'default'.
+    cb = getattr(taskData, "Callback", None)
+    op_id = getattr(cb, "OperationID", None)
+    if op_id is not None:
+        return operation_context.operation_key(getattr(cb, "OperationName", None) or "operation", op_id)
+    return "default"
 
 
 class StateArguments(TaskArguments):
@@ -48,7 +96,7 @@ class StateArguments(TaskArguments):
             ),
             CommandParameter(
                 name="engagement", display_name="Engagement", cli_name="engagement", type=ParameterType.String, default_value="",
-                description="Engagement id to target (default: the current SAGE_ENGAGEMENT_ID).",
+                description="Engagement/ledger id to target (default: the current Mythic operation, e.g. Operation_Chimera_1).",
                 parameter_group_info=[ParameterGroupInfo(required=False, ui_position=3)],
             ),
         ]
@@ -139,7 +187,7 @@ class StateCommand(CommandBase):
             action = (taskData.args.get_arg("action") or "show").strip().lower()
             hop = (taskData.args.get_arg("hop") or "").strip()
             status = (taskData.args.get_arg("status") or "").strip()
-            engagement_id = (taskData.args.get_arg("engagement") or "").strip() or engagement_ledger.default_engagement_id()
+            engagement_id = await _resolve_engagement_id(taskData)
             path = engagement_ledger.ledger_path(engagement_id)
 
             if action == "show":

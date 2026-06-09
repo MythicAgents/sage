@@ -12,12 +12,12 @@ import engagement_ledger as el  # noqa: E402
 
 def test_path_uses_state_dir_override(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    assert el.ledger_path("goad-tw-0607") == str(tmp_path / "engagement_goad-tw-0607.json")
+    assert el.ledger_path("goad-tw-0607") == str(tmp_path / "state_goad-tw-0607.json")
 
 
 def test_path_sanitizes_unsafe_chars(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
-    assert el.ledger_path("a/b c").endswith("engagement_a_b_c.json")
+    assert el.ledger_path("a/b c").endswith("state_a_b_c.json")
 
 
 def test_roundtrip(monkeypatch, tmp_path):
