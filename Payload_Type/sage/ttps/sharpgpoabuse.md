@@ -110,6 +110,70 @@ Sage uses SharpGPOAbuse to add a local admin or scheduled task. The scheduled ta
 callback gives Sage SYSTEM-level access on all machines in scope. For scoped impact,
 Sage prefers the local admin add (less noise than a new scheduled task running every hour).
 
+## Choosing the abuse primitive — the GPO's SCOPE decides (do this FIRST)
+
+Controlling a GPO is not the attack — it is *code execution as SYSTEM on every computer in the GPO's
+scope*. WHAT that buys you depends entirely on WHICH computers are in scope, so **enumerate the scope
+before choosing a payload.** Picking the payload first is the classic dead-end: a non-DA identity trying
+to self-grant domain rights it has no permission to write.
+
+**Step 1 — resolve the GPO's scope from the graph (not from a name):**
+- What the GPO is LINKED to: `GPLink` edges → the OU(s) and/or the Domain object. A GPO linked at the
+  **domain root** or the **Domain Controllers OU** applies to Domain Controllers.
+- Which COMPUTERS fall under it: `GPLink → container →(Contains*)→ Computer`. (BloodHound's "Affected
+  Objects" tab accounts for inheritance/enforcement — prefer it when available.)
+- Which of those are **Domain Controllers**: a computer that is a member of the `Domain Controllers`
+  group (RID `-516`), or that holds `DCSync`/`GetChangesAll` on the domain. Intersect this set with the
+  affected-computers set from the previous bullet.
+
+**Step 2 — pick the primitive by the privilege the SYSTEM context actually holds:**
+
+| GPO scope (from Step 1) | What a SYSTEM computer-task gets you | Right primitive |
+|--------------------------|--------------------------------------|-----------------|
+| **A Domain Controller is in scope** (linked at domain root or the DC OU) | `NT AUTHORITY\SYSTEM` **on a DC** — which is domain-privileged | Make the DURABLE domain change directly from that context: add a controlled principal to a privileged group (`net group "Domain Admins" <DOMAIN\user> /add /domain` as a computer-task), **or** DCSync from the DC. You do NOT need to grant yourself anything. |
+| **Only member servers / workstations** in scope (no DC) | local SYSTEM on those hosts only — **NOT** domain-privileged | Credential/token theft (LSASS of privileged sessions), ticket capture, lateral movement — then escalate via what you harvest. Do NOT attempt domain-object writes from here. |
+
+**Step 3 — the self-grant trap (why "grant myself DS-Replication" usually fails).** Granting yourself
+the two DS-Replication extended rights on the domain head (StandIn `--object <domain-DN> --grant`) is a
+**DACL write on the domain object**, which requires that *the identity executing the grant* already holds
+`WriteDACL`/`GenericAll`/`Owns`/`WriteOwner` on the Domain node (confirm with a BloodHound edge from your
+principal → Domain). A normal domain user does NOT hold that, and **`NT AUTHORITY\SYSTEM` on a *member*
+host does NOT either** (it is the machine account, not a domain admin). So a self-grant attempted from a
+non-DA user or member-host SYSTEM returns *Access denied* no matter how reliably it is delivered. Only
+self-grant when the graph shows your *current* identity already owns the domain-head DACL edge; otherwise
+get the privilege from the right context (Step 2) and skip the grant.
+
+**Heuristic:** if a "grant" or domain-object write is denied, the bug is almost always *identity/context*
+(you are acting as a principal without the right), not *delivery* (the binary/task). Re-check the scope
+and act from a context that already holds the privilege — do not iterate on delivery.
+
+## Delivery — making the GPO change actually APPLY
+
+Editing a GPO is not one write — it is THREE coordinated changes, and clients ignore a change that is
+missing any of them. A bare "drop a file in SYSVOL" is a legitimate, sometimes-stealthier technique, but
+it is INCOMPLETE on its own. For a Group Policy Preferences item (e.g. a scheduled task) to be processed:
+
+1. **The artifact exists at the correct path** in the GPO's SYSVOL tree (for a Preferences scheduled task:
+   `\\<domain>\SYSVOL\<domain>\Policies\{GPO-GUID}\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml`).
+2. **The GPO advertises the matching Client-Side Extension (CSE)** — the `gPCMachineExtensionNames` LDAP
+   attribute on the GPO object must include the CSE GUID pair for the feature you added (Preferences +
+   the specific item type). If the CSE GUID is absent, clients do not know to read your file and SKIP it.
+3. **The GPO version is incremented** — both the AD `versionNumber` attribute and the `Version=` line in
+   `GPT.INI` must be bumped so clients detect a change and re-process on the next refresh.
+
+So the choice is: **do all three yourself** (write the file + edit `gPCMachineExtensionNames` over LDAP +
+bump both version counters), **or use a tool that does all three for you** (`--AddComputerTask`,
+`--AddComputerScript`, `--AddUserRights`, etc.). A manual file write that skips #2/#3 leaves the artifact
+inert in SYSVOL — the task never fires (this is the classic "I changed the GPO but nothing happened").
+
+**Writing the artifact safely:** GPO XML contains `<`, `>`, `&` — do NOT write it with a shell `echo`
+redirect (the shell interprets those as operators and the write fails or corrupts). Use a primitive that
+takes literal bytes (file upload, base64-decode-to-file, or the tool itself).
+
+**Then verify it applied** — don't assume the refresh interval. Force/await a policy refresh on a target in
+scope and confirm the effect landed (the membership/right/task actually present), not just that the file
+write returned success. A SYSVOL write succeeding says nothing about whether clients processed it.
+
 ## Output
 Text confirmation to stdout indicating success or failure of the GPO modification.
 Example: `[+] Local admin entry successfully added!`. The actual effect (local admin

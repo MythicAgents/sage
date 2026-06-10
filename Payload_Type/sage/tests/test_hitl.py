@@ -28,7 +28,7 @@ def test_guarded_tools_are_state_changing_only():
         "upload_file_by_file_uuid",
         "create_payload",
         "download_tool",
-        "stage_file_to_disk",
+        "ingest_collection",
         "sandbox_exec",
         "file_upload",
     }

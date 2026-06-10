@@ -81,6 +81,40 @@ def project_graph_position(edge_records: list[dict], controlled_principals: list
     return {"current_principals": principals, "candidate_edges": candidate_edges}
 
 
+def controlled_principals_from_state(state: EngagementState) -> list[str]:
+    """Derive the BloodHound principal names we control, for the reconcile cypher's
+    ``toLower(principal.name) IN $principals`` match. Built from LIVE foothold identities
+    (``DOMAIN\\user`` or ``user@domain``) projected to the UPN form ``user@forest`` that BloodHound
+    stores as a node ``.name``, plus any ``creds:user@domain`` effects already achieved (a DCSynced /
+    dumped principal we can now act as). Pure; never raises."""
+    principals: set[str] = set()
+    try:
+        for foothold in getattr(state, "footholds", []) or []:
+            if not getattr(foothold, "alive", False):
+                continue
+            identity = _text(getattr(foothold, "identity", ""))
+            forest = _text(getattr(foothold, "forest", "")).casefold()
+            if "\\" in identity:
+                user = identity.split("\\", 1)[1]
+            elif "@" in identity:
+                user = identity.split("@", 1)[0]
+            else:
+                user = identity
+            user = user.casefold().strip()
+            if "@" in identity:
+                principals.add(identity.casefold())
+            if user and forest:
+                principals.add(f"{user}@{forest}")
+        for effect in state.achieved_effects():
+            if effect.startswith("creds:"):
+                value = effect[len("creds:"):].strip()
+                if "@" in value:
+                    principals.add(value.casefold())
+    except Exception:
+        pass
+    return sorted(principal for principal in principals if principal)
+
+
 def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState:
     """Return a new state with stale graph facts removed."""
 
@@ -101,6 +135,9 @@ def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState
     )
 
 
+_WRITE_LABELS_CYPHER = "['GenericWrite', 'GenericAll', 'WriteDacl', 'WriteOwner', 'Owns']"
+
+
 async def reconcile_graph_position(
     mcp_manager: Any,
     controlled_principals: list[str],
@@ -108,8 +145,15 @@ async def reconcile_graph_position(
     now: str,
     ttl_seconds: int,
 ) -> list[GraphFact]:
-    """Fetch existing BloodHound graph edges and return projected GraphFacts."""
+    """Project the ACL edges our controlled principals hold over GPOs / computers / domains into
+    engagement predicates, via the BloodHound MCP ``cypher_query`` tool.
 
+    The real BloodHound CE cypher API (1) requires ``info_type="run"``, (2) does NOT support query
+    parameters, and (3) returns scalar RETURNs under ``data.literals`` (a flat ``{value,key}`` list), NOT
+    a record/edge list. So we inline the principal allowlist, run one focused single-column query per
+    target kind, and read names out of ``literals``. GPO control is keyed by GPO NAME (matching
+    intent_classifier's ``gpo-abuse`` target = ``--gponame``), computers by short host, domains by FQDN.
+    Read-only; never runs collection. Fail-open -> []."""
     del objective
     try:
         tool = await asyncio.wait_for(mcp_manager.get_tool_by_name(_CYPHER_TOOL), timeout=_MCP_TIMEOUT_SECONDS)
@@ -118,13 +162,98 @@ async def reconcile_graph_position(
         principals = _normalized_unique(controlled_principals)
         if not principals:
             return []
-        # Read only: this must not run SharpHound or any data collection tool.
+        inlist = _principal_in_list(principals)
+        facts: list[GraphFact] = []
+        seen: set[str] = set()
+
+        async def _collect(target_label: str, predicate_prefix: str, key_fn) -> None:
+            query = (
+                f"MATCH (p)-[e]->(t:{target_label}) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_WRITE_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, query):
+                key = key_fn(raw_name)
+                if not key:
+                    continue
+                predicate = f"{predicate_prefix}:{key}"
+                if predicate not in seen:
+                    seen.add(predicate)
+                    facts.append(_graph_fact(predicate, now, ttl_seconds))
+
+        # GPO control: emit the control fact (keyed by NAME, matching SharpGPOAbuse --gponame) AND the
+        # GPO->domain link, so the forward planner can effect-chain gpo-abuse -> dcsync on the domain whose
+        # DC the GPO governs (the SharpGPOAbuse SYSTEM task grants DS-Replication there).
+        gpo_query = (
+            f"MATCH (p)-[e]->(t:GPO) WHERE toLower(p.name) IN {inlist} "
+            f"AND type(e) IN {_WRITE_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
+        )
+        for raw_name in await _run_scalar_names(tool, gpo_query):
+            gpo = _gpo_name_key(raw_name)
+            if not gpo:
+                continue
+            for predicate in (f"generic-write:gpo:{gpo}", _gpo_domain_fact(raw_name, gpo)):
+                if predicate and predicate not in seen:
+                    seen.add(predicate)
+                    facts.append(_graph_fact(predicate, now, ttl_seconds))
+        await _collect("Computer", "generic-write:computer", _short_host)
+        await _collect("Domain", "write-dacl:domain", lambda n: access_reconciler.normalize_forest(_text(n)))
+        return facts
+    except Exception:
+        return []
+
+
+def _gpo_domain_fact(raw_name: Any, gpo_key: str) -> str:
+    """The ``gpo-domain:{gpo}:{domain}`` link fact (domain parsed from the GPO name's ``@suffix``), or ''.
+    Lets the planner chain gpo-abuse -> dcsync on the GPO's domain — the SharpGPOAbuse SYSTEM task grants
+    DS-Replication on the DC the GPO governs, so controlling the GPO implies eventual replication rights."""
+    text = _text(raw_name)
+    if "@" not in text:
+        return ""
+    domain = access_reconciler.normalize_forest(text.split("@", 1)[1])
+    return f"gpo-domain:{gpo_key}:{domain}" if domain else ""
+
+
+def _principal_in_list(principals: list[str]) -> str:
+    """Inline a principal allowlist as a Cypher list literal (the BloodHound cypher API takes no params)."""
+    safe = [p.replace("\\", "").replace("'", "") for p in principals if p]
+    return "[" + ", ".join(f"'{p}'" for p in safe) + "]"
+
+
+def _gpo_name_key(name: Any) -> str:
+    """GPO predicate key = the display name before '@domain', lowercased (matches SharpGPOAbuse --gponame)."""
+    text = _text(name)
+    return text.split("@", 1)[0].strip().casefold() if text else ""
+
+
+async def _run_scalar_names(tool: Any, query: str) -> list[str]:
+    """Run a single-column Cypher RETURN via the MCP cypher_query tool and read the values from the
+    BloodHound ``data.literals`` response shape. Fail-open -> []."""
+    try:
         payload = await asyncio.wait_for(
-            tool.ainvoke({"query": _read_only_cypher(), "parameters": {"principals": principals}}),
+            tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
             timeout=_MCP_TIMEOUT_SECONDS,
         )
-        edge_records = _edge_records_from_json(payload)
-        return project_graph_predicates(edge_records, now, ttl_seconds)
+    except Exception:
+        return []
+    return _names_from_payload(payload)
+
+
+def _names_from_payload(payload: Any) -> list[str]:
+    """Extract scalar values from a BloodHound MCP cypher_query 'run' response (``data.literals``).
+    Handles MCP content-list wrapping plus a raw dict / JSON string. Never raises."""
+    try:
+        text = payload
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            text = payload[0].get("text", "")
+        data = json.loads(text) if isinstance(text, str) else (text or {})
+        literals = (((data or {}).get("data") or {}).get("literals")) or []
+        names: list[str] = []
+        for literal in literals:
+            if isinstance(literal, dict):
+                value = literal.get("value")
+                if isinstance(value, str) and value.strip():
+                    names.append(value.strip())
+        return names
     except Exception:
         return []
 

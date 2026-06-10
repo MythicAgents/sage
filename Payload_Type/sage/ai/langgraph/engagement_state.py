@@ -46,6 +46,10 @@ class EngagementState:
     footholds: list[Foothold] = field(default_factory=list)
     hops: list[Hop] = field(default_factory=list)
     graph_facts: list[GraphFact] = field(default_factory=list)
+    # Effect-prefixes the caller actively READ-PROBED this gate call (e.g. {"creds","krbtgt-hash"} when the
+    # credential store was read). Lets the gate distinguish "durable hop's artifact is genuinely GONE
+    # (probed, absent → re-run legit)" from "no probe available → trust the ledger, do NOT re-run".
+    probed_effect_prefixes: set[str] = field(default_factory=set)
 
     def achieved_effects(self) -> set[str]:
         """Return normalized effects from achieved hops."""
@@ -67,6 +71,24 @@ class EngagementState:
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
         return _normalize_predicate(predicate) in self.satisfied_predicates()
+
+
+def access_context_key(state: "EngagementState", foothold: "Foothold") -> str:
+    """A stable key for 'the access level a collection was run at': host|identity|integrity|held-privileges.
+    Re-collecting from the same foothold with the same rights is redundant (same key -> gate SKIP); once the
+    agent escalates (a new da:/ea:/krbtgt-hash:/creds: effect lands) the key changes and a fresh collection
+    is allowed. This makes collect-once-PER-PRIVILEGE deterministic. Pure; never raises."""
+    try:
+        privs = sorted(
+            e for e in state.achieved_effects()
+            if e.startswith(("da:", "ea:", "krbtgt-hash:", "creds:"))
+        )
+        host = _normalize_key(getattr(foothold, "host", ""))
+        identity = _normalize_key(getattr(foothold, "identity", ""))
+        integrity = _normalize_key(getattr(foothold, "integrity", ""))
+        return _normalize_predicate(f"{host}|{identity}|{integrity}|{';'.join(privs)}")
+    except Exception:
+        return ""
 
 
 def foothold_predicates(state: "EngagementState") -> set[str]:
@@ -110,14 +132,31 @@ _DA_EFFECT_PREFIXES = ("da:", "ea:")
 
 
 def _expand_implications(predicates: set[str]) -> set[str]:
-    """Augment a satisfied-predicate set with logically-implied predicates. Pure; never raises."""
+    """Augment a satisfied-predicate set with logically-implied predicates. Pure; never raises.
+
+    Two implications:
+    1. da:/ea: on a domain -> that domain's ds-replication-rights (a DA/EA can DCSync).
+    2. gpo-abuse (effect system:{gpo}) on a GPO that governs a domain (gpo-domain:{gpo}:{D} graph fact)
+       -> ds-replication-rights:{D}. The SharpGPOAbuse SYSTEM task grants/holds DS-Replication on the DC
+       the GPO governs, so controlling the GPO chains forward to dcsync on that domain (the effect-chained
+       hop the forward planner needs to name after the first graph-derived hop)."""
     expanded = set(predicates)
+    gpo_domain: dict[str, str] = {}
+    for predicate in predicates:
+        if predicate.startswith("gpo-domain:"):
+            gpo, _, domain = predicate[len("gpo-domain:"):].partition(":")
+            if gpo.strip() and domain.strip():
+                gpo_domain[gpo.strip()] = domain.strip()
     for predicate in predicates:
         for prefix in _DA_EFFECT_PREFIXES:
             if predicate.startswith(prefix):
                 domain = predicate[len(prefix):].strip()
                 if domain:
                     expanded.add(f"ds-replication-rights:{domain}")
+        if predicate.startswith("system:"):
+            domain = gpo_domain.get(predicate[len("system:"):].strip())
+            if domain:
+                expanded.add(f"ds-replication-rights:{domain}")
     return expanded
 
 
@@ -136,6 +175,16 @@ class GateDecision(str, Enum):
 
 
 TECHNIQUE_MODEL: dict[str, dict] = {
+    # Collection modeled as a STRIPS action so re-collection at the SAME access level is deterministically
+    # SKIPped by the gate (collect-once-per-privilege) — doctrine the model kept ignoring is now code. The
+    # target is an access-context key (host|identity|integrity|held-privileges); a privilege change yields a
+    # new key, re-enabling a fresh collection. Effect is verified by ingest_collection's graph_verified.
+    "collect-graph": {
+        "target_type": "access",
+        "effect": "graph-built:{target}",
+        "preconditions": ["live-foothold:*"],
+        "verify": {"achieved_all": ["graph_verified"]},
+    },
     "gpo-abuse": {
         "target_type": "host",
         "effect": "system:{host}",
@@ -256,7 +305,18 @@ def gate_decision(technique: str, target: str, state: EngagementState) -> tuple[
                 return GateDecision.SKIP, (
                     f"effect already achieved ({tag}): {effect}; evidence={dict(getattr(achieved_hop, 'evidence', {}))}"
                 )
-            durable_unconfirmed = True
+            # Durable hop, NOT corroborated by a live signal. Re-verify by READ-PROBE, NEVER by re-running
+            # the attack. If we actively probed this effect's artifact this turn and it is GONE, a re-run is
+            # legitimate (the result really is absent — e.g. a range redeploy). If no probe applies to this
+            # effect, trust the ledger and SKIP — do NOT re-execute the offensive action just to check.
+            prefix = _normalize_predicate(effect).split(":", 1)[0]
+            if prefix in (getattr(state, "probed_effect_prefixes", None) or set()):
+                durable_unconfirmed = True   # probed + absent → fall through to PROCEED (re-run is warranted)
+            else:
+                return GateDecision.SKIP, (
+                    f"effect achieved (durable, unprobed): {effect} — trusting the ledger; do NOT re-run the "
+                    f"attack to verify. Re-verify the artifact with a READ-ONLY probe if the range was redeployed."
+                )
 
         preconditions = _technique_preconditions(technique, target)
         # Belief: unknown ≠ false. Only DEFER on a precondition the state can AFFIRMATIVELY
@@ -299,6 +359,92 @@ def _is_enforceable_precondition(predicate: str, state: EngagementState) -> bool
         if not getattr(state, "graph_facts", None):
             return False
     return True
+
+
+# --- Forward planner -------------------------------------------------------------------------------
+# The reactive gate (gate_decision) judges a hop the model ALREADY proposed. The forward planner runs
+# that same STRIPS check FORWARD over candidate (technique, target) pairs derived from the grounded
+# state, so the operator can be DIRECTED to the next executable hop instead of looping on recon /
+# re-collection (the 2026-06-09 clean-run stall: graph built, but the agent never proposed an attack
+# hop because nothing told it which hop was available). Pure; never raises.
+
+# Map a satisfied-predicate prefix to the technique(s) it makes a candidate for, reading the target as
+# the predicate tail. dcsync-user is intentionally absent: it needs a SPECIFIC user picked during graph
+# analysis, not a structurally-enumerable target. Keep in sync with TECHNIQUE_MODEL preconditions.
+_CANDIDATE_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("generic-write:gpo:", ("gpo-abuse",)),
+    ("generic-write:computer:", ("rbcd-standin",)),
+    ("write-dacl:domain:", ("dcsync-rights-grant",)),
+    ("system-or-admin:", ("lsass-dump",)),
+    ("ds-replication-rights:", ("dcsync",)),
+    ("krbtgt-hash:", ("golden-ticket", "sid-history-escalation")),
+)
+
+# Stable display order: foothold-local effects first, then domain escalation.
+_AVAILABLE_PRIORITY: dict[str, int] = {
+    "lsass-dump": 0, "gpo-abuse": 1, "rbcd-standin": 2, "dcsync-rights-grant": 3,
+    "dcsync": 4, "dcsync-user": 5, "golden-ticket": 6, "sid-history-escalation": 7,
+}
+
+
+def candidate_targets_from_state(state: "EngagementState") -> list[tuple[str, str]]:
+    """Enumerate (technique, target) pairs worth considering, inverted from the grounded state's
+    satisfied predicates (graph ACL facts, foothold-derived rights, achieved-effect implications).
+    The precondition/already-achieved check is deferred to gate_decision via available_hops. Pure."""
+    candidates: set[tuple[str, str]] = set()
+    try:
+        for predicate in state.satisfied_predicates():
+            for prefix, techniques in _CANDIDATE_SOURCES:
+                if predicate.startswith(prefix):
+                    target = predicate[len(prefix):].strip()
+                    if target:
+                        for technique in techniques:
+                            candidates.add((technique, target))
+                    break
+    except Exception:
+        return []
+    return sorted(candidates)
+
+
+def engagement_phase(state: "EngagementState") -> str:
+    """Deterministic phase of the engagement, so the operator stops asking 'should I collect more?':
+    FOOTHOLD (no live access) -> RECON (no graph yet) -> EXPLOITATION (graph + an available hop) ->
+    BLOCKED (graph but nothing modeled is available). Pure; never raises."""
+    try:
+        alive = any(getattr(f, "alive", False) for f in getattr(state, "footholds", []) or [])
+        if not alive:
+            return "FOOTHOLD — establish access"
+        if not getattr(state, "graph_facts", None):
+            return "RECON — collect the graph ONCE, then analyze (do NOT re-collect)"
+        if available_hops(state):
+            return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
+        return "BLOCKED — no modeled hop available; escalate or await an access change (do NOT re-collect)"
+    except Exception:
+        return ""
+
+
+def available_hops(state: "EngagementState") -> list[tuple[str, str, str]]:
+    """Return (technique, target, reason) for every candidate hop whose preconditions are met and whose
+    effect is not already achieved — i.e. gate_decision returns PROCEED. This is the forward run of the
+    reactive gate; ordering is a stable technique priority. Pure; never raises."""
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        for technique, target in candidate_targets_from_state(state):
+            key = (technique, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                decision, reason = gate_decision(technique, target, state)
+            except Exception:
+                continue
+            if decision is GateDecision.PROCEED:
+                out.append((technique, target, reason))
+    except Exception:
+        return []
+    out.sort(key=lambda hop: (_AVAILABLE_PRIORITY.get(hop[0], 99), hop[1]))
+    return out
 
 
 def record_hop_result(
@@ -582,6 +728,10 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.append(f"Objective: {objective}")
         elif state is None:
             lines.append("Objective: (state unavailable)")
+        try:
+            lines.append(f"Phase: {engagement_phase(state)}")
+        except Exception:
+            pass
 
         live_footholds = []
         for foothold in _render_items(getattr(state, "footholds", [])):
@@ -629,7 +779,21 @@ def render_engagement_state(state: EngagementState) -> str:
         if blocked_hops:
             lines.append("Failed/blocked hops:")
             lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
-        if not live_footholds and not achieved_hops and not blocked_hops:
+
+        # Forward planner: name the next executable hop(s) so the operator ADVANCES from observed state
+        # instead of looping on recon / re-collection. Deterministic (preconditions met + not achieved).
+        try:
+            available = available_hops(state)
+        except Exception:
+            available = []
+        if available:
+            lines.append(
+                "NEXT GROUNDED ACTIONS (preconditions met — execute one of these; do NOT re-collect or re-recon):"
+            )
+            for technique, target, _reason in available[:8]:
+                lines.append(f"- {technique} → {target}")
+
+        if not live_footholds and not achieved_hops and not blocked_hops and not available:
             lines.append("(no observed state yet)")
 
         return _render_bounded("\n".join(lines))

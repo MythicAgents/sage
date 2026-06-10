@@ -116,8 +116,26 @@ reset is acceptable and simpler.
 
 DCSync requires TWO extended rights on the domain object: `DS-Replication-Get-Changes`
 (`1131f6aa-9c07-11d1-f79f-00c04fc2dcd2`) and `DS-Replication-Get-Changes-All`
-(`1131f6ad-9c07-11d1-f79f-00c04fc2dcd2`). When you hold `WriteDACL`/`GenericAll`/`WriteOwner` on the
-domain head, grant yourself both, then DCSync.
+(`1131f6ad-9c07-11d1-f79f-00c04fc2dcd2`).
+
+**PRECONDITION — only self-grant when your CURRENT identity already owns the domain-head DACL.** The
+grant below is a DACL write on the domain object: it succeeds ONLY when the principal *executing it*
+holds `WriteDACL`/`GenericAll`/`Owns`/`WriteOwner` on the Domain node (confirm with a BloodHound edge
+`your-principal → Domain`). A normal domain user does not hold that, and `NT AUTHORITY\SYSTEM` on a
+**member** host does not either. Attempting the self-grant from a context that lacks the domain-head edge
+returns *Access denied* — that is an **identity/context** problem, not a delivery problem; do not retry
+the grant, change the context.
+
+**If you do NOT hold the domain-head DACL, get the privilege from a context that does instead of granting:**
+- **A controlled GPO whose scope includes a Domain Controller** (linked at the domain root or the DC OU):
+  a SYSTEM computer-task runs ON the DC, which IS domain-privileged — add a controlled principal to
+  `Domain Admins` (`net group "Domain Admins" <DOMAIN\user> /add /domain`) or DCSync from that context.
+  See `ttps/sharpgpoabuse.md` → "Choosing the abuse primitive — the GPO's SCOPE decides". Then DCSync
+  remotely as the now-privileged principal — no DACL self-grant needed.
+- A group membership / ownership path that BloodHound shows reaching the domain-head edge or `Domain Admins`.
+
+**When you DO hold `WriteDACL`/`GenericAll`/`Owns`/`WriteOwner` on the domain head**, grant yourself both
+rights, then DCSync.
 
 **Read the GetNCChanges error code first:** `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** = you lack the
 replication rights → apply the grant below. `0x20f7` / **8439 `DS_DRA_BAD_DN`** = wrong/invalid naming

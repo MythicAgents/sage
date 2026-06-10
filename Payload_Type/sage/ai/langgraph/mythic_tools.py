@@ -454,7 +454,7 @@ GUARDED_TOOLS: set[str] = {
     "create_payload",
     "delete_payload",
     "download_tool",
-    "stage_file_to_disk",
+    "ingest_collection",
     "sandbox_exec",
     "file_upload",
     "add_credential",
@@ -508,6 +508,33 @@ class MythicTools:
         self._last_issued_callback_id = None
         self._engagement_hops: list = []
         self._pending_engagement_hop = None
+        # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
+        # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
+        # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
+        # re-collect (the 2026-06-09 loop). SUGGESTION-ONLY: these feed available_hops / the injected
+        # render, NOT the gate's enforcement state — so a reconciliation miss can never newly DEFER a real
+        # hop (suggest-on-known; blocking stays conservative / unknown != false).
+        self._engagement_graph_facts: list = []
+        self._engagement_graph_facts_ts: str | None = None
+        # Empirical pre-DCSync rights precheck: per-(technique,domain) count of times we've blocked a DCSync
+        # for missing replication rights. CAPPED (see _DCSYNC_PRECHECK_MAX_BLOCKS) so the precheck can redirect
+        # the agent to obtain rights first WITHOUT ever becoming a permanent deadlock (the failure mode that
+        # got the static gate demoted to advisory).
+        self._dcsync_precheck_blocks: dict = {}
+        # Access-context keys with a collection currently in-flight (issued, not yet ingested). Gates the
+        # parallel-spawn case (agent fires N SharpHounds before the first ingests) until graph-built lands.
+        self._collection_in_flight: set = set()
+        # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
+        # re-fetched + re-dumped them 27×, bloating context). Gate-block counts cap a hop the gate keeps
+        # DEFERring (issue_task fired 168× -> 1 task that run): a firm STOP after repeated blocks with no
+        # intervening progress; reset whenever a task actually passes the gate.
+        self._command_schema_cache: dict = {}
+        self._gate_block_counts: dict = {}
+        # Credential-store cache: the store is read both by read_credentials (which the agent hit 24× in one
+        # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
+        # neither path re-queries Mythic repeatedly.
+        self._cred_cache: list | None = None
+        self._cred_cache_ts: str | None = None
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
@@ -1115,6 +1142,16 @@ class MythicTools:
             str: JSON string containing all commands and their detailed information
         """
         # HITL: free
+        # Command schemas are STATIC per payloadtype — serve repeats from cache as a terse pointer instead
+        # of re-dumping the full schema (27× re-fetches bloated context + burned steps in a 2026-06-09 solve).
+        cached = self._command_schema_cache.get(payload)
+        if cached is not None:
+            names = sorted(c.get("cmd") for c in cached if isinstance(c, dict) and c.get("cmd"))
+            return json.dumps({
+                "payloadtype": payload, "cached": True, "command_count": len(names), "commands": names,
+                "note": ("Full schemas for this payloadtype were ALREADY returned earlier this run — re-read "
+                         "that output for parameter details. Do NOT re-fetch; choose a command and issue it."),
+            }, sort_keys=True)
         attr = """
         cmd
         commandparameters {
@@ -1150,6 +1187,11 @@ class MythicTools:
                         _ax = _fp["axes"]
                         _cmd["footprint"] = _ax
                         _cmd["footprint_summary"] = _summarize_footprint(_ax)
+            except Exception:
+                pass
+            try:
+                if isinstance(results, list):
+                    self._command_schema_cache[payload] = results
             except Exception:
                 pass
             return json.dumps(results, sort_keys=True)
@@ -1392,12 +1434,35 @@ class MythicTools:
             except Exception:
                 _gate_result = None  # fail-open: any gate error => proceed normally
             if _gate_result is not None:
+                # Post-RCA (2026-06-09): missing-precondition DEFER no longer blocks (see _engagement_gate),
+                # so the ONLY blocking result left is an already-achieved/collect-once SKIP (genuine dedup).
+                # This breaker now caps the narrow case of an agent re-proposing an ALREADY-WON hop: a firm
+                # STOP after 3 tries tells it to advance instead of re-issuing a hop the ledger already holds.
+                # Counts reset when a task actually passes the gate.
+                try:
+                    _sig = (
+                        command, callback_display_id,
+                        json.dumps(parameters, sort_keys=True) if isinstance(parameters, (dict, list)) else str(parameters),
+                    )
+                    self._gate_block_counts[_sig] = self._gate_block_counts.get(_sig, 0) + 1
+                    if self._gate_block_counts[_sig] >= 3:
+                        return (
+                            f"STOP — the engagement gate has blocked this exact action "
+                            f"{self._gate_block_counts[_sig]}× with NO intervening progress.\n{_gate_result}\n"
+                            "Re-proposing a blocked hop burns the step budget. Execute one of the NEXT GROUNDED "
+                            "ACTIONS shown in the engagement state, or handback_to_supervisor with this blocker. "
+                            "Do NOT re-issue this command."
+                        )
+                except Exception:
+                    pass
                 return _gate_result
 
         # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
         # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
-        # REPEATED reads within one epoch).
+        # REPEATED reads within one epoch). A task passing the gate is progress, so stale gate-block counts
+        # reset here too.
         self._recon_epoch += 1
+        self._gate_block_counts = {}
 
         # HITL: guarded
         if timeout is None:
@@ -1683,6 +1748,31 @@ class MythicTools:
         except Exception:
             pass
 
+        # collect-graph: deterministic collect-once-per-privilege. Rebind the empty target to the issuing
+        # callback's access-context key; SKIP if a collection is in-flight or the graph is already built at
+        # this access level. graph-built is recorded by ingest_collection on graph_verified (not on
+        # SharpHound success), so we do NOT set a pending hop here.
+        if technique == "collect-graph":
+            cg_state = engagement_state.EngagementState(
+                objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
+            )
+            fh = next(
+                (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
+            )
+            access_key = engagement_state.access_context_key(cg_state, fh) if fh is not None else ""
+            if not access_key:
+                return None  # can't key it — fail-open, allow the collection
+            if access_key in self._collection_in_flight:
+                return ("[engagement-gate] skipped: a collection is already in-flight at this access level "
+                        f"({access_key}) — wait for ingest, then analyze; do NOT launch another SharpHound.")
+            decision, _reason = engagement_state.gate_decision("collect-graph", access_key, cg_state)
+            if decision == engagement_state.GateDecision.SKIP:
+                return (f"[engagement-gate] skipped: graph already built at this access level ({access_key}) "
+                        "— analyze the existing graph or escalate; do NOT re-collect.")
+            self._collection_in_flight.add(access_key)
+            self._pending_engagement_hop = None
+            return None
+
         # Host-scoped techniques (e.g. lsass-dump) usually carry no host in the tool args — the
         # target host is the callback's own host. Rebind the target from the matching foothold so
         # the precondition (system-or-admin:<host>) resolves instead of false-DEFERing on an empty host.
@@ -1696,24 +1786,345 @@ class MythicTools:
                 if rebind is not None:
                     technique, target_key = rebind
 
+        # Lazily refresh graph facts (TTL-bounded; retries while the cache is empty) so an async-completed
+        # ingest is picked up on a later gate call — without it the chain never sees the graph if ingest
+        # reported "pending" (the 2026-06-09 false-negative).
+        try:
+            await self._refresh_graph_facts_if_stale(now)
+        except Exception:
+            pass
+        # Read-only artifact probe for durable-hop re-verification: corroborate "is the result still present?"
+        # from the credential store + cached graph (so a durable hop is SKIPped if its artifact exists, and
+        # re-run ONLY if a probed artifact is genuinely gone — never re-run merely to verify).
+        try:
+            corroboration = await self._corroboration_facts(now)
+        except Exception:
+            corroboration = []
         state = engagement_state.EngagementState(
             objective=self._engagement_objective(),
             footholds=footholds,
             hops=list(self._engagement_hops),
+            graph_facts=corroboration,
+            probed_effect_prefixes={"creds", "krbtgt-hash"},  # the cred-store probe definitively read these
         )
         decision, reason = engagement_state.gate_decision(technique, target_key, state)
         if decision == engagement_state.GateDecision.SKIP:
             self._pending_engagement_hop = None
             return f"[engagement-gate] skipped: {reason}"
         if decision == engagement_state.GateDecision.DEFER:
-            self._pending_engagement_hop = None
-            return f"[engagement-gate] deferred: {reason}"
+            # ADVISOR, NOT ENFORCER (2026-06-09 RCA): a missing-precondition DEFER is NO LONGER a veto.
+            # The hand-built STRIPS precondition model produced FATAL false-negatives — it refused 167/168
+            # correct hops in solve #37 and deadlocked every run after hop 1: `dcsync` DEFERd for
+            # `ds-replication-rights:{domain}`, and the StandIn grant that PRODUCES those rights itself
+            # DEFERd for `write-dacl:domain:{domain}` — a precondition nothing in the model ever emits from
+            # the agent's GPO/SYSTEM control. The agent cannot route around Sage's OWN refusal, so every
+            # modeling gap is a fatal deadlock. The live target is a real oracle we already possess: a wrong
+            # attack fails with real, reasoned-from feedback; a right attack advances the ledger. Cost
+            # asymmetry: a gate false-block = infinite deadlock; a false-allow = one cheap, reset-recoverable
+            # task + real signal. So we PROCEED past a would-DEFER and let execution be the judge. The
+            # advisory is LOGGED for observability but NOT injected into the agent's context — injecting it
+            # is what made the agent mistake Sage's veto for a malformed command and permute --object syntax
+            # ~50×. Already-achieved SKIP (dedup, above) is preserved — that is what prevents re-doing won
+            # work (the original 156× re-propose thrash). verify-on-record still gates the ledger, so a hop
+            # that proceeds-but-fails records `failed`, never a phantom effect.
+            # EMPIRICAL pre-DCSync rights precheck (2026-06-10): the demoted gate no longer warns, so the
+            # agent fires DCSync without replication rights and burns a step on 8453. Re-block — but ONLY
+            # for DCSync, ONLY on EMPIRICAL evidence (the graph is POPULATED and the missing precondition is
+            # replication rights), and ONLY up to a per-domain CAP so this can never re-create the static
+            # deadlock that demoted the gate. Fail-open on ignorance (no graph facts) and after the cap, where
+            # the agent's own 8453 + verify-on-record become the judge.
+            dom = self._dcsync_target_domain(technique, target_key)
+            if self._should_block_premature_dcsync(
+                technique, reason, bool(self._engagement_graph_facts),
+                self._dcsync_precheck_blocks.get((technique, dom), 0), self._DCSYNC_PRECHECK_MAX_BLOCKS,
+            ):
+                self._dcsync_precheck_blocks[(technique, dom)] = \
+                    self._dcsync_precheck_blocks.get((technique, dom), 0) + 1
+                self._pending_engagement_hop = None
+                logger.info("🧭 [engagement-precheck] DCSync rights BLOCK %d/%d for %s",
+                            self._dcsync_precheck_blocks[(technique, dom)],
+                            self._DCSYNC_PRECHECK_MAX_BLOCKS, dom)
+                return self._dcsync_rights_guidance(dom)
+            logger.info("🧭 [engagement-advisor] would-defer (proceeding, advisory only): %s", reason)
+            self._pending_engagement_hop = (technique, target_key, now)
+            return None
 
         self._pending_engagement_hop = (technique, target_key, now)
         return None
 
+    _DCSYNC_PRECHECK_MAX_BLOCKS = 2
+
+    @staticmethod
+    def _dcsync_target_domain(technique: str, target_key: str) -> str:
+        """The domain a DCSync hop targets: the bare domain for `dcsync`, the realm half for
+        `dcsync-user` (`user@domain`)."""
+        tk = str(target_key or "")
+        return tk.split("@")[-1] if technique == "dcsync-user" else tk
+
+    @staticmethod
+    def _should_block_premature_dcsync(technique, reason, graph_populated, prior_blocks, max_blocks) -> bool:
+        """Pure: block a proposed DCSync with rights-guidance? True ONLY for a dcsync technique whose gate
+        DEFER cites missing replication rights, AND only when the graph is POPULATED (so absence is real
+        evidence, not ignorance), AND only until the per-domain cap. Never blocks on an empty/unknown graph
+        and never past the cap — so it cannot become a permanent deadlock."""
+        return bool(
+            technique in ("dcsync", "dcsync-user")
+            and graph_populated
+            and "ds-replication-rights" in (reason or "")
+            and prior_blocks < max_blocks
+        )
+
+    @staticmethod
+    def _dcsync_rights_guidance(dom: str) -> str:
+        """Constructive, unambiguous block message for a premature DCSync — frames it as a RIGHTS problem
+        (not command syntax, the 2026-06-09 misread) and names the corrective path."""
+        return (
+            f"[engagement-precheck] DCSync of {dom} not attempted: per the BloodHound graph and the "
+            f"credentials you currently hold, NO principal you control has DS-Replication rights on {dom}, "
+            f"so this DCSync would fail with 8453 (DS_DRA_ACCESS_DENIED). This is a RIGHTS problem, NOT a "
+            f"command-syntax problem — do NOT permute the command or flags. First OBTAIN replication rights "
+            f"on {dom} (gain Domain Admin via your controlled GPO/ACL path, or have a controlled principal "
+            f"granted GetChanges + GetChangesAll), then re-collect or read the ACL to CONFIRM the edge "
+            f"exists, THEN DCSync. (Empirical check: fires only while the graph shows the right absent; it "
+            f"stops blocking once you hold the right or after a couple of attempts.)"
+        )
+
     def _engagement_objective(self) -> str:
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
+
+    _CRED_CACHE_TTL_SECONDS = 60
+
+    async def _fetch_credentials_cached(self, now: str) -> list:
+        """Read the Mythic credential store (read-only) with a short-TTL cache, shared by read_credentials
+        and the gate's corroboration probe so neither re-queries Mythic repeatedly. Returns raw cred rows.
+        Fail-open -> last cache or []."""
+        try:
+            try:
+                from . import engagement_state, operation_context
+            except ImportError:
+                import engagement_state
+                import operation_context
+            if self._cred_cache is not None and self._cred_cache_ts:
+                last = engagement_state._parse_iso(self._cred_cache_ts)
+                cur = engagement_state._parse_iso(now)
+                if last is not None and cur is not None and (cur - last).total_seconds() < self._CRED_CACHE_TTL_SECONDS:
+                    return self._cred_cache
+            if self.client is None:
+                return self._cred_cache or []
+            op_id = None
+            try:
+                resolved = await operation_context.resolve_operation(self.client)
+                op_id = resolved[0] if resolved else None
+            except Exception:
+                op_id = None
+            if op_id is not None:
+                query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
+                         "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
+                         "{ id account realm type credential_text comment timestamp } }")
+                variables = {"op": op_id}
+            else:
+                query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
+                         "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp } }")
+                variables = None
+            resp = await mythic.execute_custom_query(self.client, query, variables=variables)
+            creds = (resp or {}).get("credential") or []
+            self._cred_cache = creds
+            self._cred_cache_ts = now
+            return creds
+        except Exception:
+            return self._cred_cache or []
+
+    async def _corroboration_facts(self, now: str) -> list:
+        """Read-only ARTIFACT PROBE for durable-hop re-verification: turn the credential store + the cached
+        graph ACLs into corroboration predicates so the gate SKIPs a durable hop whose result is STILL
+        PRESENT instead of re-running the attack. Emits ONLY positive predicates (creds:, krbtgt-hash:,
+        ds-replication-rights:, system:{gpo}) — never generic-write:/write-dacl:, so it can't newly enforce a
+        graph precondition (no DEFER regression). Fail-open -> []."""
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        facts: list = []
+        seen: set = set()
+
+        def add(pred: str) -> None:
+            p = engagement_state._normalize_predicate(pred)
+            if p and p not in seen:
+                seen.add(p)
+                facts.append(engagement_state.GraphFact(
+                    predicate=p, source="live-probe", timestamp=now, ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS))
+
+        # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm} (the dcsync/lsass artifacts).
+        try:
+            for c in await self._fetch_credentials_cached(now):
+                acct = str(c.get("account") or "").strip().casefold()
+                realm = str(c.get("realm") or "").strip().casefold()
+                if not str(c.get("credential_text") or "").strip():
+                    continue
+                if acct and realm:
+                    add(f"creds:{acct}@{realm}")
+                if acct == "krbtgt" and realm:
+                    add(f"krbtgt-hash:{realm}")
+        except Exception:
+            pass
+        # 2. Cached graph ACLs -> gpo-abuse corroboration (you still CONTROL the GPO) + replication passthrough.
+        try:
+            for gf in (getattr(self, "_engagement_graph_facts", []) or []):
+                p = engagement_state._normalize_predicate(getattr(gf, "predicate", ""))
+                if p.startswith("generic-write:gpo:"):
+                    add("system:" + p[len("generic-write:gpo:"):])
+                elif p.startswith("ds-replication-rights:"):
+                    add(p)
+                elif p.startswith("gpo-domain:"):
+                    # Pass the GPO->domain link through so the gate's _expand_implications can chain
+                    # gpo-abuse (system:{gpo}) -> ds-replication-rights:{domain} -> dcsync. Without it the
+                    # planner names dcsync but the gate DEFERs it (missing ds-replication-rights) -> churn.
+                    add(p)
+        except Exception:
+            pass
+        return facts
+
+    _GRAPH_FACTS_TTL_SECONDS = 600                 # facts stay live in the engagement state for 10 min
+    _GRAPH_FACTS_REFRESH_INTERVAL_SECONDS = 120    # don't re-run the read-only cypher more than ~every 2 min
+
+    async def _refresh_graph_facts_if_stale(self, now: str, force: bool = False) -> None:
+        """Refresh the cached BloodHound graph facts (ACL edges → engagement predicates) that feed the
+        forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
+        unless forced — e.g. right after a verified ingest). SUGGESTION-ONLY: these are NOT fed into the
+        gate's enforcement state, so this can never newly DEFER a real hop. Best-effort, fail-open."""
+        try:
+            try:
+                from . import access_reconciler, engagement_state, graph_reconciler
+            except ImportError:
+                import access_reconciler
+                import engagement_state
+                import graph_reconciler
+
+            # Only TTL-skip when we ALREADY HAVE facts. An empty cache means the graph wasn't populated yet
+            # (ingest is async ~40s) — keep retrying on each gate call until it lands, else the chain never
+            # sees the graph (the 2026-06-09 false-negative: ingest completed late, cache stayed empty).
+            if not force and self._engagement_graph_facts and self._engagement_graph_facts_ts:
+                last = engagement_state._parse_iso(self._engagement_graph_facts_ts)
+                cur = engagement_state._parse_iso(now)
+                if last is not None and cur is not None:
+                    if (cur - last).total_seconds() < self._GRAPH_FACTS_REFRESH_INTERVAL_SECONDS:
+                        return
+
+            # Resolve the BloodHound MCP cypher_query tool (mirror ingest_collection's resolution).
+            cypher_tool = None
+            try:
+                from ai.mcp import MCPManager
+                for server in MCPManager.get_connected_servers():
+                    if "bloodhound" not in server.lower():
+                        continue
+                    for tool in MCPManager.get_tools_by_server(server):
+                        if getattr(tool, "name", "") == "cypher_query":
+                            cypher_tool = tool
+            except Exception:
+                cypher_tool = None
+            if cypher_tool is None:
+                logger.info("🧭 [graph-facts] refresh skipped: BloodHound cypher_query tool not resolvable")
+                return
+
+            # Need footholds to derive the controlled principals the cypher matches on. Use the gate's
+            # cache if present; otherwise reconcile once (collection tools aren't classified, so the cache
+            # may be empty right after the first ingest — before any attack hop has run through the gate).
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                try:
+                    footholds = await access_reconciler.reconcile_access(self, now)
+                    self._engagement_footholds = list(footholds)
+                except Exception:
+                    footholds = []
+
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(),
+                footholds=footholds,
+                hops=list(self._engagement_hops),
+            )
+            principals = graph_reconciler.controlled_principals_from_state(state)
+            if not principals:
+                logger.info(
+                    f"🧭 [graph-facts] refresh skipped: 0 controlled principals "
+                    f"(footholds={len(footholds)}, alive={sum(1 for f in footholds if getattr(f, 'alive', False))})"
+                )
+                return
+
+            class _SingleToolMCP:
+                """Adapter: graph_reconciler.reconcile_graph_position expects a get_tool_by_name(name)
+                accessor; the live MCPManager exposes get_tools_by_server instead. We already resolved the
+                cypher tool, so hand it back directly."""
+
+                def __init__(self, tool):
+                    self._tool = tool
+
+                async def get_tool_by_name(self, name, server_name=None):
+                    del name, server_name
+                    return self._tool
+
+            facts = list(await graph_reconciler.reconcile_graph_position(
+                _SingleToolMCP(cypher_tool), principals, state.objective, now,
+                self._GRAPH_FACTS_TTL_SECONDS,
+            ) or [])
+            # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
+            # from a prior refresh. Only overwrite when this reconcile actually returned edges.
+            if facts:
+                self._engagement_graph_facts = facts
+                self._engagement_graph_facts_ts = now
+            logger.info(
+                f"🧭 [graph-facts] refresh: principals={len(principals)} new_facts={len(facts)} "
+                f"cached={len(self._engagement_graph_facts)} "
+                f"preds={[getattr(f, 'predicate', '') for f in self._engagement_graph_facts][:6]}"
+            )
+        except Exception as exc:
+            logger.info(f"🧭 [graph-facts] refresh error (fail-open): {exc}")
+            # fail-open: planner suggestions are best-effort, never break the issue path
+
+    async def _record_graph_built(self, callback_display_id, verified: bool) -> None:
+        """Record the collect-graph effect (graph-built at the resolving callback's access level) on a
+        verified ingest, and clear that access key's in-flight marker either way. This is what makes the
+        gate SKIP a re-collection at the same privilege. Best-effort, fail-open."""
+        try:
+            if callback_display_id is None:
+                return
+            try:
+                from . import access_reconciler, engagement_state
+            except ImportError:
+                import access_reconciler
+                import engagement_state
+            now = datetime.now(timezone.utc).isoformat()
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                try:
+                    footholds = await access_reconciler.reconcile_access(self, now)
+                    self._engagement_footholds = list(footholds)
+                except Exception:
+                    footholds = []
+            fh = next(
+                (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
+            )
+            if fh is None:
+                return
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
+            )
+            access_key = engagement_state.access_context_key(state, fh)
+            if not access_key:
+                return
+            self._collection_in_flight.discard(access_key)
+            if not verified:
+                return
+            updated = engagement_state.record_hop_result(
+                state, "collect-graph", access_key, "achieved",
+                {"source": "ingest_collection", "provenance": "run", "graph_verified": True}, now,
+            )
+            self._engagement_hops = updated.hops
+            try:
+                self._persist_engagement_ledger()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _record_engagement_success(self, results_str) -> None:
         pending = self._pending_engagement_hop
@@ -1757,6 +2168,36 @@ class MythicTools:
                     logger.warning(
                         f"🔒 [verify-on-record] {technique} {target_key}: NO usable key in task output "
                         f"(verdict={verdict}) — recording FAILED, not achieved (prevents placeholder forgery)."
+                    )
+            elif technique in credential_artifacts.GRANT_TECHNIQUES:
+                # Verify-on-record for the DS-Replication rights grant (2026-06-09 false-achieved-grant bug):
+                # the legacy path recorded `achieved` for a StandIn `--grant` whenever the output lacked a
+                # known failure signature, so an `Access is denied` grant (samwell, medium integrity) and the
+                # GPO/SYSTEM task that NEVER FIRED (empty output) both recorded `ds-replication-rights achieved`
+                # — contradicted by the agent's own zero-ACE enumeration. With the gate demoted to advisor, the
+                # achieved-dedup SKIP would then SKIP re-attempting a grant that never landed. Gate the record
+                # on a real grant-application artifact via the existing verify_effect seam.
+                probe = credential_artifacts.extract_grant_probe(results_str)
+                verdict = engagement_state.verify_effect(technique, target_key, probe)
+                status = "achieved" if verdict == "achieved" else "failed"
+                extra = {
+                    "verified_on_record": True,
+                    "verify_verdict": verdict,
+                    "artifact_present": bool(probe.get("ds_replication_rights")),
+                }
+                if status != "achieved":
+                    # Stickiness: a later no-marker re-probe must NOT downgrade a prior VERIFIED achieved grant
+                    # (artifact_present True). A legacy/false achieved (no artifact evidence) IS overwritten —
+                    # that is the false-achieved cleanup. Reuses the technique-agnostic prior-verified check.
+                    if self._prior_verified_credential_hop(technique, target_key) is not None:
+                        logger.info(
+                            f"🔒 [verify-on-record] {technique} {target_key}: re-probe found no applied ACE, "
+                            f"but a prior VERIFIED achieved grant exists — keeping it, not downgrading."
+                        )
+                        return
+                    logger.warning(
+                        f"🔒 [verify-on-record] {technique} {target_key}: NO applied DS-Replication ACE in "
+                        f"task output (verdict={verdict}) — recording FAILED, not achieved (the grant did not land)."
                     )
             elif _is_task_failure_output(results_str):
                 # Legacy non-credential path: a known failure signature means no hop is recorded.
@@ -2270,107 +2711,157 @@ class MythicTools:
         encoded_content = base64.b64encode(file_content).decode('utf-8')
         return encoded_content
 
-    async def stage_file_to_disk(
+    async def ingest_collection(
         self,
-        file_uuid: Annotated[str, "The Mythic file UUID to materialize. Optional if callback_display_id is given."] = "",
-        callback_display_id: Annotated[int | None, "If set (and file_uuid empty), resolve the MOST RECENT completed file downloaded from this callback (e.g. a just-downloaded SharpHound ZIP) and stage that. This is the reliable path right after a `download`, because the download task output does not expose the file UUID."] = None,
-        filename: Annotated[str, "Optional basename for the staged file (basename only). Defaults to the source filename or <uuid>.zip."] = "",
-        name_contains: Annotated[str, "When resolving by callback, only match files whose name contains this substring (case-insensitive). Defaults to 'zip'; pass '' to match any download."] = "zip",
+        file_uuid: Annotated[str, "The Mythic file UUID of the downloaded SharpHound/AzureHound collection to ingest. PREFERRED. Optional if callback_display_id is given."] = "",
+        callback_display_id: Annotated[int | None, "If set (and file_uuid empty), resolve the MOST RECENT completed collection download from this callback and ingest that."] = None,
+        file_name: Annotated[str, "Optional basename for the collection (e.g. 'collection.zip'). Defaults to the source filename or <uuid>.zip."] = "",
+        name_contains: Annotated[str, "When resolving by callback, only match files whose name contains this substring (default 'zip')."] = "zip",
     ) -> str:
-        """Materialize a Mythic file artifact to a local path on the Sage host.
+        """Ingest a downloaded collection into BloodHound IN-MEMORY (no disk staging, no LLM round-trip).
 
-        Some local consumers need an on-disk file rather than bytes — notably the BloodHound
-        MCP's `file_upload`, which takes an absolute filesystem PATH, not raw content. This
-        downloads the file bytes from Mythic by UUID, or resolves the latest completed
-        agent-download for a callback display_id when the UUID is unavailable, and writes
-        them into Sage's staging directory, returning the absolute path. Sage and its stdio
-        MCP servers share a filesystem (the MCP is spawned by Sage in the same container/host),
-        so the returned path is directly readable by file_upload. Does NOT send file bytes to
-        the LLM.
+        This is the programmatic bridge between Mythic and BloodHound: it resolves the Mythic file
+        (by UUID, or the latest completed download on a callback), fetches its bytes from Mythic, and
+        uploads them DIRECTLY to BloodHound via the BloodHound MCP's `file_upload(info_type=
+        'upload_bytes', ...)` — invoked HERE in code so the (potentially large) collection bytes NEVER
+        pass through the LLM context and are never written to the Sage host disk.
+
+        This is the in-memory ingest path (no disk). After it returns, VERIFY with
+        `domain_info(info_type='list')` that the expected domain(s) appear (BloodHound ingest is
+        asynchronous — the count may lag a few seconds).
 
         Args:
             file_uuid: The Mythic file UUID. Optional if callback_display_id is given.
             callback_display_id: Resolve the most recent completed agent-download from this callback.
-            filename: Optional basename for the staged file; defaults to source filename or <uuid>.zip.
+            file_name: Optional basename for the collection.
             name_contains: Optional case-insensitive source filename substring for callback resolution.
         Returns:
-            str: JSON with status, source metadata, the absolute local path, and byte count.
+            str: JSON with status, file_uuid, filename, byte count, and BloodHound's upload response.
         """
         # HITL: guarded
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
-        logger.debug(f"🛠️ Calling stage_file_to_disk for file UUID: {file_uuid}")
-        row = None
+        logger.debug(f"🛠️ Calling ingest_collection (file_uuid={file_uuid!r}, callback={callback_display_id})")
         source_filename = ""
-        timestamp = ""
+        # 1. Resolve the Mythic file UUID (by UUID, or the latest completed download on a callback).
         if file_uuid:
             resolved_by = "uuid"
         elif callback_display_id is not None:
             row = await self._latest_download_for_callback(callback_display_id, name_contains)
             if row is None:
-                # Event-driven wait: instead of fixed-interval polling, wake on each NEW completed
-                # agent-download and re-check the callback-scoped raw query (which stays the resolver).
-                # Bounded by the subscription timeout. The subscription only signals "something new
-                # landed, re-check"; _latest_download_for_callback does the callback-scoped resolution.
-                try:
-                    async for _new in mythic.subscribe_new_downloaded_files(
-                        self.client, custom_return_attributes="id", timeout=30
-                    ):
-                        row = await self._latest_download_for_callback(callback_display_id, name_contains)
-                        if row is not None:
-                            break
-                except asyncio.TimeoutError:
-                    pass
-                except Exception as e:
-                    # Fail-soft: if the subscription is unavailable, fall back to a brief raw-query poll.
-                    logger.debug(f"subscribe_new_downloaded_files wait failed ({e}); falling back to poll")
-                    for _ in range(3):
-                        await asyncio.sleep(2)
-                        row = await self._latest_download_for_callback(callback_display_id, name_contains)
-                        if row is not None:
-                            break
-                if row is None:
-                    # Final check: a file may have completed during subscription setup (cursor=now race).
+                for _ in range(3):
+                    await asyncio.sleep(2)
                     row = await self._latest_download_for_callback(callback_display_id, name_contains)
+                    if row is not None:
+                        break
             if row is None:
                 return json.dumps({"status": "error", "callback_display_id": callback_display_id,
-                                   "error": "No completed agent-download found on this callback. Run the Mythic `download` command for the collection first, then stage."}, sort_keys=True)
+                                   "error": "No completed agent-download found on this callback. Run the Mythic `download` command for the collection first."}, sort_keys=True)
             file_uuid = row["agent_file_id"]
             source_filename = row.get("filename_utf8") or ""
-            timestamp = row.get("timestamp") or ""
-            if not filename:
-                filename = os.path.basename(source_filename)
+            if not file_name:
+                file_name = os.path.basename(source_filename)
             resolved_by = "callback:" + str(callback_display_id)
         else:
             return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
+        # 2. Fetch the collection bytes from Mythic.
         try:
             file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
         except Exception as e:
             return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
-        if file_content is None:
+        if not file_content:
             return json.dumps({"status": "error", "file_uuid": file_uuid,
                                "error": "Mythic returned no content for this file UUID."}, sort_keys=True)
-        staging_dir = Path("/tmp/sage_file_staging")
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = os.path.basename(filename) if filename else f"{file_uuid}.zip"
-        target = staging_dir / safe_name
+        safe_name = os.path.basename(file_name) if file_name else f"{file_uuid}.zip"
+        # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
+        upload_tool = None
+        info_tool = None
         try:
-            target.write_bytes(file_content)
+            from ai.mcp import MCPManager
+            for server in MCPManager.get_connected_servers():
+                if "bloodhound" not in server.lower():
+                    continue
+                for tool in MCPManager.get_tools_by_server(server):
+                    n = getattr(tool, "name", "")
+                    if n == "file_upload":
+                        upload_tool = tool
+                    elif n == "domain_info":
+                        info_tool = tool
         except Exception as e:
-            return json.dumps({"status": "error", "file_uuid": file_uuid, "error": str(e)}, sort_keys=True)
-        logger.info(f"🛠️ staged_for_ingest file_uuid={file_uuid} filename={safe_name} path={target} bytes={len(file_content)} resolved_by={resolved_by}")
-        return json.dumps({"status": "staged_NOT_ingested", "file_uuid": file_uuid, "filename": safe_name,
-                           "path": str(target), "bytes": len(file_content), "resolved_by": resolved_by,
-                           "source_filename": source_filename, "timestamp": timestamp,
+            return json.dumps({"status": "error", "error": f"Could not access the BloodHound MCP: {e}"}, sort_keys=True)
+        if upload_tool is None:
+            return json.dumps({"status": "error", "file_uuid": file_uuid,
+                               "error": "BloodHound MCP not connected (or its file_upload tool is unavailable). Connect it with `bloodhound-connect` first."}, sort_keys=True)
+        # 4. Upload the bytes DIRECTLY to BloodHound, programmatically (bytes never enter the LLM context).
+        import base64 as _b64
+        b64 = _b64.b64encode(file_content).decode("ascii")
+        logger.info(f"🩸 ingest_collection: in-memory upload of {safe_name} ({len(file_content)} bytes) to BloodHound (file_uuid={file_uuid}, {resolved_by})")
+        try:
+            result = await upload_tool.ainvoke({"info_type": "upload_bytes", "file_name": safe_name, "file_bytes_base64": b64})
+        except Exception as e:
+            return json.dumps({"status": "error", "file_uuid": file_uuid, "filename": safe_name,
+                               "error": f"BloodHound upload_bytes failed: {e}"}, sort_keys=True)
+        # 5. VERIFY via the AUTHORITATIVE ingest-job status (BloodHound ingest is ASYNCHRONOUS — observed
+        #    ~46s for a full collection — so a single immediate check yields a FALSE "empty graph"). Poll
+        #    file_upload(info_type="status", job_id=...) until status_message == "Complete" (or a failure /
+        #    timeout). This is definitive: it distinguishes Complete vs still-ingesting vs Failed, regardless
+        #    of whether the domain count changed (handles re-ingest of an already-populated collection).
+        def _mcp_data(resp):
+            try:
+                text = resp
+                if isinstance(resp, list) and resp and isinstance(resp[0], dict):
+                    text = resp[0].get("text", "")
+                parsed = json.loads(text) if isinstance(text, str) else (text or {})
+                return parsed.get("data") if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+        up = _mcp_data(result)
+        job_id_bh = up.get("job_id") if isinstance(up, dict) else None
+        status_msg = None
+        if job_id_bh is not None:
+            for _ in range(20):  # up to ~120s of async-ingest wait
+                await asyncio.sleep(6)
+                try:
+                    st = _mcp_data(await upload_tool.ainvoke({"info_type": "status", "job_id": job_id_bh}))
+                except Exception:
+                    st = None
+                status_msg = st.get("status_message") if isinstance(st, dict) else None
+                if status_msg == "Complete":
+                    break
+                if status_msg in ("Failed", "Canceled", "Partially Complete"):
+                    break
+        verified = (status_msg == "Complete")
+        failed = status_msg in ("Failed", "Canceled")
+        status_out = "ingested" if verified else ("ingest_failed" if failed else "uploaded_pending_ingest")
+        # Loop-breaker: once the graph is populated the forward planner can name the next hop. Refresh the
+        # cached graph facts so the per-turn injection surfaces NEXT GROUNDED ACTIONS (graph ACL edges →
+        # available hops) and the operator advances instead of re-collecting. Fire on EVERY ingest (not
+        # just verified): ingest is async, so a collection that reads "pending" here is often Complete
+        # seconds later — the refresh is non-clobbering (keeps prior facts if this cypher returns empty).
+        try:
+            await self._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat(), force=True)
+        except Exception:
+            pass
+        # Record the collect-graph effect (graph-built at this access level) so re-collection is gated, and
+        # clear the in-flight marker. Keyed by the resolving callback's foothold. Best-effort, fail-open.
+        try:
+            await self._record_graph_built(callback_display_id, verified)
+        except Exception:
+            pass
+        return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
+                           "bytes": len(file_content), "resolved_by": resolved_by,
+                           "bloodhound_job_id": job_id_bh, "job_status": status_msg,
+                           "graph_verified": verified,
+                           "bloodhound_response": str(result)[:300],
                            "next_action": (
-                               "This file is ONLY staged to the Sage host filesystem — it is NOT in BloodHound yet. "
-                               "Staging is NOT ingestion. The NEXT step is to INGEST it via the BloodHound MCP tool "
-                               f"file_upload(info_type='upload', file_path='{target}'). If you do not have file_upload, "
-                               "hand this staged path to the agent that owns the BloodHound MCP and have it ingest. "
-                               "Then VERIFY ingestion with domain_info(info_type='list') and confirm the expected "
-                               "domain(s) now appear. Do NOT run another collection — re-collecting will NOT add data; "
-                               "the file you just staged already holds everything your current access can enumerate."),
-                           }, sort_keys=True)
+                               f"BloodHound ingest job {job_id_bh} is COMPLETE — the graph is populated. Hand off "
+                               "to the BloodHound agent for attack-path analysis." if verified else
+                               (f"BloodHound ingest job {job_id_bh} ended '{status_msg}' — ingest FAILED. Do NOT "
+                                "re-collect; report the blocker and investigate the collection/BloodHound." if failed else
+                                f"Upload accepted (BloodHound job {job_id_bh}); status '{status_msg}' after ~120s — "
+                                "still ingesting or status unavailable. Do NOT re-collect or re-upload. Hand off to "
+                                f"the BloodHound agent to poll file_upload(info_type='status', job_id={job_id_bh}) "
+                                "until Complete, then analyze."))}, sort_keys=True)
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
@@ -2393,39 +2884,16 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling read_credentials tool (realm={realm!r}, account={account!r})")
-        op_id = None
-        try:
-            try:
-                from . import operation_context
-            except ImportError:
-                import operation_context
-            resolved = await operation_context.resolve_operation(self.client)
-            op_id = resolved[0] if resolved else None
-        except Exception:
-            op_id = None
-        if op_id is not None:
-            query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
-                     "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
-                     "{ id account realm type credential_text comment timestamp } }")
-            variables = {"op": op_id}
-        else:
-            query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
-                     "order_by: {id: desc}, limit: 200) "
-                     "{ id account realm type credential_text comment timestamp } }")
-            variables = None
-        try:
-            resp = await mythic.execute_custom_query(self.client, query, variables=variables)
-        except Exception as e:
-            return f"Failed to read credentials: {e}"
-        creds = (resp or {}).get("credential") or []
+        # Shared short-TTL cache (read_credentials was hit 24× in one solve; also powers the gate's
+        # durable-hop corroboration probe) — avoids re-querying Mythic on every call.
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
         r_cf, a_cf = (realm or "").strip().casefold(), (account or "").strip().casefold()
         if r_cf:
             creds = [c for c in creds if r_cf in str(c.get("realm") or "").casefold()]
         if a_cf:
             creds = [c for c in creds if a_cf in str(c.get("account") or "").casefold()]
         if not creds:
-            scope = f" for operation {op_id}" if op_id is not None else ""
-            return f"No credentials in the Mythic store{scope} (matching the given filters)."
+            return "No credentials in the Mythic store (matching the given filters)."
         lines = [f"{len(creds)} credential(s) in the Mythic store:"]
         for c in creds:
             line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "

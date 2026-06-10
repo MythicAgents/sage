@@ -77,12 +77,14 @@ def test_durable_corroborated_hop_skips():
     assert d == GD.SKIP and "durable+corroborated" in reason
 
 
-def test_durable_uncorroborated_hop_does_not_silently_skip():
-    # The footgun fix: a stale durable belief with no live corroboration must NOT hard-SKIP.
+def test_durable_unprobed_hop_is_trusted_not_rerun():
+    # Russel 2026-06-09: re-verify a durable belief by READ-PROBE, never by re-running the attack.
+    # gpo-abuse's effect (system:{gpo}) has no cheap artifact probe, so an uncorroborated durable hop is now
+    # TRUSTED (SKIP) instead of re-executed. (Cred-backed effects ARE probed — see test_durable_reverify.)
     s = _state("durable", footholds=[_foothold("castelblack", "medium")])
     d, reason = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d != GD.SKIP
-    assert d == GD.PROCEED and "durable belief NOT corroborated" in reason
+    assert d == GD.SKIP
+    assert "durable, unprobed" in reason and "do NOT re-run" in reason
 
 
 # --- TTL ---------------------------------------------------------------------
@@ -148,10 +150,11 @@ def test_loaded_hop_becomes_durable_and_is_not_silently_skipped(monkeypatch):
     assert mt2._engagement_hops, "ledger should have loaded"
     assert mt2._engagement_hops[0].evidence.get("provenance") == "durable"
 
-    # With no corroborating live foothold, the gate must NOT silently skip the durable belief.
+    # A durable, unprobed hop (no cheap artifact probe for system:{gpo}) is now TRUSTED, not re-run
+    # (re-verify-by-probe, never re-run the attack; Russel 2026-06-09).
     state = es.EngagementState(objective="t", footholds=[], hops=list(mt2._engagement_hops))
-    d, _ = es.gate_decision("gpo-abuse", "winterfell", state)
-    assert d != GD.SKIP
+    d, r = es.gate_decision("gpo-abuse", "winterfell", state)
+    assert d == GD.SKIP and "durable, unprobed" in r
 
 
 def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch):
@@ -178,7 +181,8 @@ def test_durable_to_run_upgrade_on_reachieve():
     # Advisor (b): re-achieving a durable hop must UPGRADE provenance to run (not keep durable), so it
     # converges to SKIP instead of PROCEED-thrashing forever.
     s = _state("durable", footholds=[_foothold("castelblack", "medium")])
-    assert es.gate_decision("gpo-abuse", "winterfell", s)[0] == GD.PROCEED
+    d1, r1 = es.gate_decision("gpo-abuse", "winterfell", s)
+    assert d1 == GD.SKIP and "durable" in r1   # durable+unprobed -> trusted (no re-run)
     s2 = es.record_hop_result(
         s, "gpo-abuse", "winterfell", "achieved",
         {"source": "issue_task", "provenance": "run"}, "2026-06-07T01:00:00+00:00",
@@ -186,7 +190,7 @@ def test_durable_to_run_upgrade_on_reachieve():
     assert len(s2.hops) == 1  # replaced, not duplicated
     assert es._hop_provenance(s2.hops[0]) == "run"
     d2, r2 = es.gate_decision("gpo-abuse", "winterfell", s2)
-    assert d2 == GD.SKIP and "run" in r2
+    assert d2 == GD.SKIP and "run" in r2   # re-achieve upgraded provenance durable -> run
 
 
 def test_ttl_keeps_hop_with_missing_timestamp():

@@ -21,7 +21,7 @@ tools:
   - list_ttp_categories
   - ensure_tool_uploaded
   - download_tool
-  - stage_file_to_disk
+  - ingest_collection
   - summarize_and_handback
   - handback_to_supervisor
   - transfer_to_Mythic_Payload
@@ -165,7 +165,7 @@ tools:
           collection (SharpHound or any enumerator) reflects exactly what your CURRENT identity and privileges can
           see on the network. Re-running it with different flags, collection methods, or output names will NOT
           reveal more — the boundary is your ACCESS, not your arguments. So: run ONE collection with your current
-          access, INGEST it immediately (stage_file_to_disk -> ingest), then ANALYZE the graph. Do NOT re-collect
+          access, INGEST it immediately (via ingest_collection), then ANALYZE the graph. Do NOT re-collect
           hoping for a fuller picture, and do NOT keep tuning flags on a collection that already succeeded.
           Collect AGAIN only after your access has materially CHANGED — new credentials, a new host/foothold, a
           different user context, or a new ticket/trust context — because that, and only that, expands what a
@@ -185,23 +185,17 @@ tools:
           And NEVER re-run a collection on a DIFFERENT agent because you couldn't find the first run's output —
           the output exists on the host where you ran it; go find it. Re-collecting doubles your footprint and
           wastes a whole cycle of steps.
-        - **STAGING A COLLECTION FOR BLOODHOUND INGEST (the handoff that actually works):** A `download`-ed
-          SharpHound ZIP becomes a Mythic FILE, but the `download` task output does NOT show you the file's
-          UUID, and a Windows path like `C:\Users\...\report.zip` is on the TARGET — the BloodHound MCP CANNOT
-          read it. So after you `download` the collection, call
-          `stage_file_to_disk(callback_display_id=<the foothold callback you downloaded from>)`. That resolves
-          the most-recent downloaded ZIP on that callback and materializes it to a host-local path
-          (`/tmp/sage_file_staging/...`) that the BloodHound MCP CAN read, and returns that path + the resolved
-          file_uuid + filename. In your hand-off to the Supervisor / MCP_Manager, give that STAGED LOCAL PATH
-          (and the file_uuid) as the ingestion artifact — NEVER a `C:\...` Windows path and NEVER a `/Mythic/...`
-          path. If you cannot stage it, hand off the foothold CALLBACK DISPLAY ID and say "ingest the latest
-          collection from callback N" — MCP_Manager can stage it itself from that small integer.
-          **Once you have staged (or downloaded) the collection, YOUR part of the recon pipeline is DONE — HAND BACK
-          so MCP_Manager ingests it (`file_upload`) and verifies it with `domain_info`. `stage_file_to_disk` only
-          copies the file to the Sage host; it does NOT put data in BloodHound. If you query BloodHound and it is
-          EMPTY, that means the staged file has NOT been ingested yet — the fix is to get it INGESTED (hand off to
-          MCP_Manager), NEVER to run another SharpHound collection. A second collection cannot add anything your
-          current access did not already capture in the first one.**
+        - **INGEST A COLLECTION INTO BLOODHOUND (you do this yourself, in-memory):** after you `download` a
+          SharpHound/AzureHound collection (it becomes a Mythic FILE), call
+          `ingest_collection(callback_display_id=<the foothold callback you downloaded from>)` — or
+          `ingest_collection(file_uuid="<uuid>")` if you have the UUID. It resolves the most-recent downloaded
+          collection on that callback, fetches its bytes, and uploads them DIRECTLY into BloodHound in one step:
+          no `/tmp` file, no bytes through your context, no separate agent. (Do NOT hand the collection to
+          another agent to ingest, and do NOT paste raw ZIP bytes into any tool yourself.) BloodHound ingest is
+          ASYNCHRONOUS — the upload is accepted immediately, but the graph populates a few seconds later. Once
+          `ingest_collection` reports success, your collection job is DONE: do NOT re-collect (a second
+          collection adds nothing your current access did not already capture). Hand off to the BloodHound agent
+          to VERIFY the domains appeared (`domain_info`) and run attack-path analysis.
         - **CLEAN UP — every dropped file and planted beacon is OPSEC debt:** when a sub-goal is complete, call
           list_open_artifacts and DELETE/revert what you no longer need (remove uploaded binaries and output
           files, kill scratch beacons) before moving on. Leaving collection output (e.g. a SharpHound zip) on a
@@ -236,6 +230,26 @@ tools:
         - Re-running a successful attack is wasted footprint and noise (a second SharpGPOAbuse, a duplicate
           ACL write) and can corrupt a working state. Verify-then-skip; execute only when the effect is
           genuinely absent.
+
+        **PRE-FLIGHT A PRIVILEGED OP — confirm the ENABLING RIGHT before you fire it:** a privileged
+        operation that requires a specific permission (DCSync needs DS-Replication on the domain; a DACL
+        write needs WriteDACL on the target; a group add needs write on the group) must be VALIDATED before
+        execution, not fired speculatively "to see if it works." A failed privileged op burns a step and
+        returns an error you could have read for free.
+        - Validate with a read whose success you can VERIFY: a BloodHound graph edge from your CURRENT
+          principal to the target (does it hold the right?), or an in-place ACL enumeration — using a flag
+          you have CONFIRMED exists for that tool.
+        - If the validating read shows you do NOT hold the right, do not run the op — first OBTAIN the right
+          (act as a principal that holds it, or make the privilege change that grants it), then re-validate.
+        - **A tool that prints its HELP / USAGE / argument banner did NOT run** — you passed an invalid or
+          invented flag. Re-read the tool's real argument list from that banner and reissue; never treat a
+          usage banner as "no result" and proceed as if the action happened.
+
+        **ENUMERATE A STATE ONCE — don't re-poll it:** reading the same state repeatedly (re-listing a group's
+        membership, re-reading an ACL, re-running the same `whoami`/enumeration) with no intervening action
+        that could have CHANGED it is wasted budget. Read it once, keep the answer, and re-check ONLY after an
+        action that should change it AND that you confirmed executed (e.g. after a privilege change has been
+        confirmed to apply). Membership/ACLs do not change while you stare at them.
 
         **Example Workflow for "Do host-based recon":**
         1. Get active callbacks → Identify callback #5 (Merlin agent)

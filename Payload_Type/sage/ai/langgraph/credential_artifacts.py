@@ -132,3 +132,61 @@ def extract_credential_probe(output) -> dict:
         "domain_hashes_dumped": has_secret,
         "secretsdump_connected": started,
     }
+
+
+# Techniques whose `achieved` record is gated on a grant-application artifact (the DS-Replication ACE
+# was actually written), parallel to CREDENTIAL_TECHNIQUES. Kept SEPARATE from CREDENTIAL_TECHNIQUES so
+# the credential-key schema invariant (test_credential_techniques_matches_verify_schema) stays exact.
+GRANT_TECHNIQUES: set[str] = {"dcsync-rights-grant"}
+
+# The three DS-Replication extended-rights, by GUID and by name. A StandIn `--grant` that lands echoes
+# the right it added; an unauthorized attempt does not apply one. (filtered-set is optional for DCSync but
+# StandIn grants it alongside the other two.)
+_REPL_GUID_GET_CHANGES = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+_REPL_GUID_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+_REPL_GUID_GET_CHANGES_FILTERED = "89e95b76-444d-4c62-991a-0facbeda640c"
+
+# Explicit "the ACE was applied" markers StandIn / SharpAllowedToAct-style tools print on success.
+_GRANT_SUCCESS_TOKENS = (
+    "dacl modified", "successfully", "ace added", "added ace", "rights granted",
+    "granted dcsync", "added the", "applied", "[+] done", "modified the dacl",
+)
+# Hard failure signatures: an attempted-but-rejected grant must NEVER record achieved. Empty output (the
+# GPO/SYSTEM scheduled-task that vanished from SYSVOL before firing) also yields no success marker -> failed.
+_GRANT_FAILURE_TOKENS = (
+    "access is denied", "access denied", "0x5", "unauthorized", "exception",
+    "insufficient", " error", "errorcode", "denied", "failed", "could not",
+    "not have", "0x80070005",
+)
+
+
+def extract_grant_probe(output) -> dict:
+    """Map free-form StandIn `--grant` output to the structured probe dict ``verify_effect`` consumes for
+    ``dcsync-rights-grant``. ``ds_replication_rights`` (the achieved_all anchor) is True ONLY when the
+    output shows an explicit ACE-applied success marker AND names a replication right AND carries NO failure
+    signature. This kills the 2026-06-09 false-achieved-grant bug: a grant that returned ``Access is denied``
+    (samwell, medium integrity) or produced NO output (the GPO SYSTEM task that never fired) was recorded
+    ``achieved`` because the legacy path only checked for a known failure signature."""
+    text = output if isinstance(output, str) else ("" if output is None else str(output))
+    low = text.lower()
+    denied = (not low.strip()) or any(tok in low for tok in _GRANT_FAILURE_TOKENS)
+
+    get_changes = (_REPL_GUID_GET_CHANGES in low) or ("get-changes" in low and "get-changes-all" not in low) \
+        or ("get changes" in low and "get changes all" not in low) or ("replicating directory changes" in low)
+    get_changes_all = (_REPL_GUID_GET_CHANGES_ALL in low) or ("get-changes-all" in low) \
+        or ("get changes all" in low) or ("replicating directory changes all" in low)
+    get_changes_filtered = (_REPL_GUID_GET_CHANGES_FILTERED in low) or ("filtered set" in low) \
+        or ("get-changes-in-filtered-set" in low)
+    ace_named = get_changes or get_changes_all or get_changes_filtered
+    success_marker = any(tok in low for tok in _GRANT_SUCCESS_TOKENS)
+
+    applied = success_marker and ace_named and not denied
+    return {
+        # achieved_all anchor for dcsync-rights-grant:
+        "ds_replication_rights": applied,
+        # partial_any signals — a right was named but no confirmed application (insufficient for achieved):
+        "ace_present": ace_named and not denied,
+        "get_changes": get_changes and not denied,
+        "get_changes_all": get_changes_all and not denied,
+        "get_changes_in_filtered_set": get_changes_filtered and not denied,
+    }

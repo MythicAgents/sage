@@ -62,6 +62,11 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
         if _is_lsass_dump(combined_cf, token_set):
             return ("lsass-dump", (_host_value(parsed) or _text(callback_host)).casefold())
 
+        # SharpHound/AzureHound collection -> the modeled collect-graph action. Target (the access-context
+        # key) is empty here; the gate rebinds it from the issuing callback's foothold (like lsass-dump).
+        if "sharphound" in combined_cf or "azurehound" in combined_cf:
+            return ("collect-graph", "")
+
         return None
     except Exception:
         return None
@@ -195,7 +200,16 @@ def _is_domain_dn(value: str) -> bool:
 
 def _fqdn_from_dn(value: str) -> str:
     try:
-        parts = re.findall(r"(?:^|,)DC=([^,]+)", _text(value), re.IGNORECASE)
+        text = _text(value)
+        # Anchor on the FIRST DC= component, even when the DN is embedded behind a prefix such as
+        # "distinguishedname=DC=north,DC=sevenkingdoms,DC=local". That leading DC= is preceded by '='
+        # (not '^'/','), so the old (?:^|,) anchor silently DROPPED the first label (north) and the NORTH
+        # grant was filed under sevenkingdoms.local (2026-06-09 BUG). Find the first DC= run, then parse
+        # only its contiguous ,DC= components so an unrelated later DC= in some other attribute can't leak in.
+        match = re.search(r"DC=[^,]+(?:\s*,\s*DC=[^,]+)*", text, re.IGNORECASE)
+        if not match:
+            return ""
+        parts = re.findall(r"DC=([^,]+)", match.group(0), re.IGNORECASE)
         return ".".join(part.strip() for part in parts if part.strip())
     except Exception:
         return ""

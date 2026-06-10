@@ -1,8 +1,9 @@
 from mythic_container.MythicCommandBase import TaskArguments, CommandBase, CommandParameter, ParameterType, ParameterGroupInfo, PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse
-from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
+from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage, SendMythicRPCOperationEventLogCreate, MythicRPCOperationEventLogCreateMessage
 from mythic_container.logging import logger
 from .utils import get_secret
 from ai.langgraph.model import Model
+from ai.bloodhound_config import ensure_bloodhound_connected, BLOODHOUND_SETUP_STEPS
 
 class QueryArguments(TaskArguments):
     def __init__(self, command_line, **kwargs):
@@ -205,6 +206,25 @@ class QueryCommand(CommandBase):
                 config["configurable"]["aws_session_token"] = aws_session_token
             if aws_region is not None:
                 config["configurable"]["region"] = aws_region
+        # BloodHound is central to Sage — auto-connect its MCP on first use (in the serving loop) BEFORE the
+        # graph is built, so the BloodHound agent picks up its tools. If it can't connect, post a Mythic
+        # EventFeed WARNING with setup steps so the operator knows how to enable it; the solve still proceeds.
+        try:
+            bh_ok, bh_msg = await ensure_bloodhound_connected()
+            logger.info(f"BloodHound auto-connect: {bh_msg}")
+            if not bh_ok:
+                try:
+                    await SendMythicRPCOperationEventLogCreate(MythicRPCOperationEventLogCreateMessage(
+                        TaskID=taskData.Task.ID,
+                        Warning=True,  # flags it as a WARNING in the Mythic EventFeed (the `level` field only
+                                       # accepts info/debug/auth/api/agent; the warning styling is this bool)
+                        Message="Sage could not auto-connect BloodHound — attack-graph ingest/analysis are unavailable. " + BLOODHOUND_SETUP_STEPS,
+                    ))
+                except Exception as _e:
+                    logger.debug(f"BloodHound EventFeed notice failed: {_e}")
+        except Exception as e:
+            logger.debug(f"BloodHound auto-connect skipped: {e}")
+
         llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, autonomous_solve=autonomous_solve, max_steps=max_steps)
         await llm.initialize()
         if verbose:

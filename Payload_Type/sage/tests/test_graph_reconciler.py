@@ -296,14 +296,27 @@ def test_prune_stale_graph_facts_drops_unparseable_timestamps():
     assert pruned.graph_facts == []
 
 
+def _literals_response(*values):
+    """A BloodHound MCP cypher_query 'run' response with scalar RETURNs under data.literals."""
+    return json.dumps({
+        "info_type": "run", "success": True,
+        "data": {"nodes": {}, "edges": [], "literals": [{"value": v, "key": "name"} for v in values]},
+    })
+
+
 class _FakeTool:
-    def __init__(self, payload):
-        self.payload = payload
-        self.args = None
+    """Query-aware fake: returns the GPO STARKWALLPAPER for the :GPO query, empty for :Computer/:Domain
+    (mirrors the real per-target-kind reconcile calls + the data.literals response shape)."""
+
+    def __init__(self):
+        self.calls = []
 
     async def ainvoke(self, args):
-        self.args = args
-        return self.payload
+        self.calls.append(args)
+        query = args.get("query", "")
+        if "(t:GPO)" in query:
+            return _literals_response("STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL")
+        return _literals_response()
 
 
 class _FakeMCPManager:
@@ -319,42 +332,35 @@ class _FakeMCPManager:
         return self.tool
 
 
-def test_reconcile_graph_position_maps_fake_mcp_payload():
-    payload = json.dumps(
-        {
-            "records": [
-                {
-                    "principal": "samwell.tarly",
-                    "type": "GenericWrite",
-                    "target_kind": "gpo",
-                    "gpo": "STARKWALLPAPER",
-                    "linked_computers": ["WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL"],
-                }
-            ]
-        }
-    )
-    tool = _FakeTool(payload)
+def test_reconcile_graph_position_keys_gpo_by_name_via_literals():
+    tool = _FakeTool()
 
     facts = asyncio.run(
         graph_reconciler.reconcile_graph_position(
             _FakeMCPManager(tool),
-            ["samwell.tarly"],
+            ["samwell.tarly@north.sevenkingdoms.local"],
             "gpo abuse",
             NOW,
             TTL_SECONDS,
         )
     )
 
-    assert [fact.predicate for fact in facts] == ["generic-write:gpo:winterfell"]
-    assert tool.args["query"].startswith("MATCH ")
-    assert tool.args["parameters"] == {"principals": ["samwell.tarly"]}
+    # GPO control is keyed by NAME (matches SharpGPOAbuse --gponame), plus the GPO->domain link fact
+    # (parsed from the name's @suffix) that lets the planner chain gpo-abuse -> dcsync on that domain.
+    preds = [fact.predicate for fact in facts]
+    assert "generic-write:gpo:starkwallpaper" in preds
+    assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
+    # Real MCP call shape: info_type=run, principals inlined into the query (no parameters support).
+    assert all(call.get("info_type") == "run" for call in tool.calls)
+    assert any("samwell.tarly@north.sevenkingdoms.local" in call.get("query", "") for call in tool.calls)
+    assert all("parameters" not in call for call in tool.calls)
 
 
 def test_reconcile_graph_position_returns_empty_on_mcp_errors():
     facts = asyncio.run(
         graph_reconciler.reconcile_graph_position(
             _FakeMCPManager(raises=True),
-            ["samwell.tarly"],
+            ["samwell.tarly@north.sevenkingdoms.local"],
             "gpo abuse",
             NOW,
             TTL_SECONDS,

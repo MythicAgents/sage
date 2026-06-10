@@ -57,6 +57,8 @@ placeholder key.**
 | mimikatz `lsadump::dcsync` prints `[DC]…[rpc] Auth…` then STOPS with no hash | The calling identity has no replication rights in that domain — wrong logon-session/token context | Establish context: `make_token`(junk) → `ticket_store_add`(DA/EA TGT) → re-run DCSync → `rev2self`. NOT a DN problem. |
 | Mythic task `status: success/completed` but empty / useless output | Task COMPLETED ≠ operation SUCCEEDED | Read the decoded output; treat empty/handshake-only output as a FAILURE and diagnose it. |
 | Output truncated mid-handshake (`[rpc] Aut…`, no result) | The op failed/handing after auth setup | Treat as failure; fix context, do not count it as progress. |
+| Tool prints its **help / usage / argument banner** instead of acting (e.g. a `--help`-style menu, "Args?", a flag list) | You passed an **invalid / mistyped / invented argument** — the action NEVER RAN | The call FAILED. Re-read the tool's real argument list from that very banner and reissue with a valid flag. Do NOT read the banner as "no result" and proceed as if the action happened. |
+| You're about to run a privileged op (DCSync, a DACL/ACL write, a group add) and you have NOT confirmed the enabling right | Firing it speculatively burns a step and returns an error you could have read for free (e.g. DCSync → 8453) | **Validate the right FIRST** with a read whose success you can verify — a BloodHound graph edge from your CURRENT principal to the target (e.g. `DCSync`/`GetChanges`/`GetChangesAll` on the domain), or an ACL enumeration with a flag you've confirmed exists. Proceed only on a positive confirmation. |
 
 ## Kerberos / KDC (ticket request & use)
 
@@ -74,7 +76,7 @@ placeholder key.**
 | Signature | Meaning | Do this |
 |-----------|---------|---------|
 | `8439 (0x20f7) DS_DRA_BAD_DN` | Wrong DN/DC/forest targeting | Make the DN and the DC both belong to the forest you're replicating (e.g. `DC=essos,DC=local` against the ESSOS DC). |
-| `8453 (0x2105) DS_DRA_ACCESS_DENIED` | Missing DS-Replication rights | Grant them (StandIn/dacledit) OR run under a DA/EA ticket via the execution-context pattern, then re-run against the SAME DC. |
+| `8453 (0x2105) DS_DRA_ACCESS_DENIED` | The identity you DCSync'd AS lacks DS-Replication rights | This is preventable: VALIDATE the right BEFORE DCSync (graph edge / ACL read), don't fire to test. To obtain it: run under a principal that HOLDS it (a DA/EA via the execution-context pattern), or grant it ONLY if your current identity holds domain-head `WriteDACL`. Then re-run against the SAME DC. |
 
 ## RPC / network / logon
 
@@ -91,6 +93,7 @@ placeholder key.**
 |-----------|---------|---------|
 | `takes no command line arguments` / `Failed to create task` | Empty-parameter encoding | The command layer normalizes this — do not blind-retry; if it persists, fix the param form. |
 | Implant dies right after running a .NET tool | A self-exiting assembly ran IN-PROCESS and called `Environment.Exit` | Run self-exiting tools FORK&RUN (sacrificial process), not in-process — see `windows-execution-context`. |
+| `< was unexpected at this time.` (or a mangled here-string) when writing a file via `cmd /c echo` | `cmd` interpreted `<`/`>`/`&`/`|` in your content as redirection/operators — the file was NOT written | Don't shell-echo content containing shell metacharacters (XML, `<...>`). Write via a method that takes literal bytes: an upload primitive, a base64-decode-to-file, or a non-cmd writer. Verify the file exists + matches before relying on it. |
 
 ## The decision rule
 On ANY failure: classify it with the tables above. If it is a **context/silent** failure → re-establish the

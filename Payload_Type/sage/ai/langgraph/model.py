@@ -8,7 +8,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.prebuilt import tools_condition
 from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
-from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware, HumanInTheLoopMiddleware, InterruptOnConfig, AgentMiddleware
+from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware, HumanInTheLoopMiddleware, InterruptOnConfig, AgentMiddleware, hook_config
 from langgraph.types import Command
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -50,7 +50,7 @@ _TRUNCATION_MARKER = "[truncated"
 _COMPACTION_PROTECTED_TOOLS = frozenset((
     "summarize_and_handback", "request_continuation", "respond_to_user",
     "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
-    "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
+    "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
 ))
 
 
@@ -443,6 +443,37 @@ class _StopCheckMiddleware(AgentMiddleware):
         return handler(request)
 
 
+_BLOODHOUND_CONNECT_STEPS = (
+    "BloodHound is NOT connected, so I can't ingest the collection or run attack-path analysis yet — and "
+    "BloodHound is central to Sage's graph features. To enable it (if you want graph-driven analysis):\n"
+    "1. Make sure BloodHound CE is running (web/API + neo4j) and reachable from the Sage host.\n"
+    "2. Create a BloodHound API token (BloodHound CE → Administration → API tokens) and put the Token ID "
+    "and Token Key in the BloodHound MCP server's .env.\n"
+    "3. Connect it with `mcp-connect` (name \"BloodHound\", a stdio command that runs the BloodHound MCP "
+    "server); verify with `mcp-list`.\n"
+    "Full steps are in the Sage payload documentation → \"Connecting BloodHound to Sage\". Re-run your "
+    "request once BloodHound is connected."
+)
+
+
+class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
+    """BloodHound agent only: if the BloodHound MCP is NOT connected, do not silently fail. Emit a Mythic
+    EventFeed WARNING with connect steps (once per run) and END the turn with a user-facing message, so the
+    Supervisor returns it to the operator — who can connect BloodHound if they wish, then re-run."""
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        connected = any("bloodhound" in s.lower() for s in MCPManager.get_connected_servers())
+        if connected:
+            return None
+        await self._model._notify_bloodhound_not_connected()
+        logger.info("🩸 [bloodhound-guard] BloodHound MCP not connected → EventFeed notice + returning steps to user")
+        return {"jump_to": "end", "messages": [AIMessage(content=_BLOODHOUND_CONNECT_STEPS)]}
+
+
 # Imperative directive paired with the observed-state block. A bare status LIST is informational; the
 # operator can still favor an overlay checklist that lists an already-achieved hop. This makes the
 # instruction explicit ("ACHIEVED = DONE, do NOT re-issue"). Shared by the per-turn middleware injection
@@ -647,6 +678,7 @@ class SageState(MessagesState):
     mythic_operator_messages: Annotated[list[AnyMessage], operator.add]
     mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
     mcp_manager_messages: Annotated[list[AnyMessage], operator.add]
+    bloodhound_messages: Annotated[list[AnyMessage], operator.add]
     _message_seq: Annotated[int, _max_seq_reducer]  # Global sequence counter with max reducer
 
 
@@ -913,6 +945,7 @@ class Model:
             "mythic_operator_messages": [],
             "mythic_payload_messages": [],
             "mcp_manager_messages": [],
+            "bloodhound_messages": [],
             "recursion_summary_requested": False,
             "recursion_handback": False,
         }
@@ -1171,7 +1204,7 @@ class Model:
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
-            "mcp_manager_messages"
+            "mcp_manager_messages", "bloodhound_messages"
         ]:
             if channel_name in state_update:
                 messages = state_update[channel_name]
@@ -1306,12 +1339,17 @@ class Model:
             .add_node("Generalist", self._generalist_agent())
             .add_node("Mythic_Operator", self._mythic_operator_agent())
             .add_node("Mythic_Payload", self._mythic_payload_agent())
+            .add_node("BloodHound", self._bloodhound_agent())
             .add_node("MCP_Manager", self._mcp_manager_agent())
             .add_edge(START, "Supervisor")
             .add_edge("Generalist", "Supervisor")
-            .add_edge("Mythic_Operator", "Supervisor")
             .add_edge("Mythic_Payload", "Supervisor")
+            .add_edge("BloodHound", "Supervisor")
             .add_edge("MCP_Manager", "Supervisor")
+            # The Operator ingests collections IN-PROCESS (ingest_collection → in-memory upload to BloodHound),
+            # so there is no cross-agent ingest handoff to force — the Operator returns to the Supervisor as
+            # normal, which then routes to the BloodHound agent for attack-path ANALYSIS.
+            .add_edge("Mythic_Operator", "Supervisor")
             .compile(checkpointer=self.memory, name="Sage")
         )
 
@@ -1517,7 +1555,7 @@ class Model:
                         "handback. Per the autonomous-solve overlay you must NOT stop after a sub-goal — execute the NEXT "
                         "action from your own REMAINING list now. To hand off you MUST call a tool (a plain stop just loops "
                         "you back here): call `handback_to_supervisor(reason, summary)` when the next step needs another "
-                        "agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or the objective is complete — the "
+                        "agent (BloodHound for graph work, Mythic_Payload for a build) or the objective is complete — the "
                         "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
                         "limit (it pauses for the operator). Do not stop silently."
                     )
@@ -1619,7 +1657,7 @@ class Model:
             # Tag new messages with sequence numbers for chronological ordering
             # Compute from max of existing messages to avoid collisions with handoff-created messages
             max_seq = 0
-            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
+            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
                 for existing_msg in state.get(ch_key, []):
                     seq = _get_seq(existing_msg)
                     if seq > max_seq:
@@ -1758,6 +1796,7 @@ class Model:
                                 "Mythic_Operator": "mythic_operator_messages",
                                 "Mythic_Payload": "mythic_payload_messages",
                                 "Generalist": "generalist_messages",
+                                "BloodHound": "bloodhound_messages",
                                 "MCP_Manager": "mcp_manager_messages",
                             }
                             calling_agent_channel_key = channel_map.get(calling_agent)
@@ -1847,7 +1886,13 @@ class Model:
                 objective = mythic_client._engagement_objective()
             except Exception:
                 objective = "sage-engagement"
-            state = _es.EngagementState(objective=objective, footholds=footholds, hops=hops)
+            # Include the cached graph facts (refreshed after each verified ingest) so the render's forward
+            # planner can surface NEXT GROUNDED ACTIONS. Suggestion-only — the gate's enforcement state is
+            # built separately (mythic_tools._engagement_gate) and intentionally omits these.
+            graph_facts = list(getattr(mythic_client, "_engagement_graph_facts", []) or [])
+            state = _es.EngagementState(
+                objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts
+            )
             rendered = _es.render_engagement_state(state)
             if not rendered:
                 return None
@@ -1880,7 +1925,7 @@ class Model:
         _PROTECTED_TOOLS = (
             "summarize_and_handback", "handback_to_supervisor", "request_continuation", "respond_to_user",
             "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
-            "transfer_to_Mythic_Payload", "transfer_to_MCP_Manager",
+            "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
         )
         # Static, run-constant schema the Mythic_Operator needs constantly — protect its tool output from the
         # DIGEST so it is fetched ONCE per payload type and kept, not elided-and-re-fetched (run 2058: 16×).
@@ -1984,7 +2029,7 @@ class Model:
                 "list_ttp_categories",
                 "ensure_tool_uploaded",
                 "download_tool",
-                "stage_file_to_disk",
+                "ingest_collection",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
@@ -2054,7 +2099,90 @@ class Model:
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
+    async def _notify_bloodhound_not_connected(self):
+        """Emit a ONE-TIME Mythic EventFeed WARNING (idempotent per run) telling the operator that
+        BloodHound is needed but not connected, and how to connect it. Fail-soft."""
+        if getattr(self, "_bh_notconnected_notified", False):
+            return
+        self._bh_notconnected_notified = True
+        client = getattr(self.mythic_client, "client", None) if getattr(self, "mythic_client", None) else None
+        if client is None:
+            return
+        try:
+            from mythic import mythic as _mythic
+            await _mythic.send_event_log_message(
+                client,
+                message=(
+                    "Sage needs BloodHound but its MCP server is NOT connected — attack-graph ingest and "
+                    "analysis are unavailable. Connect BloodHound CE via the `mcp-connect` command (see the "
+                    "Sage payload documentation: \"Connecting BloodHound to Sage\" for the exact parameters), "
+                    "then re-run the request."
+                ),
+                level="warning",
+                source="sage_bloodhound",
+            )
+            logger.info("🩸 [bloodhound-guard] emitted Mythic EventFeed warning (BloodHound MCP not connected)")
+        except Exception as e:
+            logger.debug(f"BloodHound not-connected EventFeed notify failed: {e}")
+
+    def _bloodhound_agent(self):
+        # Dedicated BloodHound agent: owns the BloodHound graph lifecycle (ingest -> verify -> query) on its
+        # OWN message channel ("bloodhound_messages"). Scoped to ONLY the BloodHound MCP server's tools so it
+        # stays distinct from the general-purpose MCP_Manager (which owns any OTHER connected MCP servers).
+        name = "BloodHound"
+
+        servers_text = prompt_context.servers_text(self)
+
+        prompt = load_prompt("bloodhound", servers_text=servers_text)
+
+        if not self.state["bloodhound_messages"]:
+            self.state["bloodhound_messages"].append(SystemMessage(content=prompt))
+
+        # Scope to the BloodHound MCP server's tools only (file_upload, domain_info, data_quality,
+        # graph_analysis, cypher_query, adcs_info, etc.) — match by name so case/registration variants work.
+        bh_servers = [s for s in MCPManager.get_connected_servers() if "bloodhound" in s.lower()]
+        mcp_tools = []
+        for s in bh_servers:
+            mcp_tools += MCPManager.get_tools_by_server(s)
+
+        # Add handback tool for recursion limit management
+        handback_tool = _create_summarize_handback_tool()
+
+        # Sage TTP knowledge tools (read-only local files) + the stage->ingest bridge so the BloodHound
+        # agent can self-serve standup guidance, the attack-path-loop playbook, and stage a staged file UUID.
+        ttp_tools = []
+        if self.mythic_client is not None:
+            ttp_tools = self.mythic_client.get_tools([
+                "get_ttp_guidance",
+                "get_ttp_full_reference",
+                "list_ttp_categories",
+            ])
+
+        tools = mcp_tools + filter_tools_by_frontmatter("bloodhound", ttp_tools + [handback_tool])
+
+        # Handle case when BloodHound MCP not connected — the agent still loads (with only its TTP/handback
+        # tools) so it can NOTIFY the user how to connect BloodHound rather than silently failing.
+        if not mcp_tools:
+            logger.warning("BloodHound agent initialized with NO BloodHound MCP tools (BloodHound MCP not connected)")
+
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for BloodHound Agent.")
+
+        agent = create_agent(
+            model=llm,
+            tools=tools,
+            name=name,
+            # Guard FIRST so a not-connected BloodHound MCP notifies the user (EventFeed + steps) and ends
+            # the turn before any model call, instead of silently failing with no graph tools.
+            middleware=[_BloodHoundConnectionGuardMiddleware(self)] + self._context_middleware(),
+        )
+        return self._wrap_create_agent(agent, "bloodhound_messages", name)
+
     def _mcp_manager_agent(self):
+        # General-purpose MCP manager: lets users connect ARBITRARY MCP servers to Sage and use their tools.
+        # Scoped to every connected MCP server EXCEPT BloodHound (which has its own dedicated agent), so the
+        # two never overlap. If only BloodHound is connected, this agent simply has no MCP tools (that's fine).
         name = "MCP_Manager"
 
         servers_text = prompt_context.servers_text(self)
@@ -2064,28 +2192,17 @@ class Model:
         if not self.state["mcp_manager_messages"]:
             self.state["mcp_manager_messages"].append(SystemMessage(content=prompt))
 
-        # Get MCP tools
-        mcp_tools = MCPManager.get_all_tools()
+        # All connected MCP servers EXCEPT BloodHound (owned by the dedicated BloodHound agent).
+        other_servers = [s for s in MCPManager.get_connected_servers() if "bloodhound" not in s.lower()]
+        mcp_tools = []
+        for s in other_servers:
+            mcp_tools += MCPManager.get_tools_by_server(s)
 
-        # Add handback tool for recursion limit management
         handback_tool = _create_summarize_handback_tool()
+        tools = mcp_tools + filter_tools_by_frontmatter("mcp_manager", [handback_tool])
 
-        # Sage TTP knowledge tools (read-only local files) so MCP_Manager can self-serve
-        # BloodHound standup guidance + the attack-path-loop playbook.
-        ttp_tools = []
-        if self.mythic_client is not None:
-            ttp_tools = self.mythic_client.get_tools([
-                "get_ttp_guidance",
-                "get_ttp_full_reference",
-                "list_ttp_categories",
-                "stage_file_to_disk",
-            ])
-
-        tools = mcp_tools + filter_tools_by_frontmatter("mcp_manager", ttp_tools + [handback_tool])
-
-        # Handle case when no MCP tools available
         if not mcp_tools:
-            logger.warning("MCP_Manager agent initialized with no MCP tools available")
+            logger.info("MCP_Manager agent initialized with no non-BloodHound MCP tools (no other MCP servers connected)")
 
         llm = self._get_base_chat_model()
         if not llm:
@@ -2114,7 +2231,7 @@ class Model:
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
                 agent_name="Mythic_Operator",
-                description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of MCP_Manager.",
+                description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of the BloodHound agent.",
             )
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
@@ -2122,9 +2239,14 @@ class Model:
                 description="Assign task to Mythic Payload for creating Mythic payloads, configuring C2 profiles, and build options.",
             )
 
+        assign_to_bloodhound_agent = _create_handoff_tool(
+                agent_name="BloodHound",
+                description="Assign to the BloodHound agent for the BloodHound attack-graph: INGEST a staged SharpHound/AzureHound collection (file_upload) then VERIFY it, and attack-path ANALYSIS (shortest path, ADCS/ESC paths, Cypher, object detail). NOTE: the Operator auto-hands-off freshly-staged collections to BloodHound; route here for any BloodHound/graph work, to re-attempt a failed ingest, or for path analysis. Do NOT route BloodHound work to Mythic_Operator.",
+            )
+
         assign_to_mcp_manager_agent = _create_handoff_tool(
                 agent_name="MCP_Manager",
-                description="Assign task to MCP Manager ONLY for external third-party tools from connected MCP servers (web fetching, external APIs, non-Mythic integrations). Do NOT use for Mythic operations - use Mythic_Operator instead.",
+                description="Assign to the general-purpose MCP Manager for tools from ARBITRARY third-party MCP servers a user has connected (web fetching, external APIs, non-Mythic integrations) — anything that is NOT BloodHound, NOT Mythic C2, and NOT a payload build. For BloodHound/graph work use the BloodHound agent; for Mythic operations use Mythic_Operator.",
             )
 
         # Completion tool - use when task is done
@@ -2138,6 +2260,7 @@ class Model:
             assign_to_generalist_agent,
             assign_to_mythic_operator_agent,
             assign_to_mythic_payload_agent,
+            assign_to_bloodhound_agent,
             assign_to_mcp_manager_agent,
             respond_to_user_tool,
             request_continuation_tool,
@@ -2372,6 +2495,7 @@ class Model:
             "Mythic_Operator": "mythic_operator_messages",
             "Mythic_Payload": "mythic_payload_messages",
             "Generalist": "generalist_messages",
+            "BloodHound": "bloodhound_messages",
             "MCP_Manager": "mcp_manager_messages"
         }
 
@@ -2643,7 +2767,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
-            "mcp_manager_messages",
+            "mcp_manager_messages", "bloodhound_messages",
         ]:
             if ch not in self.state:
                 self.state[ch] = []
@@ -2756,7 +2880,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         "generalist_messages",
                         "mythic_operator_messages",
                         "mythic_payload_messages",
-                        "mcp_manager_messages",
+                        "mcp_manager_messages", "bloodhound_messages",
                         "_message_seq"
                     ]:
                         if ch in state_update:
@@ -2789,7 +2913,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
             seen_ids = set()
-            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
+            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"📊 Channel {ch}: {len(ch_msgs)} messages")
                 for idx, msg in enumerate(ch_msgs):
@@ -2870,7 +2994,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # DEBUG: Log what's in self.state BEFORE checkpoint recovery
             logger.info(f"DEBUG: In-memory state BEFORE checkpoint recovery:")
             for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
-                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"  {ch}: {len(ch_msgs)} messages")
 
@@ -2921,7 +3045,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         # Look for agent-specific channels
                         for channel_name in ["supervisor_messages", "mythic_operator_messages",
                                             "mythic_payload_messages", "generalist_messages",
-                                            "mcp_manager_messages"]:
+                                            "mcp_manager_messages", "bloodhound_messages"]:
                             if channel_name in channel_values:
                                 current_len = len(channel_values[channel_name]) if isinstance(channel_values[channel_name], list) else 0
                                 existing_len = len(best_agent_state.get(channel_name, [])) if isinstance(best_agent_state.get(channel_name), list) else 0
@@ -2940,7 +3064,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     # If they do, DON'T rebuild from checkpoint - preserve the existing content
                     channels_need_rebuild = False
                     for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                              "generalist_messages", "mcp_manager_messages"]:
+                              "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                         existing = self.state.get(ch, [])
                         substantive_count = sum(1 for msg in existing if isinstance(msg, (AIMessage, ToolMessage)))
 
@@ -2957,14 +3081,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                         # Initialize channels if not already present
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                             if ch not in self.state:
                                 self.state[ch] = []
                     else:
                         logger.info("Agent channels already have content from previous run - skipping rebuild to preserve state")
                         # Still need to ensure channels exist
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                             if ch not in self.state:
                                 self.state[ch] = []
                         # Skip the message sorting below
@@ -2992,13 +3116,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                             elif agent_name == "Generalist" or delegated_to == "Generalist":
                                 if msg not in self.state["generalist_messages"]:
                                     self.state["generalist_messages"].append(msg)
+                            elif agent_name == "BloodHound" or delegated_to == "BloodHound":
+                                if msg not in self.state["bloodhound_messages"]:
+                                    self.state["bloodhound_messages"].append(msg)
                             elif agent_name == "MCP_Manager" or delegated_to == "MCP_Manager":
                                 if msg not in self.state["mcp_manager_messages"]:
                                     self.state["mcp_manager_messages"].append(msg)
 
                         # Log rebuilt channel sizes
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                             logger.info(f"Rebuilt {ch}: {len(self.state[ch])} messages")
 
                         # CRITICAL: Validate and fix message sequences for Bedrock compatibility
@@ -3007,7 +3134,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         # After rebuilding channels, this requirement might be violated
                         logger.info("Validating message sequences for LLM provider compatibility...")
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                             self.state[ch] = self._fix_message_sequence_for_bedrock(self.state[ch])
 
                 if not latest_messages:
@@ -3023,7 +3150,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # DEBUG: Log what's in self.state AFTER checkpoint recovery
             logger.info(f"DEBUG: In-memory state AFTER checkpoint recovery:")
             for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
-                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"  {ch}: {len(ch_msgs)} messages")
 
@@ -3090,7 +3217,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                     # Merge all agent channels
                     for ch in ["messages", "supervisor_messages", "generalist_messages",
-                               "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages"]:
+                               "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
                         if ch in saved_state:
                             ch_messages = saved_state[ch]
                             for msg in ch_messages:
@@ -3247,7 +3374,7 @@ Continue now.""")
                             if node_name in ["__start__", "__end__"]:
                                 continue
                             for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
-                                      "mythic_payload_messages", "mcp_manager_messages", "_message_seq"]:
+                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
                                 if ch in state_update:
                                     if ch == "_message_seq":
                                         self._message_seq = state_update[ch]
@@ -3278,7 +3405,7 @@ Continue now.""")
                                 nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
                                 for channel_name in ["messages", "supervisor_messages", "generalist_messages",
                                                     "mythic_operator_messages", "mythic_payload_messages",
-                                                    "mcp_manager_messages", "_message_seq"]:
+                                                    "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
                                     if channel_name in nested_state:
                                         self.state[channel_name] = nested_state[channel_name]
                                         if channel_name != "_message_seq":
@@ -3370,7 +3497,7 @@ Continue now.""")
                             if node_name in ["__start__", "__end__"]:
                                 continue
                             for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
-                                      "mythic_payload_messages", "mcp_manager_messages", "_message_seq"]:
+                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
                                 if ch in state_update:
                                     if ch == "_message_seq":
                                         self._message_seq = state_update[ch]
@@ -3401,7 +3528,7 @@ Continue now.""")
                                 nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
                                 for channel_name in ["messages", "supervisor_messages", "generalist_messages",
                                                     "mythic_operator_messages", "mythic_payload_messages",
-                                                    "mcp_manager_messages", "_message_seq"]:
+                                                    "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
                                     if channel_name in nested_state:
                                         self.state[channel_name] = nested_state[channel_name]
                                         if channel_name != "_message_seq":
@@ -3534,7 +3661,7 @@ def _build_esl_summary(mythic_client) -> str:
 def _create_handback_to_supervisor_tool(mythic_client=None):
     """
     Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
-    to another agent (MCP_Manager for BloodHound, Mythic_Payload for a build) or finalize. This is the
+    to another agent (BloodHound for graph work, Mythic_Payload for a build) or finalize. This is the
     explicit autonomous handback path: with the keep-going continue-loop a plain turn-end no longer reaches
     the Supervisor, so the Operator MUST call this to hand off across agents. Distinct from
     summarize_and_handback (which ends the run and waits for the user at the recursion limit).
@@ -3542,11 +3669,11 @@ def _create_handback_to_supervisor_tool(mythic_client=None):
     @tool("handback_to_supervisor")
     def handback_to_supervisor(
         runtime: ToolRuntime,
-        reason: Annotated[str, "Why you are handing back NOW: the capability/agent needed next (e.g. 'BloodHound ingestion -> route to MCP_Manager', 'payload build -> Mythic_Payload') or that the objective is complete."],
+        reason: Annotated[str, "Why you are handing back NOW: the capability/agent needed next (e.g. 'BloodHound ingestion -> route to BloodHound', 'payload build -> Mythic_Payload') or that the objective is complete."],
         summary: Annotated[str, "Structured DONE / FAILED / BLOCKER / REMAINING summary with concrete values (hashes, SIDs, file UUIDs, exact errors)."],
     ) -> Command:
         """Yield control to the Supervisor WITHOUT ending the run so it can route to another agent
-        (MCP_Manager for BloodHound graph work, Mythic_Payload for builds) or finalize the objective.
+        (BloodHound for graph work, Mythic_Payload for builds) or finalize the objective.
         Call this the moment the NEXT step needs a capability you do not own, or the objective is reached.
         Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only."""
         esl = ""
@@ -3679,6 +3806,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         "Generalist": "generalist_messages",
         "Mythic_Operator": "mythic_operator_messages",
         "Mythic_Payload": "mythic_payload_messages",
+        "BloodHound": "bloodhound_messages",
         "MCP_Manager": "mcp_manager_messages",
     }
     target_channel_key = channel_map.get(agent_name)
@@ -3691,7 +3819,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         # Compute sequence from max of existing messages in all channels
         # This is more reliable than state._message_seq which may not persist across checkpoints
         max_seq = 0
-        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "messages"]:
+        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "messages"]:
             for msg in runtime.state.get(ch_key, []):
                 seq = _get_seq(msg)
                 if seq > max_seq:
@@ -3732,7 +3860,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
             if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
                 # Check if this channel has recent activity (last message is not too old)
                 # This is a heuristic - the agent that just called a tool is the calling agent
-                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages"]:
+                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
                     # Simple approach: assume the tool was called from whichever non-target channel exists
                     if channel_name != agent_name:
                         current_agent = channel_name

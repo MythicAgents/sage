@@ -20,10 +20,15 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir uv
-# Clone the BloodHound MCP and pre-sync its deps so first `mcp-connect` needs no network.
-# TODO: pin to a reviewed commit once validated against the lab (currently tracks main).
-RUN git clone --depth 1 https://github.com/mwnickerson/bloodhound_mcp.git /opt/bloodhound_mcp && \
+# Clone the BloodHound MCP and pre-sync its deps so first connect needs no network.
+# Pin/override the ref at build time: --build-arg BLOODHOUND_MCP_REF=<branch|tag> (default: main).
+# This is also how to build against a feature branch (e.g. the bytes-upload branch) for testing.
+ARG BLOODHOUND_MCP_REF=main
+RUN git clone --depth 1 --branch ${BLOODHOUND_MCP_REF} https://github.com/mwnickerson/bloodhound_mcp.git /opt/bloodhound_mcp && \
     cd /opt/bloodhound_mcp && uv sync --no-dev
+# Tell Sage where the baked-in BloodHound MCP lives so it AUTO-CONNECTS on the first query
+# (ai/bloodhound_config.py reads this). Local dev overrides SAGE_BLOODHOUND_MCP_DIR to its own checkout.
+ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp
 # Connection is configured at RUNTIME (never bake the token). Required env, injected by the
 # operator via Mythic container env / build params:
 #   BLOODHOUND_DOMAIN, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY

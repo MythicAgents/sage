@@ -334,3 +334,94 @@ def test_credential_techniques_matches_verify_schema():
         if allkeys & cred_keys:
             derived.add(name)
     assert ca.CREDENTIAL_TECHNIQUES == derived
+
+
+# ---------------------------------------------------------------------------
+# Verify-on-record for dcsync-rights-grant (2026-06-09 false-achieved-grant bug)
+# ---------------------------------------------------------------------------
+
+GRANT_DOM = "north.sevenkingdoms.local"
+
+GRANT_OK = (
+    "[+] Using DC   : winterfell.north.sevenkingdoms.local\n"
+    "[+] Object     : DC=north,DC=sevenkingdoms,DC=local\n"
+    "[+] Adding DS-Replication-Get-Changes and DS-Replication-Get-Changes-All\n"
+    "[+] DACL modified successfully\n"
+)
+GRANT_OK_GUID = (
+    "[+] Object : DC=north,DC=sevenkingdoms,DC=local\n"
+    "[+] Applied ACE 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2\n"
+    "[+] Applied ACE 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2\n"
+)
+GRANT_DENIED = (
+    "[!] Object    : DC=north,DC=sevenkingdoms,DC=local\n"
+    "[!] Exception : Access is denied (0x80070005)\n"
+)
+GRANT_EMPTY = ""   # the GPO/SYSTEM scheduled task that vanished from SYSVOL before firing
+
+
+def test_grant_techniques_set_separate_from_credential():
+    assert ca.GRANT_TECHNIQUES == {"dcsync-rights-grant"}
+    assert ca.GRANT_TECHNIQUES.isdisjoint(ca.CREDENTIAL_TECHNIQUES)
+
+
+def test_grant_probe_applied_true_on_success():
+    assert ca.extract_grant_probe(GRANT_OK)["ds_replication_rights"] is True
+    assert ca.extract_grant_probe(GRANT_OK_GUID)["ds_replication_rights"] is True
+
+
+def test_grant_probe_denied_is_not_applied():
+    p = ca.extract_grant_probe(GRANT_DENIED)
+    assert p["ds_replication_rights"] is False
+    assert p["ace_present"] is False        # a denied attempt grants no partial credit
+
+
+def test_grant_probe_empty_is_not_applied():
+    assert ca.extract_grant_probe(GRANT_EMPTY)["ds_replication_rights"] is False
+    assert ca.extract_grant_probe(None)["ds_replication_rights"] is False
+
+
+def test_verify_grant_success_achieved():
+    assert es.verify_effect("dcsync-rights-grant", GRANT_DOM, ca.extract_grant_probe(GRANT_OK)) == "achieved"
+
+
+def test_verify_grant_denied_failed():
+    assert es.verify_effect("dcsync-rights-grant", GRANT_DOM, ca.extract_grant_probe(GRANT_DENIED)) == "failed"
+
+
+def test_record_grant_success_achieved(mt):
+    mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
+    mt._record_engagement_success(GRANT_OK)
+    hop = _last(mt)
+    assert hop.technique == "dcsync-rights-grant" and hop.status == "achieved"
+    assert hop.evidence.get("verify_verdict") == "achieved"
+    assert hop.evidence.get("artifact_present") is True
+
+
+def test_record_grant_denied_failed_not_achieved(mt):
+    # The false-achieved-grant lie is dead: Access-denied records FAILED, never achieved.
+    mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
+    mt._record_engagement_success(GRANT_DENIED)
+    hop = _last(mt)
+    assert hop.status == "failed"
+    assert hop.evidence.get("artifact_present") is False
+    # A failed grant must NOT be SKIPped by the achieved-dedup -> the agent can re-attempt it.
+    state = es.EngagementState(objective="t", hops=mt._engagement_hops)
+    assert es.gate_decision("dcsync-rights-grant", GRANT_DOM, state)[0] != es.GateDecision.SKIP
+
+
+def test_record_grant_empty_failed(mt):
+    mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
+    mt._record_engagement_success(GRANT_EMPTY)
+    assert _last(mt).status == "failed"
+
+
+def test_verified_achieved_grant_not_downgraded(mt):
+    mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
+    mt._record_engagement_success(GRANT_OK)
+    assert _last(mt).status == "achieved"
+    # A later denied/empty re-probe in the same instance must keep the verified achieved grant.
+    mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, "2026-06-08T01:00:00+00:00")
+    mt._record_engagement_success(GRANT_DENIED)
+    hops = [h for h in mt._engagement_hops if h.technique == "dcsync-rights-grant" and h.target == GRANT_DOM]
+    assert len(hops) == 1 and hops[0].status == "achieved"

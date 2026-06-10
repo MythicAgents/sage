@@ -30,12 +30,12 @@ overlay_for:
   and EXPECTED to drive the FULL multi-hop solve AUTONOMOUSLY. Classify the request, preserve the
   operator's stated objective, then route and supervise the solve from observed state.
 - For BloodHound routing under this overlay: for ANY objective / path-advancement request, BloodHound
-  graph analysis (MCP_Manager) is the DEFAULT opening move unless the ENGAGEMENT STATE proves fresh,
+  graph analysis (the BloodHound agent) is the DEFAULT opening move unless the ENGAGEMENT STATE proves fresh,
   target-domain graph data already exists. Mythic_Operator collects (SharpHound on the foothold),
-  `download`s the ZIP, then STAGES it for ingest: `stage_file_to_disk(callback_display_id=<foothold callback>)`
-  returns a host-local path the BloodHound MCP can read. The ingestion artifact passed to MCP_Manager is
-  that STAGED LOCAL PATH (or just the foothold callback id — "ingest the latest collection from callback N"),
-  NEVER a `C:\...` Windows target path.
+  `download`s the ZIP, then INGESTS it itself IN-MEMORY: `ingest_collection(callback_display_id=<foothold
+  callback>)` resolves the downloaded collection, fetches its bytes, and uploads them straight into BloodHound
+  (no staging, no disk, no handoff). After ingest, route to the BloodHound agent to VERIFY (`domain_info`) and
+  ANALYZE. BloodHound ingest is async — the graph populates a few seconds after the upload is accepted.
 
 {{ENGAGEMENT_STATE}}
 
@@ -48,19 +48,23 @@ memory.
 - OPSEC scope: in-memory post-ex primitives ONLY (no offline cracking, no disk artifacts where avoidable);
   self-exiting tools run fork&run.
 - No WINTERFELL beacon: do NOT drop or depend on a persistent C2 callback on WINTERFELL — it is a
-  Defender-enabled DC where GPO-dropped beacons are unreliable AND unnecessary. samwell's GPO edge is a
-  ONE-SHOT SYSTEM action that grants durable DCSync rights; all interactive work (DCSync, ticket forging,
-  cross-forest hops) runs from the Defender-disabled CASTELBLACK foothold. Credentials (`jon.snow` et al.)
-  are LSASS-resident on CASTELBLACK — recover them there, never via a DC implant.
+  Defender-enabled DC where GPO-dropped beacons are unreliable AND unnecessary. A DC-scoped GPO edge is a
+  ONE-SHOT SYSTEM action that makes a DURABLE PRIVILEGE change ON the DC (e.g. add a principal you control
+  to Domain Admins — `ttps/sharpgpoabuse.md`), so all interactive work (DCSync, ticket forging,
+  cross-forest hops) then runs REMOTELY from the Defender-disabled CASTELBLACK foothold as that privileged
+  principal. Credentials (`jon.snow` et al.) are LSASS-resident on CASTELBLACK — recover them there,
+  never via a DC implant.
 - Anti-dead-end: Domain Admins is a GLOBAL group → it CANNOT hold a foreign-forest member → do NOT try to add a NORTH principal to ESSOS Domain Admins. Use the golden-ticket route via the domain-local ADMINISTRATORS@ESSOS group instead.
 - Per-forest targeting: any DN + DC must both belong to the forest you are escalating in (e.g.
   `DC=essos,DC=local` against the ESSOS DC, NOT north/winterfell). Error codes: 8439
   (0x20f7 / DS_DRA_BAD_DN) = wrong-forest/DN/DC TARGETING (fix the target); 8453
-  (0x2105 / DS_DRA_ACCESS_DENIED) = missing DS-Replication RIGHTS (grant them, then DCSync the same DC).
+  (0x2105 / DS_DRA_ACCESS_DENIED) = the identity you DCSync'd AS lacks DS-Replication rights → DCSync as a
+  principal that HOLDS them (e.g. a DA you obtained via a DC-scoped GPO), or self-grant ONLY if your CURRENT
+  context already holds WriteDACL on the domain head; never blindly self-grant (`ttps/sharpgpoabuse.md`).
 - Stay on the stated objective: autonomy is scoped to advancing the operator's STATED objective; no
   unrelated targets, no destructive actions. An explicit operator stop/inhibit ALWAYS outranks this overlay.
 - IDEMPOTENCE: BloodHound data and hop effects persist. Before a NEW collection, especially on
-  "continue"/resume, ask MCP_Manager whether the graph already has fresh data for the TARGET domain
+  "continue"/resume, ask the BloodHound agent whether the graph already has fresh data for the TARGET domain
   specifically (e.g. essos.local populated, not just some other domain). Before each offensive hop, query
   the graph or do a cheap in-place enumeration for the effect; if it already holds, SKIP the attack and
   advance.
@@ -81,10 +85,18 @@ Defender-disabled CASTELBLACK foothold.
   LSASS-resident on CASTELBLACK and recoverable in-memory WITHOUT cracking once you hold local SYSTEM/admin
   there (escalate via the CASTELBLACK-local path — e.g. SeImpersonate from the service context, or the
   MSSQL route). Prefer this as the credential source: it needs NO implant on any DC.
-- GPO abuse as a ONE-SHOT, BEACONLESS SYSTEM action: samwell controls the `STARKWALLPAPER` GPO applied to
-  WINTERFELL (the NORTH DC). Use the GPO immediate/scheduled task to make a DURABLE privilege change —
-  grant DS-Replication (DCSync) rights on `north.sevenkingdoms.local` to a principal you control (samwell)
-  — NOT to drop a persistent Apollo/Merlin callback. Use `STARKWALLPAPER` as the task name for this hop.
+- GPO abuse as a ONE-SHOT, BEACONLESS SYSTEM action — pick the primitive from the GPO's SCOPE, don't
+  assume it (`ttps/sharpgpoabuse.md` → "Choosing the abuse primitive — the GPO's SCOPE decides"). FIRST
+  resolve from the graph what the controlled GPO (the prior here is `STARKWALLPAPER`) is linked to and
+  which computers it covers, and whether a
+  **Domain Controller is in that scope** (a GPO linked at the domain root or the DC OU covers the DC).
+  When the scope includes a DC, a SYSTEM computer-task runs ON the DC, whose SYSTEM context is
+  domain-privileged → make a DURABLE privilege change from there: add a principal you control to
+  `Domain Admins` (`net group "Domain Admins" <DOMAIN\user> /add /domain`) so you can then operate
+  REMOTELY as a DA. Do NOT attempt a DS-Replication self-grant on the domain head — that needs your
+  CURRENT identity to already hold WriteDACL on the Domain object (a non-DA user, and SYSTEM on a *member*
+  host, do not), so it returns Access-denied no matter how cleanly the task is delivered. Do NOT drop a
+  persistent callback. Name the task innocuously.
 - DCSync NORTH **remotely from CASTELBLACK** using the granted rights → recover `krbtgt` + all NORTH
   secrets (target the NORTH DC with a NORTH DN; validate the 8439-vs-8453 distinction).
 - Climb child→parent (north → sevenkingdoms) via an **ExtraSIDs golden ticket**, forged from the CHILD
@@ -146,15 +158,18 @@ memory.
   BOFs through Mythic_Operator; no offline cracking, no disk artifacts where avoidable); self-exiting tools
   run fork&run.
 - No WINTERFELL beacon: do NOT drop or depend on a persistent C2 callback on WINTERFELL — it is a
-  Defender-enabled DC where GPO-dropped beacons are unreliable AND unnecessary. Use SharpGPOAbuse for a
-  ONE-SHOT SYSTEM action that grants durable DCSync rights; run DCSync, ticket forging, and the cross-forest
-  hops from the Defender-disabled CASTELBLACK foothold. `jon.snow` et al. are LSASS-resident on CASTELBLACK —
-  recover them there, never via a DC implant.
+  Defender-enabled DC where GPO-dropped beacons are unreliable AND unnecessary. Use a DC-scoped GPO for a
+  ONE-SHOT SYSTEM action that makes a DURABLE PRIVILEGE change ON the DC (e.g. add a controlled principal
+  to Domain Admins — `ttps/sharpgpoabuse.md`); then run DCSync, ticket forging, and the cross-forest hops
+  REMOTELY from the Defender-disabled CASTELBLACK foothold as that privileged principal. `jon.snow` et al.
+  are LSASS-resident on CASTELBLACK — recover them there, never via a DC implant.
 - Anti-dead-end: Domain Admins is a GLOBAL group → it CANNOT hold a foreign-forest member → do NOT try to add a NORTH principal to ESSOS Domain Admins. Use the golden-ticket route via the domain-local ADMINISTRATORS@ESSOS group instead.
 - Per-forest targeting: any DN + DC must both belong to the forest you are escalating in (e.g.
   `DC=essos,DC=local` against the ESSOS DC, NOT north/winterfell). Error codes: 8439
   (0x20f7 / DS_DRA_BAD_DN) = wrong-forest/DN/DC TARGETING (fix the target); 8453
-  (0x2105 / DS_DRA_ACCESS_DENIED) = missing DS-Replication RIGHTS (grant them, then DCSync the same DC).
+  (0x2105 / DS_DRA_ACCESS_DENIED) = the identity you DCSync'd AS lacks DS-Replication rights → DCSync as a
+  principal that HOLDS them (e.g. a DA you obtained via a DC-scoped GPO), or self-grant ONLY if your CURRENT
+  context already holds WriteDACL on the domain head; never blindly self-grant (`ttps/sharpgpoabuse.md`).
 - Stay on the stated objective: autonomy is scoped to advancing the operator's STATED objective; no
   unrelated targets, no destructive actions.
 - EXECUTION CONTEXT (decisive for cross-realm ops — read `ttps/windows-execution-context`): a tool runs under
@@ -186,16 +201,22 @@ BloodHound graph, not as a fixed script. NOTE: this route deliberately needs NO 
 WINTERFELL — the GPO edge is a one-shot SYSTEM action; interactive work runs from the Defender-disabled
 CASTELBLACK foothold.
 - BloodHound-first recon: collect SharpHound on the foothold, `download` the ZIP, then call
-  `stage_file_to_disk(callback_display_id=<foothold callback>)` so MCP_Manager can ingest the staged local
-  path. NEVER hand MCP_Manager a `C:\...` Windows target path.
+  `ingest_collection(callback_display_id=<foothold callback>)` — the Operator ingests it into BloodHound
+  in-memory (no staging). Then route to the BloodHound agent to verify (`domain_info`) and analyze.
 - Credential recovery from CASTELBLACK (Defender-DISABLED foothold): `jon.snow`, `arya`, `catelyn` are
   LSASS-resident on CASTELBLACK and recoverable in-memory WITHOUT cracking once you hold local SYSTEM/admin
   there (escalate via the CASTELBLACK-local path — e.g. SeImpersonate from the service context, or MSSQL).
   Prefer this credential source: it needs NO implant on any DC.
-- GPO abuse as a ONE-SHOT, BEACONLESS SYSTEM action: samwell controls the `STARKWALLPAPER` GPO applied to
-  WINTERFELL (the NORTH DC). Use SharpGPOAbuse to add an immediate/scheduled task that runs a DURABLE
-  privilege change — grant DS-Replication (DCSync) rights on `north.sevenkingdoms.local` to a principal you
-  control (samwell) — NOT to launch a persistent Apollo/Merlin beacon. Use `STARKWALLPAPER` as the task name.
+- GPO abuse as a ONE-SHOT, BEACONLESS SYSTEM action — pick the primitive from the GPO's SCOPE, don't
+  assume it (`ttps/sharpgpoabuse.md` → "Choosing the abuse primitive — the GPO's SCOPE decides"). FIRST
+  resolve from the graph what the controlled GPO (the prior here is `STARKWALLPAPER`) is linked to and
+  which computers it covers, and whether a
+  **Domain Controller is in that scope** (linked at the domain root or the DC OU covers the DC). When the
+  scope includes a DC, a SYSTEM computer-task runs ON the DC (domain-privileged) → make the DURABLE change
+  there: add a principal you control to `Domain Admins` (`net group "Domain Admins" <DOMAIN\user> /add
+  /domain`), then operate REMOTELY as that DA. Do NOT self-grant DS-Replication on the domain head — it
+  needs your CURRENT identity to already hold WriteDACL on the Domain object (a non-DA user / member-host
+  SYSTEM does not) and returns Access-denied regardless of delivery. Do NOT launch a persistent beacon.
 - DCSync NORTH **remotely from CASTELBLACK** using the granted rights → recover `krbtgt` + all NORTH
   secrets (target the NORTH DC with a NORTH DN; validate the 8439-vs-8453 distinction).
 - Climb child→parent (north → sevenkingdoms) via an **ExtraSIDs golden ticket**, forged from the CHILD
@@ -246,7 +267,7 @@ repeating a plan is not progress and just spends the step/time budget until the 
 End your turn / hand back ONLY when one of these is genuinely true:
 - you are approaching the recursion limit (remaining_steps ≤ 4) — then use `summarize_and_handback` (this
   pauses for the operator);
-- the NEXT step needs a capability another agent owns — BloodHound graph analysis (MCP_Manager) or a
+- the NEXT step needs a capability another agent owns — BloodHound graph analysis (the BloodHound agent) or a
   payload build (Mythic_Payload) — call `handback_to_supervisor(reason, summary)` so the Supervisor can
   route it and the solve CONTINUES;
 - you hit a GENUINE blocker that needs an operator decision or a capability you do not have — but only

@@ -48,6 +48,9 @@ FIXTURES = {
     "mcp_manager": {
         "servers_text": "\n**Currently Connected MCP Servers:** 1\n- bloodhound: 13 tools (graph_analysis, cypher_query)\n"
     },
+    "bloodhound": {
+        "servers_text": "\n**Currently Connected MCP Servers:** 1\n- bloodhound: 13 tools (graph_analysis, cypher_query)\n"
+    },
     "supervisor": {},
 }
 
@@ -56,8 +59,9 @@ EXPECTED_META = {
     "generalist": ("Generalist", 0),
     "mythic_operator": ("Mythic_Operator", 20),
     "mythic_payload": ("Mythic_Payload", 10),
-    "mcp_manager": ("MCP_Manager", 5),
-    "supervisor": ("Supervisor", 6),
+    "mcp_manager": ("MCP_Manager", 1),
+    "bloodhound": ("BloodHound", 4),
+    "supervisor": ("Supervisor", 7),
 }
 
 # A distinctive, post-substitution substring per agent. Its presence proves the
@@ -68,6 +72,7 @@ DISTINCTIVE_RENDERED = {
     "mythic_operator": "### Available Commands for 'apollo'",
     "mythic_payload": "- apollo\n        - merlin",
     "mcp_manager": "**Currently Connected MCP Servers:** 1",
+    "bloodhound": "You are the **BloodHound Agent**",
     "supervisor": "You are a Supervisor Agent",
 }
 
@@ -76,6 +81,7 @@ PLACEHOLDERS = {
     "mythic_operator": ["{commands_text}"],
     "mythic_payload": ["{installed_payloads_text}", "{installed_c2_profiles_text}"],
     "mcp_manager": ["{servers_text}"],
+    "bloodhound": ["{servers_text}"],
 }
 
 AGENTS = list(FIXTURES.keys())
@@ -236,18 +242,18 @@ def test_filter_with_empty_frontmatter_drops_everything():
 # ---------------------------------------------------------------------------
 # 7. MCP passthrough pattern — runtime MCP tools survive alongside static tools.
 # ---------------------------------------------------------------------------
-def test_mcp_manager_passthrough_keeps_runtime_tools_and_static_set():
-    # This mirrors model.py:
-    #   tools = mcp_tools + filter_tools_by_frontmatter("mcp_manager", ttp_tools + [handback_tool])
-    static_fm_tools = prompt_loader.get_prompt_tools("mcp_manager")
-    assert len(static_fm_tools) == 5
+def test_bloodhound_passthrough_keeps_runtime_tools_and_static_set():
+    # This mirrors model.py's BloodHound agent (the passthrough pattern moved there):
+    #   tools = mcp_tools + filter_tools_by_frontmatter("bloodhound", ttp_tools + [handback_tool])
+    static_fm_tools = prompt_loader.get_prompt_tools("bloodhound")
+    assert len(static_fm_tools) == 4
 
     # Runtime-discovered MCP tools are NOT in frontmatter and must NOT be filtered.
     mcp_tools = [_Tool("graph_analysis"), _Tool("cypher_query"), _Tool("adcs_info")]
     static_candidates = [_Tool(n) for n in static_fm_tools]
 
     filtered_static = prompt_loader.filter_tools_by_frontmatter(
-        "mcp_manager", static_candidates
+        "bloodhound", static_candidates
     )
     combined = mcp_tools + filtered_static
     combined_names = [t.name for t in combined]
@@ -256,7 +262,7 @@ def test_mcp_manager_passthrough_keeps_runtime_tools_and_static_set():
     assert combined_names[:3] == ["graph_analysis", "cypher_query", "adcs_info"]
     # And all 5 static frontmatter tools survive the filter.
     assert set(combined_names[3:]) == set(static_fm_tools)
-    assert len(combined_names) == 3 + 5
+    assert len(combined_names) == 3 + 4
 
 
 # ---------------------------------------------------------------------------

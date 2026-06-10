@@ -97,7 +97,14 @@ def test_gate_skip_short_circuits_existing_gpo_effect():
     assert calls["issue"] == 0
 
 
-def test_gate_defer_short_circuits_missing_essos_preconditions():
+def test_gate_demotes_missing_preconditions_to_advisory_and_proceeds():
+    """RCA 2026-06-09: a missing-precondition would-DEFER is ADVISORY, not a veto. The hand-built STRIPS
+    precondition model produced fatal false-negatives — it refused 167/168 correct hops in solve #37 and
+    deadlocked every run after hop 1 (the StandIn rights-grant DEFERd for `write-dacl:domain`, which nothing
+    in the model emits from GPO control; `dcsync` DEFERd for the `ds-replication-rights` only that grant
+    produces). The agent cannot route around Sage's own refusal, so each modeling gap = a fatal deadlock.
+    The live target is the oracle: proceed and let execution judge. Already-achieved SKIP (dedup) still
+    blocks (see test_gate_skip_short_circuits_existing_gpo_effect); only the precondition DEFER is demoted."""
     calls = {"issue": 0}
 
     async def fake_reconcile(mythic_tools_obj, now):
@@ -106,7 +113,7 @@ def test_gate_defer_short_circuits_missing_essos_preconditions():
     mt = _make_tools()
     with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
         patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
-        _split_issue("should not issue", calls):
+        _split_issue("proceeded — real task output", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
                 "standin",
@@ -115,8 +122,9 @@ def test_gate_defer_short_circuits_missing_essos_preconditions():
             )
         )
 
-    assert "deferred" in result
-    assert calls["issue"] == 0
+    assert "deferred" not in result, "a missing-precondition hop must NO LONGER be vetoed by the gate"
+    assert result == "proceeded — real task output"
+    assert calls["issue"] == 1, "the would-defer hop must proceed to a real Mythic task (target is the oracle)"
 
 
 def test_gate_proceed_records_successful_hop():

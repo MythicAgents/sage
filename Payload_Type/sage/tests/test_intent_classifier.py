@@ -35,6 +35,23 @@ def test_standin_guid_domain_dn_dict_derives_fqdn():
     ) == ("dcsync-rights-grant", "sevenkingdoms.local")
 
 
+def test_standin_grant_prefixed_dn_keeps_first_component():
+    # 2026-06-09 BUG: a DN embedded behind a prefix ("distinguishedname=DC=north,...") had its FIRST
+    # label dropped by the old (?:^|,) anchor -> the NORTH grant was filed under sevenkingdoms.local.
+    assert intent_classifier.classify_tool_call(
+        "standin",
+        {"object": "distinguishedname=DC=north,DC=sevenkingdoms,DC=local", "grant": "samwell.tarly"},
+    ) == ("dcsync-rights-grant", "north.sevenkingdoms.local")
+
+
+def test_fqdn_from_dn_prefixed_and_plain():
+    assert intent_classifier._fqdn_from_dn("DC=north,DC=sevenkingdoms,DC=local") == "north.sevenkingdoms.local"
+    assert intent_classifier._fqdn_from_dn("distinguishedname=DC=north,DC=sevenkingdoms,DC=local") \
+        == "north.sevenkingdoms.local"
+    assert intent_classifier._fqdn_from_dn("CN=foo,DC=Essos,DC=Local") == "Essos.Local"
+    assert intent_classifier._fqdn_from_dn("no-domain-here") == ""
+
+
 def test_standin_rbcd_colon_form_extracts_target():
     assert intent_classifier.classify_tool_call(
         "execute_assembly",
