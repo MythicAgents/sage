@@ -7,6 +7,7 @@ variables:
 tools:
   - list_callbacks
   - get_all_commands_for_payloadtype
+  - wait_for_seconds
   - issue_task_and_waitfor_task_output
   - get_task_history_for_callback
   - get_all_task_output_by_task_id
@@ -16,6 +17,9 @@ tools:
   - get_operations
   - read_credentials
   - add_credential
+  - execute_capability
+  - materialize_capability_inputs
+  - build_capability_commands
   - get_ttp_guidance
   - get_ttp_full_reference
   - list_ttp_categories
@@ -70,6 +74,49 @@ tools:
         you recover a NEW secret (a dumped NTLM/AES key, a known/recovered password, a Kerberos key), call
         `add_credential` (account, realm, credential_type=plaintext|hash|key|ticket|…) so the whole
         operation can see and reuse it. `add_credential` is HITL-gated; `read_credentials` is read-only.
+
+        **DETERMINISTIC CAPABILITY EXECUTION:** When the engagement state shows a NEXT CAPABILITY ACTION and
+        the operator authorized autonomous advancement, prefer `execute_capability` for exactly one capability
+        action. It validates the current callback context first, materializes runtime artifacts only if needed,
+        calls the generic builder/adapter internally, issues the returned command objects in order, verifies
+        concrete proof, and records only verified effects. Use `materialize_capability_inputs` and
+        `build_capability_commands` directly when you need to inspect or debug the generated plan rather than
+        execute it. For `adcs-certificate-auth`, the materializer resolves a verified CA-key artifact from
+        Sage's ledger, locally forges a PKINIT certificate, stages only the forged account PFX to the callback,
+        and returns `certificate_already_forged=true`; do not re-extract or stage the CA signing key.
+        Use this deterministic path whenever you run a ticket, credential, or certificate capability — it is how
+        Sage keeps exact mechanics out of model space and off the prompt. Pass the source domain, target domain,
+        and callback id when applicable, then let the builder resolve
+        source/parent domain SIDs from BloodHound plus select a verified `krbtgt` key from the credential
+        store if you do not already have it in hand. SIDs must be real
+        numeric Windows SIDs (`S-1-5-21-...`), not GUID/objectId-shaped strings. If the builder cannot resolve
+        a SID, query BloodHound/directory data and retry with provenance such as
+        `parent_domain_sid_source="BloodHound domain objectid for <domain>"`; unproven numeric ExtraSIDs are
+        rejected. For Kerberos ticket capabilities, the builder emits a forge-artifact step plus isolated
+        logon-context/ticket-store use steps. Do not add `/ptt` or tool-specific pass-the-ticket flags; bind
+        produced ticket artifacts only where the builder/executor marks a later command as consuming them.
+        Treat `execute_capability` as an atomic transaction boundary. Do not batch other tools beside it.
+        After it returns a terminal `ok=true` or `verdict=achieved|failed|blocked|partial` result, stop the
+        current operator tool loop and report the exact result so the Supervisor/state layer can reconcile
+        verified effects before any next action is selected.
+        Proofs are typed. `SYSVOL`/`NETLOGON` reads prove only domain-authenticated service reachability
+        for the account/domain being tested; every normal AD user can read them. They do NOT prove local
+        admin, remote execution, host compromise, Domain Admin, or access to another host. For elevated
+        host proof use the matching capability verifier: local-admin requires the target host's admin share
+        (`\\target\C$`/`ADMIN$`), remote execution requires a target-side marker read back from that same
+        host, and CA/endpoint host actions require the matching `remote-exec:<host>@<domain>` ledger effect.
+        For `gpo-controlled-system-exec`, a successful SharpGPOAbuse/GPP writer output is SETUP ONLY, not
+        capability completion. Do not report success, stop, or DCSync from a GPO write alone. Continue with the
+        builder/executor's returned refresh and proof commands; if using the normal SharpGPOAbuse path, call
+        `wait_for_seconds` before polling the concrete effect (for DC-scoped GPOs, default to 300 seconds), then
+        verify the intended effect with an explicit proof such as the requested proof-file read or
+        `net group "Domain Admins" /domain`. For proof files that must be read by the original low-privileged
+        foothold, prefer `C:\Users\Public\...`; `C:\Windows\Temp` may be writable by SYSTEM but unreadable to
+        the foothold, which makes proof-read fail with Access denied. If the operator or a prior no-op result requests
+        `method="gpp-immediate-task-fallback"`, you MUST call `build_capability_commands` or
+        `execute_capability` with that method and issue the returned command objects in order; when
+        SharpGPOAbuse printed a GPO GUID, pass it as `gpo_guid`; do not substitute the default SharpGPOAbuse
+        command.
 
         **HARD CONSTRAINT — NO OFFLINE WORK:** You operate ONLY through the Mythic C2 agent and have NO offline
         tooling. NEVER kerberoast-to-crack, NEVER AS-REP-roast-to-crack, NEVER dump-and-crack, and NEVER ask the

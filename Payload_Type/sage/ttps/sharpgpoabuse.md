@@ -36,8 +36,17 @@ usage_examples:
 opsec_notes: |
   GPO modifications are persistent — the change remains until manually reverted or
   the GPO is deleted. Every machine in the GPO's scope will receive the modification
-  at the next Group Policy refresh (default 90 minutes ± 30 minute jitter; immediate
-  with `gpupdate /force`). SYSVOL writes generate file-system audit events if enabled.
+  at the next Group Policy refresh. TIMING MATTERS for any dependent step: a **Domain
+  Controller refreshes ~every 5 minutes** (`GroupPolicyRefreshTimeDC`, default 5 min) — much
+  faster than member hosts (default 90 minutes ± 30 minute jitter); `gpupdate /force` applies
+  immediately but needs execution ON the target. Enumerate the configured interval with
+  `reg query "HKLM\SOFTWARE\Policies\Microsoft\Windows\System" /v GroupPolicyRefreshTimeDC`
+  (value in minutes; absent = default). Do NOT rely on the GPO's effect until it has applied —
+  POLL the effect (e.g. re-check group membership) until it confirms before the dependent hop.
+  NOTE: after a self-granting GROUP-ADD, your existing Kerberos ticket still predates the change — refresh it
+  (NO password needed: `Rubeus purge` / `klist purge`, then `dir \\<dc>\C$` or `Rubeus tgtdeleg` so LSASS
+  re-issues a TGT carrying the new group SID) before using the new privilege, or DCSync fails 8439/8453.
+  SYSVOL writes generate file-system audit events if enabled.
   MDI has detection for non-admin GPO modifications. Clean up GPO modifications after
   achieving the objective to avoid long-lasting artifacts.
 gotchas: |

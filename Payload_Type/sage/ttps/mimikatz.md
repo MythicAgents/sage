@@ -232,7 +232,7 @@ dump + local parsing over DCSync.
 | Arg | Description |
 |-----|-------------|
 | `/domain:X` | Target domain FQDN |
-| `/user:X` | Specific user to sync (e.g. krbtgt, administrator) |
+| `/user:X` | Specific user to sync. **ALWAYS qualify with the domain NETBIOS short name** — `/user:NORTH\krbtgt`, not `/user:krbtgt` — so the DC's `CrackNames` lookup is unambiguous. The same `sAMAccountName` (krbtgt, administrator) exists in EVERY domain of a forest; an unqualified name returns `ERROR_NOT_UNIQUE` (0x3) and the dcsync yields no hash (see Exit codes below). |
 | `/dc:X` | Specific DC to replicate from |
 | `/all` | Sync all objects |
 | `/csv` | Output in CSV format |
@@ -245,6 +245,29 @@ dump + local parsing over DCSync.
 - `ERROR kuhl_m_sekurlsa_acquireLSA ; Handle on memory (0x00000005)` = access denied (need debug priv)
 - `ERROR kuhl_m_lsadump_lsa_getHandle ; OpenProcess (0x00000005)` = insufficient privileges
 - `KDC_ERR_WRONG_REALM` / clock errors in dcsync = network/clock issue
+- `ERROR kull_m_rpc_drsr_CrackName ; CrackNames (name status): 0x00000003 (3) - ERROR_NOT_UNIQUE` = the DC
+  could **not resolve the bare account name to a single object** — the same `sAMAccountName` (e.g. `krbtgt`,
+  `administrator`) exists in more than one domain of the forest, so `CrackNames` is ambiguous. The Mythic task
+  may report success while returning NO hash. **Fix: qualify `/user` with the domain NETBIOS short name** —
+  `/user:NORTH\krbtgt` instead of `/user:krbtgt` (the `/domain:` FQDN alone does not disambiguate the name
+  lookup). **Best practice: ALWAYS pass the short name** (`/user:<NETBIOS>\<account>`) on every dcsync, in any
+  forest, so the lookup is unambiguous regardless of forest shape — there is no downside in a single-domain env.
+- `GetNCChanges: 0x000020f7 (8439)` (DS_DRA_BAD_DN) **or** `0x00002105 (8453)` (DS_DRA_ACCESS_DENIED) on a
+  dcsync run AS a principal you JUST added to a privileged group (e.g. GPO/group-add → Domain Admins), with a
+  correctly-qualified `/user`, = a **STALE KERBEROS TICKET**, NOT a name or a rights bug. Your current TGT was
+  issued BEFORE the membership change, so its PAC carries no Domain-Admins SID and the DC refuses replication.
+  **FIX — refresh your own TGT; NO password or hash needed.** Because your foothold is a logged-on session,
+  LSASS already holds that user's Kerberos keys — you supply/dump nothing. Force LSASS to mint a fresh TGT that
+  reflects the new membership:
+  1. **Purge** the stale tickets in your logon session — `Rubeus purge` (or `klist purge`).
+  2. **Trigger a fresh authentication** so LSASS re-requests a TGT with its cached keys — touch a network
+     resource on the DC (`dir \\<dc-fqdn>\C$`) or run `Rubeus tgtdeleg`. LSASS performs the AS-REQ transparently
+     → a NEW TGT (then TGS) carrying your CURRENT groups, including the just-added Domain Admins SID.
+  3. **Then** run the dcsync — a fork&run mimikatz inherits the logon session's refreshed ticket.
+  Re-running the SAME dcsync WITHOUT purging fails identically every time. (Caveat: this works because LSASS
+  holds the session's credentials — true for a normal interactive/cached foothold logon, NOT for a NetOnly /
+  pass-the-hash / `make_token`-junk session, which has no usable key to re-auth with.) See
+  `ttps/windows-execution-context.md`.
 
 ### Source for this reference
 

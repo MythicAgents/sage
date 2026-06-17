@@ -18,6 +18,7 @@ unknown target kinds, missing keys, and malformed records are skipped.
 
 import asyncio
 import json
+import re
 from typing import Any
 
 try:
@@ -32,6 +33,7 @@ GraphFact = engagement_state.GraphFact
 
 _SOURCE = "bloodhound:cypher"
 _WRITE_EDGE_TYPES = {"genericwrite", "genericall", "writedacl", "writeowner", "owns"}
+_MANAGED_SECRET_EDGE_TYPES = {"readlapspassword", "readlaps", "readmslapspassword"}
 _CYPHER_TOOL = "cypher_query"
 _MCP_TIMEOUT_SECONDS = 15.0
 
@@ -48,6 +50,11 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
     safe_records = edge_records if isinstance(edge_records, list) else []
     for edge_record in safe_records:
         if not isinstance(edge_record, dict):
+            continue
+        if _is_managed_secret_edge(edge_record):
+            fact = _managed_secret_fact(edge_record, now, ttl_seconds)
+            if fact is not None:
+                facts.append(fact)
             continue
         if not _is_write_edge(edge_record):
             continue
@@ -85,8 +92,9 @@ def controlled_principals_from_state(state: EngagementState) -> list[str]:
     """Derive the BloodHound principal names we control, for the reconcile cypher's
     ``toLower(principal.name) IN $principals`` match. Built from LIVE foothold identities
     (``DOMAIN\\user`` or ``user@domain``) projected to the UPN form ``user@forest`` that BloodHound
-    stores as a node ``.name``, plus any ``creds:user@domain`` effects already achieved (a DCSynced /
-    dumped principal we can now act as). Pure; never raises."""
+    stores as a node ``.name``, any ``creds:user@domain`` effects already achieved (a DCSynced /
+    dumped principal we can now act as), and live domain-admin authority projected to the privileged
+    group principals BloodHound stores in the graph. Pure; never raises."""
     principals: set[str] = set()
     try:
         for foothold in getattr(state, "footholds", []) or []:
@@ -110,6 +118,17 @@ def controlled_principals_from_state(state: EngagementState) -> list[str]:
                 value = effect[len("creds:"):].strip()
                 if "@" in value:
                     principals.add(value.casefold())
+        predicates = state.satisfied_predicates()
+        for predicate in sorted(predicates):
+            if predicate.startswith("da:"):
+                domain = predicate[len("da:"):].strip()
+                if _has_live_domain_authority(predicates, domain):
+                    principals.add(f"domain admins@{domain}".casefold())
+                    principals.add(f"administrators@{domain}".casefold())
+            elif predicate.startswith("ea:"):
+                domain = predicate[len("ea:"):].strip()
+                if _has_live_domain_authority(predicates, domain):
+                    principals.add(f"enterprise admins@{domain}".casefold())
     except Exception:
         pass
     return sorted(principal for principal in principals if principal)
@@ -136,6 +155,7 @@ def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState
 
 
 _WRITE_LABELS_CYPHER = "['GenericWrite', 'GenericAll', 'WriteDacl', 'WriteOwner', 'Owns']"
+_MANAGED_SECRET_LABELS_CYPHER = "['ReadLAPSPassword', 'ReadLAPS', 'ReadMSLAPSPassword']"
 
 
 async def reconcile_graph_position(
@@ -144,6 +164,7 @@ async def reconcile_graph_position(
     objective: str,
     now: str,
     ttl_seconds: int,
+    credential_domains: list[str] | None = None,
 ) -> list[GraphFact]:
     """Project the ACL edges our controlled principals hold over GPOs / computers / domains into
     engagement predicates, via the BloodHound MCP ``cypher_query`` tool.
@@ -160,13 +181,16 @@ async def reconcile_graph_position(
         if tool is None:
             return []
         principals = _normalized_unique(controlled_principals)
-        if not principals:
+        domains = _normalized_unique(credential_domains or [])
+        if not principals and not domains:
             return []
-        inlist = _principal_in_list(principals)
+        inlist = _principal_in_list(principals) if principals else "[]"
         facts: list[GraphFact] = []
         seen: set[str] = set()
 
         async def _collect(target_label: str, predicate_prefix: str, key_fn) -> None:
+            if not principals:
+                return
             query = (
                 f"MATCH (p)-[e]->(t:{target_label}) WHERE toLower(p.name) IN {inlist} "
                 f"AND type(e) IN {_WRITE_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
@@ -183,21 +207,107 @@ async def reconcile_graph_position(
         # GPO control: emit the control fact (keyed by NAME, matching SharpGPOAbuse --gponame) AND the
         # GPO->domain link, so the forward planner can effect-chain gpo-abuse -> dcsync on the domain whose
         # DC the GPO governs (the SharpGPOAbuse SYSTEM task grants DS-Replication there).
-        gpo_query = (
-            f"MATCH (p)-[e]->(t:GPO) WHERE toLower(p.name) IN {inlist} "
-            f"AND type(e) IN {_WRITE_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
-        )
-        for raw_name in await _run_scalar_names(tool, gpo_query):
-            gpo = _gpo_name_key(raw_name)
-            if not gpo:
-                continue
-            for predicate in (f"generic-write:gpo:{gpo}", _gpo_domain_fact(raw_name, gpo)):
-                if predicate and predicate not in seen:
-                    seen.add(predicate)
-                    facts.append(_graph_fact(predicate, now, ttl_seconds))
+        if principals:
+            gpo_query = (
+                f"MATCH (p)-[e]->(t:GPO) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_WRITE_LABELS_CYPHER} "
+                "RETURN DISTINCT t.name + '|' + coalesce(t.distinguishedname, '') + '|' "
+                "+ coalesce(t.gpcpath, '') + '|' + coalesce(t.objectid, '') AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, gpo_query):
+                raw_name, gpo_guid = _gpo_scalar_parts(raw_name)
+                gpo = _gpo_name_key(raw_name)
+                if not gpo:
+                    continue
+                for predicate in (
+                    f"generic-write:gpo:{gpo}",
+                    _gpo_domain_fact(raw_name, gpo),
+                    _gpo_guid_fact(gpo, gpo_guid),
+                ):
+                    if predicate and predicate not in seen:
+                        seen.add(predicate)
+                        facts.append(_graph_fact(predicate, now, ttl_seconds))
+            gpo_scope_query = (
+                f"MATCH (p)-[e]->(g:GPO) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_WRITE_LABELS_CYPHER} "
+                "MATCH (g)-[:GPLink]->(container)-[:Contains*1..4]->(comp:Computer) "
+                "OPTIONAL MATCH (comp)-[:MemberOf*1..]->(dcg:Group) "
+                "WITH g, comp, any(group IN collect(dcg) WHERE coalesce(group.objectid, '') ENDS WITH '-516') AS isDc "
+                "RETURN DISTINCT g.name + '|' + comp.name + '|' + coalesce(comp.domain, '') + '|' "
+                "+ CASE WHEN isDc THEN '1' ELSE '0' END AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, gpo_scope_query):
+                for predicate in _gpo_scope_facts_from_scalar(raw_name):
+                    if predicate and predicate not in seen:
+                        seen.add(predicate)
+                        facts.append(_graph_fact(predicate, now, ttl_seconds))
         await _collect("Computer", "generic-write:computer", _short_host)
         await _collect("Domain", "write-dacl:domain", lambda n: access_reconciler.normalize_forest(_text(n)))
+        if principals:
+            laps_query = (
+                f"MATCH (p)-[e]->(c:Computer) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_MANAGED_SECRET_LABELS_CYPHER} "
+                "RETURN DISTINCT p.name + '|' + c.name + '|' + coalesce(c.domain, '') AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, laps_query):
+                fact = _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds)
+                if fact is not None and fact.predicate not in seen:
+                    seen.add(fact.predicate)
+                    facts.append(fact)
+        if principals and domains:
+            domain_filter = _user_domain_filter("u.name", domains)
+            controlled_group_member_query = (
+                "MATCH (p)-[e]->(g:Group) "
+                f"WHERE toLower(p.name) IN {inlist} AND type(e) IN {_WRITE_LABELS_CYPHER} "
+                "MATCH (u:User)-[:MemberOf*1..4]->(g) "
+                f"WHERE ({domain_filter}) "
+                "RETURN DISTINCT u.name AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, controlled_group_member_query):
+                fact = _credential_target_fact_from_scalar(raw_name, now, ttl_seconds)
+                if fact is not None and fact.predicate not in seen:
+                    seen.add(fact.predicate)
+                    facts.append(fact)
+        if domains:
+            domain_filter = _user_domain_filter("u.name", domains)
+            cross_forest_laps_query = (
+                "MATCH (u:User)-[:MemberOf*0..4]->(p)-[e]->(c:Computer) "
+                f"WHERE ({domain_filter}) AND type(e) IN {_MANAGED_SECRET_LABELS_CYPHER} "
+                "RETURN DISTINCT u.name + '|' + c.name + '|' + coalesce(c.domain, '') AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, cross_forest_laps_query):
+                for fact in (
+                    _credential_target_fact_from_scalar(raw_name, now, ttl_seconds),
+                    _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds),
+                ):
+                    if fact is not None and fact.predicate not in seen:
+                        seen.add(fact.predicate)
+                        facts.append(fact)
         return facts
+    except Exception:
+        return []
+
+
+def _has_live_domain_authority(predicates: set[str], domain: str) -> bool:
+    domain = access_reconciler.normalize_forest(_text(domain))
+    return bool(
+        domain
+        and (
+            f"kerberos-context:{domain}" in predicates
+            or f"ds-replication-rights:{domain}" in predicates
+        )
+    )
+
+
+def credential_target_domains_from_state(state: EngagementState) -> list[str]:
+    """Domains where the current state has replication rights and can extract real user keys."""
+    try:
+        domains = {
+            predicate[len("ds-replication-rights:"):].strip()
+            for predicate in state.satisfied_predicates()
+            if predicate.startswith("ds-replication-rights:")
+        }
+        return sorted(domain for domain in domains if domain)
     except Exception:
         return []
 
@@ -213,10 +323,78 @@ def _gpo_domain_fact(raw_name: Any, gpo_key: str) -> str:
     return f"gpo-domain:{gpo_key}:{domain}" if domain else ""
 
 
+def _gpo_guid_fact(gpo_key: str, gpo_guid: Any) -> str:
+    guid = _normalize_guid(gpo_guid)
+    return f"gpo-guid:{gpo_key}:{guid}" if gpo_key and guid else ""
+
+
+def _gpo_scope_facts_from_scalar(value: Any) -> list[str]:
+    text = _text(value)
+    if "|" not in text:
+        return []
+    raw_gpo, raw_computer, raw_domain, raw_is_dc, *_ = text.split("|")
+    gpo = _gpo_name_key(raw_gpo)
+    host = _short_host(raw_computer)
+    domain = access_reconciler.normalize_forest(_text(raw_domain)) or _domain_from_computer_name(raw_computer)
+    if not gpo or not host or not domain:
+        return []
+    facts = [f"gpo-affects-computer:{gpo}:{host}:{domain}"]
+    if _text(raw_is_dc).casefold() in {"1", "true", "yes", "dc"}:
+        facts.append(f"gpo-affects-dc:{gpo}:{host}:{domain}")
+    return facts
+
+
+def _gpo_scalar_parts(value: Any) -> tuple[str, str]:
+    text = _text(value)
+    if "|" not in text:
+        return text, ""
+    name, *parts = text.split("|")
+    return name, _extract_policy_guid(parts)
+
+
+def _extract_policy_guid(parts: list[str]) -> str:
+    """Return the GPO policy container GUID, not the BloodHound objectid.
+
+    BloodHound exposes ``objectid`` for GPO nodes, but SharpGPOAbuse/GPP file writes need the LDAP/SYSVOL
+    policy container name: ``CN={guid},CN=Policies,...`` or ``\\SYSVOL\\...\\Policies\\{guid}``.
+    """
+    for part in parts:
+        text = _text(part)
+        match = re.search(r"\{([0-9a-fA-F-]{36})\}", text)
+        if match:
+            return _normalize_guid(match.group(1))
+    return ""
+
+
+def _normalize_guid(value: Any) -> str:
+    text = _text(value).strip().strip("{}")
+    if not text:
+        return ""
+    if len(text) != 36:
+        return ""
+    return text.casefold()
+
+
+def _domain_from_computer_name(value: Any) -> str:
+    text = _text(value).strip().strip("@").casefold()
+    if "." not in text:
+        return ""
+    return access_reconciler.normalize_forest(text.split(".", 1)[1])
+
+
 def _principal_in_list(principals: list[str]) -> str:
     """Inline a principal allowlist as a Cypher list literal (the BloodHound cypher API takes no params)."""
     safe = [p.replace("\\", "").replace("'", "") for p in principals if p]
     return "[" + ", ".join(f"'{p}'" for p in safe) + "]"
+
+
+def _user_domain_filter(property_name: str, domains: list[str]) -> str:
+    clauses = []
+    for domain in _normalized_unique(domains):
+        safe = domain.replace("\\", "").replace("'", "")
+        if safe:
+            clauses.append(f"toLower({property_name}) ENDS WITH '@{safe}'")
+    return " OR ".join(clauses) if clauses else "false"
 
 
 def _gpo_name_key(name: Any) -> str:
@@ -320,6 +498,88 @@ def _candidate_target(edge_record: dict, target_kind: str) -> str:
 
 def _is_write_edge(edge_record: dict) -> bool:
     return _text(edge_record.get("type")).casefold() in _WRITE_EDGE_TYPES
+
+
+def _is_managed_secret_edge(edge_record: dict) -> bool:
+    return _text(edge_record.get("type")).casefold() in _MANAGED_SECRET_EDGE_TYPES
+
+
+def _managed_secret_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | None:
+    principal = _text(edge_record.get("principal"))
+    account, account_domain = _principal_account_domain(principal)
+    target = (
+        edge_record.get("computer")
+        or edge_record.get("target")
+        or edge_record.get("target_name")
+        or edge_record.get("name")
+    )
+    target_host, target_domain = _host_domain(target)
+    if not target_domain:
+        target_domain = access_reconciler.normalize_forest(_text(edge_record.get("domain")))
+    if not (account and account_domain and target_host and target_domain):
+        return None
+    predicate = (
+        "can-read-managed-local-admin-secret:"
+        f"account={account};account_domain={account_domain};target={target_host};target_domain={target_domain}"
+    )
+    return _graph_fact(predicate, now, ttl_seconds)
+
+
+def _managed_secret_fact_from_scalar(value: Any, now: str, ttl_seconds: int) -> GraphFact | None:
+    parts = [_text(part) for part in _text(value).split("|")]
+    if len(parts) < 2:
+        return None
+    principal = parts[0]
+    computer = parts[1]
+    domain = parts[2] if len(parts) > 2 else ""
+    return _managed_secret_fact(
+        {
+            "principal": principal,
+            "type": "ReadLAPSPassword",
+            "target_kind": "computer",
+            "computer": computer,
+            "domain": domain,
+        },
+        now,
+        ttl_seconds,
+    )
+
+
+def _credential_target_fact_from_scalar(value: Any, now: str, ttl_seconds: int) -> GraphFact | None:
+    parts = [_text(part) for part in _text(value).split("|")]
+    if not parts:
+        return None
+    account, domain = _principal_account_domain(parts[0])
+    if not (account and domain) or account == "krbtgt" or account.endswith("$"):
+        return None
+    return _graph_fact(f"credential-target:{account}@{domain}", now, ttl_seconds)
+
+
+def _principal_account_domain(value: Any) -> tuple[str, str]:
+    text = _text(value).strip().casefold()
+    if not text:
+        return "", ""
+    if "\\" in text:
+        domain, _, account = text.partition("\\")
+        return account.strip(), access_reconciler.normalize_forest(domain)
+    if "@" in text:
+        account, _, domain = text.partition("@")
+        return account.strip(), access_reconciler.normalize_forest(domain)
+    return "", ""
+
+
+def _host_domain(value: Any) -> tuple[str, str]:
+    text = _text(value).strip().strip("\\/").casefold()
+    if not text:
+        return "", ""
+    if "@" in text:
+        text = text.split("@", 1)[0]
+    if text.endswith("$"):
+        text = text[:-1]
+    parts = [part for part in text.split(".") if part]
+    if len(parts) >= 3:
+        return parts[0], ".".join(parts[1:])
+    return _short_host(text), ""
 
 
 def _short_host(value: Any) -> str:

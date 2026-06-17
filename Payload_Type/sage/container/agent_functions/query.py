@@ -2,7 +2,7 @@ from mythic_container.MythicCommandBase import TaskArguments, CommandBase, Comma
 from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage, SendMythicRPCOperationEventLogCreate, MythicRPCOperationEventLogCreateMessage
 from mythic_container.logging import logger
 from .utils import get_secret
-from ai.langgraph.model import Model
+from ai.langgraph.model import Model, add_session, remove_session
 from ai.bloodhound_config import ensure_bloodhound_connected, BLOODHOUND_SETUP_STEPS
 
 class QueryArguments(TaskArguments):
@@ -226,12 +226,33 @@ class QueryCommand(CommandBase):
             logger.debug(f"BloodHound auto-connect skipped: {e}")
 
         llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, autonomous_solve=autonomous_solve, max_steps=max_steps)
+        llm.command_name = "query"
+        llm.task_display_id = (
+            getattr(taskData.Task, "DisplayID", None)
+            or getattr(taskData.Task, "DisplayId", None)
+            or getattr(taskData.Task, "display_id", None)
+        )
         await llm.initialize()
         if verbose:
             llm.set_verbose(True)
 
+        session_id = str(taskData.Task.ID)
+        await add_session(session_id, llm)
         await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
-        await llm.invoke(prompt)
+        try:
+            await llm.invoke(prompt)
+        finally:
+            await remove_session(session_id)
+
+        if getattr(llm, "_stop_requested", False):
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(
+                TaskID=taskData.Task.ID,
+                UpdateStatus="stopped",
+                UpdateCompleted=True,
+            ))
+            response.Completed = True
+            response.TaskStatus = "stopped"
+            return response
 
         resp = await SendMythicRPCCallbackUpdate(
             MythicRPCCallbackUpdateMessage(

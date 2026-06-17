@@ -205,7 +205,7 @@ class ChatCommand(CommandBase):
                     MythicRPCTaskUpdateMessage(
                         TaskID=taskData.Task.ParentTaskID,
                         UpdateStatus="completed",
-                        UpdateTaskIsComplete=True
+                        UpdateCompleted=True
                     )
                 )
                 if not resp.Success:
@@ -274,6 +274,12 @@ class ChatCommand(CommandBase):
                 if aws_region is not None:
                     config["configurable"]["region"] = aws_region
             llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode, autonomous_solve=autonomous_solve, max_steps=max_steps)
+            llm.command_name = "chat"
+            llm.task_display_id = (
+                getattr(taskData.Task, "DisplayID", None)
+                or getattr(taskData.Task, "DisplayId", None)
+                or getattr(taskData.Task, "display_id", None)
+            )
             await llm.initialize()
             if verbose:
                 llm.set_verbose(True)
@@ -312,6 +318,17 @@ class ChatCommand(CommandBase):
 
         # Add user prompt indicator for next turn
         id = response.TaskID if not taskData.Task.IsInteractiveTask else taskData.Task.ParentTaskID
+        if getattr(llm, "_stop_requested", False):
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(
+                TaskID=id,
+                UpdateStatus="stopped",
+                UpdateCompleted=True,
+            ))
+            response.Completed = True
+            response.TaskStatus = "stopped"
+            await remove_session(str(id))
+            return response
+
         resp = await SendMythicRPCResponseCreate(
             MythicRPCResponseCreateMessage(id, "\n👤> ".encode())
         )

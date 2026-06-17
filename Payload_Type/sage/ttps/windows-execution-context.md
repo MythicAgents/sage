@@ -216,9 +216,22 @@ A sacrificial logon session is an intentionally created LUID used only to hold a
 or Kerberos tickets. Its purpose is isolation:
 
 - Do not pollute the agent's long-lived LUID with high-value tickets.
-- Do not overwrite or purge the current user's real ticket cache.
+- Do not overwrite or purge the current user's real ticket cache *while holding forged/stolen tickets you
+  cannot regenerate*. (EXCEPTION below: a deliberate self-refresh after YOUR OWN group membership changed.)
 - Keep one identity per LUID so Sage can reason about which user/domain will authenticate.
 - Destroy the LUID/process after the objective.
+
+### Self-refresh after a self-grant (no credential needed)
+
+When YOUR OWN identity's privileges change via a group-add (e.g. a GPO SYSTEM task adds your foothold user to
+Domain Admins), your existing TGT predates the change — its PAC lacks the new group SID, so a privileged op
+(DCSync) fails with `8439`/`8453` even though you ARE a member. You do NOT need the password or a dumped hash:
+on a normal interactive foothold LSASS already holds your session's Kerberos keys, so deliberately **purge your
+real cache** (`Rubeus purge` / `klist purge`) then **trigger a fresh authentication** (`dir \\<dc-fqdn>\C$` or
+`Rubeus tgtdeleg`). LSASS performs a fresh AS-REQ with its cached keys → a NEW TGT (and TGS) carrying your
+CURRENT groups. Then run the privileged op (a fork&run inherits the refreshed session ticket). This is the one
+case where purging your own cache is correct — it forces the refresh. (Does NOT apply to a NetOnly / PtH /
+junk-`make_token` LUID, which has no usable key to re-authenticate with.)
 
 ### Pattern A - In-process sacrificial context
 

@@ -127,7 +127,7 @@ they're already detected.
 |-----|-----------|-------------|
 | -c | --CollectionMethods | Required. Collection methods (see vocabulary below) |
 | -d | --Domain | Target domain (defaults to current) |
-| -o | --OutputDirectory | Output path for ZIP |
+| | --OutputDirectory | Output path for ZIP |
 | --SearchForest | (flag) | Collect every domain in the forest |
 | --Stealth | (flag) | LDAP-only, no SAMR/computer enumeration |
 | --LdapUsername | | Alternative LDAP creds (string) |
@@ -140,7 +140,13 @@ they're already detected.
 | --Jitter | | Jitter percent applied to Throttle |
 | --DomainController | | Specific DC FQDN to talk to |
 | --ExcludeDomainControllers | (flag) | Skip DCs as enumeration targets |
-| -v | --Verbosity | 0-2; debug output level |
+| -v | | 0-2; debug output level |
+
+Do not use unsupported cache flags such as `--NoSaveCache`; SharpHound v2.5.x rejects
+unknown flags by printing help text and producing no valid BloodHound collection ZIP.
+On observed SharpHound v2.13.0.0, `--Verbosity` is also unsupported; use `-v 1`
+or omit verbosity. The same observed build rejects short `-o`; use
+`--OutputDirectory C:\Users\Public`.
 
 ### Collection method values (-c / --CollectionMethods)
 

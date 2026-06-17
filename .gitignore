@@ -9,9 +9,11 @@ venv/
 Notes
 Plans
 sage.db*
+Payload_Type/sage/sage*.db*
 .claude/
 tasks/
 .env
+.evals/
 .mcp.json
 .envrc
 
@@ -30,3 +32,4 @@ Payload_Type/sage/evals/results/
 
 # Sage durable engagement-state ledger (runtime state — never commit)
 .sage_engagement/
+Payload_Type/sage/.trajectory/

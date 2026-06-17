@@ -133,6 +133,9 @@ def _agent_from_callback(callback: dict) -> str:
     agent = callback.get("agent")
     if agent is None:
         agent = callback.get("payloadtype")
+    if agent is None:
+        payload = callback.get("payload") if isinstance(callback.get("payload"), dict) else {}
+        agent = payload.get("payloadtype") or payload.get("payload_type")
     if isinstance(agent, dict):
         return _text(agent.get("name"))
     return _text(agent)

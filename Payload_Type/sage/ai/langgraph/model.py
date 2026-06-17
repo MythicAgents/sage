@@ -1,6 +1,7 @@
 import copy
 import json
 import re
+import asyncio
 import aiosqlite
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
@@ -23,7 +24,7 @@ from mythic_container.MythicRPC import (
     MythicRPCTaskUpdateMessage,
     SendMythicRPCTaskUpdate
 )
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from typing_extensions import NotRequired
 from uuid import UUID
 from .mythic_tools import MythicTools, GUARDED_TOOLS
@@ -409,9 +410,9 @@ class _StopCheckMiddleware(AgentMiddleware):
 
     Closes over the owning Model so it can read the live _stop_requested flag. Checking before each
     model call (before_model) and before each tool executes (awrap_tool_call) means a stop takes
-    effect at the next boundary within the agent turn, not just at top-level handoffs. (Limitation:
-    a tool already blocked mid-await — e.g. a 300s issue_task wait — still finishes before the next
-    boundary check; hard-cancel of an in-flight tool is a separate future enhancement.)
+    effect at the next boundary within the agent turn, not just at top-level handoffs. The Model also
+    tracks the active invoke() asyncio task so request_stop() can hard-cancel a tool already blocked
+    mid-await, such as wait_for_seconds or issue_task_and_waitfor_task_output.
     """
     def __init__(self, model: "Model"):
         super().__init__()
@@ -564,6 +565,149 @@ def _tool_name_from_request(request: Any) -> str:
     return ""
 
 
+class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
+    """Treat execute_capability as an atomic operator boundary.
+
+    The graph wrapper already has special handling for explicitly bounded one-action
+    requests. Live runs showed that prompt-gated handling is too narrow: a react loop
+    can execute a terminal capability and then launch another unrelated tool before
+    returning to the Supervisor/state reconciler. This middleware enforces the generic
+    contract inside create_agent:
+
+    - a tool batch containing execute_capability may execute only the first
+      execute_capability call;
+    - once a terminal execute_capability result is in the agent state, the inner
+      react loop jumps to the agent boundary before another model/tool step.
+
+    Explicit bounded requests still get the stronger graph-END behavior in the
+    wrapper below.
+    """
+
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    @staticmethod
+    def _is_bounded_state(state: Any) -> tuple[bool, list[AnyMessage]]:
+        messages = _agent_state_messages(state)
+        return _is_bounded_one_action_capability_request(messages), messages
+
+    @staticmethod
+    def _tool_call_id(request: Any) -> str:
+        try:
+            tool_call = getattr(request, "tool_call", None)
+            if isinstance(tool_call, dict):
+                value = tool_call.get("id")
+                if value:
+                    return str(value)
+        except Exception:
+            pass
+        return "bounded-execute-capability-stop"
+
+    @staticmethod
+    def _blocked_tool_message(request: Any, reason: str) -> ToolMessage:
+        name = _tool_name_from_request(request) or "unknown_tool"
+        payload = {
+            "ok": False,
+            "verdict": "blocked",
+            "capability": "execute-capability-boundary",
+            "reason": reason,
+        }
+        return ToolMessage(
+            content=json.dumps(payload, sort_keys=True),
+            name=name,
+            tool_call_id=_BoundedExecuteCapabilityStopMiddleware._tool_call_id(request),
+        )
+
+    def _before_model_update(self, state: Any) -> dict[str, Any] | None:
+        _bounded, messages = self._is_bounded_state(state)
+        terminal_payload = _terminal_execute_capability_payload(messages)
+        if terminal_payload is None:
+            return None
+        try:
+            logger.info(
+                "✅ [execute-capability-boundary] terminal execute_capability result "
+                "observed inside create_agent; ending agent loop before another model call"
+            )
+        except Exception:
+            pass
+        return {"jump_to": "end"}
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime):
+        return self._before_model_update(state)
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        return self._before_model_update(state)
+
+    def _pre_tool_block_reason(self, request: Any) -> str | None:
+        bounded, messages = self._is_bounded_state(getattr(request, "state", None))
+
+        if _terminal_execute_capability_payload(messages) is not None:
+            return (
+                "execute_capability already has a terminal "
+                "result; skipped this follow-on tool without executing it"
+            )
+
+        tool_name = _tool_name_from_request(request)
+        latest_calls = _latest_ai_tool_calls(messages)
+        execute_ids = [
+            str(tc.get("id"))
+            for tc in latest_calls
+            if (tc.get("name") or "") == "execute_capability" and tc.get("id")
+        ]
+        request_id = self._tool_call_id(request)
+
+        if execute_ids and tool_name != "execute_capability":
+            return (
+                "execute_capability is an atomic transaction boundary; skipped sibling "
+                f"tool `{tool_name or 'unknown_tool'}` from the same tool batch without executing it"
+            )
+
+        if tool_name != "execute_capability":
+            if not bounded:
+                return None
+            if execute_ids:
+                return (
+                    "bounded one-action capability request allows only the "
+                    "execute_capability call from this tool batch; skipped sibling "
+                    f"tool `{tool_name or 'unknown_tool'}` without executing it"
+                )
+            return (
+                "bounded one-action capability request requires execute_capability; "
+                f"skipped `{tool_name or 'unknown_tool'}` without executing it"
+            )
+
+        if execute_ids and request_id != execute_ids[0]:
+            return (
+                "execute_capability is an atomic transaction boundary and already selected one "
+                "execute_capability call in this tool batch; skipped duplicate "
+                "execute_capability without executing it"
+            )
+        return None
+
+    async def awrap_tool_call(self, request, handler):
+        reason = self._pre_tool_block_reason(request)
+        if reason:
+            try:
+                logger.info(f"🛑 [execute-capability-boundary] {reason}")
+            except Exception:
+                pass
+            return self._blocked_tool_message(request, reason)
+        return await handler(request)
+
+    def wrap_tool_call(self, request, handler):
+        reason = self._pre_tool_block_reason(request)
+        if reason:
+            try:
+                logger.info(f"🛑 [execute-capability-boundary] {reason}")
+            except Exception:
+                pass
+            return self._blocked_tool_message(request, reason)
+        return handler(request)
+
+
 class _ToolResultCompactionMiddleware(AgentMiddleware):
     """Caps oversized tool RESULTS at the proven awrap_tool_call seam (fires on every tool call
     inside create_agent), so large structured results (BloodHound cypher ~131k, Mythic blobs 57-76k)
@@ -679,6 +823,7 @@ class SageState(MessagesState):
     mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
     mcp_manager_messages: Annotated[list[AnyMessage], operator.add]
     bloodhound_messages: Annotated[list[AnyMessage], operator.add]
+    autonomous_executor_messages: Annotated[list[AnyMessage], operator.add]
     _message_seq: Annotated[int, _max_seq_reducer]  # Global sequence counter with max reducer
 
 
@@ -692,6 +837,156 @@ def _tag_msg(msg: AnyMessage, seq: int) -> AnyMessage:
     if "_seq" not in msg.additional_kwargs:
         msg.additional_kwargs["_seq"] = seq
     return msg
+
+
+def _is_internal_human_message(msg: AnyMessage) -> bool:
+    """True for provider/control nudges that must not be treated as operator input."""
+    return isinstance(msg, HumanMessage) and bool(msg.additional_kwargs.get("_hide_from_stream"))
+
+
+def _message_content_as_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def _is_bounded_one_action_capability_request(messages: list[AnyMessage]) -> bool:
+    """Detect delegated operator tasks that explicitly ask for one capability action then stop."""
+    for msg in reversed(messages):
+        if not isinstance(msg, HumanMessage) or _is_internal_human_message(msg):
+            continue
+        text = _message_content_as_text(msg.content).casefold()
+        if not text:
+            continue
+        asks_for_capability = "execute_capability" in text or "capability action" in text
+        asks_for_one = (
+            "exactly one" in text
+            or "single capability" in text
+            or "one next grounded capability" in text
+            or "one capability" in text
+        )
+        asks_to_stop = "then stop" in text or "stop after" in text or "retry at most" in text
+        return bool(asks_for_capability and asks_for_one and asks_to_stop)
+    return False
+
+
+def _terminal_execute_capability_payload(messages: list[AnyMessage]) -> dict[str, Any] | None:
+    """Return the latest terminal execute_capability JSON payload, if one is present."""
+    terminal_verdicts = {"achieved", "failed", "blocked", "partial"}
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        if (getattr(msg, "name", "") or "") != "execute_capability":
+            continue
+        raw = _message_content_as_text(msg.content).strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        verdict = str(payload.get("verdict") or "").casefold()
+        ok = payload.get("ok") is True
+        if not (ok or verdict in terminal_verdicts):
+            continue
+        capability = str(payload.get("capability") or "").strip()
+        action = payload.get("action")
+        if not capability and isinstance(action, dict):
+            capability = str(action.get("name") or "").strip()
+        if not capability:
+            continue
+        normalized = dict(payload)
+        normalized["capability"] = capability
+        normalized["verdict"] = verdict or ("achieved" if ok else "unknown")
+        return normalized
+    return None
+
+
+def _terminal_execute_capability_report(payload: dict[str, Any]) -> str:
+    capability = str(payload.get("capability") or "capability").strip()
+    verdict = str(payload.get("verdict") or "unknown").strip()
+    reason = str(payload.get("reason") or "").strip()
+    issued = payload.get("issued") if isinstance(payload.get("issued"), list) else []
+    recorded = payload.get("recorded_effects") if isinstance(payload.get("recorded_effects"), list) else []
+    achieved = payload.get("achieved_effects") if isinstance(payload.get("achieved_effects"), list) else []
+    proof_chain = payload.get("proof_chain") if isinstance(payload.get("proof_chain"), list) else []
+
+    task_parts: list[str] = []
+    for item in issued[:8]:
+        if not isinstance(item, dict):
+            continue
+        command = str(item.get("command") or "").strip()
+        task_id = item.get("task_id")
+        if task_id and command:
+            task_parts.append(f"{task_id} `{command}`")
+        elif task_id:
+            task_parts.append(str(task_id))
+        elif command:
+            task_parts.append(f"`{command}`")
+
+    lines = [
+        f"Executor verdict: `{verdict}` for `{capability}`.",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}")
+    lines.append("Task IDs: " + (", ".join(task_parts) if task_parts else "none issued"))
+    lines.append(
+        "Recorded effects: "
+        + (", ".join(f"`{effect}`" for effect in recorded) if recorded else "none")
+    )
+    if proof_chain:
+        lines.append("Proof chain:")
+        for item in proof_chain[:8]:
+            if not isinstance(item, dict):
+                continue
+            effect = str(item.get("effect") or "").strip()
+            task_id = str(item.get("task_id") or "").strip()
+            callback_id = str(item.get("callback_id") or "").strip()
+            detail = f"`{effect}`" if effect else "(effect not recorded)"
+            if task_id:
+                detail += f" task={task_id}"
+            if callback_id:
+                detail += f" cb={callback_id}"
+            lines.append(f"- {detail}")
+    if achieved:
+        preview = ", ".join(f"`{effect}`" for effect in achieved[:10])
+        if len(achieved) > 10:
+            preview += f", ... ({len(achieved)} total)"
+        lines.append(f"Achieved effects now include: {preview}")
+    lines.append("This was a bounded one-action capability request, so Sage stopped instead of re-delegating.")
+    return "\n".join(lines)
+
+
+def _agent_state_messages(state: Any) -> list[AnyMessage]:
+    """Return create_agent's internal message list from middleware state."""
+    try:
+        if isinstance(state, dict):
+            messages = state.get("messages")
+        else:
+            messages = getattr(state, "messages", None)
+        return list(messages) if isinstance(messages, list) else []
+    except Exception:
+        return []
+
+
+def _latest_ai_tool_calls(messages: list[AnyMessage]) -> list[dict[str, Any]]:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            calls = getattr(msg, "tool_calls", None) or []
+            return [tc for tc in calls if isinstance(tc, dict)]
+    return []
 
 
 def _msg_id(msg: AnyMessage) -> str:
@@ -918,12 +1213,15 @@ class Model:
         # Cooperative kill switch. The exit command marks the parent task completed and removes
         # the session dict entry, but the running invoke()/astream coroutine holds its own ref to
         # this Model and keeps issuing tasks. request_stop() sets this flag; every graph.astream
-        # loop checks it between super-steps and breaks, so an operator `exit`/stop actually
-        # terminates a running chat session (at the next step boundary) instead of running away.
+        # loop checks it between super-steps and breaks. The active invoke() task is also tracked
+        # and cancelled so a stop interrupts long awaits inside tools before they can issue delayed
+        # follow-up tasks.
         self._stop_requested = False
+        self._running_tasks = set()
         self._max_steps = int(max_steps) if max_steps else 0  # 0 = unlimited
         self._global_step_count = 0
         self._global_step_limit_hit = False
+        self._objective_completion_report_streamed = False
         # Initialize dynamic data cache
         self._payload_names = None
         self._c2_profiles = None
@@ -946,6 +1244,7 @@ class Model:
             "mythic_payload_messages": [],
             "mcp_manager_messages": [],
             "bloodhound_messages": [],
+            "autonomous_executor_messages": [],
             "recursion_summary_requested": False,
             "recursion_handback": False,
         }
@@ -1204,7 +1503,8 @@ class Model:
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
-            "mcp_manager_messages", "bloodhound_messages"
+            "mcp_manager_messages", "bloodhound_messages",
+            "autonomous_executor_messages",
         ]:
             if channel_name in state_update:
                 messages = state_update[channel_name]
@@ -1239,6 +1539,8 @@ class Model:
 
         # Format based on message type
         if isinstance(message, HumanMessage):
+            if _is_internal_human_message(message):
+                return ""
             # Get content
             content = str(message.content).strip() if message.content else ""
             if not content:
@@ -1318,6 +1620,10 @@ class Model:
 
         self.mythic_client = MythicTools(agent_task_id=self.agent_task_id)
         await self.mythic_client.login()
+        try:
+            await self.mythic_client._ensure_engagement_key()
+        except Exception as e:
+            logger.debug(f"Engagement ledger key resolution skipped during initialization: {e}")
 
         # CRITICAL: After RPC call, check if logger still has handlers
         ensure_logger_initialized()
@@ -1341,6 +1647,7 @@ class Model:
             .add_node("Mythic_Payload", self._mythic_payload_agent())
             .add_node("BloodHound", self._bloodhound_agent())
             .add_node("MCP_Manager", self._mcp_manager_agent())
+            .add_node("Autonomous_Executor", self._autonomous_executor_node)
             .add_edge(START, "Supervisor")
             .add_edge("Generalist", "Supervisor")
             .add_edge("Mythic_Payload", "Supervisor")
@@ -1350,6 +1657,7 @@ class Model:
             # so there is no cross-agent ingest handoff to force — the Operator returns to the Supervisor as
             # normal, which then routes to the BloodHound agent for attack-path ANALYSIS.
             .add_edge("Mythic_Operator", "Supervisor")
+            .add_edge("Autonomous_Executor", "Supervisor")
             .compile(checkpointer=self.memory, name="Sage")
         )
 
@@ -1526,10 +1834,22 @@ class Model:
             # summarize_and_handback tool call), re-invoke it with a continuation nudge — bounded by a cap — so the
             # only ways out are an explicit handback, a cross-agent transfer, or the cap. Base mode and every other
             # agent are unaffected (the loop runs exactly once and breaks immediately = current behavior).
-            _autonomous_operator = bool(self._autonomous_solve) and node_name == "Mythic_Operator"
+            _mythic_operator = node_name == "Mythic_Operator"
+            _autonomous_operator = bool(self._autonomous_solve) and _mythic_operator
+            _bounded_one_action_request = (
+                _is_bounded_one_action_capability_request(channel)
+                if _mythic_operator else False
+            )
             _continue_count = 0
             _agent_input = sanitized_channel
+            updated_channel = channel  # safe default if we halt before the first invocation
             while True:
+                # Cooperative kill switch INSIDE the autonomous continue-loop: an operator `stop`/`exit` set
+                # _stop_requested, but the outer astream only checks it between top-level super-steps — so
+                # without this guard `stop` keeps issuing real offensive Mythic tasks until the continue-cap
+                # (6) drains. Checked before each (re-)invocation: any in-flight call finishes, then we halt.
+                if getattr(self, "_stop_requested", False):
+                    break
                 result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
                 updated_channel = result.get("messages", channel)
                 if not _autonomous_operator:
@@ -1537,6 +1857,8 @@ class Model:
                 if result.get("recursion_handback"):
                     break  # explicit handback — let upstream flag handling end/route
                 _new_msgs = updated_channel[original_channel_length:]
+                if _bounded_one_action_request and _terminal_execute_capability_payload(_new_msgs):
+                    break  # the delegated task explicitly said one capability action, then stop
                 _explicit_yield = any(
                     isinstance(m, AIMessage) and any(
                         ((tc.get("name") or "").startswith("transfer_to_")) or ((tc.get("name") or "") in ("summarize_and_handback", "handback_to_supervisor"))
@@ -1585,13 +1907,22 @@ class Model:
                             _nudge_text = self._autonomous_nudge_content(_base_nudge_text, _rendered_state)
                     except Exception:
                         _nudge_text = _base_nudge_text  # fail-open: never break the continue-loop
-                    _nudge = HumanMessage(content=_nudge_text)
+                    _nudge = HumanMessage(
+                        content=_nudge_text,
+                        additional_kwargs={
+                            "_synthetic_nudge": "autonomous_operator_continue",
+                            "_hide_from_stream": True,
+                        },
+                    )
                     _agent_input = self._sanitize_messages(list(updated_channel) + [_nudge])
                     continue
                 break
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
-            returned_messages = updated_channel[original_channel_length:]
+            returned_messages = [
+                msg for msg in updated_channel[original_channel_length:]
+                if not _is_internal_human_message(msg)
+            ]
 
             # Merge captured messages (from callback) with returned messages
             # The callback captures ALL messages including the first tool-calling AIMessage
@@ -1690,6 +2021,37 @@ class Model:
                 state_key: new_messages_from_agent,  # Only new messages for operator.add
                 "messages": new_messages_from_agent,  # keep legacy/global mirror
             }
+
+            if _mythic_operator and _bounded_one_action_request:
+                terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
+                if terminal_payload is not None:
+                    final_msg = AIMessage(
+                        content=_terminal_execute_capability_report(terminal_payload),
+                        name="Supervisor",
+                        additional_kwargs={
+                            "_is_final_report": True,
+                            "_terminal_execute_capability": True,
+                        },
+                    )
+                    _tag_msg(final_msg, next_seq)
+                    next_seq += 1
+                    self._message_seq = next_seq
+                    self.state["_message_seq"] = next_seq
+                    terminal_update: dict[str, Any] = {
+                        state_key: new_messages_from_agent,
+                        "messages": new_messages_from_agent + [final_msg],
+                        "supervisor_messages": [final_msg],
+                        "_message_seq": next_seq,
+                    }
+                    for flag in ("recursion_summary_requested", "recursion_handback"):
+                        if flag in result:
+                            terminal_update[flag] = result[flag]
+                    terminal_update["recursion_summary_requested"] = False
+                    terminal_update["recursion_handback"] = True
+                    logger.info(
+                        f"✅ [{node_name}] bounded one-action execute_capability result is terminal; ending graph"
+                    )
+                    return Command(goto=END, update=terminal_update)
 
             # CRITICAL FIX: If this is a worker agent (not Supervisor), copy its response
             # back to the Supervisor's channel AND to the calling agent's channel (if worker-to-worker handoff)
@@ -1902,6 +2264,336 @@ class Model:
         except Exception:
             return None
 
+    def _current_engagement_state_snapshot(self, *, require_autonomous: bool = True):
+        """Cheap in-memory EngagementState snapshot for terminal objective checks.
+
+        This intentionally does not poll Mythic or BloodHound. It uses the same cached footholds, hops, and
+        graph facts that the engagement gate/per-turn injection maintain, so the stop check cannot mint new
+        facts; it can only notice that already-recorded proof satisfies the current objective.
+        """
+        try:
+            if require_autonomous and not bool(getattr(self, "_autonomous_solve", False)):
+                return None
+            try:
+                from . import mythic_tools as _mt
+            except ImportError:
+                import mythic_tools as _mt
+            if not bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
+                return None
+            mythic_client = getattr(self, "mythic_client", None)
+            if mythic_client is None:
+                return None
+            hops = list(getattr(mythic_client, "_engagement_hops", []) or [])
+            footholds = list(getattr(mythic_client, "_engagement_footholds", []) or [])
+            if not hops or not footholds:
+                return None
+            try:
+                from . import engagement_state as _es
+            except ImportError:
+                import engagement_state as _es
+            try:
+                objective = mythic_client._engagement_objective()
+            except Exception:
+                objective = "sage-engagement"
+            return _es.EngagementState(
+                objective=objective,
+                footholds=footholds,
+                hops=hops,
+                graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+            )
+        except Exception:
+            return None
+
+    def _autonomous_handoff_step_redirect(
+        self,
+        agent_name: str,
+        handoff_instruction: str,
+        state: dict,
+    ) -> tuple[str, str] | None:
+        """Compile autonomous handoffs from the ledger-selected next capability.
+
+        Specialist handbacks and Supervisor routing are useful for coordination, but
+        they are not allowed to choose executable tradecraft when the engagement
+        ledger already exposes a grounded next capability. This synchronous gate
+        reads only cached footholds/hops/graph facts and rewrites Mythic/BloodHound
+        handoffs to a concrete execute_capability request.
+        """
+        if agent_name not in {"Mythic_Operator", "BloodHound"}:
+            return None
+        if not bool(getattr(self, "_autonomous_solve", False)):
+            return None
+        snapshot = self._current_engagement_state_snapshot(require_autonomous=True)
+        if snapshot is None:
+            return None
+        try:
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            actions = capabilities.actions_from_state(snapshot)
+        except Exception:
+            actions = []
+        if not actions:
+            try:
+                try:
+                    from . import engagement_state as _es
+                except ImportError:
+                    import engagement_state as _es
+                if _es.current_access_collection_missing(snapshot):
+                    instruction = _compiled_autonomous_collection_instruction(
+                        snapshot,
+                        handoff_instruction=handoff_instruction,
+                        requested_agent=agent_name,
+                    )
+                    if instruction:
+                        return "Mythic_Operator", instruction
+                phase = str(_es.engagement_phase(snapshot))
+                if phase.startswith("BLOCKED"):
+                    if _recent_bloodhound_blocker_observed(state):
+                        instruction = _compiled_autonomous_blocked_report(
+                            snapshot,
+                            handoff_instruction=handoff_instruction,
+                            requested_agent=agent_name,
+                        )
+                        if instruction:
+                            return "__terminal__", instruction
+                    if agent_name == "Mythic_Operator":
+                        instruction = _compiled_autonomous_blocked_bloodhound_instruction(
+                            snapshot,
+                            handoff_instruction=handoff_instruction,
+                            requested_agent=agent_name,
+                        )
+                        if instruction:
+                            return "BloodHound", instruction
+            except Exception:
+                return None
+            return None
+        action = actions[0]
+        instruction = _compiled_autonomous_capability_instruction(
+            action,
+            snapshot,
+            handoff_instruction=handoff_instruction,
+            requested_agent=agent_name,
+        )
+        return "Autonomous_Executor", instruction
+
+    def _objective_completion_report(self, *, require_autonomous: bool = True) -> str | None:
+        """Return a terminal objective-complete report when the observed state proves it."""
+        state = self._current_engagement_state_snapshot(require_autonomous=require_autonomous)
+        if state is None:
+            return None
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        try:
+            if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
+                return None
+            candidates = _es.objective_completion_candidates(state)
+            if not candidates:
+                return None
+            objective = str(getattr(state, "objective", "") or "").strip()
+            targets = {str(t).casefold() for t in _es._objective_target_domains(objective)}
+            if targets:
+                candidates = [
+                    c for c in candidates
+                    if str(c.get("domain", "")).strip().casefold() in targets
+                ]
+            if not candidates:
+                return None
+            candidate = candidates[0]
+            domain = str(candidate.get("domain") or "").strip()
+            lines = [
+                f"Objective complete: administrative-control proof is recorded for `{domain}`.",
+            ]
+            if objective:
+                lines.append(f"Objective: {objective}")
+            lines.append("Proof chain:")
+            proof_items = [
+                ("admin", candidate.get("admin_effect"), candidate.get("admin_task_id"), ""),
+                ("access", candidate.get("access_effect"), candidate.get("access_task_id"), candidate.get("callback_id")),
+                ("auth", candidate.get("auth_effect"), candidate.get("auth_task_id"), ""),
+                ("key", candidate.get("key_effect"), candidate.get("key_task_id"), ""),
+            ]
+            for label, effect, task_id, callback_id in proof_items:
+                effect_text = str(effect or "").strip()
+                if not effect_text:
+                    continue
+                detail = f"- {label}: `{effect_text}`"
+                if task_id:
+                    detail += f" task={task_id}"
+                if callback_id:
+                    detail += f" cb={callback_id}"
+                lines.append(detail)
+            lines.append("Sage is stopping because the target objective is satisfied; no further capability will be executed.")
+            return "\n".join(lines)
+        except Exception:
+            return None
+
+    async def _autonomous_executor_node(self, state: SageState | dict, config=None):
+        """Execute a compiled autonomous capability step without another LLM handoff."""
+        del config
+        if isinstance(state, dict):
+            channel = list(state.get("autonomous_executor_messages", []) or [])
+        else:
+            channel = list(getattr(state, "autonomous_executor_messages", []) or [])
+        request = next(
+            (
+                msg for msg in reversed(channel)
+                if isinstance(msg, HumanMessage) and not _is_internal_human_message(msg)
+            ),
+            None,
+        )
+        action_payload: dict[str, Any] | None = None
+        inputs_payload: dict[str, Any] = {}
+        if request is not None:
+            action_payload, inputs_payload = _parse_compiled_autonomous_capability_instruction(
+                _message_content_as_text(request.content)
+            )
+
+        state_dict = state if isinstance(state, dict) else {}
+        max_seq = 0
+        for ch_key in [
+            "supervisor_messages",
+            "generalist_messages",
+            "mythic_operator_messages",
+            "mythic_payload_messages",
+            "mcp_manager_messages",
+            "bloodhound_messages",
+            "autonomous_executor_messages",
+            "messages",
+        ]:
+            value = state_dict.get(ch_key, []) if isinstance(state_dict, dict) else []
+            if isinstance(value, list):
+                for msg in value:
+                    max_seq = max(max_seq, _get_seq(msg))
+        next_seq = max_seq + 1
+        tool_call_id = f"autonomous-executor-{next_seq}"
+
+        if not action_payload:
+            result_text = json.dumps({
+                "ok": False,
+                "verdict": "failed",
+                "capability": "autonomous-step-driver",
+                "reason": "compiled autonomous capability instruction was missing or unparsable",
+                "issued": [],
+                "recorded_effects": [],
+            }, sort_keys=True)
+        elif getattr(self, "mythic_client", None) is None:
+            result_text = json.dumps({
+                "ok": False,
+                "verdict": "failed",
+                "capability": action_payload.get("name") or "autonomous-step-driver",
+                "reason": "Mythic client is not initialized",
+                "issued": [],
+                "recorded_effects": [],
+            }, sort_keys=True)
+        else:
+            result_text = await self.mythic_client.execute_capability(action_payload, inputs_payload)
+
+        tool_msg = ToolMessage(
+            content=result_text,
+            name="execute_capability",
+            tool_call_id=tool_call_id,
+        )
+        _tag_msg(tool_msg, next_seq)
+        next_seq += 1
+
+        terminal = _terminal_execute_capability_payload([tool_msg])
+        summary_text = (
+            _terminal_execute_capability_report(terminal)
+            if terminal is not None
+            else "Autonomous executor returned a non-terminal execute_capability result."
+        )
+        summary_msg = AIMessage(
+            content=summary_text,
+            name="Autonomous_Executor",
+            additional_kwargs={"_autonomous_executor_result": True},
+        )
+        _tag_msg(summary_msg, next_seq)
+        next_seq += 1
+
+        self._message_seq = next_seq
+        self.state["_message_seq"] = next_seq
+
+        update = {
+            "messages": [tool_msg, summary_msg],
+            "autonomous_executor_messages": [tool_msg, summary_msg],
+            "supervisor_messages": [summary_msg],
+            "_message_seq": next_seq,
+            "recursion_summary_requested": False,
+            "recursion_handback": False,
+        }
+        return Command(goto="Supervisor", update=update)
+
+    async def _refresh_footholds_for_objective_completion(self) -> None:
+        """Populate cached live footholds once for a pre-graph terminal objective check.
+
+        A fresh one-shot query has the durable hop ledger loaded, but no cached footholds until the
+        Mythic_Operator runs a tool/gate. This refresh uses Mythic callback metadata only; it does not issue
+        payload tasks. Fail-open so missing Mythic state never blocks normal graph execution.
+        """
+        try:
+            mythic_client = getattr(self, "mythic_client", None)
+            if mythic_client is None:
+                return
+            if list(getattr(mythic_client, "_engagement_footholds", []) or []):
+                return
+            try:
+                from . import access_reconciler
+            except ImportError:
+                import access_reconciler
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            footholds = await access_reconciler.reconcile_access(mythic_client, now)
+            try:
+                mythic_client._engagement_footholds = list(footholds)
+            except Exception:
+                pass
+        except Exception:
+            return
+
+    async def _maybe_stream_objective_completion_stop(
+        self,
+        *,
+        refresh_footholds: bool = False,
+        require_autonomous: bool = True,
+    ) -> bool:
+        """Stream the terminal objective-complete report once and tell the graph loop to stop."""
+        if refresh_footholds:
+            await self._refresh_footholds_for_objective_completion()
+        report = self._objective_completion_report(require_autonomous=require_autonomous)
+        if not report:
+            return False
+        self.state["recursion_handback"] = True
+        if getattr(self, "_objective_completion_report_streamed", False):
+            return True
+        self._objective_completion_report_streamed = True
+        try:
+            logger.info("✅ Objective completion detected from engagement state; halting autonomous solve")
+        except Exception:
+            pass
+        try:
+            await self._stream_message_to_mythic(f"\n{report}\n")
+        except Exception:
+            pass
+        return True
+
+    def _objective_completion_preflight_allowed(self, prompt: str) -> bool:
+        """Whether a non-autonomous prompt is explicitly asking to continue/report the engagement objective."""
+        if bool(getattr(self, "_autonomous_solve", False)):
+            return True
+        text = str(prompt or "").casefold()
+        if not text:
+            return False
+        if "autonomous" in text and "objective" in text:
+            return True
+        if "observed engagement state" in text and ("continue" in text or "satisfied" in text or "proof chain" in text):
+            return True
+        if "objective" in text and ("already satisfied" in text or "proof chain" in text or "continue" in text):
+            return True
+        return False
+
     def _autonomous_nudge_content(self, base_nudge_text: str, rendered_state: str | None) -> str:
         """Compose the autonomous-continue nudge, optionally prefixed with observed state.
 
@@ -1914,7 +2606,11 @@ class Model:
             return base_nudge_text
         return f"{rendered_state}\n\n{_ENGAGEMENT_STATE_DIRECTIVE}\n\n{base_nudge_text}"
 
-    def _context_middleware(self, inject_engagement_state: bool = False) -> list:
+    def _context_middleware(
+            self,
+            inject_engagement_state: bool = False,
+            bounded_execute_stop: bool = False,
+    ) -> list:
         """Bounded-context middleware for every create_agent.
         Strategy: ClearToolUsesEdit does the cheap, routine bounding every step (no LLM call);
         SummarizationMiddleware is a SAFETY NET that only fires on genuine context overflow.
@@ -1958,6 +2654,12 @@ class Model:
                 token_count_method="approximate",
             ),
         ]
+        if bounded_execute_stop:
+            # Mythic_Operator treats execute_capability as an atomic transaction boundary.
+            # Explicit bounded one-action requests still get a graph-END final report in
+            # _wrap_create_agent; unbounded autonomous solves return to Supervisor/state
+            # reconciliation before choosing another action.
+            mw.insert(1, _BoundedExecuteCapabilityStopMiddleware(self))
         summ_model = self._get_base_chat_model()
         if summ_model is not None:
             mw.append(SummarizationMiddleware(
@@ -2016,6 +2718,7 @@ class Model:
             mythic_tools = self.mythic_client.get_tools([
                 "list_callbacks",
                 "get_all_commands_for_payloadtype",
+                "wait_for_seconds",
                 "issue_task_and_waitfor_task_output",
                 "get_task_history_for_callback",
                 "get_all_task_output_by_task_id",
@@ -2024,6 +2727,9 @@ class Model:
                 "get_operations",
                 "read_credentials",
                 "add_credential",
+                "execute_capability",
+                "materialize_capability_inputs",
+                "build_capability_commands",
                 "get_ttp_guidance",
                 "get_ttp_full_reference",
                 "list_ttp_categories",
@@ -2054,7 +2760,10 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(inject_engagement_state=True),
+            middleware=self._context_middleware(
+                inject_engagement_state=True,
+                bounded_execute_stop=True,
+            ),
         )
         return self._wrap_create_agent(agent, "mythic_operator_messages", name)
 
@@ -2227,26 +2936,31 @@ class Model:
         assign_to_generalist_agent = _create_handoff_tool(
             agent_name="Generalist",
             description="Assign task to Generalist for general questions, explanations, advice, and tasks that don't require Mythic operations or external tools.",
+            autonomous_redirect=self._autonomous_handoff_step_redirect,
         )
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
                 agent_name="Mythic_Operator",
                 description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of the BloodHound agent.",
+                autonomous_redirect=self._autonomous_handoff_step_redirect,
             )
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
                 agent_name="Mythic_Payload",
                 description="Assign task to Mythic Payload for creating Mythic payloads, configuring C2 profiles, and build options.",
+                autonomous_redirect=self._autonomous_handoff_step_redirect,
             )
 
         assign_to_bloodhound_agent = _create_handoff_tool(
                 agent_name="BloodHound",
                 description="Assign to the BloodHound agent for the BloodHound attack-graph: INGEST a staged SharpHound/AzureHound collection (file_upload) then VERIFY it, and attack-path ANALYSIS (shortest path, ADCS/ESC paths, Cypher, object detail). NOTE: the Operator auto-hands-off freshly-staged collections to BloodHound; route here for any BloodHound/graph work, to re-attempt a failed ingest, or for path analysis. Do NOT route BloodHound work to Mythic_Operator.",
+                autonomous_redirect=self._autonomous_handoff_step_redirect,
             )
 
         assign_to_mcp_manager_agent = _create_handoff_tool(
                 agent_name="MCP_Manager",
                 description="Assign to the general-purpose MCP Manager for tools from ARBITRARY third-party MCP servers a user has connected (web fetching, external APIs, non-Mythic integrations) — anything that is NOT BloodHound, NOT Mythic C2, and NOT a payload build. For BloodHound/graph work use the BloodHound agent; for Mythic operations use Mythic_Operator.",
+                autonomous_redirect=self._autonomous_handoff_step_redirect,
             )
 
         # Completion tool - use when task is done
@@ -2410,7 +3124,13 @@ class Model:
             # with a user message. This happens when worker agent responses (AIMessages)
             # are copied back to the Supervisor's channel before re-invocation.
             if cleaned and isinstance(cleaned[-1], AIMessage):
-                cleaned.append(HumanMessage(content="Based on the above, decide your next action."))
+                cleaned.append(HumanMessage(
+                    content="Based on the above, decide your next action.",
+                    additional_kwargs={
+                        "_synthetic_nudge": "provider_requires_user_turn",
+                        "_hide_from_stream": True,
+                    },
+                ))
 
             return cleaned
 
@@ -2480,6 +3200,8 @@ class Model:
         out = ""
         for m in messages:
             if isinstance(m, HumanMessage):
+                if _is_internal_human_message(m):
+                    continue
                 out += f"👤> {m.content}\n"
             elif isinstance(m, AIMessage):
                 out += f"🤖[{getattr(m,'name','Agent')}]> {m.content if isinstance(m.content,str) else ''}\n"
@@ -2601,12 +3323,40 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         return "\n\n".join(summaries)
 
     def request_stop(self) -> None:
-        """Cooperative kill switch for a running chat session. Sets a flag that every
-        graph.astream loop checks between super-steps; the in-flight step finishes, then the
-        loop breaks and no further tasks are issued. Called by the `exit` command (exit.py)
-        so a Mythic operator can actually terminate a running/runaway session."""
+        """Kill switch for a running Sage session.
+
+        Sets the cooperative flag checked by middleware/astream loops and cancels any registered
+        invoke() task so long-running tool awaits cannot survive after Mythic marks the run stopped.
+        """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
+        current_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        cancelled = 0
+        for task in list(getattr(self, "_running_tasks", set()) or set()):
+            if task is None or task.done() or task is current_task:
+                continue
+            try:
+                task.cancel()
+                cancelled += 1
+            except Exception as exc:
+                logger.warning(f"Failed to cancel running Sage task for session {self.task_id}: {exc}")
+        if cancelled:
+            logger.info(f"🛑 Cancelled {cancelled} running invoke task(s) for session task_id={self.task_id}")
+
+    def _register_running_task(self, task: asyncio.Task | None = None) -> None:
+        """Track the active invoke() task so operator stop can interrupt long awaits."""
+        if task is None:
+            return
+        running = getattr(self, "_running_tasks", None)
+        if running is None:
+            running = set()
+            self._running_tasks = running
+        running.add(task)
+        task.add_done_callback(lambda done_task: running.discard(done_task))
 
     async def _hitl_interrupt_pending(self, thread_id: str) -> bool:
         """True if the graph for this thread is paused on a HumanInTheLoopMiddleware interrupt.
@@ -2757,6 +3507,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """
         # Store for use in streaming formatter
         self.is_interactive = is_interactive
+        try:
+            self._register_running_task(asyncio.current_task())
+        except RuntimeError:
+            pass
         if not self.graph:
             raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
         logger.debug(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
@@ -2814,6 +3568,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             formatted_prompt = self._format_message_for_streaming(user_msg, agent_name=None)
             if formatted_prompt:
                 await self._stream_message_to_mythic(formatted_prompt)
+
+        if self._objective_completion_preflight_allowed(prompt) and await self._maybe_stream_objective_completion_stop(
+            refresh_footholds=True,
+            require_autonomous=False,
+        ):
+            return ""
 
         try:
             # Recursion limit 250 for multi-hop autonomous solves (e.g. the GOAD Trust Walker is many agent
@@ -2881,6 +3641,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         "mythic_operator_messages",
                         "mythic_payload_messages",
                         "mcp_manager_messages", "bloodhound_messages",
+                        "autonomous_executor_messages",
                         "_message_seq"
                     ]:
                         if ch in state_update:
@@ -2894,10 +3655,16 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                                 # DEBUG: Log what we're extending
                                 old_len = len(self.state[ch])
-                                self.state[ch].extend(state_update[ch])
+                                self.state[ch].extend(
+                                    msg for msg in state_update[ch]
+                                    if not _is_internal_human_message(msg)
+                                )
                                 new_len = len(self.state[ch])
                                 if new_len > old_len:
                                     logger.debug(f"  Extended {ch}: {old_len} -> {new_len} messages")
+
+                if await self._maybe_stream_objective_completion_stop():
+                    break
 
             logger.debug(f"📥 After astream: self.state._message_seq={self.state.get('_message_seq')}")
 
@@ -2913,7 +3680,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
             seen_ids = set()
-            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
+            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"📊 Channel {ch}: {len(ch_msgs)} messages")
                 for idx, msg in enumerate(ch_msgs):
@@ -2960,6 +3727,17 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             elif synthetic_resp.get("recursion_handback", False):
                 logger.info("Recursion handback received from specialist agent")
                 return ""  # All output already streamed to Mythic
+        except asyncio.CancelledError:
+            # request_stop() cancels the active invoke task to interrupt long-running tool awaits
+            # immediately. Treat that as an operator stop, not as an invocation failure.
+            self._stop_requested = True
+            stop_message = "\n🛑> Session stopped by operator.\n"
+            logger.info("🛑 Operator stop cancelled active invoke task — terminating session")
+            try:
+                await self._stream_message_to_mythic(stop_message)
+            except Exception:
+                pass
+            return ""
         except _OperatorStopRequested:
             # Kill-switch fired inside an agent turn (finer-grained than the between-super-steps
             # check). End the session cleanly instead of surfacing it as an error.
@@ -3389,6 +4167,9 @@ Continue now.""")
                             if "recursion_handback" in state_update:
                                 self.state["recursion_handback"] = state_update["recursion_handback"]
 
+                        if await self._maybe_stream_objective_completion_stop():
+                            break
+
                     # Check if recursion summary was requested during streaming
                     if self.state.get("recursion_summary_requested", False):
                         return ""  # All output already streamed to Mythic
@@ -3511,6 +4292,9 @@ Continue now.""")
                                 self.state["recursion_summary_requested"] = state_update["recursion_summary_requested"]
                             if "recursion_handback" in state_update:
                                 self.state["recursion_handback"] = state_update["recursion_handback"]
+
+                        if await self._maybe_stream_objective_completion_stop():
+                            break
 
                     # Check if recursion summary was requested during streaming
                     if self.state.get("recursion_summary_requested", False):
@@ -3788,7 +4572,12 @@ def _create_recursion_summary_tool():
 
     return request_continuation
 
-def _create_handoff_tool(*, agent_name: str, description: str | None = None):
+def _create_handoff_tool(
+    *,
+    agent_name: str,
+    description: str | None = None,
+    autonomous_redirect: Callable[[str, str, dict], tuple[str, str] | None] | None = None,
+):
     """
     Create a handoff tool to transfer control to another agent.
     https://docs.langchain.com/oss/python/langchain/multi-agent#handoffs
@@ -3808,6 +4597,7 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         "Mythic_Payload": "mythic_payload_messages",
         "BloodHound": "bloodhound_messages",
         "MCP_Manager": "mcp_manager_messages",
+        "Autonomous_Executor": "autonomous_executor_messages",
     }
     target_channel_key = channel_map.get(agent_name)
 
@@ -3816,10 +4606,23 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         runtime: ToolRuntime,
         handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.' This is the ONLY argument for this tool — do not invent positional or placeholder argument names (e.g. a, b, c)."],
     ) -> Command:
+        redirect = None
+        if autonomous_redirect is not None:
+            try:
+                redirect = autonomous_redirect(agent_name, handoff_instruction, runtime.state)
+            except Exception:
+                redirect = None
+        if redirect is None:
+            redirect = _autonomous_handoff_redirect(agent_name, handoff_instruction, runtime.state)
+        terminal_redirect = bool(redirect and redirect[0] == "__terminal__")
+        actual_agent_name = "Supervisor" if terminal_redirect else (redirect[0] if redirect else agent_name)
+        actual_instruction = redirect[1] if redirect else handoff_instruction
+        actual_target_channel_key = channel_map.get(actual_agent_name)
+
         # Compute sequence from max of existing messages in all channels
         # This is more reliable than state._message_seq which may not persist across checkpoints
         max_seq = 0
-        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "messages"]:
+        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages", "messages"]:
             for msg in runtime.state.get(ch_key, []):
                 seq = _get_seq(msg)
                 if seq > max_seq:
@@ -3828,8 +4631,12 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
         logger.debug(f"🔄 Handoff to {agent_name}: computed next seq={current_seq} (max in channels was {max_seq})")
 
         # ToolMessage confirming delegation
+        if terminal_redirect:
+            ack_prefix = "Terminal autonomous report"
+        else:
+            ack_prefix = f"Redirected to {actual_agent_name}" if redirect else f"Delegated to {actual_agent_name}"
         acknowledgment = ToolMessage(
-            content=f"Delegated to {agent_name} with instruction: {handoff_instruction}",
+            content=f"{ack_prefix} with instruction: {actual_instruction}",
             name=name,
             tool_call_id=runtime.tool_call_id,
         )
@@ -3838,19 +4645,23 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
 
         # HumanMessage representing the actual task for the target agent
         # Mark as delegated so it displays differently from real user input
-        injected_human = HumanMessage(content=handoff_instruction)
-        injected_human.additional_kwargs["_delegated_to"] = agent_name
+        injected_human = HumanMessage(content=actual_instruction)
+        injected_human.additional_kwargs["_delegated_to"] = actual_agent_name
         _tag_msg(injected_human, current_seq)
         current_seq += 1
 
-        # With operator.add reducer, only provide NEW messages to append
-        update_state = {**runtime.state}
-        update_state["messages"] = [acknowledgment, injected_human]
-        update_state["_message_seq"] = current_seq  # Update sequence in state
+        # With operator.add reducers, provide only NEW messages. Returning a full state copy here
+        # re-appends old channel contents on every handoff and can trap autonomous runs in loops.
+        update_state = {
+            "messages": [acknowledgment, injected_human],
+            "_message_seq": current_seq,
+        }
+        if terminal_redirect:
+            update_state["recursion_handback"] = True
 
         # Inject into target channel (only new messages with operator.add)
-        if target_channel_key:
-            update_state[target_channel_key] = [acknowledgment, injected_human]
+        if actual_target_channel_key:
+            update_state[actual_target_channel_key] = [acknowledgment, injected_human]
 
         # CRITICAL: Track who is calling this agent so responses can be copied back
         # Store the calling agent's name in state for response routing
@@ -3860,23 +4671,826 @@ def _create_handoff_tool(*, agent_name: str, description: str | None = None):
             if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
                 # Check if this channel has recent activity (last message is not too old)
                 # This is a heuristic - the agent that just called a tool is the calling agent
-                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages"]:
                     # Simple approach: assume the tool was called from whichever non-target channel exists
-                    if channel_name != agent_name:
+                    if channel_name != actual_agent_name:
                         current_agent = channel_name
                         break
 
         # Store calling agent info for response routing
         update_state["_last_calling_agent"] = current_agent
-        update_state["_last_target_agent"] = agent_name
+        update_state["_last_target_agent"] = actual_agent_name
 
         return Command(
-            goto=agent_name,
+            goto=actual_agent_name,
             update=update_state,
             graph=Command.PARENT,
         )
 
     return handoff_tool
+
+
+def _compiled_autonomous_capability_instruction(
+    action: Any,
+    engagement_snapshot: Any,
+    *,
+    handoff_instruction: str,
+    requested_agent: str,
+) -> str:
+    action_payload = _capability_action_payload(action)
+    inputs_payload = _autonomous_capability_inputs(action, engagement_snapshot)
+    original = _message_content_as_text(handoff_instruction).strip()
+    if len(original) > 600:
+        original = original[:597].rstrip() + "..."
+    action_json = json.dumps(action_payload, sort_keys=True)
+    inputs_json = json.dumps(inputs_payload, sort_keys=True)
+    lines = [
+        "AUTONOMOUS STEP DRIVER: The engagement ledger and cached BloodHound facts were re-evaluated "
+        "at the handoff boundary. The selected capability below supersedes the delegated prose from "
+        f"{requested_agent}.",
+        "Call `execute_capability` now with these arguments:",
+        f"`action={action_json}`",
+        f"`inputs={inputs_json}`",
+        "Do not re-plan from task history, do not repeat achieved hops, and do not call BloodHound before "
+        "this capability. After `execute_capability` returns a terminal JSON result, allow Sage to return "
+        "to Supervisor/state reconciliation so the next step is recomputed from the updated ledger.",
+    ]
+    if original:
+        lines.append(f"Superseded handoff text: {original}")
+    return "\n".join(lines)
+
+
+def _compiled_autonomous_collection_instruction(
+    engagement_snapshot: Any,
+    *,
+    handoff_instruction: str,
+    requested_agent: str,
+) -> str:
+    foothold = _autonomous_collection_foothold(engagement_snapshot)
+    if foothold is None:
+        return ""
+    callback_id = str(getattr(foothold, "callback_id", "") or "").strip()
+    if not callback_id:
+        return ""
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        access_key = _es.access_context_key(engagement_snapshot, foothold)
+    except Exception:
+        access_key = ""
+    original = _message_content_as_text(handoff_instruction).strip()
+    if len(original) > 600:
+        original = original[:597].rstrip() + "..."
+    host = str(getattr(foothold, "host", "") or "").strip() or "the live foothold"
+    identity = str(getattr(foothold, "identity", "") or "").strip() or "the current user"
+    lines = [
+        "AUTONOMOUS COLLECTION DRIVER: The engagement ledger was re-evaluated at the handoff boundary. "
+        f"No executable capability is currently available, and the current access context on callback {callback_id} "
+        "has no verified BloodHound collection. This supersedes the delegated prose from "
+        f"{requested_agent}.",
+        f"Target callback: {callback_id} ({host} as {identity}).",
+    ]
+    if access_key:
+        lines.append(f"Required access-context key: `{access_key}`.")
+    lines.extend([
+        "Run exactly one NEW SharpHound collection task on that callback now. Do not use task history, task 5, "
+        "task 7, any previous file UUID, or any previous ZIP to satisfy this collection requirement.",
+        "Use Apollo `execute_assembly` with registered `SharpHound.exe` and arguments "
+        "`-c All --SearchForest --CollectAllProperties --OutputDirectory C:\\Users\\Public`.",
+        "After the collection task completes, list `C:\\Users\\Public`, download the BloodHound ZIP produced by "
+        "this new collection task, then call `ingest_collection` with `callback_display_id="
+        f"{callback_id}` and `name_contains=\"zip\"` (or the exact new file UUID plus callback_display_id="
+        f"{callback_id}).",
+        "Do not run GPO abuse, DCSync, RBCD, ticket forging, or any other attack action during this collection "
+        "driver. After `ingest_collection` returns `graph_verified=true`, hand back so Sage can recompute the "
+        "next step from the updated ledger.",
+    ])
+    if original:
+        lines.append(f"Superseded handoff text: {original}")
+    return "\n".join(lines)
+
+
+def _compiled_autonomous_blocked_bloodhound_instruction(
+    engagement_snapshot: Any,
+    *,
+    handoff_instruction: str,
+    requested_agent: str,
+) -> str:
+    original = _message_content_as_text(handoff_instruction).strip()
+    if len(original) > 600:
+        original = original[:597].rstrip() + "..."
+    phase = _engagement_phase_text(engagement_snapshot)
+    lines = [
+        "AUTONOMOUS BLOCKED-STATE GRAPH ANALYSIS: The engagement ledger was re-evaluated at the handoff "
+        f"boundary and no Mythic-executable hop is modeled. This supersedes the delegated prose from "
+        f"{requested_agent}.",
+        f"Current phase: {phase or 'BLOCKED'}.",
+        "Analyze BloodHound graph coverage and path facts from the proven current control state. Do not ask "
+        "Mythic_Operator to rerun GPO abuse, DCSync, RBCD, ticket forging, collection, or any achieved hop.",
+        "Return exactly one of: a concrete graph-supported next capability/hop with target object and "
+        "preconditions, or a blocker stating which required target-side objects/edges are absent from the graph.",
+    ]
+    _append_control_milestones(lines, engagement_snapshot)
+    if original:
+        lines.append(f"Superseded handoff text: {original}")
+    return "\n".join(lines)
+
+
+def _compiled_autonomous_blocked_report(
+    engagement_snapshot: Any,
+    *,
+    handoff_instruction: str,
+    requested_agent: str,
+) -> str:
+    original = _message_content_as_text(handoff_instruction).strip()
+    if len(original) > 600:
+        original = original[:597].rstrip() + "..."
+    phase = _engagement_phase_text(engagement_snapshot)
+    objective = str(getattr(engagement_snapshot, "objective", "") or "").strip()
+    lines = [
+        "AUTONOMOUS BLOCKED REPORT: Sage is stopping this run because the authoritative engagement state has "
+        "no modeled next hop after current-access collection and BloodHound analysis.",
+    ]
+    if objective:
+        lines.append(f"Objective: {objective}")
+    lines.append(f"Current phase: {phase or 'BLOCKED — no modeled hop available'}.")
+    _append_control_milestones(lines, engagement_snapshot)
+    lines.extend([
+        "No reset is indicated by this state. The missing input is graph/capability coverage for the next "
+        "sevenkingdoms.local -> essos.local hop, not a clean range.",
+        "Do not repeat achieved NORTH or SEVENKINGDOMS GPO, golden-ticket, Kerberos-context, DCSync, or account "
+        "harvesting steps. Continue only after adding the missing graph facts/capability for the ESSOS route or "
+        "after obtaining a new access context.",
+    ])
+    if original:
+        lines.append(f"Suppressed handoff text: {original}")
+    return "\n".join(lines)
+
+
+def _engagement_phase_text(engagement_snapshot: Any) -> str:
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        return str(_es.engagement_phase(engagement_snapshot))
+    except Exception:
+        return ""
+
+
+def _append_control_milestones(lines: list[str], engagement_snapshot: Any) -> None:
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        candidates = _es.objective_completion_candidates(engagement_snapshot)
+    except Exception:
+        candidates = []
+    if not candidates:
+        return
+    lines.append("Recorded administrative-control milestones:")
+    for candidate in candidates[:6]:
+        domain = str(candidate.get("domain") or "").strip()
+        if not domain:
+            continue
+        pieces = [f"- {domain}"]
+        for key in ("admin_effect", "access_effect", "key_effect", "auth_effect"):
+            value = str(candidate.get(key) or "").strip()
+            if value:
+                pieces.append(f"{key.removesuffix('_effect')}={value}")
+        lines.append(" | ".join(pieces))
+
+
+def _recent_bloodhound_blocker_observed(state: dict) -> bool:
+    text = _safe_lower(_recent_channel_text(state, ("bloodhound_messages", "supervisor_messages", "messages"), limit=18))
+    if "blocker / missing capability" not in text:
+        return False
+    if "essos.local" not in text:
+        return False
+    return any(marker in text for marker in (
+        "collected=false",
+        "users: `0`",
+        "groups: `0`",
+        "computers: `0`",
+        "no modeled hop",
+        "domain admins@essos.local",
+        "target-side",
+    ))
+
+
+def _autonomous_collection_foothold(engagement_snapshot: Any) -> Any | None:
+    footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
+    for foothold in footholds:
+        try:
+            if not bool(getattr(foothold, "alive", False)):
+                continue
+            if str(getattr(foothold, "agent", "") or "").strip().casefold() == "sage":
+                continue
+            return foothold
+        except Exception:
+            continue
+    return None
+
+
+def _parse_compiled_autonomous_capability_instruction(text: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if "AUTONOMOUS STEP DRIVER" not in str(text or ""):
+        return None, {}
+    action = _json_backtick_payload(text, "action")
+    inputs = _json_backtick_payload(text, "inputs")
+    if not isinstance(action, dict):
+        return None, {}
+    if not isinstance(inputs, dict):
+        inputs = {}
+    return action, inputs
+
+
+def _json_backtick_payload(text: str, label: str) -> Any:
+    pattern = rf"`{re.escape(label)}=(.*?)`"
+    match = re.search(pattern, str(text or ""), re.DOTALL)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _capability_action_payload(action: Any) -> dict[str, Any]:
+    return {
+        "name": _jsonable_value(getattr(action, "name", "")),
+        "target": _jsonable_value(getattr(action, "target", "")),
+        "preconditions": _jsonable_value(list(getattr(action, "preconditions", []) or [])),
+        "effects": _jsonable_value(list(getattr(action, "effects", []) or [])),
+        "intent": _jsonable_value(getattr(action, "intent", {}) or {}),
+        "verifier": _jsonable_value(getattr(action, "verifier", {}) or {}),
+        "reason": _jsonable_value(getattr(action, "reason", "") or ""),
+        "source_facts": _jsonable_value(list(getattr(action, "source_facts", []) or [])),
+    }
+
+
+def _jsonable_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable_value(item) for item in value]
+    return str(value)
+
+
+def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict[str, Any]:
+    inputs: dict[str, Any] = {}
+    callback_id = _autonomous_callback_id_for_action(action, engagement_snapshot)
+    if callback_id:
+        inputs["callback_id"] = callback_id
+    return inputs
+
+
+def _autonomous_callback_id_for_action(action: Any, engagement_snapshot: Any) -> str:
+    target_fields = _target_fields_from_action(action)
+    intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+    explicit = str(
+        intent.get("callback_id")
+        or intent.get("callback")
+        or intent.get("callback_display_id")
+        or target_fields.get("callback")
+        or target_fields.get("callback_id")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit.casefold().lstrip("#").removeprefix("cb")
+
+    for value in _action_text_values(action):
+        match = re.search(r"@callback:(\d+)\b", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    domain = str(
+        intent.get("domain")
+        or intent.get("source_domain")
+        or target_fields.get("domain")
+        or target_fields.get("source_domain")
+        or ""
+    ).strip().casefold()
+    achieved = set()
+    try:
+        achieved = set(engagement_snapshot.achieved_effects())
+    except Exception:
+        achieved = set()
+    if domain:
+        prefix = f"kerberos-context:{domain}@callback:"
+        for effect in sorted(achieved):
+            text = str(effect or "").strip().casefold()
+            if text.startswith(prefix):
+                return text[len(prefix):].split(None, 1)[0].strip()
+
+    footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
+    if domain:
+        for foothold in footholds:
+            if not _is_live_tradecraft_foothold(foothold):
+                continue
+            forest = str(getattr(foothold, "forest", "") or "").strip().casefold()
+            if forest == domain:
+                callback = str(getattr(foothold, "callback_id", "") or "").strip()
+                if callback:
+                    return callback
+    for foothold in footholds:
+        if not _is_live_tradecraft_foothold(foothold):
+            continue
+        callback = str(getattr(foothold, "callback_id", "") or "").strip()
+        if callback:
+            return callback
+    return ""
+
+
+def _target_fields_from_action(action: Any) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    try:
+        target = str(getattr(action, "target", "") or "")
+        for part in target.split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip().casefold()
+            value = value.strip()
+            if key and value:
+                fields[key] = value
+    except Exception:
+        return {}
+    return fields
+
+
+def _action_text_values(action: Any) -> list[str]:
+    out: list[str] = []
+    for name in ("target", "preconditions", "effects", "source_facts"):
+        value = getattr(action, name, None)
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (list, tuple, set)):
+            out.extend(str(item or "") for item in value)
+    intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+    out.extend(str(item or "") for item in intent.values() if isinstance(item, (str, int, float)))
+    return out
+
+
+def _is_live_tradecraft_foothold(foothold: Any) -> bool:
+    if getattr(foothold, "alive", False) is not True:
+        return False
+    agent = str(getattr(foothold, "agent", "") or "").strip().casefold()
+    return agent != "sage"
+
+
+def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, state: dict) -> tuple[str, str] | None:
+    """Deterministically block autonomous handoff regressions from observed progress.
+
+    This runs before a delegated task reaches the target agent. It intentionally uses tool-result evidence from
+    the graph state, not prompt text, so stale Supervisor narration cannot send the Operator backwards after a
+    verified collection or terminal capability result.
+    """
+    if agent_name != "Mythic_Operator":
+        return None
+    instruction = _safe_lower(handoff_instruction)
+
+    progress_redirect = _redirect_stale_handoff_after_capability_progress(instruction, state)
+    if progress_redirect:
+        return progress_redirect
+    gpo_progress_redirect = _redirect_stale_gpo_handoff_from_observed_effects(instruction, state)
+    if gpo_progress_redirect:
+        return gpo_progress_redirect
+
+    if _requests_collection_confirmation(instruction):
+        facts = _observed_handoff_facts(state)
+        if facts.get("graph_verified"):
+            terminal = facts.get("terminal_capability") or {}
+            if terminal and str(terminal.get("verdict") or "").casefold() in {"failed", "blocked", "partial"}:
+                capability = str(terminal.get("capability") or "the latest capability").strip()
+                verdict = str(terminal.get("verdict") or "failed").strip()
+                reason = str(terminal.get("reason") or "no reason supplied").strip()
+                tasks = _terminal_capability_task_summary(terminal)
+                return (
+                    "Mythic_Operator",
+                    "Do not perform SharpHound collection confirmation, ZIP discovery, download, or BloodHound "
+                    "ingest for this access context. Tool-result evidence in the current run already shows "
+                    f"`graph_verified=true`. Continue from the observed graph and recover from the latest "
+                    f"terminal capability result: `{capability}` returned `{verdict}`"
+                    f"{tasks}; reason: {reason}. Inspect the referenced task output if needed, repair and retry "
+                    "that capability only when the error is recoverable, or replan from the verified graph. "
+                    "Do not regress to collection work."
+                )
+            return (
+                "BloodHound",
+                "Tool-result evidence in the current run already shows `graph_verified=true` for the current "
+                "access context. Do not ask Mythic_Operator to confirm SharpHound completion, list ZIPs, "
+                "download collections, or ingest again. Analyze the verified BloodHound graph and return the "
+                "next concrete graph-supported hop plus the exact Mythic action needed next.",
+            )
+
+    if not (
+        "starkwallpaper" in instruction
+        and "gpo" in instruction
+        and "domain admins" in instruction
+        and ("sharpgpoabuse" in instruction or "net group" in instruction)
+    ):
+        return None
+    recent = _recent_channel_text(state, ("supervisor_messages", "messages"), limit=8)
+    low = _safe_lower(recent)
+    if not (
+        "handback to supervisor" in low
+        and "done (do not repeat)" in low
+        and "starkwallpaper" in low
+        and "domain admins" in low
+        and "graph-supported" in low
+        and "bloodhound" in low
+        and "essos" in low
+    ):
+        return None
+    callback_id = _extract_callback_id(recent) or "the live CASTELBLACK callback"
+    return (
+        "BloodHound",
+        "Analyze the current BloodHound graph for the next concrete sevenkingdoms.local -> essos.local hop "
+        f"from proven sevenkingdoms administrative control on callback {callback_id}. Do not repeat the "
+        "STARKWALLPAPER/GPO hop, do not rerun sevenkingdoms krbtgt DCSync after the recorded 0x20f7/8439 "
+        "failures, and return the exact next traversable principal/group/edge plus the Mythic action needed next.",
+    )
+
+
+def _redirect_stale_gpo_handoff_from_observed_effects(instruction: str, state: dict) -> tuple[str, str] | None:
+    """Advance stale GPO handoffs when tool-result effects prove the GPO chain is already past that hop."""
+    if not _requests_gpo_domain_admin_add(instruction):
+        return None
+    effects = _observed_effects_from_execute_capability_results(state)
+    if not effects:
+        return None
+
+    contexts = _kerberos_contexts_from_effects(effects)
+    for domain in sorted(_domains_with_effect_prefix(effects, "krbtgt-hash:")):
+        callback_id = contexts.get(domain) or _extract_callback_id(_recent_channel_text(
+            state, ("mythic_operator_messages", "supervisor_messages", "messages"), limit=12
+        )) or "the live callback"
+        parent = _parent_domain(domain)
+        if parent:
+            return (
+                "Mythic_Operator",
+                f"Observed execute_capability results already prove the STARKWALLPAPER/GPO chain is past the "
+                f"GPO hop: `krbtgt-hash:{domain}` is achieved. Do not repeat GPO abuse, Domain Admins "
+                f"membership polling, Kerberos PAC refresh, or NORTH DCSync. Execute the next capability now: "
+                f"call `build_capability_commands` for `forge-golden-ticket` with `domain={domain}`, "
+                f"`target_domain={parent}`, and callback {callback_id}; then issue the returned structured "
+                "commands exactly without editing SID/key/domain fields. Verify administrative control over "
+                f"`{parent}` before any ESSOS trust hop.",
+            )
+        return (
+            "Mythic_Operator",
+            f"Observed execute_capability results already prove `krbtgt-hash:{domain}` is achieved. Do not "
+            "repeat GPO abuse or membership/PAC checks. Replan from the achieved krbtgt hash and execute the "
+            "next non-GPO capability toward the objective.",
+        )
+
+    for domain, callback_id in sorted(contexts.items()):
+        netbios = _netbios_from_domain(domain)
+        user = f"{netbios}\\krbtgt" if netbios else f"{domain}\\krbtgt"
+        return (
+            "Mythic_Operator",
+            f"Observed execute_capability results already prove `kerberos-context:{domain}@callback:{callback_id}`. "
+            "Do not repeat STARKWALLPAPER/GPO abuse, Domain Admins membership polling, or PAC refresh. Execute "
+            f"NORTH DCSync now from callback {callback_id}: DCSync `{user}` against `{domain}` and record "
+            f"`krbtgt-hash:{domain}` from real secret material.",
+        )
+
+    for domain in sorted(_domains_with_effect_prefix(effects, "da:")):
+        return (
+            "Mythic_Operator",
+            f"Observed execute_capability results already prove `da:{domain}`. Do not repeat STARKWALLPAPER/GPO "
+            "abuse or Domain Admins membership polling. Execute `ensure-kerberos-context` for that domain on the "
+            "live callback, then proceed to DCSync only after the context effect is recorded.",
+        )
+
+    system_exec = sorted(_gpo_system_exec_effects(effects))
+    if system_exec:
+        gpo, domain = system_exec[0]
+        return (
+            "Mythic_Operator",
+            f"Observed execute_capability results already prove `system-exec:gpo:{gpo}@{domain}`. Do not repeat "
+            "the GPO write. Verify/record the durable domain-admin effect if missing, then continue to Kerberos "
+            "context refresh and DCSync.",
+        )
+
+    return None
+
+
+def _requests_gpo_domain_admin_add(instruction: str) -> bool:
+    if not instruction:
+        return False
+    has_gpo = "gpo" in instruction or "starkwallpaper" in instruction or "sharpgpoabuse" in instruction
+    has_group_add = (
+        "domain admins" in instruction
+        or "net group" in instruction
+        or "addcomputertask" in instruction
+        or "gpo-controlled-system-exec" in instruction
+    )
+    return bool(has_gpo and has_group_add)
+
+
+def _observed_effects_from_execute_capability_results(state: dict) -> set[str]:
+    effects: set[str] = set()
+    for msg in _state_messages(state):
+        text = _message_content_as_text(getattr(msg, "content", ""))
+        effects.update(_effect_tokens_from_text(text))
+        effects.update(_dcsync_krbtgt_effects_from_task_text(text))
+        if not isinstance(msg, ToolMessage):
+            continue
+        if (getattr(msg, "name", "") or "") != "execute_capability":
+            continue
+        raw = text.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("achieved_effects", "recorded_effects", "satisfied_effects"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                effects.update(str(item).strip().casefold() for item in values if str(item).strip())
+    return effects
+
+
+def _effect_tokens_from_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    patterns = (
+        r"\bkrbtgt-hash:[a-z0-9.-]+",
+        r"\bda:[a-z0-9.-]+",
+        r"\bea:[a-z0-9.-]+",
+        r"\bds-replication-rights:[a-z0-9.-]+",
+        r"\bkerberos-context:[a-z0-9.-]+@callback:\d+",
+        r"\bsystem-exec:gpo:[^@\s`,]+@[a-z0-9.-]+",
+    )
+    effects: set[str] = set()
+    for pattern in patterns:
+        effects.update(match.group(0).strip("`'\".,;").casefold() for match in re.finditer(pattern, text, re.IGNORECASE))
+    return effects
+
+
+def _dcsync_krbtgt_effects_from_task_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    low = text.casefold()
+    if "dcsync" not in low or "krbtgt" not in low:
+        return set()
+    success_markers = (
+        '"status": "success"',
+        "'status': 'success'",
+        '"status":"success"',
+        "hash ntlm:",
+        "aes256_hmac",
+        "[*] process exited",
+    )
+    if not any(marker in low for marker in success_markers):
+        return set()
+    effects: set[str] = set()
+    for match in re.finditer(
+        r"lsadump::dcsync\s+/domain:([a-z0-9.-]+)[^\r\n\"']*/user:(?:[a-z0-9_.-]+\\+)?krbtgt\b",
+        text,
+        re.IGNORECASE,
+    ):
+        domain = match.group(1).strip().casefold()
+        if domain:
+            effects.add(f"krbtgt-hash:{domain}")
+    return effects
+
+
+def _domains_with_effect_prefix(effects: set[str], prefix: str) -> set[str]:
+    prefix_key = prefix.casefold()
+    return {
+        effect[len(prefix_key):].strip()
+        for effect in effects
+        if effect.startswith(prefix_key) and effect[len(prefix_key):].strip()
+    }
+
+
+def _kerberos_contexts_from_effects(effects: set[str]) -> dict[str, str]:
+    contexts: dict[str, str] = {}
+    for effect in effects:
+        parsed = _parse_kerberos_context_effect_text(effect)
+        if not parsed:
+            continue
+        domain, callback_id = parsed
+        contexts[domain] = callback_id
+    return contexts
+
+
+def _gpo_system_exec_effects(effects: set[str]) -> set[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    prefix = "system-exec:gpo:"
+    for effect in effects:
+        if not effect.startswith(prefix):
+            continue
+        tail = effect[len(prefix):]
+        gpo, sep, domain = tail.partition("@")
+        if sep and gpo.strip() and domain.strip():
+            out.add((gpo.strip(), domain.strip()))
+    return out
+
+
+def _parent_domain(domain: str) -> str:
+    parts = [part for part in str(domain or "").strip().split(".") if part]
+    if len(parts) <= 2:
+        return ""
+    return ".".join(parts[1:])
+
+
+def _redirect_stale_handoff_after_capability_progress(instruction: str, state: dict) -> tuple[str, str] | None:
+    """Rewrite stale autonomous handoffs after a capability recorded a new effect.
+
+    The supervisor often phrases the next delegation by replaying the previous user prompt. If a just-finished
+    capability already recorded the sub-effect named in that prompt, replaying it sends the operator back to a
+    completed proof loop. Use the latest execute_capability tool result as the source of truth and advance to
+    the next deterministic capability.
+    """
+    if not instruction:
+        return None
+    terminal = _terminal_execute_capability_payload(_state_messages(state))
+    if not terminal or str(terminal.get("verdict") or "").casefold() != "achieved":
+        return None
+    recorded = _terminal_recorded_effects(terminal)
+    if not recorded:
+        return None
+
+    for effect in recorded:
+        parsed_context = _parse_kerberos_context_effect_text(effect)
+        if parsed_context:
+            domain, callback_id = parsed_context
+            if not _handoff_is_stale_context_or_dcsync_request(instruction, domain):
+                continue
+            netbios = _netbios_from_domain(domain)
+            user = f"{netbios}\\krbtgt" if netbios else f"{domain}\\krbtgt"
+            return (
+                "Mythic_Operator",
+                f"Tool-result evidence in this run already recorded `kerberos-context:{domain}@callback:{callback_id}`. "
+                "Do not repeat Domain Admins membership checks, klist/PAC refresh, or C$ proof for that same "
+                f"context. Execute the next capability now: DCSync `{user}` from callback {callback_id} against "
+                f"`{domain}` using the payload-native `dcsync` command or `execute_capability` for "
+                f"`dcsync-krbtgt` if available. Record `krbtgt-hash:{domain}` from the real secret material "
+                "before ticket forging or any parent/forest hop. If DCSync fails with 8439, fix DN/DC targeting; "
+                "if it fails with 8453 after the recorded Kerberos context, surface that as a rights/context "
+                "blocker instead of re-running the completed Kerberos proof.",
+            )
+
+    return None
+
+
+def _terminal_recorded_effects(payload: dict[str, Any]) -> list[str]:
+    effects: list[str] = []
+    for key in ("recorded_effects", "satisfied_effects"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            effects.extend(str(item).strip() for item in values if str(item).strip())
+    action = payload.get("action")
+    if isinstance(action, dict):
+        values = action.get("effects")
+        if isinstance(values, list) and effects:
+            # Action effects are plan-shaped; include them only when the terminal payload also recorded an effect.
+            effects.extend(str(item).strip() for item in values if str(item).strip())
+    return list(dict.fromkeys(effects))
+
+
+def _parse_kerberos_context_effect_text(effect: str) -> tuple[str, str] | None:
+    match = re.match(r"^kerberos-context:([^@\s]+)@callback:(\d+)$", str(effect or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2)
+
+
+def _handoff_is_stale_context_or_dcsync_request(instruction: str, domain: str) -> bool:
+    domain_key = _safe_lower(domain)
+    netbios = _safe_lower(_netbios_from_domain(domain))
+    mentions_domain = domain_key in instruction or (netbios and netbios in instruction)
+    if not mentions_domain:
+        return False
+    progress_terms = ("continue", "autonomous", "solve", "objective", "essos", "dcsync", "krbtgt")
+    stale_terms = (
+        "kerberos",
+        "ticket",
+        "pac",
+        "klist",
+        "c$",
+        "domain admins",
+        "membership",
+        "context",
+        "dcsync",
+        "krbtgt",
+    )
+    return any(term in instruction for term in progress_terms) and any(term in instruction for term in stale_terms)
+
+
+def _netbios_from_domain(domain: str) -> str:
+    first = str(domain or "").split(".", 1)[0].strip()
+    return first.upper()
+
+
+def _state_messages(state: dict, channel_keys: tuple[str, ...] | None = None) -> list[AnyMessage]:
+    keys = channel_keys or (
+        "messages",
+        "supervisor_messages",
+        "mythic_operator_messages",
+        "mythic_payload_messages",
+        "bloodhound_messages",
+        "mcp_manager_messages",
+        "generalist_messages",
+        "autonomous_executor_messages",
+    )
+    messages: list[AnyMessage] = []
+    for key in keys:
+        value = state.get(key, []) if isinstance(state, dict) else []
+        if isinstance(value, list):
+            messages.extend(msg for msg in value if isinstance(msg, BaseMessage))
+    return messages
+
+
+def _observed_handoff_facts(state: dict) -> dict[str, Any]:
+    messages = _state_messages(state)
+    tool_text = "\n".join(
+        _message_content_as_text(msg.content)
+        for msg in messages
+        if isinstance(msg, ToolMessage)
+    )
+    graph_verified = bool(re.search(
+        r"(?:graph[_ -]?verified)[\"'\s:=]+true\b",
+        tool_text,
+        re.IGNORECASE,
+    ))
+    return {
+        "graph_verified": graph_verified,
+        "terminal_capability": _terminal_execute_capability_payload(messages),
+    }
+
+
+def _requests_collection_confirmation(instruction: str) -> bool:
+    if not instruction:
+        return False
+    collection_terms = (
+        "sharphound",
+        "bloodhound zip",
+        "ingest_collection",
+        "graph_verified",
+        "domain_info was empty",
+    )
+    phase_terms = (
+        "zip",
+        "download",
+        "ingest",
+        "completion",
+        "collection",
+        "list c:\\users\\public",
+        "do not rerun",
+        "do not re-run",
+    )
+    return any(term in instruction for term in collection_terms) and any(
+        term in instruction for term in phase_terms
+    )
+
+
+def _terminal_capability_task_summary(payload: dict[str, Any]) -> str:
+    issued = payload.get("issued") if isinstance(payload.get("issued"), list) else []
+    task_ids: list[str] = []
+    for item in issued:
+        if not isinstance(item, dict):
+            continue
+        task_id = item.get("task_id") or item.get("mythic_task_id")
+        if task_id:
+            task_ids.append(str(task_id))
+    if not task_ids:
+        return ""
+    return f" on Mythic task(s) {', '.join(task_ids[:6])}"
+
+
+def _recent_channel_text(state: dict, channel_keys: tuple[str, ...], limit: int = 8) -> str:
+    parts: list[str] = []
+    for key in channel_keys:
+        for msg in list(state.get(key, []) or [])[-limit:]:
+            content = getattr(msg, "content", "")
+            if content:
+                parts.append(str(content))
+    return "\n".join(parts[-limit:])
+
+
+def _safe_lower(value: Any) -> str:
+    return str(value or "").casefold()
+
+
+def _extract_callback_id(text: str) -> str:
+    for pattern in (r"callback[:\s]+(\d+)", r"callback@?:(\d+)", r"callback\s+\*\*(\d+)\*\*"):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
 
 sessions: dict[str, Model] = {}
 
@@ -3892,9 +5506,24 @@ async def add_session(session_id: str, model: Model):
     logger.debug(f"Adding session {session_id} with model {model.provider} {model.model}")
     sessions[session_id] = model
 
+async def list_sessions() -> dict[str, Model]:
+    return dict(sessions)
+
+async def request_stop_for_sessions(session_id: str | None = None) -> dict[str, Model]:
+    target = str(session_id or "").strip()
+    stopped: dict[str, Model] = {}
+    for key, model in list(sessions.items()):
+        model_task_id = str(getattr(model, "task_id", "") or "")
+        model_display_id = str(getattr(model, "task_display_id", "") or "")
+        if target and target not in {str(key), model_task_id, model_display_id}:
+            continue
+        try:
+            model.request_stop()
+            stopped[str(key)] = model
+        except Exception as exc:
+            logger.warning(f"Failed to request stop for session {key}: {exc}")
+    return stopped
+
 async def remove_session(session_id: str):
     logger.debug(f"Removing session {session_id}")
-    if session_id in sessions:
-        del sessions[session_id]
-    else:
-        logger.error(f"Session {session_id} not found, cannot remove.")
+    sessions.pop(session_id, None)

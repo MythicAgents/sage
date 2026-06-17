@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -464,9 +465,9 @@ def _build_params(group_params: list[dict], mapped: dict[str, Any]) -> tuple[dic
     for param in group_params:
         cli_name = param["cli_name"]
         if cli_name in mapped:
-            params[cli_name] = _normalize_value(mapped[cli_name])
+            params[cli_name] = _normalize_param_value(mapped[cli_name], param)
         elif _has_default(param.get("default_value")):
-            params[cli_name] = _normalize_value(param.get("default_value"))
+            params[cli_name] = _normalize_param_value(param.get("default_value"), param)
             defaulted_cli_names.append(cli_name)
     return params, defaulted_cli_names
 
@@ -483,6 +484,35 @@ def _normalize_value(value: Any) -> Any:
     if isinstance(value, str) and value.strip() in ("", "{}", '""', "''"):
         return ""
     return value
+
+
+def _normalize_param_value(value: Any, param: dict) -> Any:
+    normalized = _normalize_value(value)
+    if not _is_array_param(param):
+        return normalized
+    if normalized == "":
+        return []
+    if isinstance(normalized, list):
+        return normalized
+    if isinstance(normalized, tuple):
+        return list(normalized)
+    if isinstance(normalized, set):
+        return list(normalized)
+    if isinstance(normalized, str):
+        stripped = normalized.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+    return [normalized]
+
+
+def _is_array_param(param: dict) -> bool:
+    kind = _lower(param.get("type")).replace("_", "").replace("-", "").replace(" ", "")
+    return kind in {"array", "typedarray", "stringarray"}
 
 
 def _normalize_and_validate_choices(group_params: list[dict], params: dict) -> tuple[dict, list[tuple[str, Any, list[str]]]]:

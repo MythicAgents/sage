@@ -36,14 +36,18 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
             if _has_flag(parsed, "rbcd"):
                 return ("rbcd-standin", _flag_value(parsed, "target").casefold())
 
+        if _is_domain_admin_membership_check(command_text, parsed, combined_cf):
+            return ("domain-admin-membership-check", "")
+
         if "lsadump::dcsync" in combined_cf or (_apollo_dcsync(command_text, tokens, token_set)):
-            domain = _domain_value(parsed).casefold()
-            user = _flag_value(parsed, "user").casefold()
+            user_raw = _flag_value(parsed, "user")
+            domain = (_domain_value(parsed) or (_fqdn_from_dn(user_raw) if _is_domain_dn(user_raw) else "")).casefold()
+            user = user_raw.casefold()
             # DCSyncing a SPECIFIC non-krbtgt principal (to recover THAT user's key, e.g. a SMALL COUNCIL
             # member for cross-forest LAPS) is a DISTINCT op from the domain krbtgt DCSync. Without this they
             # both collapse to ("dcsync", domain) → krbtgt-hash:{domain}, so once the krbtgt is dumped the gate
             # wrongly SKIPs every user DCSync (the 2026-06-07 lord.varys block).
-            if user and user != "krbtgt":
+            if user and not _is_krbtgt_dcsync_target(user):
                 return ("dcsync-user", f"{user}@{domain}")
             return ("dcsync", domain)
 
@@ -64,7 +68,12 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
 
         # SharpHound/AzureHound collection -> the modeled collect-graph action. Target (the access-context
         # key) is empty here; the gate rebinds it from the issuing callback's foothold (like lsass-dump).
-        if "sharphound" in combined_cf or "azurehound" in combined_cf:
+        # Only commands that can actually launch the collector should set collect-graph. Staging/registering
+        # SharpHound is not collection; marking it in-flight before execution strands the run polling for a
+        # ZIP that can never be created.
+        if _is_collection_execution_command(command_text) and (
+            "sharphound" in combined_cf or "azurehound" in combined_cf
+        ):
             return ("collect-graph", "")
 
         return None
@@ -132,11 +141,21 @@ def _tokens(text: str) -> list[str]:
     if not raw:
         return []
     try:
-        return shlex.split(raw, posix=False)
+        tokens = shlex.split(raw, posix=False)
     except ValueError:
-        return raw.split()
+        tokens = raw.split()
     except Exception:
         return []
+    expanded: list[str] = []
+    for token in tokens:
+        expanded.append(token)
+        stripped = _strip_quotes(_text(token))
+        if stripped != token and stripped:
+            try:
+                expanded.extend(shlex.split(stripped, posix=False))
+            except Exception:
+                expanded.extend(stripped.split())
+    return expanded
 
 
 def _flag_value(parsed: dict[str, Any], flag: str) -> str:
@@ -183,12 +202,64 @@ def _domain_value(parsed: dict[str, Any]) -> str:
     return _flag_value(parsed, "domain")
 
 
+def _is_collection_execution_command(command: str) -> bool:
+    command_cf = _text(command).strip().casefold()
+    if command_cf in {
+        "execute_assembly",
+        "execute-assembly",
+        "execute_pe",
+        "execute-pe",
+        "execute_bof",
+        "execute-bof",
+        "run",
+        "shell",
+        "cmd",
+        "powershell",
+        "powerpick",
+        "inline_assembly",
+        "inline-assembly",
+        "load-assembly",
+        "invoke-assembly",
+    }:
+        return True
+    return False
+
+
 def _host_value(parsed: dict[str, Any]) -> str:
     for flag in ("host", "computer", "target", "callback-host", "callback_host"):
         value = _flag_value(parsed, flag)
         if value:
             return value
     return ""
+
+
+def _is_domain_admin_membership_check(command: str, parsed: dict[str, Any], combined_cf: str) -> bool:
+    try:
+        command_cf = _text(command).casefold()
+        if command_cf not in {"run", "shell", "cmd", "powershell", "powerpick"}:
+            return False
+        if _has_flag(parsed, "add") or _has_flag(parsed, "delete"):
+            return False
+        if not _has_flag(parsed, "domain"):
+            return False
+        if "domain admins" not in combined_cf:
+            return False
+        return "net group" in combined_cf or "net.exe group" in combined_cf
+    except Exception:
+        return False
+
+
+def _is_krbtgt_dcsync_target(value: str) -> bool:
+    try:
+        text = _strip_quotes(_text(value)).strip().casefold()
+        if not text:
+            return False
+        account = re.split(r"[\\/]", text)[-1].split("@", 1)[0]
+        if account == "krbtgt":
+            return True
+        return re.search(r"(?:^|,)\s*cn\s*=\s*krbtgt\s*(?:,|$)", text, re.IGNORECASE) is not None
+    except Exception:
+        return False
 
 
 def _is_domain_dn(value: str) -> bool:

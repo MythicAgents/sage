@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+import re
 
 
 @dataclass
@@ -65,8 +66,9 @@ class EngagementState:
 
     def satisfied_predicates(self) -> set[str]:
         """Return predicates satisfied by achieved hops AND live footholds/graph facts, plus logical
-        implications (e.g. da/ea on a domain implies that domain's replication rights)."""
-        return _expand_implications(self.achieved_effects() | foothold_predicates(self))
+        implications (e.g. da/ea plus a live Kerberos context implies that domain's replication rights)."""
+        predicates = self.achieved_effects() | foothold_predicates(self)
+        return _expand_implications(_filter_live_kerberos_context_predicates(predicates))
 
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
@@ -98,13 +100,16 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
     a hop must not corroborate itself, so corroboration consults live signal only."""
     predicates: set[str] = set()
     for foothold in getattr(state, "footholds", []) or []:
-        if not getattr(foothold, "alive", False):
+        if not _is_live_target_foothold(foothold):
             continue
         predicates.add("live-foothold:*")
+        callback_id = _normalize_key(getattr(foothold, "callback_id", ""))
         host = _normalize_key(getattr(foothold, "host", ""))
         forest = _normalize_key(getattr(foothold, "forest", ""))
         identity_domain = _identity_domain(getattr(foothold, "identity", ""))
         integrity = _normalize_key(getattr(foothold, "integrity", ""))
+        if callback_id:
+            predicates.add(f"live-callback:{callback_id}")
         if forest:
             predicates.add(f"live-foothold:{forest}")
             predicates.add(f"authenticated:{forest}")
@@ -124,24 +129,29 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
     return predicates
 
 
-# Effect implications: holding one effect logically grants others, so a precondition can be satisfied without
-# a separate hop. A Domain/Enterprise Admin can replicate the directory (DCSync), so da:/ea: on a domain
-# satisfies that domain's ds-replication-rights precondition — the over-DEFER fix for the parent DCSync after a
-# SID-history climb (you are DA on the parent via a forged ticket, with no separate replication grant).
+# Effect implications: holding one effect can logically grant others, so a precondition can be satisfied
+# without a separate hop. DA/EA only unlocks remote replication when that authorization is live in a callback's
+# Kerberos context; a durable ticket proof on a dead callback is not enough to run a new DCSync.
 _DA_EFFECT_PREFIXES = ("da:", "ea:")
+_KERBEROS_CONTEXT_PREFIX = "kerberos-context:"
+_KERBEROS_CONTEXT_CALLBACK_MARKER = "@callback:"
 
 
 def _expand_implications(predicates: set[str]) -> set[str]:
     """Augment a satisfied-predicate set with logically-implied predicates. Pure; never raises.
 
-    Two implications:
-    1. da:/ea: on a domain -> that domain's ds-replication-rights (a DA/EA can DCSync).
-    2. gpo-abuse (effect system:{gpo}) on a GPO that governs a domain (gpo-domain:{gpo}:{D} graph fact)
+    Three implications:
+    1. kerberos-context:{domain}@callback:{id} + live-callback:{id} -> kerberos-context:{domain}.
+    2. da:/ea: on a domain + live kerberos-context:{domain} -> that domain's ds-replication-rights.
+    3. gpo-abuse (effect system:{gpo}) on a GPO that governs a domain (gpo-domain:{gpo}:{D} graph fact)
        -> ds-replication-rights:{D}. The SharpGPOAbuse SYSTEM task grants/holds DS-Replication on the DC
        the GPO governs, so controlling the GPO chains forward to dcsync on that domain (the effect-chained
        hop the forward planner needs to name after the first graph-derived hop)."""
     expanded = set(predicates)
     gpo_domain: dict[str, str] = {}
+    live_context_domains = _live_kerberos_context_domains(predicates)
+    for domain in live_context_domains:
+        expanded.add(f"kerberos-context:{domain}")
     for predicate in predicates:
         if predicate.startswith("gpo-domain:"):
             gpo, _, domain = predicate[len("gpo-domain:"):].partition(":")
@@ -151,13 +161,63 @@ def _expand_implications(predicates: set[str]) -> set[str]:
         for prefix in _DA_EFFECT_PREFIXES:
             if predicate.startswith(prefix):
                 domain = predicate[len(prefix):].strip()
-                if domain:
+                if domain and domain in live_context_domains:
                     expanded.add(f"ds-replication-rights:{domain}")
         if predicate.startswith("system:"):
             domain = gpo_domain.get(predicate[len("system:"):].strip())
             if domain:
                 expanded.add(f"ds-replication-rights:{domain}")
     return expanded
+
+
+def _live_kerberos_context_domains(predicates: set[str]) -> set[str]:
+    live_callbacks = {
+        predicate[len("live-callback:"):].strip()
+        for predicate in predicates
+        if predicate.startswith("live-callback:")
+    }
+    domains: set[str] = set()
+    for predicate in predicates:
+        parsed = _parse_kerberos_context_effect(predicate)
+        if not parsed:
+            continue
+        domain, callback_id = parsed
+        if domain and callback_id in live_callbacks:
+            domains.add(domain)
+    return domains
+
+
+def _filter_live_kerberos_context_predicates(predicates: set[str]) -> set[str]:
+    live_callbacks = {
+        predicate[len("live-callback:"):].strip()
+        for predicate in predicates
+        if predicate.startswith("live-callback:")
+    }
+    filtered: set[str] = set()
+    for predicate in predicates:
+        parsed = _parse_kerberos_context_effect(predicate)
+        if parsed:
+            _domain, callback_id = parsed
+            if callback_id in live_callbacks:
+                filtered.add(predicate)
+            continue
+        filtered.add(predicate)
+    return filtered
+
+
+def _parse_kerberos_context_effect(predicate: str) -> tuple[str, str] | None:
+    normalized = _normalize_predicate(predicate)
+    if not normalized.startswith(_KERBEROS_CONTEXT_PREFIX):
+        return None
+    tail = normalized[len(_KERBEROS_CONTEXT_PREFIX):]
+    domain, sep, callback_id = tail.partition(_KERBEROS_CONTEXT_CALLBACK_MARKER)
+    if not sep:
+        return None
+    domain = domain.strip()
+    callback_id = callback_id.strip()
+    if not domain or not callback_id:
+        return None
+    return domain, callback_id
 
 
 def corroborate_effect(effect: str, state: "EngagementState") -> bool:
@@ -190,8 +250,8 @@ TECHNIQUE_MODEL: dict[str, dict] = {
         "effect": "system:{host}",
         "preconditions": ["generic-write:gpo:{host}", "live-foothold:{domain}"],
         "verify": {
-            "achieved_all": ["scheduled_task_present"],
-            "partial_any": ["gpo_modified", "task_xml_present", "callback_alive"],
+            "achieved_any": ["system_command_succeeded", "system_callback_observed"],
+            "partial_any": ["scheduled_task_present", "gpo_modified", "task_xml_present", "callback_alive"],
         },
     },
     "lsass-dump": {
@@ -240,7 +300,8 @@ TECHNIQUE_MODEL: dict[str, dict] = {
         # position (a live foothold ANYWHERE), NOT a foothold inside the target domain. Requiring
         # live-foothold:{domain} false-DEFERred the parent DCSync after a SID-history climb (you hold DA on the
         # parent via a forged ticket but have no callback in it). Replication rights are satisfied either by an
-        # explicit grant (dcsync-rights-grant) OR implied by da:/ea: on the domain (see _expand_implications).
+        # explicit grant (dcsync-rights-grant) OR implied by da:/ea: paired with a live callback-scoped
+        # Kerberos context for the domain (see _expand_implications).
         "effect": "krbtgt-hash:{domain}",
         "preconditions": ["ds-replication-rights:{domain}", "live-foothold:*"],
         "verify": {
@@ -248,12 +309,25 @@ TECHNIQUE_MODEL: dict[str, dict] = {
             "partial_any": ["domain_hashes_dumped", "secretsdump_connected"],
         },
     },
+    "domain-admin-membership-check": {
+        "target_type": "domain",
+        # Read-proof that the current controlled principal is listed in Domain Admins. This is not tied to
+        # a specific add mechanism; GPO task, ACL abuse, ticket use, or any other path can prove the same
+        # durable effect when the group output contains the issuing identity.
+        "effect": "da:{domain}",
+        "preconditions": ["live-foothold:*"],
+        "verify": {
+            "achieved_any": ["domain_admin"],
+            "member_of_contains": ["domain admins"],
+            "partial_any": ["group_query_succeeded"],
+        },
+    },
     "golden-ticket": {
         "target_type": "domain",
         "effect": "da:{domain}",
         "preconditions": ["krbtgt-hash:{domain}"],
         "verify": {
-            "achieved_any": ["domain_admin", "ticket_valid"],
+            "achieved_any": ["domain_admin", "ticket_valid", "service_access_proven"],
             "member_of_contains": ["domain admins"],
             "partial_any": ["ticket_forged", "tgt_present"],
         },
@@ -270,7 +344,7 @@ TECHNIQUE_MODEL: dict[str, dict] = {
         "effect": "da:{parent}",
         "preconditions": ["krbtgt-hash:{domain}"],
         "verify": {
-            "achieved_any": ["domain_admin", "ticket_valid"],
+            "achieved_any": ["domain_admin", "ticket_valid", "service_access_proven"],
             "member_of_contains": ["domain admins", "enterprise admins"],
             "partial_any": ["ticket_forged", "tgt_present"],
         },
@@ -383,7 +457,8 @@ _CANDIDATE_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Stable display order: foothold-local effects first, then domain escalation.
 _AVAILABLE_PRIORITY: dict[str, int] = {
     "lsass-dump": 0, "gpo-abuse": 1, "rbcd-standin": 2, "dcsync-rights-grant": 3,
-    "dcsync": 4, "dcsync-user": 5, "golden-ticket": 6, "sid-history-escalation": 7,
+    "dcsync": 4, "dcsync-user": 5, "domain-admin-membership-check": 6,
+    "golden-ticket": 7, "sid-history-escalation": 8,
 }
 
 
@@ -406,21 +481,105 @@ def candidate_targets_from_state(state: "EngagementState") -> list[tuple[str, st
     return sorted(candidates)
 
 
+_OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
+
+
+def _objective_target_domains(objective) -> set:
+    """Target domain(s) the objective is about — parsed GENERICALLY from goal phrases ('Domain Admin on X',
+    'administrative control of X', 'reach/target/compromise X', 'X forest'). No hardcoded names. Intermediate
+    domains merely named in an attack-path description are not goal-phrase-adjacent and are excluded, so
+    reaching them is a milestone, not completion. Returns a (possibly empty) set."""
+    o = str(objective or "").casefold()
+    targets: set = set()
+    for m in re.finditer(
+        r"(?:domain admin(?:istrator)?s?\s+(?:on|of|over)|administrative control (?:of|over)|"
+        r"reach(?:ing)?|target(?:ing)?|compromise|pwn|own)\s+(?:the\s+)?(" + _OBJECTIVE_DOMAIN_RE + r")", o):
+        targets.add(m.group(1).strip(" .'\""))
+    for m in re.finditer(r"(" + _OBJECTIVE_DOMAIN_RE + r")\s+forest", o):
+        targets.add(m.group(1).strip(" .'\""))
+    return targets
+
+
+def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
+    """The objective's administrative-control proof is recorded AND terminal. Terminal when a proven
+    admin-control domain matches the objective's parsed TARGET domain; if no target is parseable, fall back to
+    'no further grounded hop advances' only for real human-readable objectives. Opaque ledger IDs are not
+    objectives, so they must not turn "no modeled next hop" into mission completion. A proven INTERMEDIATE
+    domain with a further hop available is a MILESTONE, not completion — so the climb continues."""
+    candidates = objective_completion_candidates(state)
+    if not candidates:
+        return False
+    objective = getattr(state, "objective", "")
+    cand_domains = {str(c.get("domain", "")).strip().casefold() for c in candidates}
+    targets = {t.casefold() for t in _objective_target_domains(objective)}
+    if targets:
+        return bool(cand_domains & targets)
+    if _objective_is_opaque_engagement_id(objective):
+        return False
+    return not has_next
+
+
+def _objective_is_opaque_engagement_id(objective: Any) -> bool:
+    return str(objective or "").strip().casefold().startswith("sage-engagement:")
+
+
 def engagement_phase(state: "EngagementState") -> str:
     """Deterministic phase of the engagement, so the operator stops asking 'should I collect more?':
-    FOOTHOLD (no live access) -> RECON (no graph yet) -> EXPLOITATION (graph + an available hop) ->
-    BLOCKED (graph but nothing modeled is available). Pure; never raises."""
+    FOOTHOLD (no live access) -> COMPLETE-CANDIDATE (recorded admin/control proof) -> EXPLOITATION
+    (a grounded hop is already available) -> RECON (no graph and no grounded hop yet) -> BLOCKED (graph but
+    nothing modeled is available). Pure; never raises."""
     try:
         alive = any(getattr(f, "alive", False) for f in getattr(state, "footholds", []) or [])
         if not alive:
             return "FOOTHOLD — establish access"
+        has_next = bool(available_hops(state) or _capability_actions_available(state))
+        # COMPLETE-CANDIDATE is TERMINAL only when the OBJECTIVE's target domain is under admin control (or, if
+        # no target is parseable, when no further hop advances). Admin control of an INTERMEDIATE domain with a
+        # further hop available is a MILESTONE — keep climbing (EXPLOITATION) instead of halting on the first
+        # domain reached.
+        if _objective_is_complete(state, has_next):
+            return "COMPLETE-CANDIDATE — administrative-control proof for the objective's target is recorded; report the proof chain before executing a new action"
+        if has_next:
+            return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
+        if current_access_collection_missing(state):
+            return "RECON — current access has not been collected; run one BloodHound collection for this access context, then analyze"
         if not getattr(state, "graph_facts", None):
             return "RECON — collect the graph ONCE, then analyze (do NOT re-collect)"
-        if available_hops(state):
-            return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
-        return "BLOCKED — no modeled hop available; escalate or await an access change (do NOT re-collect)"
+        return "BLOCKED — no modeled hop available; route to BloodHound for graph coverage/path analysis or await an access change"
     except Exception:
         return ""
+
+
+def current_access_collection_missing(state: "EngagementState") -> bool:
+    """Return whether a live non-Sage callback has no verified graph collection at its current access key.
+
+    The key includes host, identity, integrity, and achieved privilege/credential effects. After a new DA,
+    krbtgt, or real-user credential lands, the key changes, so a fresh collection is allowed only for that new
+    access context. This is the deterministic form of "re-collect when permissions changed and more data is
+    needed"; callers should consult it after checking that no grounded next action is available.
+    """
+    try:
+        achieved = state.achieved_effects()
+        for foothold in getattr(state, "footholds", []) or []:
+            if not _is_live_target_foothold(foothold):
+                continue
+            key = access_context_key(state, foothold)
+            if key and f"graph-built:{key}" not in achieved:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _capability_actions_available(state: "EngagementState") -> bool:
+    try:
+        try:
+            from . import capabilities
+        except ImportError:
+            import capabilities
+        return bool(capabilities.actions_from_state(state))
+    except Exception:
+        return False
 
 
 def available_hops(state: "EngagementState") -> list[tuple[str, str, str]]:
@@ -430,11 +589,19 @@ def available_hops(state: "EngagementState") -> list[tuple[str, str, str]]:
     out: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     try:
+        satisfied = state.satisfied_predicates()
         for technique, target in candidate_targets_from_state(state):
             key = (technique, target)
             if key in seen:
                 continue
             seen.add(key)
+            effect = _normalize_predicate(_technique_effect(technique, target))
+            if effect and effect in satisfied:
+                continue
+            if technique == "gpo-abuse" and _gpo_domain_has_downstream_progress(state, target):
+                continue
+            if technique == "rbcd-standin" and _legacy_host_takeover_superseded(state):
+                continue
             try:
                 decision, reason = gate_decision(technique, target, state)
             except Exception:
@@ -447,6 +614,70 @@ def available_hops(state: "EngagementState") -> list[tuple[str, str, str]]:
     return out
 
 
+def _legacy_host_takeover_superseded(state: "EngagementState") -> bool:
+    """Return whether legacy host-takeover candidates are stale side quests.
+
+    GenericWrite-on-computer facts do not currently carry enough target-domain context for the legacy planner
+    to prove that an RBCD hop advances the objective. Once domain-control material exists, the capability
+    planner owns downstream host actions from explicit graph facts, so the legacy RBCD candidate should not
+    block higher-privilege collection.
+    """
+    try:
+        achieved = state.achieved_effects()
+        return any(
+            effect.startswith(("da:", "ea:", "krbtgt-hash:", "kerberos-context:"))
+            for effect in achieved
+        )
+    except Exception:
+        return False
+
+
+def _gpo_domain_has_downstream_progress(state: "EngagementState", gpo: str) -> bool:
+    gpo_key = _normalize_key(gpo)
+    if not gpo_key:
+        return False
+    domains: set[str] = set()
+    try:
+        for predicate in foothold_predicates(state):
+            if not predicate.startswith("gpo-domain:"):
+                continue
+            mapped_gpo, _, domain = predicate[len("gpo-domain:"):].partition(":")
+            if _normalize_key(mapped_gpo) == gpo_key and domain.strip():
+                domains.add(_normalize_key(domain))
+    except Exception:
+        domains = set()
+    if not domains:
+        return False
+    achieved = state.achieved_effects()
+    return any(
+        effect in achieved
+        for domain in domains
+        for effect in (
+            f"ds-replication-rights:{domain}",
+            f"krbtgt-hash:{domain}",
+            f"da:{domain}",
+            f"ea:{domain}",
+        )
+    )
+
+
+def _pending_hop_superseded(state: "EngagementState", hop: Hop) -> bool:
+    technique = _normalize_key(getattr(hop, "technique", ""))
+    if technique != "gpo-abuse":
+        return False
+    target = _normalize_key(getattr(hop, "target", ""))
+    effect = _normalize_key(getattr(hop, "effect", ""))
+    gpo = target
+    if effect.startswith("system:") and effect[len("system:"):].strip():
+        gpo = effect[len("system:"):].strip()
+    if not gpo:
+        return False
+    achieved = state.achieved_effects()
+    if any(item.startswith(f"system-exec:gpo:{gpo}@") for item in achieved):
+        return True
+    return _gpo_domain_has_downstream_progress(state, gpo)
+
+
 def record_hop_result(
     state: EngagementState,
     technique: str,
@@ -456,23 +687,68 @@ def record_hop_result(
     now: str,
 ) -> EngagementState:
     """Return state with a hop result appended or updated by technique and target."""
+    effect = _technique_effect(technique, target)
+    preconditions = _technique_preconditions(technique, target)
+    return record_effect_result(
+        state,
+        technique,
+        target,
+        effect,
+        status,
+        evidence,
+        now,
+        preconditions=preconditions,
+        satisfied_effects=[effect],
+    )
+
+
+def record_effect_result(
+    state: EngagementState,
+    technique: str,
+    target: str,
+    effect: str,
+    status: str,
+    evidence: dict,
+    now: str,
+    preconditions: list[str] | None = None,
+    satisfied_effects: list[str] | None = None,
+) -> EngagementState:
+    """Return state with an explicit effect recorded.
+
+    This is the generic counterpart to ``record_hop_result``. It lets capability
+    code record effects that are not part of the legacy STRIPS technique model
+    while preserving the same hop ledger/update semantics.
+    """
     normalized_status = _normalize_key(status)
     if normalized_status not in _HOP_STATUSES:
         raise ValueError(f"invalid hop status: {status!r}")
 
-    effect = _technique_effect(technique, target)
-    preconditions = _technique_preconditions(technique, target)
+    normalized_effect = _normalize_predicate(effect)
+    normalized_effects = [
+        _normalize_predicate(item)
+        for item in (satisfied_effects if satisfied_effects is not None else [effect])
+        if _normalize_predicate(item)
+    ]
+    if normalized_effect and normalized_effect not in normalized_effects:
+        normalized_effects.insert(0, normalized_effect)
+    if not normalized_effect and normalized_effects:
+        normalized_effect = normalized_effects[0]
+    normalized_preconditions = [
+        _normalize_predicate(item)
+        for item in (preconditions or [])
+        if _normalize_predicate(item)
+    ]
     source = _text(evidence.get("source")) if isinstance(evidence, dict) else ""
     hop = Hop(
         id=_hop_id(technique, target),
         technique=technique,
         target=target,
-        effect=effect,
+        effect=normalized_effect,
         status=normalized_status,
         evidence=dict(evidence) if isinstance(evidence, dict) else {},
-        preconditions=preconditions,
-        satisfied_effects=[effect],
-        source=source or "record_hop_result",
+        preconditions=normalized_preconditions,
+        satisfied_effects=normalized_effects,
+        source=source or "record_effect_result",
         timestamp=now,
     )
 
@@ -491,6 +767,7 @@ def record_hop_result(
         footholds=list(state.footholds),
         hops=hops,
         graph_facts=list(state.graph_facts),
+        probed_effect_prefixes=set(getattr(state, "probed_effect_prefixes", set()) or set()),
     )
 
 
@@ -594,6 +871,135 @@ def _effect_evidence(state: EngagementState, effect: str) -> dict | None:
         if normalized_effect in effects:
             return dict(getattr(hop, "evidence", {}))
     return None
+
+
+def objective_completion_candidates(state: EngagementState) -> list[dict[str, str]]:
+    """Return generic objective-satisfaction candidates proven by achieved effects and live access.
+
+    This intentionally does not parse GOAD names or objective prose. It names reusable proof facts:
+    domain administrative control is a completion candidate when the ledger contains `da:`/`ea:` for a
+    domain and a currently-live callback-scoped Kerberos context proves usable access in that domain.
+    """
+    try:
+        achieved = set(getattr(state, "achieved_effects")())
+    except Exception:
+        return []
+    live_callbacks = _live_callback_ids_from_state(state)
+    if not achieved or not live_callbacks:
+        return []
+
+    candidates: list[dict[str, str]] = []
+    for admin_effect in sorted(achieved):
+        if not admin_effect.startswith(_DA_EFFECT_PREFIXES):
+            continue
+        domain = admin_effect.split(":", 1)[1].strip()
+        if not domain:
+            continue
+        context_effect, callback_id = _live_context_effect_for_domain(domain, achieved, live_callbacks)
+        cert_effect = _certificate_auth_effect_for_domain(domain, achieved)
+        if not context_effect and cert_effect:
+            context_effect, callback_id = _live_certificate_auth_effect_for_domain(
+                state,
+                cert_effect,
+                live_callbacks,
+            )
+        if not context_effect:
+            continue
+        candidate = {
+            "kind": "administrative-control",
+            "domain": domain,
+            "admin_effect": admin_effect,
+            "admin_task_id": _hop_task_id(_effect_hop(state, admin_effect)),
+            "access_effect": context_effect,
+            "access_task_id": _hop_task_id(_effect_hop(state, context_effect)),
+            "callback_id": callback_id,
+        }
+        if cert_effect:
+            candidate["auth_effect"] = cert_effect
+            candidate["auth_task_id"] = _hop_task_id(_effect_hop(state, cert_effect))
+        key_effect = f"krbtgt-hash:{domain}"
+        if key_effect in achieved:
+            candidate["key_effect"] = key_effect
+            candidate["key_task_id"] = _hop_task_id(_effect_hop(state, key_effect))
+        candidates.append(candidate)
+
+    live_domains = _live_foothold_domain_set(state)
+    candidates.sort(key=lambda item: (item.get("domain", "") in live_domains, item.get("domain", "")))
+    return candidates
+
+
+def _live_callback_ids_from_state(state: EngagementState) -> set[str]:
+    callback_ids: set[str] = set()
+    for foothold in getattr(state, "footholds", []) or []:
+        if getattr(foothold, "alive", False) is not True:
+            continue
+        callback_id = _normalize_key(getattr(foothold, "callback_id", "")).lstrip("#")
+        if callback_id:
+            callback_ids.add(callback_id)
+    return callback_ids
+
+
+def _live_foothold_domain_set(state: EngagementState) -> set[str]:
+    domains: set[str] = set()
+    for foothold in getattr(state, "footholds", []) or []:
+        if getattr(foothold, "alive", False) is not True:
+            continue
+        forest = _normalize_key(getattr(foothold, "forest", ""))
+        identity_domain = _identity_domain(getattr(foothold, "identity", ""))
+        if forest:
+            domains.add(forest)
+        if identity_domain:
+            domains.add(identity_domain)
+    return domains
+
+
+def _live_context_effect_for_domain(
+    domain: str,
+    achieved: set[str],
+    live_callbacks: set[str],
+) -> tuple[str, str]:
+    for effect in sorted(achieved):
+        parsed = _parse_kerberos_context_effect(effect)
+        if not parsed:
+            continue
+        context_domain, callback_id = parsed
+        if context_domain == domain and callback_id in live_callbacks:
+            return effect, callback_id
+    return "", ""
+
+
+def _certificate_auth_effect_for_domain(domain: str, achieved: set[str]) -> str:
+    suffix = f"@{_normalize_key(domain)}"
+    for effect in sorted(achieved):
+        if effect.startswith("certificate-auth:") and effect.endswith(suffix):
+            return effect
+    return ""
+
+
+def _live_certificate_auth_effect_for_domain(
+    state: EngagementState,
+    cert_effect: str,
+    live_callbacks: set[str],
+) -> tuple[str, str]:
+    evidence = _effect_evidence(state, cert_effect) or {}
+    for key in ("callback_id", "callback", "callback_display_id"):
+        callback_id = _normalize_key(evidence.get(key)).lstrip("#")
+        if callback_id and callback_id in live_callbacks:
+            return cert_effect, callback_id
+    return "", ""
+
+
+def _hop_task_id(hop: "Hop | None") -> str:
+    if hop is None:
+        return ""
+    evidence = getattr(hop, "evidence", {}) or {}
+    if not isinstance(evidence, dict):
+        return ""
+    for key in ("mythic_task_id", "task_id", "task", "display_id"):
+        value = _text(evidence.get(key)).strip()
+        if value:
+            return value
+    return ""
 
 
 def _technique_effect(technique: str, target: str) -> str:
@@ -732,22 +1138,34 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.append(f"Phase: {engagement_phase(state)}")
         except Exception:
             pass
+        # A completion candidate is TERMINAL (halt + suppress NEXT actions) only when no further grounded hop
+        # advances the engagement; otherwise it is an intermediate MILESTONE and the climb continues below.
+        try:
+            has_next_hop = bool(available_hops(state) or _capability_actions_available(state))
+        except Exception:
+            has_next_hop = False
+        objective_complete = _objective_is_complete(state, has_next_hop)
+        completion_lines = _render_objective_completion_candidates(state, terminal=objective_complete)
+        if completion_lines:
+            lines.extend(completion_lines)
 
         live_footholds = []
         for foothold in _render_items(getattr(state, "footholds", [])):
-            if getattr(foothold, "alive", False) is not True:
+            if not _is_live_target_foothold(foothold):
                 continue
             host = _render_value(getattr(foothold, "host", "")) or "(unknown host)"
             forest = _render_value(getattr(foothold, "forest", "")) or "(unknown forest)"
             identity = _render_value(getattr(foothold, "identity", "")) or "(unknown identity)"
             integrity = _render_value(getattr(foothold, "integrity", "")) or "(unknown integrity)"
             callback_id = _render_value(getattr(foothold, "callback_id", ""))
+            cb_text = f" | cb={callback_id}" if callback_id else ""
             live_footholds.append((
                 (_normalize_key(host), _normalize_key(forest), _normalize_key(callback_id)),
-                f"- {host} | forest={forest} | identity={identity} | integrity={integrity}",
+                f"- {host} | forest={forest} | identity={identity} | integrity={integrity}{cb_text}",
             ))
 
         achieved_hops = []
+        pending_hops = []
         blocked_hops = []
         for hop in _render_items(getattr(state, "hops", [])):
             status = _normalize_key(getattr(hop, "status", ""))
@@ -767,31 +1185,58 @@ def render_engagement_state(state: EngagementState) -> str:
                 except Exception:
                     suffix = ""
                 achieved_hops.append((sort_key, f"- {technique} → {target}: {effect}{suffix}"))
+            elif status == "pending":
+                if _pending_hop_superseded(state, hop):
+                    continue
+                pending_hops.append((sort_key, f"- pending: {technique} → {target}: {effect}"))
             elif status in {"failed", "blocked"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 
         if live_footholds:
             lines.append("Live footholds:")
             lines.extend(item for _, item in sorted(live_footholds, key=lambda item: item[0]))
+
+        available = []
+        if not objective_complete:
+            # Put executable next actions before the long achieved-hop ledger. The render is bounded for
+            # prompt injection; if completed history grows, losing history is safer than hiding the action.
+            try:
+                try:
+                    from . import capabilities
+                except ImportError:
+                    import capabilities
+                capability_lines = capabilities.render_capability_actions(state)
+            except Exception:
+                capability_lines = []
+            if capability_lines:
+                lines.extend(capability_lines)
+
+            try:
+                available = available_hops(state)
+            except Exception:
+                available = []
+            if available:
+                lines.append(
+                    "NEXT GROUNDED ACTIONS (preconditions met — execute one of these; do NOT re-collect or re-recon):"
+                )
+                for technique, target, _reason in available[:8]:
+                    lines.append(f"- {technique} → {target}")
+            if not capability_lines and not available and current_access_collection_missing(state):
+                lines.append(
+                    "GRAPH COLLECTION NEEDED: current live access has no verified BloodHound collection. "
+                    "Run exactly one collection for this changed access context, ingest it, then re-plan; "
+                    "do not re-collect an already-collected access key."
+                )
+
         if achieved_hops:
             lines.append("Achieved hops:")
             lines.extend(item for _, item in sorted(achieved_hops, key=lambda item: item[0]))
+        if pending_hops:
+            lines.append("Pending hops:")
+            lines.extend(item for _, item in sorted(pending_hops, key=lambda item: item[0]))
         if blocked_hops:
             lines.append("Failed/blocked hops:")
             lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
-
-        # Forward planner: name the next executable hop(s) so the operator ADVANCES from observed state
-        # instead of looping on recon / re-collection. Deterministic (preconditions met + not achieved).
-        try:
-            available = available_hops(state)
-        except Exception:
-            available = []
-        if available:
-            lines.append(
-                "NEXT GROUNDED ACTIONS (preconditions met — execute one of these; do NOT re-collect or re-recon):"
-            )
-            for technique, target, _reason in available[:8]:
-                lines.append(f"- {technique} → {target}")
 
         if not live_footholds and not achieved_hops and not blocked_hops and not available:
             lines.append("(no observed state yet)")
@@ -805,6 +1250,45 @@ def render_engagement_state(state: EngagementState) -> str:
                 "(no observed state yet)",
             ])
         )
+
+
+def _is_live_target_foothold(foothold: Any) -> bool:
+    if getattr(foothold, "alive", False) is not True:
+        return False
+    agent = _normalize_key(getattr(foothold, "agent", ""))
+    return agent != "sage"
+
+
+def _render_objective_completion_candidates(state: EngagementState, limit: int = 3, terminal: bool = True) -> list[str]:
+    candidates = objective_completion_candidates(state)
+    if not candidates:
+        return []
+    if terminal:
+        header = ("OBJECTIVE SATISFIED CANDIDATES (if the current objective asks for admin/control of one of "
+                  "these domains, STOP and report this proof; do not execute another capability):")
+    else:
+        header = ("ADMIN-CONTROL MILESTONES (intermediate domain control already proven — do NOT redo these; a "
+                  "further hop advances the engagement, so CONTINUE toward the objective via the NEXT actions below):")
+    lines = [header]
+    for candidate in candidates[:max(1, int(limit or 1))]:
+        pieces = [
+            f"- {candidate.get('kind', 'objective')}:{candidate.get('domain', '')}",
+            "admin=" + _effect_with_task(candidate.get("admin_effect", ""), candidate.get("admin_task_id", "")),
+            "access=" + _effect_with_task(candidate.get("access_effect", ""), candidate.get("access_task_id", "")),
+            f"callback={candidate.get('callback_id', '')}",
+        ]
+        if candidate.get("auth_effect"):
+            pieces.append("auth=" + _effect_with_task(candidate.get("auth_effect", ""), candidate.get("auth_task_id", "")))
+        if candidate.get("key_effect"):
+            pieces.append("key=" + _effect_with_task(candidate.get("key_effect", ""), candidate.get("key_task_id", "")))
+        lines.append(" | ".join(piece for piece in pieces if piece and not piece.endswith("=")))
+    return lines
+
+
+def _effect_with_task(effect: str, task_id: str) -> str:
+    if not effect:
+        return ""
+    return f"{effect} task={task_id}" if task_id else effect
 
 
 def hops_to_dicts(hops: Any) -> list[dict]:
@@ -840,6 +1324,40 @@ def hops_from_dicts(items: Any) -> list["Hop"]:
                 satisfied_effects=list(d.get("satisfied_effects") or []),
                 source=_text(d.get("source")),
                 timestamp=_text(d.get("timestamp")),
+            ))
+        except Exception:
+            continue
+    return out
+
+
+def graph_facts_to_dicts(graph_facts: Any) -> list[dict]:
+    """Serialize GraphFact dataclasses to JSON-safe dicts. Never raises."""
+    import dataclasses
+    out: list[dict] = []
+    for fact in _render_items(graph_facts):
+        try:
+            if dataclasses.is_dataclass(fact) and not isinstance(fact, type):
+                out.append(dataclasses.asdict(fact))
+        except Exception:
+            continue
+    return out
+
+
+def graph_facts_from_dicts(items: Any) -> list["GraphFact"]:
+    """Deserialize ledger graph facts back into GraphFact dataclasses. Never raises."""
+    out: list[GraphFact] = []
+    for d in _render_items(items):
+        if not isinstance(d, dict):
+            continue
+        try:
+            predicate = _normalize_predicate(d.get("predicate"))
+            if not predicate:
+                continue
+            out.append(GraphFact(
+                predicate=predicate,
+                source=_text(d.get("source")),
+                timestamp=_text(d.get("timestamp")),
+                ttl_seconds=int(d.get("ttl_seconds") or 0),
             ))
         except Exception:
             continue
