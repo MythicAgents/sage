@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage GOAD Reset"
+  short_description: "Reset and preflight Sage GOAD lab state."
+  default_prompt: "Use -goad-reset to reset or verify the Sage GOAD lab."

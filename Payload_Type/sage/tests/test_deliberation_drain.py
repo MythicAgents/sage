@@ -133,6 +133,7 @@ def test_corroboration_facts_from_cred_store_and_graph():
     mt._cred_cache = [
         {"account": "krbtgt", "realm": "north.sevenkingdoms.local", "credential_text": "deadbeef"},
         {"account": "samwell.tarly", "realm": "north.sevenkingdoms.local", "credential_text": "x"},
+        {"account": "SEVENKINGDOMS\\cersei.lannister", "realm": "sevenkingdoms.local", "credential_text": "x"},
         {"account": "empty", "realm": "north.sevenkingdoms.local", "credential_text": ""},  # no secret -> skip
     ]
     mt._cred_cache_ts = NOW
@@ -143,6 +144,8 @@ def test_corroboration_facts_from_cred_store_and_graph():
     facts = {f.predicate for f in asyncio.run(mt._corroboration_facts(NOW))}
     assert "krbtgt-hash:north.sevenkingdoms.local" in facts          # dcsync artifact
     assert "creds:samwell.tarly@north.sevenkingdoms.local" in facts  # dumped-cred artifact
+    assert "creds:cersei.lannister@sevenkingdoms.local" in facts     # NETBIOS-qualified accounts canonicalize
+    assert "creds:sevenkingdoms\\cersei.lannister@sevenkingdoms.local" not in facts
     assert "system:starkwallpaper" in facts                          # gpo-abuse still-controlled artifact
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in facts  # chains gpo-abuse->dcsync IN THE GATE
     assert not any(p.startswith("generic-write:") for p in facts)    # never emit precondition prefixes

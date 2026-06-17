@@ -13,7 +13,9 @@ convention (asyncio.run for the few async methods).
 """
 
 import asyncio
+import io
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ import pytest
 LG = Path(__file__).resolve().parents[1] / "ai" / "langgraph"
 sys.path.insert(0, str(LG))
 import engagement_ledger as el  # noqa: E402
+import engagement_state as es  # noqa: E402
 import operation_context as oc  # noqa: E402
 import mythic_tools  # noqa: E402
 from mythic import mythic as MM  # noqa: E402
@@ -28,6 +31,21 @@ from mythic import mythic as MM  # noqa: E402
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
+
+
+def _ledger_hop(technique: str, target: str, effect: str, status: str = "achieved") -> dict:
+    return {
+        "id": f"{technique}:{target}",
+        "technique": technique,
+        "target": target,
+        "effect": effect,
+        "status": status,
+        "evidence": {"source": "test", "provenance": "run"},
+        "preconditions": [],
+        "satisfied_effects": [effect],
+        "source": "test",
+        "timestamp": "2026-06-11T00:00:00Z",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +214,47 @@ def test_ensure_engagement_key_resolves_operation(monkeypatch, tmp_path):
     assert Path(mt._engagement_ledger_path()).exists()
 
 
+def test_default_ledger_not_loaded_before_operation_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
+    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+    el.save({
+        "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
+    }, "default")
+
+    mt = mythic_tools.MythicTools(agent_task_id="x")
+
+    assert mt._engagement_hops == []
+
+
+def test_operation_key_load_replaces_stale_default_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
+    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+    el.save({
+        "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
+    }, "default")
+    el.save({
+        "hops": [_ledger_hop("capability:forge-golden-ticket", "domain=child.local;target_domain=parent.local", "da:parent.local")],
+    }, "Operation_Chimera_1")
+
+    async def fake_key(client):
+        return "Operation_Chimera_1"
+    monkeypatch.setattr(oc, "resolve_operation_key", fake_key)
+
+    mt = mythic_tools.MythicTools(agent_task_id="x")
+    mt.client = object()
+    mt._engagement_hops = es.hops_from_dicts([
+        _ledger_hop("collect-graph", "stale", "graph-built:stale"),
+    ])
+
+    _run(mt._ensure_engagement_key())
+
+    effects = {getattr(h, "effect", "") for h in mt._engagement_hops}
+    assert "da:parent.local" in effects
+    assert "graph-built:stale" not in effects
+
+
 def test_explicit_engagement_id_overrides_operation(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "manual-eng")
@@ -209,6 +268,23 @@ def test_explicit_engagement_id_overrides_operation(monkeypatch, tmp_path):
     mt.client = object()
     _run(mt._ensure_engagement_key())
     assert mt._eng_key() == "manual-eng"
+
+
+def test_engagement_objective_env_override(monkeypatch):
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "obtain administrative control of essos.local")
+
+    mt = mythic_tools.MythicTools(agent_task_id="x")
+
+    assert mt._engagement_objective() == "obtain administrative control of essos.local"
+
+
+def test_bloodhound_collection_zip_shape_validation():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("computers.json", "[]")
+
+    assert mythic_tools._looks_like_bloodhound_collection_zip(buf.getvalue()) is True
+    assert mythic_tools._looks_like_bloodhound_collection_zip(b"SharpHound help text") is False
 
 
 def test_ensure_engagement_key_idempotent(monkeypatch, tmp_path):
@@ -338,3 +414,107 @@ def test_state_env_overrides(monkeypatch):
     state = _load_state_module()
     monkeypatch.setenv("SAGE_ENGAGEMENT_ID", "manual-eng")
     assert _run(state._resolve_engagement_id(_FakeTask())) == "manual-eng"
+
+
+def test_state_reconcile_imports_credentials_without_returning_secret(monkeypatch):
+    state = _load_state_module()
+    secret = "a" * 64
+    created = []
+
+    async def fake_resolve_operation(client):
+        return (1, "Operation Chimera")
+
+    async def fake_query(client, query, variables=None):
+        assert variables == {"op": 1}
+        return {"credential": []}
+
+    async def fake_create(client, credential, account="", realm="", comment="", credential_type=""):
+        created.append({
+            "credential": credential,
+            "account": account,
+            "realm": realm,
+            "comment": comment,
+            "credential_type": credential_type,
+        })
+        return {"status": "success", "id": 99}
+
+    monkeypatch.setattr(state.operation_context, "resolve_operation", fake_resolve_operation)
+    monkeypatch.setattr(state.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(state.mythic, "create_credential", fake_create)
+
+    material = {
+        "account": "krbtgt",
+        "realm": "sevenkingdoms.local",
+        "secret_type": "aes256",
+        "credential_type": "key",
+        "credential": secret,
+    }
+
+    # Dry-run is the DEFAULT: task output is attacker-influenceable, so nothing is written to the Mythic
+    # credential store without an explicit operator opt-in. Nothing created, nothing referenced, secret never leaked.
+    refs_dry, notes_dry = _run(state._import_reconciled_credentials(object(), [material], 450))
+    assert created == []
+    assert refs_dry == []
+    assert any("[dry-run]" in n for n in notes_dry)
+    assert secret not in "\n".join(notes_dry)
+
+    # apply=True is the explicit opt-in that actually writes the credential.
+    refs, notes = _run(state._import_reconciled_credentials(object(), [material], 450, apply=True))
+
+    assert created == [{
+        "credential": secret,
+        "account": "krbtgt",
+        "realm": "sevenkingdoms.local",
+        "comment": "Sage task-history reconcile from Mythic task 450: aes256",
+        "credential_type": "key",
+    }]
+    assert refs == [{
+        "id": 99,
+        "account": "krbtgt",
+        "realm": "sevenkingdoms.local",
+        "secret_type": "aes256",
+        "credential_type": "key",
+        "status": "added",
+    }]
+    assert secret not in str(refs)
+    assert secret not in "\n".join(notes)
+
+
+def test_state_reconcile_reuses_existing_exact_credential(monkeypatch):
+    state = _load_state_module()
+    secret = "b" * 32
+    created = []
+
+    async def fake_resolve_operation(client):
+        return (1, "Operation Chimera")
+
+    async def fake_query(client, query, variables=None):
+        return {"credential": [{
+            "id": 7,
+            "account": "krbtgt",
+            "realm": "sevenkingdoms.local",
+            "type": "hash",
+            "credential_text": secret,
+            "comment": "manual",
+        }]}
+
+    async def fake_create(*args, **kwargs):
+        created.append(kwargs)
+        return {"status": "success", "id": 100}
+
+    monkeypatch.setattr(state.operation_context, "resolve_operation", fake_resolve_operation)
+    monkeypatch.setattr(state.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(state.mythic, "create_credential", fake_create)
+
+    refs, notes = _run(state._import_reconciled_credentials(object(), [{
+        "account": "krbtgt",
+        "realm": "sevenkingdoms.local",
+        "secret_type": "ntlm",
+        "credential_type": "hash",
+        "credential": secret.upper(),
+    }], 450))
+
+    assert created == []
+    assert refs[0]["id"] == 7
+    assert refs[0]["status"] == "existing"
+    assert "reused" in "\n".join(notes)

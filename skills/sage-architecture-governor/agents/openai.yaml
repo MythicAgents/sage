@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Architecture Governor"
+  short_description: "Gate high-risk Sage architecture work"
+  default_prompt: "Use $sage-architecture-governor to prepare and enforce an architecture gate before changing Sage autonomous harness code."

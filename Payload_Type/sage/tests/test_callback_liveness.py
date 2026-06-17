@@ -45,6 +45,22 @@ def test_dead_when_gap_exceeds_threshold():
     assert "no checkin for 18000s" in result["reason"]
 
 
+def test_three_second_sleep_four_hour_gap_is_dead():
+    result = _compute_liveness(
+        display_id=13,
+        last_checkin=_checkin(4 * 60 * 60),
+        callback_interval=3,
+        callback_jitter=0,
+        tasks=[],
+        now=NOW,
+    )
+
+    assert result["status"] == "dead"
+    assert result["alive"] is False
+    assert result["threshold_seconds"] == 45
+    assert result["seconds_since_checkin"] == 14400
+
+
 def test_sleep_task_interval_overrides_c2_profile_threshold():
     last_checkin = _checkin(240)
     sleep_task = {

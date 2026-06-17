@@ -3,7 +3,8 @@
 Verify the per-turn fix for the mis-wired continue-loop-only injection:
 
 - Model._render_engagement_state_for_injection() is a cheap, synchronous, in-memory render that
-  gates correctly (None unless autonomous + gate-on + observed state present) and emits the
+  gates correctly (None unless autonomous + observed state present; the STRIPS planning block is
+  included only when the gate is on) and emits the
   `=== ENGAGEMENT STATE` block otherwise.
 - _EngagementStateMiddleware._augment appends the rendered block as a HumanMessage via
   request.override (EPHEMERAL — the original request is untouched, so it never accumulates).
@@ -79,13 +80,20 @@ def test_render_none_when_not_autonomous(monkeypatch):
     assert m._render_engagement_state_for_injection() is None
 
 
-def test_render_none_when_gate_off(monkeypatch):
+def test_render_observed_state_when_gate_off(monkeypatch):
+    # Stage A (engagement-gate retirement): gate OFF still injects OBSERVED state (footholds/hops) so the
+    # model can plan from the ledger — but WITHOUT the STRIPS planning block (Phase / NEXT GROUNDED ACTIONS).
     mod = _load_model_module()
     _set_gate(monkeypatch, False)
     m = mod.Model.__new__(mod.Model)
     m._autonomous_solve = True
     m.mythic_client = _StubClient(hops=_achieved_hop())
-    assert m._render_engagement_state_for_injection() is None
+    out = m._render_engagement_state_for_injection()
+    assert out is not None
+    assert "=== ENGAGEMENT STATE" in out
+    assert "gpo-abuse" in out             # observed hop is present
+    assert "NEXT GROUNDED" not in out     # STRIPS planning suppressed when gate off
+    assert "Phase:" not in out
 
 
 def test_render_none_when_no_observed_state(monkeypatch):

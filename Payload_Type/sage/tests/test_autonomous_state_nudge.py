@@ -15,6 +15,7 @@ this repo does not configure pytest-asyncio.
 
 import asyncio
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -37,12 +38,41 @@ def _load_model_class():
 class _StubMythicClient:
     """Minimal MythicTools-like stub exposing what the helper reads."""
 
-    def __init__(self, hops=None, objective="sage-engagement:test"):
+    def __init__(self, hops=None, objective="sage-engagement:test", footholds=None, graph_facts=None):
         self._engagement_hops = list(hops or [])
+        self._engagement_footholds = list(footholds or [])
+        self._engagement_graph_facts = list(graph_facts or [])
         self._objective = objective
 
     def _engagement_objective(self) -> str:
         return self._objective
+
+
+class _ReconcilingStubMythicClient(_StubMythicClient):
+    """Stub that supports access_reconciler.reconcile_access without issuing payload tasks."""
+
+    def __init__(self, *args, callback_id="6", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.client = object()
+        self.callback_id = str(callback_id)
+        self.callback_reads = 0
+
+    async def get_all_active_callbacks(self):
+        self.callback_reads += 1
+        return json.dumps([{
+            "id": int(self.callback_id),
+            "display_id": int(self.callback_id),
+            "agent": "apollo",
+            "host": "CASTELBLACK",
+            "user": "samwell.tarly",
+            "integrity": 2,
+        }])
+
+
+class _GraphMustNotRun:
+    async def astream(self, *args, **kwargs):
+        raise AssertionError("graph.astream should not run after preflight objective completion")
+        yield {}
 
 
 def _achieved_gpo_abuse_hop():
@@ -56,6 +86,35 @@ def _achieved_gpo_abuse_hop():
         "2026-06-06T12:00:00Z",
     )
     return state.hops
+
+
+def _achieved_effect(effect, task_id, technique="capability:proof", target="essos.local"):
+    return engagement_state.Hop(
+        id=f"{technique}:{target}:{effect}",
+        technique=technique,
+        target=target,
+        effect=effect,
+        status="achieved",
+        evidence={"source": "test", "task_id": str(task_id), "provenance": "run"},
+        preconditions=[],
+        satisfied_effects=[effect],
+        source="test",
+        timestamp="2026-06-14T00:00:00Z",
+    )
+
+
+def _live_apollo_foothold(callback_id="6"):
+    return engagement_state.Foothold(
+        callback_id=str(callback_id),
+        agent="apollo",
+        host="castelblack",
+        forest="north.sevenkingdoms.local",
+        identity="NORTH\\samwell.tarly",
+        integrity="medium",
+        alive=True,
+        source="test",
+        timestamp="2026-06-14T00:00:00Z",
+    )
 
 
 _DIRECTIVE_MARKER = "do NOT re-issue"
@@ -231,3 +290,193 @@ def test_build_state_does_not_raise_on_broken_client(monkeypatch):
 
     state = asyncio.run(m._build_current_engagement_state())
     assert state is None
+
+
+# ---------------------------------------------------------------------------
+# 5. Terminal objective completion: full autonomous solve stops on verified target proof
+# ---------------------------------------------------------------------------
+
+
+def test_objective_completion_report_streams_and_sets_handback(monkeypatch):
+    Model = _load_model_class()
+    package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
+    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    m._objective_completion_report_streamed = False
+    m.state = {}
+    m.mythic_client = _StubMythicClient(
+        objective="obtain administrative control of essos.local",
+        footholds=[_live_apollo_foothold("6")],
+        hops=[
+            _achieved_effect("da:essos.local", "229", technique="adcs-certificate-auth"),
+            _achieved_effect("certificate-auth:administrator@essos.local", "229", technique="adcs-certificate-auth"),
+            _achieved_effect(
+                "kerberos-context:essos.local@callback:6",
+                "229",
+                technique="capability:ensure-kerberos-context",
+                target="domain=essos.local;callback=6",
+            ),
+            _achieved_effect("krbtgt-hash:essos.local", "232", technique="dcsync"),
+        ],
+    )
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+
+    m._stream_message_to_mythic = _stream
+
+    assert asyncio.run(m._maybe_stream_objective_completion_stop()) is True
+    assert m.state["recursion_handback"] is True
+    assert len(streamed) == 1
+    assert "Objective complete" in streamed[0]
+    assert "`da:essos.local` task=229" in streamed[0]
+    assert "`kerberos-context:essos.local@callback:6` task=229 cb=6" in streamed[0]
+    assert "`krbtgt-hash:essos.local` task=232" in streamed[0]
+    assert "Sage is stopping" in streamed[0]
+
+
+def test_objective_completion_report_ignores_opaque_engagement_id(monkeypatch):
+    Model = _load_model_class()
+    package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
+    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    m.mythic_client = _StubMythicClient(
+        objective="sage-engagement:d499206c-e493-45cf-a422-54ffa33fcece",
+        footholds=[_live_apollo_foothold("6")],
+        hops=[
+            _achieved_effect("da:essos.local", "229", technique="adcs-certificate-auth"),
+            _achieved_effect(
+                "kerberos-context:essos.local@callback:6",
+                "229",
+                technique="capability:ensure-kerberos-context",
+                target="domain=essos.local;callback=6",
+            ),
+        ],
+    )
+
+    assert m._objective_completion_report() is None
+
+
+def test_objective_completion_preflight_refreshes_empty_foothold_cache(monkeypatch):
+    Model = _load_model_class()
+    package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
+    package_access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
+    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+
+    async def _alive(client, callback_display_id):
+        return {"alive": str(callback_display_id) == "6"}
+
+    monkeypatch.setattr(package_access_reconciler, "assess_callback_liveness", _alive)
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    m._objective_completion_report_streamed = False
+    m.state = {}
+    m.mythic_client = _ReconcilingStubMythicClient(
+        objective="obtain administrative control of essos.local",
+        footholds=[],
+        hops=[
+            _achieved_effect("da:essos.local", "229", technique="adcs-certificate-auth"),
+            _achieved_effect(
+                "kerberos-context:essos.local@callback:6",
+                "229",
+                technique="capability:ensure-kerberos-context",
+                target="domain=essos.local;callback=6",
+            ),
+            _achieved_effect("krbtgt-hash:essos.local", "232", technique="dcsync"),
+        ],
+    )
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+
+    m._stream_message_to_mythic = _stream
+
+    assert asyncio.run(m._maybe_stream_objective_completion_stop(refresh_footholds=True)) is True
+    assert m.mythic_client.callback_reads == 1
+    assert len(m.mythic_client._engagement_footholds) == 1
+    assert streamed and "Objective complete" in streamed[0]
+
+
+def test_invoke_preflight_stops_before_graph_astream(monkeypatch):
+    Model = _load_model_class()
+    package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
+    package_access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
+    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
+
+    async def _alive(client, callback_display_id):
+        return {"alive": str(callback_display_id) == "6"}
+
+    monkeypatch.setattr(package_access_reconciler, "assess_callback_liveness", _alive)
+
+    m = Model.__new__(Model)
+    m.provider = "test"
+    m.model = "test"
+    m.mode = "auto"
+    m.graph = _GraphMustNotRun()
+    m.verbose = False
+    m._autonomous_solve = False
+    m._objective_completion_report_streamed = False
+    m._message_seq = 1
+    m._stop_requested = False
+    m.agent_task_id = "agent-task"
+    m.task_id = 272
+    m.state = {
+        "messages": [],
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "recursion_summary_requested": False,
+        "recursion_handback": False,
+    }
+    m.mythic_client = _ReconcilingStubMythicClient(
+        objective="obtain administrative control of essos.local",
+        footholds=[],
+        hops=[
+            _achieved_effect("da:essos.local", "229", technique="adcs-certificate-auth"),
+            _achieved_effect(
+                "kerberos-context:essos.local@callback:6",
+                "229",
+                technique="capability:ensure-kerberos-context",
+                target="domain=essos.local;callback=6",
+            ),
+            _achieved_effect("krbtgt-hash:essos.local", "232", technique="dcsync"),
+        ],
+    )
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+
+    m._stream_message_to_mythic = _stream
+
+    prompt = (
+        "Continue the autonomous objective from the observed engagement state. If the objective is already "
+        "satisfied, report the proof chain and stop."
+    )
+    result = asyncio.run(m.invoke(prompt, is_interactive=False))
+
+    assert result == ""
+    assert m.state["recursion_handback"] is True
+    assert m.mythic_client.callback_reads == 1
+    assert any("Continue the autonomous objective" in item for item in streamed)
+    assert any("Objective complete" in item for item in streamed)
+
+
+def test_objective_completion_preflight_does_not_intercept_unrelated_query():
+    Model = _load_model_class()
+    m = Model.__new__(Model)
+    m._autonomous_solve = False
+
+    assert m._objective_completion_preflight_allowed("list active callbacks") is False
+    assert m._objective_completion_preflight_allowed("Continue the autonomous objective from the observed engagement state") is True

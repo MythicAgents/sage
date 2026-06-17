@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Focused Capability Tests"
+  short_description: "Run focused capability smoke and repair tests."
+  default_prompt: "Use -focused-capability-tests to validate one Sage capability or adapter path."

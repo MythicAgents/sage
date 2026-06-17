@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Mythic Payload Deploy"
+  short_description: "Download, stage, and launch Mythic payloads"
+  default_prompt: "Use $sage-mythic-payload-deploy to download a Mythic payload, stage it to a Ludus Windows host, and launch it under the desired user."

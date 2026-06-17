@@ -30,7 +30,10 @@ def test_project_access_maps_live_apollo_and_merlin_to_north_footholds():
         },
     ]
 
-    footholds = access_reconciler.project_access(raw_callbacks, NOW, {"10": True, "11": True})
+    footholds = access_reconciler.project_access(
+        raw_callbacks, NOW, {"10": True, "11": True},
+        netbios_to_fqdn={"NORTH": "north.sevenkingdoms.local"},
+    )
 
     assert [foothold.callback_id for foothold in footholds] == ["10", "11"]
     assert [foothold.agent for foothold in footholds] == ["Apollo", "Merlin"]
@@ -39,6 +42,28 @@ def test_project_access_maps_live_apollo_and_merlin_to_north_footholds():
         "north.sevenkingdoms.local",
     ]
     assert all(foothold.alive is True for foothold in footholds)
+
+
+def test_project_access_reads_nested_payloadtype_name_for_sage_filtering():
+    foothold = access_reconciler.project_access(
+        [
+            {
+                "display_id": 1,
+                "payload": {"payloadtype": {"name": "sage"}},
+                "host": "SAGE",
+                "user": "Sage",
+                "integrity_level": 2,
+            }
+        ],
+        NOW,
+        {"1": True},
+    )[0]
+
+    assert foothold.agent == "sage"
+    rendered = engagement_state.render_engagement_state(
+        engagement_state.EngagementState(objective="x", footholds=[foothold])
+    )
+    assert "SAGE | forest=sage" not in rendered
 
 
 def test_dead_winterfell_system_callback_does_not_satisfy_host_predicates_until_live():
@@ -86,6 +111,7 @@ def test_forest_scoping_keeps_north_access_from_satisfying_essos_access():
         ],
         NOW,
         {"20": True},
+        netbios_to_fqdn={"NORTH": "north.sevenkingdoms.local"},
     )[0]
 
     predicates = engagement_state.EngagementState(
@@ -98,8 +124,37 @@ def test_forest_scoping_keeps_north_access_from_satisfying_essos_access():
     assert "live-foothold:essos.local" not in predicates
 
 
-def test_forest_normalization_maps_netbios_north_to_fqdn():
-    assert access_reconciler.normalize_forest("NORTH") == "north.sevenkingdoms.local"
+def test_forest_normalization_maps_netbios_via_engagement_config():
+    # An engagement-supplied map resolves NetBIOS -> FQDN (no hardcoded lab topology).
+    assert access_reconciler.normalize_forest(
+        "NORTH", netbios_to_fqdn={"NORTH": "north.sevenkingdoms.local"}
+    ) == "north.sevenkingdoms.local"
+    # A generic, non-lab map works identically — proves environment-agnosticism.
+    assert access_reconciler.normalize_forest(
+        "CORP", netbios_to_fqdn={"CORP": "corp.example.com"}
+    ) == "corp.example.com"
+
+
+def test_forest_normalization_passes_netbios_through_without_config():
+    # With NO engagement map, a NetBIOS hint passes through casefolded — no fabricated FQDN,
+    # and no hardcoded GOAD default (the old DEFAULT_NETBIOS_TO_FQDN is gone).
+    assert access_reconciler.normalize_forest("NORTH") == "north"
+    assert access_reconciler.normalize_forest("CORP") == "corp"
+    assert not hasattr(access_reconciler, "DEFAULT_NETBIOS_TO_FQDN")
+
+
+def test_engagement_netbios_map_reads_env_json(monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", '{"CORP": "corp.example.com"}')
+    assert access_reconciler._engagement_netbios_map() == {"CORP": "corp.example.com"}
+
+
+def test_engagement_netbios_map_failsoft_on_unset_or_malformed(monkeypatch):
+    monkeypatch.delenv("SAGE_ENGAGEMENT_NETBIOS_MAP", raising=False)
+    assert access_reconciler._engagement_netbios_map() == {}
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", "not json{{")
+    assert access_reconciler._engagement_netbios_map() == {}
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", '["not", "a", "dict"]')
+    assert access_reconciler._engagement_netbios_map() == {}
 
 
 def test_integrity_normalization_maps_system_identity_to_system():

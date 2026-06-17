@@ -47,7 +47,23 @@ def _drive_chain(state, max_rounds=25):
             break
         technique, target, _reason = hops[0]
         sequence.append((technique, target))
-        state = es.record_hop_result(state, technique, target, "achieved", {"source": "eval"}, NOW)
+        effect = es._technique_effect(technique, target)
+        callback_id = "3"
+        satisfied = [effect]
+        prefix, _, effect_domain = effect.partition(":")
+        if prefix in {"da", "ea"} and effect_domain:
+            satisfied.append(f"kerberos-context:{effect_domain}@callback:{callback_id}")
+        state = es.record_effect_result(
+            state,
+            technique,
+            target,
+            effect,
+            "achieved",
+            {"source": "eval", "callback_id": callback_id},
+            NOW,
+            preconditions=es._technique_preconditions(technique, target),
+            satisfied_effects=satisfied,
+        )
     return sequence, state
 
 

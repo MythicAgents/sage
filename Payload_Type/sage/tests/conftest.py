@@ -14,4 +14,5 @@ def _isolate_engagement_ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", ...) after this fixture (its value wins).
     """
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
+    monkeypatch.setenv("SAGE_TRAJECTORY_STORE", str(tmp_path / "trajectory" / "transitions.jsonl"))
     yield

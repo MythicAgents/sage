@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Forge Ops"
+  short_description: "Run Sage-specific Forge/Codex helper workflows."
+  default_prompt: "Use -forge-ops for Sage Forge helper workflows."

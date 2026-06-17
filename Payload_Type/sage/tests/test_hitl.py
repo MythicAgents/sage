@@ -26,6 +26,8 @@ def test_guarded_tools_are_state_changing_only():
     expected = {
         "issue_task_and_waitfor_task_output",
         "upload_file_by_file_uuid",
+        "materialize_capability_inputs",
+        "execute_capability",
         "create_payload",
         "download_tool",
         "ingest_collection",

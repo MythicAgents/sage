@@ -85,8 +85,8 @@ def test_candidate_targets_inverts_graph_and_effect_predicates():
     assert ("gpo-abuse", "winterfell") in cands
     assert ("golden-ticket", "sevenkingdoms.local") in cands
     assert ("sid-history-escalation", "sevenkingdoms.local") in cands
-    # da:/ea: imply ds-replication-rights -> dcsync candidate; here we hold krbtgt-hash directly so the
-    # dcsync candidate for that domain is also enumerable via ds-replication-rights only when implied.
+    # krbtgt-hash still enumerates ticket-forge candidates; DCSync candidates come from explicit
+    # replication rights or DA/EA paired with a live callback-scoped Kerberos context.
 
 
 # --- available_hops ---------------------------------------------------------------------------------
@@ -125,6 +125,16 @@ def test_available_hops_chains_golden_ticket_after_krbtgt():
     )
     available = [(t, tgt) for t, tgt, _ in engagement_state.available_hops(state)]
     assert ("golden-ticket", "north.sevenkingdoms.local") in available
+
+
+def test_phase_is_exploitation_when_grounded_hop_exists_without_graph_facts():
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[_samwell_foothold()],
+        hops=[_hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local")],
+    )
+
+    assert engagement_state.engagement_phase(state).startswith("EXPLOITATION")
 
 
 # --- render NEXT GROUNDED ACTIONS -------------------------------------------------------------------
@@ -194,6 +204,40 @@ def test_reconcile_then_plan_names_gpo_abuse():
     assert ("gpo-abuse", "starkwallpaper") in [(t, tgt) for t, tgt, _ in engagement_state.available_hops(state)]
 
 
+def test_gpo_grounded_action_suppressed_after_downstream_domain_proof():
+    foothold = _samwell_foothold()
+    facts = [
+        engagement_state.GraphFact(
+            predicate="generic-write:gpo:wallpaperpolicy",
+            source="bloodhound:cypher",
+            timestamp=NOW,
+            ttl_seconds=TTL,
+        ),
+        engagement_state.GraphFact(
+            predicate="gpo-domain:wallpaperpolicy:child.example.local",
+            source="bloodhound:cypher",
+            timestamp=NOW,
+            ttl_seconds=TTL,
+        ),
+    ]
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        graph_facts=facts,
+        hops=[
+            _hop(
+                "dcsync",
+                "child.example.local",
+                "krbtgt-hash:child.example.local",
+            )
+        ],
+    )
+
+    available = [(t, tgt) for t, tgt, _ in engagement_state.available_hops(state)]
+
+    assert ("gpo-abuse", "wallpaperpolicy") not in available
+
+
 # --- sync guard: every modeled, structurally-enumerable technique has a candidate source -------------
 
 # --- Part 1: collect-graph (deterministic collect-once-per-privilege) -------------------------------
@@ -202,6 +246,12 @@ def test_classifier_maps_sharphound_to_collect_graph():
     assert intent_classifier.classify_tool_call(
         "execute_assembly", {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"}
     ) == ("collect-graph", "")
+
+
+def test_classifier_does_not_mark_sharphound_registration_as_collect_graph():
+    assert intent_classifier.classify_tool_call(
+        "register_file", {"filename": "SharpHound.exe"}
+    ) is None
 
 
 def test_classifier_keeps_sharpgpoabuse_as_gpo_abuse_not_collect():
@@ -248,11 +298,85 @@ def test_collect_graph_not_a_planner_candidate():
     assert all(t != "collect-graph" for t, _, _ in engagement_state.available_hops(built))
 
 
+def test_phase_requests_collection_after_access_key_changes_and_no_next_action():
+    fh = _samwell_foothold()
+    base = engagement_state.EngagementState(objective="reach essos.local forest", footholds=[fh])
+    old_key = engagement_state.access_context_key(base, fh)
+    state = engagement_state.EngagementState(
+        objective="reach essos.local forest",
+        footholds=[fh],
+        graph_facts=[
+            engagement_state.GraphFact(
+                predicate="domain-collected:sevenkingdoms.local",
+                source="bloodhound:test",
+                timestamp=NOW,
+                ttl_seconds=TTL,
+            )
+        ],
+        hops=[
+            _hop("collect-graph", old_key, f"graph-built:{old_key}"),
+            _hop("forge-golden-ticket", "sevenkingdoms.local", "da:sevenkingdoms.local"),
+            _hop(
+                "ensure-kerberos-context",
+                "sevenkingdoms.local",
+                "kerberos-context:sevenkingdoms.local@callback:2",
+            ),
+            _hop("dcsync", "sevenkingdoms.local", "krbtgt-hash:sevenkingdoms.local"),
+        ],
+    )
+
+    assert engagement_state.current_access_collection_missing(state) is True
+    assert engagement_state.engagement_phase(state).startswith("RECON — current access")
+    assert "GRAPH COLLECTION NEEDED" in engagement_state.render_engagement_state(state)
+
+
+def test_legacy_acl_side_quests_do_not_block_collection_after_domain_control():
+    fh = _samwell_foothold()
+    base = engagement_state.EngagementState(objective="obtain administrative control of essos.local", footholds=[fh])
+    old_key = engagement_state.access_context_key(base, fh)
+    state = engagement_state.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[fh],
+        graph_facts=[
+            engagement_state.GraphFact(
+                predicate="generic-write:computer:kingslanding",
+                source="bloodhound:test",
+                timestamp=NOW,
+                ttl_seconds=TTL,
+            ),
+            engagement_state.GraphFact(
+                predicate="write-dacl:domain:sevenkingdoms.local",
+                source="bloodhound:test",
+                timestamp=NOW,
+                ttl_seconds=TTL,
+            ),
+        ],
+        hops=[
+            _hop("collect-graph", old_key, f"graph-built:{old_key}"),
+            _hop("forge-golden-ticket", "sevenkingdoms.local", "da:sevenkingdoms.local"),
+            _hop(
+                "ensure-kerberos-context",
+                "sevenkingdoms.local",
+                "kerberos-context:sevenkingdoms.local@callback:2",
+            ),
+            _hop("dcsync", "sevenkingdoms.local", "krbtgt-hash:sevenkingdoms.local"),
+        ],
+    )
+
+    available = [(technique, target) for technique, target, _ in engagement_state.available_hops(state)]
+
+    assert ("rbcd-standin", "kingslanding") not in available
+    assert ("dcsync-rights-grant", "sevenkingdoms.local") not in available
+    assert engagement_state.current_access_collection_missing(state) is True
+    assert engagement_state.engagement_phase(state).startswith("RECON — current access")
+
+
 def test_candidate_sources_cover_enumerable_techniques():
-    # dcsync-user (needs a specific user) and collect-graph (Part 1, not in this pass) are intentionally
-    # not auto-enumerated; every OTHER technique must be reachable from a candidate-source prefix.
+    # dcsync-user (needs a specific user), collect-graph (Part 1, not in this pass), and
+    # domain-admin-membership-check (read-proof emitted from a command/result pair) are intentionally not
+    # auto-enumerated; every OTHER technique must be reachable from a candidate-source prefix.
     sourced = {tech for _prefix, techs in engagement_state._CANDIDATE_SOURCES for tech in techs}
-    exempt = {"dcsync-user", "collect-graph"}
+    exempt = {"dcsync-user", "collect-graph", "domain-admin-membership-check"}
     for technique in engagement_state.TECHNIQUE_MODEL:
         if technique in exempt:
             continue

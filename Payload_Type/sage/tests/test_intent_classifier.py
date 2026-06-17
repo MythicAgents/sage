@@ -73,6 +73,24 @@ def test_apollo_dcsync_command_extracts_dict_domain():
     ) == ("dcsync", "north.sevenkingdoms.local")
 
 
+def test_dcsync_krbtgt_dn_target_is_domain_krbtgt_not_user_dcsync():
+    assert intent_classifier.classify_tool_call(
+        "dcsync",
+        {
+            "domain": "north.sevenkingdoms.local",
+            "user": "CN=krbtgt,CN=Users,DC=north,DC=sevenkingdoms,DC=local",
+            "dc": "winterfell.north.sevenkingdoms.local",
+        },
+    ) == ("dcsync", "north.sevenkingdoms.local")
+
+
+def test_dcsync_domain_qualified_krbtgt_is_domain_krbtgt_not_user_dcsync():
+    assert intent_classifier.classify_tool_call(
+        "execute_pe",
+        {"Commands": ["lsadump::dcsync /domain:north.sevenkingdoms.local /user:NORTH\\krbtgt"]},
+    ) == ("dcsync", "north.sevenkingdoms.local")
+
+
 def test_dcsync_order_wins_over_bare_golden_token():
     assert intent_classifier.classify_tool_call(
         "mimikatz",
@@ -92,6 +110,17 @@ def test_bare_golden_token_extracts_domain_from_cli():
         "rubeus",
         "golden /domain:SevenKingdoms.Local",
     ) == ("golden-ticket", "sevenkingdoms.local")
+
+
+def test_net_domain_admins_read_is_membership_check_not_gpo_add():
+    assert intent_classifier.classify_tool_call(
+        "run",
+        'net group "Domain Admins" /domain',
+    ) == ("domain-admin-membership-check", "")
+    assert intent_classifier.classify_tool_call(
+        "run",
+        'net group "Domain Admins" alice /add /domain',
+    ) is None
 
 
 def test_lsass_dump_nanodump_extracts_host():

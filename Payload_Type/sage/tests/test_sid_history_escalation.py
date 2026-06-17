@@ -50,6 +50,15 @@ def test_classifier_mimikatz_extrasids_form():
     assert tech == "sid-history-escalation" and target == CHILD
 
 
+def test_classifier_handles_quoted_mimikatz_extrasids_form():
+    tech, target = ic.classify_tool_call(
+        "mimikatz",
+        {"arguments": (f'"kerberos::golden /user:administrator /domain:{CHILD} '
+                       f'/sid:S-1-5-21-CHILD /sids:S-1-5-21-ROOT-519 /krbtgt:hash"')},
+    )
+    assert tech == "sid-history-escalation" and target == CHILD
+
+
 # --- model effect / precondition --------------------------------------------
 
 def test_effect_is_parent_domain():
@@ -111,7 +120,7 @@ def test_child_golden_ticket_still_skips_when_already_done():
     assert d == GD.SKIP and f"da:{CHILD}" in reason
 
 
-# --- gate: da:{domain} unlocks remote DCSync of that domain (parent DCSync after the climb) ----------
+# --- gate: da:{domain} needs a live Kerberos context before remote DCSync of that domain --------------
 
 def _castelblack():
     return es.Foothold(callback_id="50", agent="apollo", host="castelblack",
@@ -119,19 +128,34 @@ def _castelblack():
                        alive=True, source="reconcile", timestamp=TS)
 
 
-def test_da_implies_replication_rights():
-    s = es.EngagementState(objective="t")
-    s = es.record_hop_result(s, "sid-history-escalation", CHILD, "achieved",
-                             {"source": "issue_task", "provenance": "run"}, TS)  # effect da:ROOT
+def test_da_with_live_callback_context_implies_replication_rights():
+    s = es.EngagementState(objective="t", footholds=[_castelblack()])
+    s = es.record_effect_result(
+        s, "sid-history-escalation", CHILD, f"da:{ROOT}", "achieved",
+        {"source": "issue_task", "provenance": "run", "callback_id": "50"}, TS,
+        preconditions=[f"krbtgt-hash:{CHILD}"],
+        satisfied_effects=[f"da:{ROOT}", f"kerberos-context:{ROOT}@callback:50"],
+    )
     assert s.satisfies_predicate(f"ds-replication-rights:{ROOT}")
 
 
-def test_da_unlocks_remote_parent_dcsync():
-    # After the climb (da:ROOT) with a live NORTH foothold, DCSync of the PARENT must PROCEED:
-    # da implies replication rights, and DCSync is remote (foothold anywhere).
+def test_da_without_live_callback_context_does_not_imply_replication_rights():
     s = es.EngagementState(objective="t", footholds=[_castelblack()])
     s = es.record_hop_result(s, "sid-history-escalation", CHILD, "achieved",
-                             {"source": "issue_task", "provenance": "run"}, TS)
+                             {"source": "issue_task", "provenance": "run", "callback_id": "11"}, TS)
+    assert not s.satisfies_predicate(f"ds-replication-rights:{ROOT}")
+
+
+def test_da_unlocks_remote_parent_dcsync():
+    # After the climb (da:ROOT) with a live callback-scoped Kerberos context, DCSync of the PARENT
+    # can proceed remotely from the NORTH foothold.
+    s = es.EngagementState(objective="t", footholds=[_castelblack()])
+    s = es.record_effect_result(
+        s, "sid-history-escalation", CHILD, f"da:{ROOT}", "achieved",
+        {"source": "issue_task", "provenance": "run", "callback_id": "50"}, TS,
+        preconditions=[f"krbtgt-hash:{CHILD}"],
+        satisfied_effects=[f"da:{ROOT}", f"kerberos-context:{ROOT}@callback:50"],
+    )
     d, reason = es.gate_decision("dcsync", ROOT, s)
     assert d == GD.PROCEED, reason
 
@@ -139,8 +163,12 @@ def test_da_unlocks_remote_parent_dcsync():
 def test_dcsync_still_defers_without_any_foothold():
     # DCSync still needs a live foothold somewhere (network position) — with none, DEFER.
     s = es.EngagementState(objective="t", footholds=[])
-    s = es.record_hop_result(s, "sid-history-escalation", CHILD, "achieved",
-                             {"source": "issue_task", "provenance": "run"}, TS)
+    s = es.record_effect_result(
+        s, "sid-history-escalation", CHILD, f"da:{ROOT}", "achieved",
+        {"source": "issue_task", "provenance": "run", "callback_id": "50"}, TS,
+        preconditions=[f"krbtgt-hash:{CHILD}"],
+        satisfied_effects=[f"da:{ROOT}", f"kerberos-context:{ROOT}@callback:50"],
+    )
     d, reason = es.gate_decision("dcsync", ROOT, s)
     assert d == GD.DEFER and "live-foothold" in reason
 

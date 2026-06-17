@@ -203,6 +203,24 @@ def test_project_graph_predicates_maps_domain_and_computer_edges_with_provenance
     assert all(fact.ttl_seconds == TTL_SECONDS for fact in facts)
 
 
+def test_project_graph_predicates_maps_laps_read_edge_to_managed_secret_fact():
+    records = [
+        {
+            "principal": "alice@LAB.LOCAL",
+            "type": "ReadLAPSPassword",
+            "target_kind": "computer",
+            "computer": "WS01.CHILD.LAB.LOCAL",
+        },
+    ]
+
+    facts = graph_reconciler.project_graph_predicates(records, NOW, TTL_SECONDS)
+
+    assert [fact.predicate for fact in facts] == [
+        "can-read-managed-local-admin-secret:"
+        "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+    ]
+
+
 def test_project_graph_predicates_skips_unknown_edges_and_malformed_records():
     records = [
         {"principal": "arya.stark", "type": "MemberOf", "target_kind": "domain", "domain": "essos.local"},
@@ -315,7 +333,23 @@ class _FakeTool:
         self.calls.append(args)
         query = args.get("query", "")
         if "(t:GPO)" in query:
-            return _literals_response("STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL")
+            return _literals_response(
+                "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL|"
+                "CN={0A93E998-2599-4DA8-9717-6744993DED3A},CN=POLICIES,CN=SYSTEM,"
+                "DC=NORTH,DC=SEVENKINGDOMS,DC=LOCAL|"
+                "\\\\NORTH.SEVENKINGDOMS.LOCAL\\SYSVOL\\NORTH.SEVENKINGDOMS.LOCAL\\POLICIES\\"
+                "{0A93E998-2599-4DA8-9717-6744993DED3A}|"
+                "89A762BB-09B9-45CF-AB37-E517C964B4A5"
+            )
+        if "GPLink" in query and "Contains" in query and "(g:GPO)" in query:
+            return _literals_response(
+                "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL|"
+                "WINTERFELL.NORTH.SEVENKINGDOMS.LOCAL|NORTH.SEVENKINGDOMS.LOCAL|1",
+                "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL|"
+                "CASTELBLACK.NORTH.SEVENKINGDOMS.LOCAL|NORTH.SEVENKINGDOMS.LOCAL|0",
+            )
+        if "ReadLAPSPassword" in query:
+            return _literals_response("alice@LAB.LOCAL|WS01.CHILD.LAB.LOCAL|")
         return _literals_response()
 
 
@@ -350,10 +384,169 @@ def test_reconcile_graph_position_keys_gpo_by_name_via_literals():
     preds = [fact.predicate for fact in facts]
     assert "generic-write:gpo:starkwallpaper" in preds
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
+    assert "gpo-guid:starkwallpaper:0a93e998-2599-4da8-9717-6744993ded3a" in preds
+    assert "gpo-affects-computer:starkwallpaper:winterfell:north.sevenkingdoms.local" in preds
+    assert "gpo-affects-dc:starkwallpaper:winterfell:north.sevenkingdoms.local" in preds
+    assert "gpo-affects-computer:starkwallpaper:castelblack:north.sevenkingdoms.local" in preds
+    assert (
+        "can-read-managed-local-admin-secret:"
+        "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+    ) in preds
     # Real MCP call shape: info_type=run, principals inlined into the query (no parameters support).
     assert all(call.get("info_type") == "run" for call in tool.calls)
     assert any("samwell.tarly@north.sevenkingdoms.local" in call.get("query", "") for call in tool.calls)
     assert all("parameters" not in call for call in tool.calls)
+
+
+def test_credential_target_domains_from_state_uses_live_kerberos_context():
+    state = engagement_state.EngagementState(
+        objective="essos DA",
+        footholds=[
+            engagement_state.Foothold(
+                callback_id="3",
+                agent="Apollo",
+                host="CASTELBLACK",
+                forest="north.sevenkingdoms.local",
+                identity="NORTH\\samwell.tarly",
+                integrity="medium",
+                alive=True,
+                source="test",
+                timestamp=NOW,
+            )
+        ],
+        hops=[
+            engagement_state.Hop(
+                id="da:sevenkingdoms.local",
+                technique="forge-golden-ticket",
+                target="sevenkingdoms.local",
+                effect="da:sevenkingdoms.local",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["da:sevenkingdoms.local"],
+                source="test",
+                timestamp=NOW,
+            ),
+            engagement_state.Hop(
+                id="ctx:sevenkingdoms.local",
+                technique="forge-golden-ticket",
+                target="sevenkingdoms.local",
+                effect="kerberos-context:sevenkingdoms.local@callback:3",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["kerberos-context:sevenkingdoms.local@callback:3"],
+                source="test",
+                timestamp=NOW,
+            ),
+        ],
+    )
+
+    assert graph_reconciler.credential_target_domains_from_state(state) == ["sevenkingdoms.local"]
+
+
+def test_controlled_principals_include_live_da_groups_for_graph_projection():
+    state = engagement_state.EngagementState(
+        objective="essos DA",
+        footholds=[_north_foothold()],
+        hops=[
+            engagement_state.Hop(
+                id="da:sevenkingdoms.local",
+                technique="forge-golden-ticket",
+                target="sevenkingdoms.local",
+                effect="da:sevenkingdoms.local",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=[
+                    "da:sevenkingdoms.local",
+                    "kerberos-context:sevenkingdoms.local@callback:10",
+                ],
+                source="test",
+                timestamp=NOW,
+            )
+        ],
+    )
+
+    principals = graph_reconciler.controlled_principals_from_state(state)
+
+    assert "domain admins@sevenkingdoms.local" in principals
+    assert "administrators@sevenkingdoms.local" in principals
+
+
+def test_reconcile_graph_position_projects_targets_from_controlled_group_members():
+    class _SmallCouncilTool:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            query = args.get("query", "")
+            if "(p)-[e]->(g:Group)" in query and "MemberOf*1..4" in query:
+                return _literals_response("CERSEI.LANNISTER@SEVENKINGDOMS.LOCAL")
+            return _literals_response()
+
+    tool = _SmallCouncilTool()
+
+    facts = asyncio.run(
+        graph_reconciler.reconcile_graph_position(
+            _FakeMCPManager(tool),
+            ["domain admins@sevenkingdoms.local"],
+            "essos DA",
+            NOW,
+            TTL_SECONDS,
+            credential_domains=["sevenkingdoms.local"],
+        )
+    )
+
+    preds = [fact.predicate for fact in facts]
+    assert "credential-target:cersei.lannister@sevenkingdoms.local" in preds
+    assert any("MATCH (p)-[e]->(g:Group)" in call.get("query", "") for call in tool.calls)
+
+
+def test_reconcile_graph_position_projects_dcsync_target_from_laps_reader_path():
+    class _LapsPathTool:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            query = args.get("query", "")
+            if "MemberOf*0..4" in query:
+                return _literals_response(
+                    "CERSEI.LANNISTER@SEVENKINGDOMS.LOCAL|BRAAVOS.ESSOS.LOCAL|ESSOS.LOCAL"
+                )
+            return _literals_response()
+
+    tool = _LapsPathTool()
+
+    facts = asyncio.run(
+        graph_reconciler.reconcile_graph_position(
+            _FakeMCPManager(tool),
+            [],
+            "essos DA",
+            NOW,
+            TTL_SECONDS,
+            credential_domains=["sevenkingdoms.local"],
+        )
+    )
+
+    preds = [fact.predicate for fact in facts]
+    assert "credential-target:cersei.lannister@sevenkingdoms.local" in preds
+    assert (
+        "can-read-managed-local-admin-secret:"
+        "account=cersei.lannister;account_domain=sevenkingdoms.local;target=braavos;target_domain=essos.local"
+    ) in preds
+    assert any("ENDS WITH '@sevenkingdoms.local'" in call.get("query", "") for call in tool.calls)
+
+
+def test_gpo_scalar_parts_does_not_treat_objectid_as_policy_guid():
+    name, guid = graph_reconciler._gpo_scalar_parts(
+        "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL|||89A762BB-09B9-45CF-AB37-E517C964B4A5"
+    )
+
+    assert name == "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL"
+    assert guid == ""
 
 
 def test_reconcile_graph_position_returns_empty_on_mcp_errors():

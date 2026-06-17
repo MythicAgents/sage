@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Trajectory Learning"
+  short_description: "Build trajectory datasets and replay repair policy."
+  default_prompt: "Use -trajectory-learning to export trajectory records and evaluate Sage repair policy."

@@ -62,6 +62,18 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Always re-discover live callback IDs after lab resets. Historical IDs in Plans are examples, not truth.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
 - If touching autonomous execution, run focused tests plus the full offline suite.
+- High-risk Sage architecture work must pass the architecture governor before edits. Use
+  `skills/sage-architecture-governor` for any change touching prompts, agent topology, tool lists,
+  `Payload_Type/sage/ai/langgraph/model.py`, `mythic_tools.py`, `engagement_state.py`, reconcilers,
+  capability planning/adapters, trajectory, eval harnesses, or live-run drivers. The required gate is:
+  hypothesis, Ideal State Criteria, non-goals, complexity budget, falsifier, stop-loss, verification plan,
+  generality risk, expected file scope, and explicit user approval before opening a scoped edit token.
+- Do not grow prompts, tool surfaces, GOAD-specific live code, or symbolic planning/gating logic as a
+  tactical fix without first comparing a thinner verifier/retrieval/data-backed alternative. The third
+  tactical patch to the same subsystem requires RCA before more code.
+- Project hooks in `.codex/config.toml` enforce the architecture gate for high-risk edits. If a legitimate
+  high-risk edit is blocked, prepare the gate brief, get explicit user approval, then open a short-lived
+  scoped token with `python3 skills/sage-architecture-governor/scripts/open_gate.py open ...`.
 
 ## Lab Reset Tools
 

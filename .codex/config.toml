@@ -1,0 +1,20 @@
+[features]
+hooks = true
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Edit|Write|Bash)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-architecture-governor/scripts/pre_tool_use_arch_gate.py"'
+timeout = 10
+statusMessage = "Checking Sage architecture gate"
+
+[[hooks.Stop]]
+matcher = ".*"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-architecture-governor/scripts/check_arch_budget.py" --quiet --changed'
+timeout = 20
+statusMessage = "Checking Sage architecture budget"

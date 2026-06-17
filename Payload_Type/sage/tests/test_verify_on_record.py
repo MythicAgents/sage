@@ -204,13 +204,14 @@ def test_record_dcsync_krbtgt_no_key_failed(mt):
         != es.GateDecision.SKIP
 
 
-def test_non_credential_unchanged_achieved(mt):
-    # gpo-abuse keeps legacy behavior: achieved on non-failure output (ISC-25).
+def test_gpo_abuse_system_proof_achieved(mt):
+    # GPO abuse records achieved only when the output proves execution, not merely setup.
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell.north.sevenkingdoms.local", TS)
-    mt._record_engagement_success("STARKWALLPAPER GPO modified; scheduled task present")
+    mt._record_engagement_success("whoami\r\nnt authority\\system\r\n")
     hop = _last(mt)
     assert hop.technique == "gpo-abuse" and hop.status == "achieved"
-    assert "verify_verdict" not in hop.evidence          # verify-on-record did NOT touch it
+    assert hop.evidence.get("verify_verdict") == "achieved"
+    assert hop.evidence.get("verified_on_record") is True
 
 
 def test_non_credential_failure_signature_records_nothing(mt):
@@ -425,3 +426,285 @@ def test_verified_achieved_grant_not_downgraded(mt):
     mt._record_engagement_success(GRANT_DENIED)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-rights-grant" and h.target == GRANT_DOM]
     assert len(hops) == 1 and hops[0].status == "achieved"
+
+
+# ---------------------------------------------------------------------------
+# Verify-on-record for golden-ticket / SID-history (2026-06-11 false-achieved ticket bug)
+# ---------------------------------------------------------------------------
+
+CHILD_DOM = "north.sevenkingdoms.local"
+ROOT_DOM = "sevenkingdoms.local"
+
+RUBEUS_SDDL_EXCEPTION = """
+Created C:\\Windows\\System32\\WerFault.exe process with an ID of 7696
+[*] Action: Build TGT
+[*] Building PAC
+[!] Unhandled Rubeus exception:
+System.ArgumentException: Value was invalid.
+Parameter name: sddlForm
+   at System.Security.Principal.SecurityIdentifier..ctor(String sddlForm)
+"""
+
+MIMIKATZ_GOLDEN_FORGE_ONLY = """
+mimikatz(commandline) # kerberos::golden /user:Administrator /domain:north.sevenkingdoms.local
+ * PAC generated
+ * PAC signed
+ * EncTicketPart generated
+ * EncTicketPart encrypted
+Golden ticket for 'Administrator @ north.sevenkingdoms.local' successfully submitted for current session
+"""
+
+MIMIKATZ_SPLIT_ERROR = """
+mimikatz(commandline) # /user:Administrator
+ERROR mimikatz_doLocal ; "/user:Administrator" command of "standard" module not found !
+"""
+
+TICKET_GROUP_PROOF = """
+GROUP INFORMATION
+-----------------
+SEVENKINGDOMS\\Enterprise Admins Group used for deny only
+SEVENKINGDOMS\\Domain Admins       Enabled group
+The command completed successfully.
+"""
+
+
+def test_ticket_techniques_set():
+    assert ca.TICKET_TECHNIQUES == {"golden-ticket", "sid-history-escalation"}
+
+
+def test_ticket_probe_rubeus_exception_failed_not_partial():
+    probe = ca.extract_ticket_probe(RUBEUS_SDDL_EXCEPTION)
+    assert probe["ticket_error"] is True
+    assert probe["ticket_forged"] is False
+    assert probe["domain_admin"] is False
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) == "failed"
+
+
+def test_ticket_probe_forge_only_partial_never_achieved():
+    probe = ca.extract_ticket_probe(MIMIKATZ_GOLDEN_FORGE_ONLY)
+    assert probe["ticket_forged"] is True
+    assert probe["ticket_valid"] is False
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) == "partial"
+
+
+def test_ticket_probe_mimikatz_split_error_failed():
+    probe = ca.extract_ticket_probe(MIMIKATZ_SPLIT_ERROR)
+    assert probe["ticket_error"] is True
+    assert es.verify_effect("golden-ticket", CHILD_DOM, probe) == "failed"
+
+
+def test_ticket_probe_group_proof_achieved():
+    probe = ca.extract_ticket_probe(TICKET_GROUP_PROOF)
+    assert probe["domain_admin"] is True
+    assert "Domain Admins" in probe["member_of"]
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) == "achieved"
+
+
+def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
+    mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
+    mt._record_engagement_success(RUBEUS_SDDL_EXCEPTION)
+    hop = _last(mt)
+    assert hop.technique == "sid-history-escalation"
+    assert hop.status == "failed"
+    assert hop.effect == f"da:{ROOT_DOM}"
+    assert hop.evidence["verified_on_record"] is True
+    assert hop.evidence["verify_verdict"] == "failed"
+    assert hop.evidence["artifact_present"] is False
+    assert es.gate_decision("sid-history-escalation", CHILD_DOM, es.EngagementState(objective="t", hops=mt._engagement_hops))[0] \
+        != es.GateDecision.SKIP
+
+
+def test_record_sid_history_forge_only_failed_with_partial_verdict(mt):
+    mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
+    mt._record_engagement_success(MIMIKATZ_GOLDEN_FORGE_ONLY)
+    hop = _last(mt)
+    assert hop.status == "failed"
+    assert hop.evidence["verify_verdict"] == "partial"
+    assert hop.evidence["ticket_forged"] is True
+    assert hop.evidence["artifact_present"] is False
+
+
+def test_record_sid_history_group_proof_achieved(mt):
+    mt._last_issued_callback_id = 13
+    mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
+    mt._record_engagement_success(TICKET_GROUP_PROOF)
+    hop = _last(mt)
+    assert hop.status == "achieved"
+    assert hop.effect == f"da:{ROOT_DOM}"
+    assert f"kerberos-context:{ROOT_DOM}@callback:13" in hop.satisfied_effects
+    assert hop.evidence["verify_verdict"] == "achieved"
+    assert hop.evidence["artifact_present"] is True
+
+
+# --- Negative tests (2026-06-12 audit): the forgeable-proof holes, now closed. Each of these would have
+#     recorded ACHIEVED (false-achieved) under the pre-fix substring proof; they must now NOT be achieved. ---
+
+CHILD_DA_LINE = """
+GROUP INFORMATION
+-----------------
+NORTH\\Domain Admins       Enabled group
+The command completed successfully.
+"""
+
+DENY_ONLY_EA = """
+GROUP INFORMATION
+-----------------
+SEVENKINGDOMS\\Enterprise Admins   Group used for deny only
+The command completed successfully.
+"""
+
+PARENT_EA_ENABLED = """
+GROUP INFORMATION
+-----------------
+SEVENKINGDOMS\\Enterprise Admins   Enabled group
+The command completed successfully.
+"""
+
+BENIGN_SUCCESS_ONLY = "The command completed successfully.\n"
+
+NEGATED_MEMBERSHIP = "The user samwell is not a member of Domain Admins.\n"
+
+
+def test_ticket_probe_benign_success_string_is_not_proof():
+    # "The command completed successfully." alone is NOT proof of admin/Kerberos access (CRIT-A).
+    probe = ca.extract_ticket_probe(BENIGN_SUCCESS_ONLY)
+    assert probe["domain_admin"] is False
+    assert probe["service_access_proven"] is False
+    assert probe["member_of"] == []
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) != "achieved"
+
+
+def test_ticket_probe_deny_only_enterprise_admins_not_membership():
+    # A deny-only / disabled Enterprise Admins SID is NOT effective membership (CRIT-C).
+    probe = ca.extract_ticket_probe(DENY_ONLY_EA, expected_domain=ROOT_DOM)
+    assert "Enterprise Admins" not in probe["member_of"]
+    assert probe["domain_admin"] is False
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) != "achieved"
+
+
+def test_ticket_probe_cross_domain_child_da_does_not_prove_parent():
+    # A child NORTH\\Domain Admins line must NOT prove da:sevenkingdoms.local (the parent effect) (CRIT-B).
+    probe = ca.extract_ticket_probe(CHILD_DA_LINE, expected_domain=ROOT_DOM)
+    assert probe["member_of"] == []
+    assert probe["domain_admin"] is False
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) != "achieved"
+
+
+def test_ticket_probe_cross_domain_child_fqdn_does_not_prove_parent():
+    # FQDN-form child line: north.sevenkingdoms.local\Domain Admins must NOT correlate to parent
+    # sevenkingdoms.local by substring (the qualifier must EQUAL the target, not merely contain it).
+    child_fqdn_line = (
+        "GROUP INFORMATION\n-----------------\n"
+        "north.sevenkingdoms.local\\Domain Admins   Enabled group\n"
+        "The command completed successfully.\n"
+    )
+    probe = ca.extract_ticket_probe(child_fqdn_line, expected_domain=ROOT_DOM)
+    assert probe["member_of"] == []
+    assert probe["domain_admin"] is False
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) != "achieved"
+
+
+def test_ticket_probe_parent_fqdn_qualified_line_achieved():
+    # Exact FQDN-qualified parent line DOES correlate (qualifier == target domain).
+    parent_fqdn_line = (
+        "GROUP INFORMATION\n-----------------\n"
+        "sevenkingdoms.local\\Domain Admins   Enabled group\n"
+        "The command completed successfully.\n"
+    )
+    probe = ca.extract_ticket_probe(parent_fqdn_line, expected_domain=ROOT_DOM)
+    assert "Domain Admins" in probe["member_of"]
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) == "achieved"
+
+
+def test_ticket_probe_parent_correlated_enterprise_admins_achieved():
+    # The legitimate parent climb: an ENABLED, parent-correlated Enterprise Admins line IS proof.
+    probe = ca.extract_ticket_probe(PARENT_EA_ENABLED, expected_domain=ROOT_DOM)
+    assert "Enterprise Admins" in probe["member_of"]
+    assert es.verify_effect("sid-history-escalation", CHILD_DOM, probe) == "achieved"
+
+
+def test_ticket_probe_apollo_bytes_repr_directory_listing_proves_service_access():
+    output = (
+        r"b' Volume in drive \\\\KINGSLANDING.SEVENKINGDOMS.LOCAL\\C$ is Windows 10\r\n"
+        r" Volume Serial Number is 78B2-6C28\r\n\r\n"
+        r" Directory of \\\\KINGSLANDING.SEVENKINGDOMS.LOCAL\\C$\r\n\r\n"
+        r"06/04/2026  01:22 PM    <DIR>          inetpub\r\n'"
+    )
+
+    probe = ca.extract_ticket_probe(output, expected_domain=ROOT_DOM)
+
+    assert probe["service_access_proven"] is True
+    assert probe["ticket_valid"] is True
+
+
+def test_ticket_probe_negated_membership_not_achieved():
+    probe = ca.extract_ticket_probe(NEGATED_MEMBERSHIP, expected_domain=DOM)
+    assert probe["domain_admin"] is False
+    assert es.verify_effect("golden-ticket", DOM, probe) != "achieved"
+
+
+def test_redact_secretsdump_line_redacts_nt_not_lm_when_equal():
+    # user:rid:LM:NT::: where LM == NT — the NT (rightmost captured) must be redacted, not the first-occurring
+    # LM. The pre-fix value-based replace(NT, ..., 1) would redact the LM and leak the real NT secret.
+    h = "31d6cfe0d16ae931b73c59d7e0c089c0"
+    line = f"krbtgt:502:{h}:{h}:::"
+    out = ca.redact_credential_material(line)
+    assert out == f"krbtgt:502:{h}:<redacted>:::"
+
+
+# --- 2026-06-12 live false-achieved: a NO-PROBE technique (gpo-abuse) recorded achieved off a Mythic task
+#     that errored AT CREATION ("no assembly by that name" — SharpGPOAbuse never registered, never ran). The
+#     narrow breaker list missed the creation-error traceback, so it fell through to the achieved default. ---
+
+GPO_ABUSE_CREATION_ERROR = (
+    "Traceback (most recent call last):\n"
+    "  File \".../apollo/mythic/agent_functions/execute_assembly.py\", line 185, in create_go_tasking\n"
+    "    raise Exception(f\"no assembly by that name that's not deleted\")\n"
+    "Exception: no assembly by that name that's not deleted\n"
+)
+
+GPO_ABUSE_SUCCESS = (
+    "[+] Domain Admins group was found.\n"
+    "[+] The GPO was modified to include an immediate scheduled task. Wait for the GPO refresh cycle.\n"
+)
+
+GPO_ABUSE_GUID_ONLY = (
+    "[+] Domain = north.sevenkingdoms.local\r\n"
+    "[+] Domain Controller = winterfell.north.sevenkingdoms.local\r\n"
+    "[+] Distinguished Name = CN=Policies,CN=System,DC=north,DC=sevenkingdoms,DC=local\r\n"
+    "[+] GUID of \"STARKWALLPAPER\" is: {0A93E998-2599-4DA8-9717-6744993DED3A}\r\n"
+)
+
+
+def test_record_gpo_abuse_creation_error_not_achieved(mt):
+    mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
+    before = len(mt._engagement_hops)
+    mt._record_engagement_success(GPO_ABUSE_CREATION_ERROR)
+    assert len(mt._engagement_hops) == before  # nothing recorded — the task never ran
+    assert not any(h.technique == "gpo-abuse" for h in mt._engagement_hops)
+
+
+def test_record_gpo_abuse_empty_output_not_achieved(mt):
+    mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
+    before = len(mt._engagement_hops)
+    mt._record_engagement_success("   ")
+    assert len(mt._engagement_hops) == before
+
+
+def test_record_gpo_abuse_setup_only_records_pending_not_achieved(mt):
+    # A clean SharpGPOAbuse setup output is not enough: the GPO still needs refresh and effect proof.
+    mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
+    mt._record_engagement_success(GPO_ABUSE_SUCCESS)
+    hop = _last(mt)
+    assert hop is not None and hop.technique == "gpo-abuse" and hop.status == "pending"
+    assert hop.evidence.get("verify_verdict") == "partial"
+    assert hop.effect == "system:starkwallpaper"
+
+
+def test_record_gpo_abuse_guid_only_records_failed_not_waitable(mt):
+    mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
+    mt._record_engagement_success(GPO_ABUSE_GUID_ONLY)
+    hop = _last(mt)
+    assert hop is not None and hop.technique == "gpo-abuse" and hop.status == "failed"
+    assert hop.evidence.get("verify_verdict") == "failed"
+    assert hop.evidence.get("artifact_present") is False

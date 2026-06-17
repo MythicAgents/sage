@@ -152,6 +152,32 @@ def test_mimikatz_required_defaults_auto_fill_without_overriding_supplied_argume
     assert "defaulted arguments=token::whoami" not in result.notes
 
 
+def test_apollo_mimikatz_commands_array_wraps_single_command_string():
+    schema = [
+        _param("Commands", "Default", name="commands", kind="Array", required=True, default_value="[]"),
+    ]
+    command_text = "kerberos::golden /user:Administrator /domain:north.local /sid:S-1-5-21-1-2-3 /aes256:" + "a" * 64 + " /ptt"
+
+    result = resolve_params(schema, {"commands": command_text}, command="mimikatz")
+
+    assert result.ok is True
+    assert result.group == "Default"
+    assert result.params == {"Commands": [command_text]}
+    assert "mapped 'commands' to 'Commands'" in result.notes
+
+
+def test_apollo_mimikatz_commands_array_preserves_command_list():
+    schema = [
+        _param("Commands", "Default", name="commands", kind="Array", required=True, default_value="[]"),
+    ]
+    commands = ["privilege::debug", "sekurlsa::logonpasswords"]
+
+    result = resolve_params(schema, {"commands": commands}, command="mimikatz")
+
+    assert result.ok is True
+    assert result.params == {"Commands": commands}
+
+
 def test_argumentless_commands_accept_empty_dict_as_empty_params():
     for command in ("ps", "whoami", "rev2self"):
         result = resolve_params([], {}, command=command)

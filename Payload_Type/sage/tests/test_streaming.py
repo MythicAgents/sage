@@ -222,6 +222,19 @@ class TestMessageFormatting:
         assert "SystemMessage" in src, "Must check for SystemMessage"
         assert 'return ""' in src, "Must return empty string for SystemMessage"
 
+    def test_internal_provider_nudges_not_rendered_as_user_prompts(self):
+        """Regression: provider/autonomous control nudges are not shown as Mythic user input."""
+        fmt_src = self._get_format_source()
+        render_src = get_method_source("_render_combined")
+        sanitize_src = get_method_source("_sanitize_messages")
+        wrapper_src = get_method_source("_wrap_create_agent")
+
+        assert "_hide_from_stream" in sanitize_src
+        assert "_is_internal_human_message" in fmt_src
+        assert "_is_internal_human_message" in render_src
+        assert "_is_internal_human_message" in wrapper_src
+        assert "autonomous_operator_continue" in wrapper_src
+
     def test_format_handles_list_content(self):
         """Regression: AI messages with list content (Anthropic blocks) handled."""
         src = self._get_format_source()
@@ -390,15 +403,15 @@ class TestRecursionHandling:
         )
 
     def test_isc20_continuation_resumes_with_higher_limit(self):
-        """ISC-20: handle_continuation_response resumes with increased recursion limit."""
+        """ISC-20: handle_continuation_response resumes with configured recursion budget."""
         continuation_src = get_method_source("handle_continuation_response")
         assert continuation_src, "handle_continuation_response must exist"
-        assert "recursion_limit" in continuation_src, (
-            "Must set recursion_limit in continuation"
+        assert "_graph_run_config" in continuation_src, (
+            "Continuation must use the centralized graph recursion config"
         )
-        # Check that the limit is higher than the original 25
-        assert "50" in continuation_src, (
-            "Continuation should use recursion_limit=50 (higher than original 25)"
+        graph_config_src = get_method_source("_graph_run_config")
+        assert "recursion_limit" in graph_config_src, (
+            "Central graph config must set recursion_limit"
         )
         assert "astream" in continuation_src, (
             "Continuation must use astream for streaming"

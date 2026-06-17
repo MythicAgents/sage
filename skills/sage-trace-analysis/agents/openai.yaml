@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Trace Analysis"
+  short_description: "Analyze Phoenix, Mythic, and run-log traces."
+  default_prompt: "Use -trace-analysis to inspect Sage traces, logs, and failure metrics."

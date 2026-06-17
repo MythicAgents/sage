@@ -72,39 +72,8 @@ def test_render_engagement_state_empty_state_is_non_empty_and_safe():
     assert output.strip()
 
 
-def test_overlay_prompt_contains_engagement_state_marker():
-    raw = (prompt_loader.PROMPTS_DIR / "demo_autonomous_solve.md").read_text(encoding="utf-8")
+def test_render_engagement_state_marker_is_stripped_when_present():
+    """The {{ENGAGEMENT_STATE}} marker is a template token; renderer output must not contain it."""
+    output = engagement_state.render_engagement_state(_state())
 
-    assert MARKER in raw
-
-
-def test_load_autonomous_overlay_injects_state_when_gate_enabled(monkeypatch):
-    monkeypatch.setattr(prompt_loader, "ENGAGEMENT_GATE_ENABLED", True)
-
-    for role in ("Supervisor", "Mythic_Operator"):
-        section = prompt_loader.load_autonomous_overlay(role, _state())
-
-        assert HEADER in section
-        assert MARKER not in section
-        assert "WINTERFELL" in section
-
-
-def test_load_autonomous_overlay_removes_marker_when_gate_disabled(monkeypatch):
-    monkeypatch.setattr(prompt_loader, "ENGAGEMENT_GATE_ENABLED", False)
-
-    section = prompt_loader.load_autonomous_overlay("Supervisor", _state())
-
-    assert MARKER not in section
-    assert HEADER not in section
-    assert "AUTONOMOUS ATTACK-PATH SOLVE" in section
-
-
-def test_trust_walker_tradecraft_is_retained_as_prior():
-    raw = (prompt_loader.PROMPTS_DIR / "demo_autonomous_solve.md").read_text(encoding="utf-8")
-
-    assert "STARKWALLPAPER" in raw
-    assert "golden ticket" in raw
-    assert "ADMINISTRATORS@ESSOS" in raw
-    assert "Domain Admins is a GLOBAL group" in raw
-    assert "it CANNOT hold a foreign-forest member" in raw
-    assert "Use the golden-ticket route via the domain-local ADMINISTRATORS@ESSOS group instead" in raw
+    assert MARKER not in output

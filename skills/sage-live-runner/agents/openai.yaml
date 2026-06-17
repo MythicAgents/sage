@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Live Runner"
+  short_description: "Run, monitor, and inspect live Sage solves."
+  default_prompt: "Use -live-runner to run and inspect live Sage GOAD solves."
