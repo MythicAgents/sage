@@ -1,6 +1,7 @@
 """Project Mythic callback access into engagement-state footholds."""
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,11 +17,31 @@ except ImportError:
 
 Foothold = engagement_state.Foothold
 
-DEFAULT_NETBIOS_TO_FQDN: dict[str, str] = {
-    "NORTH": "north.sevenkingdoms.local",
-    "ESSOS": "essos.local",
-    "SEVENKINGDOMS": "sevenkingdoms.local",
-}
+_NETBIOS_MAP_ENV = "SAGE_ENGAGEMENT_NETBIOS_MAP"
+
+
+def _engagement_netbios_map() -> dict[str, str]:
+    """NetBIOS->FQDN overrides sourced from engagement config, not hardcoded.
+
+    Read from the ``SAGE_ENGAGEMENT_NETBIOS_MAP`` env var (a JSON object), keeping forest
+    resolution environment-agnostic: each engagement supplies its own NetBIOS->FQDN map
+    instead of a fixed lab topology. Example::
+
+        SAGE_ENGAGEMENT_NETBIOS_MAP='{"CORP": "corp.example.com", "EU": "eu.corp.example.com"}'
+
+    Fail-soft: an unset, empty, or malformed value yields ``{}``, in which case a NetBIOS
+    domain hint passes through casefolded (no fabricated FQDN).
+    """
+    raw = os.environ.get(_NETBIOS_MAP_ENV, "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): str(value) for key, value in parsed.items()}
 
 _SOURCE = "mythic:get_all_active_callbacks"
 _INTEGRITY_LEVELS = {
@@ -70,7 +91,7 @@ def normalize_forest(domain: str, *, netbios_to_fqdn: dict[str, str] | None = No
     if not raw:
         return ""
 
-    mappings = dict(DEFAULT_NETBIOS_TO_FQDN)
+    mappings: dict[str, str] = {}
     if isinstance(netbios_to_fqdn, dict):
         mappings.update({_text(key).upper(): _text(value).casefold() for key, value in netbios_to_fqdn.items()})
 
@@ -107,7 +128,7 @@ async def reconcile_access(mythic_tools: Any, now: str) -> list[Foothold]:
             liveness[display_id] = bool(result.get("alive")) if isinstance(result, dict) else False
         except Exception:
             liveness[display_id] = False
-    return project_access(raw_callbacks, now, liveness)
+    return project_access(raw_callbacks, now, liveness, netbios_to_fqdn=_engagement_netbios_map())
 
 
 def _text(value: Any) -> str:
