@@ -1919,18 +1919,12 @@ class MythicTools:
             return fallback or None
 
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
-        """
-        Issue a task to execute 'command' on the specified agent and wait for the agent to checkin, execute the task, and return the results.
-        **IMPORTANT**: When a command has a parameter type of "File" (e.g., "type": "File"), you must pass in the Mythic file UUID (not the filename).
+        """Issue `command` on the agent at `callback_display_id` and wait for its output.
 
-        Args:
-            command: The command name to execute from the "cmd" field from the get_all_commands_for_payloadtype tool. Validate the agent's operating system and the supported_os match.
-            parameters: The command's parameters or arguments. Prefer a JSON string that leverages the commandparameters "name" value (e.g. {"arguments": "value"}). Alternatively, use a non-JSON string that has dash with the "cli_name" field (e.g. -path /etc/issue).
-            callback_display_id: The callback_display_id of the target agent to run the command on.
-            token_id: Optional Mythic identifier for tracked Windows user access tokens to use for impersonation.
-            timeout: Optional timeout in seconds for the task to complete.
-        Returns:
-            str: Command output (binary output coerced to string).
+        Caveat: for a parameter of type "File" pass the Mythic file UUID, not a filename. Format
+        `parameters` as a JSON string of name/value pairs (e.g. {"arguments": "value"}) or a CLI-style
+        string using each parameter's cli_name (e.g. -path /etc/issue). token_id impersonates a tracked
+        Windows token; timeout is in seconds.
         """
         self._pending_task_backed_transition = None
         # Deterministically normalize a dcsync target /user to NETBIOS\sAMAccountName (NORTH\krbtgt) no matter
@@ -10077,23 +10071,7 @@ class MythicTools:
         return json.dumps([e for e in self._artifact_ledger if not e.get("cleaned")], default=str)
 
     async def get_task_history_for_callback(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to retrieve task history for"]) -> str:
-        """Get the task history of commands issued for a specific agent (callback).
-
-        This tool retrieves detailed information about all tasks issued to a specific Mythic agent, including the following fields:
-
-        - **id**: The ID associated with the task.
-        - **operator**: The Mythic operator who issued the command.
-        - **status**: The status of the task (e.g., success, completed, agent_processing, error).
-        - **completed**: Whether the task is completed (True/False).
-        - **original_params**: The original parameters or arguments issued with the command.
-        - **timestamp**: The timestamp when the command was issued.
-        - **command_name**: The name of the command issued to the Mythic agent.
-
-        Args:
-            callback_display_id: The callback_display_id of the target agent to retrieve task history for.
-        Returns:
-            str: JSON string containing the task history for the specified agent.
-        """
+        """Return a callback's full task history as JSON (per task: id, operator, status, completed, original_params, timestamp, command_name)."""
         # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
@@ -10310,28 +10288,10 @@ class MythicTools:
             token_id: Annotated[int | None, "Optional token ID for authentication"] = None, 
             timeout: Annotated[int | None, "Optional timeout for the upload operation"] = None,
             ) -> str:
-        """Upload a file stored in Mythic to a specific Mythic agent by the Mythic file UUID.
+        """Upload a Mythic-stored file (by file UUID) to the agent at callback_display_id via the agent's upload-style command.
 
-        This tool uploads a file, identified by its Mythic file UUID, to a specified Mythic agent. The file will be transferred to the agent associated with the provided callback_display_id.
-
-        **IMPORTANT**: The command's parameter must be of type "File" (e.g., "type": "File"). DO NOT USE PARAMETER TYPE "STRING" TO UPLOAD FILES.
-        For the Merlin agent, use the "upload" command with the "file" parameter set to the Mythic file UUID and the "path" parameter set to the destination path and file name on the target system.
-
-        **IMPORTANT — which UUID:** `file_uuid` must be the Mythic *file* UUID, i.e. the `agent_file_id`
-        returned by create_payload (surfaced as the top-level `agent_file_id` field), NOT the payload's
-        `uuid` (the Payload UUID). They are different values; passing the Payload UUID will fail because no
-        downloadable file has that UUID. For a freshly built payload, also confirm its build_phase is
-        "success" before uploading — a payload that errored during build has no file bytes to send.
-
-        Args:
-            command: The name of the command for a Mythic agent that has upload functionality, typically the "upload" command.
-            parameters: Parameters a Mythic agent's upload command.
-            file_uuid: The Mythic file UUID (agent_file_id) to upload to the target agent.
-            callback_display_id: The callback_display_id of the target agent to upload the file to.
-            token_id: Optional token ID for authentication.
-            timeout: Optional timeout for the upload operation.
-        Returns:
-            str: Command output (binary output coerced to string) after the upload operation."""
+        Caveat: file_uuid is the Mythic *file* UUID (`agent_file_id` from create_payload), NOT the
+        payload `uuid`; the command's target parameter must be type "File", never "String"."""
         # HITL: guarded
         
         if self.client is None:
@@ -10413,25 +10373,10 @@ class MythicTools:
         file_name: Annotated[str, "Optional basename for the collection (e.g. 'collection.zip'). Defaults to the source filename or <uuid>.zip."] = "",
         name_contains: Annotated[str, "When resolving by callback, only match files whose name contains this substring (default 'zip')."] = "zip",
     ) -> str:
-        """Ingest a downloaded collection into BloodHound IN-MEMORY (no disk staging, no LLM round-trip).
+        """Ingest a downloaded SharpHound/AzureHound collection straight into BloodHound in-memory (bytes never touch the LLM or Sage disk); pass file_uuid, or callback_display_id to use that callback's latest download.
 
-        This is the programmatic bridge between Mythic and BloodHound: it resolves the Mythic file
-        (by UUID, or the latest completed download on a callback), fetches its bytes from Mythic, and
-        uploads them DIRECTLY to BloodHound via the BloodHound MCP's `file_upload(info_type=
-        'upload_bytes', ...)` — invoked HERE in code so the (potentially large) collection bytes NEVER
-        pass through the LLM context and are never written to the Sage host disk.
-
-        This is the in-memory ingest path (no disk). After it returns, VERIFY with
-        `domain_info(info_type='list')` that the expected domain(s) appear (BloodHound ingest is
-        asynchronous — the count may lag a few seconds).
-
-        Args:
-            file_uuid: The Mythic file UUID. Optional if callback_display_id is given.
-            callback_display_id: Resolve the most recent completed agent-download from this callback.
-            file_name: Optional basename for the collection.
-            name_contains: Optional case-insensitive source filename substring for callback resolution.
-        Returns:
-            str: JSON with status, file_uuid, filename, byte count, and BloodHound's upload response.
+        Caveat: ingest is asynchronous — afterward verify with domain_info(info_type='list') that the
+        expected domains appear (the count may lag a few seconds).
         """
         # HITL: guarded
         if self.client is None:
@@ -10867,24 +10812,10 @@ class MythicTools:
         goal: Annotated[str, "The tradecraft goal in plain language, e.g. 'enumerate the domain', 'dump LSASS', 'abuse a GPO', 'request an ADCS cert'."],
         callback_display_id: Annotated[int, "The callback_display_id of the agent you intend to run the tradecraft on. Used to tailor execution guidance to that Mythic agent."],
     ) -> str:
-        """Get C2-agnostic tradecraft guidance for a goal, joined to how the target agent runs it.
+        """Match a plain-language goal to Sage's TTP library and return the tool's common_args/usage_examples + guidance, tailored to how the target callback's agent runs it. Consult this FIRST, before reaching for an offensive tool.
 
-        This is the FIRST tool to consult before reaching for a specific offensive tool. It
-        matches your goal to Sage's TTP knowledge library and returns the tool's frontmatter
-        (including `common_args` and `usage_examples`) plus the prose guidance UP TO the
-        "## Full Reference" section, along with an `execution_on_agent` hint describing how the
-        callback's Mythic agent runs that binary type.
-
-        Progressive disclosure: rely on `common_args` and `usage_examples` first. Only call
-        `get_ttp_full_reference(slug)` when you need an uncommon flag, exact output format, or
-        version-specific behavior the guidance doesn't cover.
-
-        Args:
-            goal: Plain-language tradecraft goal.
-            callback_display_id: Target agent's callback_display_id (tailors execution guidance).
-        Returns:
-            str: JSON with matched slug, frontmatter, guidance prose, execution_on_agent, and
-                 whether a Full Reference is available.
+        Caveat: progressive disclosure — rely on common_args/usage_examples; call
+        get_ttp_full_reference(slug) only for an uncommon flag or exact output format.
         """
         # HITL: free
         logger.debug(f"🛠️ Calling get_ttp_guidance tool (goal={goal!r}, callback={callback_display_id})")
@@ -11129,18 +11060,10 @@ class MythicTools:
         self,
         binary_filename: Annotated[str, "The tool binary filename, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
     ) -> str:
-        """Ensure a tool binary is in Mythic's file store, uploading it from the tools/ drop zone if needed.
+        """Ensure a tool binary is in Mythic's file store, uploading it from the tools/ drop zone if missing; returns the Mythic file UUID to pass as a later File parameter.
 
-        Workflow: (1) check Mythic's file store by name and compare hashes when local bytes are available;
-        (2) if absent or same-name content changed, look for the file in the operator drop zone at
-        Payload_Type/sage/tools/<binary_filename>; (3) if found, register it with Mythic via register_file
-        using md5/sha1 dedupe. Returns the Mythic file UUID to pass as the File parameter of a subsequent
-        issue_task_and_waitfor_task_output call (e.g. assembly_file for inline_assembly).
-
-        Args:
-            binary_filename: The tool binary filename (matches a TTP's binary_filename).
-        Returns:
-            str: JSON with status and, when available, the Mythic file UUID.
+        Caveat: call this and retry when a by-name assembly call fails with "0 files were found" /
+        "file not found by name" — the file is just unregistered, not unavailable.
         """
         # HITL: free
         if self.client is None:
@@ -11220,21 +11143,10 @@ class MythicTools:
         self,
         binary_filename: Annotated[str, "The tool binary filename to fetch from its pinned TTP source, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
     ) -> str:
-        """Download a tool binary from its pinned TTP source into the tools/ drop zone.
+        """Download a tool binary from its pinned, sha256-verified TTP source into the tools/ drop zone (does NOT upload to Mythic — call ensure_tool_uploaded afterward).
 
-        Finds the TTP whose frontmatter binary_filename matches, reads its pinned
-        `binary_download` block (url + archive_sha256 + extract_member), downloads the
-        archive, VERIFIES the sha256 (tamper-evidence) BEFORE extracting, then extracts
-        the named member into the tools/ drop zone. Does NOT upload to Mythic — call
-        ensure_tool_uploaded(binary_filename) afterward to register it with Mythic.
-
-        REQUIRES PRIOR OPERATOR APPROVAL: this fetches a binary from the internet. The
-        agent must ask the operator and receive explicit approval before calling this.
-
-        Args:
-            binary_filename: The tool binary filename (matches a TTP's binary_filename).
-        Returns:
-            str: JSON with a "status" key describing the outcome.
+        Caveat: REQUIRES prior explicit operator approval — it fetches a binary from the internet; ask
+        and receive approval before calling.
         """
         # HITL: guarded
         import hashlib, io, zipfile

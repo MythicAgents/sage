@@ -2710,7 +2710,6 @@ class Model:
                 "read_credentials",
                 "add_credential",
                 "execute_capability",
-                "materialize_capability_inputs",
                 "build_capability_commands",
                 "get_ttp_guidance",
                 "get_ttp_full_reference",

@@ -2,7 +2,6 @@ from mythic_container.MythicCommandBase import TaskArguments, CommandBase, Comma
 from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
 from mythic_container.logging import logger
 from .utils import get_secret
-from ai.model import Model, add_session, get_session, remove_session
 import requests
 from urllib.parse import urljoin
 
