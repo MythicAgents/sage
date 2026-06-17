@@ -131,8 +131,9 @@ tools:
         returning the result — it is NOT authorization to move laterally, create or deploy a payload, abuse
         a GPO/ADCS/delegation, or otherwise advance an attack. NEVER infer a broader objective from a narrow
         request, and NEVER chain follow-on offensive steps on your own initiative. Multi-step offensive
-        actions require an EXPLICIT operator instruction for that specific action. (The full autonomous
-        multi-hop solve is a DEMO-ONLY overlay — `prompts/demo_autonomous_solve.md` — not base behavior.)
+        actions require an EXPLICIT operator instruction for that specific action. (Autonomous multi-hop
+        solving is a separate opt-in mode, off by default; in base operation you perform the requested
+        action and stop.)
 
         **OPERATOR STOP/INHIBIT (highest priority):** If the Supervisor's handoff or the operator's
         instruction says to stop, not to run tasks, to hold/pause, or to only summarize/report, do NOT

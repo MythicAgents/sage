@@ -42,23 +42,8 @@ except Exception:  # pragma: no cover - fallback for standalone/unit-test contex
 
 import yaml
 
-try:
-    from engagement_state import render_engagement_state
-except Exception:  # pragma: no cover - package import context
-    from .engagement_state import render_engagement_state
-
-try:
-    from mythic_tools import ENGAGEMENT_GATE_ENABLED
-except Exception:
-    try:
-        from .mythic_tools import ENGAGEMENT_GATE_ENABLED
-    except Exception:
-        # mythic_tools owns the flag but may pull Mythic runtime imports in tests/local prompt loading.
-        ENGAGEMENT_GATE_ENABLED = os.environ.get("SAGE_ENGAGEMENT_GATE", "").lower() in ("1", "true", "yes")
-
 # sage/ai/langgraph/prompt_loader.py -> sage/prompts  (CWD-independent)
 PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
-_ENGAGEMENT_STATE_MARKER = "{{ENGAGEMENT_STATE}}"
 
 
 def _read(name: str) -> str:
@@ -103,43 +88,6 @@ def load_prompt(name: str, **subs) -> str:
         )
         rendered = body
     return rendered.strip()
-
-
-def load_autonomous_overlay(role: str, state=None) -> str:
-    """Return the autonomous-solve overlay section for a supported agent role."""
-    _, body = _split_frontmatter(_read("demo_autonomous_solve"))
-    match_prefix = f"## Append to {role}"
-    lines = body.splitlines()
-    start_index = None
-
-    for i, line in enumerate(lines):
-        if line.strip().startswith(match_prefix):
-            start_index = i + 1
-            break
-
-    if start_index is None:
-        raise ValueError(f"autonomous_solve overlay section for role '{role}' was not found")
-
-    section_lines = []
-    for line in lines[start_index:]:
-        if line.strip().startswith("## "):
-            break
-        section_lines.append(line)
-
-    section = "\n".join(section_lines).strip()
-    if not section:
-        raise ValueError(f"autonomous_solve overlay section for role '{role}' is empty")
-    return _inject_engagement_state(section, state)
-
-
-def _inject_engagement_state(section: str, state) -> str:
-    if ENGAGEMENT_GATE_ENABLED:
-        return section.replace(_ENGAGEMENT_STATE_MARKER, render_engagement_state(state))
-    lines = [
-        line for line in section.splitlines()
-        if line.strip() != _ENGAGEMENT_STATE_MARKER
-    ]
-    return "\n".join(lines).strip()
 
 
 def load_prompt_meta(name: str) -> dict:

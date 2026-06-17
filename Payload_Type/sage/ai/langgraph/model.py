@@ -29,7 +29,7 @@ from typing_extensions import NotRequired
 from uuid import UUID
 from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
-from .prompt_loader import load_prompt, filter_tools_by_frontmatter, load_autonomous_overlay
+from .prompt_loader import load_prompt, filter_tools_by_frontmatter
 from . import prompt_context
 from ai.mcp import MCPManager
 
@@ -1270,23 +1270,6 @@ class Model:
         logger.debug(f"🔢 Model._next_seq: returned seq={seq}, state now has _message_seq={self._message_seq}")
         return seq
 
-    def _apply_autonomous_overlay(self, prompt: str, role: str) -> str:
-        """Append the DEMO-ONLY autonomous-solve overlay for `role` when enabled.
-
-        When self._autonomous_solve is False (default) the prompt is returned
-        UNCHANGED (literal early return - byte identity matters). When enabled,
-        the role's overlay section is appended; an empty section raises (fail loud).
-        """
-        if not self._autonomous_solve:
-            return prompt
-        section = load_autonomous_overlay(role)
-        if not section.strip():
-            raise ValueError(
-                f"autonomous_solve enabled but overlay section for role '{role}' is empty"
-            )
-        logger.debug(f"_apply_autonomous_overlay: applied autonomous-solve overlay for role '{role}'")
-        return prompt + "\n\n" + section
-
     def _get_base_chat_model(self) -> BaseChatModel | None:
         """Initialize and return the BaseChatModel based on provider and model."""
         ensure_logger_initialized()
@@ -1874,7 +1857,7 @@ class Model:
                     _continue_count += 1
                     _base_nudge_text = (
                         "[autonomous-continue] You ended your turn without reaching the objective and without an explicit "
-                        "handback. Per the autonomous-solve overlay you must NOT stop after a sub-goal — execute the NEXT "
+                        "handback. In autonomous mode you must NOT stop after a sub-goal — execute the NEXT "
                         "action from your own REMAINING list now. To hand off you MUST call a tool (a plain stop just loops "
                         "you back here): call `handback_to_supervisor(reason, summary)` when the next step needs another "
                         "agent (BloodHound for graph work, Mythic_Payload for a build) or the objective is complete — the "
@@ -2710,7 +2693,6 @@ class Model:
         commands_text = prompt_context.commands_text(self)
 
         prompt = load_prompt("mythic_operator", commands_text=commands_text)
-        prompt = self._apply_autonomous_overlay(prompt, "Mythic_Operator")
         if not self.state["mythic_operator_messages"]:
             self.state["mythic_operator_messages"].append(SystemMessage(content=prompt))
         # Tools
@@ -2928,7 +2910,6 @@ class Model:
     def _supervisor_agent(self):
         name = "Supervisor"
         prompt = load_prompt("supervisor")
-        prompt = self._apply_autonomous_overlay(prompt, "Supervisor")
         if not self.state["supervisor_messages"]:
             self.state["supervisor_messages"].append(SystemMessage(content=prompt))
 

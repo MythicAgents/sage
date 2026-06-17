@@ -54,7 +54,7 @@ class QueryArguments(TaskArguments):
             cli_name="autonomous_solve",
             type=ParameterType.Boolean,
             default_value=False,
-            description="DEMO ONLY: turn an objective into a self-directed multi-hop attack-path solve (Trust Walker). Never enable for evals/normal ops.",
+            description="Opt-in autonomous mode: drive an objective through multi-hop solving without per-step operator confirmation. Off (default) = scoped, confirm-first behavior. Leave off for evals/normal ops.",
             parameter_group_info=[ParameterGroupInfo(required=False, ui_position=3)]
         )
         # Max Steps
