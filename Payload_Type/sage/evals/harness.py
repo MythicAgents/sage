@@ -139,7 +139,7 @@ async def issue_chat_task(client: Any, prompt: str, sage_cb: int) -> Any:
     return await mythic.issue_task(
         mythic=client,
         command_name="query",
-        parameters=json.dumps({"prompt": prompt, "verbose": True}),
+        parameters=json.dumps({"prompt": prompt, "verbose": True, "mode": "auto"}),
         callback_display_id=sage_cb,
     )
 

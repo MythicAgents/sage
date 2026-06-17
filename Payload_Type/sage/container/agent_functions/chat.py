@@ -127,8 +127,8 @@ class ChatArguments(TaskArguments):
             cli_name="mode",
             type=ParameterType.ChooseOne,
             choices=["auto", "supervised"],
-            default_value="auto",
-            description="auto = run unattended; supervised = require operator approve/deny on guarded tool calls",
+            default_value="supervised",
+            description="auto = run unattended (evals/automation); supervised (default) = require operator approve/deny on guarded tool calls — safe for live ops",
             parameter_group_info=[ParameterGroupInfo(required=False, ui_position=11)]
         )
 
@@ -242,7 +242,7 @@ class ChatCommand(CommandBase):
                 return response
             
             verbose = taskData.args.get_arg("verbose")
-            mode = taskData.args.get_arg("mode") or "auto"
+            mode = taskData.args.get_arg("mode") or "supervised"
             autonomous_solve = taskData.args.get_arg("autonomous_solve") or False
             max_steps = taskData.args.get_arg("max_steps")
             max_steps = int(max_steps) if max_steps not in (None, "") else 200

@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import re
 import asyncio
 import aiosqlite
@@ -46,6 +47,7 @@ import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
+_DEFAULT_GRAPH_RECURSION_LIMIT = 250
 _TOON_SENTINEL = "⟦TOON "
 _TRUNCATION_MARKER = "[truncated"
 _COMPACTION_PROTECTED_TOOLS = frozenset((
@@ -53,6 +55,20 @@ _COMPACTION_PROTECTED_TOOLS = frozenset((
     "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
     "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
 ))
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT = _env_positive_int(
+    "SAGE_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT",
+    100000,
+)
 
 
 def _is_scalar_tool_value(value: Any) -> bool:
@@ -1189,7 +1205,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "auto", autonomous_solve: bool = False, max_steps: int = 200):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -1199,7 +1215,7 @@ class Model:
         """
         self.provider = provider
         self.model = model
-        self.mode = mode if mode in ("auto", "supervised") else "auto"
+        self.mode = mode if mode in ("auto", "supervised") else "supervised"
         self._autonomous_solve = bool(autonomous_solve)
         self.graph = None
         self.verbose = False
@@ -1261,6 +1277,17 @@ class Model:
         self.llm = self._get_base_chat_model()
         if not self.llm:
             raise ValueError("Failed to initialize the BaseChatModel with the provided configuration.")
+
+    def _graph_recursion_limit(self) -> int:
+        if self._autonomous_solve and self._max_steps == 0:
+            return _AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT
+        return _DEFAULT_GRAPH_RECURSION_LIMIT
+
+    def _graph_run_config(self, thread_id: str) -> dict[str, Any]:
+        return {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": self._graph_recursion_limit(),
+        }
 
     def _next_seq(self) -> int:
         """Get next sequence number and increment counter. Also syncs to state."""
@@ -2214,8 +2241,6 @@ class Model:
                 from . import mythic_tools as _mt
             except ImportError:
                 import mythic_tools as _mt
-            if not bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
-                return None
             mythic_client = getattr(self, "mythic_client", None)
             if mythic_client is None:
                 return None
@@ -2238,7 +2263,11 @@ class Model:
             state = _es.EngagementState(
                 objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts
             )
-            rendered = _es.render_engagement_state(state)
+            # Gate ON: full render incl. STRIPS planning (NEXT GROUNDED ACTIONS). Gate OFF (Stage A gate-
+            # retirement measurement): observed-state only — model plans from footholds/effects/graph facts.
+            rendered = _es.render_engagement_state(
+                state, include_planning=bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False))
+            )
             if not rendered:
                 return None
             # Pair the observed-state block with the imperative directive so the per-turn injection is
@@ -3406,7 +3435,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # Resume the paused graph with the decision payload the installed middleware expects.
         async for event in self.graph.astream(
             Command(resume={"decisions": decisions}),
-            {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
+            self._graph_run_config(thread_id)
         ):
             if self._stop_requested:
                 logger.info("🛑 Stop requested — terminating graph execution (HITL resume)")
@@ -3556,16 +3585,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             return ""
 
         try:
-            # Recursion limit 250 for multi-hop autonomous solves (e.g. the GOAD Trust Walker is many agent
-            # hops — foothold→essos DA exceeded 150); RemainingSteps + handback still terminate gracefully,
-            # and the global step cap (_max_steps, default 200 / 300 via the solve driver) backstops runaways.
+            # Use a central graph recursion budget so operator-facing max_steps=0 can mean
+            # unbounded autonomous budget while LangGraph still receives a valid positive limit.
             logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
             # Stream graph execution and process events incrementally
             hitl_interrupted = False
             async for event in self.graph.astream(
                 self.state,
-                {"configurable": {"thread_id": f"{self.agent_task_id}-{self.task_id}"}, "recursion_limit": 250}
+                self._graph_run_config(f"{self.agent_task_id}-{self.task_id}")
             ):
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
                 # Model; halt before driving the next super-step so the session can't run away.
@@ -3932,7 +3960,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 **Progress by Agent:**
 {summary_text}
 
-**Status:** Hit the system's iteration limit of 250 steps. All work and context have been preserved in each agent's conversation history.
+**Status:** Hit the system's iteration limit of {self._graph_recursion_limit()} steps. All work and context have been preserved in each agent's conversation history.
 
 **Your Options:**
 • Reply **"continue"** to increase the limit and keep going from where we left off
@@ -4117,10 +4145,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream continuation with raised recursion limit (250)
+                    # Stream continuation with the configured graph recursion budget.
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
+                        self._graph_run_config(thread_id)
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (continue branch)")
@@ -4243,10 +4271,10 @@ Continue now.""")
 
             if self.graph:
                 try:
-                    # Stream new task direction with raised recursion limit (250)
+                    # Stream new task direction with the configured graph recursion budget.
                     async for event in self.graph.astream(
                         self.state,
-                        {"configurable": {"thread_id": thread_id}, "recursion_limit": 250}
+                        self._graph_run_config(thread_id)
                     ):
                         if self._stop_requested:
                             logger.info("🛑 Stop requested — terminating graph execution (redirect branch)")

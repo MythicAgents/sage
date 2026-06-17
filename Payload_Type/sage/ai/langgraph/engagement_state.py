@@ -1125,8 +1125,13 @@ _RENDER_LIMIT = 1500
 _TRUNCATED_MARKER = "\n… (truncated)"
 
 
-def render_engagement_state(state: EngagementState) -> str:
-    """Return a compact observed-state block for prompt injection."""
+def render_engagement_state(state: EngagementState, include_planning: bool = True) -> str:
+    """Return a compact observed-state block for prompt injection.
+
+    include_planning=True (default) renders the STRIPS-gate planning output (phase, completion
+    candidates, NEXT GROUNDED ACTIONS). include_planning=False renders observed state ONLY
+    (footholds, hops, graph facts) so the model plans from the ledger — the engagement-gate-off path.
+    """
     try:
         lines = [_RENDER_HEADER]
         objective = _render_value(getattr(state, "objective", ""))
@@ -1134,20 +1139,25 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.append(f"Objective: {objective}")
         elif state is None:
             lines.append("Objective: (state unavailable)")
-        try:
-            lines.append(f"Phase: {engagement_phase(state)}")
-        except Exception:
-            pass
-        # A completion candidate is TERMINAL (halt + suppress NEXT actions) only when no further grounded hop
-        # advances the engagement; otherwise it is an intermediate MILESTONE and the climb continues below.
-        try:
-            has_next_hop = bool(available_hops(state) or _capability_actions_available(state))
-        except Exception:
-            has_next_hop = False
-        objective_complete = _objective_is_complete(state, has_next_hop)
-        completion_lines = _render_objective_completion_candidates(state, terminal=objective_complete)
-        if completion_lines:
-            lines.extend(completion_lines)
+        # Planning derivations (phase, completion candidates, NEXT GROUNDED ACTIONS) are STRIPS-gate output.
+        # When include_planning is False (engagement gate off — Stage A retirement) the render is observed-
+        # state only (footholds, hops, graph facts) and the model plans from it.
+        objective_complete = False
+        if include_planning:
+            try:
+                lines.append(f"Phase: {engagement_phase(state)}")
+            except Exception:
+                pass
+            # A completion candidate is TERMINAL (halt + suppress NEXT actions) only when no further grounded
+            # hop advances the engagement; otherwise it is an intermediate MILESTONE and the climb continues.
+            try:
+                has_next_hop = bool(available_hops(state) or _capability_actions_available(state))
+            except Exception:
+                has_next_hop = False
+            objective_complete = _objective_is_complete(state, has_next_hop)
+            completion_lines = _render_objective_completion_candidates(state, terminal=objective_complete)
+            if completion_lines:
+                lines.extend(completion_lines)
 
         live_footholds = []
         for foothold in _render_items(getattr(state, "footholds", [])):
@@ -1197,7 +1207,7 @@ def render_engagement_state(state: EngagementState) -> str:
             lines.extend(item for _, item in sorted(live_footholds, key=lambda item: item[0]))
 
         available = []
-        if not objective_complete:
+        if include_planning and not objective_complete:
             # Put executable next actions before the long achieved-hop ledger. The render is bounded for
             # prompt injection; if completed history grows, losing history is safer than hiding the action.
             try:

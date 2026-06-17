@@ -121,9 +121,20 @@ class QueryArguments(TaskArguments):
             description="[OPTIONAL] The AWS Region (AWS_DEFAULT_REGION) to use for Bedrock",
             parameter_group_info=[ParameterGroupInfo(required=False,ui_position=10)]
         )
+        # Mode (HITL)
+        mode = CommandParameter(
+            name="mode",
+            display_name="Mode",
+            cli_name="mode",
+            type=ParameterType.ChooseOne,
+            choices=["auto", "supervised"],
+            default_value="supervised",
+            description="auto = run unattended (evals/automation); supervised (default) = require operator approve/deny on guarded tool calls — safe for live ops",
+            parameter_group_info=[ParameterGroupInfo(required=False, ui_position=11)]
+        )
 
         # Add all the parameters
-        self.args = [provider, model, prompt, verbose, autonomous_solve, max_steps, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region]
+        self.args = [provider, model, prompt, verbose, autonomous_solve, max_steps, api_endpoint, api_key, aws_access_key, aws_secret_access_key, aws_session_token, aws_region, mode]
 
     async def parse_arguments(self):
         if len(self.command_line) == 0:
@@ -177,6 +188,7 @@ class QueryCommand(CommandBase):
         
         verbose = taskData.args.get_arg("verbose")
         autonomous_solve = taskData.args.get_arg("autonomous_solve") or False
+        mode = taskData.args.get_arg("mode") or "supervised"
         max_steps = taskData.args.get_arg("max_steps")
         max_steps = int(max_steps) if max_steps not in (None, "") else 200
 
@@ -225,7 +237,7 @@ class QueryCommand(CommandBase):
         except Exception as e:
             logger.debug(f"BloodHound auto-connect skipped: {e}")
 
-        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, autonomous_solve=autonomous_solve, max_steps=max_steps)
+        llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode, autonomous_solve=autonomous_solve, max_steps=max_steps)
         llm.command_name = "query"
         llm.task_display_id = (
             getattr(taskData.Task, "DisplayID", None)
@@ -241,6 +253,21 @@ class QueryCommand(CommandBase):
         await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(TaskID=taskData.Task.ID, UpdateStatus="LLM Processing..."))
         try:
             await llm.invoke(prompt)
+        except Exception as e:
+            error_text = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"LLM invocation failed: {error_text}")
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(
+                TaskID=taskData.Task.ID,
+                UpdateStatus="error",
+                UpdateCompleted=True,
+            ))
+            error_msg = f"\n❌> Error: {error_text}\n"
+            resp = await SendMythicRPCResponseCreate(MythicRPCResponseCreateMessage(taskData.Task.ID, error_msg.encode()))
+            if not resp.Success:
+                logger.error(f"Failed to stream error message to task: {resp.Error}")
+            response.Completed = True
+            response.TaskStatus = "error"
+            return response
         finally:
             await remove_session(session_id)
 
