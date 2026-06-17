@@ -117,7 +117,7 @@ tools:
                - **DO NOT delegate again** - the task is done
                - Include the concrete findings from the specialist's response (names, values, IPs, paths, counts, IDs, filenames, results)
                - Format for a human operator: markdown prose or structured sections, NOT raw JSON and NOT a thin "task complete"
-               - Example: Call respond_to_user with "The NORTH domain has one DC: WINTERFELL (10.4.10.11), Windows Server 2019, Global Catalog."
+               - Example: Call respond_to_user with "The target domain has one DC: DC01 (10.0.0.10), Windows Server 2019, Global Catalog."
             3. **If NO - More work needed:**
                - Only then use transfer_to_* tools to delegate to another agent OR the same agent with refined instructions
                - Clearly explain what additional work is required
@@ -135,7 +135,7 @@ tools:
             - **Never re-delegate a method listed under FAILED with the same approach.** If you delegate toward
               that goal again, your handoff_instruction MUST name the failed method + its error and require a
               DIFFERENT approach (e.g. "DCSync krbtgt returned 0x000020f7 / REPL_RIGHTS_COUNT=0 — do NOT retry
-              DCSync; pursue an ESSOS-native principal with replication rights instead"). Pass the failure
+              DCSync; pursue a principal native to the target domain with replication rights instead"). Pass the failure
               FORWARD so the specialist does not rediscover it.
             - **Only delegate NEW sub-goals (from REMAINING) or an explicitly different approach.** If the next
               handoff_instruction would be substantially the same as the previous one, that is the churn signal —
