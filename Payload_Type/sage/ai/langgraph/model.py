@@ -1439,6 +1439,34 @@ class Model:
             True if successful, False otherwise
         """
         try:
+            if self.verbose:
+                import time as _t
+                # Verbose timestamps: a logger copy for the Sage stdout/tmux pane (logger adds its own
+                # timestamp), and an explicit HH:MM:SS clock on the message sent back to Mythic. Lets the
+                # operator see the gap between each Sage message (e.g. to localize per-turn latency).
+                #
+                # A single AIMessage is formatted as ONE blob that can carry several display lines
+                # (e.g. "🤖[Agent]> reasoning\n🛠️[Agent:call_x]> Tool Request: ...") streamed in one send.
+                # Stamping only the front would leave every line after the first (the 🛠️ tool-request
+                # lines) un-timestamped. So stamp the first non-empty line AND any later line that begins
+                # with a Sage display marker, while leaving content-continuation lines (wrapped text,
+                # multi-line tool output) untouched.
+                logger.info(f"📤 {formatted_message.rstrip()}")
+                _ts = _t.strftime('%H:%M:%S')
+                _markers = ("🤖", "🛠️", "🔧", "📋", "👤", "🛑", "📊")
+                _stamped_lines = []
+                _first_done = False
+                for _ln in formatted_message.split("\n"):
+                    if not _ln.strip():
+                        _stamped_lines.append(_ln)
+                    elif not _first_done:
+                        _stamped_lines.append(f"[{_ts}] {_ln}")
+                        _first_done = True
+                    elif _ln.startswith(_markers):
+                        _stamped_lines.append(f"[{_ts}] {_ln}")
+                    else:
+                        _stamped_lines.append(_ln)
+                formatted_message = "\n".join(_stamped_lines)
             encoded = formatted_message.encode()
             if not encoded:
                 logger.warning(f"⚠️  Skipping empty response to Mythic task {self.task_id} (would cause 'Response must have actual bytes' error)")
