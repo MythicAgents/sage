@@ -103,6 +103,59 @@ def test_sage_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
     ]
 
 
+def test_apollo_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "APOLLO_CALLBACK_HOST=http://100.64.0.1\n"
+        "APOLLO_CALLBACK_PORT=8080\n"
+        "APOLLO_CALLBACK_INTERVAL=5\n"
+        "APOLLO_CALLBACK_JITTER=17\n"
+        "APOLLO_AESPSK=none\n"
+        "APOLLO_GET_URI=hello\n"
+        "APOLLO_POST_URI=submit\n"
+        "APOLLO_QUERY_PATH_NAME=id\n"
+        "APOLLO_OUTPUT_TYPE=Shellcode\n"
+        "APOLLO_ADJUST_FILENAME=true\n"
+        "APOLLO_DEBUG=true\n"
+        "APOLLO_DOWNLOAD_DIR=/payloads\n",
+        encoding="utf-8",
+    )
+    keys = [
+        "APOLLO_CALLBACK_HOST",
+        "APOLLO_CALLBACK_PORT",
+        "APOLLO_CALLBACK_INTERVAL",
+        "APOLLO_CALLBACK_JITTER",
+        "APOLLO_AESPSK",
+        "APOLLO_GET_URI",
+        "APOLLO_POST_URI",
+        "APOLLO_QUERY_PATH_NAME",
+        "APOLLO_OUTPUT_TYPE",
+        "APOLLO_ADJUST_FILENAME",
+        "APOLLO_DEBUG",
+        "APOLLO_DOWNLOAD_DIR",
+    ]
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    bootstrap_payloads.load_env_file(env_file)
+    parser = argparse.ArgumentParser()
+
+    bootstrap_payloads.add_apollo_args(parser)
+    args = parser.parse_args([])
+
+    assert args.callback_host == "http://100.64.0.1"
+    assert args.callback_port == 8080
+    assert args.callback_interval == 5
+    assert args.callback_jitter == 17
+    assert args.aespsk == "none"
+    assert args.get_uri == "hello"
+    assert args.post_uri == "submit"
+    assert args.query_path_name == "id"
+    assert args.output_type == "Shellcode"
+    assert args.adjust_filename is True
+    assert args.debug is True
+    assert args.download_dir == "/payloads"
+
+
 def test_sage_task_password_resolver_prefers_environment(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("MYTHIC_ADMIN_PASSWORD=from-file\n", encoding="utf-8")

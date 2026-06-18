@@ -69,7 +69,8 @@ uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skil
 uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py status
 ```
 
-Require `available-domains: count=0` before ingest. The wipe is asynchronous.
+The wipe waits 10 seconds before its first verification poll, then polls every 5 seconds until
+`available-domains: count=0`. Do not run a separate immediate status check.
 
 ## Bundled Scripts
 

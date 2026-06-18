@@ -125,6 +125,13 @@ def load_env_file(path: Path = SKILL_ENV_PATH) -> dict[str, str]:
 load_env_file()
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 def _build_parameters(values: dict[str, Any], *, keep_empty: set[str] | None = None) -> list[dict[str, str]]:
     keep_empty = keep_empty or set()
     params: list[dict[str, str]] = []
@@ -349,6 +356,11 @@ async def create_sage(client, args: argparse.Namespace) -> dict[str, Any]:
 
 
 async def create_apollo(client, args: argparse.Namespace) -> dict[str, Any]:
+    if not args.callback_host:
+        raise ValueError(
+            "Set APOLLO_CALLBACK_HOST in skills/sage-callback-bootstrap/.env "
+            "or pass --callback-host."
+        )
     return await mythic.create_payload(
         client,
         payload_type_name="apollo",
@@ -432,7 +444,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def add_sage_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--sage-filename", default="sage-goad-fresh")
+    parser.add_argument("--sage-filename", default=os.environ.get("SAGE_FILENAME", "sage-goad-fresh"))
     parser.add_argument("--provider", default=os.environ.get("SAGE_PROVIDER", "Bedrock"))
     parser.add_argument("--model", default=os.environ.get("SAGE_MODEL", ""))
     parser.add_argument("--api-endpoint", default=os.environ.get("SAGE_API_ENDPOINT", ""))
@@ -444,19 +456,46 @@ def add_sage_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_apollo_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--apollo-filename", default="apollo-castelblack-fresh.exe")
-    parser.add_argument("--callback-host", required=True)
-    parser.add_argument("--callback-port", default=80, type=int)
-    parser.add_argument("--callback-interval", default=3, type=int)
-    parser.add_argument("--callback-jitter", default=23, type=int)
-    parser.add_argument("--aespsk", default="aes256_hmac", choices=["aes256_hmac", "none"])
-    parser.add_argument("--get-uri", default="index")
-    parser.add_argument("--post-uri", default="data")
-    parser.add_argument("--query-path-name", default="q")
-    parser.add_argument("--output-type", default="WinExe", choices=["WinExe", "Shellcode", "Service", "Source"])
-    parser.add_argument("--adjust-filename", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--download-dir", default=None)
+    parser.add_argument(
+        "--apollo-filename",
+        default=os.environ.get("APOLLO_FILENAME", "apollo-castelblack-fresh.exe"),
+    )
+    parser.add_argument("--callback-host", default=os.environ.get("APOLLO_CALLBACK_HOST", ""))
+    parser.add_argument("--callback-port", default=int(os.environ.get("APOLLO_CALLBACK_PORT", "80")), type=int)
+    parser.add_argument(
+        "--callback-interval",
+        default=int(os.environ.get("APOLLO_CALLBACK_INTERVAL", "3")),
+        type=int,
+    )
+    parser.add_argument(
+        "--callback-jitter",
+        default=int(os.environ.get("APOLLO_CALLBACK_JITTER", "23")),
+        type=int,
+    )
+    parser.add_argument(
+        "--aespsk",
+        default=os.environ.get("APOLLO_AESPSK", "aes256_hmac"),
+        choices=["aes256_hmac", "none"],
+    )
+    parser.add_argument("--get-uri", default=os.environ.get("APOLLO_GET_URI", "index"))
+    parser.add_argument("--post-uri", default=os.environ.get("APOLLO_POST_URI", "data"))
+    parser.add_argument("--query-path-name", default=os.environ.get("APOLLO_QUERY_PATH_NAME", "q"))
+    parser.add_argument(
+        "--output-type",
+        default=os.environ.get("APOLLO_OUTPUT_TYPE", "WinExe"),
+        choices=["WinExe", "Shellcode", "Service", "Source"],
+    )
+    parser.add_argument(
+        "--adjust-filename",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("APOLLO_ADJUST_FILENAME"),
+    )
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("APOLLO_DEBUG"),
+    )
+    parser.add_argument("--download-dir", default=os.environ.get("APOLLO_DOWNLOAD_DIR") or None)
 
 
 def build_parser() -> argparse.ArgumentParser:

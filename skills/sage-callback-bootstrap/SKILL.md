@@ -13,9 +13,9 @@ Mythic reset changes payload crypto keys, so old Sage/Apollo payload files and c
 Do not store passwords in skills. Use `MYTHIC_ADMIN_PASSWORD`, a local gitignored Mythic `.env`, or an operator
 secret manager. The bundled bootstrap script resolves environment credentials first.
 
-## Sage Payload Defaults
+## Payload Defaults
 
-Sage payload provider/model/API defaults belong in the repo-local skill `.env`, not in ad hoc command lines:
+Sage and Apollo payload defaults belong in the repo-local skill `.env`, not in ad hoc command lines:
 
 ```bash
 skills/sage-callback-bootstrap/.env
@@ -27,9 +27,9 @@ The tracked template is:
 skills/sage-callback-bootstrap/.env.example
 ```
 
-The current GOAD bootstrap defaults are `SAGE_PROVIDER=OpenAI`, `SAGE_MODEL=gpt-5.5-cyber-preview`,
-`SAGE_API_ENDPOINT=http://127.0.0.1:8100/v1`, and `SAGE_API_KEY=dummy-key`. Shell environment variables still
-override this file for one-off payload builds.
+The file stores Sage model/API settings plus Apollo filename, callback, C2 timing, output, and download settings.
+Set `APOLLO_CALLBACK_HOST` to the Mythic address reachable from GOAD. Shell variables and CLI arguments still
+override the file for one-off builds.
 
 ## Workflow
 
@@ -39,10 +39,10 @@ Inspect first:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
 ```
 
-Create fresh payloads with the live HTTP C2 callback host:
+Create fresh payloads from the skill `.env`:
 
 ```bash
-.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-all --callback-host <callback_host> --download-dir /tmp/sage_payloads
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-all
 ```
 
 After Apollo launches on CASTELBLACK, verify readiness and discover callbacks:
