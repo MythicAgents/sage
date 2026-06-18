@@ -87,13 +87,17 @@ class LiveRunner:
             argv += ["--sage-cb", str(self.sage_cb)]
         if self.db:
             argv += ["--db", self.db]
-        run_id = f"gauge-{getattr(config, 'name', config)}-{getattr(scenario, 'name', 'scn')}-{uuid.uuid4().hex[:8]}"
+        token = f"gauge-{getattr(config, 'name', config)}-{getattr(scenario, 'name', 'scn')}-{uuid.uuid4().hex[:8]}"
         env = dict(os.environ)
         env.update(getattr(config, "env", {}) or {})
-        env["SAGE_ENGAGEMENT_ID"] = getattr(scenario, "engagement_id", "")
-        env["SAGE_TRAJECTORY_RUN_ID"] = run_id
+        # Pin a FRESH engagement id per run. mythic_tools:813 uses SAGE_ENGAGEMENT_ID as the ledger key
+        # verbatim (bypassing Sage's per-reset UUID), so a fresh token gives a clean, known ledger every
+        # run and avoids reading stale hops from a previous run/reset. The same token keys the trajectory
+        # store, and C1/C1b are pointed at it via build_scorecard_from_run below.
+        env["SAGE_ENGAGEMENT_ID"] = token
+        env["SAGE_TRAJECTORY_RUN_ID"] = token
         env["SAGE_TRAJECTORY_ENABLED"] = "1"
-        return argv, env, run_id
+        return argv, env, token
 
     def _default_invoke(self, argv: list[str], env: dict, out_dir: str) -> dict:
         """Run the harness and return the newest eval-*.json. Lab-only path."""
@@ -106,11 +110,12 @@ class LiveRunner:
 
     def run_batch(self, config, scenario, seeds: int = 5) -> list[ScoreCard]:
         """One harness invocation (N seeds) -> N ScoreCards scored by the gauge."""
-        argv, env, run_id = self.build_command(config, scenario, seeds)
+        argv, env, token = self.build_command(config, scenario, seeds)
         report = self._invoke(argv, env, self.out_dir)
         records = parse_report(report, self.case_id_for(scenario))
         return [
-            build_scorecard_from_run(rec, scenario, trajectory_run_id=run_id, gauge_version=self.gauge_version)
+            build_scorecard_from_run(rec, scenario, engagement_id=token, trajectory_run_id=token,
+                                     gauge_version=self.gauge_version)
             for rec in records
         ]
 

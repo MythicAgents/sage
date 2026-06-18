@@ -162,12 +162,14 @@ def build_scorecard_from_run(
     harness_record: dict,
     scenario,
     *,
+    engagement_id: str | None = None,
     trajectory_run_id: str | None = None,
     gauge_version: str = GAUGE_VERSION,
 ) -> ScoreCard:
-    """Compose a ScoreCard from a real harness run: C1 ground truth (from the scenario's ledger)
-    + C1b tradecraft + C2 fitness. This is the grounded glue the LIVE runner uses."""
-    gt = read_ground_truth(scenario)
+    """Compose a ScoreCard from a real harness run: C1 ground truth (from the run's ledger key)
+    + C1b tradecraft + C2 fitness. `engagement_id`/`trajectory_run_id` are the live runner's
+    fresh per-run keys. This is the grounded glue the LIVE runner uses."""
+    gt = read_ground_truth(scenario, engagement_id=engagement_id)
     proc = read_process_signals(trajectory_run_id)  # None -> whole store
     return _score(harness_record, gt, proc, scenario=scenario, gauge_version=gauge_version)
 

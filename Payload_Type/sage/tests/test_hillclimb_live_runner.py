@@ -33,14 +33,15 @@ def test_build_command_has_harness_args_and_env(monkeypatch, tmp_path):
     _hermetic(monkeypatch, tmp_path)
     runner = lr.LiveRunner(sage_cb=13, out_dir=str(tmp_path), db="/x/phoenix.db")
     scn = goad_scenarios("Operation_Test")[0]  # name == "single-hop-system"
-    argv, env, run_id = runner.build_command(lr.LiveConfig("weak", {"SAGE_PROMPT_VARIANT": "weak"}), scn, seeds=3)
+    argv, env, token = runner.build_command(lr.LiveConfig("weak", {"SAGE_PROMPT_VARIANT": "weak"}), scn, seeds=3)
     assert argv[:4] == [runner.python_exe, "-m", "evals.harness", "run"]
     assert "--only" in argv and "single-hop-system" in argv
     assert "--seeds" in argv and "3" in argv
     assert "--sage-cb" in argv and "13" in argv
-    assert env["SAGE_ENGAGEMENT_ID"] == "Operation_Test"
     assert env["SAGE_PROMPT_VARIANT"] == "weak"          # config env overlay applied
-    assert run_id.startswith("gauge-weak-single-hop-system-")
+    assert token.startswith("gauge-weak-single-hop-system-")
+    assert env["SAGE_ENGAGEMENT_ID"] == token            # FRESH per-run id, not the static scenario id
+    assert env["SAGE_TRAJECTORY_RUN_ID"] == token        # same token keys the trajectory store
 
 
 def test_parse_report_extracts_seed_records():

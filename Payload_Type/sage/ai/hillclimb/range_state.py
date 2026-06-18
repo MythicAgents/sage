@@ -183,11 +183,17 @@ def _milestone_met(spec: MilestoneSpec, proven_effects: set[str], domains: dict[
 def read_ground_truth(
     scenario: Scenario,
     *,
+    engagement_id: str | None = None,
     foothold_seen: bool | None = None,
     require_run_provenance: bool = False,
 ) -> GroundTruth:
-    """Read the verified milestone vector for `scenario` from its durable ledger. READ-ONLY."""
-    data = engagement_ledger.load(scenario.engagement_id)  # never raises; {} skeleton if missing
+    """Read the verified milestone vector for `scenario` from its durable ledger. READ-ONLY.
+
+    `engagement_id` overrides `scenario.engagement_id` — the live runner pins a FRESH per-run id via
+    SAGE_ENGAGEMENT_ID and passes the same id here, so C1 reads that run's clean ledger rather than a
+    stale static one (the per-reset-UUID staleness fix)."""
+    eid = engagement_id if engagement_id is not None else scenario.engagement_id
+    data = engagement_ledger.load(eid)  # never raises; {} skeleton if missing
     hops = [h for h in (data.get("hops") or []) if isinstance(h, dict)]
 
     proven_effects: set[str] = set()
