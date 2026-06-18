@@ -305,10 +305,13 @@ def _mythic_login():
     return asyncio.run(mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw))
 
 
-def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_steps: int = 200):
+def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_steps: int = 0):
     """The HARNESS side of bare-vs-harness: run a FULL autonomous Sage solve for an objective.
     Issues a `query` task to the Sage callback (the autonomous-solve path, per container/agent_functions/
-    query.py) and waits for completion. Same Mythic path proven by sage_task.py."""
+    query.py) and waits for completion. Same Mythic path proven by sage_task.py.
+
+    max_steps=0 = UNLIMITED (model.py:1282 uses the central graph recursion budget for autonomous solves);
+    a finite cap (e.g. 200) truncates a real solve early, so 0 is the default for a full run."""
     from mythic import mythic  # type: ignore
 
     async def _solve(objective: str) -> str:

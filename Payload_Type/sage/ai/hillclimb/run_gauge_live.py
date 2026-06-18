@@ -77,7 +77,7 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
                 OBJECTIVE: live_seams.ad_domain_admins(tasker, OBJECTIVE)}
     probes = build_probes(tasker, baseline)
     if side == "harness":
-        solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=200)
+        solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
         solve(scn.objective)                                   # full autonomous Sage solve
         card = bare_runner.score_from_probes(scn, probes, status="done")
     elif side == "bare":
@@ -137,6 +137,8 @@ def main(argv=None) -> int:
     r.add_argument("--go", action="store_true", help="actually run live offensive tooling")
     r.add_argument("--sage-cb", type=int, default=None)
     r.add_argument("--apollo-cb", type=int, default=None)
+    r.add_argument("--solve-timeout", type=int, default=None,
+                   help="seconds to wait for the harness solve (default 1800=30min); raise for full solves")
     c = sub.add_parser("compare", help="combine recorded ScoreCards for a scenario into a verdict")
     c.add_argument("--scenario", required=True)
     args = ap.parse_args(argv)
@@ -146,6 +148,8 @@ def main(argv=None) -> int:
         cfg.sage_cb = args.sage_cb
     if getattr(args, "apollo_cb", None) is not None:
         cfg.apollo_cb = args.apollo_cb
+    if getattr(args, "solve_timeout", None) is not None:
+        cfg.solve_timeout = args.solve_timeout
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
