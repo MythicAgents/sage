@@ -89,6 +89,26 @@ class BareModelRunner:
         return BareModelResult(objective=objective, steps=len(history), transcript=history, stopped=stopped)
 
 
+def score_from_probes(
+    scenario,
+    probes: dict,
+    *,
+    status: str = "done",
+    steps: int = 0,
+    substring_score: float = 0.0,
+    foothold_seen: bool = True,
+    gauge_version: str = GAUGE_VERSION,
+) -> ScoreCard:
+    """Score ANY agent's run from ledger-independent range probes — the SINGLE shared ruler for both
+    the bare model and the harness, so bare-vs-harness is apples-to-apples on the same ground truth."""
+    gt = read_ground_truth_from_probes(scenario, probes, foothold_seen=foothold_seen)
+    record = {
+        "score": substring_score, "status": status, "tool_calls": steps, "model_calls": steps,
+        "recursion_deaths": 0, "errors": [], "total_tokens": 0, "wall_seconds": 0.0,
+    }
+    return _score(record, gt, None, scenario=scenario, gauge_version=gauge_version)
+
+
 def score_bare_run(
     result: BareModelResult,
     scenario,
@@ -97,14 +117,9 @@ def score_bare_run(
     foothold_seen: bool = True,
     gauge_version: str = GAUGE_VERSION,
 ) -> ScoreCard:
-    """Score a bare-model run with the ledger-independent gauge. Capability comes from range probes;
-    the substring eval does not apply to a bare model, so it is 0 (and the Goodhart gap is moot)."""
-    gt = read_ground_truth_from_probes(scenario, probes, foothold_seen=foothold_seen)
-    record = {
-        "score": 0.0, "status": result.stopped, "tool_calls": result.steps, "model_calls": result.steps,
-        "recursion_deaths": 0, "errors": [], "total_tokens": 0, "wall_seconds": 0.0,
-    }
-    return _score(record, gt, None, scenario=scenario, gauge_version=gauge_version)
+    """Score a bare-model run via the shared probe gauge (substring eval N/A for a bare model -> 0)."""
+    return score_from_probes(scenario, probes, status=result.stopped, steps=result.steps,
+                             foothold_seen=foothold_seen, gauge_version=gauge_version)
 
 
 @dataclass

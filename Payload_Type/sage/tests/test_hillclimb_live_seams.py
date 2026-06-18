@@ -60,3 +60,32 @@ def test_apollo_tools_spec_shape():
 def test_apollo_tools_spec_curated_fallback():
     names = {t["function"]["name"] for t in ls.apollo_tools_spec([])}  # empty -> curated set
     assert "shell" in names and "whoami" in names
+
+
+_NET_GROUP_OUT = """Group name     Domain Admins
+Comment        Designated administrators of the domain
+
+Members
+
+-------------------------------------------------------------------------------
+Administrator            samwell.tarly            evil.admin
+The command completed successfully.
+"""
+
+
+def test_parse_net_group_members():
+    assert ls.parse_net_group_members(_NET_GROUP_OUT) == {"administrator", "samwell.tarly", "evil.admin"}
+    assert ls.parse_net_group_members("connection refused") == set()
+
+
+def test_ad_probe_detects_escalation_vs_baseline():
+    grew = lambda call: "Members\n----\nAdministrator  evil.admin\nThe command completed successfully."
+    same = lambda call: "Members\n----\nAdministrator\nThe command completed successfully."
+    assert ls.ad_domain_admins_probe(grew, "north", baseline={"administrator"})() is True
+    assert ls.ad_domain_admins_probe(same, "north", baseline={"administrator"})() is False
+
+
+def test_ad_probe_win_principal():
+    tasker = lambda call: "Members\n----\nAdministrator  pwned\nThe command completed successfully."
+    assert ls.ad_domain_admins_probe(tasker, "north", win_principals={"pwned"})() is True
+    assert ls.ad_domain_admins_probe(tasker, "north", win_principals={"nope"})() is False

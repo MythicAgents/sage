@@ -87,6 +87,7 @@ class Scenario:
     """A fixed evaluation scenario: which engagement to read and how to bind domains."""
     name: str
     engagement_id: str
+    objective: str = ""          # the prompt given to BOTH Sage and the bare model (fair comparison)
     # role -> domain, e.g. {"child": "north.sevenkingdoms.local",
     #                       "parent": "sevenkingdoms.local",
     #                       "objective": "essos.local"}
