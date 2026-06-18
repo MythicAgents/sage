@@ -51,9 +51,10 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Use `rg`/`rg --files` first for search.
 - Use `apply_patch` for manual edits.
 - Sage runs as a local process in the `sage` tmux session for this workflow. Do not use Docker/Mythic
-  container restart commands for Sage unless the user explicitly asks for that different deployment mode.
-- Never delete files from this repo or runtime tree. In particular, `Payload_Type/sage/sage.db` and
-  `Payload_Type/sage/.phoenix/phoenix.db` cleanup is operator-owned; wait for the operator to remove them.
+  container restart commands for Sage unless the user explicitly asks for that future deployment mode.
+- Never delete runtime databases. Before a clean reset, stop local Sage and use
+  `skills/sage-goad-reset/scripts/archive_runtime_dbs.py` to move active databases to timestamped
+  `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db` archives.
 - Do not create new reusable tools, operator scripts, Codex helpers, or Claude Code helpers in `Plans/`.
   Put them in repo-local skills under `skills/<skill-name>/scripts/` and document the workflow in that skill's
   `SKILL.md`. `Plans/` is for minimal current planning/handoff markdown plus archived historical notes.
@@ -93,29 +94,31 @@ Do not store lab passwords in skills or copied helper scripts. Prefer session en
 `.env` files owned by each tool, or an OS keychain/secret manager. Current Mythic-facing reset helpers should resolve
 `MYTHIC_ADMIN_PASSWORD` from the environment first and `/home/john/dev/mythic/.env` second.
 
-Use this order for clean GOAD/BloodHound/Mythic rehearsal setup. Mythic reset, runtime database cleanup, and
-payload creation are operator-owned unless the user explicitly asks Codex to help with non-deletion steps.
+Use this order for clean GOAD/BloodHound/Mythic rehearsal setup. Mythic is Docker-backed, but Sage runs locally
+in tmux throughout current development.
 
 ### Clean Rehearsal Order
 
-1. **Operator resets Mythic first.** Do not start Sage or a GOAD solve against a half-reset Mythic instance.
-2. **Operator removes local Sage runtime databases before starting Sage back up.** At minimum the operator removes
-   `Payload_Type/sage/sage.db` and `Payload_Type/sage/.phoenix/phoenix.db` so checkpoints/traces from the prior
-   Mythic operation cannot contaminate the next run. Codex must not delete these files; wait for explicit operator
-   confirmation that cleanup is complete before restarting Sage.
-3. **Start/restart local Sage in the `sage` tmux session after operator-confirmed DB cleanup**, with the engagement gate and BloodHound MCP directory:
+1. **Stop local Sage and archive its active databases.** Run
+   `/bin/bash skills/sage-goad-reset/scripts/sage_stop.sh`, then
+   `.venv/bin/python skills/sage-goad-reset/scripts/archive_runtime_dbs.py`. Never overwrite or delete retained
+   archives.
+2. **Reset Mythic through its CLI.** Run
+   `/bin/bash skills/sage-goad-reset/scripts/mythic_reset.sh --yes`, which executes `mythic-cli stop`,
+   `mythic-cli database reset -f`, and `mythic-cli start`.
+3. **Reset GOAD and BloodHound.** Roll back/power on GOAD, wipe BloodHound, and require
+   `available-domains: count=0` before ingest.
+4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
    `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp`.
-4. **Create fresh payloads in Mythic every reset.** Build a new Sage payload and a new Apollo payload after the
+5. **Create fresh payloads in Mythic every reset.** Build a new Sage payload and a new Apollo payload after the
    Mythic reset because payload crypto keys change. Never reuse old Sage/Apollo payload files or old callback IDs
    across Mythic resets. If helping from the CLI, use `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect` first, then
    `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-sage` / `create-apollo` / `create-all` with the live Mythic C2
    `callback_host`.
-5. **Ensure GOAD and BloodHound are clean before launching footholds.** Roll back/power on GOAD and wipe/verify
-   BloodHound as needed, then confirm GOAD is powered on and BloodHound shows `available-domains: count=0`.
 6. **Launch fresh callbacks.** Establish the Sage callback from the new Sage payload, then launch Apollo on
    CASTELBLACK as the assumed-breach foothold (`north\samwell.tarly`) after GOAD is powered on.
-7. **Only then rediscover callbacks and run Sage.** After operator-confirmed DB cleanup and Sage restart, run
-   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --operator-db-cleanup-confirmed` as a non-destructive
+7. **Only then rediscover callbacks and run Sage.** After DB archival and Sage restart, run
+   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
    preflight; it must show `ready: true`. Then use `.venv/bin/python skills/sage-live-runner/scripts/sage_task.py callbacks`; identify
    the live fresh Sage and Apollo callback display IDs; then run
    `SAGE_CB=<sage_cb> APOLLO_CB=<apollo_cb> .venv/bin/python skills/sage-live-runner/scripts/run_essos_da.py`.

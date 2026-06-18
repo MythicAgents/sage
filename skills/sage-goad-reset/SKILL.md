@@ -1,27 +1,44 @@
 ---
 name: sage-goad-reset
-description: Repo-local Sage GOAD/Trust Walker lab reset and readiness workflow. Use when Codex, Claude Code, or an operator needs to reset or verify Ludus GOAD, wipe/check BloodHound CE, restart Sage safely, coordinate operator-owned Mythic and runtime DB cleanup gates, or preflight before a guided Sage GOAD solve.
+description: Repo-local Sage GOAD/Trust Walker lab reset and readiness workflow. Use when Codex, Claude Code, or an operator needs to archive Sage/Phoenix runtime databases, reset Docker-backed Mythic, reset or verify Ludus GOAD, wipe/check BloodHound CE, restart local Sage safely, or preflight before a guided Sage GOAD solve.
 ---
 
 # Sage GOAD Reset
 
 Use from `/home/john/dev/sage`. Sage runs locally in the `sage` tmux session for this workflow, not in a
-Docker/Mythic Sage container. Do not delete files. Runtime cleanup of `Payload_Type/sage/sage.db`,
-`Payload_Type/sage/.phoenix/phoenix.db`, and retained historical DBs is operator-owned.
+Docker/Mythic Sage container. Mythic remains Docker-backed and is managed through `mythic-cli`. Do not delete
+runtime databases or retained archives.
 
 ## Order
 
-1. Operator resets Mythic first.
-2. Operator removes current runtime DBs only when they intend a clean run. Codex never removes files.
-3. Restart Sage after operator confirmation:
+1. Stop local Sage before moving its databases:
+
+```bash
+/bin/bash skills/sage-goad-reset/scripts/sage_stop.sh
+```
+
+2. Archive the active databases. The helper moves them beside their originals as
+   `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db`. It never overwrites an existing archive:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/archive_runtime_dbs.py
+```
+
+3. Reset and restart Mythic. This uses the Docker-backed Mythic CLI without `sudo`:
+
+```bash
+/bin/bash skills/sage-goad-reset/scripts/mythic_reset.sh --yes
+```
+
+4. Reset/verify GOAD and BloodHound.
+5. Restart local Sage in tmux:
 
 ```bash
 /bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp
 ```
 
-4. Use `$sage-callback-bootstrap` to create fresh Sage/Apollo payloads and callbacks.
-5. Reset/verify GOAD and BloodHound before any guided solve.
-6. Rediscover callback IDs. Never trust historical IDs.
+6. Use `$sage-callback-bootstrap` to create fresh Sage/Apollo payloads and callbacks.
+7. Rediscover callback IDs. Never trust historical IDs.
 
 ## GOAD
 
@@ -57,9 +74,12 @@ Require `available-domains: count=0` before ingest. The wipe is asynchronous.
 ## Bundled Scripts
 
 - `_sage_relaunch.py`
+- `archive_runtime_dbs.py`
 - `bh_reset.py`
 - `liveness.py`
 - `ludus.py`
 - `mcp_check.py`
+- `mythic_reset.sh`
 - `pkinit_padata_probe.py`
 - `sage_restart.sh`
+- `sage_stop.sh`

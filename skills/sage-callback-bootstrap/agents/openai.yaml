@@ -1,4 +1,4 @@
 interface:
   display_name: "Sage Callback Bootstrap"
   short_description: "Create and verify fresh Sage/Apollo callbacks."
-  default_prompt: "Use -callback-bootstrap after Mythic reset to create fresh Sage and Apollo callbacks."
+  default_prompt: "Use $sage-callback-bootstrap after Mythic reset to create fresh Sage and Apollo callbacks."

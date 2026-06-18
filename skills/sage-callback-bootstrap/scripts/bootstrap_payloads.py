@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Bootstrap fresh Sage/Apollo payloads after an operator-owned Mythic reset.
+"""Bootstrap fresh Sage/Apollo payloads after a Mythic reset.
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
-operator resets Mythic, operator removes stale Sage/Phoenix DBs, Sage is restarted,
-then this helper can create fresh payloads before Apollo is launched on CASTELBLACK.
+active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
+this helper creates fresh payloads before Apollo is launched on CASTELBLACK.
 
 Examples:
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
@@ -216,21 +216,33 @@ def payload_type_name(callback: dict[str, Any]) -> str:
 def runtime_db_status(
     repo_root: Path = REPO_ROOT,
     *,
-    operator_db_cleanup_confirmed: bool = False,
+    runtime_dbs_archived: bool = False,
+    operator_db_cleanup_confirmed: bool | None = None,
 ) -> dict[str, Any]:
+    if operator_db_cleanup_confirmed is not None:
+        runtime_dbs_archived = operator_db_cleanup_confirmed
     required = [repo_root / rel for rel in REQUIRED_RUNTIME_DBS]
-    session_dbs = sorted((repo_root / "Payload_Type" / "sage").glob("sage_*.db"))
+    sage_archives = sorted((repo_root / "Payload_Type" / "sage").glob("sage_*.db"))
+    phoenix_archives = sorted((repo_root / "Payload_Type" / "sage" / ".phoenix").glob("phoenix_*.db"))
     existing_required = [str(path.relative_to(repo_root)) for path in required if path.exists()]
-    existing_session = [str(path.relative_to(repo_root)) for path in session_dbs if path.exists()]
-    blocks = bool(existing_required and not operator_db_cleanup_confirmed)
+    existing_archives = [
+        str(path.relative_to(repo_root))
+        for path in (*sage_archives, *phoenix_archives)
+        if path.exists()
+    ]
+    blocks = bool(existing_required and not runtime_dbs_archived)
     return {
         "ready": not blocks,
-        "operator_db_cleanup_confirmed": operator_db_cleanup_confirmed,
+        "runtime_dbs_archived": runtime_dbs_archived,
+        "operator_db_cleanup_confirmed": runtime_dbs_archived,
         "existing_required": existing_required,
-        "existing_session": existing_session,
+        "existing_archives": existing_archives,
+        "existing_session": [
+            path for path in existing_archives if Path(path).name.startswith("sage_")
+        ],
         "note": (
-            "Codex must not delete these files. Before Sage restart, required DBs must be absent. "
-            "After operator-confirmed cleanup and Sage restart, recreated DB files are expected and do not block."
+            "Archive active DBs with sage-goad-reset before Sage restart. Recreated active DB files are expected "
+            "after restart and do not block when --runtime-dbs-archived is supplied."
         ),
     }
 
@@ -289,8 +301,11 @@ async def readiness(
     client,
     repo_root: Path = REPO_ROOT,
     *,
-    operator_db_cleanup_confirmed: bool = False,
+    runtime_dbs_archived: bool = False,
+    operator_db_cleanup_confirmed: bool | None = None,
 ) -> dict[str, Any]:
+    if operator_db_cleanup_confirmed is not None:
+        runtime_dbs_archived = operator_db_cleanup_confirmed
     observed = await inspect(client)
     liveness_by_display_id: dict[int, dict[str, Any]] = {}
     for callback in observed.get("callbacks", []):
@@ -304,11 +319,11 @@ async def readiness(
         except Exception as exc:
             liveness_by_display_id[display_id] = {"alive": False, "reason": f"liveness check failed: {exc}"}
 
-    runtime = runtime_db_status(repo_root, operator_db_cleanup_confirmed=operator_db_cleanup_confirmed)
+    runtime = runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
     callbacks = summarize_callback_readiness(observed.get("callbacks", []), liveness_by_display_id)
     blockers = []
     if not runtime["ready"]:
-        blockers.append("operator must remove stale Sage/Phoenix runtime DBs")
+        blockers.append("archive stale Sage/Phoenix runtime DBs before restarting Sage")
     if not callbacks["ready"]:
         blockers.append("fresh live Sage and Apollo callbacks are not both present")
     return {
@@ -373,7 +388,7 @@ async def command_readiness(args: argparse.Namespace) -> None:
         await readiness(
             client,
             Path(args.repo_root),
-            operator_db_cleanup_confirmed=args.operator_db_cleanup_confirmed,
+            runtime_dbs_archived=args.runtime_dbs_archived,
         ),
         indent=2,
         sort_keys=True,
@@ -456,11 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(readiness_parser)
     readiness_parser.add_argument("--repo-root", default=str(REPO_ROOT))
     readiness_parser.add_argument(
+        "--runtime-dbs-archived",
         "--operator-db-cleanup-confirmed",
+        dest="runtime_dbs_archived",
         action="store_true",
         help=(
-            "Use only after the operator confirms sage.db/phoenix.db were removed before Sage restart. "
-            "This allows DB files recreated by the fresh Sage process."
+            "Use after sage.db and phoenix.db were archived before local Sage restarted. "
+            "The old --operator-db-cleanup-confirmed spelling remains as a compatibility alias."
         ),
     )
     readiness_parser.set_defaults(func=command_readiness)

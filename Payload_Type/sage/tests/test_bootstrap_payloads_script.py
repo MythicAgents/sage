@@ -283,6 +283,7 @@ def test_runtime_db_status_blocks_required_dbs_without_deleting(tmp_path):
     (sage_root / "sage.db").write_text("checkpoint", encoding="utf-8")
     (phoenix_root / "phoenix.db").write_text("trace", encoding="utf-8")
     (sage_root / "sage_20260613.db").write_text("session", encoding="utf-8")
+    (phoenix_root / "phoenix_20260613-1200.db").write_text("trace archive", encoding="utf-8")
 
     status = bootstrap_payloads.runtime_db_status(tmp_path)
 
@@ -292,11 +293,15 @@ def test_runtime_db_status_blocks_required_dbs_without_deleting(tmp_path):
         "Payload_Type/sage/.phoenix/phoenix.db",
     ]
     assert status["existing_session"] == ["Payload_Type/sage/sage_20260613.db"]
+    assert status["existing_archives"] == [
+        "Payload_Type/sage/sage_20260613.db",
+        "Payload_Type/sage/.phoenix/phoenix_20260613-1200.db",
+    ]
     assert (sage_root / "sage.db").exists()
     assert (phoenix_root / "phoenix.db").exists()
 
 
-def test_runtime_db_status_allows_recreated_dbs_after_operator_confirmation(tmp_path):
+def test_runtime_db_status_allows_recreated_dbs_after_archive_confirmation(tmp_path):
     sage_root = tmp_path / "Payload_Type" / "sage"
     phoenix_root = sage_root / ".phoenix"
     phoenix_root.mkdir(parents=True)
@@ -305,10 +310,11 @@ def test_runtime_db_status_allows_recreated_dbs_after_operator_confirmation(tmp_
 
     status = bootstrap_payloads.runtime_db_status(
         tmp_path,
-        operator_db_cleanup_confirmed=True,
+        runtime_dbs_archived=True,
     )
 
     assert status["ready"] is True
+    assert status["runtime_dbs_archived"] is True
     assert status["operator_db_cleanup_confirmed"] is True
     assert status["existing_required"] == [
         "Payload_Type/sage/sage.db",

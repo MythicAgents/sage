@@ -5,8 +5,8 @@ description: Repo-local post-Mythic-reset Sage/Apollo payload and callback boots
 
 # Sage Callback Bootstrap
 
-Use after the operator resets Mythic and confirms any intended runtime DB cleanup. Do not delete files. Mythic
-reset changes payload crypto keys, so old Sage/Apollo payload files and callback IDs are invalid.
+Use after `$sage-goad-reset` archives the active runtime databases, resets Mythic, and restarts local Sage.
+Mythic reset changes payload crypto keys, so old Sage/Apollo payload files and callback IDs are invalid.
 
 ## Credentials
 
@@ -45,10 +45,10 @@ Create fresh payloads with the live HTTP C2 callback host:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-all --callback-host <callback_host> --download-dir /tmp/sage_payloads
 ```
 
-After the operator launches Apollo on CASTELBLACK, verify readiness and discover callbacks:
+After Apollo launches on CASTELBLACK, verify readiness and discover callbacks:
 
 ```bash
-.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --operator-db-cleanup-confirmed
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived
 .venv/bin/python skills/sage-live-runner/scripts/sage_task.py callbacks
 ```
 
