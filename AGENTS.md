@@ -186,6 +186,16 @@ Concrete next sequence:
 
 This is higher value than another prompt iteration or another full autonomous run because it turns Sage from a guided GOAD solver into a domain-agnostic CTF solver: the model decides which capability to try, while code owns exact mechanics and verification.
 
+## Eval Gauge / Hill-Climbing (Phase 0)
+
+A ground-truthed measurement instrument lives at `Payload_Type/sage/ai/hillclimb/` — the eval **gauge**: "is config A better than B?", bare-model-vs-harness, the Gate Experiment (Spearman ρ of eval-vs-ground-truth), and the noise floor. It exists because substring-match eval scores are gameable; a hill-climber optimizes whatever the metric measures, so the gauge must track real range state, not trace text.
+
+- **Entry point:** the `sage-eval-gauge` skill (run commands, helpers, gotchas).
+- **Why (canonical):** `Plans/SAGE_HILL_CLIMBING_DESIGN.md` + `SPEC.md`. **Build spec/ISA:** `Plans/SAGE_EVAL_GAUGE_PHASE0_ISA.md`.
+- **Additive + read-only to Sage:** the running Sage process never imports it; **no Sage restart** is needed for gauge changes.
+- **Offline tests:** `tests/test_hillclimb_*.py` (hermetic). **Live driver** `ai/hillclimb/run_gauge_live.py --go` runs OFFENSIVE solves and is operator-gated.
+- The bare model uses Sage's own model from `skills/sage-callback-bootstrap/.env` (no `--model`); BloodHound ground truth is read-only via the CE REST API.
+
 ## Common Pitfalls
 
 - RESUME can be stale; trust but verify against code and tests.

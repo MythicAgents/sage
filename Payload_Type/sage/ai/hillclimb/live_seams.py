@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -118,8 +120,15 @@ def make_tool_executor(
     async def _run(call: dict) -> str:
         cmd = call.get("tool", "")
         args = call.get("args", {})
-        # Empty args -> "" (not "{}"): matches the proven no-arg path (Apollo rejects an empty-dict arg).
-        params = args if isinstance(args, str) else (json.dumps(args) if args else "")
+        # Apollo wants a raw parameter STRING. The bare model's tools expose one string field
+        # (command_line); extract it. Empty -> "" (not "{}"): Apollo rejects an empty-dict arg.
+        if isinstance(args, str):
+            params = args
+        elif isinstance(args, dict):
+            params = args.get("command_line") or args.get("args") or (
+                str(next(iter(args.values()))) if len(args) == 1 else (json.dumps(args) if args else ""))
+        else:
+            params = ""
         task = await mythic.issue_task(
             client, command_name=cmd, parameters=params,
             callback_display_id=callback_display_id, wait_for_complete=False,
@@ -174,3 +183,107 @@ def graph_collected_probe(*, timeout: int = 60) -> Callable[[], bool]:
     def probe() -> bool:
         return bloodhound_domain_count(timeout=timeout) > 0
     return probe
+
+
+# --- Sage model defaults (so the BARE model uses the SAME model as Sage; answers "--model") ----------
+
+_SAGE_ENV = "/home/john/dev/sage/skills/sage-callback-bootstrap/.env"
+
+
+def load_sage_defaults(env_path: str = _SAGE_ENV) -> dict:
+    """Read the Sage payload defaults so the bare model matches Sage — no --model needed.
+    Returns {provider, model, api_key, base_url}. provider lowercased for init_chat_model."""
+    vals: dict = {}
+    p = Path(env_path)
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip().strip("'\"")
+    return {
+        "provider": (vals.get("SAGE_PROVIDER") or "").lower() or None,
+        "model": vals.get("SAGE_MODEL") or None,
+        "api_key": vals.get("SAGE_API_KEY") or None,
+        "base_url": vals.get("SAGE_API_ENDPOINT") or None,
+    }
+
+
+# --- Apollo command catalog (live) -> bare-model tool schemas ----------------------------------------
+
+_CURATED_APOLLO = [
+    "shell", "run", "powershell", "powerpick", "whoami", "ls", "cat", "ps", "upload",
+    "make_token", "steal_token", "rev2self", "mimikatz", "net_localgroup", "wmiexecute",
+]
+
+
+def apollo_command_catalog(*, timeout: int = 60) -> list:
+    """Live-query Apollo's command catalog from Mythic (read-only). [] on failure.
+    VALIDATED 2026-06-18: returns the real Apollo command set (shell, run, mimikatz, ticket_*, ...)."""
+    from mythic import mythic  # type: ignore
+
+    pw = os.environ.get("MYTHIC_ADMIN_PASSWORD")
+    if not pw:
+        env = Path("/home/john/dev/mythic/.env")
+        for line in (env.read_text(encoding="utf-8").splitlines() if env.exists() else []):
+            if line.startswith("MYTHIC_ADMIN_PASSWORD="):
+                pw = line.split("=", 1)[1].strip().strip("'\"")
+
+    async def _q():
+        client = await mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw)
+        query = ('query Cmds {command(where:{payloadtype:{name:{_eq:"apollo"}}}) {cmd description}}')
+        return (await mythic.execute_custom_query(client, query)).get("command", [])
+
+    try:
+        return asyncio.run(_q())
+    except Exception:
+        return []
+
+
+def apollo_tools_spec(commands: list | None = None) -> list:
+    """Apollo commands -> OpenAI-function tool schemas (each command = a tool taking one string,
+    `command_line`, which tool_executor passes through as the Mythic parameter string).
+    Uses the live catalog; falls back to a curated set. NOTE: the model_fn<->tool_executor arg
+    convention is validated on the first live run."""
+    cmds = commands if commands is not None else apollo_command_catalog()
+    if not cmds:
+        cmds = [{"cmd": c, "description": c} for c in _CURATED_APOLLO]
+    spec = []
+    for x in cmds:
+        name = x.get("cmd") if isinstance(x, dict) else str(x)
+        desc = ((x.get("description") if isinstance(x, dict) else "") or name).replace("\n", " ")[:200]
+        spec.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command_line": {"type": "string",
+                                                    "description": "Mythic parameter string for this command"}},
+                    "required": [],
+                },
+            },
+        })
+    return spec
+
+
+# --- BloodHound cypher (read-only) -> deeper milestone probes (DA, objective) ------------------------
+
+_BH_CYPHER = "/home/john/dev/sage/skills/sage-eval-gauge/scripts/bh_cypher.py"
+
+
+def bloodhound_cypher_count(query: str, *, timeout: int = 60) -> int:
+    """Run a read-only Cypher and return the node count, via the BloodHound MCP's signed client.
+    Grounded in CypherClient.run_query (POST /api/v2/graphs/cypher)."""
+    cmd = ["uv", "--directory", "/home/john/dev/bloodhound_mcp", "run", "python", _BH_CYPHER, query]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        return int(json.loads(proc.stdout.strip().splitlines()[-1]).get("node_count", 0))
+    except Exception:
+        return 0
+
+
+def bloodhound_cypher(query: str, *, timeout: int = 60) -> list:
+    """cypher_run-compatible: returns a truthy list iff the query matched ≥1 node (for cypher probes)."""
+    return list(range(bloodhound_cypher_count(query, timeout=timeout)))

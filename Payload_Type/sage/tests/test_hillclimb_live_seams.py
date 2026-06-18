@@ -37,3 +37,26 @@ def test_parse_domain_count():
     assert ls.parse_domain_count("available-domains: 200 count=3 -> ['a','b','c']") == 3
     assert ls.parse_domain_count("available-domains: 200 count=0 -> []") == 0
     assert ls.parse_domain_count("connection refused") == 0
+
+
+def test_load_sage_defaults(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("# Local Sage defaults\nSAGE_PROVIDER=OpenAI\nSAGE_MODEL=gpt-5.5-cyber-preview\n"
+                   "SAGE_API_ENDPOINT=http://127.0.0.1:8100/v1\nSAGE_API_KEY=sk-abc\n")
+    d = ls.load_sage_defaults(str(env))
+    assert d["provider"] == "openai"            # lowercased for init_chat_model
+    assert d["model"] == "gpt-5.5-cyber-preview"
+    assert d["base_url"] == "http://127.0.0.1:8100/v1"
+    assert d["api_key"] == "sk-abc"
+
+
+def test_apollo_tools_spec_shape():
+    spec = ls.apollo_tools_spec([{"cmd": "shell", "description": "run a shell command"}, {"cmd": "whoami"}])
+    assert spec[0]["type"] == "function"
+    assert spec[0]["function"]["name"] == "shell"
+    assert "command_line" in spec[0]["function"]["parameters"]["properties"]
+
+
+def test_apollo_tools_spec_curated_fallback():
+    names = {t["function"]["name"] for t in ls.apollo_tools_spec([])}  # empty -> curated set
+    assert "shell" in names and "whoami" in names
