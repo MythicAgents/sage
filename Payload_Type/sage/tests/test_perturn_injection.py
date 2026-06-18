@@ -3,9 +3,8 @@
 Verify the per-turn fix for the mis-wired continue-loop-only injection:
 
 - Model._render_engagement_state_for_injection() is a cheap, synchronous, in-memory render that
-  gates correctly (None unless autonomous + observed state present; the STRIPS planning block is
-  included only when the gate is on) and emits the
-  `=== ENGAGEMENT STATE` block otherwise.
+  returns None unless autonomous + observed state are present, and otherwise emits the observed
+  `=== ENGAGEMENT STATE` block.
 - _EngagementStateMiddleware._augment appends the rendered block as a HumanMessage via
   request.override (EPHEMERAL — the original request is untouched, so it never accumulates).
 - awrap_model_call passes the augmented request to the handler.
@@ -31,18 +30,6 @@ def _load_model_module():
         return importlib.import_module("ai.langgraph.model")
     except Exception as e:  # pragma: no cover - environment guard
         pytest.skip(f"model.py runtime unavailable: {e}")
-
-
-def _set_gate(monkeypatch, enabled: bool):
-    """Set ENGAGEMENT_GATE_ENABLED on every loaded mythic_tools module object.
-
-    model.py resolves mythic_tools via a package-qualified import (ai.langgraph.mythic_tools),
-    which is a distinct module object from a bare top-level `import mythic_tools`. Set both so the
-    render helper sees the intended value regardless of which object it bound."""
-    import mythic_tools as _top  # noqa
-    for mod in (_top, sys.modules.get("ai.langgraph.mythic_tools")):
-        if mod is not None:
-            monkeypatch.setattr(mod, "ENGAGEMENT_GATE_ENABLED", enabled)
 
 
 class _StubClient:
@@ -73,18 +60,15 @@ def _achieved_hop():
 
 def test_render_none_when_not_autonomous(monkeypatch):
     mod = _load_model_module()
-    _set_gate(monkeypatch, True)
     m = mod.Model.__new__(mod.Model)
     m._autonomous_solve = False
     m.mythic_client = _StubClient(hops=_achieved_hop())
     assert m._render_engagement_state_for_injection() is None
 
 
-def test_render_observed_state_when_gate_off(monkeypatch):
-    # Stage A (engagement-gate retirement): gate OFF still injects OBSERVED state (footholds/hops) so the
-    # model can plan from the ledger — but WITHOUT the STRIPS planning block (Phase / NEXT GROUNDED ACTIONS).
+def test_render_observed_state_without_planning_block(monkeypatch):
+    # Stage B: per-turn injection always renders observed state only. The STRIPS planning block is gone.
     mod = _load_model_module()
-    _set_gate(monkeypatch, False)
     m = mod.Model.__new__(mod.Model)
     m._autonomous_solve = True
     m.mythic_client = _StubClient(hops=_achieved_hop())
@@ -98,16 +82,14 @@ def test_render_observed_state_when_gate_off(monkeypatch):
 
 def test_render_none_when_no_observed_state(monkeypatch):
     mod = _load_model_module()
-    _set_gate(monkeypatch, True)
     m = mod.Model.__new__(mod.Model)
     m._autonomous_solve = True
     m.mythic_client = _StubClient(hops=[], footholds=[])
     assert m._render_engagement_state_for_injection() is None
 
 
-def test_render_present_when_autonomous_and_gate_on(monkeypatch):
+def test_render_present_when_autonomous_and_observed_state_exists(monkeypatch):
     mod = _load_model_module()
-    _set_gate(monkeypatch, True)
     m = mod.Model.__new__(mod.Model)
     m._autonomous_solve = True
     m.mythic_client = _StubClient(hops=_achieved_hop())

@@ -1,6 +1,5 @@
 import os
 from dataclasses import asdict, is_dataclass
-ENGAGEMENT_GATE_ENABLED = os.environ.get("SAGE_ENGAGEMENT_GATE", "").lower() in ("1", "true", "yes")
 # Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
@@ -790,11 +789,8 @@ class MythicTools:
         self._collection_in_flight: dict[str, dict] = {}
         self._pending_task_backed_transition: dict | None = None
         # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
-        # re-fetched + re-dumped them 27×, bloating context). Gate-block counts cap a hop the gate keeps
-        # DEFERring (issue_task fired 168× -> 1 task that run): a firm STOP after repeated blocks with no
-        # intervening progress; reset whenever a task actually passes the gate.
+        # re-fetched + re-dumped them 27×, bloating context).
         self._command_schema_cache: dict = {}
-        self._gate_block_counts: dict = {}
         # Credential-store cache: the store is read both by read_credentials (which the agent hit 24× in one
         # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
         # neither path re-queries Mythic repeatedly.
@@ -804,17 +800,17 @@ class MythicTools:
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
-        # serializes that one-time resolve+reload so two concurrent gate calls can't both reload and stomp
+        # serializes that one-time resolve+reload so two concurrent hook calls can't both reload and stomp
         # an appended hop.
         self._engagement_key: str | None = None
         self._engagement_key_lock = asyncio.Lock()
-        # Live footholds cache (populated by the gate after reconcile) so the per-turn state render in
+        # Live footholds cache (populated by the issue hook after reconcile) so the per-turn state render in
         # model.py can show footholds without an extra network round-trip on every model call.
         self._engagement_footholds: list = []
         # Durable cross-run resume: when an explicit engagement key is configured, load it now. The normal
         # operation-named key needs a Mythic client, so it is resolved after login; loading state_default here
         # would let stale default state drive planning before the first gated task.
-        if ENGAGEMENT_GATE_ENABLED and SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
+        if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID
             try:
                 self._load_engagement_ledger(replace=True)
@@ -1933,35 +1929,13 @@ class MythicTools:
             parameters = self._qualify_dcsync_params(command, parameters)
         except Exception:
             pass  # fail-open: never block the issue path on normalization
-        if ENGAGEMENT_GATE_ENABLED:
-            try:
-                _gate_result = await self._engagement_gate(command, parameters, callback_display_id)
-            except Exception:
-                _gate_result = None  # fail-open: any gate error => proceed normally
-            if _gate_result is not None:
-                # Post-RCA (2026-06-09): missing-precondition DEFER no longer blocks (see _engagement_gate),
-                # so the ONLY blocking result left is an already-achieved/collect-once SKIP (genuine dedup).
-                # This breaker now caps the narrow case of an agent re-proposing an ALREADY-WON hop: a firm
-                # STOP after 3 tries tells it to advance instead of re-issuing a hop the ledger already holds.
-                # Counts reset when a task actually passes the gate.
-                try:
-                    _sig = (
-                        command, callback_display_id,
-                        json.dumps(parameters, sort_keys=True) if isinstance(parameters, (dict, list)) else str(parameters),
-                    )
-                    self._gate_block_counts[_sig] = self._gate_block_counts.get(_sig, 0) + 1
-                    if self._gate_block_counts[_sig] >= 3:
-                        return (
-                            f"STOP — the engagement gate has blocked this exact action "
-                            f"{self._gate_block_counts[_sig]}× with NO intervening progress.\n{_gate_result}\n"
-                            "Re-proposing a blocked hop burns the step budget. Execute one of the NEXT GROUNDED "
-                            "ACTIONS shown in the engagement state, or handback_to_supervisor with this blocker. "
-                            "Do NOT re-issue this command."
-                        )
-                except Exception:
-                    pass
-                self._pending_task_backed_transition = None
-                return _gate_result
+        try:
+            _hook_result = await self._engagement_issue_hook(command, parameters, callback_display_id)
+        except Exception:
+            _hook_result = None  # fail-open: any hook error => proceed normally
+        if _hook_result is not None:
+            self._pending_task_backed_transition = None
+            return _hook_result
 
         liveness_blocker = await self._callback_tasking_liveness_blocker(callback_display_id)
         if liveness_blocker:
@@ -1970,10 +1944,8 @@ class MythicTools:
 
         # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
         # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
-        # REPEATED reads within one epoch). A task passing the gate is progress, so stale gate-block counts
-        # reset here too.
+        # REPEATED reads within one epoch).
         self._recon_epoch += 1
-        self._gate_block_counts = {}
 
         # HITL: guarded
         if timeout is None:
@@ -2267,15 +2239,14 @@ class MythicTools:
                         logger.info(f"🛡️ OPSEC annotated command={command} footprint_total={_fp['total']} axes={_ax}")
             except Exception:
                 pass
-            if ENGAGEMENT_GATE_ENABLED:
-                try:
-                    self._record_engagement_success(results_str)
-                except Exception:
-                    pass  # fail-open: recording must never break the issue path
-                try:
-                    self._apply_contradiction_downgrade(command, parameters, results_str)
-                except Exception:
-                    pass  # fail-open: a downgrade must never break the issue path
+            try:
+                self._record_engagement_success(results_str)
+            except Exception:
+                pass  # fail-open: recording must never break the issue path
+            try:
+                self._apply_contradiction_downgrade(command, parameters, results_str)
+            except Exception:
+                pass  # fail-open: a downgrade must never break the issue path
             return results_str
         except Exception as e:
             error_result = f"Error issuing command '{command}' to agent {callback_display_id}: {e}"
@@ -2291,7 +2262,7 @@ class MythicTools:
                 )
             return error_result
 
-    async def _engagement_gate(self, command, parameters, callback_display_id) -> str | None:
+    async def _engagement_issue_hook(self, command, parameters, callback_display_id) -> str | None:
         self._pending_engagement_hop = None
         try:
             try:
@@ -2317,7 +2288,7 @@ class MythicTools:
             return None
 
         # Resolve the durable-ledger key from the current Mythic operation (and reload the ledger under
-        # it) before the first gated decision — __init__ loaded under 'default' with no client yet.
+        # it) before the first issue-time decision — __init__ loaded under 'default' with no client yet.
         await self._ensure_engagement_key()
 
         technique, target_key = classified
@@ -2335,12 +2306,16 @@ class MythicTools:
             pass
 
         # collect-graph: deterministic collect-once-per-privilege. Rebind the empty target to the issuing
-        # callback's access-context key; SKIP if a collection is in-flight or the graph is already built at
-        # this access level. graph-built is recorded by ingest_collection on graph_verified (not on
-        # SharpHound success), so we do NOT set a pending hop here.
+        # callback's access-context key; block only if a collection is in-flight or a verified graph exists
+        # for this access level and the cached graph corroborates that collection. graph-built is recorded
+        # by ingest_collection on graph_verified (not on SharpHound success), so we do NOT set a pending hop here.
         if technique == "collect-graph":
+            graph_facts = list(getattr(self, "_engagement_graph_facts", []) or [])
             cg_state = engagement_state.EngagementState(
-                objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
+                objective=self._engagement_objective(),
+                footholds=footholds,
+                hops=list(self._engagement_hops),
+                graph_facts=graph_facts,
             )
             fh = next(
                 (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
@@ -2351,8 +2326,26 @@ class MythicTools:
             in_flight_blocker = await self._collection_in_flight_blocker(access_key)
             if in_flight_blocker:
                 return in_flight_blocker
-            decision, _reason = engagement_state.gate_decision("collect-graph", access_key, cg_state)
-            if decision == engagement_state.GateDecision.SKIP:
+            graph_effect = f"graph-built:{access_key}"
+            graph_verified = False
+            for hop in list(getattr(cg_state, "hops", []) or []):
+                if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
+                    continue
+                effects = {
+                    self._capability_text(item).casefold()
+                    for item in getattr(hop, "satisfied_effects", []) or []
+                }
+                effects.add(self._capability_text(getattr(hop, "effect", "")).casefold())
+                evidence = getattr(hop, "evidence", {}) or {}
+                if graph_effect.casefold() in effects and isinstance(evidence, dict) and evidence.get("graph_verified") is True:
+                    graph_verified = True
+                    break
+            graph_corroborated = bool(graph_facts)
+            try:
+                graph_corroborated = graph_corroborated or engagement_state.corroborate_effect(graph_effect, cg_state)
+            except Exception:
+                pass
+            if graph_verified and graph_corroborated:
                 return (f"[engagement-gate] skipped: graph already built at this access level ({access_key}) "
                         "— analyze the existing graph or escalate; do NOT re-collect.")
             self._queue_task_backed_transition(
@@ -2435,47 +2428,24 @@ class MythicTools:
             graph_facts=corroboration,
             probed_effect_prefixes={"creds", "krbtgt-hash"},  # the cred-store probe definitively read these
         )
-        decision, reason = engagement_state.gate_decision(technique, target_key, state)
-        if decision == engagement_state.GateDecision.SKIP:
+        dom = self._dcsync_target_domain(technique, target_key)
+        rights_missing = (
+            technique in {"dcsync", "dcsync-user"}
+            and bool(dom)
+            and f"ds-replication-rights:{dom}" not in state.satisfied_predicates()
+        )
+        reason = f"missing precondition(s): ds-replication-rights:{dom}" if rights_missing else ""
+        if self._should_block_premature_dcsync(
+            technique, reason, bool(self._engagement_graph_facts),
+            self._dcsync_precheck_blocks.get((technique, dom), 0), self._DCSYNC_PRECHECK_MAX_BLOCKS,
+        ):
+            self._dcsync_precheck_blocks[(technique, dom)] = \
+                self._dcsync_precheck_blocks.get((technique, dom), 0) + 1
             self._pending_engagement_hop = None
-            return f"[engagement-gate] skipped: {reason}"
-        if decision == engagement_state.GateDecision.DEFER:
-            # ADVISOR, NOT ENFORCER (2026-06-09 RCA): a missing-precondition DEFER is NO LONGER a veto.
-            # The hand-built STRIPS precondition model produced FATAL false-negatives — it refused 167/168
-            # correct hops in solve #37 and deadlocked every run after hop 1: `dcsync` DEFERd for
-            # `ds-replication-rights:{domain}`, and the StandIn grant that PRODUCES those rights itself
-            # DEFERd for `write-dacl:domain:{domain}` — a precondition nothing in the model ever emits from
-            # the agent's GPO/SYSTEM control. The agent cannot route around Sage's OWN refusal, so every
-            # modeling gap is a fatal deadlock. The live target is a real oracle we already possess: a wrong
-            # attack fails with real, reasoned-from feedback; a right attack advances the ledger. Cost
-            # asymmetry: a gate false-block = infinite deadlock; a false-allow = one cheap, reset-recoverable
-            # task + real signal. So we PROCEED past a would-DEFER and let execution be the judge. The
-            # advisory is LOGGED for observability but NOT injected into the agent's context — injecting it
-            # is what made the agent mistake Sage's veto for a malformed command and permute --object syntax
-            # ~50×. Already-achieved SKIP (dedup, above) is preserved — that is what prevents re-doing won
-            # work (the original 156× re-propose thrash). verify-on-record still gates the ledger, so a hop
-            # that proceeds-but-fails records `failed`, never a phantom effect.
-            # EMPIRICAL pre-DCSync rights precheck (2026-06-10): the demoted gate no longer warns, so the
-            # agent fires DCSync without replication rights and burns a step on 8453. Re-block — but ONLY
-            # for DCSync, ONLY on EMPIRICAL evidence (the graph is POPULATED and the missing precondition is
-            # replication rights), and ONLY up to a per-domain CAP so this can never re-create the static
-            # deadlock that demoted the gate. Fail-open on ignorance (no graph facts) and after the cap, where
-            # the agent's own 8453 + verify-on-record become the judge.
-            dom = self._dcsync_target_domain(technique, target_key)
-            if self._should_block_premature_dcsync(
-                technique, reason, bool(self._engagement_graph_facts),
-                self._dcsync_precheck_blocks.get((technique, dom), 0), self._DCSYNC_PRECHECK_MAX_BLOCKS,
-            ):
-                self._dcsync_precheck_blocks[(technique, dom)] = \
-                    self._dcsync_precheck_blocks.get((technique, dom), 0) + 1
-                self._pending_engagement_hop = None
-                logger.info("🧭 [engagement-precheck] DCSync rights BLOCK %d/%d for %s",
-                            self._dcsync_precheck_blocks[(technique, dom)],
-                            self._DCSYNC_PRECHECK_MAX_BLOCKS, dom)
-                return self._dcsync_rights_guidance(dom)
-            logger.info("🧭 [engagement-advisor] would-defer (proceeding, advisory only): %s", reason)
-            self._pending_engagement_hop = (technique, target_key, now)
-            return None
+            logger.info("🧭 [engagement-precheck] DCSync rights BLOCK %d/%d for %s",
+                        self._dcsync_precheck_blocks[(technique, dom)],
+                        self._DCSYNC_PRECHECK_MAX_BLOCKS, dom)
+            return self._dcsync_rights_guidance(dom)
 
         self._pending_engagement_hop = (technique, target_key, now)
         return None
@@ -3236,8 +3206,6 @@ class MythicTools:
         DS-Replication rights on that domain — refuting da:/ea:/ds-replication-rights: for it. Intentionally
         decisive: even if the actor IS a real DA whose ticket/context was wrong, REOPENING the hop (re-verify, or
         fix the Kerberos execution context) is correct and cheap; an unbreakable retry loop is not."""
-        if not ENGAGEMENT_GATE_ENABLED:
-            return
         if not self._is_dcsync_command(command, parameters):
             return  # only a dcsync/replication command's ACCESS_DENIED can refute replication rights
         low = str(results_str or "").casefold()

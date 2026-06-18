@@ -48,69 +48,19 @@ def _state_with_effect(effect, technique="seed", target="seed", evidence=None):
     )
 
 
-def test_gate_skips_gpo_abuse_when_effect_already_achieved_with_evidence():
-    state = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="essos DA"),
-        "gpo-abuse",
-        "WINTERFELL",
-        "achieved",
-        {"task_id": "2285", "source": "mythic"},
-        "2026-06-06T12:34:00Z",
+def _hop(technique, target, effect, status="achieved"):
+    return engagement_state.Hop(
+        id=f"{technique}:{target}",
+        technique=technique,
+        target=target,
+        effect=effect,
+        status=status,
+        evidence={"provenance": "run"},
+        preconditions=[],
+        satisfied_effects=[effect],
+        source="test",
+        timestamp="2026-06-09T12:00:00Z",
     )
-
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "WINTERFELL", state)
-
-    assert decision == engagement_state.GateDecision.SKIP
-    assert "effect already achieved" in reason
-    assert "2285" in reason
-
-
-def test_gate_defers_dcsync_rights_grant_without_essos_access():
-    state = engagement_state.EngagementState(
-        objective="essos DA",
-        footholds=[_foothold(host="WINTERFELL", forest="north.local")],
-    )
-
-    decision, reason = engagement_state.gate_decision("dcsync-rights-grant", "essos.local", state)
-
-    assert decision == engagement_state.GateDecision.DEFER
-    assert "missing precondition" in reason
-    # belief-aware: write-dacl is graph-derived; with no graph data reconciled it is UNKNOWN, not
-    # false, so it must NOT block. The DEFER stands on the foothold-observable precondition only.
-    assert "live-foothold:essos.local" in reason
-    assert "write-dacl:domain:essos.local" not in reason
-
-
-def test_gate_proceeds_when_preconditions_are_met():
-    state = _state_with_effect(
-        "write-dacl:domain:essos.local",
-        technique="acl-discovery",
-        target="essos.local",
-    )
-    state.footholds.append(_foothold(host="MEEREEN", forest="essos.local", integrity="high"))
-
-    decision, reason = engagement_state.gate_decision("dcsync-rights-grant", "essos.local", state)
-
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "preconditions met" in reason
-
-
-def test_gate_fail_open_for_unknown_technique():
-    decision, reason = engagement_state.gate_decision(
-        "totally-unknown-technique",
-        "X",
-        engagement_state.EngagementState(objective="essos DA"),
-    )
-
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "fail-open" in reason
-
-
-def test_gate_fail_soft_on_malformed_state():
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "WINTERFELL", object())
-
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "fail-open" in reason
 
 
 def test_verify_effect_uses_structured_gpo_probe_only():
@@ -221,28 +171,6 @@ def test_record_hop_result_round_trips_with_provenance_and_updates():
     assert hop.satisfied_effects == ["system:winterfell"]
     assert "system:winterfell" in updated.achieved_effects()
 
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "WINTERFELL", updated)
-
-    assert decision == engagement_state.GateDecision.SKIP
-    assert "2285" in reason
-
-
-def test_technique_model_chains_dcsync_to_golden_ticket():
-    state = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="essos DA"),
-        "dcsync",
-        "essos.local",
-        "achieved",
-        {"task_id": "2400", "source": "mythic"},
-        "2026-06-06T14:00:00Z",
-    )
-
-    decision, reason = engagement_state.gate_decision("golden-ticket", "essos.local", state)
-
-    assert len(engagement_state.TECHNIQUE_MODEL) >= 6
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "preconditions met" in reason
-
 
 def test_explicit_kerberos_context_proof_unlocks_dcsync():
     foothold = engagement_state.Foothold(
@@ -275,8 +203,6 @@ def test_explicit_kerberos_context_proof_unlocks_dcsync():
     assert "live-callback:9" in engagement_state.foothold_predicates(state)
     assert "kerberos-context:north.sevenkingdoms.local@callback:9" in state.achieved_effects()
     assert state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
-    decision, reason = engagement_state.gate_decision("dcsync", "north.sevenkingdoms.local", state)
-    assert decision == engagement_state.GateDecision.PROCEED, reason
 
 
 def test_sage_control_callback_is_not_rendered_as_target_foothold():
@@ -309,6 +235,136 @@ def test_sage_control_callback_is_not_rendered_as_target_foothold():
     assert "live-foothold:north.sevenkingdoms.local" in predicates
     assert "SAGE | forest=sage" not in rendered
     assert "CASTELBLACK | forest=north.sevenkingdoms.local" in rendered
+
+
+def test_render_no_longer_emits_planning_lines():
+    state = engagement_state.EngagementState(
+        objective="reach essos DA",
+        footholds=[_foothold(forest="north.sevenkingdoms.local")],
+        graph_facts=[
+            engagement_state.GraphFact(
+                predicate="generic-write:gpo:winterfell",
+                source="bloodhound:cypher",
+                timestamp="2026-06-09T12:00:00Z",
+                ttl_seconds=600,
+            )
+        ],
+    )
+    out = engagement_state.render_engagement_state(state)
+    assert "NEXT GROUNDED ACTIONS" not in out
+    assert "Phase:" not in out
+
+
+def test_render_empty_state_unchanged():
+    out = engagement_state.render_engagement_state(engagement_state.EngagementState(objective="x"))
+    assert "(no observed state yet)" in out
+    assert "NEXT GROUNDED ACTIONS" not in out
+
+
+def test_access_context_key_changes_with_privilege():
+    foothold = _foothold(forest="north.sevenkingdoms.local")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    escalated = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[_hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local")],
+    )
+    k0 = engagement_state.access_context_key(base, foothold)
+    k1 = engagement_state.access_context_key(escalated, foothold)
+    assert k0 and k1 and k0 != k1
+
+
+def test_phase_is_exploitation_when_grounded_hop_exists_without_graph_facts():
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[_foothold(forest="north.sevenkingdoms.local")],
+        hops=[_hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local")],
+    )
+
+    assert engagement_state.engagement_phase(state).startswith("EXPLOITATION")
+
+
+def test_phase_requests_collection_after_access_key_changes_and_no_next_action():
+    foothold = _foothold(forest="north.sevenkingdoms.local")
+    base = engagement_state.EngagementState(objective="reach essos.local forest", footholds=[foothold])
+    old_key = engagement_state.access_context_key(base, foothold)
+    state = engagement_state.EngagementState(
+        objective="reach essos.local forest",
+        footholds=[foothold],
+        graph_facts=[
+            engagement_state.GraphFact(
+                predicate="domain-collected:sevenkingdoms.local",
+                source="bloodhound:test",
+                timestamp="2026-06-09T12:00:00Z",
+                ttl_seconds=600,
+            )
+        ],
+        hops=[
+            _hop("collect-graph", old_key, f"graph-built:{old_key}"),
+            _hop("forge-golden-ticket", "sevenkingdoms.local", "da:sevenkingdoms.local"),
+            _hop(
+                "ensure-kerberos-context",
+                "sevenkingdoms.local",
+                "kerberos-context:sevenkingdoms.local@callback:cb50",
+            ),
+            _hop("dcsync", "sevenkingdoms.local", "krbtgt-hash:sevenkingdoms.local"),
+        ],
+    )
+
+    assert engagement_state.current_access_collection_missing(state) is True
+    phase = engagement_state.engagement_phase(state)
+    assert phase.startswith("RECON")
+    assert "current access" in phase
+    assert "GRAPH COLLECTION NEEDED" not in engagement_state.render_engagement_state(state)
+
+
+def test_gpo_domain_downstream_progress_detects_domain_proof():
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[_foothold(forest="north.sevenkingdoms.local")],
+        graph_facts=[
+            engagement_state.GraphFact(
+                predicate="gpo-domain:wallpaperpolicy:child.example.local",
+                source="bloodhound:test",
+                timestamp="2026-06-09T12:00:00Z",
+                ttl_seconds=600,
+            )
+        ],
+        hops=[_hop("dcsync", "child.example.local", "krbtgt-hash:child.example.local")],
+    )
+
+    assert engagement_state._gpo_domain_has_downstream_progress(state, "wallpaperpolicy") is True
+
+
+def test_gpo_domain_link_expands_system_effect_to_replication_rights():
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[_foothold(forest="north.sevenkingdoms.local")],
+        hops=[
+            engagement_state.Hop(
+                id="gpo-abuse:starkwallpaper",
+                technique="gpo-abuse",
+                target="starkwallpaper",
+                effect="system:starkwallpaper",
+                status="achieved",
+                evidence={"provenance": "run"},
+                preconditions=[],
+                satisfied_effects=["system:starkwallpaper"],
+                source="t",
+                timestamp="2026-06-09T12:00:00Z",
+            )
+        ],
+        graph_facts=[
+            engagement_state.GraphFact(
+                "gpo-domain:starkwallpaper:north.sevenkingdoms.local",
+                "live-probe",
+                "2026-06-09T12:00:00Z",
+                600,
+            )
+        ],
+    )
+
+    assert "ds-replication-rights:north.sevenkingdoms.local" in state.satisfied_predicates()
 
 
 def test_domain_admin_membership_check_alone_does_not_imply_kerberos_context():
@@ -394,8 +450,9 @@ def test_objective_completion_candidate_renders_admin_control_proof_chain():
     candidates = engagement_state.objective_completion_candidates(state)
     rendered = engagement_state.render_engagement_state(state)
 
+    # The kept planner functions still derive phase + completion candidates (model.py's terminal/
+    # blocked-report consumers depend on them) ...
     assert engagement_state.engagement_phase(state).startswith("COMPLETE-CANDIDATE")
-    assert "Phase: COMPLETE-CANDIDATE" in rendered
     assert candidates == [{
         "kind": "administrative-control",
         "domain": "essos.local",
@@ -409,13 +466,9 @@ def test_objective_completion_candidate_renders_admin_control_proof_chain():
         "key_effect": "krbtgt-hash:essos.local",
         "key_task_id": "664",
     }]
-    assert "OBJECTIVE SATISFIED CANDIDATES" in rendered
-    assert "STOP and report this proof" in rendered
-    assert "administrative-control:essos.local" in rendered
-    assert "admin=da:essos.local task=655" in rendered
-    assert "access=kerberos-context:essos.local@callback:14 task=670" in rendered
-    assert "auth=certificate-auth:administrator@essos.local task=655" in rendered
-    assert rendered.index("OBJECTIVE SATISFIED CANDIDATES") < rendered.index("Live footholds:")
+    # ... but Stage B: the observed-state render no longer emits any planning/completion output.
+    assert "Phase:" not in rendered
+    assert "OBJECTIVE SATISFIED CANDIDATES" not in rendered
     assert "NEXT CAPABILITY ACTIONS" not in rendered
     assert "NEXT GROUNDED ACTIONS" not in rendered
 
@@ -493,8 +546,9 @@ def test_objective_completion_candidate_accepts_live_certificate_auth_proof():
         "auth_effect": "certificate-auth:administrator@essos.local",
         "auth_task_id": "150",
     }]
-    assert "OBJECTIVE SATISFIED CANDIDATES" in rendered
-    assert "STOP and report this proof" in rendered
+    # Stage B: completion candidates are still derived by the kept function (above), but the
+    # observed-state render no longer emits the OBJECTIVE SATISFIED CANDIDATES planning block.
+    assert "OBJECTIVE SATISFIED CANDIDATES" not in rendered
     assert "NEXT CAPABILITY ACTIONS" not in rendered
 
 
@@ -511,9 +565,6 @@ def test_domain_admin_without_live_context_does_not_imply_replication_rights():
 
     assert "da:north.sevenkingdoms.local" in state.achieved_effects()
     assert not state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
-    decision, reason = engagement_state.gate_decision("dcsync", "north.sevenkingdoms.local", state)
-    assert decision == engagement_state.GateDecision.DEFER
-    assert "ds-replication-rights:north.sevenkingdoms.local" in reason
 
 
 # --- COMPLETE-CANDIDATE: don't halt on an intermediate domain; climb to the objective's target ---

@@ -1,7 +1,10 @@
-"""Pure engagement-state gate for STRIPS preconditions and effects."""
+"""Pure engagement-state model: observed footholds/hops/graph facts, verify-on-record effect
+verification, and observed-state phase classification. The STRIPS planner-as-gate (the reactive
+precondition gate plus forward-planner hop enumeration) was retired in the engagement-gate retirement;
+what remains derives state and verdicts from achieved effects and live signals, never from closed-world
+precondition planning."""
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 import re
 
@@ -224,14 +227,8 @@ def corroborate_effect(effect: str, state: "EngagementState") -> bool:
     """Best-effort live corroboration of a durable hop's effect: True iff an INDEPENDENT live signal
     (a foothold-derived or graph-derived predicate) supports the effect. This is the deterministic,
     no-network verifier shipped now. The per-technique read-probe path (engagement_state.verify_effect
-    fed by a live query) is the documented follow-up that plugs into the same seam in gate_decision."""
+    fed by a live query) is the documented follow-up that plugs into the same verify-on-record seam."""
     return _normalize_predicate(effect) in foothold_predicates(state)
-
-
-class GateDecision(str, Enum):
-    SKIP = "skip"
-    DEFER = "defer"
-    PROCEED = "proceed"
 
 
 TECHNIQUE_MODEL: dict[str, dict] = {
@@ -353,132 +350,6 @@ TECHNIQUE_MODEL: dict[str, dict] = {
 
 _ADMIN_INTEGRITY = {"admin", "administrator", "elevated", "high", "system"}
 _HOP_STATUSES = {"achieved", "failed", "blocked", "pending"}
-# Predicate prefixes that can ONLY be asserted from BloodHound graph data. When no graph data has
-# been reconciled into the state, these are UNKNOWN (not false) and must not block a hop.
-_GRAPH_DERIVED_PREFIXES = ("generic-write", "generic-all", "write-dacl", "write-owner", "can-add-member")
-
-
-def gate_decision(technique: str, target: str, state: EngagementState) -> tuple[GateDecision, str]:
-    """Return whether a hop should skip, defer, or proceed."""
-    try:
-        model = TECHNIQUE_MODEL.get(technique)
-        if model is None:
-            return GateDecision.PROCEED, "technique not modeled — fail-open"
-
-        effect = _technique_effect(technique, target)
-        achieved_hop = _effect_hop(state, effect)
-        durable_unconfirmed = False
-        if achieved_hop is not None:
-            provenance = _hop_provenance(achieved_hop)
-            # A run-provenance hop (achieved THIS process) is trustworthy → hard-SKIP (preserves the
-            # within-run 604→0 loop fix). A durable hop (loaded from disk) is only trusted when an
-            # INDEPENDENT live signal corroborates it; otherwise we must NOT silently skip a possibly
-            # stale belief (the redeploy footgun) — fall through and let the operator re-verify by doing.
-            if provenance != "durable" or corroborate_effect(effect, state):
-                tag = "durable+corroborated" if provenance == "durable" else "run"
-                return GateDecision.SKIP, (
-                    f"effect already achieved ({tag}): {effect}; evidence={dict(getattr(achieved_hop, 'evidence', {}))}"
-                )
-            # Durable hop, NOT corroborated by a live signal. Re-verify by READ-PROBE, NEVER by re-running
-            # the attack. If we actively probed this effect's artifact this turn and it is GONE, a re-run is
-            # legitimate (the result really is absent — e.g. a range redeploy). If no probe applies to this
-            # effect, trust the ledger and SKIP — do NOT re-execute the offensive action just to check.
-            prefix = _normalize_predicate(effect).split(":", 1)[0]
-            if prefix in (getattr(state, "probed_effect_prefixes", None) or set()):
-                durable_unconfirmed = True   # probed + absent → fall through to PROCEED (re-run is warranted)
-            else:
-                return GateDecision.SKIP, (
-                    f"effect achieved (durable, unprobed): {effect} — trusting the ledger; do NOT re-run the "
-                    f"attack to verify. Re-verify the artifact with a READ-ONLY probe if the range was redeployed."
-                )
-
-        preconditions = _technique_preconditions(technique, target)
-        # Belief: unknown ≠ false. Only DEFER on a precondition the state can AFFIRMATIVELY
-        # determine is unmet. A graph-derived ACL precondition with no graph data reconciled,
-        # or an empty/unresolved-value predicate, is UNKNOWN — it must not block the hop.
-        missing = [
-            predicate for predicate in preconditions
-            if not state.satisfies_predicate(predicate)
-            and _is_enforceable_precondition(predicate, state)
-        ]
-        if missing:
-            return GateDecision.DEFER, f"missing precondition(s): {', '.join(missing)}"
-
-        proceed_reason = f"preconditions met for {technique} on {target}"
-        if durable_unconfirmed:
-            proceed_reason += (
-                " [durable belief NOT corroborated by live signal — proceeding to re-verify by execution "
-                "rather than silently skip a possibly-stale hop]"
-            )
-        return GateDecision.PROCEED, proceed_reason
-    except Exception as exc:
-        return GateDecision.PROCEED, f"gate failed — fail-open: {exc}"
-
-
-def _is_enforceable_precondition(predicate: str, state: EngagementState) -> bool:
-    """Whether the current state can affirmatively determine this precondition is UNMET.
-
-    Returns False (do not block) when the precondition is unknowable from the available data:
-    - an empty / unresolved value (predicate ending in ':' or with no value), or
-    - a graph-derived ACL predicate when no graph data has been reconciled into the state.
-    Returns True only when the state can genuinely assert-or-deny the predicate.
-    """
-    norm = _normalize_predicate(predicate)
-    if ":" not in norm:
-        return False
-    _, _, tail = norm.partition(":")
-    if not tail.strip():
-        return False
-    if any(norm.startswith(prefix) for prefix in _GRAPH_DERIVED_PREFIXES):
-        if not getattr(state, "graph_facts", None):
-            return False
-    return True
-
-
-# --- Forward planner -------------------------------------------------------------------------------
-# The reactive gate (gate_decision) judges a hop the model ALREADY proposed. The forward planner runs
-# that same STRIPS check FORWARD over candidate (technique, target) pairs derived from the grounded
-# state, so the operator can be DIRECTED to the next executable hop instead of looping on recon /
-# re-collection (the 2026-06-09 clean-run stall: graph built, but the agent never proposed an attack
-# hop because nothing told it which hop was available). Pure; never raises.
-
-# Map a satisfied-predicate prefix to the technique(s) it makes a candidate for, reading the target as
-# the predicate tail. dcsync-user is intentionally absent: it needs a SPECIFIC user picked during graph
-# analysis, not a structurally-enumerable target. Keep in sync with TECHNIQUE_MODEL preconditions.
-_CANDIDATE_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("generic-write:gpo:", ("gpo-abuse",)),
-    ("generic-write:computer:", ("rbcd-standin",)),
-    ("write-dacl:domain:", ("dcsync-rights-grant",)),
-    ("system-or-admin:", ("lsass-dump",)),
-    ("ds-replication-rights:", ("dcsync",)),
-    ("krbtgt-hash:", ("golden-ticket", "sid-history-escalation")),
-)
-
-# Stable display order: foothold-local effects first, then domain escalation.
-_AVAILABLE_PRIORITY: dict[str, int] = {
-    "lsass-dump": 0, "gpo-abuse": 1, "rbcd-standin": 2, "dcsync-rights-grant": 3,
-    "dcsync": 4, "dcsync-user": 5, "domain-admin-membership-check": 6,
-    "golden-ticket": 7, "sid-history-escalation": 8,
-}
-
-
-def candidate_targets_from_state(state: "EngagementState") -> list[tuple[str, str]]:
-    """Enumerate (technique, target) pairs worth considering, inverted from the grounded state's
-    satisfied predicates (graph ACL facts, foothold-derived rights, achieved-effect implications).
-    The precondition/already-achieved check is deferred to gate_decision via available_hops. Pure."""
-    candidates: set[tuple[str, str]] = set()
-    try:
-        for predicate in state.satisfied_predicates():
-            for prefix, techniques in _CANDIDATE_SOURCES:
-                if predicate.startswith(prefix):
-                    target = predicate[len(prefix):].strip()
-                    if target:
-                        for technique in techniques:
-                            candidates.add((technique, target))
-                    break
-    except Exception:
-        return []
-    return sorted(candidates)
 
 
 _OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
@@ -532,7 +403,7 @@ def engagement_phase(state: "EngagementState") -> str:
         alive = any(getattr(f, "alive", False) for f in getattr(state, "footholds", []) or [])
         if not alive:
             return "FOOTHOLD — establish access"
-        has_next = bool(available_hops(state) or _capability_actions_available(state))
+        has_next = bool(_capability_actions_available(state))
         # COMPLETE-CANDIDATE is TERMINAL only when the OBJECTIVE's target domain is under admin control (or, if
         # no target is parseable, when no further hop advances). Admin control of an INTERMEDIATE domain with a
         # further hop available is a MILESTONE — keep climbing (EXPLOITATION) instead of halting on the first
@@ -578,56 +449,6 @@ def _capability_actions_available(state: "EngagementState") -> bool:
         except ImportError:
             import capabilities
         return bool(capabilities.actions_from_state(state))
-    except Exception:
-        return False
-
-
-def available_hops(state: "EngagementState") -> list[tuple[str, str, str]]:
-    """Return (technique, target, reason) for every candidate hop whose preconditions are met and whose
-    effect is not already achieved — i.e. gate_decision returns PROCEED. This is the forward run of the
-    reactive gate; ordering is a stable technique priority. Pure; never raises."""
-    out: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    try:
-        satisfied = state.satisfied_predicates()
-        for technique, target in candidate_targets_from_state(state):
-            key = (technique, target)
-            if key in seen:
-                continue
-            seen.add(key)
-            effect = _normalize_predicate(_technique_effect(technique, target))
-            if effect and effect in satisfied:
-                continue
-            if technique == "gpo-abuse" and _gpo_domain_has_downstream_progress(state, target):
-                continue
-            if technique == "rbcd-standin" and _legacy_host_takeover_superseded(state):
-                continue
-            try:
-                decision, reason = gate_decision(technique, target, state)
-            except Exception:
-                continue
-            if decision is GateDecision.PROCEED:
-                out.append((technique, target, reason))
-    except Exception:
-        return []
-    out.sort(key=lambda hop: (_AVAILABLE_PRIORITY.get(hop[0], 99), hop[1]))
-    return out
-
-
-def _legacy_host_takeover_superseded(state: "EngagementState") -> bool:
-    """Return whether legacy host-takeover candidates are stale side quests.
-
-    GenericWrite-on-computer facts do not currently carry enough target-domain context for the legacy planner
-    to prove that an RBCD hop advances the objective. Once domain-control material exists, the capability
-    planner owns downstream host actions from explicit graph facts, so the legacy RBCD candidate should not
-    block higher-privilege collection.
-    """
-    try:
-        achieved = state.achieved_effects()
-        return any(
-            effect.startswith(("da:", "ea:", "krbtgt-hash:", "kerberos-context:"))
-            for effect in achieved
-        )
     except Exception:
         return False
 
@@ -1125,12 +946,10 @@ _RENDER_LIMIT = 1500
 _TRUNCATED_MARKER = "\n… (truncated)"
 
 
-def render_engagement_state(state: EngagementState, include_planning: bool = True) -> str:
+def render_engagement_state(state: EngagementState) -> str:
     """Return a compact observed-state block for prompt injection.
 
-    include_planning=True (default) renders the STRIPS-gate planning output (phase, completion
-    candidates, NEXT GROUNDED ACTIONS). include_planning=False renders observed state ONLY
-    (footholds, hops, graph facts) so the model plans from the ledger — the engagement-gate-off path.
+    The renderer is observed-state only: objective, live footholds, and durable hop ledger.
     """
     try:
         lines = [_RENDER_HEADER]
@@ -1139,25 +958,6 @@ def render_engagement_state(state: EngagementState, include_planning: bool = Tru
             lines.append(f"Objective: {objective}")
         elif state is None:
             lines.append("Objective: (state unavailable)")
-        # Planning derivations (phase, completion candidates, NEXT GROUNDED ACTIONS) are STRIPS-gate output.
-        # When include_planning is False (engagement gate off — Stage A retirement) the render is observed-
-        # state only (footholds, hops, graph facts) and the model plans from it.
-        objective_complete = False
-        if include_planning:
-            try:
-                lines.append(f"Phase: {engagement_phase(state)}")
-            except Exception:
-                pass
-            # A completion candidate is TERMINAL (halt + suppress NEXT actions) only when no further grounded
-            # hop advances the engagement; otherwise it is an intermediate MILESTONE and the climb continues.
-            try:
-                has_next_hop = bool(available_hops(state) or _capability_actions_available(state))
-            except Exception:
-                has_next_hop = False
-            objective_complete = _objective_is_complete(state, has_next_hop)
-            completion_lines = _render_objective_completion_candidates(state, terminal=objective_complete)
-            if completion_lines:
-                lines.extend(completion_lines)
 
         live_footholds = []
         for foothold in _render_items(getattr(state, "footholds", [])):
@@ -1206,38 +1006,6 @@ def render_engagement_state(state: EngagementState, include_planning: bool = Tru
             lines.append("Live footholds:")
             lines.extend(item for _, item in sorted(live_footholds, key=lambda item: item[0]))
 
-        available = []
-        if include_planning and not objective_complete:
-            # Put executable next actions before the long achieved-hop ledger. The render is bounded for
-            # prompt injection; if completed history grows, losing history is safer than hiding the action.
-            try:
-                try:
-                    from . import capabilities
-                except ImportError:
-                    import capabilities
-                capability_lines = capabilities.render_capability_actions(state)
-            except Exception:
-                capability_lines = []
-            if capability_lines:
-                lines.extend(capability_lines)
-
-            try:
-                available = available_hops(state)
-            except Exception:
-                available = []
-            if available:
-                lines.append(
-                    "NEXT GROUNDED ACTIONS (preconditions met — execute one of these; do NOT re-collect or re-recon):"
-                )
-                for technique, target, _reason in available[:8]:
-                    lines.append(f"- {technique} → {target}")
-            if not capability_lines and not available and current_access_collection_missing(state):
-                lines.append(
-                    "GRAPH COLLECTION NEEDED: current live access has no verified BloodHound collection. "
-                    "Run exactly one collection for this changed access context, ingest it, then re-plan; "
-                    "do not re-collect an already-collected access key."
-                )
-
         if achieved_hops:
             lines.append("Achieved hops:")
             lines.extend(item for _, item in sorted(achieved_hops, key=lambda item: item[0]))
@@ -1248,7 +1016,7 @@ def render_engagement_state(state: EngagementState, include_planning: bool = Tru
             lines.append("Failed/blocked hops:")
             lines.extend(item for _, item in sorted(blocked_hops, key=lambda item: item[0]))
 
-        if not live_footholds and not achieved_hops and not blocked_hops and not available:
+        if not live_footholds and not achieved_hops and not blocked_hops:
             lines.append("(no observed state yet)")
 
         return _render_bounded("\n".join(lines))

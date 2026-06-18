@@ -300,7 +300,6 @@ def test_build_state_does_not_raise_on_broken_client(monkeypatch):
 def test_objective_completion_report_streams_and_sets_handback(monkeypatch):
     Model = _load_model_class()
     package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
-    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     m = Model.__new__(Model)
     m._autonomous_solve = True
@@ -341,7 +340,6 @@ def test_objective_completion_report_streams_and_sets_handback(monkeypatch):
 def test_objective_completion_report_ignores_opaque_engagement_id(monkeypatch):
     Model = _load_model_class()
     package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
-    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     m = Model.__new__(Model)
     m._autonomous_solve = True
@@ -366,7 +364,6 @@ def test_objective_completion_preflight_refreshes_empty_foothold_cache(monkeypat
     Model = _load_model_class()
     package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
     package_access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
-    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     async def _alive(client, callback_display_id):
         return {"alive": str(callback_display_id) == "6"}
@@ -408,7 +405,6 @@ def test_invoke_preflight_stops_before_graph_astream(monkeypatch):
     Model = _load_model_class()
     package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
     package_access_reconciler = importlib.import_module("ai.langgraph.access_reconciler")
-    monkeypatch.setattr(package_mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     async def _alive(client, callback_display_id):
         return {"alive": str(callback_display_id) == "6"}

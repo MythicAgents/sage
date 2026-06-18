@@ -402,7 +402,6 @@ def test_autonomous_handoff_redirects_stale_gpo_after_task_history_dcsync_to_tic
 def test_autonomous_step_gate_compiles_bloodhound_handoff_to_next_capability(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     class FakeMythic:
         _engagement_footholds = [_fake_foothold(es)]
@@ -446,7 +445,6 @@ def test_autonomous_step_gate_compiles_bloodhound_handoff_to_next_capability(mon
 def test_autonomous_step_gate_compiles_collection_needed_over_stale_gpo(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     foothold = _fake_foothold(es)
     old_access_key = es.access_context_key(es.EngagementState(objective="compromise essos.local", footholds=[foothold]), foothold)
@@ -495,7 +493,6 @@ def test_autonomous_step_gate_compiles_collection_needed_over_stale_gpo(monkeypa
 def test_autonomous_step_gate_routes_blocked_mythic_handoff_to_bloodhound(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     foothold = _fake_foothold(es)
     state_with_control = es.EngagementState(
@@ -541,7 +538,6 @@ def test_autonomous_step_gate_routes_blocked_mythic_handoff_to_bloodhound(monkey
 def test_autonomous_step_gate_terminalizes_blocked_after_bloodhound_blocker(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     foothold = _fake_foothold(es)
     state_with_control = es.EngagementState(
@@ -597,7 +593,6 @@ def test_autonomous_step_gate_terminalizes_blocked_after_bloodhound_blocker(monk
 def test_autonomous_executor_node_calls_execute_capability_once(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     class FakeMythic:
         _engagement_footholds = [_fake_foothold(es)]
@@ -670,7 +665,6 @@ def test_autonomous_executor_node_calls_execute_capability_once(monkeypatch):
 def test_autonomous_step_gate_is_inactive_outside_autonomous_mode(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     class FakeMythic:
         _engagement_footholds = [_fake_foothold(es)]

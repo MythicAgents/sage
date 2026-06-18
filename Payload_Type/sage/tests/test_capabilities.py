@@ -188,12 +188,14 @@ def test_render_engagement_state_includes_capability_actions_before_legacy_hops(
         ],
     )
 
-    rendered = es.render_engagement_state(state)
+    # Stage B: capability actions are no longer RENDERED (planning is retired). The capability
+    # FUNCTION still surfaces the action for the kept consumers; the observed-state render omits it.
+    capability_lines = capabilities.render_capability_actions(state)
+    assert any("gpo-controlled-system-exec -> gpo=workstation-policy;domain=lab.local" in line for line in capability_lines)
 
-    assert "NEXT CAPABILITY ACTIONS" in rendered
-    assert "gpo-controlled-system-exec -> gpo=workstation-policy;domain=lab.local" in rendered
-    assert "verify: system_callback_observed OR system_command_succeeded" in rendered
-    assert "GOAD" not in rendered
+    rendered = es.render_engagement_state(state)
+    assert "NEXT CAPABILITY ACTIONS" not in rendered
+    assert "gpo-controlled-system-exec ->" not in rendered
 
 
 def test_render_engagement_state_keeps_next_capability_when_history_is_long():
@@ -222,11 +224,14 @@ def test_render_engagement_state_keeps_next_capability_when_history_is_long():
         ],
     )
 
+    # Stage B: the observed-state render still bounds (truncates) long history; capability actions
+    # are no longer rendered, but the capability FUNCTION still surfaces the next action directly.
     rendered = es.render_engagement_state(state)
-
     assert "… (truncated)" in rendered
-    assert "NEXT CAPABILITY ACTIONS" in rendered
-    assert "adcs-ca-private-key-export -> target=braavos;target_domain=essos.local;callback=2" in rendered
+    assert "NEXT CAPABILITY ACTIONS" not in rendered
+
+    capability_lines = capabilities.render_capability_actions(state)
+    assert any("adcs-ca-private-key-export -> target=braavos;target_domain=essos.local;callback=2" in line for line in capability_lines)
 
 
 def test_verify_gpo_controlled_system_exec_requires_system_proof_for_achieved():
@@ -328,10 +333,13 @@ def test_render_includes_grant_after_system_exec():
         hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
     )
 
-    rendered = es.render_engagement_state(state)
+    # Stage B: planning lines (incl. grant-after-system-exec) are no longer rendered; the capability
+    # FUNCTION still surfaces the grant action for the kept consumers.
+    capability_lines = capabilities.render_capability_actions(state)
+    assert any("grant-directory-rights -> domain=lab.local;source=gpo-system-exec:workstation-policy" in line for line in capability_lines)
 
-    assert "grant-directory-rights -> domain=lab.local;source=gpo-system-exec:workstation-policy" in rendered
-    assert "verify: ds_replication_rights" in rendered
+    rendered = es.render_engagement_state(state)
+    assert "grant-directory-rights ->" not in rendered
 
 
 def test_verify_grant_directory_rights_requires_acl_evidence():

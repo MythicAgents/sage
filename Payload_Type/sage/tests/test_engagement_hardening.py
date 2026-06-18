@@ -18,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 import engagement_state as es  # noqa: E402
 import mythic_tools  # noqa: E402
 
-GD = es.GateDecision
-
 
 def _state(provenance, footholds=None, target="winterfell"):
     s = es.EngagementState(objective="t", footholds=footholds or [])
@@ -54,37 +52,6 @@ def test_corroborate_true_when_live_system_foothold():
 def test_corroborate_false_without_independent_signal():
     s = _state("durable", footholds=[_foothold("castelblack", "medium")])
     assert es.corroborate_effect("system:winterfell", s) is False
-
-
-# --- gate_decision provenance behavior --------------------------------------
-
-def test_run_hop_hard_skips():
-    s = _state("run", footholds=[_foothold("castelblack", "medium")])
-    d, reason = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d == GD.SKIP and "run" in reason
-
-
-def test_run_hop_never_downgraded_even_without_corroboration():
-    # ISC-16: a run hop with NO corroborating foothold still SKIPs (preserves 604->0 within-run fix).
-    s = _state("run", footholds=[])
-    d, _ = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d == GD.SKIP
-
-
-def test_durable_corroborated_hop_skips():
-    s = _state("durable", footholds=[_foothold("winterfell", "system")])
-    d, reason = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d == GD.SKIP and "durable+corroborated" in reason
-
-
-def test_durable_unprobed_hop_is_trusted_not_rerun():
-    # Russel 2026-06-09: re-verify a durable belief by READ-PROBE, never by re-running the attack.
-    # gpo-abuse's effect (system:{gpo}) has no cheap artifact probe, so an uncorroborated durable hop is now
-    # TRUSTED (SKIP) instead of re-executed. (Cred-backed effects ARE probed — see test_durable_reverify.)
-    s = _state("durable", footholds=[_foothold("castelblack", "medium")])
-    d, reason = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d == GD.SKIP
-    assert "durable, unprobed" in reason and "do NOT re-run" in reason
 
 
 # --- TTL ---------------------------------------------------------------------
@@ -137,7 +104,6 @@ def test_render_no_mark_for_run_hop():
 
 def test_loaded_hop_becomes_durable_and_is_not_silently_skipped(monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "harden-test")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     mt1 = mythic_tools.MythicTools(agent_task_id="run-1")
     mt1._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
@@ -150,12 +116,6 @@ def test_loaded_hop_becomes_durable_and_is_not_silently_skipped(monkeypatch):
     assert mt2._engagement_hops, "ledger should have loaded"
     assert mt2._engagement_hops[0].evidence.get("provenance") == "durable"
 
-    # A durable, unprobed hop (no cheap artifact probe for system:{gpo}) is now TRUSTED, not re-run
-    # (re-verify-by-probe, never re-run the attack; Russel 2026-06-09).
-    state = es.EngagementState(objective="t", footholds=[], hops=list(mt2._engagement_hops))
-    d, r = es.gate_decision("gpo-abuse", "winterfell", state)
-    assert d == GD.SKIP and "durable, unprobed" in r
-
 
 def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch):
     # Advisor (a): the highest-priority independence check. The durable ledger must persist ONLY hops,
@@ -164,7 +124,6 @@ def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch
     # set ONLY from live reconcile_access; this proves it is never written to / read from disk.
     import json
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "indep-test")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = mythic_tools.MythicTools(agent_task_id="r1")
     mt._engagement_footholds = [_foothold("winterfell", "system")]  # live cache — must NOT be persisted
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
@@ -178,19 +137,14 @@ def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch
 
 
 def test_durable_to_run_upgrade_on_reachieve():
-    # Advisor (b): re-achieving a durable hop must UPGRADE provenance to run (not keep durable), so it
-    # converges to SKIP instead of PROCEED-thrashing forever.
+    # Re-achieving a durable hop UPGRADES provenance to run and REPLACES (not duplicates) the hop.
     s = _state("durable", footholds=[_foothold("castelblack", "medium")])
-    d1, r1 = es.gate_decision("gpo-abuse", "winterfell", s)
-    assert d1 == GD.SKIP and "durable" in r1   # durable+unprobed -> trusted (no re-run)
     s2 = es.record_hop_result(
         s, "gpo-abuse", "winterfell", "achieved",
         {"source": "issue_task", "provenance": "run"}, "2026-06-07T01:00:00+00:00",
     )
     assert len(s2.hops) == 1  # replaced, not duplicated
     assert es._hop_provenance(s2.hops[0]) == "run"
-    d2, r2 = es.gate_decision("gpo-abuse", "winterfell", s2)
-    assert d2 == GD.SKIP and "run" in r2   # re-achieve upgraded provenance durable -> run
 
 
 def test_ttl_keeps_hop_with_missing_timestamp():
@@ -212,7 +166,6 @@ def test_record_attaches_mythic_task_id(monkeypatch, tmp_path):
     # The recorded hop's evidence must capture the Mythic task display_id that proved the effect.
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "task-id-test")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = mythic_tools.MythicTools(agent_task_id="r1")
     mt._last_issued_task_display_id = 2712
     mt._last_issued_callback_id = 50
@@ -224,7 +177,6 @@ def test_record_attaches_mythic_task_id(monkeypatch, tmp_path):
 
 def test_ttl_drops_at_load(monkeypatch):
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "harden-ttl")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     monkeypatch.setenv("SAGE_ENGAGEMENT_HOP_TTL_HOURS", "0.0001")  # ~0.36s — anything on disk is stale
 
     mt1 = mythic_tools.MythicTools(agent_task_id="ttl-1")

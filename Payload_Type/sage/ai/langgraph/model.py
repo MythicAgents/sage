@@ -1891,30 +1891,22 @@ class Model:
                         "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
                         "limit (it pauses for the operator). Do not stop silently."
                     )
-                    # Engagement-state-aware nudge (flag-gated, fail-open): when the engagement gate is
-                    # enabled, prepend a FRESH rendered snapshot of the observed engagement state plus a
-                    # "don't re-propose achieved hops" directive. This stops the Operator from re-issuing
-                    # already-achieved hops dozens of times (which the gate would only SKIP, burning the
-                    # step budget). With the flag OFF this is a byte-for-byte no-op (plain base nudge).
+                    # Engagement-state-aware nudge (fail-open): prepend a FRESH rendered snapshot of the
+                    # observed engagement state plus a "don't re-propose achieved hops" directive.
                     _nudge_text = _base_nudge_text
                     try:
+                        _rendered_state = None
                         try:
-                            from . import mythic_tools as _mt
-                        except ImportError:
-                            import mythic_tools as _mt
-                        if bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
-                            _rendered_state = None
-                            try:
-                                _state = await self._build_current_engagement_state()
-                                if _state is not None:
-                                    try:
-                                        from . import engagement_state as _es
-                                    except ImportError:
-                                        import engagement_state as _es
-                                    _rendered_state = _es.render_engagement_state(_state)
-                            except Exception:
-                                _rendered_state = None  # fail-open to the plain base nudge
-                            _nudge_text = self._autonomous_nudge_content(_base_nudge_text, _rendered_state)
+                            _state = await self._build_current_engagement_state()
+                            if _state is not None:
+                                try:
+                                    from . import engagement_state as _es
+                                except ImportError:
+                                    import engagement_state as _es
+                                _rendered_state = _es.render_engagement_state(_state)
+                        except Exception:
+                            _rendered_state = None  # fail-open to the plain base nudge
+                        _nudge_text = self._autonomous_nudge_content(_base_nudge_text, _rendered_state)
                     except Exception:
                         _nudge_text = _base_nudge_text  # fail-open: never break the continue-loop
                     _nudge = HumanMessage(
@@ -2189,10 +2181,10 @@ class Model:
         return _ainvoke
 
     async def _build_current_engagement_state(self):
-        """Best-effort build of the current EngagementState the same way the gate does.
+        """Best-effort build of the current EngagementState the same way the issue hook does.
 
         Returns an ``engagement_state.EngagementState`` or ``None`` on ANY error — never raises.
-        Mirrors ``MythicTools._engagement_gate``: reconcile live footholds (fail-open to []) and
+        Mirrors ``MythicTools._engagement_issue_hook``: reconcile live footholds (fail-open to []) and
         snapshot the recorded hops. Graph facts are intentionally skipped (optional).
         """
         try:
@@ -2230,17 +2222,12 @@ class Model:
 
     def _render_engagement_state_for_injection(self) -> str | None:
         """Cheap, synchronous, in-memory render of the observed engagement state for PER-TURN injection
-        by `_EngagementStateMiddleware`. Returns None — and the middleware injects nothing — when:
-        the gate is off, this is not an autonomous solve, there is no mythic_client, or there is no
-        observed state yet. NO network: reads the in-memory incremental hop ledger (the anti-loop
-        signal) plus the footholds the gate cached. Never raises (caller also guards)."""
+        by `_EngagementStateMiddleware`. Returns None — and the middleware injects nothing — when this is not
+        an autonomous solve, there is no mythic_client, or there is no observed state yet. NO network: reads the
+        in-memory incremental hop ledger plus cached footholds. Never raises (caller also guards)."""
         try:
             if not bool(getattr(self, "_autonomous_solve", False)):
                 return None
-            try:
-                from . import mythic_tools as _mt
-            except ImportError:
-                import mythic_tools as _mt
             mythic_client = getattr(self, "mythic_client", None)
             if mythic_client is None:
                 return None
@@ -2256,18 +2243,12 @@ class Model:
                 objective = mythic_client._engagement_objective()
             except Exception:
                 objective = "sage-engagement"
-            # Include the cached graph facts (refreshed after each verified ingest) so the render's forward
-            # planner can surface NEXT GROUNDED ACTIONS. Suggestion-only — the gate's enforcement state is
-            # built separately (mythic_tools._engagement_gate) and intentionally omits these.
+            # Include cached graph facts so durable-hop corroboration markers can be computed.
             graph_facts = list(getattr(mythic_client, "_engagement_graph_facts", []) or [])
             state = _es.EngagementState(
                 objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts
             )
-            # Gate ON: full render incl. STRIPS planning (NEXT GROUNDED ACTIONS). Gate OFF (Stage A gate-
-            # retirement measurement): observed-state only — model plans from footholds/effects/graph facts.
-            rendered = _es.render_engagement_state(
-                state, include_planning=bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False))
-            )
+            rendered = _es.render_engagement_state(state)
             if not rendered:
                 return None
             # Pair the observed-state block with the imperative directive so the per-turn injection is
@@ -2280,17 +2261,11 @@ class Model:
         """Cheap in-memory EngagementState snapshot for terminal objective checks.
 
         This intentionally does not poll Mythic or BloodHound. It uses the same cached footholds, hops, and
-        graph facts that the engagement gate/per-turn injection maintain, so the stop check cannot mint new
+        graph facts that the issue hook/per-turn injection maintain, so the stop check cannot mint new
         facts; it can only notice that already-recorded proof satisfies the current objective.
         """
         try:
             if require_autonomous and not bool(getattr(self, "_autonomous_solve", False)):
-                return None
-            try:
-                from . import mythic_tools as _mt
-            except ImportError:
-                import mythic_tools as _mt
-            if not bool(getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False)):
                 return None
             mythic_client = getattr(self, "mythic_client", None)
             if mythic_client is None:
@@ -4468,21 +4443,8 @@ def _create_handback_to_supervisor_tool(mythic_client=None):
         (BloodHound for graph work, Mythic_Payload for builds) or finalize the objective.
         Call this the moment the NEXT step needs a capability you do not own, or the objective is reached.
         Plain completion = keep going; summarize_and_handback = pause for the user at the recursion limit only."""
-        esl = ""
-        try:
-            try:
-                from . import mythic_tools as _mt
-            except ImportError:
-                import mythic_tools as _mt
-        except ImportError:
-            _mt = None
-        if _mt is not None and getattr(_mt, "ENGAGEMENT_GATE_ENABLED", False):
-            try:
-                esl = _build_esl_summary(mythic_client)
-            except Exception:
-                esl = ""  # fail-open: never break handback
         msg = ToolMessage(
-            content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}" + (f"\n\n{esl}" if esl else ""),
+            content=f"🔄 **Handback to Supervisor** — {reason}\n\n{summary}",
             name="handback_to_supervisor",
             tool_call_id=runtime.tool_call_id,
         )

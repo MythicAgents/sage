@@ -94,7 +94,6 @@ def test_to_dicts_skips_non_dataclass():
 def test_cross_run_resume(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-eng")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     # First run: fresh ledger, record an achieved hop -> write-through to disk.
     mt1 = mythic_tools.MythicTools(agent_task_id="solve-1")
@@ -119,7 +118,6 @@ def test_cross_run_resume(tmp_path, monkeypatch):
 def test_cross_run_resume_restores_graph_facts(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-graph")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     mt1 = mythic_tools.MythicTools(agent_task_id="solve-1")
     mt1._engagement_graph_facts = [
@@ -166,15 +164,16 @@ def test_cross_run_resume_restores_graph_facts(tmp_path, monkeypatch):
         graph_facts=list(mt2._engagement_graph_facts),
     )
     rendered = engagement_state.render_engagement_state(state)
-    assert "Phase: EXPLOITATION" in rendered
-    assert "gpo-controlled-system-exec -> gpo=starkwallpaper;domain=north.sevenkingdoms.local" in rendered
+    assert "=== ENGAGEMENT STATE" in rendered
+    assert "CASTELBLACK" in rendered
+    assert "Phase:" not in rendered
+    assert "NEXT GROUNDED ACTIONS" not in rendered
 
 
 def test_ledger_objective_is_preserved_across_runtime_persist(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-test")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     path = Path(el.ledger_path("objective-test"))
     path.write_text(json.dumps({
@@ -195,7 +194,6 @@ def test_running_objective_refreshes_when_state_command_updates_ledger(tmp_path,
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-refresh")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     path = Path(el.ledger_path("objective-refresh"))
     path.write_text(json.dumps({
@@ -218,7 +216,6 @@ def test_opaque_ledger_objective_is_not_treated_as_human_goal(tmp_path, monkeypa
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "objective-opaque")
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_OBJECTIVE", "")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     path = Path(el.ledger_path("objective-opaque"))
     path.write_text(json.dumps({
@@ -236,12 +233,10 @@ def test_opaque_ledger_objective_is_not_treated_as_human_goal(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 
 
-def test_gate_off_does_not_read_disk(tmp_path, monkeypatch):
+def test_fresh_instance_loads_durable_ledger_unconditionally(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-eng2")
 
-    # Seed a ledger with the gate ON.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     seed = mythic_tools.MythicTools(agent_task_id="seed")
     seed._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
@@ -249,12 +244,5 @@ def test_gate_off_does_not_read_disk(tmp_path, monkeypatch):
     seed._record_engagement_success("whoami\r\nnt authority\\system\r\n")
     assert Path(seed._engagement_ledger_path()).exists()
 
-    # Gate OFF: a fresh instance must NOT load from disk.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", False)
-    off = mythic_tools.MythicTools(agent_task_id="off")
-    assert off._engagement_hops == []
-
-    # Gate back ON: it loads again.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
-    on = mythic_tools.MythicTools(agent_task_id="on")
-    assert any(getattr(h, "technique", "") == "gpo-abuse" for h in on._engagement_hops)
+    fresh = mythic_tools.MythicTools(agent_task_id="fresh")
+    assert any(getattr(h, "technique", "") == "gpo-abuse" for h in fresh._engagement_hops)

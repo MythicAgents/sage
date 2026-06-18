@@ -160,7 +160,6 @@ def test_verify_lsass_with_key_achieved():
 def mt(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-vor")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     return mythic_tools.MythicTools(agent_task_id="vor")
 
 
@@ -176,6 +175,20 @@ def test_record_dcsync_user_with_key_achieved(mt):
     assert hop.evidence.get("verify_verdict") == "achieved"
     assert hop.evidence.get("verified_on_record") is True
     assert mt._pending_engagement_hop is None          # cleared in finally (ISC-27)
+
+
+def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
+    assert not hasattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED")
+    mt._pending_engagement_hop = ("dcsync-user", USER, TS)
+    mt._record_engagement_success(MIMIKATZ_OK)
+
+    hop = _last(mt)
+    assert hop.technique == "dcsync-user"
+    assert hop.status == "achieved"
+    assert hop.effect == f"creds:{USER}"
+    assert hop.evidence.get("verify_verdict") == "achieved"
+    assert hop.evidence.get("verified_on_record") is True
+    assert hop.evidence.get("artifact_present") is True
 
 
 def test_record_dcsync_user_no_key_failed_not_achieved(mt):
@@ -199,9 +212,6 @@ def test_record_dcsync_krbtgt_no_key_failed(mt):
     mt._record_engagement_success(TRUNCATED)
     hop = _last(mt)
     assert hop.status == "failed"
-    # A failed krbtgt hop must not be matched as achieved (gate will not SKIP it) — ISC-24.
-    assert es.gate_decision("dcsync", DOM, es.EngagementState(objective="t", hops=mt._engagement_hops))[0] \
-        != es.GateDecision.SKIP
 
 
 def test_gpo_abuse_system_proof_achieved(mt):
@@ -296,7 +306,6 @@ def test_verified_achieved_not_downgraded_same_run(mt):
 def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-vor-reload")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     a = mythic_tools.MythicTools(agent_task_id="run1")
     a._pending_engagement_hop = ("dcsync-user", USER, TS)
     a._record_engagement_success(MIMIKATZ_OK)
@@ -406,9 +415,6 @@ def test_record_grant_denied_failed_not_achieved(mt):
     hop = _last(mt)
     assert hop.status == "failed"
     assert hop.evidence.get("artifact_present") is False
-    # A failed grant must NOT be SKIPped by the achieved-dedup -> the agent can re-attempt it.
-    state = es.EngagementState(objective="t", hops=mt._engagement_hops)
-    assert es.gate_decision("dcsync-rights-grant", GRANT_DOM, state)[0] != es.GateDecision.SKIP
 
 
 def test_record_grant_empty_failed(mt):
@@ -510,8 +516,6 @@ def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
     assert hop.evidence["verified_on_record"] is True
     assert hop.evidence["verify_verdict"] == "failed"
     assert hop.evidence["artifact_present"] is False
-    assert es.gate_decision("sid-history-escalation", CHILD_DOM, es.EngagementState(objective="t", hops=mt._engagement_hops))[0] \
-        != es.GateDecision.SKIP
 
 
 def test_record_sid_history_forge_only_failed_with_partial_verdict(mt):

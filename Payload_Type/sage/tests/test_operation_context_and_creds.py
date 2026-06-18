@@ -196,7 +196,6 @@ def test_hostile_operation_name_no_path_traversal(monkeypatch, tmp_path):
 def test_ensure_engagement_key_resolves_operation(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     async def fake_key(client):
         return "Operation_Chimera_1"
@@ -217,7 +216,6 @@ def test_ensure_engagement_key_resolves_operation(monkeypatch, tmp_path):
 def test_default_ledger_not_loaded_before_operation_key(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     el.save({
         "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
     }, "default")
@@ -230,7 +228,6 @@ def test_default_ledger_not_loaded_before_operation_key(monkeypatch, tmp_path):
 def test_operation_key_load_replaces_stale_default_state(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     el.save({
         "hops": [_ledger_hop("collect-graph", "stale", "graph-built:stale")],
     }, "default")
@@ -258,7 +255,6 @@ def test_operation_key_load_replaces_stale_default_state(monkeypatch, tmp_path):
 def test_explicit_engagement_id_overrides_operation(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "manual-eng")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
 
     async def boom(client):
         raise AssertionError("must not query Mythic when SAGE_ENGAGEMENT_ID is explicit")
@@ -291,7 +287,6 @@ def test_ensure_engagement_key_idempotent(monkeypatch, tmp_path):
     # The lock + double-check means a second call (or a concurrent one) does NOT re-query or re-reload.
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "default")
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     calls = {"n": 0}
 
     async def fake_key(client):

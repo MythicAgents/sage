@@ -75,6 +75,13 @@ def _seed_hop(mt: MythicTools, technique: str, target: str) -> None:
     mt._engagement_hops = state.hops
 
 
+def _seeded_reconcile(mt: MythicTools):
+    async def fake_reconcile(mythic_tools_obj, now):
+        return list(getattr(mt, "_engagement_footholds", []) or [])
+
+    return fake_reconcile
+
+
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed"):
     evidence = {"mythic_task_id": task_id, "source": "test"}
     if callback_id:
@@ -143,8 +150,7 @@ def _write_test_ca_artifact(path: Path) -> Path:
 def test_flag_off_no_op_does_not_invoke_gate():
     calls = {"issue": 0}
     mt = _make_tools()
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", False), \
-        patch.object(mt, "_engagement_gate", side_effect=AssertionError("gate should not run")), \
+    with patch.object(mt, "_engagement_issue_hook", side_effect=AssertionError("gate should not run")), \
         _split_issue("normal result", calls):
         result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", "", 11))
 
@@ -167,8 +173,7 @@ def test_issue_task_refuses_dead_callback_before_mythic_tasking():
             "reason": "no checkin for 14400s (≈4h0m); interval 3s, jitter 0% → dead threshold 45s",
         }
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", False), \
-        patch.object(mythic_tools, "assess_callback_liveness", dead_liveness), \
+    with patch.object(mythic_tools, "assess_callback_liveness", dead_liveness), \
         _split_issue("should not issue", calls):
         result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", "", 13, timeout=5))
 
@@ -177,7 +182,7 @@ def test_issue_task_refuses_dead_callback_before_mythic_tasking():
     assert calls["issue"] == 0
 
 
-def test_gate_skip_short_circuits_existing_gpo_effect():
+def test_existing_gpo_effect_no_longer_short_circuits_issue_path():
     calls = {"issue": 0}
 
     async def fake_reconcile(mythic_tools_obj, now):
@@ -185,8 +190,7 @@ def test_gate_skip_short_circuits_existing_gpo_effect():
 
     mt = _make_tools()
     _seed_hop(mt, "gpo-abuse", "winterfell")
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -196,8 +200,8 @@ def test_gate_skip_short_circuits_existing_gpo_effect():
             )
         )
 
-    assert "skipped" in result
-    assert calls["issue"] == 0
+    assert result == "should not issue"
+    assert calls["issue"] == 1
 
 
 def test_gate_demotes_missing_preconditions_to_advisory_and_proceeds():
@@ -214,8 +218,7 @@ def test_gate_demotes_missing_preconditions_to_advisory_and_proceeds():
         return [_foothold(host="WINTERFELL", forest="north.local")]
 
     mt = _make_tools()
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("proceeded — real task output", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -244,8 +247,7 @@ def test_collect_graph_inflight_marker_is_task_backed_after_issue(monkeypatch):
 
     mt = _make_tools()
     mt._assembly_file_checks.add("sharphound.exe")
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
         _split_issue("SharpHound completed", calls, display_id=777):
         result = asyncio.run(
@@ -278,8 +280,7 @@ def test_collect_graph_unbacked_inflight_marker_self_heals_and_issues(monkeypatc
     mt = _make_tools()
     mt._assembly_file_checks.add("sharphound.exe")
     mt._collection_in_flight[access_key] = {"kind": "collect-graph", "key": access_key}
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
         _split_issue("SharpHound completed", calls, display_id=778):
         result = asyncio.run(
@@ -316,8 +317,7 @@ def test_collect_graph_backed_inflight_marker_blocks_with_task_id(monkeypatch):
         "task_id": "779",
         "callback_id": "50",
     }
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
@@ -332,6 +332,104 @@ def test_collect_graph_backed_inflight_marker_blocks_with_task_id(monkeypatch):
     assert "Mythic task #779" in result
     assert "already in-flight" in result
     assert calls["issue"] == 0
+
+
+def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_reconcile(mythic_tools_obj, now):
+        return [foothold]
+
+    async def fake_tasks(*args, **kwargs):
+        return []
+
+    achieved = engagement_state.record_hop_result(
+        engagement_state.EngagementState(objective="test"),
+        "collect-graph",
+        access_key,
+        "achieved",
+        {"source": "ingest_collection", "graph_verified": True},
+        "2026-06-17T00:00:00Z",
+    )
+
+    mt = _make_tools()
+    mt._assembly_file_checks.add("sharphound.exe")
+    mt._engagement_hops = achieved.hops
+    calls = {"issue": 0}
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        _split_issue("SharpHound rerun allowed", calls, display_id=780):
+        result = asyncio.run(
+            mt.issue_task_and_waitfor_task_output(
+                "execute_assembly",
+                {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"},
+                50,
+                timeout=5,
+            )
+        )
+
+    assert result == "SharpHound rerun allowed"
+    assert calls["issue"] == 1
+
+    mt2 = _make_tools()
+    mt2._assembly_file_checks.add("sharphound.exe")
+    mt2._engagement_hops = achieved.hops
+    mt2._engagement_graph_facts = [
+        engagement_state.GraphFact(
+            "domain:north.sevenkingdoms.local",
+            "bloodhound:domain_info",
+            "2026-06-17T00:00:00Z",
+            600,
+        )
+    ]
+    calls2 = {"issue": 0}
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        _split_issue("should not issue", calls2):
+        skipped = asyncio.run(
+            mt2.issue_task_and_waitfor_task_output(
+                "execute_assembly",
+                {"assembly": "SharpHound.exe", "arguments": "-c All --SearchForest"},
+                50,
+                timeout=5,
+            )
+        )
+
+    assert "skipped: graph already built" in skipped
+    assert calls2["issue"] == 0
+
+
+def test_stage_b_dcsync_precheck_blocks_then_caps_through_issue_hook(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+
+    async def fake_reconcile(mythic_tools_obj, now):
+        return [foothold]
+
+    mt = _make_tools()
+    mt._engagement_graph_facts = [
+        engagement_state.GraphFact(
+            "domain:north.sevenkingdoms.local",
+            "bloodhound:domain_info",
+            "2026-06-17T00:00:00Z",
+            600,
+        )
+    ]
+    calls = {"issue": 0}
+    params = {"domain": "north.sevenkingdoms.local"}
+
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        _split_issue("Hash NTLM: 2b576acbe6bcfda7294d6bd18041b8fe", calls):
+        first = asyncio.run(mt.issue_task_and_waitfor_task_output("dcsync", params, 50, timeout=5))
+        second = asyncio.run(mt.issue_task_and_waitfor_task_output("dcsync", params, 50, timeout=5))
+        third = asyncio.run(mt.issue_task_and_waitfor_task_output("dcsync", params, 50, timeout=5))
+
+    assert "DCSync of north.sevenkingdoms.local not attempted" in first
+    assert "DCSync of north.sevenkingdoms.local not attempted" in second
+    assert "Hash NTLM:" in third
+    assert calls["issue"] == 1
+    assert mt._dcsync_precheck_blocks[("dcsync", "north.sevenkingdoms.local")] == mt._DCSYNC_PRECHECK_MAX_BLOCKS
 
 
 def test_ticket_gate_blocks_prompt_built_rubeus_before_tasking():
@@ -350,8 +448,7 @@ def test_ticket_gate_blocks_prompt_built_rubeus_before_tasking():
         "2026-06-11T00:00:00Z",
     ).hops
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -387,8 +484,7 @@ def test_ticket_gate_blocks_prompt_built_asktgt_before_tasking():
         ),
     }
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -429,8 +525,7 @@ def test_ticket_gate_allows_builder_emitted_managed_kerberos_forge_command():
     mt._deterministic_ticket_command_keys.add(mythic_tools._ticket_command_key("execute_assembly", command))
     proof_output = "SEVENKINGDOMS\\Domain Admins Enabled group\nThe command completed successfully."
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue(proof_output, calls, display_id=5150):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -476,8 +571,7 @@ def test_ensure_kerberos_context_forge_is_not_skipped_by_durable_da():
     mt._deterministic_ticket_command_keys.add(key)
     mt._deterministic_ticket_command_contexts[key] = {"capability": "ensure-kerberos-context"}
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("[*] base64(ticket.kirbi):\n" + "A" * 88, calls, display_id=5151):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -608,8 +702,7 @@ def test_ticket_gate_blocks_builder_shaped_command_not_emitted_by_builder():
         "2026-06-11T00:00:00Z",
     ).hops
 
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("should not issue", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -636,13 +729,8 @@ def test_gate_proceed_records_gpo_setup_as_pending_until_system_proof():
     async def fake_reconcile(mythic_tools_obj, now):
         return []
 
-    def fake_gate_decision(technique, target, state):
-        return engagement_state.GateDecision.PROCEED, "unit-test proceed"
-
     mt = _make_tools()
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
-        patch.object(engagement_state, "gate_decision", fake_gate_decision), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue("[+] The GPO was modified to include an immediate scheduled task.", calls, display_id=2712):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -673,9 +761,6 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
     async def fake_reconcile(mythic_tools_obj, now):
         return []
 
-    def fake_gate_decision(technique, target, state):
-        return engagement_state.GateDecision.PROCEED, "unit-test proceed"
-
     output = (
         "[+] Domain = north.sevenkingdoms.local\r\n"
         "[+] Domain Controller = winterfell.north.sevenkingdoms.local\r\n"
@@ -683,9 +768,7 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
         "[+] GUID of \"STARKWALLPAPER\" is: {0A93E998-2599-4DA8-9717-6744993DED3A}\r\n"
     )
     mt = _make_tools()
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
-        patch.object(engagement_state, "gate_decision", fake_gate_decision), \
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
         _split_issue(output, calls, display_id=2713):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -1322,7 +1405,8 @@ def test_execute_capability_gpo_fallback_waits_and_records_membership_proof(monk
     ])
     calls = {}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=3135):
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3135):
         raw = asyncio.run(mt.execute_capability(
             {
                 "capability": "gpo-controlled-system-exec",
@@ -1400,7 +1484,8 @@ def test_execute_capability_gpo_fallback_retries_delayed_membership_proof(monkey
     ])
     calls = {}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=3138):
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3138):
         raw = asyncio.run(mt.execute_capability(
             {
                 "capability": "gpo-controlled-system-exec",
@@ -1470,7 +1555,8 @@ def test_execute_capability_gpo_rewrites_live_fallback_proof_marker_to_primary_g
     ])
     calls = {}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=3137):
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3137):
         raw = asyncio.run(mt.execute_capability(
             {
                 "capability": "gpo-controlled-system-exec",
@@ -1558,7 +1644,8 @@ def test_execute_capability_gpo_direct_invalid_xml_waits_for_membership_before_r
     ])
     calls = {}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=3136):
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3136):
         raw = asyncio.run(mt.execute_capability(
             {
                 "capability": "gpo-controlled-system-exec",
@@ -4767,8 +4854,7 @@ def test_forge_golden_ticket_service_proof_records_da_effect():
 def test_gate_failure_fails_open_and_issues_normally():
     calls = {"issue": 0}
     mt = _make_tools()
-    with patch.object(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True), \
-        patch.object(intent_classifier, "classify_tool_call", side_effect=RuntimeError("boom")), \
+    with patch.object(intent_classifier, "classify_tool_call", side_effect=RuntimeError("boom")), \
         _split_issue("normal result", calls):
         result = asyncio.run(
             mt.issue_task_and_waitfor_task_output(
@@ -4964,7 +5050,6 @@ def _seed_false_da(mt, monkeypatch, evidence=None):
 
 
 def test_contradiction_downgrade_8453_access_denied_reopens_false_da_hop(monkeypatch):
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = _make_tools()
     _seed_false_da(mt, monkeypatch)
     # 0x2105 / 8453 == DS_DRA_ACCESS_DENIED == a real replication-RIGHTS denial
@@ -4977,7 +5062,6 @@ def test_contradiction_downgrade_8453_access_denied_reopens_false_da_hop(monkeyp
 
 def test_contradiction_downgrade_bad_dn_8439_does_NOT_downgrade(monkeypatch):
     # 0x20f7 / 8439 == DS_DRA_BAD_DN == a malformed-DN / name-resolution error, NOT a rights denial.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = _make_tools()
     _seed_false_da(mt, monkeypatch)
     out = "ERROR kuhl_m_lsadump_dcsync ; GetNCChanges: 0x000020f7 (8439)\n"
@@ -4988,7 +5072,6 @@ def test_contradiction_downgrade_bad_dn_8439_does_NOT_downgrade(monkeypatch):
 
 def test_contradiction_downgrade_skips_evidence_backed_hop(monkeypatch):
     # A hop backed by REAL proof (verified_on_record) is not downgraded — a later denial is a context issue.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = _make_tools()
     _seed_false_da(mt, monkeypatch, evidence={"source": "issue_task", "verified_on_record": True, "artifact_present": True})
     out = "ERROR kuhl_m_lsadump_dcsync ; GetNCChanges: 0x00002105 (8453)\n"
@@ -4999,7 +5082,6 @@ def test_contradiction_downgrade_skips_evidence_backed_hop(monkeypatch):
 
 def test_contradiction_downgrade_ignores_non_dcsync_command(monkeypatch):
     # An access-denied 8453 in a NON-dcsync command's output must not downgrade a rights hop.
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = _make_tools()
     _seed_false_da(mt, monkeypatch)
     mt._apply_contradiction_downgrade("ls", '{"Path":"C:\\\\"}', "8453 GetNCChanges /domain:north.sevenkingdoms.local")
@@ -5008,7 +5090,6 @@ def test_contradiction_downgrade_ignores_non_dcsync_command(monkeypatch):
 
 
 def test_contradiction_downgrade_leaves_unrelated_and_successful_alone(monkeypatch):
-    monkeypatch.setattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED", True)
     mt = _make_tools()
     ts = "2026-06-12T00:00:00Z"
     state = engagement_state.EngagementState(objective="t", hops=[])

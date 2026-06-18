@@ -14,7 +14,7 @@ NOW = "2026-06-06T12:00:00Z"
 TTL_SECONDS = 300
 
 
-def _north_foothold():
+def _north_foothold(alive=True):
     return engagement_state.Foothold(
         callback_id="10",
         agent="Apollo",
@@ -22,21 +22,7 @@ def _north_foothold():
         forest="north.sevenkingdoms.local",
         identity="NORTH\\samwell.tarly",
         integrity="medium",
-        alive=True,
-        source="test",
-        timestamp=NOW,
-    )
-
-
-def _essos_foothold():
-    return engagement_state.Foothold(
-        callback_id="20",
-        agent="Apollo",
-        host="MEEREEN",
-        forest="essos.local",
-        identity="ESSOS\\jorah",
-        integrity="high",
-        alive=True,
+        alive=alive,
         source="test",
         timestamp=NOW,
     )
@@ -74,81 +60,80 @@ def test_project_graph_predicates_maps_gpo_edge_to_host_predicate():
     ]
 
 
-def test_gpo_abuse_gate_is_belief_aware_on_graph_acl():
-    # belief: unknown != false. The gate only blocks on a graph-derived ACL precondition when
-    # graph data has actually been reconciled (so it can deny it); with no graph data it must PROCEED.
-    foothold = _north_foothold()
+def test_controlled_principals_projects_foothold_to_upn():
+    state = engagement_state.EngagementState(objective="x", footholds=[_north_foothold()])
+    assert graph_reconciler.controlled_principals_from_state(state) == [
+        "samwell.tarly@north.sevenkingdoms.local"
+    ]
 
-    # (1) No graph data at all -> generic-write is UNKNOWN -> do NOT block (the over-block fix).
-    no_graph = engagement_state.EngagementState(objective="gpo abuse", footholds=[foothold])
-    decision, _reason = engagement_state.gate_decision("gpo-abuse", "winterfell", no_graph)
-    assert decision == engagement_state.GateDecision.PROCEED
 
-    # (2) Graph data present but for a DIFFERENT edge -> graph can now deny -> DEFER.
-    wrong_edge = engagement_state.EngagementState(
-        objective="gpo abuse",
-        footholds=[foothold],
-        graph_facts=[
-            engagement_state.GraphFact(
-                predicate="generic-write:gpo:other",
-                source="bloodhound:cypher",
+def test_controlled_principals_skips_dead_foothold():
+    state = engagement_state.EngagementState(objective="x", footholds=[_north_foothold(alive=False)])
+    assert graph_reconciler.controlled_principals_from_state(state) == []
+
+
+def test_controlled_principals_includes_dcsynced_creds():
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[_north_foothold()],
+        hops=[
+            engagement_state.Hop(
+                id="dcsync-user:cersei.lannister@sevenkingdoms.local",
+                technique="dcsync-user",
+                target="cersei.lannister@sevenkingdoms.local",
+                effect="creds:cersei.lannister@sevenkingdoms.local",
+                status="achieved",
+                evidence={"provenance": "run"},
+                preconditions=[],
+                satisfied_effects=["creds:cersei.lannister@sevenkingdoms.local"],
+                source="test",
                 timestamp=NOW,
-                ttl_seconds=TTL_SECONDS,
             )
         ],
     )
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "winterfell", wrong_edge)
-    assert decision == engagement_state.GateDecision.DEFER
-    assert "generic-write:gpo:winterfell" in reason
+    principals = graph_reconciler.controlled_principals_from_state(state)
+    assert "samwell.tarly@north.sevenkingdoms.local" in principals
+    assert "cersei.lannister@sevenkingdoms.local" in principals
 
-    # (3) Matching graph edge present -> PROCEED.
-    with_graph_fact = engagement_state.EngagementState(
-        objective="gpo abuse", footholds=[foothold], graph_facts=[_gpo_fact()]
+
+class _FakeTool:
+    """Query-aware fake mirroring real per-target-kind reconcile calls and data.literals shape."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        if "(t:GPO)" in args.get("query", ""):
+            return json.dumps({"info_type": "run", "success": True, "data": {
+                "nodes": {}, "edges": [],
+                "literals": [{"value": "STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL", "key": "name"}]}})
+        return json.dumps({"info_type": "run", "success": True,
+                           "data": {"nodes": {}, "edges": [], "literals": []}})
+
+
+class _FakeMCP:
+    def __init__(self, tool):
+        self.tool = tool
+
+    async def get_tool_by_name(self, name, server_name=None):
+        del name, server_name
+        return self.tool
+
+
+def test_reconcile_graph_position_projects_gpo_domain_facts_from_mcp_shape():
+    foothold = _north_foothold()
+    principals = graph_reconciler.controlled_principals_from_state(
+        engagement_state.EngagementState(objective="x", footholds=[foothold])
     )
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "winterfell", with_graph_fact)
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "preconditions met" in reason
+    assert principals == ["samwell.tarly@north.sevenkingdoms.local"]
 
-
-def test_gpo_abuse_belief_aware_no_graph_proceeds_extra():
-    # explicit regression guard for the wired-run over-block: foothold present, zero graph data.
-    state = engagement_state.EngagementState(objective="gpo abuse", footholds=[_north_foothold()])
-    decision, _ = engagement_state.gate_decision("gpo-abuse", "starkwallpaper", state)
-    assert decision == engagement_state.GateDecision.PROCEED
-
-
-def test_dcsync_rights_grant_requires_domain_graph_fact_and_essos_foothold():
-    graph_fact = engagement_state.GraphFact(
-        predicate="write-dacl:domain:essos.local",
-        source="bloodhound:cypher",
-        timestamp=NOW,
-        ttl_seconds=TTL_SECONDS,
-    )
-    without_essos_foothold = engagement_state.EngagementState(
-        objective="essos DA",
-        graph_facts=[graph_fact],
-    )
-    with_essos_foothold = engagement_state.EngagementState(
-        objective="essos DA",
-        footholds=[_essos_foothold()],
-        graph_facts=[graph_fact],
-    )
-
-    decision, reason = engagement_state.gate_decision(
-        "dcsync-rights-grant",
-        "essos.local",
-        without_essos_foothold,
-    )
-    assert decision == engagement_state.GateDecision.DEFER
-    assert "live-foothold:essos.local" in reason
-
-    decision, reason = engagement_state.gate_decision(
-        "dcsync-rights-grant",
-        "essos.local",
-        with_essos_foothold,
-    )
-    assert decision == engagement_state.GateDecision.PROCEED
-    assert "preconditions met" in reason
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCP(_FakeTool()), principals, "reach essos DA", NOW, TTL_SECONDS
+    ))
+    preds = [f.predicate for f in facts]
+    assert "generic-write:gpo:starkwallpaper" in preds
+    assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
 
 
 def test_prune_stale_graph_facts_flips_gpo_abuse_from_proceed_to_defer():
@@ -165,15 +150,9 @@ def test_prune_stale_graph_facts_flips_gpo_abuse_from_proceed_to_defer():
         graph_facts=[stale_fact, fresh_fact],
     )
 
-    decision, _reason = engagement_state.gate_decision("gpo-abuse", "winterfell", state)
-    assert decision == engagement_state.GateDecision.PROCEED
-
     pruned = graph_reconciler.prune_stale_graph_facts(state, NOW)
 
     assert pruned.graph_facts == [fresh_fact]
-    decision, reason = engagement_state.gate_decision("gpo-abuse", "winterfell", pruned)
-    assert decision == engagement_state.GateDecision.DEFER
-    assert "generic-write:gpo:winterfell" in reason
 
 
 def test_project_graph_predicates_maps_domain_and_computer_edges_with_provenance():
