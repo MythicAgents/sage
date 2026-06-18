@@ -1,0 +1,4 @@
+# Eval-gauge / hill-climb runtime artifacts — never committed (corpus-style; see
+# Plans/SAGE_HILL_CLIMBING_SPEC.md §8). Keep this .gitignore, ignore everything else.
+*
+!.gitignore
