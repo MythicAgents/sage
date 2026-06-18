@@ -27,14 +27,14 @@ import json
 from dataclasses import dataclass, field
 
 try:  # package import
-    from .range_state import Milestone, GroundTruth
+    from .range_state import Milestone, GroundTruth, DEFAULT_SPEC
     from .process_state import ProcessSignals
 except Exception:  # script / sys.path import
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from range_state import Milestone, GroundTruth  # type: ignore
+    from range_state import Milestone, GroundTruth, DEFAULT_SPEC  # type: ignore
     from process_state import ProcessSignals  # type: ignore
 
 
@@ -43,15 +43,18 @@ _MAX_MILESTONE = max(m.value for m in Milestone)  # OBJECTIVE = 9
 
 
 def verifier_hash(scenario=None, gauge_version: str = GAUGE_VERSION) -> str:
-    """A stable id for the gauge VERSION (logic + milestone spec). Results are only
-    comparable within one hash; changing the spec or gauge logic must change it."""
-    spec = scenario.spec() if scenario is not None and hasattr(scenario, "spec") else {}
+    """A stable id for the gauge VERSION — gauge logic + the GLOBAL default milestone spec.
+
+    It is intentionally independent of the per-scenario spec: scenarios are *inputs* to a
+    campaign, so a gate experiment spanning several scenarios must share one verifier_hash.
+    Changing the gauge version or the default milestone definitions changes it; a scenario's
+    own OBJECTIVE/cert override does not. (`scenario` is accepted for call-site symmetry.)"""
     payload = {
         "gauge_version": gauge_version,
         "milestones": [m.name for m in Milestone],
-        "spec": {
+        "default_spec": {
             m.name: [list(s.effect_prefixes), (s.domain_role or "")]
-            for m, s in sorted(spec.items(), key=lambda kv: kv[0].value)
+            for m, s in sorted(DEFAULT_SPEC.items(), key=lambda kv: kv[0].value)
         },
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
