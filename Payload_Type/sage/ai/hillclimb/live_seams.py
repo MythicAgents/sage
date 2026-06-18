@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import subprocess
 from typing import Any, Callable
 
 
@@ -145,3 +147,30 @@ def make_cypher_run(mcp_tool: Any, *, timeout: int = 30) -> Callable[[str], list
         return extract_literals(asyncio.run(_q()))
 
     return cypher_run
+
+
+# --- BloodHound REST probe (GRAPH_COLLECTED), VALIDATED via the working bh_reset.py status path -----
+
+def parse_domain_count(text: str) -> int:
+    """Parse the domain count from `bh_reset.py status` output. Pure/testable."""
+    m = re.search(r"available-domains:\s*\d+\s+count=(\d+)", text or "")
+    return int(m.group(1)) if m else 0
+
+
+def bloodhound_domain_count(*, timeout: int = 60) -> int:
+    """Read-only count of BloodHound domains via the MCP's signed client (reuses bh_reset.py status).
+    VALIDATED 2026-06-18: returns 0 on a freshly-wiped graph (`available-domains: 200 count=0`)."""
+    cmd = [
+        "uv", "--directory", "/home/john/dev/bloodhound_mcp", "run", "python",
+        "/home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py", "status",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return parse_domain_count(proc.stdout)
+
+
+def graph_collected_probe(*, timeout: int = 60) -> Callable[[], bool]:
+    """A DirectProbe for GRAPH_COLLECTED grounded in the validated BloodHound REST path
+    (domains non-empty == a collection has been ingested)."""
+    def probe() -> bool:
+        return bloodhound_domain_count(timeout=timeout) > 0
+    return probe
