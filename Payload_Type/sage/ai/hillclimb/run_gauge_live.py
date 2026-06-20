@@ -25,13 +25,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 try:
-    from . import live_seams, bare_runner, probes as probes_mod
+    from . import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod
     from .scenarios import goad_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import live_seams, bare_runner, probes as probes_mod  # type: ignore
+    import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod  # type: ignore
     from scenarios import goad_scenarios, CHILD, OBJECTIVE  # type: ignore
     from range_state import Milestone  # type: ignore
     from fitness import ScoreCard  # type: ignore
@@ -42,22 +42,37 @@ class Config:
     sage_cb: int = 1
     apollo_cb: int = 4
     engagement_op: str = "Operation_Chimera_1"
-    max_steps: int = 40
-    solve_timeout: int = 1800
+    max_steps: int = 0          # 0 = UNLIMITED steps for the bare model (parity with Sage's solve)
+    solve_timeout: int = 1800   # also the bare loop's wall-clock ceiling (not a step/recursion cap)
+    # AD-direct DA probes poll for up to this long (re-reading every interval) so GPO/SYSTEM-on-DC
+    # membership changes have time to propagate before scoring — returns True the instant they appear.
+    da_settle_timeout: int = 300
+    da_settle_interval: int = 20
 
     @property
     def results_path(self) -> Path:
         return Path(__file__).resolve().parents[2] / ".hillclimb" / "results" / "bare_vs_harness.jsonl"
 
 
-def build_probes(tasker, baseline: dict) -> dict:
-    """All collection-independent. KRBTGT via Mythic loot; DA/OBJECTIVE via AD-DIRECT live DC membership
-    (escalation vs the post-reset baseline). krbtgt-loot also covers DA achieved without a membership add."""
-    return {
-        Milestone.KRBTGT_DUMPED: live_seams.mythic_credential_probe("krbtgt"),
-        Milestone.DA_CHILD: live_seams.ad_domain_admins_probe(tasker, CHILD, baseline=baseline.get(CHILD, set())),
-        Milestone.OBJECTIVE: live_seams.ad_domain_admins_probe(tasker, OBJECTIVE, baseline=baseline.get(OBJECTIVE, set())),
-    }
+def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
+                 settle_interval: float = 20) -> dict:
+    """All collection-independent. KRBTGT via Mythic loot; DA/OBJECTIVE via AD-DIRECT OUT-OF-BAND LDAP
+    membership (escalation vs the post-reset baseline) — read by the referee `reader(domain)->set`, never
+    through the agent callback. krbtgt-loot also covers DA achieved without a membership add. Probes are
+    scoped to the scenario's milestone_subset so a scenario never builds (or needs referee creds for) a
+    milestone it does not score. The DA probes get a settling window so GPO/SYSTEM-on-DC membership
+    changes have time to propagate before scoring (krbtgt-loot is immediate, so it needs no window)."""
+    sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
+    probes = {Milestone.KRBTGT_DUMPED: live_seams.mythic_credential_probe("krbtgt")}
+    if Milestone.DA_CHILD in sub:
+        probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
+            reader, CHILD, baseline=baseline.get(CHILD, set()),
+            settle_timeout=settle_timeout, settle_interval=settle_interval)
+    if Milestone.OBJECTIVE in sub:
+        probes[Milestone.OBJECTIVE] = live_seams.ad_domain_admins_probe_via_reader(
+            reader, OBJECTIVE, baseline=baseline.get(OBJECTIVE, set()),
+            settle_timeout=settle_timeout, settle_interval=settle_interval)
+    return probes
 
 
 def _scenario(cfg: Config, name: str):
@@ -71,23 +86,58 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     scn = _scenario(cfg, scenario_name)
     client = live_seams.default_mythic_client()
-    tasker = live_seams.make_tool_executor(client, cfg.apollo_cb)
-    # AD-direct baseline (post-reset, pre-agent): lets the DA/OBJECTIVE probe detect escalation vs default.
-    baseline = {CHILD: live_seams.ad_domain_admins(tasker, CHILD),
-                OBJECTIVE: live_seams.ad_domain_admins(tasker, OBJECTIVE)}
-    probes = build_probes(tasker, baseline)
+
+    # GROUND TRUTH is read OUT-OF-BAND over LDAP (the referee), NOT through the agent's Apollo callback.
+    # Routing it through that callback would (a) pollute the HARNESS — Sage reconciles the callback's task
+    # history at solve start, so it would see the recon AND the answer, asymmetrically vs the bare model —
+    # and (b) misread the domain (`net group /domain` only enumerates the host's own domain). Scope the
+    # baseline to the AD-direct milestones THIS scenario scores, so e.g. child-da neither queries nor needs
+    # referee creds for essos. The baseline is captured pre-solve but off-callback, so it cannot pollute.
+    sub = set(scn.milestone_subset or tuple(Milestone))
+    needed = {d for m, d in ((Milestone.DA_CHILD, CHILD), (Milestone.OBJECTIVE, OBJECTIVE)) if m in sub}
+    reader = live_seams.make_referee_reader() if needed else (lambda _d: set())
+    baseline = {d: reader(d) for d in needed}
+    probes = build_probes(reader, baseline, scn,
+                          settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
+
     if side == "harness":
         solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
-        solve(scn.objective)                                   # full autonomous Sage solve
-        card = bare_runner.score_from_probes(scn, probes, status="done")
+        _start = time.time()
+        _deadline = _start + cfg.solve_timeout
+        print(f"[harness/{scenario_name}] started {time.strftime('%H:%M:%S', time.localtime(_start))} · "
+              f"times out by {time.strftime('%H:%M:%S', time.localtime(_deadline))} "
+              f"(+{cfg.solve_timeout // 60} min via --solve-timeout, unless Sage finishes first)", flush=True)
+        solve_status = "done"
+        try:
+            # make_harness_solver returns the Mythic task status: "success" when Sage finished,
+            # "timeout" when the wall-clock poll expired (Sage may still be churning in the background).
+            solve_status = solve(scn.objective) or "done"
+        except KeyboardInterrupt:
+            solve_status = "interrupted"
+            print("⎈ interrupted — scoring the current range state", flush=True)
+        _elapsed = int(time.time() - _start)
+        print(f"[harness/{scenario_name}] solve returned {time.strftime('%H:%M:%S')} "
+              f"(elapsed {_elapsed // 60}m{_elapsed % 60}s, status={solve_status})", flush=True)
+        # Record the REAL terminal status (incl. "timeout") in the card -> jsonl, not a hardcoded "done".
+        card = bare_runner.score_from_probes(scn, probes, status=solve_status)
     elif side == "bare":
-        bare = build_bare_runner(cfg, tasker=tasker)
+        bare = build_bare_runner(cfg)            # builds its own stripped-Mythic dispatcher (all callbacks)
         result = bare.run(scn.objective)
         card = bare_runner.score_bare_run(result, scn, probes)
     else:
         raise SystemExit("--side must be harness|bare")
 
-    rec = {"side": side, "scenario": scenario_name, "ts": time.time(), "card": asdict(card)}
+    # Record which LLM produced this run, for provenance and multi-LLM matrices. Today both sides read
+    # the model from Sage's .env (bare via build_bare_runner -> load_sage_defaults; harness = whatever Sage
+    # is running). When a bare-side --model override is added, record THAT for the bare side instead.
+    _defs = live_seams.load_sage_defaults()
+    _now = time.time()
+    rec = {"side": side, "scenario": scenario_name,
+           "model": _defs.get("model"), "provider": _defs.get("provider"),
+           # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
+           # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
+           "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
+           "card": asdict(card)}
     p = cfg.results_path
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
@@ -97,14 +147,38 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     return card
 
 
-def build_bare_runner(cfg: Config, tasker=None) -> bare_runner.BareModelRunner:
+def build_bare_runner(cfg: Config) -> bare_runner.BareModelRunner:
     d = live_seams.load_sage_defaults()
     model_fn = live_seams.make_model_fn(d["provider"], d["model"], api_key=d["api_key"], base_url=d["base_url"])
-    if tasker is None:
-        client = live_seams.default_mythic_client()
-        tasker = live_seams.make_tool_executor(client, cfg.apollo_cb)
-    return bare_runner.BareModelRunner(model_fn, tasker,
-                                       tools_spec=live_seams.apollo_tools_spec(), max_steps=cfg.max_steps)
+    # Bare uses the SAME Mythic interface as Sage (enumerate payloads -> commands -> args -> task), via the
+    # STRIPPED (Sage-free) toolset — NOT a hardcoded Apollo command list. The dispatcher routes the model's
+    # tool calls straight to the raw Mythic SDK. No step cap (cfg.max_steps=0); solve_timeout is a
+    # wall-clock ceiling; a live stdout logger lets the operator watch the model between Mythic tasks.
+    client = live_seams.default_mythic_client()
+    mythic_exec = bare_mythic_tools.make_mythic_dispatcher(client)
+
+    # BloodHound: discover EVERY MCP tool dynamically (not hardcoded). Raw external tool — Sage's
+    # BloodHound *agent* (ingest reconciliation, collect-once gate, graph-fact injection) stays excluded.
+    bh_specs, bh_registry = bare_bloodhound.load_bloodhound_mcp_tools()
+    bh_exec = bare_bloodhound.make_bloodhound_dispatcher(bh_registry)
+    print(f"[bare] toolset: {len(bare_mythic_tools.TOOLS)} Mythic + {len(bh_specs)} BloodHound MCP tools", flush=True)
+
+    def executor(call: dict) -> str:
+        name = call.get("tool", "")
+        if name in bare_mythic_tools.TOOLS:
+            return mythic_exec(call)
+        bh = bh_exec(call)
+        if bh is not None:
+            return bh
+        return f"[unknown tool] {name!r}"
+
+    return bare_runner.BareModelRunner(
+        model_fn, executor,
+        tools_spec=bare_mythic_tools.bare_tool_specs() + bh_specs,
+        max_steps=cfg.max_steps,
+        timeout=cfg.solve_timeout,
+        logger=bare_runner.make_stdout_logger(),
+    )
 
 
 def compare(cfg: Config, scenario_name: str) -> None:
@@ -139,6 +213,9 @@ def main(argv=None) -> int:
     r.add_argument("--apollo-cb", type=int, default=None)
     r.add_argument("--solve-timeout", type=int, default=None,
                    help="seconds to wait for the harness solve (default 1800=30min); raise for full solves")
+    r.add_argument("--da-settle-timeout", type=int, default=None,
+                   help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
+                        "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
     c = sub.add_parser("compare", help="combine recorded ScoreCards for a scenario into a verdict")
     c.add_argument("--scenario", required=True)
     args = ap.parse_args(argv)
@@ -150,6 +227,8 @@ def main(argv=None) -> int:
         cfg.apollo_cb = args.apollo_cb
     if getattr(args, "solve_timeout", None) is not None:
         cfg.solve_timeout = args.solve_timeout
+    if getattr(args, "da_settle_timeout", None) is not None:
+        cfg.da_settle_timeout = args.da_settle_timeout
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
@@ -165,7 +244,13 @@ def main(argv=None) -> int:
         print(f"  objective: {_scenario(cfg, args.scenario).objective}")
         return 0
 
-    run_side(cfg, args.side, args.scenario)
+    try:
+        run_side(cfg, args.side, args.scenario)
+    except KeyboardInterrupt:
+        # Backstop for a Ctrl-C OUTSIDE the model loop / harness wait (e.g. during baseline LDAP or
+        # scoring); interrupts inside those are already caught and scored. Exit cleanly, no traceback.
+        print("\n⎈ interrupted by operator — exiting cleanly.", flush=True)
+        return 130
     return 0
 
 

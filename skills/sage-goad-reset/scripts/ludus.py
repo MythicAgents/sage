@@ -5,8 +5,9 @@ Reads LUDUS_URL + LUDUS_API_KEY from Sage's .mcp.json (the key's user owns range
 Subcommands:
   status                 GET range state + VM power/IP table
   logs                   GET latest deploy logs (tail)
-  snapshot <name>        take a Proxmox snapshot of all range VMs (the clean-baseline primitive)
-  rollback <name>        roll all range VMs back to <name> (the fast between-eval reset)
+  snapshot <name> [--include-ram]
+                         take a Proxmox snapshot of all range VMs
+  rollback [name]        roll all range VMs back to a snapshot (default: eval-defender-apollo)
   snapshots              list snapshots
   poweron [machines]     PUT power on range VMs (default "all"; CSV of VMID/name for a subset)
   poweroff [machines]    PUT power off range VMs (default "all")
@@ -17,6 +18,7 @@ from __future__ import annotations
 import json, sys, urllib.request, urllib.error, ssl
 
 MCP = "/home/john/dev/sage/.mcp.json"
+DEFAULT_ROLLBACK_SNAPSHOT = "eval-defender-apollo"
 
 def _creds():
     c = json.load(open(MCP))
@@ -54,11 +56,18 @@ def logs():
 def snapshots():
     print(_call("GET", "/api/v2/snapshots/list"))
 
-def snapshot(name):
-    print(_call("POST", "/api/v2/snapshots/create", {"name": name, "description": f"clean-baseline {name}", "includeRAM": False}))
+def snapshot(name, *, include_ram=False):
+    print(_call("POST", "/api/v2/snapshots/create", {
+        "name": name,
+        "description": f"clean-baseline {name}",
+        "includeRAM": include_ram,
+    }))
 
 def rollback(name):
     print(_call("POST", "/api/v2/snapshots/rollback", {"name": name}))
+
+def _rollback_snapshot(args):
+    return next((arg for arg in args if arg != "--yes"), DEFAULT_ROLLBACK_SNAPSHOT)
 
 def _machines_body(machines):
     # API wants {"machines": ["all"]} or a list of VMIDs/names; accept "all" or a CSV string.
@@ -76,10 +85,11 @@ if __name__ == "__main__":
     if cmd == "status": status()
     elif cmd == "logs": logs()
     elif cmd == "snapshots": snapshots()
-    elif cmd == "snapshot": snapshot(sys.argv[2])
+    elif cmd == "snapshot":
+        snapshot(sys.argv[2], include_ram="--include-ram" in sys.argv[3:])
     elif cmd == "poweron": poweron(sys.argv[2] if len(sys.argv) > 2 else "all")
     elif cmd == "poweroff": poweroff(sys.argv[2] if len(sys.argv) > 2 else "all")
     elif cmd == "rollback":
         if "--yes" not in sys.argv: print("rollback is destructive — pass --yes"); sys.exit(2)
-        rollback(sys.argv[2])
+        rollback(_rollback_snapshot(sys.argv[2:]))
     else: print(f"unknown: {cmd}"); sys.exit(2)

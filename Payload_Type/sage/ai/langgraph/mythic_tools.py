@@ -700,6 +700,19 @@ GUARDED_TOOLS: set[str] = {
 }
 
 
+# Volatile substrings stripped before hashing a command's output for the unproductive-repeat loop-guard, so
+# two runs of the same command that differ ONLY in drifting values (ticket timestamps, LUIDs/handles) hash
+# identically. A module constant so the guard and its tests stay in lockstep.
+_VOLATILE_OUTPUT_PATTERNS = [
+    re.compile(r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}\S*", re.I),  # ISO 2026-06-19T10:22:31Z
+    re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"),                          # 6/19/2026
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\b", re.I),      # 10:22:31 AM
+    re.compile(r"\b0x[0-9a-f]+\b", re.I),                                 # 0x3e7 LUIDs/handles
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I),  # GUID
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b"),                   # IP:port (ephemeral source ports)
+]
+
+
 class MythicTools:
     """A class to manage Mythic API tools for LangChain agents.
 
@@ -740,6 +753,17 @@ class MythicTools:
         # returns a curt "stop re-reading, act" after repeats within an epoch, and resets when a command runs.
         self._recon_epoch: int = 0
         self._recon_call_log: dict[tuple, int] = {}
+        # Unproductive-success loop-guard: a SUCCESSFUL command RESETS the failure circuit breaker, so a command
+        # that keeps succeeding while returning the SAME (volatile-normalized) output — e.g. `shell klist` 10× —
+        # slips past the breaker entirely. This tracks a GLOBAL consecutive-identical-action streak (command +
+        # params + normalized output); an intervening different/failed action breaks the streak, so legitimate
+        # re-runs across real work never accrue. At the limit the action is flagged and refused until real
+        # progress (a different successful action) clears the flag.
+        self._unproductive_repeat_limit: int = 3
+        self._last_action_sig: tuple | None = None
+        self._action_repeat_count: int = 0
+        self._unproductive_tripped: set[tuple] = set()
+        self._volatile_output_patterns = _VOLATILE_OUTPUT_PATTERNS
         # Mythic display_id + callback display_id of the most recently issued task — attached to an engagement
         # hop's evidence so the operator (and `state show`) can trace each achieved effect back to the exact
         # task AND the callback that proved it.
@@ -1650,6 +1674,66 @@ class MythicTools:
             self._task_failure_counts[fail_key] = attempts + 1
         return decision
 
+    def _serialize_params_for_signature(self, parameters) -> str:
+        """Stable serialization of command parameters for the loop-guard action signature."""
+        try:
+            if isinstance(parameters, (dict, list)):
+                return json.dumps(parameters, sort_keys=True)
+            return str(parameters)
+        except Exception:
+            return str(parameters)
+
+    def _normalize_volatile_output(self, text: str) -> str:
+        """Strip volatile fields (timestamps, LUIDs/handles) and collapse whitespace so two runs of the same
+        command that differ ONLY in drifting values (e.g. `klist` ticket valid/expires/renew times) hash to
+        the same string. Without this the loop-guard would never fire on klist. Never raises."""
+        try:
+            s = str(text or "")
+            for pat in getattr(self, "_volatile_output_patterns", []) or []:
+                s = pat.sub("", s)
+            return " ".join(s.split()).casefold()
+        except Exception:
+            return str(text or "")
+
+    def _unproductive_action_key(self, command: str, callback_display_id, parameters) -> tuple:
+        return (str(command), callback_display_id, self._serialize_params_for_signature(parameters))
+
+    def _unproductive_repeat_nudge(self, command, callback_display_id, parameters, results_str, result_class) -> str | None:
+        """Track consecutive identical SUCCESSFUL actions and return an escalating STOP nudge at the limit.
+
+        Only SUCCESS counts: failures are handled by the failure circuit breaker, and SUCCESS is exactly the
+        case that breaker RESETS and therefore cannot catch (the `shell klist` loop). A different or non-success
+        action breaks the streak AND clears prior loop flags (it is real progress). Never raises."""
+        try:
+            if str(result_class) != command_builder.ResultClass.SUCCESS.value:
+                self._last_action_sig = None
+                self._action_repeat_count = 0
+                return None
+            action_key = self._unproductive_action_key(command, callback_display_id, parameters)
+            sig = action_key + (self._normalize_volatile_output(results_str),)
+            if sig == self._last_action_sig:
+                self._action_repeat_count += 1
+            else:
+                self._last_action_sig = sig
+                self._action_repeat_count = 1
+                # A genuinely different successful observation is progress — let previously-looped commands run
+                # again (e.g. `klist` after a fresh ticket forge legitimately shows new output).
+                self._unproductive_tripped.clear()
+            if self._action_repeat_count >= self._unproductive_repeat_limit:
+                self._unproductive_tripped.add(action_key)
+                self._action_repeat_count = 0
+                return (
+                    f"STOP — '{command}' on callback {callback_display_id} has returned the SAME output "
+                    f"{self._unproductive_repeat_limit}× in a row with no new progress. Re-running a succeeding-"
+                    f"but-unchanged command is NOT progress and burns the step budget. If the objective is "
+                    f"already satisfied, report the proof chain and call handback_to_supervisor; otherwise take a "
+                    f"DIFFERENT next action, or handback_to_supervisor with a concrete named blocker. Do not "
+                    f"repeat this command."
+                )
+            return None
+        except Exception:
+            return None
+
     def _cache_kerberos_ticket_artifact(self, command: str, parameters, output: str) -> None:
         try:
             if _normalize_command_name(command) not in {"execute_assembly", "execute-assembly", "inline_assembly"}:
@@ -2079,6 +2163,19 @@ class MythicTools:
                 "proof, or run rev2self first if you intentionally need to abandon the current context."
             )
 
+        # Loop-guard pre-issue refusal: this exact action already tripped the unproductive-repeat limit and has
+        # not been cleared by intervening progress. Refuse to re-issue it (the failure breaker can't, because
+        # the command SUCCEEDS) so a post-success loop (e.g. `shell klist`) cannot keep consuming the budget.
+        _loop_action_key = self._unproductive_action_key(command, callback_display_id, parameters)
+        if _loop_action_key in self._unproductive_tripped:
+            return (
+                f"STOP — '{command}' on callback {callback_display_id} was already flagged as an unproductive "
+                f"loop (it returned the same output {self._unproductive_repeat_limit}× with no new progress). Do "
+                f"NOT re-issue it. If the objective is satisfied, report the proof chain and call "
+                f"handback_to_supervisor; otherwise take a DIFFERENT next action or handback with a concrete "
+                f"named blocker."
+            )
+
         _fp = await self._action_footprint(command, parameters, callback_display_id)
         self._ledger_record(command, callback_display_id, parameters, _fp)
 
@@ -2185,6 +2282,14 @@ class MythicTools:
             # them toward the circuit breaker so blind retries are still capped.
             result_class = command_builder.classify_result(command, results_str)
             decision = self._apply_task_result_class(fail_key, result_class)
+            # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
+            # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag
+            # the action so the pre-issue guard refuses further repeats.
+            _unprod_nudge = self._unproductive_repeat_nudge(
+                command, callback_display_id, parameters, results_str, result_class
+            )
+            if _unprod_nudge:
+                results_str += f"\n\n[SAGE LOOP-GUARD] {_unprod_nudge}"
             if result_class == command_builder.ResultClass.CONSTRUCTION.value:
                 repair_hint = await self._construction_repair_hint(command, parameters, callback_display_id, results_str)
                 if decision == "stop":

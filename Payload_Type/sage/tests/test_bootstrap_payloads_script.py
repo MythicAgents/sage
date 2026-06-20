@@ -1,5 +1,7 @@
 import argparse
+import asyncio
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -154,6 +156,187 @@ def test_apollo_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
     assert args.adjust_filename is True
     assert args.debug is True
     assert args.download_dir == "/payloads"
+
+
+def test_callback_config_export_document_round_trips_with_owner_only_permissions(tmp_path):
+    path = tmp_path / "apollo_callback_config.json"
+
+    document = bootstrap_payloads.write_callback_config(
+        path,
+        {
+            "status": "success",
+            "error": None,
+            "agent_callback_id": "callback-uuid",
+            "config": '{"uuid":"payload-uuid","key":"secret"}',
+        },
+    )
+
+    assert document["agent_callback_id"] == "callback-uuid"
+    assert bootstrap_payloads.load_callback_config(path) == {
+        "uuid": "payload-uuid",
+        "key": "secret",
+    }
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_export_callback_config_resolves_display_id_and_uses_graphql_variables(monkeypatch):
+    calls = []
+
+    async def fake_query(client, query, variables=None):
+        calls.append((query, variables))
+        if "CallbackIdentity" in query:
+            return {
+                "callback": [
+                    {"display_id": 7, "agent_callback_id": "callback-uuid"}
+                ]
+            }
+        return {
+            "exportCallbackConfig": {
+                "status": "success",
+                "error": None,
+                "agent_callback_id": "callback-uuid",
+                "config": '{"uuid":"payload-uuid"}',
+            }
+        }
+
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(bootstrap_payloads.export_callback_config(object(), "7"))
+
+    assert result["agent_callback_id"] == "callback-uuid"
+    assert calls[0][1] == {"displayId": 7}
+    assert calls[1][1] == {"agentCallbackId": "callback-uuid"}
+
+
+def test_import_callback_config_passes_jsonb_object(monkeypatch):
+    observed = {}
+
+    async def fake_query(client, query, variables=None):
+        observed["query"] = query
+        observed["variables"] = variables
+        return {
+            "importCallbackConfig": {
+                "status": "success",
+                "error": None,
+            }
+        }
+
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(
+        bootstrap_payloads.import_callback_config(
+            object(),
+            '{"uuid":"payload-uuid","key":"secret"}',
+        )
+    )
+
+    assert result == {"status": "success", "error": None}
+    assert observed["variables"] == {
+        "config": {"uuid": "payload-uuid", "key": "secret"}
+    }
+    assert "$config: jsonb!" in observed["query"]
+
+
+def test_bootstrap_reset_imports_baked_apollo_without_creating_payload(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = tmp_path / "apollo_callback_config.json"
+    config_path.write_text(
+        json.dumps({"config": {"uuid": "payload-uuid", "key": "secret"}}),
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def fake_login(args):
+        return object()
+
+    async def fake_import(client, config):
+        calls.append(("import", config))
+        return {"status": "success", "error": None}
+
+    async def fake_create_sage(client, args):
+        calls.append(("sage", None))
+        return {"build_phase": "success", "uuid": "sage-uuid"}
+
+    async def fail_create_apollo(client, args):
+        raise AssertionError("Apollo payload creation must be skipped")
+
+    async def fake_query(client, query, variables=None):
+        return {"callback": []}
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
+    monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
+    monkeypatch.setattr(bootstrap_payloads, "create_sage", fake_create_sage)
+    monkeypatch.setattr(bootstrap_payloads, "create_apollo", fail_create_apollo)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    asyncio.run(
+        bootstrap_payloads.command_bootstrap_reset(
+            argparse.Namespace(
+                callback_config=str(config_path),
+            )
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert calls == [
+        ("sage", None),
+        ("import", {"uuid": "payload-uuid", "key": "secret"}),
+    ]
+    assert output["mode"] == "imported-baked-apollo"
+    assert "apollo" not in output
+
+
+def test_bootstrap_reset_falls_back_to_fresh_apollo_when_config_is_missing(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    calls = []
+
+    async def fake_login(args):
+        return object()
+
+    async def fake_create_apollo(client, args):
+        calls.append(("apollo", None))
+        return {"build_phase": "success", "uuid": "apollo-uuid"}
+
+    async def fake_download(client, payload, download_dir):
+        calls.append(("download", download_dir))
+        return {"downloaded": True, "path": "/payloads/apollo.exe"}
+
+    async def fake_create_sage(client, args):
+        calls.append(("sage", None))
+        return {"build_phase": "success", "uuid": "sage-uuid"}
+
+    async def fake_query(client, query, variables=None):
+        return {"callback": []}
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
+    monkeypatch.setattr(bootstrap_payloads, "create_apollo", fake_create_apollo)
+    monkeypatch.setattr(bootstrap_payloads, "maybe_download_payload", fake_download)
+    monkeypatch.setattr(bootstrap_payloads, "create_sage", fake_create_sage)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    asyncio.run(
+        bootstrap_payloads.command_bootstrap_reset(
+            argparse.Namespace(
+                callback_config=str(tmp_path / "missing.json"),
+                download_dir="/payloads",
+            )
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert calls == [
+        ("sage", None),
+        ("apollo", None),
+        ("download", "/payloads"),
+    ]
+    assert output["mode"] == "fresh-apollo-fallback"
+    assert output["apollo"]["uuid"] == "apollo-uuid"
 
 
 def test_sage_task_password_resolver_prefers_environment(monkeypatch, tmp_path):

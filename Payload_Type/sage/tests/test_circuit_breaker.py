@@ -55,10 +55,12 @@ def test_is_task_failure_output_signatures():
 
 def test_empty_params_normalized_to_empty_string():
     seen = {}
-    mt = _make_tools()
     with _split_issue("ok", on_issue=lambda p: seen.__setitem__("parameters", p)):
         for empty in ({}, "", "{}", '""', None):
             seen.clear()
+            # Fresh tools per case: these are independent normalization checks, not a real repeated-action
+            # loop, so they must not accumulate the unproductive-success loop-guard streak.
+            mt = _make_tools()
             asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", empty, 11))
             assert seen["parameters"] == "", f"{empty!r} should normalize to ''"
 

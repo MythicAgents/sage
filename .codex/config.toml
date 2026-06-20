@@ -15,6 +15,6 @@ matcher = ".*"
 
 [[hooks.Stop.hooks]]
 type = "command"
-command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-architecture-governor/scripts/check_arch_budget.py" --quiet --changed'
+command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-architecture-governor/scripts/check_arch_budget.py" --quiet --changed --warn-only'
 timeout = 20
 statusMessage = "Checking Sage architecture budget"

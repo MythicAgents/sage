@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Bootstrap fresh Sage/Apollo payloads after a Mythic reset.
+"""Bootstrap Sage and Apollo callbacks after a Mythic reset.
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
 active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
-this helper creates fresh payloads before Apollo is launched on CASTELBLACK.
+this helper restores a baked Apollo callback config or creates fresh payloads before
+Apollo is launched on CASTELBLACK.
 
 Examples:
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
+  .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py export-callback-config --callback 2
+  .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py import-callback-config
+  .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-sage --provider Bedrock --model us.anthropic.claude-3-5-sonnet-20241022-v2:0
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-apollo --callback-host https://10.4.10.1 --download-dir /tmp/sage_payloads
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-all --callback-host https://10.4.10.1 --download-dir /tmp/sage_payloads
@@ -20,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from mythic import mythic
@@ -37,6 +42,7 @@ MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
 SKILL_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
+DEFAULT_CALLBACK_CONFIG_PATH = Path(__file__).resolve().parents[1] / "apollo_callback_config.json"
 REQUIRED_RUNTIME_DBS = (
     "Payload_Type/sage/sage.db",
     "Payload_Type/sage/.phoenix/phoenix.db",
@@ -64,10 +70,40 @@ CALLBACK_QUERY = """
 query ActiveCallbacks {
   callback(order_by: {display_id: asc}) {
     display_id
+    agent_callback_id
     host
     user
     active
     payload { payloadtype { name } }
+  }
+}
+"""
+
+CALLBACK_ID_QUERY = """
+query CallbackIdentity($displayId: Int!) {
+  callback(where: {display_id: {_eq: $displayId}}, limit: 1) {
+    display_id
+    agent_callback_id
+  }
+}
+"""
+
+EXPORT_CALLBACK_CONFIG_QUERY = """
+query ExportCallbackConfig($agentCallbackId: String!) {
+  exportCallbackConfig(agent_callback_id: $agentCallbackId) {
+    status
+    error
+    agent_callback_id
+    config
+  }
+}
+"""
+
+IMPORT_CALLBACK_CONFIG_MUTATION = """
+mutation ImportCallbackConfig($config: jsonb!) {
+  importCallbackConfig(config: $config) {
+    status
+    error
   }
 }
 """
@@ -130,6 +166,58 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def callback_config_path(value: str | None = None) -> Path:
+    return Path(
+        value
+        or os.environ.get("APOLLO_CALLBACK_CONFIG_PATH")
+        or DEFAULT_CALLBACK_CONFIG_PATH
+    ).expanduser()
+
+
+def _require_success(operation: str, response: dict[str, Any]) -> dict[str, Any]:
+    status = str(response.get("status") or "")
+    if status.casefold() != "success":
+        error = response.get("error") or f"status={status or 'missing'}"
+        raise RuntimeError(f"Mythic {operation} failed: {error}")
+    return response
+
+
+def normalize_callback_config(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Callback config is not valid JSON: {exc}") from exc
+    if not isinstance(value, (dict, list)):
+        raise ValueError("Callback config must be a JSON object or array.")
+    return value
+
+
+def build_callback_config_document(exported: dict[str, Any]) -> dict[str, Any]:
+    exported = _require_success("callback config export", exported)
+    return {
+        "schema_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "agent_callback_id": exported.get("agent_callback_id"),
+        "config": normalize_callback_config(exported.get("config")),
+    }
+
+
+def write_callback_config(path: Path, exported: dict[str, Any]) -> dict[str, Any]:
+    document = build_callback_config_document(exported)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    return document
+
+
+def load_callback_config(path: Path) -> Any:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(document, dict) and "config" in document:
+        return normalize_callback_config(document["config"])
+    return normalize_callback_config(document)
 
 
 def _build_parameters(values: dict[str, Any], *, keep_empty: set[str] | None = None) -> list[dict[str, str]]:
@@ -304,6 +392,48 @@ async def inspect(client) -> dict[str, Any]:
     return {"schemas": schemas, "callbacks": callbacks.get("callback", [])}
 
 
+async def resolve_agent_callback_id(client, selector: str) -> str:
+    selector = str(selector).strip()
+    if not selector:
+        raise ValueError("Callback selector cannot be empty.")
+    if not selector.isdigit():
+        return selector
+    result = await mythic.execute_custom_query(
+        client,
+        CALLBACK_ID_QUERY,
+        variables={"displayId": int(selector)},
+    )
+    callbacks = result.get("callback") or []
+    if not callbacks or not callbacks[0].get("agent_callback_id"):
+        raise RuntimeError(f"No callback found for display ID {selector}.")
+    return str(callbacks[0]["agent_callback_id"])
+
+
+async def export_callback_config(client, selector: str) -> dict[str, Any]:
+    agent_callback_id = await resolve_agent_callback_id(client, selector)
+    result = await mythic.execute_custom_query(
+        client,
+        EXPORT_CALLBACK_CONFIG_QUERY,
+        variables={"agentCallbackId": agent_callback_id},
+    )
+    return _require_success(
+        "callback config export",
+        result.get("exportCallbackConfig") or {},
+    )
+
+
+async def import_callback_config(client, config: Any) -> dict[str, Any]:
+    result = await mythic.execute_custom_query(
+        client,
+        IMPORT_CALLBACK_CONFIG_MUTATION,
+        variables={"config": normalize_callback_config(config)},
+    )
+    return _require_success(
+        "callback config import",
+        result.get("importCallbackConfig") or {},
+    )
+
+
 async def readiness(
     client,
     repo_root: Path = REPO_ROOT,
@@ -407,6 +537,28 @@ async def command_readiness(args: argparse.Namespace) -> None:
     ))
 
 
+async def command_export_callback_config(args: argparse.Namespace) -> None:
+    client = await login(args)
+    exported = await export_callback_config(client, args.callback)
+    path = callback_config_path(args.output)
+    document = write_callback_config(path, exported)
+    print(json.dumps({
+        "status": "success",
+        "path": str(path),
+        "agent_callback_id": document.get("agent_callback_id"),
+    }, indent=2, sort_keys=True))
+
+
+async def command_import_callback_config(args: argparse.Namespace) -> None:
+    client = await login(args)
+    path = callback_config_path(args.config)
+    result = await import_callback_config(client, load_callback_config(path))
+    print(json.dumps({
+        "callback_config": str(path),
+        "import": result,
+    }, indent=2, sort_keys=True))
+
+
 async def command_create_sage(args: argparse.Namespace) -> None:
     client = await login(args)
     result = {"sage": await create_sage(client, args)}
@@ -432,6 +584,28 @@ async def command_create_all(args: argparse.Namespace) -> None:
     download = await maybe_download_payload(client, apollo, args.download_dir)
     if download:
         result["apollo_download"] = download
+    result["callbacks_after"] = (await mythic.execute_custom_query(client, CALLBACK_QUERY)).get("callback", [])
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+async def command_bootstrap_reset(args: argparse.Namespace) -> None:
+    client = await login(args)
+    path = callback_config_path(args.callback_config)
+    result: dict[str, Any] = {"sage": await create_sage(client, args)}
+    if path.exists():
+        result["apollo_callback_import"] = await import_callback_config(
+            client,
+            load_callback_config(path),
+        )
+        result["apollo_callback_config"] = str(path)
+        result["mode"] = "imported-baked-apollo"
+    else:
+        apollo = await create_apollo(client, args)
+        result["apollo"] = apollo
+        download = await maybe_download_payload(client, apollo, args.download_dir)
+        if download:
+            result["apollo_download"] = download
+        result["mode"] = "fresh-apollo-fallback"
     result["callbacks_after"] = (await mythic.execute_custom_query(client, CALLBACK_QUERY)).get("callback", [])
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -521,6 +695,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     readiness_parser.set_defaults(func=command_readiness)
 
+    export_parser = sub.add_parser(
+        "export-callback-config",
+        help="One-time export of a callback config for a baked range snapshot.",
+    )
+    add_common(export_parser)
+    export_parser.add_argument(
+        "--callback",
+        required=True,
+        help="Mythic callback display ID or agent_callback_id.",
+    )
+    export_parser.add_argument(
+        "--output",
+        default=os.environ.get("APOLLO_CALLBACK_CONFIG_PATH"),
+        help=f"Output path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+    )
+    export_parser.set_defaults(func=command_export_callback_config)
+
+    import_parser = sub.add_parser(
+        "import-callback-config",
+        help="Import the retained baked Apollo callback config into Mythic.",
+    )
+    add_common(import_parser)
+    import_parser.add_argument(
+        "--config",
+        default=os.environ.get("APOLLO_CALLBACK_CONFIG_PATH"),
+        help=f"Config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+    )
+    import_parser.set_defaults(func=command_import_callback_config)
+
     sage_parser = sub.add_parser("create-sage", help="Create a fresh Sage payload/callback.")
     add_common(sage_parser)
     add_sage_args(sage_parser)
@@ -536,6 +739,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_sage_args(all_parser)
     add_apollo_args(all_parser)
     all_parser.set_defaults(func=command_create_all)
+
+    reset_parser = sub.add_parser(
+        "bootstrap-reset",
+        help="Import a baked Apollo config when present, otherwise create fresh Apollo; always create Sage.",
+    )
+    add_common(reset_parser)
+    add_sage_args(reset_parser)
+    add_apollo_args(reset_parser)
+    reset_parser.add_argument(
+        "--callback-config",
+        default=os.environ.get("APOLLO_CALLBACK_CONFIG_PATH"),
+        help=f"Retained callback config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+    )
+    reset_parser.set_defaults(func=command_bootstrap_reset)
 
     return parser
 

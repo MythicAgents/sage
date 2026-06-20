@@ -1,4 +1,4 @@
 interface:
   display_name: "Sage GOAD Reset"
-  short_description: "Archive and reset the Sage GOAD lab."
-  default_prompt: "Use $sage-goad-reset to archive runtime databases and reset the Sage GOAD lab."
+  short_description: "Fully reset the Sage GOAD lab."
+  default_prompt: "Use $sage-goad-reset to archive runtime databases, reset Mythic/GOAD/BloodHound, restart local Sage, and restore callbacks."

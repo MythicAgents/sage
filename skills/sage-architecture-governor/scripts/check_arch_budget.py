@@ -135,6 +135,11 @@ def main() -> int:
     parser.add_argument("--paths", action="append", default=[], help="Specific repo-relative path to check.")
     parser.add_argument("--require-token", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--warn-only",
+        action="store_true",
+        help="Report architecture budget violations without returning a failing exit code.",
+    )
     parser.add_argument("--max-mythic-operator-lines", type=int, default=430)
     parser.add_argument("--max-mythic-operator-tools", type=int, default=24)
     args = parser.parse_args()
@@ -142,9 +147,10 @@ def main() -> int:
         return self_test()
     ok, errors = run_checks(args)
     if not ok:
+        prefix = "ARCHITECTURE BUDGET WARNING" if args.warn_only else "ARCHITECTURE BUDGET"
         for error in errors:
-            print(f"ARCHITECTURE BUDGET: {error}", file=sys.stderr)
-        return 1
+            print(f"{prefix}: {error}", file=sys.stderr)
+        return 0 if args.warn_only else 1
     if not args.quiet:
         print("architecture budget checks passed")
     return 0

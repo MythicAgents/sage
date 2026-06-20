@@ -371,6 +371,39 @@ def _objective_target_domains(objective) -> set:
     return targets
 
 
+def _objective_required_effects(objective, domain) -> set[str]:
+    """Effects the objective EXPLICITLY demands for `domain`, beyond admin control itself — parsed
+    generically from the objective text, with no hardcoded scenario names. Today: an objective that calls for
+    dumping/DCSyncing krbtgt requires `krbtgt-hash:{domain}` as an INDEPENDENT witness, so completion is not
+    declared on DA alone before the krbtgt material is actually extracted (an under-reach). Returns a
+    (possibly empty) set; empty means admin control of the target domain is itself sufficient."""
+    o = str(objective or "").casefold()
+    domain = _normalize_key(domain)
+    required: set[str] = set()
+    if not domain:
+        return required
+    if "krbtgt" in o:
+        required.add(f"krbtgt-hash:{domain}")
+    return required
+
+
+def _effect_satisfied(required_effect: str, achieved: set[str]) -> bool:
+    """Whether `required_effect` (a `prefix:domain` predicate) is met by `achieved`, tolerating domain-form
+    differences (NetBIOS vs FQDN) between the demand and the recorded effect — otherwise a consistent objective
+    is silently never-completed when two record paths spell the same domain differently (an under-reach that
+    re-creates exactly the klist-loop this change kills)."""
+    if required_effect in achieved:
+        return True
+    prefix, sep, dom = required_effect.partition(":")
+    if not sep or not dom:
+        return False
+    for eff in achieved:
+        p, s, d = eff.partition(":")
+        if s and p == prefix and _domains_equivalent(d, dom):
+            return True
+    return False
+
+
 def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
     """The objective's administrative-control proof is recorded AND terminal. Terminal when a proven
     admin-control domain matches the objective's parsed TARGET domain; if no target is parseable, fall back to
@@ -381,10 +414,27 @@ def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
     if not candidates:
         return False
     objective = getattr(state, "objective", "")
-    cand_domains = {str(c.get("domain", "")).strip().casefold() for c in candidates}
-    targets = {t.casefold() for t in _objective_target_domains(objective)}
+    try:
+        achieved = state.achieved_effects()
+    except Exception:
+        achieved = set()
+    # Declarative per-objective witness set: a candidate is completion-worthy only when EVERY effect the
+    # objective explicitly demands for that candidate's domain is recorded. This stops a relaxed access proof
+    # (e.g. an in-domain live callback) from declaring victory BEFORE the objective's required artifacts (the
+    # krbtgt dump) exist — which would be an under-reach. Objectives with no extra demands are unaffected.
+    qualified = [
+        c for c in candidates
+        if all(
+            _effect_satisfied(req, achieved)
+            for req in _objective_required_effects(objective, str(c.get("domain", "")).strip())
+        )
+    ]
+    if not qualified:
+        return False
+    cand_domains = [str(c.get("domain", "")).strip() for c in qualified]
+    targets = _objective_target_domains(objective)
     if targets:
-        return bool(cand_domains & targets)
+        return any(_domains_equivalent(cd, t) for cd in cand_domains for t in targets)
     if _objective_is_opaque_engagement_id(objective):
         return False
     return not has_next
@@ -694,6 +744,56 @@ def _effect_evidence(state: EngagementState, effect: str) -> dict | None:
     return None
 
 
+_IN_DOMAIN_CALLBACK_PREFIX = "in-domain-callback:"
+
+
+def _domain_label(domain: str) -> str:
+    """Leading DNS label of a domain (north.sevenkingdoms.local -> north); a bare label returns itself."""
+    d = _normalize_key(domain)
+    return d.split(".", 1)[0] if d else ""
+
+
+def _domains_equivalent(a: str, b: str) -> bool:
+    """Whether two domain spellings denote the SAME domain: exact match (FQDN==FQDN or label==label), or a
+    FQDN against its own single-label NetBIOS form (north.sevenkingdoms.local <-> north). Deliberately does
+    NOT treat a child FQDN as equal to its parent (north.sevenkingdoms.local != sevenkingdoms.local): an
+    in-domain callback must prove access to THIS domain, not merely the forest root."""
+    a = _normalize_key(a)
+    b = _normalize_key(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if "." not in a and "." in b:
+        return a == _domain_label(b)
+    if "." not in b and "." in a:
+        return b == _domain_label(a)
+    return False
+
+
+def _in_domain_live_callback(state: EngagementState, domain: str) -> str:
+    """A live, non-Sage callback whose foothold's DNS domain (forest) IS `domain`. Returns the callback id, or
+    "" when no in-domain live foothold exists. This is the access witness for an in-forest objective; a
+    cross-forest objective has no in-domain foothold until cert-auth, so it returns "" and the strict
+    cert-auth/kerberos-context gate still governs.
+
+    Matching is on the foothold FOREST only — deliberately NOT the identity's NetBIOS domain — because a bare
+    NetBIOS label (e.g. NORTH) can collide across unrelated forests (north.sevenkingdoms.local vs
+    north.otherforest.local) and would leak a cross-forest foothold in as a false in-domain witness. `forest`
+    is already canonicalized to an FQDN via the engagement NetBIOS→FQDN map in access_reconciler when one is
+    known, so exact-FQDN equality is the common path; the residual bare-label match in `_domains_equivalent`
+    only applies in a degraded environment with no FQDN mapping (and no same-label sibling forest)."""
+    for foothold in getattr(state, "footholds", []) or []:
+        if not _is_live_target_foothold(foothold):
+            continue
+        callback_id = _normalize_key(getattr(foothold, "callback_id", "")).lstrip("#")
+        if not callback_id:
+            continue
+        if _domains_equivalent(domain, getattr(foothold, "forest", "")):
+            return callback_id
+    return ""
+
+
 def objective_completion_candidates(state: EngagementState) -> list[dict[str, str]]:
     """Return generic objective-satisfaction candidates proven by achieved effects and live access.
 
@@ -724,6 +824,18 @@ def objective_completion_candidates(state: EngagementState) -> list[dict[str, st
                 cert_effect,
                 live_callbacks,
             )
+        if not context_effect:
+            # In-domain access witness (generic, but reachable ONLY because admin_effect — da:/ea:, which is
+            # verifier-gated — is already held): a live non-Sage callback whose foothold sits in `domain`
+            # itself proves usable access there, so the existing Kerberos session stands in for a separately
+            # recorded kerberos-context effect. A cross-forest objective has no in-domain foothold until
+            # cert-auth, so this never fires for it and its strict cert-auth gate is preserved.
+            in_domain_cb = _in_domain_live_callback(state, domain)
+            if in_domain_cb:
+                context_effect = (
+                    f"{_IN_DOMAIN_CALLBACK_PREFIX}{domain}{_KERBEROS_CONTEXT_CALLBACK_MARKER}{in_domain_cb}"
+                )
+                callback_id = in_domain_cb
         if not context_effect:
             continue
         candidate = {

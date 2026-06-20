@@ -75,6 +75,9 @@ The project hook config in `.codex/config.toml` wires `pre_tool_use_arch_gate.py
 shell write paths, but it does not replace careful review. Treat a passed hook as permission to edit only within
 the approved gate scope.
 
+The Stop hook runs `check_arch_budget.py --changed --warn-only`. It reports actionable budget violations without
+failing the stop event. Manual and CI invocations remain strict by default and return exit code 1 on violations.
+
 ## Verification
 
 Validate the skill and scripts after changes:

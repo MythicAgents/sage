@@ -13,6 +13,7 @@ Payload_Type/sage/sage*.db*
 .claude/
 tasks/
 .env
+skills/sage-callback-bootstrap/apollo_callback_config.json
 .evals/
 .mcp.json
 .envrc

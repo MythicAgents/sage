@@ -81,8 +81,11 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
 
 - Use `skills/sage-goad-reset` for the clean GOAD/Ludus/BloodHound/Sage rehearsal reset and readiness preflight.
-- Use `skills/sage-callback-bootstrap` after the operator resets Mythic and confirms DB cleanup to build fresh Sage/Apollo
-  payloads, establish callbacks, and rediscover live callback IDs.
+- `$sage-goad-reset full reset` means the complete workflow: archive Sage/Phoenix, reset Mythic, roll back GOAD,
+  wipe BloodHound, restart local Sage, and generate fresh Sage/Apollo payloads. Do not interpret it as Ludus-only.
+- Use `skills/sage-callback-bootstrap` after Mythic reset to import the retained baked-Apollo callback config when
+  available, create a fresh Sage callback, and rediscover live callback IDs. It falls back to a fresh Apollo
+  build/download until the baked callback workflow is configured.
 - Use `skills/sage-live-runner` for guided solves, verbose Sage tasking, monitoring, and inspection.
 - Use `skills/sage-focused-capability-tests` for narrow capability/adaptor validation.
 - Use `skills/sage-trace-analysis` for Phoenix/Mythic/log analysis.
@@ -110,13 +113,15 @@ in tmux throughout current development.
    `available-domains: count=0` before ingest.
 4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
    `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp`.
-5. **Create fresh payloads in Mythic every reset.** Build a new Sage payload and a new Apollo payload after the
-   Mythic reset because payload crypto keys change. Never reuse old Sage/Apollo payload files or old callback IDs
-   across Mythic resets. If helping from the CLI, use `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect` first, then
-   `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-sage` / `create-apollo` / `create-all` with the live Mythic C2
-   `callback_host`.
-6. **Launch fresh callbacks.** Establish the Sage callback from the new Sage payload, then launch Apollo on
-   CASTELBLACK as the assumed-breach foothold (`north\samwell.tarly`) after GOAD is powered on.
+5. **Restore callback configuration and create Sage.** Run
+   `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It creates Sage first so Sage
+   receives callback display ID `1` on a clean Mythic database. When
+   `apollo_callback_config.json` exists, it imports the callback crypto/config for the Apollo process baked into
+   the Ludus snapshot. Until that file exists, it falls back to creating and downloading a fresh Apollo payload
+   after Sage. `create-all` remains the explicit fresh-payload path.
+6. **Establish callbacks.** The fresh Sage payload establishes its callback immediately. After GOAD is powered
+   on, wait for the baked Apollo process on CASTELBLACK (`north\samwell.tarly`) to reconnect; in fallback mode,
+   launch the newly generated Apollo payload manually.
 7. **Only then rediscover callbacks and run Sage.** After DB archival and Sage restart, run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
    preflight; it must show `ready: true`. Then use `.venv/bin/python skills/sage-live-runner/scripts/sage_task.py callbacks`; identify
@@ -129,7 +134,8 @@ payload/callback lifecycle above.
 - **GOAD Ludus range:** `skills/sage-goad-reset/scripts/ludus.py` reads Ludus credentials from `.mcp.json`.
   - Check state: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py status`
   - List snapshots: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots`
-  - Roll back all range VMs: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback clean-baseline --yes`
+  - Roll back all range VMs to the default RAM-backed `eval-defender-apollo` snapshot:
+    `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback --yes`
   - Power on all range VMs: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all`
   - Verify all six VMs are ON and reporting IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`,
     SRV02/CASTELBLACK `.22`, SRV03/BRAAVOS `.23`. DC01/DC02 can briefly show `ip=null` after rollback; wait and
