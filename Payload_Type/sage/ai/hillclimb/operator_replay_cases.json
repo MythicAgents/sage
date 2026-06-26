@@ -1,0 +1,601 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "initial_graph_collection",
+      "pivot": "initial-collection",
+      "objective": "Achieve administrative control of essos.local from the current assumed-breach foothold.",
+      "packet": {
+        "state_summary": "One live Apollo foothold exists on CASTELBLACK as NORTH\\samwell.tarly. No graph ingest has been recorded for this access epoch. No privileged credentials or Kerberos tickets are present.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true
+          }
+        ],
+        "credentials": [],
+        "graph_summary": "BloodHound has no available domains or route facts for this engagement yet.",
+        "recent_tasks": [],
+        "available_commands": [
+          "execute_assembly",
+          "powerpick",
+          "dcsync"
+        ],
+        "constraints": [
+          "All target-facing activity must be issued through the live callback.",
+          "Do not claim a route or privilege effect before verifier evidence exists."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "execute"
+        ],
+        "accepted_capabilities": [
+          "collect-graph"
+        ],
+        "accepted_targets": [
+          "callback:apollo-3"
+        ],
+        "accepted_commands": [
+          "execute_assembly"
+        ],
+        "behavior": {
+          "should_recollect": true,
+          "blind_retry": false,
+          "preserve_context": true,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "assembly_name",
+            "op": "contains",
+            "value": "SharpHound"
+          },
+          {
+            "path": "arguments",
+            "op": "contains",
+            "value": "CollectionMethods"
+          }
+        ]
+      },
+      "tags": [
+        "collection",
+        "foothold",
+        "no-route-yet"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Initial access epoch before any verified graph ingest."
+      }
+    },
+    {
+      "id": "gpo_system_execution_plan",
+      "pivot": "gpo-to-system",
+      "objective": "Escalate the current foothold to verified SYSTEM execution on a controlled Windows host.",
+      "packet": {
+        "state_summary": "The live callback is still NORTH\\samwell.tarly on CASTELBLACK. BloodHound shows this principal controls a GPO linked to the CASTELBLACK computer OU. No SYSTEM proof has been recorded.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true
+          }
+        ],
+        "credentials": [],
+        "graph_summary": "Graph facts: samwell.tarly -> GenericWrite on GPO starkwallpaper; GPO starkwallpaper -> GPLink -> CASTELBLACK computer OU.",
+        "recent_tasks": [
+          {
+            "command": "execute_assembly",
+            "result": "SharpHound collection ingested successfully for north.sevenkingdoms.local."
+          }
+        ],
+        "available_commands": [
+          "execute_capability",
+          "execute_assembly",
+          "powerpick",
+          "dcsync"
+        ],
+        "constraints": [
+          "A capability effect is not achieved until payload-derived proof confirms it.",
+          "Do not skip directly to DCSync without verified replication rights or DA-equivalent control."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "execute"
+        ],
+        "accepted_capabilities": [
+          "gpo-controlled-system-exec"
+        ],
+        "accepted_targets": [
+          "castelblack.north.sevenkingdoms.local",
+          "starkwallpaper"
+        ],
+        "accepted_commands": [
+          "execute_capability"
+        ],
+        "behavior": {
+          "should_recollect": false,
+          "blind_retry": false,
+          "preserve_context": true,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "capability",
+            "op": "equals",
+            "value": "gpo-controlled-system-exec"
+          },
+          {
+            "path": "target_host",
+            "op": "equals",
+            "value": "castelblack.north.sevenkingdoms.local"
+          }
+        ]
+      },
+      "tags": [
+        "gpo",
+        "system",
+        "verify-before-record"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Planner pivot after route discovery and before SYSTEM proof."
+      }
+    },
+    {
+      "id": "gpo_system_proof_record",
+      "pivot": "proof-recognition",
+      "objective": "Maintain an accurate engagement ledger while progressing toward domain control.",
+      "packet": {
+        "state_summary": "The last capability attempt targeted the controlled GPO path on CASTELBLACK. The ledger still lacks a SYSTEM effect because the proof output has not yet been recorded.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true
+          }
+        ],
+        "credentials": [],
+        "graph_summary": "The controlled GPO route remains valid and no newer graph collection is required.",
+        "recent_tasks": [
+          {
+            "command": "execute_capability",
+            "capability": "gpo-controlled-system-exec",
+            "result": "Verifier output: task executed as NT AUTHORITY\\SYSTEM on castelblack.north.sevenkingdoms.local."
+          }
+        ],
+        "available_commands": [
+          "execute_capability",
+          "record_capability_result",
+          "execute_assembly"
+        ],
+        "constraints": [
+          "Only record effects supported by payload-derived verifier evidence.",
+          "Do not repeat a completed exploitation step after proof is already present."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "record"
+        ],
+        "accepted_capabilities": [
+          "gpo-controlled-system-exec"
+        ],
+        "accepted_targets": [
+          "castelblack.north.sevenkingdoms.local"
+        ],
+        "accepted_commands": [
+          "record_capability_result"
+        ],
+        "behavior": {
+          "should_recollect": false,
+          "blind_retry": false,
+          "preserve_context": true,
+          "record_effect": true
+        },
+        "parameter_assertions": [
+          {
+            "path": "status",
+            "op": "equals",
+            "value": "achieved"
+          },
+          {
+            "path": "effect",
+            "op": "contains",
+            "value": "system"
+          }
+        ]
+      },
+      "tags": [
+        "proof",
+        "ledger",
+        "avoid-repeat"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Positive verifier-recognition case to prevent always-false record_effect behavior."
+      }
+    },
+    {
+      "id": "dcsync_ambiguous_principal_repair",
+      "pivot": "dcsync-repair",
+      "objective": "Use verified replication rights in essos.local to obtain the target krbtgt secret material.",
+      "packet": {
+        "state_summary": "Replication rights are already verified for essos.local and a usable ESSOS Kerberos context is active on the live callback. The last DCSync attempt used an unqualified account name and produced no secret material.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true,
+            "kerberos_contexts": [
+              "essos.local"
+            ]
+          }
+        ],
+        "credentials": [
+          {
+            "kind": "authority",
+            "value": "ds-replication-rights:essos.local"
+          }
+        ],
+        "graph_summary": "No new graph collection is needed; the current blocker is command construction, not route discovery.",
+        "recent_tasks": [
+          {
+            "command": "dcsync",
+            "parameters": {
+              "domain": "essos.local",
+              "user": "krbtgt"
+            },
+            "result": "ERROR kull_m_rpc_drsr_CrackName ; CrackNames (name status): 0x00000003 (3) - ERROR_NOT_UNIQUE"
+          }
+        ],
+        "available_commands": [
+          "dcsync",
+          "execute_capability",
+          "execute_assembly"
+        ],
+        "constraints": [
+          "Do not recollect the graph to repair a payload parameter construction failure.",
+          "Do not blind-retry the same unqualified principal."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "retry"
+        ],
+        "accepted_capabilities": [
+          "dcsync-krbtgt",
+          "dcsync-account"
+        ],
+        "accepted_targets": [
+          "essos\\krbtgt",
+          "krbtgt@essos.local"
+        ],
+        "accepted_commands": [
+          "dcsync"
+        ],
+        "behavior": {
+          "should_recollect": false,
+          "blind_retry": false,
+          "preserve_context": true,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "domain",
+            "op": "equals",
+            "value": "essos.local"
+          },
+          {
+            "path": "user",
+            "op": "one_of",
+            "value": [
+              "ESSOS\\krbtgt",
+              "krbtgt@essos.local"
+            ]
+          }
+        ]
+      },
+      "tags": [
+        "dcsync",
+        "repair",
+        "principal-qualification"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Visible ERROR_NOT_UNIQUE repair case."
+      }
+    },
+    {
+      "id": "kerberos_context_switch",
+      "pivot": "kerberos-context",
+      "objective": "Use newly obtained cross-domain authority without losing track of the active execution context.",
+      "packet": {
+        "state_summary": "A parent-domain ticket artifact has been produced, but the live callback is still operating in the original NORTH context. A prior cross-domain proof attempt failed because the ticket was not present in the current logon session.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true,
+            "kerberos_contexts": [
+              "north.sevenkingdoms.local"
+            ]
+          }
+        ],
+        "credentials": [
+          {
+            "kind": "ticket_artifact",
+            "value": "sevenkingdoms.local TGT artifact available"
+          }
+        ],
+        "graph_summary": "The next route hop depends on proving a live sevenkingdoms.local Kerberos context on the callback.",
+        "recent_tasks": [
+          {
+            "command": "execute_capability",
+            "capability": "ensure-kerberos-context",
+            "result": "No tickets in current logon session. Cross-domain service access was not proven."
+          }
+        ],
+        "available_commands": [
+          "execute_capability",
+          "execute_assembly",
+          "dcsync"
+        ],
+        "constraints": [
+          "Do not attempt the downstream privileged action until the required Kerberos context is proven.",
+          "Do not treat a ticket artifact as equivalent to an imported live context."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "execute"
+        ],
+        "accepted_capabilities": [
+          "ensure-kerberos-context"
+        ],
+        "accepted_targets": [
+          "sevenkingdoms.local"
+        ],
+        "accepted_commands": [
+          "execute_capability"
+        ],
+        "behavior": {
+          "should_recollect": false,
+          "blind_retry": false,
+          "preserve_context": false,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "capability",
+            "op": "equals",
+            "value": "ensure-kerberos-context"
+          },
+          {
+            "path": "domain",
+            "op": "equals",
+            "value": "sevenkingdoms.local"
+          },
+          {
+            "path": "callback_id",
+            "op": "equals",
+            "value": "apollo-3"
+          }
+        ]
+      },
+      "tags": [
+        "kerberos",
+        "context",
+        "cross-domain"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Ticket-artifact versus live-context distinction."
+      }
+    },
+    {
+      "id": "adcs_certificate_auth_pivot",
+      "pivot": "adcs-certificate-auth",
+      "objective": "Convert verified ADCS material into a live authenticated context for essos.local.",
+      "packet": {
+        "state_summary": "A payload-derived verifier confirmed access to the target CA private key material. The objective domain still lacks a live authenticated context, and no certificate-auth proof has been recorded.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true
+          }
+        ],
+        "credentials": [
+          {
+            "kind": "artifact",
+            "value": "verified CA private key material for essos.local"
+          }
+        ],
+        "graph_summary": "The graph identifies administrator@essos.local as the target identity for the final authority hop.",
+        "recent_tasks": [
+          {
+            "command": "execute_capability",
+            "capability": "adcs-ca-private-key-export",
+            "result": "Verifier confirmed CA private key material from payload-collected artifact."
+          }
+        ],
+        "available_commands": [
+          "execute_capability",
+          "execute_assembly",
+          "powerpick"
+        ],
+        "constraints": [
+          "Certificate material alone is not proof of authenticated domain control.",
+          "All certificate forge and authentication steps must remain payload-task-derived."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "execute"
+        ],
+        "accepted_capabilities": [
+          "adcs-certificate-auth"
+        ],
+        "accepted_targets": [
+          "administrator@essos.local"
+        ],
+        "accepted_commands": [
+          "execute_capability"
+        ],
+        "behavior": {
+          "should_recollect": false,
+          "blind_retry": false,
+          "preserve_context": false,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "capability",
+            "op": "equals",
+            "value": "adcs-certificate-auth"
+          },
+          {
+            "path": "domain",
+            "op": "equals",
+            "value": "essos.local"
+          },
+          {
+            "path": "account",
+            "op": "equals",
+            "value": "administrator"
+          }
+        ]
+      },
+      "tags": [
+        "adcs",
+        "certificate-auth",
+        "objective-domain"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Final certificate-auth pivot after CA material proof."
+      }
+    },
+    {
+      "id": "cross_forest_scope_expansion",
+      "pivot": "scope-expansion",
+      "objective": "Achieve administrative control of essos.local after obtaining new cross-forest authority.",
+      "packet": {
+        "state_summary": "The callback now has a live sevenkingdoms.local authority context and the previous graph ingest only covered the initial forest scope. The objective domain remains unresolved in the graph.",
+        "callbacks": [
+          {
+            "id": "apollo-3",
+            "host": "castelblack.north.sevenkingdoms.local",
+            "identity": "north\\samwell.tarly",
+            "integrity": "high",
+            "alive": true,
+            "kerberos_contexts": [
+              "sevenkingdoms.local"
+            ]
+          }
+        ],
+        "credentials": [
+          {
+            "kind": "authority",
+            "value": "da:sevenkingdoms.local"
+          }
+        ],
+        "graph_summary": "Existing ingest covers north.sevenkingdoms.local only. No BloodHound facts have been ingested yet for essos.local under the new authority epoch.",
+        "recent_tasks": [
+          {
+            "command": "execute_capability",
+            "capability": "ensure-kerberos-context",
+            "result": "Verifier confirmed live sevenkingdoms.local Kerberos context on callback apollo-3."
+          }
+        ],
+        "available_commands": [
+          "execute_assembly",
+          "execute_capability",
+          "dcsync"
+        ],
+        "constraints": [
+          "A new authority epoch can legitimately require one new targeted graph collection.",
+          "Do not guess an objective-domain route before graph evidence exists."
+        ]
+      },
+      "expected": {
+        "accepted_decisions": [
+          "recollect",
+          "execute"
+        ],
+        "accepted_capabilities": [
+          "collect-graph"
+        ],
+        "accepted_targets": [
+          "essos.local"
+        ],
+        "accepted_commands": [
+          "execute_assembly"
+        ],
+        "behavior": {
+          "should_recollect": true,
+          "blind_retry": false,
+          "preserve_context": true,
+          "record_effect": false
+        },
+        "parameter_assertions": [
+          {
+            "path": "assembly_name",
+            "op": "contains",
+            "value": "SharpHound"
+          },
+          {
+            "path": "arguments",
+            "op": "contains",
+            "value": "essos.local"
+          }
+        ]
+      },
+      "tags": [
+        "collection",
+        "scope-expansion",
+        "cross-forest"
+      ],
+      "source": {
+        "kind": "curated-replay",
+        "artifact_ids": [
+          "clean-guided-run"
+        ],
+        "note": "Collect-once-per-authority-epoch case for the objective scope."
+      }
+    }
+  ]
+}

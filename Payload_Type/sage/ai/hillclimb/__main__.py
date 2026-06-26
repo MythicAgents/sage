@@ -1,6 +1,8 @@
-"""CLI for the Sage eval gauge (Phase 0): gate-experiment | report.
+"""CLI for the Sage eval gauge (Phase 0) and additive offline benchmarks.
 
   python -m ai.hillclimb gate-experiment --dry-run        # runnable now; synthetic runner
+  python -m ai.hillclimb decision-benchmark run --dry-run  # no lab or model calls
+  python -m ai.hillclimb operator-replay run --dry-run     # no lab or model calls
   python ai/hillclimb/__main__.py gate-experiment --dry-run
 
 A LIVE gate-experiment needs the GOAD lab (each config run through evals/harness.py, scored by
@@ -17,6 +19,8 @@ from pathlib import Path
 try:  # package import
     from . import gate_experiment as gx
     from . import gate_live
+    from . import decision_benchmark
+    from . import operator_replay_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
     from .range_state import Milestone
@@ -24,6 +28,8 @@ except Exception:  # script / sys.path import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import gate_experiment as gx  # type: ignore
     import gate_live  # type: ignore
+    import decision_benchmark  # type: ignore
+    import operator_replay_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
     from range_state import Milestone  # type: ignore
@@ -164,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
     nf.add_argument("--n", type=int, default=None, help="use only the last N recorded runs (default: all)")
     nf.add_argument("--results", default=None, help="path to bare_vs_harness.jsonl (default: .hillclimb/results/)")
     nf.set_defaults(func=_cmd_noise_floor)
+
+    decision_benchmark.add_cli(sub)
+    operator_replay_benchmark.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

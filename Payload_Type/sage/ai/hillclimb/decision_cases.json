@@ -1,0 +1,521 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "gpo_delayed_effect_wait",
+      "category": "failure_repair",
+      "objective": "Escalate from the current foothold to verified directory administrative control.",
+      "state": "A controlled GPO write completed. The graph already exposes a viable route. No SYSTEM proof, membership change, or other verified effect has been recorded yet.",
+      "observation": "[SAGE RESULT] GPO setup pending: artifact write and version bump succeeded. This is not SYSTEM execution proof. Wait for Group Policy to apply before proof.",
+      "available_actions": [
+        "Wait and poll for verifier proof of the delayed policy effect.",
+        "Retry the same GPO write immediately.",
+        "Run another graph collection.",
+        "Stop and surface a blocker."
+      ],
+      "candidate_failure_labels": [
+        "delayed_effect",
+        "wrong_security_context",
+        "missing_artifact",
+        "transient_infra"
+      ],
+      "candidate_repairs": [
+        "bounded_poll_wait_for_verifier",
+        "establish_required_execution_context",
+        "materialize_or_stage_missing_artifact",
+        "refresh_liveness_and_retry_once"
+      ],
+      "candidate_next_actions": [
+        "wait_for_verifier",
+        "retry_after_repair",
+        "recollect_graph",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "delayed_effect",
+        "repair_kind": "bounded_poll_wait_for_verifier",
+        "next_action": "wait_for_verifier",
+        "should_recollect": false
+      },
+      "tags": [
+        "gpo",
+        "delayed-effect",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from the repeated GPO setup-without-proof failure class seen in clean GOAD runs."
+    },
+    {
+      "id": "dcsync_ambiguous_principal",
+      "category": "failure_repair",
+      "objective": "Use verified replication rights to obtain the target account secret material.",
+      "state": "Replication rights are already verified for the target domain. The last command used an unqualified account name and no secret material was recorded.",
+      "observation": "ERROR kull_m_rpc_drsr_CrackName ; CrackNames (name status): 0x00000003 (3) - ERROR_NOT_UNIQUE",
+      "available_actions": [
+        "Retry once with a target-domain qualified principal.",
+        "Collect BloodHound again.",
+        "Wait for a delayed effect.",
+        "Stop without attempting a repair."
+      ],
+      "candidate_failure_labels": [
+        "ambiguous_account_name",
+        "dcsync_bad_dn_or_context",
+        "access_denied",
+        "repeated_no_progress"
+      ],
+      "candidate_repairs": [
+        "qualify_principal_with_target_netbios",
+        "rebuild_dcsync_target_and_materialize_context",
+        "verify_privilege_or_security_context",
+        "stop_replanning_and_surface_blocker"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "ambiguous_account_name",
+        "repair_kind": "qualify_principal_with_target_netbios",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "dcsync",
+        "principal-resolution",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from live ERROR_NOT_UNIQUE DCSync failures and the normalized repair policy."
+    },
+    {
+      "id": "dcsync_bad_dn_context",
+      "category": "failure_repair",
+      "objective": "Obtain verified krbtgt secret material from the current domain.",
+      "state": "The route is already known and the relevant authority effect exists, but the last DCSync command may have used the wrong domain, DC, or execution context.",
+      "observation": "ERROR kuhl_m_lsadump_dcsync ; GetNCChanges: 0x000020f7 (8439) DS_DRA_BAD_DN",
+      "available_actions": [
+        "Rebuild the DCSync target and prove the required execution context before retrying.",
+        "Blind-retry the same command.",
+        "Run another graph collection.",
+        "Treat the route as complete."
+      ],
+      "candidate_failure_labels": [
+        "dcsync_bad_dn_or_context",
+        "ambiguous_account_name",
+        "access_denied",
+        "transient_infra"
+      ],
+      "candidate_repairs": [
+        "rebuild_dcsync_target_and_materialize_context",
+        "qualify_principal_with_target_netbios",
+        "verify_privilege_or_security_context",
+        "refresh_liveness_and_retry_once"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "dcsync_bad_dn_or_context",
+        "repair_kind": "rebuild_dcsync_target_and_materialize_context",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "dcsync",
+        "context",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from live DS_DRA_BAD_DN failures during cross-domain DCSync work."
+    },
+    {
+      "id": "kerberos_context_missing",
+      "category": "failure_repair",
+      "objective": "Use an existing cross-domain access path without losing the required Kerberos context.",
+      "state": "The required ticket material exists in the operation, but the callback command ran in a logon session that does not hold it.",
+      "observation": "No tickets in current context. Access to the requested domain resource was not proven.",
+      "available_actions": [
+        "Materialize or switch into the required Kerberos context, then retry.",
+        "Collect the graph again.",
+        "Assume access is already proven.",
+        "Stop immediately."
+      ],
+      "candidate_failure_labels": [
+        "wrong_security_context",
+        "missing_artifact",
+        "transient_infra",
+        "repeated_no_progress"
+      ],
+      "candidate_repairs": [
+        "establish_required_execution_context",
+        "materialize_or_stage_missing_artifact",
+        "refresh_liveness_and_retry_once",
+        "stop_replanning_and_surface_blocker"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "wrong_security_context",
+        "repair_kind": "establish_required_execution_context",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "kerberos",
+        "execution-context",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from repeated no-ticket-in-current-context failures in the trust-walk path."
+    },
+    {
+      "id": "payload_schema_mismatch",
+      "category": "failure_repair",
+      "objective": "Execute the already-selected capability through the live payload schema.",
+      "state": "The capability choice is still valid, but the command failed before execution because the generated parameters did not match the payload command schema.",
+      "observation": "Supplied Arguments do not match any parameter group. Required parameter missing for the selected command.",
+      "available_actions": [
+        "Rebuild parameters from the live payload schema and retry once.",
+        "Collect graph data again.",
+        "Wait for a delayed verifier.",
+        "Treat the capability as achieved."
+      ],
+      "candidate_failure_labels": [
+        "schema_or_argument_mismatch",
+        "missing_artifact",
+        "transient_infra",
+        "verifier_false_positive"
+      ],
+      "candidate_repairs": [
+        "rebuild_with_payload_schema",
+        "materialize_or_stage_missing_artifact",
+        "refresh_liveness_and_retry_once",
+        "invalidate_effect_and_require_probe"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "schema_or_argument_mismatch",
+        "repair_kind": "rebuild_with_payload_schema",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "schema",
+        "builder",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from live payload command argument mismatches that should repair at the builder seam."
+    },
+    {
+      "id": "gpo_identity_unresolved",
+      "category": "failure_repair",
+      "objective": "Use a controlled GPO only after resolving its exact policy identity.",
+      "state": "A controlled GPO display name is known from graph facts, but the write adapter has not resolved the exact policy GUID needed for the filesystem-backed operation.",
+      "observation": "GPO identity unresolved: could not resolve GPO 'controlled-policy' in the target domain. GPO not found in SYSVOL policy root.",
+      "available_actions": [
+        "Resolve the exact GPO GUID and retry once.",
+        "Retry the same unresolved write.",
+        "Collect graph data again.",
+        "Treat the missing proof as success."
+      ],
+      "candidate_failure_labels": [
+        "unresolved_gpo_identity",
+        "delayed_effect",
+        "missing_artifact",
+        "verifier_false_positive"
+      ],
+      "candidate_repairs": [
+        "resolve_gpo_guid_then_retry",
+        "bounded_poll_wait_for_verifier",
+        "materialize_or_stage_missing_artifact",
+        "invalidate_effect_and_require_probe"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "unresolved_gpo_identity",
+        "repair_kind": "resolve_gpo_guid_then_retry",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "gpo",
+        "identity-resolution",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from the exact-GPO-identity failure class isolated in recent focused probes."
+    },
+    {
+      "id": "builder_template_bug_stop",
+      "category": "failure_repair",
+      "objective": "Avoid looping on a deterministic command construction defect.",
+      "state": "The same deterministic builder would emit the same malformed command if retried. No environment change can make the current command valid.",
+      "observation": "The specified wildcard character pattern is not valid. The generated command template failed before the target-side operation ran.",
+      "available_actions": [
+        "Stop and surface a deterministic builder defect.",
+        "Retry the same command.",
+        "Collect graph data again.",
+        "Wait for a delayed effect."
+      ],
+      "candidate_failure_labels": [
+        "command_template_error",
+        "delayed_effect",
+        "schema_or_argument_mismatch",
+        "transient_infra"
+      ],
+      "candidate_repairs": [
+        "fix_deterministic_builder_template",
+        "bounded_poll_wait_for_verifier",
+        "rebuild_with_payload_schema",
+        "refresh_liveness_and_retry_once"
+      ],
+      "candidate_next_actions": [
+        "stop_and_surface_blocker",
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier"
+      ],
+      "expected": {
+        "failure_label": "command_template_error",
+        "repair_kind": "fix_deterministic_builder_template",
+        "next_action": "stop_and_surface_blocker",
+        "should_recollect": false
+      },
+      "tags": [
+        "builder",
+        "terminal",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from the malformed wildcard-template defect found in the GPO adapter path."
+    },
+    {
+      "id": "callback_timeout_retry_once",
+      "category": "failure_repair",
+      "objective": "Distinguish a transient callback problem from a route or graph problem.",
+      "state": "The selected capability remains valid and the callback was recently alive. No evidence shows the graph or route changed.",
+      "observation": "No output returned before timeout. Callback liveness is uncertain after a temporary connection reset.",
+      "available_actions": [
+        "Refresh liveness and retry once if the callback is healthy.",
+        "Collect the graph again.",
+        "Mark the capability achieved.",
+        "Blind-retry indefinitely."
+      ],
+      "candidate_failure_labels": [
+        "transient_infra",
+        "wrong_security_context",
+        "missing_artifact",
+        "repeated_no_progress"
+      ],
+      "candidate_repairs": [
+        "refresh_liveness_and_retry_once",
+        "establish_required_execution_context",
+        "materialize_or_stage_missing_artifact",
+        "stop_replanning_and_surface_blocker"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "transient_infra",
+        "repair_kind": "refresh_liveness_and_retry_once",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "infra",
+        "liveness",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from callback timing failures that should not trigger strategic replanning."
+    },
+    {
+      "id": "retryable_adcs_failure_no_recollect",
+      "category": "control_decision",
+      "objective": "Complete certificate authentication after verified CA private-key export.",
+      "state": "The objective-domain graph is already collected. The latest certificate-auth capability failed with terminal_failure=false because the generated domain-controller endpoint violated the command input contract. The verified CA private-key effect remains achieved.",
+      "observation": "Invalid parameters: generated /dc endpoint pointed at a member server instead of a domain controller. Repair the current capability before any scope expansion.",
+      "available_actions": [
+        "Repair the current certificate-auth command and retry.",
+        "Issue another SharpHound collection.",
+        "Wait for a delayed policy effect.",
+        "Stop and discard the verified CA private-key effect."
+      ],
+      "candidate_failure_labels": [
+        "schema_or_argument_mismatch",
+        "objective_or_state_drift",
+        "transient_infra",
+        "repeated_no_progress"
+      ],
+      "candidate_repairs": [
+        "rebuild_with_payload_schema",
+        "reconcile_objective_and_live_state",
+        "refresh_liveness_and_retry_once",
+        "stop_replanning_and_surface_blocker"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "schema_or_argument_mismatch",
+        "repair_kind": "rebuild_with_payload_schema",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "adcs",
+        "retry-vs-recollect",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from the clean-run ADCS failure that incorrectly caused later scope expansion."
+    },
+    {
+      "id": "objective_scope_expansion_collect",
+      "category": "control_decision",
+      "objective": "Reach administrative control of an externally trusted objective domain.",
+      "state": "The current forest graph is verified. The frontier is empty. A trust edge exposes the objective domain, but no verified graph collection exists for that objective scope. There is no latest retryable capability failure.",
+      "observation": "No admissible capability action is available from the current graph. The objective domain is trusted and uncollected.",
+      "available_actions": [
+        "Collect the objective scope once to reveal new grounded actions.",
+        "Retry a nonexistent failed capability.",
+        "Wait for a delayed verifier.",
+        "Stop and claim the objective is impossible."
+      ],
+      "candidate_failure_labels": [
+        null,
+        "objective_or_state_drift",
+        "repeated_no_progress",
+        "transient_infra"
+      ],
+      "candidate_repairs": [
+        null,
+        "reconcile_objective_and_live_state",
+        "stop_replanning_and_surface_blocker",
+        "refresh_liveness_and_retry_once"
+      ],
+      "candidate_next_actions": [
+        "recollect_graph",
+        "retry_after_repair",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": null,
+        "repair_kind": null,
+        "next_action": "recollect_graph",
+        "should_recollect": true
+      },
+      "tags": [
+        "scope-expansion",
+        "retry-vs-recollect",
+        "recollect"
+      ],
+      "source_note": "Derived from the legitimate objective-scope expansion used by the strict unguided solve."
+    },
+    {
+      "id": "access_denied_no_blind_retry",
+      "category": "failure_repair",
+      "objective": "Avoid treating denied directory operations as transient success paths.",
+      "state": "The requested operation needs privilege or security-context proof that is not currently present. The last command reached the target and was denied.",
+      "observation": "GetNCChanges: 0x000020f5 (8453) DS_DRA_ACCESS_DENIED. No verified replication-rights effect exists.",
+      "available_actions": [
+        "Verify privilege or execution context before attempting another capability.",
+        "Blind-retry the same denied operation.",
+        "Collect graph data again.",
+        "Record the effect as achieved."
+      ],
+      "candidate_failure_labels": [
+        "access_denied",
+        "transient_infra",
+        "delayed_effect",
+        "verifier_false_positive"
+      ],
+      "candidate_repairs": [
+        "verify_privilege_or_security_context",
+        "refresh_liveness_and_retry_once",
+        "bounded_poll_wait_for_verifier",
+        "invalidate_effect_and_require_probe"
+      ],
+      "candidate_next_actions": [
+        "stop_and_surface_blocker",
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier"
+      ],
+      "expected": {
+        "failure_label": "access_denied",
+        "repair_kind": "verify_privilege_or_security_context",
+        "next_action": "stop_and_surface_blocker",
+        "should_recollect": false
+      },
+      "tags": [
+        "dcsync",
+        "privilege",
+        "terminal"
+      ],
+      "source_note": "Derived from real denied DCSync attempts where a blind retry would be misleading."
+    },
+    {
+      "id": "tool_registration_repair",
+      "category": "failure_repair",
+      "objective": "Execute a capability only after the required payload tool is present.",
+      "state": "The capability is still valid, but the payload does not currently have the required assembly registered.",
+      "observation": "Assembly has not been uploaded or registered. No file is registered for the requested tool.",
+      "available_actions": [
+        "Register or upload the required tool, then retry once.",
+        "Collect graph data again.",
+        "Wait for a delayed verifier.",
+        "Treat the missing tool as an environment success."
+      ],
+      "candidate_failure_labels": [
+        "tool_not_registered",
+        "missing_artifact",
+        "transient_infra",
+        "schema_or_argument_mismatch"
+      ],
+      "candidate_repairs": [
+        "register_tool_then_retry",
+        "materialize_or_stage_missing_artifact",
+        "refresh_liveness_and_retry_once",
+        "rebuild_with_payload_schema"
+      ],
+      "candidate_next_actions": [
+        "retry_after_repair",
+        "recollect_graph",
+        "wait_for_verifier",
+        "stop_and_surface_blocker"
+      ],
+      "expected": {
+        "failure_label": "tool_not_registered",
+        "repair_kind": "register_tool_then_retry",
+        "next_action": "retry_after_repair",
+        "should_recollect": false
+      },
+      "tags": [
+        "tooling",
+        "artifact",
+        "avoid-recollect"
+      ],
+      "source_note": "Derived from tool staging failures that should repair mechanically rather than replan."
+    }
+  ]
+}
