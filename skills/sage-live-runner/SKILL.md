@@ -1,6 +1,6 @@
 ---
 name: sage-live-runner
-description: Repo-local Sage live run, tasking, monitoring, and inspection workflow. Use when Codex, Claude Code, or an operator needs to issue verbose Sage query/chat/state tasks, run a guided GOAD solve, inspect decoded output, monitor a solve, resume a run, or restart the Sage process without writing helper tools into Plans.
+description: Repo-local Sage live run, tasking, monitoring, and inspection workflow. Use when Codex, Claude Code, or an operator needs to issue verbose Sage query/chat/state tasks, run guided or strict unguided GOAD solves, inspect decoded output, monitor a solve, resume a run, or restart the Sage process without writing helper tools into Plans.
 ---
 
 # Sage Live Runner
@@ -25,6 +25,17 @@ Run guided GOAD solve:
 `--auto-callbacks` selects the latest live Sage callback and the latest live Apollo callback on CASTELBLACK as
 samwell.tarly, then renders the guided prompt with those live IDs. Use `--sage-cb` or `--apollo-cb` only when
 intentionally overriding discovery.
+
+Run strict unguided one-prompt GOAD solve:
+
+```bash
+.venv/bin/python skills/sage-live-runner/scripts/run_unguided_essos_da.py
+```
+
+The strict runner auto-discovers the latest taskable Sage callback and latest live Apollo callback on CASTELBLACK
+as samwell.tarly, then issues exactly one Sage `query` with the fixed objective-only prompt. It never issues a
+pre-query `state` task and does not inject guided route facts or typed route hints. Use `--sage-cb` or
+`--apollo-cb` only when intentionally overriding discovery.
 
 Show engagement state:
 
@@ -57,6 +68,7 @@ Inspect a solve:
 - `restart_sage_process.py`
 - `run_asis.py`
 - `run_essos_da.py`
+- `run_unguided_essos_da.py`
 - `run_golden.py`
 - `run_resume.py`
 - `run_resume2.py`
