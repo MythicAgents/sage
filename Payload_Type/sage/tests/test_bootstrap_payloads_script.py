@@ -158,6 +158,16 @@ def test_apollo_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
     assert args.download_dir == "/payloads"
 
 
+def test_apollo_arg_default_filename_is_apollo_exe(monkeypatch):
+    monkeypatch.delenv("APOLLO_FILENAME", raising=False)
+    parser = argparse.ArgumentParser()
+
+    bootstrap_payloads.add_apollo_args(parser)
+    args = parser.parse_args([])
+
+    assert args.apollo_filename == "apollo.exe"
+
+
 def test_callback_config_export_document_round_trips_with_owner_only_permissions(tmp_path):
     path = tmp_path / "apollo_callback_config.json"
 
@@ -237,7 +247,7 @@ def test_import_callback_config_passes_jsonb_object(monkeypatch):
     assert "$config: jsonb!" in observed["query"]
 
 
-def test_bootstrap_reset_imports_baked_apollo_without_creating_payload(
+def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     monkeypatch,
     tmp_path,
     capsys,
@@ -263,6 +273,10 @@ def test_bootstrap_reset_imports_baked_apollo_without_creating_payload(
     async def fail_create_apollo(client, args):
         raise AssertionError("Apollo payload creation must be skipped")
 
+    async def fake_preflight(client, *, timeout_seconds, max_skew_seconds):
+        calls.append(("preflight", timeout_seconds, max_skew_seconds))
+        return {"ready": True}
+
     async def fake_query(client, query, variables=None):
         return {"callback": []}
 
@@ -270,12 +284,16 @@ def test_bootstrap_reset_imports_baked_apollo_without_creating_payload(
     monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
     monkeypatch.setattr(bootstrap_payloads, "create_sage", fake_create_sage)
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fail_create_apollo)
+    monkeypatch.setattr(bootstrap_payloads, "post_callback_preflight", fake_preflight)
     monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
 
     asyncio.run(
         bootstrap_payloads.command_bootstrap_reset(
             argparse.Namespace(
                 callback_config=str(config_path),
+                use_baked_apollo=True,
+                post_callback_timeout=180,
+                max_clock_skew_seconds=60.0,
             )
         )
     )
@@ -284,16 +302,23 @@ def test_bootstrap_reset_imports_baked_apollo_without_creating_payload(
     assert calls == [
         ("sage", None),
         ("import", {"uuid": "payload-uuid", "key": "secret"}),
+        ("preflight", 180, 60.0),
     ]
-    assert output["mode"] == "imported-baked-apollo"
+    assert output["mode"] == "legacy-imported-baked-apollo"
+    assert output["post_callback_preflight"]["ready"] is True
     assert "apollo" not in output
 
 
-def test_bootstrap_reset_falls_back_to_fresh_apollo_when_config_is_missing(
+def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_config_exists(
     monkeypatch,
     tmp_path,
     capsys,
 ):
+    config_path = tmp_path / "apollo_callback_config.json"
+    config_path.write_text(
+        json.dumps({"config": {"uuid": "payload-uuid", "key": "secret"}}),
+        encoding="utf-8",
+    )
     calls = []
 
     async def fake_login(args):
@@ -311,6 +336,9 @@ def test_bootstrap_reset_falls_back_to_fresh_apollo_when_config_is_missing(
         calls.append(("sage", None))
         return {"build_phase": "success", "uuid": "sage-uuid"}
 
+    async def fail_import(client, config):
+        raise AssertionError("Baked Apollo import must be opt-in")
+
     async def fake_query(client, query, variables=None):
         return {"callback": []}
 
@@ -318,12 +346,14 @@ def test_bootstrap_reset_falls_back_to_fresh_apollo_when_config_is_missing(
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fake_create_apollo)
     monkeypatch.setattr(bootstrap_payloads, "maybe_download_payload", fake_download)
     monkeypatch.setattr(bootstrap_payloads, "create_sage", fake_create_sage)
+    monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fail_import)
     monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
 
     asyncio.run(
         bootstrap_payloads.command_bootstrap_reset(
             argparse.Namespace(
-                callback_config=str(tmp_path / "missing.json"),
+                callback_config=str(config_path),
+                use_baked_apollo=False,
                 download_dir="/payloads",
             )
         )
@@ -335,8 +365,10 @@ def test_bootstrap_reset_falls_back_to_fresh_apollo_when_config_is_missing(
         ("apollo", None),
         ("download", "/payloads"),
     ]
-    assert output["mode"] == "fresh-apollo-fallback"
+    assert output["mode"] == "fresh-interactive-apollo"
     assert output["apollo"]["uuid"] == "apollo-uuid"
+    assert output["apollo_bootstrap"]["method"] == "interactive-rdp-scheduled-task"
+    assert output["apollo_bootstrap"]["payload_uuid"] == "apollo-uuid"
 
 
 def test_sage_task_password_resolver_prefers_environment(monkeypatch, tmp_path):

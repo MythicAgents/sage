@@ -4,7 +4,7 @@
     <img src="Sage.png">
 </p>
 
-Sage is a virtual Mythic agent that that uses an AI agentic system to operate Mythic and Mythic agents running on compromised hosts. Sage does not run on a compromised host, it runs entirely in the Sage container. Sage leverages external AI model providers (e.g., Anthropic, Ollama, OpenAI) for inference and requires API keys for the selected provider.
+Sage is a virtual Mythic agent that that uses an AI agentic system to operate Mythic and Mythic agents running on compromised hosts. Sage does not run on a compromised host, it runs entirely in the Sage container. Sage is control-plane only: target-facing actions and proof must flow through Mythic tasks executed by payload callbacks, never direct Sage-container access to target hosts or services. Sage leverages external AI model providers (e.g., Anthropic, Ollama, OpenAI) for inference and requires API keys for the selected provider.
 
 **WARNING: DO NOT USE THIS IN A PRODUCTION ENVIRONMENT BECAUSE THERE ARE CURRENTLY NO CONTROLS OR HUMAN-IN-LOOP FOR COMMANDS ISSUED TO MYTHIC AGENTS**
 

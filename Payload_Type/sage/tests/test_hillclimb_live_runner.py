@@ -8,9 +8,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
+import engagement_ledger  # noqa: E402
 import live_runner as lr  # noqa: E402
 import gate_experiment as gx  # noqa: E402
+from range_state import Milestone  # noqa: E402
 from scenarios import goad_scenarios  # noqa: E402
 
 
@@ -63,6 +66,63 @@ def test_run_batch_builds_one_scorecard_per_seed(monkeypatch, tmp_path):
     assert len(cards) == 3
     assert [round(c.substring_score, 2) for c in cards] == [0.8, 0.6, 0.9]
     assert all(c.verifier_hash.startswith("sha256:") for c in cards)
+
+
+def test_run_batch_enables_live_probe_execution(monkeypatch, tmp_path):
+    _hermetic(monkeypatch, tmp_path)
+    scn = goad_scenarios("Op")[0]
+    events = []
+
+    def fake(argv, env, out):
+        events.append("invoke")
+        return _synthetic_report("single-hop-system", [0.8])
+
+    seen = []
+
+    def build_scorecard(rec, scenario, **kwargs):
+        events.append("score")
+        seen.append(kwargs["run_live_probes"])
+        return gx.synthetic_runner({"x": {"substring": 0.1, "furthest": Milestone.FOOTHOLD}})("x", scenario, 0)
+
+    def capture(_scenario, _token):
+        events.append("capture")
+        return {"GRAPH_COLLECTED": False}
+
+    monkeypatch.setattr(lr, "build_scorecard_from_run", build_scorecard)
+    runner = lr.LiveRunner(sage_cb=13, out_dir=str(tmp_path), invoke=fake, capture_probes_fn=capture)
+    runner.run_batch(lr.LiveConfig("prod"), scn, seeds=1)
+    assert seen == [True]
+    assert events == ["invoke", "capture", "score"]
+
+
+def test_run_batch_capture_persists_ground_truth_probes_by_engagement_id(monkeypatch, tmp_path):
+    _hermetic(monkeypatch, tmp_path)
+    scn = next(s for s in goad_scenarios("Op") if s.name == "child-da")
+    fake = lambda argv, env, out: _synthetic_report("child-da", [0.8])
+    tokens = []
+
+    def capture(_scenario, token):
+        tokens.append(token)
+        return lr._persist_ground_truth_probe_results(
+            token,
+            {
+                Milestone.FOOTHOLD: False,
+                Milestone.DA_CHILD: True,
+                Milestone.KRBTGT_DUMPED: False,
+            },
+            recorded_milestones={Milestone.DA_CHILD, Milestone.KRBTGT_DUMPED},
+        )
+
+    runner = lr.LiveRunner(sage_cb=13, out_dir=str(tmp_path), invoke=fake, capture_probes_fn=capture)
+    runner.run_batch(lr.LiveConfig("prod"), scn, seeds=1)
+
+    assert len(tokens) == 1
+    data = engagement_ledger.load(tokens[0])
+    assert data["ground_truth_probes"]["DA_CHILD"] is True
+    assert data["ground_truth_probes"]["KRBTGT_DUMPED"] is False
+    assert "FOOTHOLD" not in data["ground_truth_probes"]
+    assert data["ground_truth_probes"]["_source"] == "probe"
+    assert isinstance(data["ground_truth_probes"]["_captured_at"], str)
 
 
 def test_as_run_fn_memoizes_one_batch_per_config_scenario(monkeypatch, tmp_path):

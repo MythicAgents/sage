@@ -1,0 +1,447 @@
+"""Deterministic autonomous controller (control-state reprioritization, P0).
+
+THE PROBLEM (Plans/SAGE_AUTONOMOUS_CONTROLLER_DESIGN_2026-06-22.md): autonomous control is diffuse —
+selection / sequencing / polling / termination are owned by the Supervisor+worker LLMs negotiating in text.
+Locally-correct components form globally-incorrect loops (the `1116` 461K-token redelegation tail; the latest
+canary's poll/ingest/recon wander). The execution substrate is deterministic and guided-proven, and the
+precondition/effect model is already declared (`capabilities.actions_from_state` returns a priority-ordered
+admissible frontier — Spike 0 confirmed it reproduces a full proven attack chain's critical path at rank 0).
+
+THE FIX: a deterministic controller OWNS the cycle
+
+    observe -> collect-once-if-needed -> compute frontier -> select one admissible action
+            -> execute -> verify -> update state -> decide(continue|route|stop)
+
+and demotes the LLM to a BOUNDED advisor: it ranks among already-admissible, precondition-checked actions on a
+priority tie, and proposes a candidate only when the deterministic frontier is EMPTY (route discovery). The LLM
+never owns scheduling, polling, repeat-policy, or termination.
+
+WHY THE `1116` LOOP BECOMES STRUCTURALLY IMPOSSIBLE: the controller selects ONLY from the precondition-checked
+frontier, so it cannot select `adcs-certificate-auth` before `adcs-ca-private-key` exists — it picks the
+prerequisite export first. The `worker_outcome` loop-breaker is the backstop: the same blocker at the same
+progress epoch -> STOP, never a 48x redelegation.
+
+This module is dependency-light and OFFLINE-TESTABLE: every side-effecting boundary (observe / execute /
+collect / objective-check / token+clock budget / LLM tie-rank / LLM route-discovery) is an INJECTED callable
+(sync or async). The runtime wiring (a later step) supplies the real seams; the core loop logic is unit-tested
+with fakes here. Per the C2 retro lesson the wiring step must still PROVE the real seam fires at runtime — unit
+tests on fakes are necessary, not sufficient.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+try:
+    from . import capabilities as cap
+    from . import worker_outcome as wo
+except ImportError:  # flat-import runtimes (mirrors the codebase's relative-then-flat pattern)
+    import capabilities as cap
+    import worker_outcome as wo
+
+
+# NOTE: progress/milestone "wall checkpoints" are deliberately NOT defined here. They are scenario-specific
+# (GOAD route literals etc.) and belong in the eval layer, never in the generic Sage runtime. The controller
+# emits RAW achieved effects (ControllerResult.achieved_effects + per-cycle new_effects); the eval/hillclimb
+# layer maps those to scenario walls (see ai/hillclimb/wall_checkpoints.py). Keep ai/langgraph/ range-agnostic.
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Config / result types
+# ---------------------------------------------------------------------------------------------------------
+@dataclass
+class ControllerConfig:
+    """Hard runtime stop-losses. The point is that a run NEVER 2-hour-timeouts: it halts cleanly with a
+    precise blocker. Every ceiling is enforced in the loop, not aspirational."""
+    max_cycles: int = 60                 # absolute backstop on loop iterations
+    max_no_effect_cycles: int = 4        # consecutive verified-no-new-effect cycles -> halt
+    token_budget: int = 3_000_000        # cumulative output/observed tokens -> halt
+    wall_clock_budget_s: float = 2700.0  # 45 min -> halt
+    max_collections: int | None = None   # optional emergency global cap; policy is per-request, not global
+    max_collection_attempts_per_request: int = 2  # retry one failed request once, then halt diagnostically
+    seam_timeout_s: float | None = None  # per-seam await deadline (None in tests; runtime sets it so a hung
+                                         # observe/execute/collect halts cleanly instead of a 2-hour timeout)
+
+
+# Halt status taxonomy — every terminal state is diagnostic.
+STATUS_COMPLETE = "complete"                  # objective achieved
+STATUS_BLOCKED = "halted_blocked"             # same blocker recurred at same state (loop-breaker STOP)
+STATUS_NO_ACTION = "halted_no_action"         # empty frontier, no collection/route-discovery move
+STATUS_NO_PROGRESS = "halted_no_progress"     # max_no_effect_cycles with no new effect
+STATUS_BUDGET = "halted_budget"               # token or wall-clock budget exhausted
+STATUS_MAX_CYCLES = "halted_max_cycles"       # absolute cycle backstop
+STATUS_ABORTED = "halted_aborted"             # operator stop requested between cycles (cooperative kill switch)
+
+
+@dataclass
+class CycleRecord:
+    cycle: int
+    phase: str            # 'collect' | 'execute' | 'route_discovery'
+    action: str = ""
+    target: str = ""
+    ok: bool = False
+    new_effects: list[str] = field(default_factory=list)
+    note: str = ""
+
+
+@dataclass
+class ControllerResult:
+    status: str
+    reason: str
+    blocker: dict | None
+    cycle_count: int
+    cycles: list[CycleRecord]
+    achieved_effects: list[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "blocker": self.blocker,
+            "cycle_count": self.cycle_count,
+            "achieved_effects": self.achieved_effects,
+            "cycles": [vars(c) for c in self.cycles],
+        }
+
+
+def _parse_result(value: Any) -> dict:
+    """Coerce a capability/collection result into a dict, FAIL-CLOSED. The real `execute_capability` returns a
+    JSON *string* (`-> str`), not a dict — so a naive `isinstance(dict)` check would treat every live result
+    (success AND failure) as non-dict. A malformed / None / unparseable result must become a BLOCKER, never a
+    silent success (the inverse would convert live failures into successes — the `1116`-class landmine)."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {"ok": False, "reason": f"unparseable capability result: {value[:160]}"}
+    return {"ok": False, "reason": f"non-dict capability result of type {type(value).__name__}"}
+
+
+def _action_effects(action: Any) -> set[str]:
+    return {cap._canonical_effect(e) for e in (getattr(action, "effects", None) or []) if e}
+
+
+def _tie_cluster(frontier: list[Any]) -> list[Any]:
+    """The set of top-priority actions (a genuine selection tie the LLM may rank). Same priority value as the
+    rank-0 action; the deterministic order already put them first."""
+    if not frontier:
+        return []
+    top = cap._capability_action_priority(frontier[0])
+    return [a for a in frontier if cap._capability_action_priority(a) == top]
+
+
+def _collection_request_key(value: Any) -> str:
+    """Best-effort stable key for one requested collection reason/scope.
+
+    Runtime wiring returns a `_ControllerCollectionRequest`; unit fakes often return `True`. Anonymous requests
+    still get a retry budget, but real requests are isolated so one failed scope cannot consume another scope's
+    allowance."""
+    if isinstance(value, dict):
+        key = value.get("collection_key") or value.get("request_key")
+        return str(key or "").strip()
+    key = getattr(value, "collection_key", "")
+    return str(key or "").strip()
+
+
+class AutonomousController:
+    """Owns the deterministic autonomous control loop. All boundaries are injected callables.
+
+    Required seams:
+      observe()            -> EngagementState     (rebuild current state; runtime: Model._build_current_engagement_state)
+      execute(action)      -> dict result         (runtime: mythic_client.execute_capability; result has 'ok', maybe 'reason'/'run_first')
+
+    Optional seams (default to safe no-ops):
+      objective_met(state) -> bool                (completion recognition; default: never)
+      needs_collection(state) -> request|bool    (truthy request when a fresh collection would help; default: never)
+      collect(state)       -> dict               (run collection once; idempotent)
+      rank_ties(actions)   -> action             (bounded LLM rank among admissible ties; default: first)
+      route_discovery(state) -> action|None      (bounded LLM candidate when frontier EMPTY; default: None)
+      tokens_spent()       -> int                (cumulative tokens; default: 0)
+      clock()              -> float               (monotonic seconds; default: 0.0)
+    """
+
+    def __init__(self, *, observe: Callable[[], Any], execute: Callable[[Any], Any],
+                 objective_met: Callable[[Any], Any] | None = None,
+                 needs_collection: Callable[[Any], Any] | None = None,
+                 collect: Callable[[Any], Any] | None = None,
+                 rank_ties: Callable[[list[Any]], Any] | None = None,
+                 route_discovery: Callable[[Any], Any] | None = None,
+                 tokens_spent: Callable[[], int] | None = None,
+                 clock: Callable[[], float] | None = None,
+                 should_abort: Callable[[], bool] | None = None,
+                 frontier_fn: Callable[[Any], list[Any]] | None = None,
+                 config: ControllerConfig | None = None,
+                 logger: Callable[[str], None] | None = None):
+        self._observe = observe
+        self._execute = execute
+        self._objective_met = objective_met
+        self._needs_collection = needs_collection
+        self._collect = collect
+        self._rank_ties = rank_ties
+        self._route_discovery = route_discovery
+        self._tokens_spent = tokens_spent
+        self._clock = clock
+        self._should_abort = should_abort
+        self._frontier_fn = frontier_fn or cap.actions_from_state
+        self.config = config or ControllerConfig()
+        self._log = logger or (lambda _m: None)
+        self._loop = wo.LoopBreakerState()
+        self._collections = 0
+        self._collection_attempts: dict[str, int] = {}
+        self._no_effect = 0
+
+    def _achieved(self, state: Any) -> set[str]:
+        """Canonical achieved-effect set, normalized with the SAME fn the frontier uses (cap._canonical_effect)
+        so the controller's progress diff agrees with the frontier's notion of 'already achieved'."""
+        return {cap._canonical_effect(e) for e in (state.achieved_effects() or [])}
+
+    async def _seam(self, thunk: Callable[[], Any], name: str) -> tuple[str, Any]:
+        """Call an injected seam (sync or async) with exception->diagnostic and an optional per-seam deadline.
+        Returns (status, value): status is 'ok' | 'timeout' | 'error'. This is what makes the 'NEVER a 2-hour
+        timeout, always a clean halt' promise true even when a live seam hangs or raises."""
+        try:
+            value = thunk()
+            if inspect.isawaitable(value):
+                if self.config.seam_timeout_s:
+                    value = await asyncio.wait_for(value, self.config.seam_timeout_s)
+                else:
+                    value = await value
+            return ("ok", value)
+        except asyncio.TimeoutError:
+            return ("timeout", f"{name} exceeded seam_timeout_s={self.config.seam_timeout_s}")
+        except Exception as e:  # a live observe/execute WILL occasionally throw; convert, don't crash the loop
+            return ("error", f"{name} raised {type(e).__name__}: {e}")
+
+    async def _budget_exceeded(self) -> str:
+        # FAIL CLOSED: budgets are the last-resort guard against a runaway run, so a meter that errors/times out
+        # halts the run rather than silently disabling the ceiling (Forge NEW-5).
+        if self._tokens_spent is not None:
+            st, v = await self._seam(lambda: self._tokens_spent(), "tokens_spent")
+            if st != "ok":
+                return f"token meter unavailable ({st}); failing closed"
+            if int(v) >= self.config.token_budget:
+                return "token budget exhausted"
+        if self._clock is not None:
+            st, v = await self._seam(lambda: self._clock(), "clock")
+            if st != "ok":
+                return f"clock unavailable ({st}); failing closed"
+            if float(v) >= self.config.wall_clock_budget_s:
+                return "wall-clock budget exhausted"
+        return ""
+
+    async def _select(self, frontier: list[Any]) -> Any:
+        """Top-priority admissible action; bounded-LLM rank only among a genuine priority tie."""
+        cluster = _tie_cluster(frontier)
+        if len(cluster) <= 1:
+            return frontier[0]
+        if self._rank_ties is not None:
+            st, chosen = await self._seam(lambda: self._rank_ties(list(cluster)), "rank_ties")
+            if st == "ok" and chosen in cluster:  # the LLM may only REORDER admissible actions, never inject one
+                return chosen
+            self._log(f"rank_ties unusable ({st}); deterministic top")
+        return cluster[0]
+
+    def _candidate_admissible(self, state: Any, action: Any) -> bool:
+        """A route-discovery (LLM-proposed) candidate must still pass precondition checking — design §3's
+        guarantee that 'a bad LLM suggestion cannot start a loop'. The deterministic frontier was empty, so the
+        candidate is novel; we admit it ONLY if it carries EXPLICIT prerequisites that are ALL satisfied by
+        observed state. An empty/missing precondition list is REJECTED (Forge NEW-1): `all([])` is vacuously
+        true, so an ad-hoc unconditional LLM action would otherwise be admitted and could start a loop — and a
+        catalog action whose preconditions were truly met would already be in the (here-empty) frontier."""
+        try:
+            preconds = list(getattr(action, "preconditions", None) or [])
+            if not preconds:
+                return False
+            return all(state.satisfies_predicate(p) for p in preconds)
+        except Exception:
+            return False
+
+    async def run(self) -> ControllerResult:
+        # Per-solve reset (a Sage Model may reuse one controller across solves; never leak a prior objective's
+        # blockers/counters — the cross-solve leak Forge caught in the earlier P0 wiring).
+        self._loop = wo.LoopBreakerState()
+        self._collections = 0
+        self._collection_attempts = {}
+        self._no_effect = 0
+        cycles: list[CycleRecord] = []
+        blocker: dict | None = None
+        achieved: set[str] = set()
+
+        def done(status: str, reason: str) -> ControllerResult:
+            return ControllerResult(status=status, reason=reason, blocker=blocker,
+                                    cycle_count=len(cycles), cycles=cycles,
+                                    achieved_effects=sorted(achieved))
+
+        # Budget check BEFORE the first (potentially expensive) observe — fail cheap.
+        over = await self._budget_exceeded()
+        if over:
+            return done(STATUS_BUDGET, over)
+        st, state = await self._seam(lambda: self._observe(), "observe")
+        if st != "ok" or state is None:
+            blocker = {"reason": f"observe unavailable: {state if st != 'ok' else 'None state'}"}
+            return done(STATUS_NO_ACTION, "could not observe engagement state")
+        achieved = self._achieved(state)
+
+        for cycle in range(1, self.config.max_cycles + 1):
+            # 0) cooperative kill switch — honor an operator stop BETWEEN cycles (a hung in-cycle seam is bounded
+            #    separately by seam_timeout_s). Cheap; checked before any expensive step.
+            if self._should_abort is not None:
+                st, ab = await self._seam(lambda: self._should_abort(), "should_abort")
+                if st == "ok" and bool(ab):
+                    return done(STATUS_ABORTED, "operator requested stop")
+
+            # 1) completion
+            if self._objective_met is not None:
+                st, met = await self._seam(lambda: self._objective_met(state), "objective_met")
+                if st == "ok" and bool(met):
+                    return done(STATUS_COMPLETE, "objective satisfied")
+
+            # 2) budget stop-loss (before any expensive step)
+            over = await self._budget_exceeded()
+            if over:
+                return done(STATUS_BUDGET, over)
+
+            # 3) collection (deterministic, reasoned, per-request bounded) — covers the empty-frontier early
+            #    phase without using a low global cap that can starve later justified scopes.
+            if self._needs_collection is not None and self._collect is not None:
+                st, need = await self._seam(lambda: self._needs_collection(state), "needs_collection")
+                if st == "ok" and bool(need):
+                    request_key = _collection_request_key(need) or "__anonymous_collection_request__"
+                    attempts = self._collection_attempts.get(request_key, 0)
+                    if attempts >= self.config.max_collection_attempts_per_request:
+                        blocker = {
+                            "reason": "collection retry budget exhausted",
+                            "collection_key": request_key,
+                            "attempts": attempts,
+                            "achieved": sorted(achieved),
+                        }
+                        cycles.append(CycleRecord(
+                            cycle,
+                            "collect",
+                            action="collect_graph",
+                            ok=False,
+                            note=f"collection retry budget exhausted for {request_key}",
+                        ))
+                        return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
+                    if self.config.max_collections is not None and self._collections >= self.config.max_collections:
+                        blocker = {
+                            "reason": "configured global collection emergency cap exhausted",
+                            "collection_key": request_key,
+                            "attempts": attempts,
+                            "achieved": sorted(achieved),
+                        }
+                        cycles.append(CycleRecord(
+                            cycle,
+                            "collect",
+                            action="collect_graph",
+                            ok=False,
+                            note=f"configured global collection emergency cap exhausted at {self._collections}",
+                        ))
+                        return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
+                    cst, cres = await self._seam(lambda: self._collect(state), "collect")
+                    self._collections += 1
+                    self._collection_attempts[request_key] = attempts + 1
+                    res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
+                    note = str(res.get("status") or res.get("reason") or "")
+                    collection_reason = str(res.get("collection_reason") or "")
+                    if collection_reason:
+                        note = f"{collection_reason}: {note}" if note else collection_reason
+                    cycles.append(CycleRecord(cycle, "collect", action="collect_graph",
+                                              ok=bool(res.get("ok", True)), note=note))
+                    ost, state = await self._seam(lambda: self._observe(), "observe")
+                    if ost != "ok" or state is None:
+                        blocker = {"reason": f"observe unavailable after collect: {state}"}
+                        return done(STATUS_NO_ACTION, "could not observe after collection")
+                    achieved = self._achieved(state)
+                    continue
+
+            # 4) frontier
+            frontier = list(self._frontier_fn(state) or [])
+            if not frontier:
+                # 5) empty frontier -> bounded LLM route discovery (precondition-checked), else clean halt.
+                candidate = None
+                if self._route_discovery is not None:
+                    st, cand = await self._seam(lambda: self._route_discovery(state), "route_discovery")
+                    if st == "ok" and cand is not None and self._candidate_admissible(state, cand):
+                        candidate = cand
+                    elif st == "ok" and cand is not None:
+                        self._log("route_discovery candidate failed precondition check; rejected")
+                if candidate is None:
+                    blocker = {"reason": "no admissible capability action from observed state",
+                               "achieved": sorted(achieved)}
+                    cycles.append(CycleRecord(cycle, "route_discovery", ok=False,
+                                              note="empty frontier; no admissible route-discovery candidate"))
+                    return done(STATUS_NO_ACTION, "empty frontier and no admissible route-discovery move")
+                action = candidate
+                phase = "route_discovery"
+            else:
+                action = await self._select(frontier)
+                phase = "execute"
+
+            name = cap._normalize(getattr(action, "name", ""))
+            target = str(getattr(action, "target", ""))
+            expected = _action_effects(action)
+
+            # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
+            est, eres = await self._execute_seam(action)
+            result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
+
+            # 7) verify — re-observe and diff achieved effects; PROGRESS is attributed to THIS action's expected
+            #    effect (not global drift, which unrelated effects could fake — Forge #4).
+            prev = achieved
+            ost, state = await self._seam(lambda: self._observe(), "observe")
+            if ost != "ok" or state is None:
+                blocker = {"reason": f"observe unavailable after execute: {state}", "last_action": name}
+                return done(STATUS_NO_ACTION, "could not observe after execute")
+            achieved = self._achieved(state)
+            new_effects = sorted(achieved - prev)
+            # PROGRESS is attributed to THIS action's own declared (canonical) effect — NOT to global drift
+            # (unrelated effects landing could otherwise fake progress, Forge #4) and NOT via a global-drift
+            # fallback for effectless actions (Forge NEW-3): an action with no declared effect cannot progress
+            # by definition, so it must register as no-progress and be caught by the loop-breaker / no-effect cap.
+            progressed = bool(expected & set(new_effects))
+
+            cycles.append(CycleRecord(cycle, phase, action=name, target=target,
+                                      ok=bool(result.get("ok", True)), new_effects=new_effects,
+                                      note=str(result.get("reason", ""))[:160]))
+            self._log(f"cycle {cycle}: {phase} {name}->{target} ok={result.get('ok')} "
+                      f"progressed={progressed} new_effects={new_effects}")
+
+            # 8) loop-breaker (worker_outcome): the EPOCH advances on VERIFIED progress (decoupled from the
+            #    self-reported `ok`, Forge #3/NEW-4) while the OUTCOME is classified from the REAL result — so a
+            #    real retry after a verified state change is not over-suppressed, a self-reported success with no
+            #    verified effect cannot mask a loop, AND a slow/idempotent real success is not mislabeled a
+            #    blocker. Same blocker + same epoch -> STOP (kills the 1116 redelegation tail).
+            should_stop = wo.observe_capability_outcome(self._loop, name or target, result,
+                                                        turn_key=str(cycle), progressed=progressed)
+            if should_stop:
+                blocker = {"capability": name, "reason": str(result.get("reason") or result.get("error") or ""),
+                           "suggested_capability": str(result.get("suggested_capability")
+                                                       or result.get("run_first")
+                                                       or result.get("next_capability") or ""),
+                           "achieved": sorted(achieved)}
+                return done(STATUS_BLOCKED, f"terminal blocker on {name}: same blocker recurred without progress")
+
+            # 9) no-progress stop-loss
+            if progressed:
+                self._no_effect = 0
+            else:
+                self._no_effect += 1
+                if self._no_effect >= self.config.max_no_effect_cycles:
+                    blocker = {"reason": "no new verified effect", "last_action": name,
+                               "achieved": sorted(achieved)}
+                    return done(STATUS_NO_PROGRESS,
+                                f"{self._no_effect} consecutive cycles produced no new verified effect")
+
+        return done(STATUS_MAX_CYCLES, f"reached max_cycles={self.config.max_cycles}")
+
+    async def _execute_seam(self, action: Any) -> tuple[str, Any]:
+        return await self._seam(lambda: self._execute(action), "execute")

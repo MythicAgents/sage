@@ -184,6 +184,7 @@ async def reconcile_graph_position(
         domains = _normalized_unique(credential_domains or [])
         if not principals and not domains:
             return []
+        principals = await _resolve_principal_aliases(tool, principals)
         inlist = _principal_in_list(principals) if principals else "[]"
         facts: list[GraphFact] = []
         seen: set[str] = set()
@@ -227,20 +228,29 @@ async def reconcile_graph_position(
                     if predicate and predicate not in seen:
                         seen.add(predicate)
                         facts.append(_graph_fact(predicate, now, ttl_seconds))
-            gpo_scope_query = (
-                f"MATCH (p)-[e]->(g:GPO) WHERE toLower(p.name) IN {inlist} "
-                f"AND type(e) IN {_WRITE_LABELS_CYPHER} "
-                "MATCH (g)-[:GPLink]->(container)-[:Contains*1..4]->(comp:Computer) "
-                "OPTIONAL MATCH (comp)-[:MemberOf*1..]->(dcg:Group) "
-                "WITH g, comp, any(group IN collect(dcg) WHERE coalesce(group.objectid, '') ENDS WITH '-516') AS isDc "
-                "RETURN DISTINCT g.name + '|' + comp.name + '|' + coalesce(comp.domain, '') + '|' "
-                "+ CASE WHEN isDc THEN '1' ELSE '0' END AS name"
+            # BloodHound CE's cypher API rejects `WITH ... any(...) AS isDc` + `CASE WHEN` (observed live: the
+            # old combined scope query silently returned nothing, so `gpo-affects-dc` was never produced and a
+            # controlled GPO that governs a DC never gained its `da:` effect -> the deterministic controller
+            # could not escalate via the GPO). Split into two CE-compatible queries: all governed computers
+            # (|0), and DC-governed only (DC filtered in WHERE, |1). The `seen` set dedupes the
+            # `gpo-affects-computer` predicate a DC yields from both passes.
+            gpo_scope_queries = (
+                (f"MATCH (p)-[e]->(g:GPO) WHERE toLower(p.name) IN {inlist} "
+                 f"AND type(e) IN {_WRITE_LABELS_CYPHER} "
+                 "MATCH (g)-[:GPLink]->(container)-[:Contains*1..4]->(comp:Computer) "
+                 "RETURN DISTINCT g.name + '|' + comp.name + '|' + coalesce(comp.domain, '') + '|0' AS name"),
+                (f"MATCH (p)-[e]->(g:GPO) WHERE toLower(p.name) IN {inlist} "
+                 f"AND type(e) IN {_WRITE_LABELS_CYPHER} "
+                 "MATCH (g)-[:GPLink]->(container)-[:Contains*1..4]->(comp:Computer)-[:MemberOf*1..]->(dcg:Group) "
+                 "WHERE coalesce(dcg.objectid, '') ENDS WITH '-516' "
+                 "RETURN DISTINCT g.name + '|' + comp.name + '|' + coalesce(comp.domain, '') + '|1' AS name"),
             )
-            for raw_name in await _run_scalar_names(tool, gpo_scope_query):
-                for predicate in _gpo_scope_facts_from_scalar(raw_name):
-                    if predicate and predicate not in seen:
-                        seen.add(predicate)
-                        facts.append(_graph_fact(predicate, now, ttl_seconds))
+            for gpo_scope_query in gpo_scope_queries:
+                for raw_name in await _run_scalar_names(tool, gpo_scope_query):
+                    for predicate in _gpo_scope_facts_from_scalar(raw_name):
+                        if predicate and predicate not in seen:
+                            seen.add(predicate)
+                            facts.append(_graph_fact(predicate, now, ttl_seconds))
         await _collect("Computer", "generic-write:computer", _short_host)
         await _collect("Domain", "write-dacl:domain", lambda n: access_reconciler.normalize_forest(_text(n)))
         if principals:
@@ -283,6 +293,16 @@ async def reconcile_graph_position(
                     if fact is not None and fact.predicate not in seen:
                         seen.add(fact.predicate)
                         facts.append(fact)
+        trust_query = (
+            "MATCH (source:Domain)-[edge]->(target:Domain) "
+            "WHERE type(edge) CONTAINS 'Trust' "
+            "RETURN DISTINCT source.name + '|' + target.name AS name"
+        )
+        for raw_name in await _run_scalar_names(tool, trust_query):
+            predicate = _trust_reachable_fact_from_scalar(raw_name)
+            if predicate and predicate not in seen:
+                seen.add(predicate)
+                facts.append(_graph_fact(predicate, now, ttl_seconds))
         return facts
     except Exception:
         return []
@@ -344,6 +364,18 @@ def _gpo_scope_facts_from_scalar(value: Any) -> list[str]:
     return facts
 
 
+def _trust_reachable_fact_from_scalar(value: Any) -> str:
+    text = _text(value)
+    if "|" not in text:
+        return ""
+    raw_source, raw_target, *_ = text.split("|")
+    source = access_reconciler.normalize_forest(raw_source)
+    target = access_reconciler.normalize_forest(raw_target)
+    if not source or not target or source == target:
+        return ""
+    return f"trust-reachable:{source}:{target}"
+
+
 def _gpo_scalar_parts(value: Any) -> tuple[str, str]:
     text = _text(value)
     if "|" not in text:
@@ -386,6 +418,31 @@ def _principal_in_list(principals: list[str]) -> str:
     """Inline a principal allowlist as a Cypher list literal (the BloodHound cypher API takes no params)."""
     safe = [p.replace("\\", "").replace("'", "") for p in principals if p]
     return "[" + ", ".join(f"'{p}'" for p in safe) + "]"
+
+
+async def _resolve_principal_aliases(tool: Any, principals: list[str]) -> list[str]:
+    """Resolve ``user@NETBIOS`` names to BloodHound's FQDN UPN when exactly one node matches."""
+    resolved: list[str] = []
+    for principal in _normalized_unique(principals):
+        account, separator, domain = principal.partition("@")
+        if not separator or not account or not domain or "." in domain:
+            resolved.append(principal)
+            continue
+        safe_prefix = f"{account}@{domain}".replace("\\", "").replace("'", "")
+        query = (
+            "MATCH (u:User) "
+            f"WHERE toLower(u.name) = '{safe_prefix}' "
+            f"OR toLower(u.name) STARTS WITH '{safe_prefix}.' "
+            "RETURN DISTINCT u.name AS name"
+        )
+        matches = [
+            name.casefold()
+            for name in await _run_scalar_names(tool, query)
+            if name.casefold() == safe_prefix or name.casefold().startswith(f"{safe_prefix}.")
+        ]
+        aliases = _normalized_unique(matches)
+        resolved.append(aliases[0] if len(aliases) == 1 else principal)
+    return _normalized_unique(resolved)
 
 
 def _user_domain_filter(property_name: str, domains: list[str]) -> str:

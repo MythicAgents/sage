@@ -1,8 +1,10 @@
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
+import mythic_tools  # noqa: E402
 from mythic_tools import _compute_liveness  # noqa: E402
 
 
@@ -59,6 +61,65 @@ def test_three_second_sleep_four_hour_gap_is_dead():
     assert result["alive"] is False
     assert result["threshold_seconds"] == 45
     assert result["seconds_since_checkin"] == 14400
+
+
+def test_sage_service_callback_is_taskable_despite_stale_timestamp():
+    result = _compute_liveness(
+        display_id=3,
+        last_checkin=_checkin(6 * 60 * 60),
+        callback_interval=3,
+        callback_jitter=0,
+        tasks=[],
+        payload_type="sage",
+        active=True,
+        now=NOW,
+    )
+
+    assert result["status"] == "taskable"
+    assert result["alive"] is True
+    assert result["liveness_mode"] == "service"
+    assert result["seconds_since_checkin"] == 21600
+    assert "timestamp advances only when a command is sent" in result["reason"]
+
+
+def test_inactive_sage_service_callback_is_not_taskable():
+    result = _compute_liveness(
+        display_id=3,
+        last_checkin=_checkin(6),
+        callback_interval=3,
+        callback_jitter=0,
+        tasks=[],
+        payload_type="sage",
+        active=False,
+        now=NOW,
+    )
+
+    assert result["status"] == "inactive"
+    assert result["alive"] is False
+
+
+def test_assess_callback_liveness_reads_sage_payload_type(monkeypatch):
+    seen = {}
+
+    async def fake_query(client, query, variables=None):
+        seen["query"] = query
+        return {
+            "callback": [{
+                "display_id": 3,
+                "active": True,
+                "last_checkin": _checkin(6 * 60 * 60),
+                "payload": {"payloadtype": {"name": "sage"}},
+                "c2profileparametersinstances": [],
+                "tasks": [],
+            }]
+        }
+
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", fake_query)
+    result = asyncio.run(mythic_tools.assess_callback_liveness(object(), 3, now=NOW))
+
+    assert "payload { payloadtype { name } }" in seen["query"]
+    assert result["status"] == "taskable"
+    assert result["alive"] is True
 
 
 def test_sleep_task_interval_overrides_c2_profile_threshold():

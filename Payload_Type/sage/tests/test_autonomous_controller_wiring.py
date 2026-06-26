@@ -1,0 +1,764 @@
+"""Wiring tests for Model._run_autonomous_controller (the runtime seam adapters).
+
+Run: cd Payload_Type/sage && python3 -m pytest tests/test_autonomous_controller_wiring.py -q
+
+These prove the RUNTIME boundary the controller's own unit tests (which use dict-returning fakes) cannot:
+the real `execute_capability` returns a JSON *string*, and the seam adapters must build a dict payload/inputs
+from a CapabilityAction and parse the string result as a real outcome — NOT coerce a failure into a silent
+success (Forge finding #1). We instantiate a bare Model via object.__new__ and inject only the attributes the
+method touches, so no live Mythic/RabbitMQ is needed.
+"""
+import asyncio
+import json
+import re
+import sys
+from pathlib import Path
+
+
+async def _nosleep(*_a, **_k):
+    return None
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ai.langgraph import model  # noqa: E402
+from ai.langgraph import engagement_state as es  # noqa: E402
+
+
+def _state_with_remote_exec():
+    """A real EngagementState where remote-exec:braavos@essos is achieved (GOAD literals are fine in TESTS) ->
+    the real frontier offers adcs-ca-private-key-export."""
+    foothold = es.Foothold(callback_id="3", agent="apollo", host="braavos", forest="essos.local",
+                           identity="essos\\administrator", integrity="high", alive=True,
+                           source="test", timestamp="")
+    hop = es.Hop(id="h", technique="capability:execute-as-local-admin", target="braavos",
+                 effect="remote-exec:braavos@essos.local", status="achieved", evidence={},
+                 preconditions=[], satisfied_effects=["remote-exec:braavos@essos.local"],
+                 source="test", timestamp="")
+    return es.EngagementState(objective="obtain administrative control of essos.local",
+                             footholds=[foothold], hops=[hop], graph_facts=[])
+
+
+def _bare_model(execute_return, state, calls):
+    m = object.__new__(model.Model)
+
+    class FakeMythic:
+        async def execute_capability(self, payload, inputs):
+            calls.append((payload, inputs))
+            return execute_return
+
+    m.mythic_client = FakeMythic()
+
+    async def _observe():
+        return state
+    m._build_current_engagement_state = _observe
+    m._objective_completion_report = lambda require_autonomous=False: None
+    m._format_message_for_streaming = lambda msg, agent_name=None: getattr(msg, "content", "")
+
+    async def _stream(_text):
+        return True
+    m._stream_message_to_mythic = _stream
+    return m
+
+
+def test_string_capability_failure_flows_to_blocked_not_silent_success():
+    """THE wiring C2 proof: execute_capability returns a JSON STRING failure; the adapters + controller must
+    parse it as a blocker and reach halted_blocked — never coerce it to a silent success."""
+    calls = []
+    blocked_string = json.dumps({"ok": False, "verdict": "blocked", "capability": "adcs-ca-private-key-export",
+                                 "reason": "CA host enumeration failed",
+                                 "suggested_capability": "adcs-esc-certificate-enroll"})
+    m = _bare_model(blocked_string, _state_with_remote_exec(), calls)
+
+    report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    # the real seam adapters fired: a dict payload + dict inputs were built from the CapabilityAction
+    assert calls, "execute_capability was never called"
+    payload, inputs = calls[0]
+    assert isinstance(payload, dict) and payload.get("name") == "adcs-ca-private-key-export", payload
+    assert isinstance(inputs, dict)
+    # the STRING result was parsed as a FAILURE (not coerced to success) -> clean terminal blocker
+    assert "halted_blocked" in report, report
+    assert "adcs-ca-private-key-export" in report
+
+
+def test_observe_none_halts_cleanly_without_crash():
+    """A failed observe (real method returns None on any error) must produce a clean halt, not a traceback."""
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), None, calls)
+    report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+    assert "halted_no_action" in report, report
+    assert calls == []  # never executed anything without a state
+
+
+def test_gate_defaults_on_but_blocks_supervised_and_interactive():
+    """Forge CRITICAL: the controller must NOT run in supervised mode (guarded tools need operator HITL
+    approval there) nor on interactive follow-up turns. Auto-mode autonomous one-shots use it by default."""
+    import os
+    saved = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+    try:
+        m = object.__new__(model.Model)
+        m._autonomous_solve = True
+        # supervised mode -> never use the controller, even non-interactive
+        m.mode = "supervised"
+        assert m._should_use_controller(is_interactive=False) is False
+        # auto mode but interactive follow-up -> fall through to normal path
+        m.mode = "auto"
+        assert m._should_use_controller(is_interactive=True) is False
+        # auto + non-interactive -> run the controller by default
+        assert m._should_use_controller(is_interactive=False) is True
+        # not an autonomous solve -> never
+        m._autonomous_solve = False
+        assert m._should_use_controller(is_interactive=False) is False
+        # flag off -> never
+        m._autonomous_solve = True
+        os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = "0"
+        assert m._should_use_controller(is_interactive=False) is False
+    finally:
+        if saved is None:
+            os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+        else:
+            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved
+
+
+def test_observe_attaches_graph_facts():
+    """Forge HIGH: the observe seam must attach graph_facts (refresh-if-stale then read the cache) so the
+    frontier can derive GPO/ADCS actions; without them the frontier is falsely empty at those walls."""
+    calls = []
+
+    class GF:
+        predicate = "gpo-domain:starkwallpaper:north.sevenkingdoms.local"
+        source = "bloodhound"
+        timestamp = ""
+        ttl_seconds = 0
+
+    state = _state_with_remote_exec()
+    m = _bare_model(json.dumps({"ok": True}), state, calls)
+
+    refreshed = {"n": 0}
+
+    class FakeMythicGF:
+        _engagement_graph_facts = [GF()]
+
+        async def _refresh_graph_facts_if_stale(self, now, force=False):
+            refreshed["n"] += 1
+
+        async def execute_capability(self, payload, inputs):
+            calls.append((payload, inputs))
+            return json.dumps({"ok": False, "reason": "stop here"})
+    m.mythic_client = FakeMythicGF()
+
+    asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+    assert refreshed["n"] >= 1, "observe must refresh graph facts"
+    # state.graph_facts was populated from the cache on observe
+    assert any(getattr(f, "predicate", "") for f in (state.graph_facts or [])), state.graph_facts
+
+
+def _foothold(callback_id="2", agent="apollo", host="dc01", identity="north\\admin", forest="north.local"):
+    return es.Foothold(callback_id=callback_id, agent=agent, host=host, forest=forest,
+                       identity=identity, integrity="high", alive=True, source="test", timestamp="")
+
+
+def _live_foothold_state(callback_id="2", agent="apollo"):
+    return es.EngagementState(objective="obtain administrative control of essos.local",
+                             footholds=[_foothold(callback_id, agent)], hops=[], graph_facts=[])
+
+
+class _CollectMythic:
+    """Models the REAL seams. execute_assembly captures the run's `--ZipFilename` token; `ls` returns STRUCTURED
+    JSON (Apollo's real shape) with the on-disk file optionally carrying a SharpHound TIMESTAMP PREFIX; the
+    download is resolved by token; ingest_collection returns the real taxonomy with `graph_verified`."""
+    def __init__(
+        self,
+        ingest,
+        *,
+        ls_has_zip=True,
+        timestamp_prefix=True,
+        download_visible=True,
+        whoami_output="north\\admin",
+        ticket_output=(
+            '[{"client_name":"admin","client_realm":"NORTH.LOCAL",'
+            '"service_name":"krbtgt/NORTH.LOCAL","luid":"0x123","current_luid":"0x123"}]'
+        ),
+    ):
+        self.calls = []
+        self.ingest_kwargs = []
+        self._ingest = ingest
+        self._ls_has_zip = ls_has_zip
+        self._ts = timestamp_prefix
+        self._dl_visible = download_visible
+        self._zipname = None
+        self._whoami_output = whoami_output
+        self._ticket_output = ticket_output
+
+    async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+        self.calls.append((command, parameters, callback_display_id))
+        if command == "whoami":
+            return self._whoami_output
+        if command == "rev2self":
+            return "Reverted token"
+        if command == "ticket_cache_list":
+            return self._ticket_output
+        if command == "execute_assembly":
+            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("assembly_arguments", ""))
+            self._zipname = mt.group(1) if mt else None
+            return "SharpHound enumeration completed"
+        if command == "ls":
+            files = [{"name": "apollo.exe", "full_name": "C:\\Users\\Public\\apollo.exe", "is_file": True}]
+            if self._ls_has_zip and self._zipname:
+                on_disk = (f"20260101000000_{self._zipname}" if self._ts else self._zipname)
+                files.insert(0, {"name": on_disk, "full_name": f"C:\\Users\\Public\\{on_disk}", "is_file": True})
+            return json.dumps({"files": files, "success": True})
+        return "task output"
+
+    async def probe_authentication_context(self, callback_display_id, host=""):
+        from ai.langgraph import auth_context
+        identity = await self.issue_task_and_waitfor_task_output("whoami", "", callback_display_id)
+        tickets = await self.issue_task_and_waitfor_task_output(
+            "ticket_cache_list",
+            {"luid": "", "getSystemTickets": False},
+            callback_display_id,
+        )
+        return auth_context.build_authentication_context(callback_display_id, host, identity, tickets)
+
+    async def _latest_download_for_callback(self, cb, name_contains="zip"):
+        self.calls.append(("_latest_download", cb, name_contains))
+        if self._dl_visible and self._zipname and name_contains and name_contains in self._zipname:
+            on_disk = (f"20260101000000_{self._zipname}" if self._ts else self._zipname)
+            return {"agent_file_id": 11, "filename_utf8": on_disk}
+        return None
+
+    async def ingest_collection(self, file_uuid="", callback_display_id=None, file_name="", **kw):
+        self.calls.append(("ingest_collection", file_uuid, callback_display_id))
+        self.ingest_kwargs.append(dict(kw))
+        return json.dumps(self._ingest)
+
+
+def test_collect_discovers_timestamped_zip_and_ingests_it():
+    """The CRITICAL fix: SharpHound writes <timestamp>_<name>, so collect must DISCOVER the real path via `ls`
+    (not predict it) and download THAT, then ingest by file_uuid+callback. ok only because graph_verified."""
+    m = object.__new__(model.Model)
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True}, timestamp_prefix=True)
+    m.mythic_client = fake
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is True, result
+    issued = [c[0] for c in fake.calls if c[0] in ("execute_assembly", "ls", "download", "ingest_collection")]
+    assert issued == ["execute_assembly", "ls", "download", "ingest_collection"], issued
+    # downloaded the DISCOVERED timestamped path, not the predicted bare name
+    dl_path = next(c[1]["path"] for c in fake.calls if c[0] == "download")
+    assert dl_path.startswith("C:\\Users\\Public\\20260101000000_bloodhound_"), dl_path
+    assert ("ingest_collection", 11, 2) in fake.calls
+
+
+def test_collect_restores_domain_identity_before_sharphound_when_callback_is_host_local():
+    m = object.__new__(model.Model)
+    fake = _CollectMythic(
+        {"status": "ingested", "graph_verified": True},
+        whoami_output="Local Identity: north\\samwell.tarly\nImpersonation Identity: north\\samwell.tarly",
+    )
+    m.mythic_client = fake
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("2", host="braavos", identity="BRAAVOS\\Administrator")],
+        hops=[],
+        graph_facts=[],
+    )
+
+    result = asyncio.run(m._controller_collect(state))
+
+    assert result["ok"] is True, result
+    issued = [call[0] for call in fake.calls]
+    assert issued[:3] == ["whoami", "ticket_cache_list", "execute_assembly"], issued
+
+
+def test_authority_change_collect_probes_effective_identity_and_restores_stale_local_token():
+    m = object.__new__(model.Model)
+
+    class EffectiveIdentityMythic(_CollectMythic):
+        def __init__(self):
+            super().__init__({"status": "ingested", "graph_verified": True})
+            self.whoami_outputs = iter([
+                "Local Identity: braavos\\administrator\nImpersonation Identity: braavos\\administrator",
+                "Local Identity: north\\samwell.tarly\nImpersonation Identity: north\\samwell.tarly",
+            ])
+            self.ticket_outputs = iter([
+                "0x456",
+                (
+                    '[{"client_name":"samwell.tarly","client_realm":"NORTH.LOCAL",'
+                    '"service_name":"krbtgt/NORTH.LOCAL","luid":"0x123","current_luid":"0x123"}]'
+                ),
+            ])
+
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            if command == "whoami":
+                self.calls.append((command, parameters, callback_display_id))
+                return next(self.whoami_outputs)
+            if command == "ticket_cache_list":
+                self.calls.append((command, parameters, callback_display_id))
+                return next(self.ticket_outputs)
+            return await super().issue_task_and_waitfor_task_output(
+                command,
+                parameters,
+                callback_display_id,
+                **kw,
+            )
+
+    fake = EffectiveIdentityMythic()
+    m.mythic_client = fake
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("2", host="braavos", identity="NORTH\\samwell.tarly")],
+        hops=[],
+        graph_facts=[],
+    )
+    request = model._ControllerCollectionRequest(
+        foothold=state.footholds[0],
+        reason="authority-change",
+    )
+
+    result = asyncio.run(m._controller_collect(state, request=request))
+
+    assert result["ok"] is True, result
+    issued = [call[0] for call in fake.calls]
+    assert issued[:6] == [
+        "whoami",
+        "ticket_cache_list",
+        "rev2self",
+        "whoami",
+        "ticket_cache_list",
+        "execute_assembly",
+    ], issued
+
+
+def test_collect_refuses_sharphound_when_restored_identity_is_still_host_local():
+    m = object.__new__(model.Model)
+    fake = _CollectMythic(
+        {"status": "ingested", "graph_verified": True},
+        whoami_output=(
+            "Local Identity: braavos\\administrator\n"
+            "Impersonation Identity: braavos\\administrator"
+        ),
+        ticket_output="0x123",
+    )
+    m.mythic_client = fake
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("2", host="braavos", identity="BRAAVOS\\Administrator")],
+        hops=[],
+        graph_facts=[],
+    )
+
+    result = asyncio.run(m._controller_collect(state))
+
+    assert result["ok"] is False
+    assert result["status"] == "no_domain_identity"
+    assert not any(call[0] == "execute_assembly" for call in fake.calls)
+
+
+def test_collect_preserves_local_token_when_current_luid_has_domain_tgt():
+    m = object.__new__(model.Model)
+    fake = _CollectMythic(
+        {"status": "ingested", "graph_verified": True},
+        whoami_output=(
+            "Local Identity: braavos\\administrator\n"
+            "Impersonation Identity: braavos\\administrator"
+        ),
+        ticket_output=(
+            '[{"client_name":"administrator","client_realm":"ESSOS.LOCAL",'
+            '"service_name":"krbtgt/ESSOS.LOCAL","luid":"0x123","current_luid":"0x123"}]'
+        ),
+    )
+    m.mythic_client = fake
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("2", host="braavos", identity="BRAAVOS\\Administrator")],
+        hops=[],
+        graph_facts=[],
+    )
+
+    result = asyncio.run(m._controller_collect(state))
+
+    assert result["ok"] is True, result
+    issued = [call[0] for call in fake.calls]
+    assert "rev2self" not in issued
+    assert issued[:3] == ["whoami", "ticket_cache_list", "execute_assembly"]
+
+
+def test_collect_no_zip_in_output_is_no_artifact(monkeypatch):
+    """SharpHound produced no token-bearing ZIP (failed/usage output) -> collect discovers nothing, downloads
+    nothing, ingests nothing, and reports no_collection_artifact (fail-closed)."""
+    monkeypatch.setattr(model.asyncio, "sleep", _nosleep)
+    m = object.__new__(model.Model)
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True}, ls_has_zip=False)
+    m.mythic_client = fake
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is False and result["status"] == "no_collection_artifact", result
+    assert not any(c[0] in ("download", "ingest_collection") for c in fake.calls), fake.calls
+
+
+def test_collect_ingest_failed_is_not_ok():
+    """Forge H2: ingest_failed (graph_verified False) must be ok=False, not a false success."""
+    m = object.__new__(model.Model)
+    m.mythic_client = _CollectMythic({"status": "ingest_failed", "graph_verified": False})
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is False and result["status"] == "ingest_failed", result
+
+
+def test_collect_pending_ingest_is_not_ok():
+    """Forge H2: uploaded_pending_ingest (graph_verified False) must be ok=False so the gate stays missing."""
+    m = object.__new__(model.Model)
+    m.mythic_client = _CollectMythic({"status": "uploaded_pending_ingest", "graph_verified": False})
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is False and result["status"] == "uploaded_pending_ingest", result
+
+
+def test_collect_already_ingested_is_ok():
+    m = object.__new__(model.Model)
+    m.mythic_client = _CollectMythic({"status": "already_ingested", "graph_verified": True})
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+    assert result["ok"] is True, result
+
+
+def test_collect_skips_non_apollo_foothold(monkeypatch):
+    """Forge N2: a non-Apollo missing foothold is NOT selected (so no slot is burned). With only a beacon
+    foothold, the target resolver yields nothing -> no_target, and SharpHound is never even issued."""
+    monkeypatch.setattr(model.asyncio, "sleep", _nosleep)
+    m = object.__new__(model.Model)
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True})
+    m.mythic_client = fake
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2", agent="beacon")))
+    assert result["ok"] is False and result["status"] == "no_target", result
+    assert not any(c[0] == "execute_assembly" for c in fake.calls), "must not run SharpHound on a non-Apollo foothold"
+
+
+def test_collect_no_target():
+    m = object.__new__(model.Model)
+    m.mythic_client = _CollectMythic({"status": "ingested", "graph_verified": True})
+    state = es.EngagementState(objective="x", footholds=[], hops=[], graph_facts=[])
+    result = asyncio.run(m._controller_collect(state))
+    assert result["ok"] is False and result["status"] == "no_target", result
+
+
+# --- _find_token_zip_path: parses the REAL Apollo `ls` JSON shape captured live on cb2 ---
+_LS_SAMPLE = ('{"files":[{"name":"20260622_bloodhound_ab12cd34.zip","full_name":'
+              '"C:\\\\Users\\\\Public\\\\20260622_bloodhound_ab12cd34.zip","is_file":true,"size":1234},'
+              '{"name":"apollo.exe","full_name":"C:\\\\Users\\\\Public\\\\apollo.exe","is_file":true}],'
+              '"success":true}')
+
+
+def test_find_token_zip_path_discovers_timestamped_name():
+    path = model._find_token_zip_path(_LS_SAMPLE, "ab12cd34")
+    assert path == "C:\\Users\\Public\\20260622_bloodhound_ab12cd34.zip", path
+
+
+def test_find_token_zip_path_token_absent_returns_empty():
+    assert model._find_token_zip_path(_LS_SAMPLE, "deadbeef") == ""
+
+
+def test_find_token_zip_path_ignores_non_matching_zip():
+    """Token disambiguation (Forge LOW): a different run's ZIP on the same dir must NOT be selected."""
+    two_zips = ('{"files":[{"name":"20260622_bloodhound_OTHER999.zip","full_name":'
+                '"C:\\\\Users\\\\Public\\\\20260622_bloodhound_OTHER999.zip","is_file":true},'
+                '{"name":"20260622_bloodhound_ab12cd34.zip","full_name":'
+                '"C:\\\\Users\\\\Public\\\\20260622_bloodhound_ab12cd34.zip","is_file":true}],"success":true}')
+    assert model._find_token_zip_path(two_zips, "ab12cd34").endswith("bloodhound_ab12cd34.zip")
+
+
+def test_find_token_zip_path_handles_concatenated_json_objects():
+    """Apollo streams >1 JSON object in one task output; the parser must walk them all."""
+    doubled = _LS_SAMPLE + '{"files":[],"success":true}'
+    assert model._find_token_zip_path(doubled, "ab12cd34").endswith("bloodhound_ab12cd34.zip")
+
+
+def test_collection_target_picks_the_missing_foothold_not_the_first():
+    """Forge H3: when foothold A's forest is already collected and B's distinct forest is missing, the target
+    must be B — not the first live foothold A. Same-forest same-authority footholds now intentionally dedupe."""
+    a = _foothold(callback_id="2", host="hostA", identity="north\\a")
+    b = _foothold(callback_id="3", host="hostB", identity="other\\b", forest="other.local")
+    state = es.EngagementState(objective="x", footholds=[a, b], hops=[], graph_facts=[])
+    key_a = es.access_context_key(state, a)
+    hop = es.Hop(id="g", technique="collect-graph", target="hostA", effect=f"graph-built:{key_a}",
+                 status="achieved",
+                 evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+                 preconditions=[], satisfied_effects=[f"graph-built:{key_a}"],
+                 source="test", timestamp="")
+    state = es.EngagementState(objective="x", footholds=[a, b], hops=[hop], graph_facts=[])
+    m = object.__new__(model.Model)
+    target = m._controller_collection_target(state)
+    assert target is not None and target.callback_id == "3", target
+
+
+def test_collection_request_targets_trusted_domain_only_after_default_scope_is_covered():
+    foothold = _foothold(callback_id="2", host="castelblack", identity="north\\samwell.tarly")
+    base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[foothold])
+    key = es.collection_target_key(base, foothold)
+    hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=key,
+        effect=f"graph-built:{key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{key}"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[foothold],
+        hops=[hop],
+        graph_facts=[
+            es.GraphFact("domain-collected:north.local", "test", "", 600),
+            es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    assert m._controller_collection_request(state, include_trusted_scope=False) is None
+    request = m._controller_collection_request(state, include_trusted_scope=True)
+    assert request is not None
+    assert request.foothold.callback_id == "2"
+    assert request.scope_domain == "essos.local"
+    assert request.reason == "objective-scope-expansion"
+
+
+def test_collection_request_prefers_objective_scope_over_optional_authority_recollection():
+    foothold = _foothold(callback_id="2", host="castelblack", identity="north\\samwell.tarly")
+    base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[foothold])
+    baseline_key = es.collection_target_key(base, foothold)
+    baseline_hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=baseline_key,
+        effect=f"graph-built:{baseline_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{baseline_key}"],
+        source="test",
+        timestamp="",
+    )
+    da_hop = es.Hop(
+        id="da",
+        technique="domain-admin-membership-check",
+        target="north.local",
+        effect="da:north.local",
+        status="achieved",
+        evidence={},
+        preconditions=[],
+        satisfied_effects=["da:north.local"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[foothold],
+        hops=[baseline_hop, da_hop],
+        graph_facts=[
+            es.GraphFact("domain-collected:north.local", "test", "", 600),
+            es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    assert es.graph_collection_covers_foothold(state, foothold) is False
+    request = m._controller_collection_request(
+        state,
+        include_trusted_scope=True,
+        include_optional_recollection=True,
+    )
+    assert request is not None
+    assert request.scope_domain == "essos.local"
+    assert request.reason == "objective-scope-expansion"
+
+    authority_request = m._controller_collection_request(
+        state,
+        include_trusted_scope=False,
+        include_optional_recollection=True,
+    )
+    assert authority_request is not None
+    assert authority_request.scope_domain == ""
+    assert authority_request.reason == "authority-change"
+
+
+def test_collection_request_does_not_recollect_authority_after_objective_domain_is_collected():
+    foothold = _foothold(callback_id="2", host="castelblack", identity="north\\samwell.tarly")
+    base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[foothold])
+    baseline_key = es.collection_target_key(base, foothold)
+    baseline_hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=baseline_key,
+        effect=f"graph-built:{baseline_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{baseline_key}"],
+        source="test",
+        timestamp="",
+    )
+    da_hop = es.Hop(
+        id="da",
+        technique="domain-admin-membership-check",
+        target="north.local",
+        effect="da:north.local",
+        status="achieved",
+        evidence={},
+        preconditions=[],
+        satisfied_effects=["da:north.local"],
+        source="test",
+        timestamp="",
+    )
+    current_epoch = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[foothold],
+        hops=[baseline_hop, da_hop],
+    )
+    targeted_key = es.collection_target_key(current_epoch, foothold, "essos.local")
+    targeted_hop = es.Hop(
+        id="collect-target",
+        technique="collect-graph",
+        target=targeted_key,
+        effect=f"graph-built:{targeted_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["essos.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{targeted_key}"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[foothold],
+        hops=[baseline_hop, da_hop, targeted_hop],
+        graph_facts=[
+            es.GraphFact("domain-collected:north.local", "test", "", 600),
+            es.GraphFact("domain-collected:essos.local", "test", "", 600),
+            es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    assert es.graph_collection_covers_foothold(state, foothold) is False
+    assert es.graph_domain_has_verified_collection(state, "essos.local") is True
+    request = m._controller_collection_request(
+        state,
+        include_trusted_scope=True,
+        include_optional_recollection=True,
+    )
+    assert request is None
+
+
+def test_collection_request_does_not_expand_scope_after_retryable_capability_failure():
+    foothold = _foothold(callback_id="2", host="castelblack", identity="north\\samwell.tarly")
+    base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[foothold])
+    baseline_key = es.collection_target_key(base, foothold)
+    baseline_hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=baseline_key,
+        effect=f"graph-built:{baseline_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{baseline_key}"],
+        source="test",
+        timestamp="",
+    )
+    retryable_failure = es.Hop(
+        id="failed-cert-auth",
+        technique="capability:adcs-certificate-auth",
+        target="domain=essos.local;account=administrator;ca_host=braavos;callback=2",
+        effect="da:essos.local",
+        status="failed",
+        evidence={"terminal_failure": False, "failure_class": "transient"},
+        preconditions=[],
+        satisfied_effects=["da:essos.local", "certificate-auth:administrator@essos.local"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[foothold],
+        hops=[baseline_hop, retryable_failure],
+        graph_facts=[
+            es.GraphFact("domain-collected:north.local", "test", "", 600),
+            es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    request = m._controller_collection_request(
+        state,
+        include_trusted_scope=True,
+        include_optional_recollection=True,
+    )
+
+    assert request is None
+
+
+def test_collect_targeted_scope_passes_domain_to_sharphound_and_ingest():
+    m = object.__new__(model.Model)
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True})
+    m.mythic_client = fake
+    state = _live_foothold_state("2")
+    request = model._ControllerCollectionRequest(
+        foothold=state.footholds[0],
+        scope_domain="essos.local",
+        reason="objective-scope-expansion",
+    )
+
+    result = asyncio.run(m._controller_collect(state, request=request))
+
+    assert result["ok"] is True, result
+    assembly_args = next(
+        call[1]["assembly_arguments"]
+        for call in fake.calls
+        if call[0] == "execute_assembly"
+    )
+    assert "--Domain essos.local" in assembly_args
+    assert "--SearchForest" not in assembly_args
+    assert fake.ingest_kwargs == [{"collection_scope_domain": "essos.local"}]
+    assert result["collection_reason"] == "objective-scope-expansion"
+
+
+def test_capability_inputs_pass_controlled_principal():
+    """The controller must pass the foothold identity as controlled_principal/current_user so deterministic
+    self-escalation builders (gpo-controlled-system-exec -> add-to-Domain-Admins) can fill in the command."""
+    from ai.langgraph import capabilities as cap
+    action = cap.CapabilityAction(name="gpo-controlled-system-exec",
+                                  target="gpo=starkwallpaper;domain=north.sevenkingdoms.local")
+    snap = es.EngagementState(objective="x", footholds=[_foothold("2", "apollo", "castelblack", "north\\samwell.tarly")],
+                             hops=[], graph_facts=[])
+    inputs = model._autonomous_capability_inputs(action, snap)
+    assert inputs.get("controlled_principal") == "north\\samwell.tarly", inputs
+    assert inputs.get("current_user") == "north\\samwell.tarly", inputs
+
+
+def test_graph_reconciler_gpo_scope_query_is_ce_compatible():
+    """Guardrail: the GPO scope query must not reintroduce the BloodHound-CE-incompatible constructs that
+    silently dropped gpo-affects-dc (CASE WHEN / WITH-collect-any). DC-ness must be filtered in WHERE."""
+    import inspect
+    from ai.langgraph import graph_reconciler as gr
+    src = inspect.getsource(gr.reconcile_graph_position)
+    # The exact regressing construct (only ever in the broken scope cypher; not in comments/other queries):
+    assert "isDc THEN" not in src, "CE-incompatible `CASE WHEN isDc THEN` reintroduced into the scope cypher"
+    # And the fix must be present: DC-ness filtered in WHERE via the -516 group objectid.
+    assert "ENDS WITH '-516'" in src, "DC-scope must be filtered in WHERE (CE-compatible), not via CASE WHEN"
+
+
+def test_controller_flag_on_by_default_with_explicit_rollback():
+    import os
+    saved = os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+    try:
+        assert model._controller_flag_enabled() is True
+        os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = "1"
+        assert model._controller_flag_enabled() is True
+        os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = "off"
+        assert model._controller_flag_enabled() is False
+        os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = ""
+        assert model._controller_flag_enabled() is True
+    finally:
+        os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+        if saved is not None:
+            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved

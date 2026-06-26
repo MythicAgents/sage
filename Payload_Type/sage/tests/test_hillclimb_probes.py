@@ -30,14 +30,14 @@ def test_vector_from_probes_and_furthest():
 
 
 def test_missing_probe_is_false():
-    scn = goad_scenarios()[1]
+    scn = goad_scenarios()[2]  # cross-forest-objective still scores GRAPH_COLLECTED (child-da no longer does)
     gt = pr.read_ground_truth_from_probes(scn, {Milestone.GRAPH_COLLECTED: lambda: True}, foothold_seen=True)
     assert gt.milestones[Milestone.GRAPH_COLLECTED] is True
     assert gt.milestones[Milestone.SYSTEM_ON_HOST] is False  # no probe supplied -> unmeasured -> False
 
 
 def test_raising_probe_is_false_and_surfaced():
-    scn = goad_scenarios()[1]
+    scn = goad_scenarios()[2]  # cross-forest-objective still scores GRAPH_COLLECTED
 
     def boom():
         raise RuntimeError("BloodHound unreachable")

@@ -63,7 +63,7 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
     milestone it does not score. The DA probes get a settling window so GPO/SYSTEM-on-DC membership
     changes have time to propagate before scoring (krbtgt-loot is immediate, so it needs no window)."""
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
-    probes = {Milestone.KRBTGT_DUMPED: live_seams.mythic_credential_probe("krbtgt")}
+    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=CHILD)}
     if Milestone.DA_CHILD in sub:
         probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
             reader, CHILD, baseline=baseline.get(CHILD, set()),
@@ -72,6 +72,13 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
         probes[Milestone.OBJECTIVE] = live_seams.ad_domain_admins_probe_via_reader(
             reader, OBJECTIVE, baseline=baseline.get(OBJECTIVE, set()),
             settle_timeout=settle_timeout, settle_interval=settle_interval)
+    if Milestone.GRAPH_COLLECTED in sub:
+        # Ground-truth, ledger-independent: BloodHound holds >=1 ingested Domain == a SharpHound
+        # collection was successfully run AND uploaded. Independent of Sage's self-reported
+        # `graph-built:` predicate, so range_state's disagreement check ("who verifies the verifier")
+        # can finally catch a collection self-report that reality does not back. Scenarios that do not
+        # score GRAPH_COLLECTED (e.g. child-da) never build this probe.
+        probes[Milestone.GRAPH_COLLECTED] = live_seams.graph_collected_probe()
     return probes
 
 
@@ -80,6 +87,79 @@ def _scenario(cfg: Config, name: str):
         if s.name == name:
             return s
     raise SystemExit(f"unknown scenario {name!r}; choices: {[s.name for s in goad_scenarios(cfg.engagement_op)]}")
+
+
+def objective_recognizable(objective: str) -> tuple[bool, str]:
+    """Cheap pre-run contract check: is completion-recognition REACHABLE for this objective?
+
+    Guards the harness->Sage objective seam that regressed in the Phase-0 re-set (the gauge's read-only/
+    seam-injected architecture made the seam untestable offline, so the only detector was a ~60-min live
+    range run). The HARD contract is the exact thing that regressed: the objective Sage runs with must NOT
+    be blank/opaque (`sage-engagement:*`), since engagement_state._objective_is_complete deliberately never
+    completes an opaque objective. Target-domain parse is reported as a DIAGNOSTIC only, NOT a failure:
+    objectives like single-hop-system ("SYSTEM on a host") and cross-forest-objective ("control of THE
+    objective domain X") legitimately have no DA-phrase target and complete via the no-next-hop/milestone
+    fallback — gating on target-parse would wrongly abort valid scenarios. Returns (ok, reason)."""
+    o = str(objective or "").strip()
+    if not o or o.casefold().startswith("sage-engagement"):
+        return False, f"objective is empty/opaque (completion-recognition unreachable): {o!r}"
+    try:
+        from ..langgraph import engagement_state as _es
+    except Exception:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+        import engagement_state as _es  # type: ignore
+    targets = _es._objective_target_domains(o)
+    if targets:
+        return True, f"recognizable: target-matched completion (targets={sorted(targets)})"
+    return True, "recognizable: non-opaque; completion via no-next-hop/milestone fallback (no DA-phrase target)"
+
+
+def _scored_referee_domains(scn) -> set:
+    """AD-direct domains a scenario SCORES (so the run needs out-of-band referee LDAP creds for each).
+    Mirrors run_side's baseline scope EXACTLY, so the preflight validates precisely the creds the run will
+    require — no more, no less."""
+    sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
+    return {d for m, d in ((Milestone.DA_CHILD, CHILD), (Milestone.OBJECTIVE, OBJECTIVE)) if m in sub}
+
+
+def _referee_creds_present(domain: str) -> tuple[bool, str]:
+    """OFFLINE check: the referee config has dc_ip+user+password for `domain` (reads the JSON config; does
+    NOT bind to LDAP). This is the cheap tier of the cred precondition — the live tier (can we actually bind
+    to the DC) genuinely needs the range up, so only the offline tier is hoisted before the reset."""
+    try:
+        from . import live_seams as _ls
+    except Exception:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import live_seams as _ls  # type: ignore
+    try:
+        _ls.referee_domain_entry(domain, config=_ls.load_referee_ldap_config())
+        return True, f"referee creds present for {domain}"
+    except Exception as e:
+        return False, str(e)
+
+
+def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
+    """DECLARED preconditions for a scenario — the manifest the preflight ITERATES (vs a hand-maintained
+    allowlist). Each entry is (name, cost, check) where check()->(ok, detail) and cost is:
+      'offline' — validatable with no lab/reset (hoisted before any expensive step), or
+      'live'    — genuinely needs the running range (cannot be hoisted; runs in-path).
+    The fail-cheap-before-expensive contract: declare a new precondition HERE, never validate it lazily at
+    point-of-use inside the post-reset path. New preconditions are then gated automatically — no one has to
+    "remember to add it to preflight" after the next incident."""
+    scn = _scenario(cfg, scenario_name)
+    checks: list = [("objective-recognizable", "offline", lambda: objective_recognizable(scn.objective))]
+    # 'smoke' tier: needs Mythic/BloodHound UP (but NOT the GOAD range), so still hoistable before the
+    # expensive reset+solve. Fail-CLOSED validity checks that run the EXACT probe queries against the live
+    # schema — a GraphQL field typo / down service fails in ~5s here instead of after a ~2h solve (the
+    # 2026-06-21 `responses{response}` bug). All scenarios score KRBTGT_DUMPED (Mythic); only graph-scoring
+    # scenarios use the BloodHound REST path.
+    checks.append(("mythic-queries-valid", "smoke", lambda: live_seams.mythic_queries_valid()))
+    sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
+    if Milestone.GRAPH_COLLECTED in sub:
+        checks.append(("bloodhound-reachable", "smoke", lambda: live_seams.bloodhound_reachable()))
+    for d in sorted(_scored_referee_domains(scn)):
+        checks.append((f"referee-creds:{d}", "offline", (lambda d=d: _referee_creds_present(d))))
+    return checks
 
 
 def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
@@ -93,8 +173,7 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     # and (b) misread the domain (`net group /domain` only enumerates the host's own domain). Scope the
     # baseline to the AD-direct milestones THIS scenario scores, so e.g. child-da neither queries nor needs
     # referee creds for essos. The baseline is captured pre-solve but off-callback, so it cannot pollute.
-    sub = set(scn.milestone_subset or tuple(Milestone))
-    needed = {d for m, d in ((Milestone.DA_CHILD, CHILD), (Milestone.OBJECTIVE, OBJECTIVE)) if m in sub}
+    needed = _scored_referee_domains(scn)   # same scope the preflight validates creds for (single source)
     reader = live_seams.make_referee_reader() if needed else (lambda _d: set())
     baseline = {d: reader(d) for d in needed}
     probes = build_probes(reader, baseline, scn,
@@ -118,8 +197,10 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
         _elapsed = int(time.time() - _start)
         print(f"[harness/{scenario_name}] solve returned {time.strftime('%H:%M:%S')} "
               f"(elapsed {_elapsed // 60}m{_elapsed % 60}s, status={solve_status})", flush=True)
-        # Record the REAL terminal status (incl. "timeout") in the card -> jsonl, not a hardcoded "done".
-        card = bare_runner.score_from_probes(scn, probes, status=solve_status)
+        # Record the REAL terminal status (incl. "timeout") AND the wall-clock cost in the card -> jsonl.
+        # wall_seconds is the discriminating signal once capability saturates: a completion-recognized clean
+        # stop (status="stopped" well under the budget) vs a churn-to-timeout shows up here, not in capability.
+        card = bare_runner.score_from_probes(scn, probes, status=solve_status, wall_seconds=_elapsed)
     elif side == "bare":
         bare = build_bare_runner(cfg)            # builds its own stripped-Mythic dispatcher (all callbacks)
         result = bare.run(scn.objective)
@@ -218,9 +299,34 @@ def main(argv=None) -> int:
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
     c = sub.add_parser("compare", help="combine recorded ScoreCards for a scenario into a verdict")
     c.add_argument("--scenario", required=True)
+    pf = sub.add_parser("preflight",
+                        help="fast (<5s) check that the scenario objective is completion-recognizable; "
+                             "run BEFORE a reset+solve so a dropped/opaque objective fails cheap, not after 60 min")
+    pf.add_argument("--scenario", required=True)
     args = ap.parse_args(argv)
 
     cfg = Config()
+
+    if args.cmd == "preflight":
+        # Iterate the DECLARED manifest and run every OFFLINE precondition before any expensive step.
+        # Exit non-zero on ANY failure so orchestrate aborts before spending a reset (fail-cheap-first).
+        failures = []
+        offline = [(n, c) for (n, cost, c) in scenario_preconditions(cfg, args.scenario)
+                   if cost in ("offline", "smoke")]
+        for name, check in offline:
+            try:
+                ok, detail = check()
+            except Exception as e:
+                ok, detail = False, f"check raised: {e}"
+            print(f"[preflight/{args.scenario}] {'OK  ' if ok else 'FAIL'} {name}: {detail}", flush=True)
+            if not ok:
+                failures.append(name)
+        if failures:
+            print(f"[preflight/{args.scenario}] {len(failures)} precondition(s) FAILED before any reset: "
+                  f"{failures} — fix these (they are all knowable offline) then re-run.", flush=True)
+            return 2
+        print(f"[preflight/{args.scenario}] all {len(offline)} offline preconditions passed", flush=True)
+        return 0
     if getattr(args, "sage_cb", None) is not None:
         cfg.sage_cb = args.sage_cb
     if getattr(args, "apollo_cb", None) is not None:

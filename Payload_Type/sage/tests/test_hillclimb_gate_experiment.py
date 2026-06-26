@@ -61,3 +61,20 @@ def test_single_verifier_hash_when_frozen():
     rep = gx.run_gate_experiment(list(_ALIGNED), goad_scenarios(), gx.synthetic_runner(_ALIGNED),
                                  seeds=1, write_record=False)
     assert rep.verifier_hash.startswith("sha256:")  # one frozen gauge across all runs
+
+
+def test_build_scorecard_threads_live_probe_flag(monkeypatch):
+    seen = []
+    scn = goad_scenarios()[0]
+
+    def read_ground_truth(scenario, **kwargs):
+        seen.append(kwargs["run_live_probes"])
+        milestones = {Milestone.FOOTHOLD: True}
+        return gx.GroundTruth(scenario.name, milestones, Milestone.FOOTHOLD)
+
+    monkeypatch.setattr(gx, "read_ground_truth", read_ground_truth)
+    monkeypatch.setattr(gx, "read_process_signals", lambda _run_id: None)
+    rec = {"score": 0.1, "status": "pass", "tool_calls": 1, "model_calls": 1, "errors": []}
+    gx.build_scorecard_from_run(rec, scn)
+    gx.build_scorecard_from_run(rec, scn, run_live_probes=True)
+    assert seen == [False, True]

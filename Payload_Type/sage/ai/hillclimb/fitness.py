@@ -91,6 +91,29 @@ class ScoreCard:
     failure_class_counts: dict = field(default_factory=dict)
     # --- validity alarms (C1) ---
     probe_disagreements: list = field(default_factory=list)
+    # --- objective-recognition / clean-stop (Phase-1 signal) ---
+    # True iff the run reached the scenario's TERMINAL milestone by GROUND TRUTH (probe-verified, not the
+    # agent's self-report) AND terminated on its own (clean status, not a churn-to-timeout). This is the
+    # discriminating signal once capability saturates: reach-the-objective-and-stop (status "stopped") beats
+    # reach-the-objective-and-loop-to-timeout, and stopping BEFORE the objective earns nothing (no under-reach
+    # reward). The ground-truth half is Goodhart-safe (probe-derived milestone, never the agent's self-report).
+    # LIMITATION (Forge audit 2026-06-20): the "clean status" half is NOT yet recognition-gated — on the harness
+    # path a normal solve ends with Mythic's default "success"/"stopped" whether Sage RECOGNIZED the objective
+    # or merely terminated (step-limit, wandered-then-ended). It currently discriminates "finished before the
+    # wall-clock" vs "timeout", which catches the present over-reach bug but is NOT safe to OPTIMIZE against until
+    # container/agent_functions/query.py emits a status distinguishing genuine completion-recognition from
+    # budget/step-limit termination, after which _CLEAN_TERMINAL_STATUSES is narrowed to that status. Use as a
+    # diagnostic for now, not as the optimization target.
+    objective_clean_stop: bool = False
+
+
+# Terminal status that means Sage genuinely RECOGNIZED objective completion — set by query.py ONLY when the
+# autonomous solve streamed the objective-completion report (`_objective_completion_report_streamed`), NOT the
+# platform-default "success"/"stopped" that any non-error finish (step-limit, wandered, operator stop) lands
+# on. Gating objective_clean_stop on this — together with the independent out-of-band ground-truth check —
+# is what makes the signal Goodhart-safe: it requires BOTH that the objective is really met (probes) AND that
+# Sage recognized it (this status). A run that reaches the objective but churns/step-limits does NOT qualify.
+_CLEAN_TERMINAL_STATUSES = {"objective-recognized"}
 
 
 def _f(record: dict, key: str, default: float = 0.0) -> float:
@@ -123,6 +146,17 @@ def score(
     capability = ground_truth.furthest.value / _MAX_MILESTONE if _MAX_MILESTONE else 0.0
     substring = _f(r, "score")
 
+    # Objective-recognition / clean-stop signal (Phase-1). Ground-truth-gated: the run reached the scenario's
+    # TERMINAL (highest measurable) milestone, AND it halted on its own (clean status) rather than churning to
+    # the gauge's timeout. `milestones` keys are the scenario's candidate Milestones, so their max is the
+    # objective for that scenario.
+    _terminal = max(milestones) if milestones else None
+    _objective_reached = (
+        _terminal is not None and _terminal != Milestone.FOOTHOLD and ground_truth.furthest == _terminal
+    )
+    _clean_status = str(r.get("status", "")).strip().casefold() in _CLEAN_TERMINAL_STATUSES
+    objective_clean_stop = bool(_objective_reached and _clean_status)
+
     tool_calls = _i(r, "tool_calls")
     model_calls = _i(r, "model_calls")
 
@@ -149,6 +183,7 @@ def score(
         failure_class_counts=(dict(process.failure_class_counts) if process else {}),
         probe_disagreements=[m.name if isinstance(m, Milestone) else str(m)
                              for m in (ground_truth.probe_disagreements or [])],
+        objective_clean_stop=objective_clean_stop,
     )
 
 

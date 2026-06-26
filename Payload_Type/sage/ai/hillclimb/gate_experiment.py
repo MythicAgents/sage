@@ -78,6 +78,7 @@ class GateExperimentReport:
     low_truth: float = 0.3
     verdict: str = "INSUFFICIENT"                          # PASS | FAIL | INSUFFICIENT | INVALID
     note: str = ""
+    record_written: bool = False                          # did the durable jsonl write succeed?
 
 
 def default_results_dir() -> Path:
@@ -108,6 +109,8 @@ def run_gate_experiment(
         for scn in scenarios:
             for seed in range(seeds):
                 card = run_fn(config, scn, seed)
+                if card is None:                  # a dropped/failed run (e.g. empty batch) — skip, don't crash
+                    continue
                 cards.append(card)
                 hashes.add(card.verifier_hash)
                 total += 1
@@ -128,7 +131,17 @@ def run_gate_experiment(
         vh = "MIXED:" + ",".join(sorted(hashes))
     else:
         vh = next(iter(hashes)) if hashes else "none"
-        if len(per_config) < 3 or rho is None:
+        max_cap = max(caps) if caps else 0.0
+        if total > 0 and max_cap <= 0.0:
+            # Every config produced zero ground-truth capability. Almost never a real result — it means the
+            # per-run engagement-id and config never reached the Sage process (the harness drives the
+            # already-running Sage callback; SAGE_ENGAGEMENT_ID/config set on the harness subprocess do not
+            # reach it). Fail LOUD instead of emitting a confident PASS/FAIL on no data.
+            verdict, note = "INVALID", (
+                "ground truth uniformly empty/zero across all configs — the per-run engagement-id/config almost "
+                "certainly never reached Sage. Fix the reset to restart Sage with SAGE_ENGAGEMENT_ID=<run token> "
+                "AND the config before trusting any verdict (see gate_live.py honest-seam note).")
+        elif len(per_config) < 3 or rho is None:
             verdict, note = "INSUFFICIENT", "need >=3 (ideally 5-8) known-different configs to judge the gauge"
         elif rho >= rho_threshold and not danger:
             verdict, note = "PASS", "gauge ranks configs like ground truth; safe to optimize against"
@@ -144,8 +157,9 @@ def run_gate_experiment(
     if write_record:
         try:
             write_gate_record(report, results_dir=results_dir)
+            report.record_written = True
         except Exception:
-            pass
+            report.record_written = False  # a multi-hour run with no durable record must be visible, not silent
     return report
 
 
@@ -165,11 +179,12 @@ def build_scorecard_from_run(
     engagement_id: str | None = None,
     trajectory_run_id: str | None = None,
     gauge_version: str = GAUGE_VERSION,
+    run_live_probes: bool = False,
 ) -> ScoreCard:
     """Compose a ScoreCard from a real harness run: C1 ground truth (from the run's ledger key)
     + C1b tradecraft + C2 fitness. `engagement_id`/`trajectory_run_id` are the live runner's
     fresh per-run keys. This is the grounded glue the LIVE runner uses."""
-    gt = read_ground_truth(scenario, engagement_id=engagement_id)
+    gt = read_ground_truth(scenario, engagement_id=engagement_id, run_live_probes=run_live_probes)
     proc = read_process_signals(trajectory_run_id)  # None -> whole store
     return _score(harness_record, gt, proc, scenario=scenario, gauge_version=gauge_version)
 

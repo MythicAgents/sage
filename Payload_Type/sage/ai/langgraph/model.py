@@ -4,6 +4,7 @@ import os
 import re
 import asyncio
 import aiosqlite
+from dataclasses import dataclass
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -47,6 +48,10 @@ import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
+# Halt the autonomous solve after this many consecutive capability steps that add NO new achieved effect
+# (the ledger doesn't grow) — a stall detector so a dead/unsatisfiable hop (e.g. a dcsync that keeps failing)
+# halts with a report instead of looping forever and burning tokens.
+_AUTONOMOUS_STALL_LIMIT = 6
 _DEFAULT_GRAPH_RECURSION_LIMIT = 250
 _TOON_SENTINEL = "⟦TOON "
 _TRUNCATION_MARKER = "[truncated"
@@ -65,10 +70,27 @@ def _env_positive_int(name: str, default: int) -> int:
     return value if value >= 1 else default
 
 
+def _controller_flag_enabled() -> bool:
+    """Use deterministic control by default for autonomous solves, with an explicit legacy-path rollback."""
+    value = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    if value is None or not value.strip():
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 _AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT = _env_positive_int(
     "SAGE_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT",
     100000,
 )
+
+
+@dataclass(frozen=True)
+class _ControllerCollectionRequest:
+    foothold: Any
+    scope_domain: str = ""
+    reason: str = ""
+    collection_key: str = ""
+    support: str = ""
 
 
 def _is_scalar_tool_value(value: Any) -> bool:
@@ -640,6 +662,15 @@ class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
         terminal_payload = _terminal_execute_capability_payload(messages)
         if terminal_payload is None:
             return None
+        # Control-state P0: feed the terminal capability outcome to the loop-breaker. The fresh execute_capability
+        # tool-call id is the per-turn dedup key (re-delegations get a new id, so cross-turn repeats still count).
+        try:
+            _calls = _latest_ai_tool_calls(messages)
+            _eid = next((str(tc.get("id")) for tc in _calls
+                         if (tc.get("name") or "") == "execute_capability" and tc.get("id")), "")
+            self._model._note_capability_outcome(terminal_payload, _eid)
+        except Exception:
+            pass
         try:
             logger.info(
                 "✅ [execute-capability-boundary] terminal execute_capability result "
@@ -831,6 +862,7 @@ class SageState(MessagesState):
     count: int
     remaining_steps: RemainingSteps
     mode: NotRequired[Literal["auto", "supervised"]]
+    next_owner: NotRequired[str]
     recursion_summary_requested: bool
     recursion_handback: bool
     supervisor_messages: Annotated[list[AnyMessage], operator.add]
@@ -1238,6 +1270,14 @@ class Model:
         self._global_step_count = 0
         self._global_step_limit_hit = False
         self._objective_completion_report_streamed = False
+        # Autonomous-solve stall detector state (reset per solve in invoke() so counters never cross objectives).
+        self._autonomous_stall_progress = None
+        self._autonomous_stall_count = 0
+        self._autonomous_stall_sig = None
+        # Control-state loop-breaker (P0): see _note_capability_outcome. The per-solve state object is (re)created
+        # in invoke() so a prior objective's blockers never leak into the next solve (a Sage session reuses one
+        # Model across invoke() calls — the same reuse hazard as the stall counters).
+        self._loop_breaker = None
         # Initialize dynamic data cache
         self._payload_names = None
         self._c2_profiles = None
@@ -2384,6 +2424,24 @@ class Model:
                 return None
             return None
         action = actions[0]
+        # Stall detector: halt if the SAME hop is re-selected with no ledger progress for N consecutive steps
+        # (a dead hop, e.g. a dcsync whose precondition/execution keeps failing) — recover instead of looping
+        # and burning tokens. Skip when the objective is already a completion candidate, so a just-completed
+        # run reports completion, not "stalled".
+        try:
+            _progress = len(snapshot.achieved_effects())
+        except Exception:
+            _progress = 0
+        try:
+            from . import engagement_state as _es_stall
+        except ImportError:
+            import engagement_state as _es_stall
+        try:
+            _complete = str(_es_stall.engagement_phase(snapshot)).startswith("COMPLETE-CANDIDATE")
+        except Exception:
+            _complete = False
+        if not _complete and self._autonomous_stall_halt(_progress, _action_signature(action)):
+            return "__terminal__", _autonomous_stall_report(snapshot)
         instruction = _compiled_autonomous_capability_instruction(
             action,
             snapshot,
@@ -2391,6 +2449,55 @@ class Model:
             requested_agent=agent_name,
         )
         return "Autonomous_Executor", instruction
+
+    def _note_capability_outcome(self, payload, turn_key: str = "") -> None:
+        """Observe a terminal execute_capability result (control-state P0 loop-breaker).
+
+        When the SAME blocker (capability + reason) recurs with NO progress since last seen, request a clean
+        stop instead of letting the supervisor re-delegate the identical blocked action — the 1116 461K-token
+        loop. Keyed on the worker's blocker, so it is immune to the supervisor's paraphrasing (which defeated the
+        action-signature stall detector). `turn_key` dedups multiple middleware fires WITHIN one worker turn (the
+        execute_capability tool-call id is fresh per re-delegation, so cross-turn repeats still count). Fail-open:
+        never raises into the agent loop."""
+        try:
+            if not isinstance(payload, dict) or self._loop_breaker is None:
+                return
+            try:
+                from . import worker_outcome as _wo
+            except ImportError:
+                import worker_outcome as _wo
+            # All dedup (incl. the empty-turn_key guard), epoch, and decision logic lives in the pure
+            # observe_capability_outcome (unit-tested) — this stays a thin, fail-open shell.
+            should_halt = _wo.observe_capability_outcome(
+                self._loop_breaker, str(payload.get("capability") or ""), payload, turn_key)
+            if should_halt and not getattr(self, "_stop_requested", False):
+                self._stop_requested = True
+                logger.warning(
+                    "🛑 [terminal-blocker] same blocker recurred with no progress — halting the solve instead of "
+                    "re-delegating it (control-state P0; kills the supervisor↔worker loop).")
+        except Exception:
+            pass
+
+    def _autonomous_stall_halt(self, progress: int, action_sig=None) -> bool:
+        """Track progress across autonomous capability steps. `progress` is the count of achieved effects;
+        `action_sig` identifies the selected hop. Returns True only when the SAME hop has been re-selected with
+        NO new progress for _AUTONOMOUS_STALL_LIMIT consecutive steps — the dead-loop signature. Real progress
+        (count grows) OR moving to a DIFFERENT hop resets the counter, so a solve that keeps advancing — or that
+        legitimately works through distinct multi-step precondition hops — never trips; only a genuinely stuck
+        re-selection of one dead hop does. Pure counter; never raises."""
+        last_progress = getattr(self, "_autonomous_stall_progress", None)
+        last_sig = getattr(self, "_autonomous_stall_sig", None)
+        progressed = last_progress is not None and progress > last_progress
+        if progressed or action_sig != last_sig:
+            self._autonomous_stall_count = 0
+        else:
+            self._autonomous_stall_count = getattr(self, "_autonomous_stall_count", 0) + 1
+        self._autonomous_stall_progress = progress
+        self._autonomous_stall_sig = action_sig
+        if self._autonomous_stall_count >= _AUTONOMOUS_STALL_LIMIT:
+            self._autonomous_stall_count = 0  # reset after signalling so a resumed solve gets a fresh window
+            return True
+        return False
 
     def _objective_completion_report(self, *, require_autonomous: bool = True) -> str | None:
         """Return a terminal objective-complete report when the observed state proves it."""
@@ -2444,6 +2551,488 @@ class Model:
             return "\n".join(lines)
         except Exception:
             return None
+
+    def _should_use_controller(self, is_interactive: bool) -> bool:
+        """Whether the deterministic autonomous controller should handle this solve. ALL must hold:
+        autonomous_solve, AUTO mode (supervised keeps operator HITL approval for guarded tools — the controller
+        would bypass it), the FIRST/non-interactive turn, and no explicit rollback override."""
+        return bool(
+            getattr(self, "_autonomous_solve", False)
+            and getattr(self, "mode", "auto") == "auto"
+            and not is_interactive
+            and _controller_flag_enabled()
+        )
+
+    async def _run_autonomous_controller(self, prompt: str) -> str:
+        """Run the deterministic AutonomousController for a feature-flagged autonomous solve.
+
+        OWNS the observe -> frontier -> select -> execute -> verify -> stop cycle in deterministic code; the LLM
+        is NOT in the control loop. Returns a terminal report (also streamed to Mythic). Each seam emits a
+        runtime FIRE-LOG so we can PROVE the real boundary fired (the C2 'green tests, dead seam' lesson — the
+        controller's unit tests use fakes; this proves execute_capability's STRING return actually flows here).
+
+        Collection is deterministic too: initial current-forest collection runs when no verified graph exists for
+        that domain, then later collection is allowed only when the real capability frontier is empty and there is
+        a concrete reason: a new graph-visible authority epoch or an uncollected trusted domain that supports the
+        objective.
+        """
+        try:
+            from . import autonomous_controller as _ctrl
+            from . import capabilities as _cap
+            from . import engagement_state as _es
+        except ImportError:
+            import autonomous_controller as _ctrl
+            import capabilities as _cap
+            import engagement_state as _es
+
+        def fire(msg: str) -> None:
+            logger.info(f"[autonomous-controller] {msg}")
+
+        snap = {"state": None, "collection_request": None}
+
+        async def observe():
+            state = await self._build_current_engagement_state()
+            # _build_current_engagement_state intentionally omits graph_facts, but actions_from_state derives
+            # GPO/credential/managed-secret/ADCS actions FROM graph_facts — without them the frontier is falsely
+            # empty at exactly those walls (Forge HIGH). Refresh-if-stale (so post-collect ingestion is visible)
+            # then attach the cached facts. Fail-open: graph-fact errors must not break the loop.
+            if state is not None and self.mythic_client is not None:
+                try:
+                    from datetime import datetime, timezone
+                    await self.mythic_client._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat())
+                    state.graph_facts = list(getattr(self.mythic_client, "_engagement_graph_facts", []) or [])
+                except Exception:
+                    pass
+            snap["state"] = state
+            hops = len(getattr(state, "hops", []) or []) if state is not None else -1
+            gf = len(getattr(state, "graph_facts", []) or []) if state is not None else -1
+            fire(f"observe -> {'None' if state is None else f'{hops} hops, {gf} graph_facts'}")
+            return state
+
+        async def execute(action):
+            payload = _capability_action_payload(action)
+            inputs = _autonomous_capability_inputs(action, snap["state"])
+            fire(f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}")
+            result = await self.mythic_client.execute_capability(payload, inputs)
+            kind = type(result).__name__
+            size = len(result) if isinstance(result, str) else "n/a"
+            fire(f"execute returned {kind} (len={size})")  # PROVE the real string-return boundary fired
+            return result
+
+        def needs_collection(state):
+            # N2: signal collection ONLY when a SUPPORTED (Apollo) foothold actually needs it — aligned with
+            # _controller_collection_target — so an unsupported-agent missing foothold doesn't trigger a
+            # collect()->no_target slot burn. (current_access_collection_missing counts ALL agents.)
+            try:
+                frontier_empty = not bool(_cap.actions_from_state(state))
+                if not frontier_empty:
+                    snap["collection_request"] = None
+                    return False
+                request = self._controller_collection_request(
+                    state,
+                    include_trusted_scope=True,
+                    include_optional_recollection=True,
+                )
+                snap["collection_request"] = request
+                return request
+            except Exception:
+                snap["collection_request"] = None
+                return False
+
+        async def collect(state):
+            request = snap.get("collection_request")
+            snap["collection_request"] = None
+            return await self._controller_collect(state, request=request)
+
+        def objective_met(state):
+            try:
+                if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
+                    return False
+                cands = _es.objective_completion_candidates(state)
+                targets = list(_es._objective_target_domains(getattr(state, "objective", "") or ""))
+                if targets:
+                    # domain-equivalence (lab == lab.example.local), matching real completion semantics — raw
+                    # casefold equality would drop a valid candidate and MISS completion -> over-reach (Forge MEDIUM).
+                    cands = [c for c in cands
+                             if any(_es._domains_equivalent(str(c.get("domain", "")), t) for t in targets)]
+                return bool(cands)
+            except Exception:
+                return False
+
+        start = asyncio.get_event_loop().time()
+
+        def clock():
+            return asyncio.get_event_loop().time() - start
+
+        cfg = _ctrl.ControllerConfig(
+            seam_timeout_s=float(_env_positive_int("SAGE_CONTROLLER_SEAM_TIMEOUT_S", 900)),
+            wall_clock_budget_s=float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700)),
+            token_budget=_env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000),
+            max_cycles=_env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
+        )
+
+        fire(f"START (flagged) objective_seed='{(prompt or '')[:80]}' "
+             f"seam_timeout={cfg.seam_timeout_s}s wall={cfg.wall_clock_budget_s}s")
+        controller = _ctrl.AutonomousController(
+            observe=observe,
+            execute=execute,
+            objective_met=objective_met,
+            needs_collection=needs_collection,
+            collect=collect,
+            frontier_fn=_cap.actions_from_state,
+            clock=clock,
+            should_abort=lambda: bool(getattr(self, "_stop_requested", False)),  # operator kill switch between cycles
+            config=cfg,
+            logger=fire,
+        )
+        result = await controller.run()
+        fire(f"DONE status={result.status} cycles={result.cycle_count} "
+             f"effects={len(result.achieved_effects)} reason={result.reason}")
+
+        report = None
+        if result.status == _ctrl.STATUS_COMPLETE:
+            report = self._objective_completion_report(require_autonomous=False)
+        if not report:
+            report = self._controller_terminal_report(result)
+        # Persist the assistant turn to state so a reused Model on a later interactive turn does not see a
+        # human prompt with no recorded reply (Forge MEDIUM: dangling-turn hazard).
+        report_msg = AIMessage(content=report, name="Autonomous_Controller")
+        try:
+            _tag_msg(report_msg, self._next_seq())
+            self.state.setdefault("messages", []).append(report_msg)
+            self.state.setdefault("supervisor_messages", []).append(report_msg)
+        except Exception:
+            pass
+        try:
+            formatted = self._format_message_for_streaming(report_msg, agent_name="Autonomous_Controller")
+            if formatted:
+                await self._stream_message_to_mythic(formatted)
+        except Exception:
+            pass
+        return report
+
+    def _controller_terminal_report(self, result) -> str:
+        """Render a terminal controller result as an operator-facing report. Range-agnostic: lists status,
+        reason, the precise blocker (if any), and achieved effects. Scenario 'wall' mapping is the eval layer's
+        job (ai/hillclimb/wall_checkpoints.py), not the runtime's."""
+        lines = [f"Autonomous controller halted: **{result.status}** — {result.reason}.",
+                 f"Cycles: {result.cycle_count}. Verified effects: {len(result.achieved_effects)}."]
+        blocker = result.blocker or {}
+        if blocker:
+            if blocker.get("capability"):
+                lines.append(f"Blocker: `{blocker.get('capability')}` — {blocker.get('reason') or 'blocked'}.")
+                if blocker.get("suggested_capability"):
+                    lines.append(f"Suggested prerequisite: `{blocker.get('suggested_capability')}`.")
+            elif blocker.get("reason"):
+                lines.append(f"Blocker: {blocker.get('reason')}.")
+        if result.achieved_effects:
+            lines.append("Achieved effects:")
+            lines.extend(f"- `{e}`" for e in result.achieved_effects[:40])
+        return "\n".join(lines)
+
+    def _controller_collection_target(self, state):
+        """The SPECIFIC live SUPPORTED-AGENT foothold whose CURRENT authority epoch has no verified collection.
+        Aligned with `current_access_collection_missing` (scans ALL footholds, not just the first) so we don't
+        re-collect an already-covered authority epoch forever while the missing one is never collected (Forge H3) — but
+        ADDITIONALLY filtered to Apollo, the only agent this deterministic collector supports. Selecting an
+        unsupported-agent foothold and then rejecting it would burn collection slots and starve a collectable
+        Apollo foothold (Forge N2). Returns a Foothold or None."""
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        try:
+            for fh in (getattr(state, "footholds", []) or []):
+                if not _es._is_live_target_foothold(fh):
+                    continue
+                if str(getattr(fh, "agent", "") or "").strip().lower() != "apollo":
+                    continue  # N2: skip unsupported agents at SELECTION, never select-then-reject
+                if not _es.graph_collection_covers_foothold(state, fh):
+                    return fh
+        except Exception:
+            return None
+        return None
+
+    def _controller_latest_capability_failure_is_retryable(self, state) -> bool:
+        """Do not turn a repairable capability failure into an unrelated graph collection.
+
+        The executor records construction/transient failures for traceability, but marks
+        them non-terminal so the same grounded action can be repaired or retried. If the
+        latest capability hop has that marker, an empty frontier is a repair/control
+        problem, not evidence that BloodHound coverage is missing.
+        """
+        try:
+            for hop in reversed(list(getattr(state, "hops", []) or [])):
+                technique = str(getattr(hop, "technique", "") or "").strip().casefold()
+                if not technique.startswith("capability:"):
+                    continue
+                status = str(getattr(hop, "status", "") or "").strip().casefold()
+                evidence = getattr(hop, "evidence", {})
+                return (
+                    status in {"failed", "blocked"}
+                    and isinstance(evidence, dict)
+                    and evidence.get("terminal_failure") is False
+                )
+        except Exception:
+            return False
+        return False
+
+    def _controller_collection_request(
+        self,
+        state,
+        include_trusted_scope: bool = False,
+        include_optional_recollection: bool = False,
+    ):
+        """Return the next deterministic collection request.
+
+        Ordering is objective-driven:
+
+        1. A domain with no verified collection at all gets one baseline collection.
+        2. Once baseline graph exists, an objective-target trusted domain that is visible but uncollected wins.
+        3. Only when no grounded action remains may a new modeled authority epoch recollect the current forest.
+        4. Other trusted-domain expansion remains available after the objective-target and authority cases.
+
+        This prevents raw credential/ticket churn from preempting the route the graph already exposes."""
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        supported_footholds = [
+            fh for fh in (getattr(state, "footholds", []) or [])
+            if _es._is_live_target_foothold(fh)
+            and str(getattr(fh, "agent", "") or "").strip().casefold() == "apollo"
+        ]
+        if not supported_footholds:
+            return None
+
+        def request_for(foothold, *, scope_domain: str = "", reason: str, support: str):
+            return _ControllerCollectionRequest(
+                foothold=foothold,
+                scope_domain=scope_domain,
+                reason=reason,
+                collection_key=_es.collection_target_key(state, foothold, scope_domain),
+                support=support,
+            )
+
+        # Initial coverage is not optional. Without one verified graph for this domain, there is no reliable
+        # basis for capability selection or trust expansion.
+        for candidate in supported_footholds:
+            if _es.graph_collection_covers_foothold(state, candidate):
+                continue
+            forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
+            if not _es.graph_domain_has_verified_collection(state, forest):
+                return request_for(
+                    candidate,
+                    reason="baseline",
+                    support=f"no verified collection exists for {forest or 'the foothold forest'}",
+                )
+
+        if self._controller_latest_capability_failure_is_retryable(state):
+            return None
+
+        trusted_domains = _es.trusted_uncollected_domains(state) if include_trusted_scope else []
+        objective_targets = list(_es._objective_target_domains(getattr(state, "objective", "") or ""))
+
+        def objective_scope(domain: str) -> bool:
+            return any(_es._domains_equivalent(domain, target) for target in objective_targets)
+
+        objective_coverage_complete = bool(objective_targets) and all(
+            _es.graph_domain_has_verified_collection(state, target)
+            for target in objective_targets
+        )
+
+        # If BloodHound already exposes the objective domain as reachable but uncollected, collect that scope
+        # before spending a cycle on an optional current-forest recollection.
+        for scope_domain in trusted_domains:
+            if not objective_scope(scope_domain):
+                continue
+            for candidate in supported_footholds:
+                if not _es.graph_collection_covers_scope(state, candidate, scope_domain):
+                    return request_for(
+                        candidate,
+                        scope_domain=scope_domain,
+                        reason="objective-scope-expansion",
+                        support=f"objective domain {scope_domain} is trusted and uncollected",
+                    )
+
+        # A new authority epoch is only an optional collection reason while the objective still lacks verified
+        # domain coverage. Once the objective domain is already collected, an empty frontier is a real blocker or
+        # capability gap, not a reason to run SharpHound again under a different token.
+        if include_optional_recollection and not objective_coverage_complete:
+            for candidate in supported_footholds:
+                if _es.graph_collection_covers_foothold(state, candidate):
+                    continue
+                forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
+                if _es.graph_domain_has_verified_collection(state, forest):
+                    return request_for(
+                        candidate,
+                        reason="authority-change",
+                        support=f"new collection authority epoch is not covered for {forest or 'the foothold forest'}",
+                    )
+
+        for scope_domain in trusted_domains:
+            if objective_scope(scope_domain):
+                continue
+            for candidate in supported_footholds:
+                if not _es.graph_collection_covers_scope(state, candidate, scope_domain):
+                    return request_for(
+                        candidate,
+                        scope_domain=scope_domain,
+                        reason="trusted-scope-expansion",
+                        support=f"trusted domain {scope_domain} is visible and uncollected",
+                    )
+        return None
+
+    async def _controller_collect(self, state, request=None) -> dict:
+        """Deterministic collect-once for the controller: run SharpHound (execute_assembly) -> download the ZIP
+        -> ingest the FRESH artifact. Polling/waiting is deterministic (issue_task_and_waitfor_task_output), OFF
+        the model path (the 'remove polling from model reasoning' P1 win). Range-agnostic: canonical SharpHound
+        2.x args + canonical output path; no range literals.
+
+        FAIL-CLOSED on a failed collection: issue_task_and_waitfor_task_output returns a failure STRING without
+        raising, so we never trust that SharpHound ran. SharpHound prepends a timestamp to `--ZipFilename`, so
+        the on-disk name is NOT predictable — instead we give it a UNIQUE per-run token name (opsec + anchor),
+        then DISCOVER the real path via a structured `ls` of the output dir filtered to our token, and download
+        THAT exact path. If no token-bearing ZIP exists, SharpHound failed -> no artifact ingested. Ingest is by
+        the resolved `file_uuid` (the exact artifact), with `callback_display_id` so `_record_graph_built` flips
+        the collection gate. `ok` is driven by `graph_verified` (Forge H2): only `ingested`/`already_ingested`
+        set it True; `ingest_failed`/`uploaded_pending_ingest`/`error` are NOT success, so the collection stays
+        'missing' and the controller's per-request retry budget may re-run it (self-heal by composition)."""
+        try:
+            from . import mythic_tools as _mt
+        except ImportError:
+            import mythic_tools as _mt
+
+        def fire(msg: str) -> None:
+            logger.info(f"[autonomous-controller:collect] {msg}")
+
+        request = request or self._controller_collection_request(state)
+        foothold = getattr(request, "foothold", None)
+        scope_domain = str(getattr(request, "scope_domain", "") or "").strip().casefold()
+        collection_reason = str(getattr(request, "reason", "") or "").strip()
+        collection_key = str(getattr(request, "collection_key", "") or "").strip()
+        if not collection_key and foothold is not None:
+            try:
+                from . import engagement_state as _es
+            except ImportError:
+                import engagement_state as _es
+            collection_key = _es.collection_target_key(state, foothold, scope_domain)
+
+        def outcome(ok: bool, status: str, reason: str = "") -> dict:
+            result = {
+                "ok": ok,
+                "status": status,
+                "collection_reason": collection_reason,
+                "collection_key": collection_key,
+                "scope_domain": scope_domain,
+            }
+            if reason:
+                result["reason"] = reason
+            return result
+
+        if foothold is None:
+            # No SUPPORTED (Apollo) foothold needs collection. (An unsupported-agent foothold that is missing
+            # collection is deliberately not selected — see _controller_collection_target / Forge N2.)
+            return outcome(False, "no_target", "no supported (Apollo) foothold needs collection")
+        cb = str(getattr(foothold, "callback_id", "") or "").strip()
+        try:
+            cb_int = int(cb.lstrip("#").removeprefix("cb"))
+        except (TypeError, ValueError):
+            return outcome(False, "bad_callback", f"non-numeric callback id {cb!r}")
+
+        host = str(getattr(foothold, "host", "") or "").strip()
+        try:
+            context = await self.mythic_client.probe_authentication_context(cb_int, host=host)
+        except Exception as e:
+            return outcome(False, "identity_probe_failed", f"{type(e).__name__}: {e}")
+
+        if not context.domain_capable:
+            fire(f"callback authentication context is local-only ({context.evidence}); restoring process context")
+            try:
+                await self.mythic_client.issue_task_and_waitfor_task_output("rev2self", "", cb_int)
+                context = await self.mythic_client.probe_authentication_context(cb_int, host=host)
+            except Exception as e:
+                return outcome(False, "identity_restore_failed", f"{type(e).__name__}: {e}")
+            if not context.domain_capable:
+                return outcome(
+                    False,
+                    "no_domain_identity",
+                    f"SharpHound requires domain authentication; observed {context.evidence}",
+                )
+        fire(
+            f"verified callback authentication context luid={context.current_luid or 'unknown'} "
+            f"evidence={context.evidence}"
+        )
+
+        # UNIQUE per-run ZIP name: good opsec (controlled name) + a random anchor so discovery cannot match any
+        # other file. Range-agnostic (random token, not a range literal).
+        import secrets as _secrets
+        token = _secrets.token_hex(8)  # 64-bit anchor (Forge LOW: avoid any same-token stale-row collision)
+        zip_name = f"bloodhound_{token}.zip"
+        args = _mt.build_sharphound_arguments(zip_filename=zip_name, domain=scope_domain)
+        out_dir = _mt.SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY
+        try:
+            scope_note = f" scope={scope_domain}" if scope_domain else " scope=current-forest"
+            reason_note = f" reason={collection_reason}" if collection_reason else ""
+            fire(f"SharpHound execute_assembly on cb={cb_int}:{scope_note}{reason_note} {args}")
+            await self.mythic_client.issue_task_and_waitfor_task_output(
+                "execute_assembly",
+                {"assembly_name": "SharpHound.exe", "assembly_arguments": args},
+                cb_int,
+            )
+            # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
+            # output dir, find the file carrying our token. Bounded retry for filesystem latency.
+            real_path = ""
+            for _attempt in range(4):
+                ls_out = await self.mythic_client.issue_task_and_waitfor_task_output(
+                    "ls", {"path": out_dir}, cb_int)
+                real_path = _find_token_zip_path(ls_out, token)
+                if real_path:
+                    break
+                await asyncio.sleep(2)
+            if not real_path:
+                fire("no token-bearing SharpHound ZIP found in the output dir -> collection failed (not ingesting)")
+                return outcome(False, "no_collection_artifact",
+                               "SharpHound produced no collection ZIP carrying this run's token")
+            fire(f"discovered collection artifact: {real_path}")
+            await self.mythic_client.issue_task_and_waitfor_task_output(
+                "download", {"path": real_path}, cb_int,
+            )
+            # Resolve the Mythic download by our token -> file_uuid (bounded retry; completed-download filemeta is
+            # not always visible immediately).
+            row = None
+            for _attempt in range(4):
+                row = await self.mythic_client._latest_download_for_callback(cb_int, token)
+                if isinstance(row, dict) and row.get("agent_file_id"):
+                    break
+                await asyncio.sleep(2)
+            file_uuid = row.get("agent_file_id") if isinstance(row, dict) else None
+            if not file_uuid:
+                fire("downloaded artifact not visible in Mythic filemeta -> not ingesting")
+                return outcome(False, "no_fresh_collection",
+                               "the downloaded collection ZIP was not found in Mythic")
+            file_name = (row.get("filename_utf8") if isinstance(row, dict) else "") or zip_name
+            fire(f"ingest_collection(file_uuid={file_uuid}, callback_display_id={cb_int})")
+            # file_uuid wins for RESOLUTION (the exact discovered artifact); callback_display_id lets
+            # _record_graph_built flip the collection gate (it early-returns on a None callback).
+            ingest_raw = await self.mythic_client.ingest_collection(
+                file_uuid=file_uuid,
+                callback_display_id=cb_int,
+                file_name=file_name,
+                collection_scope_domain=scope_domain,
+            )
+        except Exception as e:
+            fire(f"collect failed: {type(e).__name__}: {e}")
+            return outcome(False, "error", f"{type(e).__name__}: {e}")
+
+        try:
+            parsed = json.loads(ingest_raw) if isinstance(ingest_raw, str) else (ingest_raw or {})
+        except Exception:
+            parsed = {}
+        ok = bool(parsed.get("graph_verified")) if isinstance(parsed, dict) else False
+        status = str(parsed.get("status", "")) if isinstance(parsed, dict) else ""
+        fire(f"ingest status={status} graph_verified={ok}")
+        return outcome(ok, status or "unknown")
 
     async def _autonomous_executor_node(self, state: SageState | dict, config=None):
         """Execute a compiled autonomous capability step without another LLM handoff."""
@@ -2754,7 +3343,10 @@ class Model:
             handback_tool = _create_summarize_handback_tool()
             # Explicit autonomous handback to the Supervisor (routes to Supervisor, does NOT end the run) —
             # the continue-loop consumes plain turn-ends, so this is the Operator's path to cross-agent routing.
-            handback_to_supervisor_tool = _create_handback_to_supervisor_tool(self.mythic_client)
+            handback_to_supervisor_tool = _create_handback_to_supervisor_tool(
+                self.mythic_client,
+                autonomous=bool(self._autonomous_solve),
+            )
 
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
@@ -3510,6 +4102,30 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         logger.info(f"HITL interrupt surfaced to operator ({len(lines)} action(s)); awaiting approve/deny")
         return True
 
+    def _seed_autonomous_objective(self, prompt: str) -> None:
+        """For an autonomous solve the prompt IS the mission: seed it on the client so
+        MythicTools._engagement_objective() adopts it when no operator/env/ledger objective exists. Clearing
+        the one-shot persist latch on a NEW prompt lets a reused client re-adopt per solve (an operator-set
+        objective stays sticky — the persist path refuses to clobber it). Then a LOUD guard: if the objective
+        STILL resolves opaque (blank/opaque prompt AND no operator/env objective), warn once — in that case
+        completion-recognition (engagement_state._objective_is_complete) is unreachable and the solve would
+        silently over-reach until the stall detector halts it. No-op unless this is an autonomous solve with a
+        live client. Fail-open: never breaks the solve."""
+        if not getattr(self, "_autonomous_solve", False) or self.mythic_client is None:
+            return
+        try:
+            if self.mythic_client._autonomous_objective_seed != prompt:
+                self.mythic_client._autonomous_objective_seed = prompt
+                self.mythic_client._autonomous_objective_persisted = False
+            if str(self.mythic_client._engagement_objective() or "").startswith("sage-engagement"):
+                logger.warning(
+                    "⚠️ autonomous solve has no resolvable objective (opaque sage-engagement:* fallback) — "
+                    "completion-recognition is UNREACHABLE; set SAGE_ENGAGEMENT_OBJECTIVE or run "
+                    "`state objective <text>`. The solve will run but cannot recognize completion."
+                )
+        except Exception:
+            pass
+
     async def invoke(self, prompt: str, is_interactive: bool = False) -> str:
         """
         Invoke the model with a prompt and return the response.
@@ -3519,6 +4135,24 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """
         # Store for use in streaming formatter
         self.is_interactive = is_interactive
+        # Fresh stall-detector window per solve — never carry a prior objective's counters into this one
+        # (a Sage session may reuse one Model across invoke() calls).
+        self._autonomous_stall_progress = None
+        self._autonomous_stall_count = 0
+        self._autonomous_stall_sig = None
+        # Fresh control-state loop-breaker per solve (same Model-reuse hazard as the stall counters above) so a
+        # prior objective's blockers never carry into this solve (Forge-caught cross-solve leak).
+        try:
+            from . import worker_outcome as _wo_init
+        except ImportError:
+            import worker_outcome as _wo_init
+        self._loop_breaker = _wo_init.LoopBreakerState()
+        # Self-describe the mission: for an autonomous solve the prompt IS the objective, so seed it on the
+        # client. _engagement_objective() adopts it as the engagement objective when none is set, so
+        # completion-recognition has a parseable target instead of the opaque sage-engagement:<task> fallback
+        # (which is never completable) — the root cause of post-objective over-reach. Generic to any caller;
+        # never overwrites an operator/env objective. No I/O here (deferred to the resolved-key write).
+        self._seed_autonomous_objective(prompt)
         try:
             self._register_running_task(asyncio.current_task())
         except RuntimeError:
@@ -3586,6 +4220,28 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             require_autonomous=False,
         ):
             return ""
+
+        # Deterministic autonomous controller. For autonomous auto one-shots, OWN the
+        # observe->frontier->select->execute->verify->stop cycle in deterministic code, bypassing the
+        # Supervisor/worker astream negotiation entirely. SAGE_AUTONOMOUS_CONTROLLER=0 is the rollback path.
+        # SAFETY GATE (Forge CRITICAL): only in AUTO mode and only on the FIRST (non-interactive) turn. In
+        # supervised mode guarded tools (execute_capability) require operator HITL approval via the astream
+        # middleware path — the controller calls execute_capability directly, so it MUST NOT run in supervised
+        # mode or it would fire live offensive capabilities without approval. Interactive follow-ups also fall
+        # through to the normal path.
+        if self._should_use_controller(is_interactive):
+            try:
+                return await self._run_autonomous_controller(prompt)
+            except asyncio.CancelledError:
+                logger.info("🛑 Autonomous controller cancelled — clean stop")
+                try:
+                    await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                logger.error(f"Autonomous controller failed: {e}", exc_info=True)
+                return f"Autonomous controller error: {type(e).__name__}: {e}"
 
         try:
             # Use a central graph recursion budget so operator-facing max_steps=0 can mean
@@ -4453,7 +5109,52 @@ def _build_esl_summary(mythic_client) -> str:
     return "\n".join(lines[:12])
 
 
-def _create_handback_to_supervisor_tool(mythic_client=None):
+def _deterministic_post_ingest_owner(mythic_client) -> tuple[str, str] | None:
+    """Route verified post-ingest work without asking the Supervisor to classify prose."""
+    if mythic_client is None:
+        return None
+    try:
+        try:
+            from . import capabilities
+            from . import engagement_state as _es
+        except ImportError:
+            import capabilities
+            import engagement_state as _es
+        snapshot = _es.EngagementState(
+            objective=mythic_client._engagement_objective(),
+            footholds=list(getattr(mythic_client, "_engagement_footholds", []) or []),
+            hops=list(getattr(mythic_client, "_engagement_hops", []) or []),
+            graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+        )
+        if capabilities.actions_from_state(snapshot):
+            return None
+        phase = str(_es.engagement_phase(snapshot))
+        if phase.startswith("COMPLETE-CANDIDATE") or _es.current_access_collection_missing(snapshot):
+            return None
+        verified_keys = []
+        for foothold in snapshot.footholds:
+            if not _es._is_live_target_foothold(foothold):
+                continue
+            key = _es.access_context_key(snapshot, foothold)
+            if key and _es.graph_collection_covers_foothold(snapshot, foothold):
+                verified_keys.append(key)
+        if not verified_keys:
+            return None
+        objective = str(snapshot.objective or "the engagement objective").strip()
+        instruction = (
+            "AUTONOMOUS POST-INGEST ROUTER: The authoritative engagement ledger proves a verified "
+            "BloodHound collection for the current access context, no grounded executable capability is "
+            "available, and the objective is not complete. Analyze the existing graph now; do not route back "
+            "to Mythic_Operator for callback reconnaissance, collection confirmation, ZIP handling, download, "
+            f"or ingest. Objective: {objective}. Return the next concrete graph-supported hop and its required "
+            "Mythic capability, or a specific graph-coverage blocker."
+        )
+        return "BloodHound", instruction
+    except Exception:
+        return None
+
+
+def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool = False):
     """
     Let a specialist yield control to the Supervisor WITHOUT ending the run, so the Supervisor can route
     to another agent (BloodHound for graph work, Mythic_Payload for a build) or finalize. This is the
@@ -4476,9 +5177,32 @@ def _create_handback_to_supervisor_tool(mythic_client=None):
             name="handback_to_supervisor",
             tool_call_id=runtime.tool_call_id,
         )
+        post_ingest_route = (
+            _deterministic_post_ingest_owner(mythic_client)
+            if autonomous else None
+        )
+        if post_ingest_route is not None:
+            owner, instruction = post_ingest_route
+            delegated = HumanMessage(
+                content=instruction,
+                additional_kwargs={"_delegated_to": owner},
+            )
+            return Command(
+                goto=owner,
+                update={
+                    "messages": [msg, delegated],
+                    "supervisor_messages": [msg],
+                    "bloodhound_messages": [msg, delegated],
+                    "next_owner": owner,
+                    "_last_calling_agent": "Mythic_Operator",
+                    "_last_target_agent": owner,
+                },
+                graph=Command.PARENT,
+            )
         updated_state = {**runtime.state}
         updated_state["supervisor_messages"] = [msg]
         updated_state["messages"] = [msg]
+        updated_state["next_owner"] = "Supervisor"
         updated_state["_last_calling_agent"] = "Mythic_Operator"
         return Command(
             goto="Supervisor",
@@ -4796,6 +5520,35 @@ def _compiled_autonomous_blocked_bloodhound_instruction(
     return "\n".join(lines)
 
 
+def _action_signature(action) -> tuple:
+    """A stable identity for a selected capability action (handles dict or object), used by the stall detector
+    to tell "re-selecting the same dead hop" from "advancing through distinct hops". Never raises."""
+    try:
+        if isinstance(action, dict):
+            return (action.get("name"), action.get("target"), action.get("effect"))
+        return (getattr(action, "name", None), getattr(action, "target", None), getattr(action, "effect", None))
+    except Exception:
+        return (None, None, None)
+
+
+def _autonomous_stall_report(snapshot) -> str:
+    """Terminal report when the autonomous solve stalls (no ledger progress for _AUTONOMOUS_STALL_LIMIT steps).
+    Self-contained string surfaced to the operator via the __terminal__ handback. Never raises."""
+    try:
+        objective = str(getattr(snapshot, "objective", "") or "")
+        achieved = sorted(snapshot.achieved_effects()) if snapshot is not None else []
+    except Exception:
+        objective, achieved = "", []
+    return (
+        f"AUTONOMOUS SOLVE HALTED — no new objective progress in {_AUTONOMOUS_STALL_LIMIT} consecutive "
+        f"capability steps: the selected hop is not advancing the engagement ledger (likely an unmet "
+        f"precondition or a repeatedly-failing execution). Stopping to avoid a token-burning loop.\n"
+        f"Objective: {objective}\n"
+        f"Achieved so far: {achieved}\n"
+        f"Operator: inspect why the next capability is not progressing, then resume manually."
+    )
+
+
 def _compiled_autonomous_blocked_report(
     engagement_snapshot: Any,
     *,
@@ -4917,6 +5670,42 @@ def _json_backtick_payload(text: str, label: str) -> Any:
         return None
 
 
+def _find_token_zip_path(ls_output: str, token: str) -> str:
+    """Find the real on-disk path of THIS collection's ZIP in an Apollo `ls` result. SharpHound prepends a
+    timestamp to `--ZipFilename` (e.g. `<ts>_bloodhound_<token>.zip`), so the on-disk name is NOT predictable —
+    we discover it instead. Anchored on the per-run random `token` so it cannot match any other file. Parses
+    the STRUCTURED `ls` JSON (Apollo streams one-or-more concatenated objects, each `{"files":[{name, full_name,
+    is_file}]}`), not free text, so it is robust to format/locale. Returns the file's `full_name` or ""."""
+    dec = json.JSONDecoder()
+    s = ls_output or ""
+    i, n = 0, len(s)
+    tok = (token or "").lower()
+    if not tok:
+        return ""
+    while i < n:
+        while i < n and s[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, end = dec.raw_decode(s, i)
+        except ValueError:
+            i += 1
+            continue
+        i = end
+        if not isinstance(obj, dict):
+            continue
+        for f in (obj.get("files") or []):
+            if not isinstance(f, dict):
+                continue
+            name = str(f.get("name", "")).lower()
+            if f.get("is_file") is True and tok in name and name.endswith(".zip"):
+                full = str(f.get("full_name") or "").strip()
+                if full:
+                    return full
+    return ""
+
+
 def _capability_action_payload(action: Any) -> dict[str, Any]:
     return {
         "name": _jsonable_value(getattr(action, "name", "")),
@@ -4945,7 +5734,37 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
     callback_id = _autonomous_callback_id_for_action(action, engagement_snapshot)
     if callback_id:
         inputs["callback_id"] = callback_id
+    # Deterministic capability builders that make a durable domain change (e.g. gpo-controlled-system-exec
+    # adding us to Domain Admins) need to know WHICH principal we control — the foothold identity. The old
+    # LLM path supplied this implicitly; the controller must. Range-agnostic (the live foothold user); builders
+    # that don't need it ignore it.
+    identity = _autonomous_controlled_identity(engagement_snapshot, callback_id)
+    if identity:
+        inputs["controlled_principal"] = identity
+        inputs["current_user"] = identity
     return inputs
+
+
+def _autonomous_controlled_identity(engagement_snapshot: Any, callback_id: str = "") -> str:
+    """The identity (DOMAIN\\user or user@domain) of the live foothold we control — preferring the one on the
+    action's callback, else any live foothold. Used to parameterize self-escalation capabilities."""
+    footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
+    cb = str(callback_id or "").strip()
+    if cb:
+        for fh in footholds:
+            if not _is_live_tradecraft_foothold(fh):
+                continue
+            if str(getattr(fh, "callback_id", "") or "").strip() == cb:
+                ident = str(getattr(fh, "identity", "") or "").strip()
+                if ident:
+                    return ident
+    for fh in footholds:
+        if not _is_live_tradecraft_foothold(fh):
+            continue
+        ident = str(getattr(fh, "identity", "") or "").strip()
+        if ident:
+            return ident
+    return ""
 
 
 def _autonomous_callback_id_for_action(action: Any, engagement_snapshot: Any) -> str:

@@ -3,8 +3,8 @@
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
 active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
-this helper restores a baked Apollo callback config or creates fresh payloads before
-Apollo is launched on CASTELBLACK.
+this helper creates fresh Sage/Apollo payloads before Apollo is launched on CASTELBLACK.
+The older baked-callback import flow is still available behind --use-baked-apollo.
 
 Examples:
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,9 @@ SKILL_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
 DEFAULT_CALLBACK_CONFIG_PATH = Path(__file__).resolve().parents[1] / "apollo_callback_config.json"
+SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py"
+DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
+DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
 REQUIRED_RUNTIME_DBS = (
     "Payload_Type/sage/sage.db",
     "Payload_Type/sage/.phoenix/phoenix.db",
@@ -471,6 +475,202 @@ async def readiness(
     }
 
 
+def _task_output_text(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _load_sync_range_time_module():
+    spec = importlib.util.spec_from_file_location("sage_sync_range_time", SYNC_RANGE_TIME_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load clock sync helper from {SYNC_RANGE_TIME_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def synchronize_range_clocks(max_skew_seconds: float) -> dict[str, Any]:
+    module = _load_sync_range_time_module()
+    hosts = module.windows_hosts(module.load_inventory(module.DEFAULT_MCP_PATH))
+    if not hosts:
+        raise RuntimeError("No GOAD Windows hosts found in Ludus inventory")
+    module.sync_clocks(hosts)
+    result = module.check_clocks(hosts, max_skew_seconds)
+    if not result.get("ready"):
+        raise RuntimeError(f"Range clock verification failed: {json.dumps(result, sort_keys=True)}")
+    return result
+
+
+async def wait_for_samwell_apollo_callback(
+    client,
+    *,
+    timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_rows: list[dict[str, Any]] = []
+    while True:
+        observed = await mythic.execute_custom_query(client, CALLBACK_QUERY)
+        last_rows = observed.get("callback", [])
+        candidates = [
+            callback
+            for callback in last_rows
+            if payload_type_name(callback).casefold() == "apollo"
+            and str(callback.get("host") or "").casefold() == "castelblack"
+            and "samwell" in str(callback.get("user") or "").casefold()
+            and isinstance(callback.get("display_id"), int)
+        ]
+        for callback in sorted(
+            candidates,
+            key=lambda row: int(row["display_id"]),
+            reverse=True,
+        ):
+            liveness = await assess_callback_liveness(client, int(callback["display_id"]))
+            if liveness.get("alive"):
+                return {
+                    "display_id": int(callback["display_id"]),
+                    "host": callback.get("host"),
+                    "user": callback.get("user"),
+                    "liveness": liveness,
+                }
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for live Apollo callback on CASTELBLACK as samwell.tarly; "
+                f"last callbacks: {json.dumps(last_rows, sort_keys=True)}"
+            )
+        await asyncio.sleep(poll_seconds)
+
+
+wait_for_baked_apollo_callback = wait_for_samwell_apollo_callback
+
+
+async def issue_callback_task(
+    client,
+    callback_display_id: int,
+    command_name: str,
+    parameters: str,
+    *,
+    timeout_seconds: int = 60,
+) -> dict[str, Any]:
+    task = await mythic.issue_task(
+        mythic=client,
+        command_name=command_name,
+        parameters=parameters,
+        callback_display_id=callback_display_id,
+        wait_for_complete=False,
+        timeout=timeout_seconds,
+    )
+    task_display_id = task.get("display_id") if isinstance(task, dict) else None
+    if not isinstance(task_display_id, int):
+        raise RuntimeError(f"Mythic did not return a task display ID for {command_name}")
+    output = await asyncio.wait_for(
+        mythic.waitfor_for_task_output(
+            mythic=client,
+            task_display_id=task_display_id,
+            timeout=timeout_seconds,
+        ),
+        timeout=timeout_seconds + 20,
+    )
+    return {
+        "task_display_id": task_display_id,
+        "output": _task_output_text(output),
+    }
+
+
+def parse_callback_probe(
+    output: str,
+    *,
+    max_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+    controller_utc: datetime | None = None,
+) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    observed = None
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            observed = candidate
+    if observed is None:
+        raise RuntimeError(f"Callback identity probe returned no JSON object: {output!r}")
+
+    normalized = {str(key).casefold(): value for key, value in observed.items()}
+    guest_utc_text = str(normalized.get("utc") or "")
+    domain = str(normalized.get("domain") or "").strip()
+    identity = str(normalized.get("user") or "").strip()
+    if not guest_utc_text or not domain or not identity:
+        raise RuntimeError(f"Callback identity probe was incomplete: {observed!r}")
+
+    guest_utc = datetime.fromisoformat(guest_utc_text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    controller_utc = (controller_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    skew_seconds = abs((guest_utc - controller_utc).total_seconds())
+    if skew_seconds > max_skew_seconds:
+        raise RuntimeError(
+            f"Callback clock skew is {skew_seconds:.3f}s; maximum is {max_skew_seconds:.3f}s"
+        )
+    return {
+        "ready": True,
+        "guest_utc": guest_utc.isoformat(),
+        "controller_utc": controller_utc.isoformat(),
+        "skew_seconds": round(skew_seconds, 3),
+        "domain": domain,
+        "identity": identity,
+    }
+
+
+async def post_callback_preflight(
+    client,
+    *,
+    timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+    max_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+) -> dict[str, Any]:
+    callback = await wait_for_samwell_apollo_callback(
+        client,
+        timeout_seconds=timeout_seconds,
+    )
+    clocks = await asyncio.to_thread(synchronize_range_clocks, max_skew_seconds)
+    callback_id = callback["display_id"]
+
+    purge = await issue_callback_task(
+        client,
+        callback_id,
+        "shell",
+        "klist purge",
+    )
+    if "purged" not in purge["output"].casefold():
+        raise RuntimeError(f"Kerberos ticket purge was not confirmed: {purge['output']!r}")
+
+    probe_command = (
+        'powershell -NoProfile -NonInteractive -Command '
+        '"$d=[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name;'
+        "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
+        "[PSCustomObject]@{Utc=(Get-Date).ToUniversalTime().ToString('o');Domain=$d;User=$u}"
+        '|ConvertTo-Json -Compress"'
+    )
+    probe_task = await issue_callback_task(
+        client,
+        callback_id,
+        "shell",
+        probe_command,
+    )
+    probe = parse_callback_probe(
+        probe_task["output"],
+        max_skew_seconds=max_skew_seconds,
+    )
+    return {
+        "ready": True,
+        "apollo_callback": callback,
+        "range_clocks": clocks,
+        "kerberos_purge_task": purge["task_display_id"],
+        "identity_probe_task": probe_task["task_display_id"],
+        "identity_probe": probe,
+    }
+
+
 async def create_sage(client, args: argparse.Namespace) -> dict[str, Any]:
     return await mythic.create_payload(
         client,
@@ -588,26 +788,63 @@ async def command_create_all(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def fresh_apollo_bootstrap_instructions(apollo: dict[str, Any]) -> dict[str, Any]:
+    payload_uuid = str(apollo.get("uuid") or "<apollo-payload-uuid>")
+    return {
+        "required": True,
+        "method": "interactive-rdp-scheduled-task",
+        "payload_uuid": payload_uuid,
+        "notes": [
+            "Open an RDP session as NORTH\\samwell.tarly on CASTELBLACK before launching Apollo.",
+            "Launch the staged payload with --launch-method scheduled-task-interactive; the default remote path is C:\\Users\\Public\\apollo.exe.",
+            "After a new callback is observed, the deploy helper disconnects the RDP session with tsdiscon by default; use --no-disconnect-interactive-session only for troubleshooting.",
+            "Use --add-defender-exclusion for C:\\Users\\Public\\apollo.exe on clean-baseline; stock Apollo was quarantined by Defender in live validation.",
+            "After the callback appears, run post-callback-preflight and readiness before a solve.",
+        ],
+    }
+
+
 async def command_bootstrap_reset(args: argparse.Namespace) -> None:
     client = await login(args)
     path = callback_config_path(args.callback_config)
     result: dict[str, Any] = {"sage": await create_sage(client, args)}
-    if path.exists():
+    if getattr(args, "use_baked_apollo", False):
+        if not path.exists():
+            raise RuntimeError(f"--use-baked-apollo requires callback config at {path}")
         result["apollo_callback_import"] = await import_callback_config(
             client,
             load_callback_config(path),
         )
         result["apollo_callback_config"] = str(path)
-        result["mode"] = "imported-baked-apollo"
+        result["mode"] = "legacy-imported-baked-apollo"
+        result["post_callback_preflight"] = await post_callback_preflight(
+            client,
+            timeout_seconds=args.post_callback_timeout,
+            max_skew_seconds=args.max_clock_skew_seconds,
+        )
     else:
         apollo = await create_apollo(client, args)
         result["apollo"] = apollo
         download = await maybe_download_payload(client, apollo, args.download_dir)
         if download:
             result["apollo_download"] = download
-        result["mode"] = "fresh-apollo-fallback"
+        result["mode"] = "fresh-interactive-apollo"
+        result["apollo_bootstrap"] = fresh_apollo_bootstrap_instructions(apollo)
     result["callbacks_after"] = (await mythic.execute_custom_query(client, CALLBACK_QUERY)).get("callback", [])
     print(json.dumps(result, indent=2, sort_keys=True))
+
+
+async def command_post_callback_preflight(args: argparse.Namespace) -> None:
+    client = await login(args)
+    print(json.dumps(
+        await post_callback_preflight(
+            client,
+            timeout_seconds=args.post_callback_timeout,
+            max_skew_seconds=args.max_clock_skew_seconds,
+        ),
+        indent=2,
+        sort_keys=True,
+    ))
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -632,7 +869,7 @@ def add_sage_args(parser: argparse.ArgumentParser) -> None:
 def add_apollo_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--apollo-filename",
-        default=os.environ.get("APOLLO_FILENAME", "apollo-castelblack-fresh.exe"),
+        default=os.environ.get("APOLLO_FILENAME", "apollo.exe"),
     )
     parser.add_argument("--callback-host", default=os.environ.get("APOLLO_CALLBACK_HOST", ""))
     parser.add_argument("--callback-port", default=int(os.environ.get("APOLLO_CALLBACK_PORT", "80")), type=int)
@@ -742,7 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset_parser = sub.add_parser(
         "bootstrap-reset",
-        help="Import a baked Apollo config when present, otherwise create fresh Apollo; always create Sage.",
+        help="Create fresh Sage/Apollo payloads for the clean-baseline workflow; legacy baked Apollo is opt-in.",
     )
     add_common(reset_parser)
     add_sage_args(reset_parser)
@@ -750,9 +987,49 @@ def build_parser() -> argparse.ArgumentParser:
     reset_parser.add_argument(
         "--callback-config",
         default=os.environ.get("APOLLO_CALLBACK_CONFIG_PATH"),
-        help=f"Retained callback config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+        help=f"Legacy retained callback config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+    )
+    reset_parser.add_argument(
+        "--use-baked-apollo",
+        action="store_true",
+        default=env_bool("APOLLO_USE_BAKED_CALLBACK"),
+        help=(
+            "Legacy opt-in: import a retained baked Apollo callback config and wait for reconnect. "
+            "The clean-baseline workflow creates a fresh Apollo payload instead."
+        ),
+    )
+    reset_parser.add_argument(
+        "--post-callback-timeout",
+        type=int,
+        default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+        help="Seconds to wait for the baked Apollo callback before failing.",
+    )
+    reset_parser.add_argument(
+        "--max-clock-skew-seconds",
+        type=float,
+        default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+        help="Maximum accepted guest/controller clock skew after synchronization.",
     )
     reset_parser.set_defaults(func=command_bootstrap_reset)
+
+    preflight_parser = sub.add_parser(
+        "post-callback-preflight",
+        help="Wait for live Samwell Apollo, synchronize clocks, purge tickets, and verify callback identity.",
+    )
+    add_common(preflight_parser)
+    preflight_parser.add_argument(
+        "--post-callback-timeout",
+        type=int,
+        default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+        help="Seconds to wait for the Samwell Apollo callback before failing.",
+    )
+    preflight_parser.add_argument(
+        "--max-clock-skew-seconds",
+        type=float,
+        default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+        help="Maximum accepted guest/controller clock skew after synchronization.",
+    )
+    preflight_parser.set_defaults(func=command_post_callback_preflight)
 
     return parser
 

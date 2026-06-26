@@ -53,6 +53,29 @@ def test_cap_yields_after_max_blocks():
     assert MT._should_block_premature_dcsync("dcsync", REASON, True, MAX + 5, MAX) is False
 
 
+def test_cross_domain_forge_parent_scopes_same_forest_only():
+    # The cross-domain forge grants the parent DS-Replication right (via the imported parent-EA referral) ONLY
+    # for a same-forest child->parent target — the parent must be a DNS suffix of the child. A cross-FOREST
+    # target must get no grant (no implicit Enterprise-Admins path), so the precheck still guards it.
+    import capabilities  # noqa: E402
+
+    mt = MT.__new__(MT)
+
+    def action(child, parent):
+        return capabilities.CapabilityAction(
+            name="forge-golden-ticket",
+            target=f"domain={child}" + (f";target_domain={parent}" if parent else ""),
+            preconditions=[], effects=[],
+            intent={"capability": "forge-golden-ticket", "domain": child, **({"target_domain": parent} if parent else {})},
+        )
+
+    assert mt._cross_domain_forge_parent(action("north.sevenkingdoms.local", "sevenkingdoms.local"), {}) == "sevenkingdoms.local"
+    assert mt._cross_domain_forge_parent(action("north.sevenkingdoms.local", "essos.local"), {}) == ""   # cross-forest
+    assert mt._cross_domain_forge_parent(action("sevenkingdoms.local", ""), {}) == ""                    # same-domain
+    other = capabilities.CapabilityAction(name="dcsync-krbtgt", target="domain=sevenkingdoms.local;account=krbtgt", preconditions=[], effects=[], intent={})
+    assert mt._cross_domain_forge_parent(other, {}) == ""
+
+
 def test_guidance_frames_rights_not_syntax():
     g = MT._dcsync_rights_guidance("north.sevenkingdoms.local")
     assert "north.sevenkingdoms.local" in g

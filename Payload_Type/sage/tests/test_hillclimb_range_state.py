@@ -103,5 +103,70 @@ def test_direct_probe_disagreement_is_flagged(tmp_path, monkeypatch):
     # Ledger says GRAPH_COLLECTED True; an independent probe says False -> validity alarm.
     scn = _scenario("run1")
     scn.direct_probes = {rs.Milestone.GRAPH_COLLECTED: lambda: False}
-    gt = rs.read_ground_truth(scn)
+    gt = rs.read_ground_truth(scn, run_live_probes=True)
     assert rs.Milestone.GRAPH_COLLECTED in gt.probe_disagreements
+
+
+def test_probeable_milestone_without_verifier_is_flagged_offline(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+    scn = rs.Scenario(
+        name="graph-without-verifier",
+        engagement_id="run1",
+        domains={"child": CHILD, "parent": PARENT, "objective": OBJ},
+        milestone_subset=(rs.Milestone.FOOTHOLD, rs.Milestone.GRAPH_COLLECTED),
+    )
+    gt = rs.read_ground_truth(scn, run_live_probes=False)
+    assert rs.Milestone.GRAPH_COLLECTED in gt.probe_disagreements
+
+
+def test_wired_probe_is_not_executed_when_live_probes_disabled(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+
+    def raising_probe():
+        raise AssertionError("probe should not execute on offline path")
+
+    scn = rs.Scenario(
+        name="graph-offline",
+        engagement_id="run1",
+        domains={"child": CHILD, "parent": PARENT, "objective": OBJ},
+        milestone_subset=(rs.Milestone.FOOTHOLD, rs.Milestone.GRAPH_COLLECTED),
+        direct_probes={rs.Milestone.GRAPH_COLLECTED: raising_probe},
+    )
+    gt = rs.read_ground_truth(scn, run_live_probes=False)
+    assert rs.Milestone.GRAPH_COLLECTED not in gt.probe_disagreements
+
+
+def test_recorded_probe_overrides_conflicting_self_report_and_flags_drift(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+    data = engagement_ledger.load("run1")
+    data["ground_truth_probes"] = {
+        "KRBTGT_DUMPED": False,
+        "_captured_at": "2026-06-21T00:00:00+00:00",
+        "_source": "probe",
+    }
+    engagement_ledger.save(data, engagement_id="run1")
+
+    scn = rs.Scenario(
+        name="recorded-krbtgt",
+        engagement_id="run1",
+        domains={"child": CHILD, "parent": PARENT, "objective": OBJ},
+        milestone_subset=(rs.Milestone.FOOTHOLD, rs.Milestone.KRBTGT_DUMPED),
+        recorded_probe_milestones=frozenset({rs.Milestone.KRBTGT_DUMPED}),
+    )
+    gt = rs.read_ground_truth(scn, run_live_probes=False)
+    assert gt.milestones[rs.Milestone.KRBTGT_DUMPED] is False
+    assert rs.Milestone.KRBTGT_DUMPED in gt.probe_disagreements
+
+
+def test_recorded_probe_declaration_without_record_falls_back_to_ledger(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+    scn = rs.Scenario(
+        name="recorded-krbtgt-missing",
+        engagement_id="run1",
+        domains={"child": CHILD, "parent": PARENT, "objective": OBJ},
+        milestone_subset=(rs.Milestone.FOOTHOLD, rs.Milestone.KRBTGT_DUMPED),
+        recorded_probe_milestones=frozenset({rs.Milestone.KRBTGT_DUMPED}),
+    )
+    gt = rs.read_ground_truth(scn, run_live_probes=False)
+    assert gt.milestones[rs.Milestone.KRBTGT_DUMPED] is True
+    assert rs.Milestone.KRBTGT_DUMPED not in gt.probe_disagreements

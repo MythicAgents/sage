@@ -31,7 +31,7 @@ Historical markdown that is not part of the current minimal handoff lives under 
 - `Payload_Type/sage/evals/`: Phoenix-backed GOAD eval harness.
 - `Payload_Type/sage/tests/`: fast offline unit/regression suite.
 - `Payload_Type/sage/ai/trajectory/`: trajectory corpus/export/replay/runtime bridge tooling for data-backed repair policy.
-- `skills/`: repo-local Sage skills. Reusable operator/Codex/Claude tooling belongs here, not in `Plans/`.
+- `skills/`: repo-local Sage skills. Reusable operator/Codex/Claude tooling belongs here, not in `Plans/`. **Read `skills/README.md` first** — it indexes every skill (name, purpose, entry script); tool-agnostic.
 
 ## Current Validation Baseline
 
@@ -52,6 +52,14 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Use `apply_patch` for manual edits.
 - Sage runs as a local process in the `sage` tmux session for this workflow. Do not use Docker/Mythic
   container restart commands for Sage unless the user explicitly asks for that future deployment mode.
+- Hard execution boundary: Sage runtime may reason over Mythic/BloodHound control-plane data and build task
+  parameters, but it must never connect directly to target hosts/services or perform target-facing tradecraft
+  from the Sage process/container. LDAP/LDAPS, SMB, Kerberos, WinRM, RPC, HTTP, and similar target interactions
+  must be issued as Mythic tasks to live payload callbacks.
+- Objective/proof boundary: no capability effect or objective completion may be recorded from Sage-host target
+  I/O or Sage-local attack-artifact generation/use. Valid proof comes from Mythic task output/artifacts,
+  Mythic credential-store state, or BloodHound facts derived from payload-collected artifacts. Operator
+  reset/readiness/eval helpers may inspect the lab out of band, but they are not Sage execution or proof.
 - Never delete runtime databases. Before a clean reset, stop local Sage and use
   `skills/sage-goad-reset/scripts/archive_runtime_dbs.py` to move active databases to timestamped
   `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db` archives.
@@ -110,19 +118,27 @@ in tmux throughout current development.
    `/bin/bash skills/sage-goad-reset/scripts/mythic_reset.sh --yes`, which executes `mythic-cli stop`,
    `mythic-cli database reset -f`, and `mythic-cli start`.
 3. **Reset GOAD and BloodHound.** Roll back/power on GOAD, wipe BloodHound, and require
-   `available-domains: count=0` before ingest.
+   `available-domains: count=0` before ingest. Then run
+   `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes` and require `"ready": true`;
+   RAM-backed snapshots can restore guests with clocks days apart.
 4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
    `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp`.
-5. **Restore callback configuration and create Sage.** Run
+5. **Create fresh Sage and Apollo payloads.** Run
    `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It creates Sage first so Sage
-   receives callback display ID `1` on a clean Mythic database. When
-   `apollo_callback_config.json` exists, it imports the callback crypto/config for the Apollo process baked into
-   the Ludus snapshot. Until that file exists, it falls back to creating and downloading a fresh Apollo payload
-   after Sage. `create-all` remains the explicit fresh-payload path.
-6. **Establish callbacks.** The fresh Sage payload establishes its callback immediately. After GOAD is powered
-   on, wait for the baked Apollo process on CASTELBLACK (`north\samwell.tarly`) to reconnect; in fallback mode,
-   launch the newly generated Apollo payload manually.
-7. **Only then rediscover callbacks and run Sage.** After DB archival and Sage restart, run
+   receives callback display ID `1` on a clean Mythic database, then builds/downloads a fresh Apollo payload for
+   the clean-baseline workflow. The old baked callback import is legacy-only behind `--use-baked-apollo`.
+6. **Establish callbacks.** The fresh Sage payload establishes its callback immediately. Open an active RDP
+   session as `NORTH\samwell.tarly` on CASTELBLACK, then stage/launch the fresh Apollo payload with
+   `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
+   `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged
+   bootstrap payload file, which defaults to `C:\Users\Public\apollo.exe`; clean-baseline Defender otherwise
+   quarantines stock Apollo. After a new callback is observed, the helper disconnects the RDP session with
+   `tsdiscon` by default so the local client exits without logging off the Windows session.
+7. **Run the callback preflight.** Run
+   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight`; it
+   waits for the live Samwell Apollo callback, synchronizes clocks, purges stale Kerberos tickets, and verifies
+   UTC/domain/identity output.
+8. **Only then rediscover callbacks and run Sage.** After DB archival and Sage restart, run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
    preflight; it must show `ready: true`. Then use `.venv/bin/python skills/sage-live-runner/scripts/sage_task.py callbacks`; identify
    the live fresh Sage and Apollo callback display IDs; then run
@@ -134,12 +150,16 @@ payload/callback lifecycle above.
 - **GOAD Ludus range:** `skills/sage-goad-reset/scripts/ludus.py` reads Ludus credentials from `.mcp.json`.
   - Check state: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py status`
   - List snapshots: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots`
-  - Roll back all range VMs to the default RAM-backed `eval-defender-apollo` snapshot:
+  - Roll back all range VMs to the default `clean-baseline` snapshot:
     `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback --yes`
   - Power on all range VMs: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all`
   - Verify all six VMs are ON and reporting IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`,
     SRV02/CASTELBLACK `.22`, SRV03/BRAAVOS `.23`. DC01/DC02 can briefly show `ip=null` after rollback; wait and
     poll `status` until the guest agent reports IPs.
+  - Synchronize Windows clocks after every rollback:
+    `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes`
+  - Read-only clock gate:
+    `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py check`
 - **BloodHound CE reset:** `skills/sage-goad-reset/scripts/bh_reset.py` uses the BloodHound MCP environment at
   `/home/john/dev/bloodhound_mcp`.
   - Status: `uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py status`
@@ -152,6 +172,8 @@ payload/callback lifecycle above.
 - `chat` supports `mode=supervised`, and supervised mode inserts default-deny HITL for guarded tools.
 - `query` currently has no supervised mode parameter and runs through auto behavior.
 - The engagement gate is currently an advisor for most missing-precondition DEFERs because hard enforcement deadlocked live Trust Walker runs. Verify-on-record, achieved-hop SKIP, collect-once, capped DCSync precheck, circuit breakers, and supervised HITL are the remaining controls.
+- Sage is a control-plane agent, not an alternate implant. A direct Sage-process connection to a target service
+  is a boundary violation even when it is only intended as a verifier or fallback.
 - `read_credentials` can expose raw secrets to model context/traces. Be deliberate when changing credential behavior or observability.
 
 ## Highest-Value Demo Work
@@ -164,7 +186,9 @@ The target architecture is:
 2. **Model capabilities:** represent generic actions as typed capabilities with preconditions, effects, command-intent builders, OPSEC notes, and verifiers. Examples: collect graph, abuse controlled GPO, grant directory rights, DCSync account, forge/use ticket, read LAPS, abuse ADCS, move laterally.
 3. **Plan:** choose next candidate actions from the observed state and graph edges, not from a static demo overlay.
 4. **Execute:** convert selected capability intent into exact Mythic command parameters deterministically.
-5. **Verify:** prove the effect via Mythic/BloodHound/credential-store or task-output evidence before updating the ledger.
+5. **Verify:** prove the effect via Mythic task output/artifacts, Mythic credential-store state, or BloodHound
+   facts derived from payload-collected artifacts before updating the ledger. Never use direct Sage-to-target
+   sockets or Sage-local attack execution as proof.
 6. **Learn/repair:** classify failures as construction, transient, or genuine environment blockers; repair mechanics once, then re-plan instead of looping.
 
 The reusable capability layer is implemented in `capabilities.py`:
@@ -181,13 +205,18 @@ translate those primitives into Mythic command/parameter plans for the active pa
 
 Concrete next sequence:
 
-1. Run one measured clean one-shot GOAD solve using `skills/sage-live-runner/scripts/run_essos_da.py`. This is intentionally the guided
-   mode: the driver includes extra GOAD/Trust Walker guidance so we can first make the full chain reliable.
-2. Inspect Phoenix/decoded Mythic output, ledger rows, repeated tool calls, skips, failures, and proof chain.
-   Fix the smallest deterministic capability, verifier, adapter, or prompt failure exposed by the run.
-3. Reset GOAD/BloodHound/Mythic to a clean state and repeat until the guided one-shot reliably reaches verified
-   ESSOS administrative control from the initial CASTELBLACK foothold.
-4. Only after the guided one-shot is reliable, remove the GOAD-specific guidance from the prompt/driver and test
+1. Audit and remove any off-agent runtime path that touches target services directly or performs a compromise
+   primitive outside a Mythic payload task. The current known violation is host-side Schannel LDAP proof after
+   ADCS PKINIT failure; Sage-local certificate forging also needs an explicit admissibility decision under this
+   boundary.
+2. Add deterministic guards/tests so a capability cannot record achieved effects from off-agent target I/O or
+   off-agent compromise primitives.
+3. Run one measured clean one-shot GOAD solve using `skills/sage-live-runner/scripts/run_essos_da.py` only after
+   the boundary fix is in place. Inspect Phoenix/decoded Mythic output, ledger rows, repeated tool calls, skips,
+   failures, and the final proof chain.
+4. Reset GOAD/BloodHound/Mythic to a clean state and repeat until the guided one-shot reliably reaches verified
+   ESSOS administrative control from the initial CASTELBLACK foothold using only Mythic-task-derived proof.
+5. Only after the guided one-shot is reliable, remove the GOAD-specific guidance from the prompt/driver and test
    whether the generic capability system reaches the same objective from observed state and graph facts.
 
 This is higher value than another prompt iteration or another full autonomous run because it turns Sage from a guided GOAD solver into a domain-agnostic CTF solver: the model decides which capability to try, while code owns exact mechanics and verification.

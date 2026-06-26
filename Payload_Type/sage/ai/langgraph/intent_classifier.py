@@ -70,11 +70,12 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
         # key) is empty here; the gate rebinds it from the issuing callback's foothold (like lsass-dump).
         # Only commands that can actually launch the collector should set collect-graph. Staging/registering
         # SharpHound is not collection; marking it in-flight before execution strands the run polling for a
-        # ZIP that can never be created.
+        # ZIP that can never be created. A targeted SharpHound `--Domain` scope is returned as the target key
+        # so the gate can distinguish "same auth context, new external domain scope" from a redundant repeat.
         if _is_collection_execution_command(command_text) and (
             "sharphound" in combined_cf or "azurehound" in combined_cf
         ):
-            return ("collect-graph", "")
+            return ("collect-graph", _domain_value(parsed).casefold())
 
         return None
     except Exception:

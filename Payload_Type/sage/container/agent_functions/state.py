@@ -612,6 +612,9 @@ class StateCommand(CommandBase):
                 else:
                     data = engagement_ledger.load(engagement_id)
                     data["objective"] = hop
+                    # Operator-set objective is STICKY: provenance prevents an autonomous solve from later
+                    # superseding it (an auto-adopted prompt objective only replaces a prior autonomous one).
+                    data["objective_source"] = "operator"
                     data["updated"] = datetime.now(timezone.utc).isoformat()
                     engagement_ledger.save(data, engagement_id)
                     footholds = await _reconcile_state_footholds(taskData)

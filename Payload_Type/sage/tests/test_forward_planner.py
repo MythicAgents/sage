@@ -156,6 +156,16 @@ def test_classifier_maps_sharphound_to_collect_graph():
     ) == ("collect-graph", "")
 
 
+def test_classifier_maps_targeted_sharphound_domain_scope():
+    assert intent_classifier.classify_tool_call(
+        "execute_assembly",
+        {
+            "assembly_name": "SharpHound.exe",
+            "assembly_arguments": "-c All --Domain target.example.local --OutputDirectory C:\\Users\\Public",
+        },
+    ) == ("collect-graph", "target.example.local")
+
+
 def test_classifier_does_not_mark_sharphound_registration_as_collect_graph():
     assert intent_classifier.classify_tool_call(
         "register_file", {"filename": "SharpHound.exe"}
@@ -174,11 +184,42 @@ def test_access_context_key_changes_with_privilege():
     base = engagement_state.EngagementState(objective="x", footholds=[fh])
     escalated = engagement_state.EngagementState(
         objective="x", footholds=[fh],
-        hops=[_hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local")],
+        hops=[_hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local")],
     )
     k0 = engagement_state.access_context_key(base, fh)
     k1 = engagement_state.access_context_key(escalated, fh)
     assert k0 and k1 and k0 != k1  # a new privilege re-enables a fresh collection
+
+
+def test_access_context_key_does_not_change_for_dumped_hash_or_unbound_creds():
+    fh = _samwell_foothold()
+    base = engagement_state.EngagementState(objective="x", footholds=[fh])
+    artifacts_only = engagement_state.EngagementState(
+        objective="x",
+        footholds=[fh],
+        hops=[
+            _hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local"),
+            _hop("dcsync-user", "arya@north.sevenkingdoms.local", "creds:arya@north.sevenkingdoms.local"),
+        ],
+    )
+    assert engagement_state.access_context_key(base, fh) == engagement_state.access_context_key(artifacts_only, fh)
+
+
+def test_access_context_key_does_not_change_for_kerberos_context_without_new_authority():
+    fh = _samwell_foothold()
+    base = engagement_state.EngagementState(objective="x", footholds=[fh])
+    contextual = engagement_state.EngagementState(
+        objective="x",
+        footholds=[fh],
+        hops=[
+            _hop(
+                "ensure-account-kerberos-context",
+                "cersei@sevenkingdoms.local",
+                "kerberos-account-context:cersei@sevenkingdoms.local@callback:2",
+            ),
+        ],
+    )
+    assert engagement_state.access_context_key(base, fh) == engagement_state.access_context_key(contextual, fh)
 
 
 def test_phase_requests_collection_after_access_key_changes_and_no_next_action():

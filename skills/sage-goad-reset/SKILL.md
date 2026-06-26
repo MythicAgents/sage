@@ -1,6 +1,6 @@
 ---
 name: sage-goad-reset
-description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness workflow. Use when Codex, Claude Code, or an operator asks to reset everything, perform a full reset, archive Sage/Phoenix runtime databases, reset Docker-backed Mythic, reset or verify Ludus GOAD, wipe/check BloodHound CE, restart local Sage safely, restore a baked Apollo callback config, generate payloads, or preflight before a guided Sage GOAD solve.
+description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness workflow. Use when Codex, Claude Code, or an operator asks to reset everything, perform a full reset, archive Sage/Phoenix runtime databases, reset Docker-backed Mythic, reset or verify Ludus GOAD, wipe/check BloodHound CE, restart local Sage safely, generate fresh payloads, establish a Samwell Apollo callback, or preflight before a guided Sage GOAD solve.
 ---
 
 # Sage GOAD Reset
@@ -18,9 +18,8 @@ $sage-goad-reset full reset
 ```
 
 Treat `full reset`, `reset everything`, or an equivalent request as the entire workflow below, including fresh
-Sage creation and Apollo callback restoration through `$sage-callback-bootstrap`. Until a baked Apollo callback
-config has been exported, the bootstrap command falls back to fresh Apollo payload generation/download. A
-Ludus-only rollback must be requested explicitly as a range-only or GOAD-only reset.
+Sage/Apollo creation and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
+must be requested explicitly as a range-only or GOAD-only reset.
 
 ## Order
 
@@ -50,16 +49,31 @@ Ludus-only rollback must be requested explicitly as a range-only or GOAD-only re
 /bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp
 ```
 
+Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
+
 6. Run:
 
 ```bash
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-   This creates Sage first, then imports the retained Apollo callback config when present. On a clean Mythic
-   database, Sage is callback `1`. If the config is absent, it creates and downloads a fresh Apollo payload after
-   Sage as before.
-7. Rediscover callback IDs. Never trust historical IDs.
+   This creates Sage first, then builds/downloads a fresh Apollo payload for the clean-baseline workflow. On a
+   clean Mythic database, Sage is callback `1`.
+7. Open an RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then launch the fresh Apollo
+   payload with `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
+   `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged
+   bootstrap payload file, which defaults to `C:\Users\Public\apollo.exe`; without it, Defender quarantines stock
+   Apollo on clean-baseline. After a new callback is observed, the deploy helper disconnects the RDP session with
+   `tsdiscon` by default so the local RDP client exits without logging off Apollo's Windows session.
+8. Run:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight
+```
+
+   This waits for the live Samwell Apollo callback, synchronizes range clocks, purges stale Kerberos tickets, and
+   verifies UTC/domain/identity output. Treat any nonzero exit as a reset failure.
+9. Rediscover callback IDs. Never trust historical IDs.
 
 ## GOAD
 
@@ -69,17 +83,25 @@ Ludus-only rollback must be requested explicitly as a range-only or GOAD-only re
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback --yes
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py status
+.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes
+.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py check
 ```
 
-Use `--include-ram` only when a snapshot must preserve running process state, such as a baked Apollo callback.
-Without it, rollback restores disk state and powers the VM off rather than resuming guest memory.
+Use `--include-ram` only when a snapshot must preserve running process state. The current clean-baseline workflow
+does not require RAM-backed snapshots.
 
-The default rollback snapshot is `eval-defender-apollo`, which preserves CASTELBLACK's Defender exclusions and
-the running Apollo process through RAM state. Pass an explicit snapshot name before `--yes` only when
-intentionally selecting another baseline.
+The default rollback snapshot is `clean-baseline`. Pass an explicit snapshot name before `--yes` only when
+intentionally selecting another baseline. The old `eval-defender-apollo` RAM-backed path is retired for normal
+rehearsals.
 
 Expected IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`, CASTELBLACK/SRV02 `.22`,
 BRAAVOS/SRV03 `.23`. Poll until Windows guest IPs populate.
+
+The standalone sync/check commands remain available for diagnosis. The helper obtains existing WinRM credentials
+from the Ludus ansible inventory, sets all three DCs before member servers, and disables Windows Time so trigger
+start cannot restore stale snapshot CMOS time during the rehearsal. The next rollback restores service state. The
+helper fails closed when any host remains more than 60 seconds from the controller or Windows Time is not stopped
+and disabled.
 
 Optional MEEREEN PKINIT readiness check before launching Apollo:
 

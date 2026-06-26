@@ -136,6 +136,93 @@ def test_reconcile_graph_position_projects_gpo_domain_facts_from_mcp_shape():
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
 
 
+def test_reconcile_graph_position_projects_trust_reachability_fact():
+    class _TrustTool:
+        async def ainvoke(self, args):
+            if "MATCH (source:Domain)-[edge]->(target:Domain)" in args.get("query", ""):
+                return _literals_response("ROOT.EXAMPLE.LOCAL|TARGET.EXAMPLE.LOCAL")
+            return _literals_response()
+
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCP(_TrustTool()),
+        ["operator@root.example.local"],
+        "obtain administrative control of target.example.local",
+        NOW,
+        TTL_SECONDS,
+    ))
+    assert "trust-reachable:root.example.local:target.example.local" in [fact.predicate for fact in facts]
+
+
+def test_resolve_principal_aliases_expands_unambiguous_netbios_domain():
+    class _AliasTool:
+        async def ainvoke(self, args):
+            assert "samwell.tarly@north." in args.get("query", "")
+            return _literals_response("SAMWELL.TARLY@NORTH.SEVENKINGDOMS.LOCAL")
+
+    aliases = asyncio.run(
+        graph_reconciler._resolve_principal_aliases(
+            _AliasTool(),
+            ["samwell.tarly@north"],
+        )
+    )
+
+    assert aliases == ["samwell.tarly@north.sevenkingdoms.local"]
+
+
+def test_resolve_principal_aliases_fails_closed_on_ambiguous_netbios_domain():
+    class _AmbiguousAliasTool:
+        async def ainvoke(self, args):
+            assert "alice@corp." in args.get("query", "")
+            return _literals_response(
+                "ALICE@CORP.EXAMPLE.LOCAL",
+                "ALICE@CORP.OTHER.LOCAL",
+            )
+
+    aliases = asyncio.run(
+        graph_reconciler._resolve_principal_aliases(
+            _AmbiguousAliasTool(),
+            ["alice@corp"],
+        )
+    )
+
+    assert aliases == ["alice@corp"]
+
+
+def test_reconcile_graph_position_uses_resolved_netbios_principal():
+    class _AliasReconcileTool:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            query = args.get("query", "")
+            if "MATCH (u:User)" in query:
+                return _literals_response("SAMWELL.TARLY@NORTH.SEVENKINGDOMS.LOCAL")
+            if "(t:GPO)" in query:
+                return _literals_response("STARKWALLPAPER@NORTH.SEVENKINGDOMS.LOCAL")
+            return _literals_response()
+
+    tool = _AliasReconcileTool()
+    facts = asyncio.run(
+        graph_reconciler.reconcile_graph_position(
+            _FakeMCP(tool),
+            ["samwell.tarly@north"],
+            "reach target",
+            NOW,
+            TTL_SECONDS,
+        )
+    )
+
+    assert "generic-write:gpo:starkwallpaper" in [fact.predicate for fact in facts]
+    acl_queries = [
+        call["query"]
+        for call in tool.calls
+        if "MATCH (p)-[e]->" in call.get("query", "")
+    ]
+    assert acl_queries
+    assert all("samwell.tarly@north.sevenkingdoms.local" in query for query in acl_queries)
+
+
 def test_prune_stale_graph_facts_flips_gpo_abuse_from_proceed_to_defer():
     stale_fact = _gpo_fact(timestamp="2026-06-06T11:54:59Z")
     fresh_fact = engagement_state.GraphFact(

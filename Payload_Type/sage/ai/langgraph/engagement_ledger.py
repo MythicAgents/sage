@@ -17,6 +17,27 @@ def default_engagement_id() -> str:
     return os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
 
 
+# The engagement key the live Sage process resolved/froze for THIS run (operation-resolved or explicit
+# override). `SAGE_ENGAGEMENT_ID` lives on the harness, NOT inside the persistent Sage process, so diagnostics
+# that need to attribute records to a specific seed must read this published value rather than the env. Set by
+# `mythic_tools._ensure_engagement_key` the first time the key is frozen; read by `_trace_rights_decision`.
+_ACTIVE_ENGAGEMENT_ID: str = ""
+
+
+def set_active_engagement_id(engagement_id: str | None) -> None:
+    """Publish the live process's frozen engagement key for diagnostics. Best-effort; never raises. An empty
+    or 'default' key is ignored so a real key, once set, is not clobbered by a later 'default' resolution."""
+    global _ACTIVE_ENGAGEMENT_ID
+    key = (engagement_id or "").strip()
+    if key and key != "default":
+        _ACTIVE_ENGAGEMENT_ID = key
+
+
+def active_engagement_id() -> str:
+    """The frozen engagement key published by the live Sage process (empty string if never resolved)."""
+    return _ACTIVE_ENGAGEMENT_ID
+
+
 def state_dir() -> str:
     """Directory holding the per-engagement ledgers. `SAGE_ENGAGEMENT_STATE_DIR` overrides; default is
     `.sage_engagement` next to the Sage process cwd (same persistence guarantee as the operational db)."""

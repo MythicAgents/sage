@@ -92,6 +92,22 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
     assert "BloodHound scope includes DC host(s): dc01" in action.reason
 
 
+def test_gpo_candidate_accepts_equivalent_netbios_foothold_domain():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("corp", identity="CORP\\operator")],
+        graph_facts=[
+            _fact("generic-write:gpo:domain-policy"),
+            _fact("gpo-domain:domain-policy:corp.example.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert [action.name for action in actions] == ["gpo-controlled-system-exec"]
+    assert actions[0].target == "gpo=domain-policy;domain=corp.example.local"
+
+
 def test_gpo_capability_requires_domain_link_and_live_access():
     missing_domain = es.EngagementState(
         objective="x",
@@ -293,6 +309,45 @@ def test_grant_directory_rights_candidate_suppressed_when_rights_verified():
     actions = capabilities.actions_from_state(state)
 
     assert "grant-directory-rights" not in [action.name for action in actions]
+
+
+def test_netbios_da_dominates_fqdn_grant_and_selects_context_refresh():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("north", callback_id="2", identity="NORTH\\samwell.tarly")],
+        hops=[
+            _hop("system-exec:gpo:workstation-policy@north.example.local"),
+            _hop("da:north"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert "grant-directory-rights" not in [action.name for action in actions]
+    refresh = next(action for action in actions if action.name == "ensure-kerberos-context")
+    assert refresh.target == "domain=north.example.local;callback=2"
+    assert refresh.preconditions == ["da:north", "live-callback:2"]
+    assert refresh.effects == ["kerberos-context:north.example.local@callback:2"]
+
+
+def test_netbios_da_suppresses_redundant_same_domain_ticket_forge():
+    state = es.EngagementState(
+        objective="continue trust path",
+        footholds=[_foothold("north", callback_id="2", identity="NORTH\\samwell.tarly")],
+        hops=[
+            _hop("system-exec:gpo:workstation-policy@north.example.local"),
+            _hop("da:north"),
+            _hop("krbtgt-hash:north.example.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert not any(
+        action.name == "forge-golden-ticket"
+        and action.target == "domain=north.example.local"
+        for action in actions
+    )
 
 
 def test_grant_directory_rights_candidate_suppressed_after_krbtgt_recovered():
@@ -2048,6 +2103,101 @@ def test_build_ensure_kerberos_context_plan_reuses_forge_builder_inputs():
     assert forge.parameters["extra_sids"] == ["S-1-5-21-444-555-666-519"]
     assert plan.steps[1].parameters["target_context"] == "current"
     assert plan.steps[-1].parameters["resource"] == "\\\\dc01.root.local\\C$"
+    # ensure-kerberos-context proves by service access even cross-domain — it must NOT divert into the
+    # forge capability's inter-realm referral / parent-DCSync proof.
+    operations = [step.operation for step in plan.steps]
+    assert "kerberos-inter-realm-referral" not in operations
+    assert "drsuapi-dcsync" not in operations
+    _assert_payload_agnostic_plan(plan)
+
+
+def test_forge_golden_ticket_cross_domain_plan_uses_referral_hop_and_parent_dcsync():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=child.root.local;target_domain=root.local",
+        preconditions=["krbtgt-hash:child.root.local"],
+        effects=["da:root.local"],
+        intent={
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+    )
+    plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "extra_sids": ["S-1-5-21-444-555-666-519"],
+        "proof_host": "dc01.root.local",
+        "child_dc": "dc01.child.root.local",
+    })
+
+    assert plan.ok is True
+    operations = [step.operation for step in plan.steps]
+    assert operations[2] == "kerberos-ticket-forge"
+    assert operations[3] == "kerberos-inter-realm-referral"
+    assert operations[4] == "kerberos-service-ticket-request"
+    assert operations[-1] == "drsuapi-dcsync"
+    # No netonly logon fork on the cross-domain path — the referral ticket loads into the current context.
+    assert "kerberos-logon-session-create" not in operations
+    referral = plan.steps[3]
+    assert referral.parameters["service"] == "krbtgt/root.local"
+    assert referral.parameters["child_dc"] == "dc01.child.root.local"
+    assert referral.parameters["ticket_base64"] == "{{kerberos_ticket_base64}}"
+    service_ticket = plan.steps[4]
+    assert service_ticket.parameters == {
+        "target_domain": "root.local",
+        "service": "ldap/dc01.root.local",
+        "ticket_base64": "{{kerberos_ticket_base64}}",
+        "dc": "dc01.root.local",
+        "nowrap": True,
+    }
+    assert plan.steps[5].parameters == {
+        "domain": "root.local",
+        "target_context": "current",
+        "store": "agent-cache",
+    }
+    assert plan.steps[6].parameters == {
+        "domain": "root.local",
+        "ticket_artifact": "{{kerberos_ticket_base64}}",
+        "target_context": "current",
+        "store": "agent-cache",
+    }
+    assert plan.steps[7].parameters == {
+        "domain": "root.local",
+        "target_context": "current",
+        "store": "agent-cache",
+    }
+    dcsync = plan.steps[-1]
+    assert dcsync.parameters == {
+        "domain": "root.local",
+        "account": "krbtgt",
+        "executor": "native",
+        "dc": "dc01.root.local",
+    }
+    _assert_payload_agnostic_plan(plan)
+
+
+def test_forge_golden_ticket_same_domain_plan_has_no_referral_or_dcsync():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=root.local",
+        preconditions=["krbtgt-hash:root.local"],
+        effects=["da:root.local"],
+        intent={"capability": "forge-golden-ticket", "domain": "root.local"},
+    )
+    plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "proof_host": "dc01.root.local",
+    })
+
+    assert plan.ok is True
+    operations = [step.operation for step in plan.steps]
+    assert "kerberos-inter-realm-referral" not in operations
+    assert "drsuapi-dcsync" not in operations
+    # Same-domain forge keeps the isolated-context + service-proof path.
+    assert "kerberos-logon-session-create" in operations
+    assert operations[-1] == "kerberos-context-service-proof"
     _assert_payload_agnostic_plan(plan)
 
 
@@ -2287,6 +2437,156 @@ def test_downstream_account_edge_suppresses_sibling_account_contexts():
     ]
 
     assert [action.target for action in actions] == ["domain=lab.local;account=alice;callback=13"]
+
+
+def test_equivalent_downstream_routes_advance_one_account_end_to_end():
+    route_facts = [
+        _fact("credential-target:alice@lab.local"),
+        _fact("credential-target:bob@lab.local"),
+        _fact(
+            "can-read-managed-local-admin-secret:"
+            "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+        ),
+        _fact(
+            "can-read-managed-local-admin-secret:"
+            "account=bob;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+        ),
+    ]
+    base_hops = [
+        _hop("ds-replication-rights:lab.local"),
+        _hop("kerberos-context:lab.local@callback:13"),
+    ]
+
+    before_creds = es.EngagementState(
+        objective=(
+            "obtain administrative control of child.lab.local "
+            "can-read-managed-local-admin-secret:"
+            "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+        ),
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=base_hops,
+        graph_facts=route_facts,
+    )
+    after_creds = es.EngagementState(
+        objective=before_creds.objective,
+        footholds=before_creds.footholds,
+        hops=[*base_hops, _hop("creds:alice@lab.local")],
+        graph_facts=route_facts,
+    )
+    after_context = es.EngagementState(
+        objective=before_creds.objective,
+        footholds=before_creds.footholds,
+        hops=[
+            *base_hops,
+            _hop("creds:alice@lab.local"),
+            _hop("kerberos-account-context:alice@lab.local@callback:13"),
+        ],
+        graph_facts=route_facts,
+    )
+
+    assert [
+        action.target
+        for action in capabilities.actions_from_state(before_creds)
+        if action.name == "dcsync-account"
+    ] == ["domain=lab.local;account=alice"]
+    after_creds_actions = capabilities.actions_from_state(after_creds)
+    assert not any(action.name == "dcsync-account" for action in after_creds_actions)
+    assert [
+        action.target
+        for action in after_creds_actions
+        if action.name == "ensure-account-kerberos-context"
+    ] == ["domain=lab.local;account=alice;callback=13"]
+    after_context_actions = capabilities.actions_from_state(after_context)
+    assert not any(
+        action.name in {"dcsync-account", "ensure-account-kerberos-context"}
+        for action in after_context_actions
+    )
+    assert [
+        action.target
+        for action in after_context_actions
+        if action.name == "read-managed-local-admin-secret"
+    ] == [
+        "account=alice;account_domain=lab.local;target=ws01;"
+        "target_domain=child.lab.local;callback=13"
+    ]
+
+
+def test_equivalent_downstream_route_falls_back_after_selected_credential_failure():
+    state = es.EngagementState(
+        objective=(
+            "obtain administrative control of child.lab.local "
+            "can-read-managed-local-admin-secret:"
+            "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+        ),
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("ds-replication-rights:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+            _failed_hop("creds:alice@lab.local"),
+        ],
+        graph_facts=[
+            _fact("credential-target:alice@lab.local"),
+            _fact("credential-target:bob@lab.local"),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=bob;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+        ],
+    )
+
+    actions = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "dcsync-account"
+    ]
+
+    assert [action.target for action in actions] == ["domain=lab.local;account=bob"]
+
+
+def test_equivalent_downstream_route_falls_back_after_selected_context_failure():
+    state = es.EngagementState(
+        objective=(
+            "obtain administrative control of child.lab.local "
+            "can-read-managed-local-admin-secret:"
+            "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+        ),
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("ds-replication-rights:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+            _hop("creds:alice@lab.local"),
+            _failed_hop("kerberos-account-context:alice@lab.local@callback:13"),
+        ],
+        graph_facts=[
+            _fact("credential-target:alice@lab.local"),
+            _fact("credential-target:bob@lab.local"),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=bob;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert not any(
+        action.name == "ensure-account-kerberos-context"
+        and "account=alice" in action.target
+        for action in actions
+    )
+    assert [
+        action.target
+        for action in actions
+        if action.name == "dcsync-account"
+    ] == ["domain=lab.local;account=bob"]
 
 
 def test_downstream_account_edge_allows_context_after_domain_control_material():
@@ -3174,6 +3474,37 @@ def test_failed_certificate_auth_suppresses_repeat_candidate():
     assert actions == []
 
 
+def test_retryable_failed_certificate_auth_does_not_suppress_repeat_candidate():
+    failed_cert_auth = es.Hop(
+        id="failed-cert-auth",
+        technique="capability:adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        effect="da:lab.local",
+        status="failed",
+        evidence={
+            "verify_reason": "No answer from domain controller",
+            "terminal_failure": False,
+            "failure_class": "transient",
+        },
+        preconditions=[],
+        satisfied_effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        source="test",
+        timestamp=NOW,
+    )
+    state = es.EngagementState(
+        objective="prove domain admin with certificate auth certificate-auth-target:administrator@lab.local",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("adcs-ca-private-key:ca01@lab.local"),
+            failed_cert_auth,
+        ],
+    )
+
+    actions = [action for action in capabilities.actions_from_state(state) if action.name == "adcs-certificate-auth"]
+
+    assert len(actions) == 1
+
+
 def test_adcs_ca_private_key_probe_requires_valid_pfx_material():
     pfx = base64.b64encode(b"0" + b"A" * 512).decode("ascii")
     output = "\n".join([
@@ -3200,6 +3531,32 @@ def test_adcs_ca_private_key_probe_requires_valid_pfx_material():
     assert probe["ca_private_key_material_present"] is True
     assert probe["pfx_sha256"]
     assert "PFX_BASE64" not in probe
+
+
+def test_adcs_ca_private_key_probe_blocks_declared_pfx_sha_mismatch():
+    pfx = base64.b64encode(b"0" + b"A" * 512).decode("ascii")
+    output = "\n".join([
+        "SAGE_CA_EXPORT_PROOF_ca01_13",
+        "CA_EXPORT_STATUS=OK",
+        "CA_SUBJECT=CN=LAB-CA",
+        "CA_THUMBPRINT=ABCDEF123456",
+        f"PFX_SHA256={'a' * 64}",
+        f"PFX_BASE64={pfx}",
+    ])
+
+    probe = capabilities.extract_adcs_ca_private_key_probe(
+        output,
+        "ca01",
+        "lab.local",
+        "SAGE_CA_EXPORT_PROOF_ca01_13",
+    )
+    probe["callback_id"] = "13"
+    verdict = capabilities.verify_capability("adcs-ca-private-key-export", probe)
+
+    assert probe["pfx_sha256_mismatch"] is True
+    assert probe["pfx_blob_valid"] is False
+    assert verdict.verdict == "blocked"
+    assert verdict.reason == "pfx sha256 mismatch"
 
 
 def test_adcs_ca_private_key_probe_accepts_sharpdpapi_pem_material():
@@ -3332,6 +3689,7 @@ def test_build_adcs_certificate_auth_plan_uses_pkinit_artifact_not_ptt():
     pkinit = plan.steps[3]
     assert pkinit.parameters["certificate_path"] == r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx"
     assert pkinit.parameters["getcredentials"] is True
+    assert "dc" not in pkinit.parameters
     assert plan.steps[5].parameters["ticket_artifact"] == "{{kerberos_ticket_base64}}"
     proof = plan.steps[-1]
     assert proof.expected_probe == "extract_adcs_certificate_auth_probe"
@@ -3481,6 +3839,7 @@ def test_adcs_certificate_auth_probe_classifies_pkinit_not_supported():
     probe["callback_id"] = "13"
     verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
 
+    assert probe["pkinit_tgt_present"] is False
     assert probe["pkinit_not_supported"] is True
     assert verdict.verdict == "blocked"
     assert verdict.reason == "pkinit not supported"

@@ -267,11 +267,187 @@ def test_access_context_key_changes_with_privilege():
     escalated = engagement_state.EngagementState(
         objective="x",
         footholds=[foothold],
-        hops=[_hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local")],
+        hops=[_hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local")],
     )
     k0 = engagement_state.access_context_key(base, foothold)
     k1 = engagement_state.access_context_key(escalated, foothold)
     assert k0 and k1 and k0 != k1
+
+
+def test_access_context_key_ignores_hash_and_unbound_credential_artifacts():
+    foothold = _foothold(forest="north.sevenkingdoms.local")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    artifacts_only = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[
+            _hop("dcsync", "north.sevenkingdoms.local", "krbtgt-hash:north.sevenkingdoms.local"),
+            _hop("dcsync-user", "arya@north.sevenkingdoms.local", "creds:arya@north.sevenkingdoms.local"),
+        ],
+    )
+    assert engagement_state.access_context_key(base, foothold) == engagement_state.access_context_key(artifacts_only, foothold)
+
+
+def test_access_context_key_ignores_same_domain_kerberos_proof_after_da():
+    foothold = _foothold(forest="north.sevenkingdoms.local", callback_id="2")
+    da_only = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[_hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local")],
+    )
+    da_with_context = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[
+            _hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local"),
+            _hop("ensure-kerberos-context", "north.sevenkingdoms.local",
+                 "kerberos-context:north.sevenkingdoms.local@callback:2"),
+        ],
+    )
+
+    assert engagement_state.access_context_key(da_only, foothold) == engagement_state.access_context_key(
+        da_with_context,
+        foothold,
+    )
+
+
+def test_access_context_key_changes_for_active_cross_domain_da_authority():
+    foothold = _foothold(forest="north.sevenkingdoms.local", callback_id="2")
+    child_da = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[_hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local")],
+    )
+    parent_da_active = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[
+            _hop("membership", "north.sevenkingdoms.local", "da:north.sevenkingdoms.local"),
+            _hop("forge-golden-ticket", "sevenkingdoms.local", "da:sevenkingdoms.local"),
+            _hop("ensure-kerberos-context", "sevenkingdoms.local",
+                 "kerberos-context:sevenkingdoms.local@callback:2"),
+        ],
+    )
+
+    assert engagement_state.access_context_key(child_da, foothold) != engagement_state.access_context_key(
+        parent_da_active,
+        foothold,
+    )
+
+
+def test_graph_collection_coverage_requires_matching_foothold_domain():
+    foothold = _foothold(forest="north.example.local")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    key = engagement_state.access_context_key(base, foothold)
+    hop = engagement_state.Hop(
+        id="collect",
+        technique="collect-graph",
+        target=key,
+        effect=f"graph-built:{key}",
+        status="achieved",
+        evidence={
+            "graph_verified": True,
+            "covered_domains": ["target.example.local"],
+        },
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{key}"],
+        source="test",
+        timestamp="2026-06-24T12:00:00Z",
+    )
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[hop],
+    )
+
+    assert engagement_state.graph_collection_covers_foothold(state, foothold) is False
+    assert engagement_state.current_access_collection_missing(state) is True
+
+
+def test_graph_collection_coverage_accepts_netbios_equivalent_domain():
+    foothold = _foothold(forest="north")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    key = engagement_state.access_context_key(base, foothold)
+    hop = engagement_state.Hop(
+        id="collect",
+        technique="collect-graph",
+        target=key,
+        effect=f"graph-built:{key}",
+        status="achieved",
+        evidence={
+            "graph_verified": True,
+            "covered_domains": ["north.example.local"],
+        },
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{key}"],
+        source="test",
+        timestamp="2026-06-24T12:00:00Z",
+    )
+    state = engagement_state.EngagementState(
+        objective="x",
+        footholds=[foothold],
+        hops=[hop],
+    )
+
+    assert engagement_state.graph_collection_covers_foothold(state, foothold) is True
+    assert engagement_state.current_access_collection_missing(state) is False
+
+
+def test_targeted_collection_scope_is_distinct_from_default_forest_scope():
+    foothold = _foothold(forest="north.example.local")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    default_key = engagement_state.collection_target_key(base, foothold)
+    targeted_key = engagement_state.collection_target_key(base, foothold, "target.example.local")
+    assert default_key
+    assert targeted_key == f"{default_key}|scope:target.example.local"
+    assert targeted_key != default_key
+
+
+def test_targeted_collection_scope_coverage_uses_target_domain():
+    foothold = _foothold(forest="north.example.local")
+    base = engagement_state.EngagementState(objective="x", footholds=[foothold])
+    key = engagement_state.collection_target_key(base, foothold, "target.example.local")
+    hop = engagement_state.Hop(
+        id="collect-target",
+        technique="collect-graph",
+        target=key,
+        effect=f"graph-built:{key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["target.example.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{key}"],
+        source="test",
+        timestamp="2026-06-24T12:00:00Z",
+    )
+    state = engagement_state.EngagementState(objective="x", footholds=[foothold], hops=[hop])
+    assert engagement_state.graph_collection_covers_scope(state, foothold, "target.example.local") is True
+    assert engagement_state.graph_collection_covers_foothold(state, foothold) is False
+
+
+def test_trusted_uncollected_domains_prefers_objective_target():
+    state = engagement_state.EngagementState(
+        objective="obtain administrative control of target.example.local",
+        graph_facts=[
+            engagement_state.GraphFact("domain-collected:root.example.local", "test", "", 600),
+            engagement_state.GraphFact("trust-reachable:root.example.local:other.example.local", "test", "", 600),
+            engagement_state.GraphFact("trust-reachable:root.example.local:target.example.local", "test", "", 600),
+        ],
+    )
+    assert engagement_state.trusted_uncollected_domains(state) == [
+        "target.example.local",
+        "other.example.local",
+    ]
+
+
+def test_trusted_uncollected_domains_accepts_netbios_collected_source():
+    state = engagement_state.EngagementState(
+        objective="obtain administrative control of target.example.local",
+        graph_facts=[
+            engagement_state.GraphFact("domain-collected:root", "test", "", 600),
+            engagement_state.GraphFact("trust-reachable:root.example.local:target.example.local", "test", "", 600),
+        ],
+    )
+    assert engagement_state.trusted_uncollected_domains(state) == ["target.example.local"]
 
 
 def test_phase_is_exploitation_when_grounded_hop_exists_without_graph_facts():
@@ -393,7 +569,11 @@ def test_domain_admin_membership_check_alone_does_not_imply_kerberos_context():
 
     assert "da:north.sevenkingdoms.local" in state.achieved_effects()
     assert "kerberos-context:north.sevenkingdoms.local@callback:9" not in state.achieved_effects()
-    assert not state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
+    # ds-replication-rights IS now implied (intentional 2026-06-20): the foothold is a LIVE IN-DOMAIN callback
+    # and DA-group membership grants replication rights (in-domain arm of _expand_implications). It still does
+    # NOT fabricate a kerberos-context effect (asserted above) — selection is unblocked; execution proves the
+    # live token, and the stall detector recovers if it is not yet DA-privileged.
+    assert state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
 
 
 def _achieved_hop(effect, task_id, technique="capability:seed", target="seed"):
@@ -552,7 +732,12 @@ def test_objective_completion_candidate_accepts_live_certificate_auth_proof():
     assert "NEXT CAPABILITY ACTIONS" not in rendered
 
 
-def test_domain_admin_without_live_context_does_not_imply_replication_rights():
+def test_in_domain_da_implies_replication_rights_without_kerberos_context():
+    # Intentional change (2026-06-20): DA from a LIVE IN-DOMAIN foothold implies ds-replication-rights even
+    # without a recorded kerberos-context — DA-group membership grants replication, usable from your own
+    # in-domain foothold. This unblocks the DA->DCSync selection loop. (Cross-forest keeps the kerberos-context
+    # gate — covered by test_cross_forest_da_without_context_or_in_domain_foothold_keeps_gate.) If the live
+    # token is not actually DA-privileged yet, dcsync fails at execution and the stall detector recovers.
     foothold = _foothold(host="castelblack", forest="north.sevenkingdoms.local")
     state = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="trust path", footholds=[foothold]),
@@ -564,7 +749,24 @@ def test_domain_admin_without_live_context_does_not_imply_replication_rights():
     )
 
     assert "da:north.sevenkingdoms.local" in state.achieved_effects()
-    assert not state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
+    assert state.satisfies_predicate("ds-replication-rights:north.sevenkingdoms.local")
+
+
+def test_netbios_da_with_fqdn_kerberos_context_implies_fqdn_replication_rights():
+    state = engagement_state.EngagementState(
+        objective="trust path",
+        footholds=[_foothold(host="castelblack", forest="north", callback_id="2")],
+        hops=[
+            _hop("seed", "north", "da:north"),
+            _hop(
+                "ensure-kerberos-context",
+                "north.example.local",
+                "kerberos-context:north.example.local@callback:2",
+            ),
+        ],
+    )
+
+    assert state.satisfies_predicate("ds-replication-rights:north.example.local")
 
 
 # --- COMPLETE-CANDIDATE: don't halt on an intermediate domain; climb to the objective's target ---
@@ -603,3 +805,82 @@ def test_opaque_engagement_id_does_not_complete_from_no_next_hop(monkeypatch):
     monkeypatch.setattr(es, "objective_completion_candidates", lambda s: [{"domain": "sevenkingdoms.local"}])
 
     assert es._objective_is_complete(st, has_next=False) is False
+
+
+# --- rights-trace diagnostic: eid attribution (Fix #1) + test-pollution guard (Fix #2) ---
+
+def test_rights_trace_attributes_frozen_engagement_id(monkeypatch, tmp_path):
+    """Fix #1: when the live process publishes its frozen engagement key, the rights-trace record carries it
+    in `eid` (NOT the empty harness-side SAGE_ENGAGEMENT_ID env)."""
+    import json
+    import os
+    import engagement_ledger as el
+
+    es = engagement_state
+    # Simulate the live (non-pytest) Sage process so the diagnostic actually writes.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("SAGE_ENGAGEMENT_ID", raising=False)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(el, "_ACTIVE_ENGAGEMENT_ID", "", raising=False)  # auto-restored after test
+    el.set_active_engagement_id("gauge-c0-cross-forest-deadbeef")
+    es._RIGHTS_TRACE_SEEN.clear()
+
+    es._trace_rights_decision(
+        {"da:north.sevenkingdoms.local", "live-foothold:north.sevenkingdoms.local"},
+        {"ds-replication-rights:north.sevenkingdoms.local"},
+    )
+
+    trace = tmp_path / "rights_trace.jsonl"
+    assert trace.exists()
+    rec = json.loads(trace.read_text().strip().splitlines()[-1])
+    assert rec["eid"] == "gauge-c0-cross-forest-deadbeef"
+    assert rec["rights_granted"] is True
+
+
+def test_rights_trace_skipped_under_pytest(monkeypatch, tmp_path):
+    """Fix #2: under pytest the trace must not write — synthetic test predicates were polluting the real
+    .sage_engagement/rights_trace.jsonl with empty-eid fixture records."""
+    import os
+
+    es = engagement_state
+    assert os.environ.get("PYTEST_CURRENT_TEST")  # precondition: pytest sets this for the test's duration
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    es._RIGHTS_TRACE_SEEN.clear()
+
+    es._trace_rights_decision(
+        {"da:north.sevenkingdoms.local"},
+        {"ds-replication-rights:north.sevenkingdoms.local"},
+    )
+
+    assert not (tmp_path / "rights_trace.jsonl").exists()
+
+
+def test_runtime_trace_writer_honors_isolation_never_repo_root(monkeypatch, tmp_path):
+    """REGRESSION for the bypass that caused real pollution: the live write path MUST honor
+    SAGE_ENGAGEMENT_STATE_DIR (the conftest isolation) and never fall back to writing under os.getcwd().
+    The original relative-only `from . import engagement_ledger` failed in flat-import runtimes and fell
+    through to `os.getcwd()/.sage_engagement`, bypassing isolation — which is how 30 records landed in the
+    repo working tree."""
+    import os
+    import engagement_ledger as el
+
+    es = engagement_state
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)  # simulate the live (non-pytest) process
+    monkeypatch.delenv("SAGE_ENGAGEMENT_ID", raising=False)
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "isolated"))
+    monkeypatch.setattr(el, "_ACTIVE_ENGAGEMENT_ID", "", raising=False)
+    el.set_active_engagement_id("Operation_Isolated")
+    es._RIGHTS_TRACE_SEEN.clear()
+
+    repo_root_pollution = os.path.join(os.getcwd(), ".sage_engagement", "rights_trace.jsonl")
+    existed_before = os.path.exists(repo_root_pollution)
+
+    es._trace_rights_decision(
+        {"da:north.sevenkingdoms.local", "live-foothold:north.sevenkingdoms.local"},
+        {"ds-replication-rights:north.sevenkingdoms.local"},
+    )
+
+    # The write honored the configured isolation dir...
+    assert (tmp_path / "isolated" / "rights_trace.jsonl").exists()
+    # ...and never created repo-root pollution.
+    assert os.path.exists(repo_root_pollution) == existed_before

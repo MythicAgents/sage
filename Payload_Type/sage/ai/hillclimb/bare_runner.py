@@ -152,14 +152,20 @@ def score_from_probes(
     steps: int = 0,
     substring_score: float = 0.0,
     foothold_seen: bool = True,
+    wall_seconds: float = 0.0,
     gauge_version: str = GAUGE_VERSION,
 ) -> ScoreCard:
     """Score ANY agent's run from ledger-independent range probes — the SINGLE shared ruler for both
-    the bare model and the harness, so bare-vs-harness is apples-to-apples on the same ground truth."""
+    the bare model and the harness, so bare-vs-harness is apples-to-apples on the same ground truth.
+
+    `wall_seconds` is the run's wall-clock cost. For a scenario whose capability saturates (child-da caps at
+    KRBTGT_DUMPED), wall-clock is the discriminating signal: a harness that reaches the same milestone and
+    STOPS promptly (objective-completion recognized) beats one that churns to the timeout ceiling. The caller
+    measures it; 0.0 means unmeasured (e.g. a bare run that does not track it yet)."""
     gt = read_ground_truth_from_probes(scenario, probes, foothold_seen=foothold_seen)
     record = {
         "score": substring_score, "status": status, "tool_calls": steps, "model_calls": steps,
-        "recursion_deaths": 0, "errors": [], "total_tokens": 0, "wall_seconds": 0.0,
+        "recursion_deaths": 0, "errors": [], "total_tokens": 0, "wall_seconds": float(wall_seconds or 0.0),
     }
     return _score(record, gt, None, scenario=scenario, gauge_version=gauge_version)
 

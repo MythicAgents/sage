@@ -271,6 +271,23 @@ class QueryCommand(CommandBase):
         finally:
             await remove_session(session_id)
 
+        # Objective-completion recognition: when the autonomous solve halted because Sage RECOGNIZED the
+        # objective was satisfied (engagement state reached COMPLETE-CANDIDATE and `_maybe_stream_objective_
+        # completion_stop` streamed the completion report), surface a DISTINCT terminal status. The hill-climb
+        # gauge keys its clean-stop signal on this so it can tell "reached the objective and recognized it"
+        # apart from "ended for any other reason" (step-limit, wandered) — both of which otherwise land on
+        # Mythic's default success status and would falsely read as a clean stop. Checked before the operator
+        # stop so a recognized completion is credited even if a stop also raced in.
+        if getattr(llm, "_objective_completion_report_streamed", False):
+            await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(
+                TaskID=taskData.Task.ID,
+                UpdateStatus="objective-recognized",
+                UpdateCompleted=True,
+            ))
+            response.Completed = True
+            response.TaskStatus = "objective-recognized"
+            return response
+
         if getattr(llm, "_stop_requested", False):
             await SendMythicRPCTaskUpdate(MythicRPCTaskUpdateMessage(
                 TaskID=taskData.Task.ID,

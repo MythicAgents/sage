@@ -7,7 +7,7 @@ Subcommands:
   logs                   GET latest deploy logs (tail)
   snapshot <name> [--include-ram]
                          take a Proxmox snapshot of all range VMs
-  rollback [name]        roll all range VMs back to a snapshot (default: eval-defender-apollo)
+  rollback [name]        roll all range VMs back to a snapshot (default: clean-baseline)
   snapshots              list snapshots
   poweron [machines]     PUT power on range VMs (default "all"; CSV of VMID/name for a subset)
   poweroff [machines]    PUT power off range VMs (default "all")
@@ -18,7 +18,7 @@ from __future__ import annotations
 import json, sys, urllib.request, urllib.error, ssl
 
 MCP = "/home/john/dev/sage/.mcp.json"
-DEFAULT_ROLLBACK_SNAPSHOT = "eval-defender-apollo"
+DEFAULT_ROLLBACK_SNAPSHOT = "clean-baseline"
 
 def _creds():
     c = json.load(open(MCP))

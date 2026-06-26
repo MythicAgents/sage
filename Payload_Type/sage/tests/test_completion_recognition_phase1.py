@@ -154,6 +154,40 @@ def test_parent_domain_foothold_does_not_satisfy_child_in_domain():
     assert not _complete(state)
 
 
+def test_in_domain_da_implies_ds_replication_rights():
+    # DA from a live in-domain foothold -> ds-replication-rights (so dcsync becomes selectable). Fixes the
+    # DA->DCSync loop where the right was only implied from a live kerberos-context the in-forest path lacked.
+    state = es.EngagementState(
+        objective=CHILD_DA_OBJECTIVE,
+        footholds=[_foothold(forest="north.sevenkingdoms.local", identity="NORTH\\samwell.tarly")],
+        hops=[_achieved_hop("da:north.sevenkingdoms.local", "655", target="domain=north.sevenkingdoms.local")],
+    )
+    assert "ds-replication-rights:north.sevenkingdoms.local" in state.satisfied_predicates()
+
+
+def test_same_netbios_label_cross_forest_does_not_imply_replication():
+    # A foothold NORTH\\evil in an UNRELATED forest (north.otherforest.local) + da:north.sevenkingdoms.local
+    # must NOT grant ds-replication-rights — FQDN-only matching; the bare "north" label is not trusted (the
+    # cross-forest DCSync hazard Forge caught).
+    state = es.EngagementState(
+        objective=CHILD_DA_OBJECTIVE,
+        footholds=[_foothold(forest="north.otherforest.local", identity="NORTH\\evil")],
+        hops=[_achieved_hop("da:north.sevenkingdoms.local", "1", target="domain=north.sevenkingdoms.local")],
+    )
+    assert "ds-replication-rights:north.sevenkingdoms.local" not in state.satisfied_predicates()
+
+
+def test_cross_forest_da_without_context_or_in_domain_foothold_keeps_gate():
+    # foothold is NORTH; da:essos.local but no kerberos-context:essos and no in-domain essos foothold ->
+    # replication rights NOT implied (cross-forest must still earn the usable context first).
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold(forest="north.sevenkingdoms.local", identity="NORTH\\samwell.tarly")],
+        hops=[_achieved_hop("da:essos.local", "1", target="domain=essos.local")],
+    )
+    assert "ds-replication-rights:essos.local" not in state.satisfied_predicates()
+
+
 def test_dead_in_domain_callback_does_not_complete():
     # A dead (not alive) in-domain foothold is not usable access -> no candidate.
     state = es.EngagementState(

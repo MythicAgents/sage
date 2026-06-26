@@ -4,11 +4,19 @@ The lab-touching factories (make_model_fn/tool_executor/cypher_run) are validate
 here. These pin the parsing: LLM decision, BloodHound literals, and the domain-count read.
 """
 import sys
+import base64
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import live_seams as ls  # noqa: E402
+import credential_artifacts as ca  # noqa: E402
+
+
+CHILD = "north.sevenkingdoms.local"
+GOOD_NT = "c1a2b3c4d5e6f708192a3b4c5d6e7f80"
 
 
 class _Msg:
@@ -89,3 +97,95 @@ def test_ad_probe_win_principal():
     tasker = lambda call: "Members\n----\nAdministrator  pwned\nThe command completed successfully."
     assert ls.ad_domain_admins_probe(tasker, "north", win_principals={"pwned"})() is True
     assert ls.ad_domain_admins_probe(tasker, "north", win_principals={"nope"})() is False
+
+
+def test_krbtgt_probe_store_hit_short_circuits_task_fetch(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [
+        {"account": "NORTH\\krbtgt$", "realm": CHILD},
+    ])
+
+    def unexpected_task_fetch(**kw):
+        raise AssertionError("task-output path should not run after a store hit")
+
+    monkeypatch.setattr(ls, "_fetch_krbtgt_dcsync_task_outputs", unexpected_task_fetch)
+    assert ls.krbtgt_dumped_probe(realm=CHILD)() is True
+
+
+def test_krbtgt_probe_task_output_real_secretsdump_material(monkeypatch):
+    assert GOOD_NT not in ca._DEGENERATE_HASHES
+    assert set(GOOD_NT) != {"0"}
+    output = f"krbtgt:502:aad3b435b51404eeaad3b435b51404ee:{GOOD_NT}:::"
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [])
+    monkeypatch.setattr(ls, "_fetch_krbtgt_dcsync_task_outputs", lambda **kw: [
+        {"output": output, "realm": ""},
+    ])
+
+    assert ls.krbtgt_dumped_probe(realm=CHILD)() is True
+
+
+def test_krbtgt_probe_rejects_degenerate_task_hash(monkeypatch):
+    output = (
+        "krbtgt:502:aad3b435b51404eeaad3b435b51404ee:"
+        "31d6cfe0d16ae931b73c59d7e0c089c0:::"
+    )
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [])
+    monkeypatch.setattr(ls, "_fetch_krbtgt_dcsync_task_outputs", lambda **kw: [
+        {"output": output, "realm": CHILD},
+    ])
+
+    assert ls.krbtgt_dumped_probe(realm=CHILD)() is False
+
+
+def test_krbtgt_probe_empty_store_and_no_task_material_false(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [])
+    monkeypatch.setattr(ls, "_fetch_krbtgt_dcsync_task_outputs", lambda **kw: [
+        {"output": "dcsync completed but no secret material", "realm": CHILD},
+    ])
+
+    assert ls.krbtgt_dumped_probe(realm=CHILD)() is False
+
+
+def test_krbtgt_realm_netbios_and_fqdn_match(monkeypatch):
+    assert ls._realms_match("NORTH", CHILD) is True
+    assert ls._realms_match(CHILD, "NORTH") is True
+
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [
+        {"account": "NORTH\\krbtgt", "realm": "NORTH"},
+    ])
+    assert ls.mythic_credential_probe("krbtgt", realm=CHILD)() is True
+
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [
+        {"account": "krbtgt@north.sevenkingdoms.local", "realm": CHILD},
+    ])
+    assert ls.mythic_credential_probe("krbtgt", realm="NORTH")() is True
+
+
+def test_krbtgt_dumped_probe_callable_no_live_range_no_hang(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_credentials_for_probe", lambda **kw: [])
+    monkeypatch.setattr(ls, "_fetch_krbtgt_dcsync_task_outputs", lambda **kw: [])
+    probe = ls.krbtgt_dumped_probe(realm=CHILD)
+
+    start = time.monotonic()
+    assert probe() is False
+    assert time.monotonic() - start < 1.0
+
+
+def test_decode_mythic_response_rows_base64_with_raw_fallback():
+    encoded = base64.b64encode(b"decoded output").decode("ascii")
+    assert ls._decode_mythic_response_rows([{"response_text": encoded}]) == "decoded output"
+    assert ls._decode_mythic_response_rows([
+        {"response_text": "not-base64", "response": "raw output"},
+    ]) == "raw output"
+
+
+def test_krbtgt_dcsync_task_realm_parses_native_and_mimikatz():
+    native = {
+        "command_name": "dcsync",
+        "original_params": '{"Domain":"north.sevenkingdoms.local","User":"krbtgt"}',
+    }
+    mimikatz = {
+        "command_name": "execute_pe",
+        "display_params": "lsadump::dcsync /domain:essos.local /user:ESSOS\\krbtgt",
+    }
+    assert ls._krbtgt_dcsync_task_realm(native) == CHILD
+    assert ls._krbtgt_dcsync_task_realm(mimikatz) == "essos.local"

@@ -71,7 +71,10 @@ class EngagementState:
         """Return predicates satisfied by achieved hops AND live footholds/graph facts, plus logical
         implications (e.g. da/ea plus a live Kerberos context implies that domain's replication rights)."""
         predicates = self.achieved_effects() | foothold_predicates(self)
-        return _expand_implications(_filter_live_kerberos_context_predicates(predicates))
+        filtered = _filter_live_kerberos_context_predicates(predicates)
+        expanded = _expand_implications(filtered)
+        _trace_rights_decision(filtered, expanded)  # DIAGNOSTIC: remove after krbtgt-variance root-caused
+        return expanded
 
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
@@ -79,21 +82,209 @@ class EngagementState:
 
 
 def access_context_key(state: "EngagementState", foothold: "Foothold") -> str:
-    """A stable key for 'the access level a collection was run at': host|identity|integrity|held-privileges.
-    Re-collecting from the same foothold with the same rights is redundant (same key -> gate SKIP); once the
-    agent escalates (a new da:/ea:/krbtgt-hash:/creds: effect lands) the key changes and a fresh collection
-    is allowed. This makes collect-once-PER-PRIVILEGE deterministic. Pure; never raises."""
+    """A stable key for the collection-relevant authority epoch.
+
+    This is deliberately not a raw session fingerprint. SharpHound should not re-run merely because a callback
+    identity string, integrity label, dumped hash, or Kerberos proof changed. A new key is created only when the
+    modeled authority that can change graph visibility changes:
+
+    - the foothold's baseline forest scope;
+    - active ``da:`` / ``ea:`` authority in that scope;
+    - active cross-domain ``da:`` / ``ea:`` authority only after a callback-scoped Kerberos context proves that
+      authority is actually in use on this callback.
+
+    Same-domain Kerberos proof does not create a second epoch after DA is already recorded. This keeps the key
+    aligned with the reason to collect: a new graph-visible authority, not an authentication artifact. Pure;
+    never raises."""
     try:
-        privs = sorted(
-            e for e in state.achieved_effects()
-            if e.startswith(("da:", "ea:", "krbtgt-hash:", "creds:"))
+        scope = (
+            _normalize_key(getattr(foothold, "forest", ""))
+            or _identity_domain(getattr(foothold, "identity", ""))
+            or _normalize_key(getattr(foothold, "host", ""))
         )
-        host = _normalize_key(getattr(foothold, "host", ""))
-        identity = _normalize_key(getattr(foothold, "identity", ""))
-        integrity = _normalize_key(getattr(foothold, "integrity", ""))
-        return _normalize_predicate(f"{host}|{identity}|{integrity}|{';'.join(privs)}")
+        if not scope:
+            return ""
+        authorities = sorted(_collection_auth_context_effects(state, foothold))
+        epoch = ";".join(authorities) or "baseline"
+        return _normalize_predicate(f"{scope}|{epoch}")
     except Exception:
         return ""
+
+
+def collection_target_key(
+    state: "EngagementState",
+    foothold: "Foothold",
+    scope_domain: str = "",
+) -> str:
+    """Return the durable collect-graph target key for one authority epoch plus one requested scope.
+
+    Targeted domain collections append ``|scope:<domain>`` so the same authority epoch can legitimately collect
+    an external trusted domain without overwriting or being suppressed by the current-forest collection."""
+    try:
+        access_key = access_context_key(state, foothold)
+        if not access_key:
+            return ""
+        scope = _normalize_key(scope_domain)
+        if not scope:
+            return access_key
+        return _normalize_predicate(f"{access_key}|scope:{scope}")
+    except Exception:
+        return ""
+
+
+def graph_collection_covers_scope(
+    state: "EngagementState",
+    foothold: "Foothold",
+    scope_domain: str = "",
+) -> bool:
+    """Return whether verified ingest evidence covers a requested collection scope for this auth context."""
+    try:
+        target_key = collection_target_key(state, foothold, scope_domain)
+        if not target_key:
+            return False
+        graph_effect = _normalize_predicate(f"graph-built:{target_key}")
+        expected_domain = _normalize_key(scope_domain) or _normalize_key(getattr(foothold, "forest", ""))
+        matched_verified_hop = False
+        for hop in getattr(state, "hops", []) or []:
+            if _text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            effects = {
+                _normalize_predicate(effect)
+                for effect in getattr(hop, "satisfied_effects", []) or []
+            }
+            effects.add(_normalize_predicate(getattr(hop, "effect", "")))
+            if graph_effect not in effects:
+                continue
+            evidence = getattr(hop, "evidence", {}) or {}
+            if not isinstance(evidence, dict) or evidence.get("graph_verified") is not True:
+                continue
+            matched_verified_hop = True
+            if not expected_domain:
+                return True
+            covered_domains = evidence.get("covered_domains") or []
+            if any(_domains_equivalent(expected_domain, domain) for domain in covered_domains):
+                return True
+        if not matched_verified_hop or not expected_domain:
+            return False
+        return any(
+            _domains_equivalent(
+                expected_domain,
+                _text(getattr(fact, "predicate", ""))[len("domain-collected:"):],
+            )
+            for fact in getattr(state, "graph_facts", []) or []
+            if _text(getattr(fact, "predicate", "")).casefold().startswith("domain-collected:")
+        )
+    except Exception:
+        return False
+
+
+def graph_collection_covers_foothold(state: "EngagementState", foothold: "Foothold") -> bool:
+    """Return whether verified ingest evidence covers this foothold's default forest scope."""
+    return graph_collection_covers_scope(state, foothold)
+
+
+def graph_domain_has_verified_collection(state: "EngagementState", domain: str) -> bool:
+    """Return whether any verified collection has covered ``domain`` in any authority epoch.
+
+    This distinguishes an initial baseline collection from an optional recollection after authority changes.
+    The latter is useful only when the objective still needs more graph data; it should not preempt an already
+    visible objective-scoped collection or a grounded executable capability."""
+    try:
+        expected_domain = _normalize_key(domain)
+        if not expected_domain:
+            return False
+        for hop in getattr(state, "hops", []) or []:
+            if _text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            effects = {
+                _normalize_predicate(effect)
+                for effect in getattr(hop, "satisfied_effects", []) or []
+            }
+            effects.add(_normalize_predicate(getattr(hop, "effect", "")))
+            if not any(effect.startswith("graph-built:") for effect in effects):
+                continue
+            evidence = getattr(hop, "evidence", {}) or {}
+            if not isinstance(evidence, dict) or evidence.get("graph_verified") is not True:
+                continue
+            covered_domains = evidence.get("covered_domains") or []
+            if any(_domains_equivalent(expected_domain, covered) for covered in covered_domains):
+                return True
+        return any(
+            _domains_equivalent(
+                expected_domain,
+                _text(getattr(fact, "predicate", ""))[len("domain-collected:"):],
+            )
+            for fact in getattr(state, "graph_facts", []) or []
+            if _text(getattr(fact, "predicate", "")).casefold().startswith("domain-collected:")
+        )
+    except Exception:
+        return False
+
+
+def trusted_uncollected_domains(state: "EngagementState") -> list[str]:
+    """Return trusted domains visible in the graph but not yet fully collected.
+
+    Only trust edges whose source domain is already collected are considered. This avoids chasing stub domains
+    from incomplete graph data. Objective-target domains sort first; remaining candidates are stable-sorted."""
+    try:
+        collected = {
+            _normalize_key(_text(getattr(fact, "predicate", ""))[len("domain-collected:"):])
+            for fact in getattr(state, "graph_facts", []) or []
+            if _text(getattr(fact, "predicate", "")).casefold().startswith("domain-collected:")
+        }
+        candidates: set[str] = set()
+        for fact in getattr(state, "graph_facts", []) or []:
+            predicate = _normalize_predicate(getattr(fact, "predicate", ""))
+            if not predicate.startswith("trust-reachable:"):
+                continue
+            source, sep, target = predicate[len("trust-reachable:"):].partition(":")
+            source = _normalize_key(source)
+            target = _normalize_key(target)
+            if not sep or not source or not target:
+                continue
+            if not any(_domains_equivalent(source, domain) for domain in collected):
+                continue
+            if any(_domains_equivalent(target, domain) for domain in collected):
+                continue
+            candidates.add(target)
+        objective_targets = {
+            _normalize_key(domain)
+            for domain in _objective_target_domains(getattr(state, "objective", ""))
+            if _normalize_key(domain)
+        }
+        return sorted(
+            candidates,
+            key=lambda domain: (0 if any(_domains_equivalent(domain, target) for target in objective_targets) else 1, domain),
+        )
+    except Exception:
+        return []
+
+
+def _collection_auth_context_effects(state: "EngagementState", foothold: "Foothold") -> set[str]:
+    """Canonical active DA/EA authority effects that can change SharpHound graph visibility.
+
+    A Kerberos context is only an activation witness for authority in another domain. It is not itself a reason
+    to recollect, and an account-context proof without modeled DA/EA authority is intentionally ignored."""
+    callback_id = _normalize_key(getattr(foothold, "callback_id", ""))
+    foothold_domain = _normalize_key(getattr(foothold, "forest", ""))
+    active_domains: set[str] = {foothold_domain} if foothold_domain else set()
+    achieved = state.achieved_effects()
+    for effect in achieved:
+        parsed = _parse_kerberos_context_effect(effect) or _parse_kerberos_account_context_effect(effect)
+        if not parsed:
+            continue
+        context_domain, context_callback_id = parsed
+        if callback_id and context_callback_id == callback_id:
+            active_domains.add(context_domain)
+
+    effects: set[str] = set()
+    for effect in achieved:
+        if effect.startswith(("da:", "ea:")):
+            authority, _, domain = effect.partition(":")
+            canonical_domain = _canonical_active_collection_domain(domain, active_domains)
+            if canonical_domain:
+                effects.add(f"{authority}:{canonical_domain}")
+    return effects
 
 
 def foothold_predicates(state: "EngagementState") -> set[str]:
@@ -140,12 +331,76 @@ _KERBEROS_CONTEXT_PREFIX = "kerberos-context:"
 _KERBEROS_CONTEXT_CALLBACK_MARKER = "@callback:"
 
 
+_RIGHTS_TRACE_SEEN: set = set()
+
+
+def _trace_rights_decision(input_preds: set, expanded: set) -> None:
+    """DIAGNOSTIC (temporary; remove after the krbtgt-variance root-cause is confirmed).
+
+    When DA/EA is held, snapshot whether `_expand_implications` granted ds-replication-rights, plus the
+    Fix-A-relevant predicates — captured from the RUNTIME set (incl. live-callback/authenticated footholds
+    that the stored ledger does NOT persist as hops, which is why offline ledger replay couldn't reproduce
+    Fix A's behavior). Deduped per-process on the (DA, rights, relevant-preds) tuple; fail-safe; never
+    affects behavior. Writes `.sage_engagement/rights_trace.jsonl`."""
+    try:
+        import os
+        # Test-pollution guard: pytest exercises satisfied_predicates() with synthetic predicates, which would
+        # otherwise append junk (empty-eid, fixture preds) to the real .sage_engagement/rights_trace.jsonl.
+        # PYTEST_CURRENT_TEST is set by pytest for the duration of every test; skip the write entirely there.
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        da = sorted(p for p in input_preds if p.startswith(("da:", "ea:")))
+        if not da:
+            return
+        rights = sorted(p for p in expanded if p.startswith("ds-replication-rights:"))
+        rel = sorted(p for p in input_preds if p.startswith((
+            "da:", "ea:", "system:", "gpo-domain:", "kerberos-context:", "kerberos-account-context:",
+            "authenticated:", "live-foothold:", "live-callback:", "krbtgt-hash:", "graph-built:")))
+        key = (tuple(da), tuple(rights), tuple(rel))
+        if key in _RIGHTS_TRACE_SEEN:
+            return
+        _RIGHTS_TRACE_SEEN.add(key)
+        import json
+        from datetime import datetime, timezone
+        eid = ""
+        try:
+            try:
+                from . import engagement_ledger as _el
+            except ImportError:  # ai/langgraph on sys.path directly (tests, some runtimes)
+                import engagement_ledger as _el
+            d = _el.state_dir()
+            # The live Sage process publishes its frozen engagement key here; the SAGE_ENGAGEMENT_ID env lives
+            # on the harness, NOT this process, so prefer the published value (fall back to env, then "").
+            eid = _el.active_engagement_id() or os.environ.get("SAGE_ENGAGEMENT_ID", "")
+        except Exception:
+            d = os.path.join(os.getcwd(), ".sage_engagement")
+            eid = os.environ.get("SAGE_ENGAGEMENT_ID", "")
+        os.makedirs(d, exist_ok=True)
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "eid": eid,
+            "da": da,
+            "rights_granted": bool(rights),
+            "ds_replication_rights": rights,
+            "predicates": rel,
+        }
+        with open(os.path.join(d, "rights_trace.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def _expand_implications(predicates: set[str]) -> set[str]:
     """Augment a satisfied-predicate set with logically-implied predicates. Pure; never raises.
 
     Three implications:
     1. kerberos-context:{domain}@callback:{id} + live-callback:{id} -> kerberos-context:{domain}.
-    2. da:/ea: on a domain + live kerberos-context:{domain} -> that domain's ds-replication-rights.
+    2. da:/ea: on a domain -> that domain's ds-replication-rights, when the right is USABLE: either a live
+       kerberos-context:{domain} (the cross-forest path — you hold a usable ticket for it), OR a live IN-DOMAIN
+       foothold in that domain (you can DCSync your own DA domain directly; DA-group membership grants
+       DS-Replication unless explicitly removed). The in-domain arm unblocks in-forest DA (e.g. GPO->DA) where
+       no separate kerberos-context was minted; cross-forest keeps the context requirement (no in-domain
+       foothold there until cert-auth), so it cannot DCSync prematurely.
     3. gpo-abuse (effect system:{gpo}) on a GPO that governs a domain (gpo-domain:{gpo}:{D} graph fact)
        -> ds-replication-rights:{D}. The SharpGPOAbuse SYSTEM task grants/holds DS-Replication on the DC
        the GPO governs, so controlling the GPO chains forward to dcsync on that domain (the effect-chained
@@ -155,6 +410,20 @@ def _expand_implications(predicates: set[str]) -> set[str]:
     live_context_domains = _live_kerberos_context_domains(predicates)
     for domain in live_context_domains:
         expanded.add(f"kerberos-context:{domain}")
+    # Domains where we hold a live, in-domain foothold (from foothold_predicates: authenticated:/live-foothold:).
+    # FQDN-ONLY: a bare NetBIOS label (e.g. "child", from authenticated:{identity_domain}) collides across
+    # unrelated forests (child.root.example.local vs child.other.example.local), so a same-label foothold in a
+    # DIFFERENT forest + a separately-held da: could wrongly grant replication rights and trigger a wrong-forest
+    # DCSync. Trust only dotted forest FQDNs (canonicalized via access_reconciler's NetBIOS->FQDN map), mirroring
+    # _in_domain_live_callback's forest-only matching. Degrades safely (no grant -> stall detector recovers).
+    live_foothold_domains = {
+        v for v in (
+            p.split(":", 1)[1].strip()
+            for p in predicates
+            if p.startswith(("authenticated:", "live-foothold:")) and ":" in p and not p.endswith(":*")
+        )
+        if "." in v
+    }
     for predicate in predicates:
         if predicate.startswith("gpo-domain:"):
             gpo, _, domain = predicate[len("gpo-domain:"):].partition(":")
@@ -164,8 +433,20 @@ def _expand_implications(predicates: set[str]) -> set[str]:
         for prefix in _DA_EFFECT_PREFIXES:
             if predicate.startswith(prefix):
                 domain = predicate[len(prefix):].strip()
-                if domain and domain in live_context_domains:
-                    expanded.add(f"ds-replication-rights:{domain}")
+                context_matches = {
+                    candidate
+                    for candidate in live_context_domains
+                    if _domains_equivalent(domain, candidate)
+                }
+                foothold_matches = {
+                    candidate
+                    for candidate in live_foothold_domains
+                    if _domains_equivalent(domain, candidate)
+                }
+                usable_domains = context_matches or foothold_matches
+                if domain and usable_domains:
+                    for usable_domain in usable_domains:
+                        expanded.add(f"ds-replication-rights:{usable_domain}")
         if predicate.startswith("system:"):
             domain = gpo_domain.get(predicate[len("system:"):].strip())
             if domain:
@@ -223,6 +504,36 @@ def _parse_kerberos_context_effect(predicate: str) -> tuple[str, str] | None:
     return domain, callback_id
 
 
+def _parse_kerberos_account_context_effect(predicate: str) -> tuple[str, str] | None:
+    normalized = _normalize_predicate(predicate)
+    prefix = "kerberos-account-context:"
+    if not normalized.startswith(prefix):
+        return None
+    tail = normalized[len(prefix):]
+    account_domain, sep, callback_id = tail.partition(_KERBEROS_CONTEXT_CALLBACK_MARKER)
+    if not sep:
+        return None
+    _account, domain_sep, domain = account_domain.rpartition("@")
+    domain = domain.strip()
+    callback_id = callback_id.strip()
+    if not domain_sep or not domain or not callback_id:
+        return None
+    return domain, callback_id
+
+
+def _canonical_active_collection_domain(domain: str, active_domains: set[str]) -> str:
+    """Return the active canonical spelling for one authority domain, or ``""`` when inactive."""
+    normalized_domain = _normalize_key(domain)
+    if not normalized_domain:
+        return ""
+    # Prefer an FQDN witness over a NetBIOS label so equivalent da:north / da:north.example.local effects do
+    # not create separate collection epochs.
+    for active_domain in sorted(active_domains, key=lambda item: ("." not in item, item)):
+        if _domains_equivalent(normalized_domain, active_domain):
+            return active_domain
+    return ""
+
+
 def corroborate_effect(effect: str, state: "EngagementState") -> bool:
     """Best-effort live corroboration of a durable hop's effect: True iff an INDEPENDENT live signal
     (a foothold-derived or graph-derived predicate) supports the effect. This is the deterministic,
@@ -232,10 +543,10 @@ def corroborate_effect(effect: str, state: "EngagementState") -> bool:
 
 
 TECHNIQUE_MODEL: dict[str, dict] = {
-    # Collection modeled as a STRIPS action so re-collection at the SAME access level is deterministically
-    # SKIPped by the gate (collect-once-per-privilege) — doctrine the model kept ignoring is now code. The
-    # target is an access-context key (host|identity|integrity|held-privileges); a privilege change yields a
-    # new key, re-enabling a fresh collection. Effect is verified by ingest_collection's graph_verified.
+    # Collection modeled as a STRIPS action so re-collection at the SAME authority epoch is deterministically
+    # SKIPped by the gate. The target is a collection-authority key (forest|active-da/ea-authority); a modeled
+    # authority change yields a new key, while raw identity/ticket churn does not. Effect is verified by
+    # ingest_collection's graph_verified.
     "collect-graph": {
         "target_type": "access",
         "effect": "graph-built:{target}",
@@ -464,6 +775,12 @@ def engagement_phase(state: "EngagementState") -> str:
             return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
         if current_access_collection_missing(state):
             return "RECON — current access has not been collected; run one BloodHound collection for this access context, then analyze"
+        trusted_missing = trusted_uncollected_domains(state)
+        if trusted_missing:
+            return (
+                "RECON — a trusted domain is visible but not collected; run one targeted BloodHound collection "
+                f"for {trusted_missing[0]}, then analyze"
+            )
         if not getattr(state, "graph_facts", None):
             return "RECON — collect the graph ONCE, then analyze (do NOT re-collect)"
         return "BLOCKED — no modeled hop available; route to BloodHound for graph coverage/path analysis or await an access change"
@@ -472,20 +789,18 @@ def engagement_phase(state: "EngagementState") -> str:
 
 
 def current_access_collection_missing(state: "EngagementState") -> bool:
-    """Return whether a live non-Sage callback has no verified graph collection at its current access key.
+    """Return whether a live non-Sage callback lacks a collection for its current authority epoch.
 
-    The key includes host, identity, integrity, and achieved privilege/credential effects. After a new DA,
-    krbtgt, or real-user credential lands, the key changes, so a fresh collection is allowed only for that new
-    access context. This is the deterministic form of "re-collect when permissions changed and more data is
-    needed"; callers should consult it after checking that no grounded next action is available.
+    The key changes only for modeled active DA/EA authority, not for dumped hashes, raw identity churn, or
+    same-domain Kerberos proof. This is the deterministic form of "re-collect when graph-visible permissions
+    changed and more data is needed"; callers should consult it only after checking that no grounded next action
+    is available.
     """
     try:
-        achieved = state.achieved_effects()
         for foothold in getattr(state, "footholds", []) or []:
             if not _is_live_target_foothold(foothold):
                 continue
-            key = access_context_key(state, foothold)
-            if key and f"graph-built:{key}" not in achieved:
+            if not graph_collection_covers_foothold(state, foothold):
                 return True
     except Exception:
         return False
