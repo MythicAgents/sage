@@ -210,7 +210,13 @@ class _CollectMythic:
             return json.dumps({"files": files, "success": True})
         return "task output"
 
-    async def probe_authentication_context(self, callback_display_id, host=""):
+    async def probe_authentication_context(
+        self,
+        callback_display_id,
+        host="",
+        adapter=None,
+        known_domain_authorities=(),
+    ):
         from ai.langgraph import auth_context
         identity = await self.issue_task_and_waitfor_task_output("whoami", "", callback_display_id)
         tickets = await self.issue_task_and_waitfor_task_output(
@@ -218,7 +224,13 @@ class _CollectMythic:
             {"luid": "", "getSystemTickets": False},
             callback_display_id,
         )
-        return auth_context.build_authentication_context(callback_display_id, host, identity, tickets)
+        return auth_context.build_authentication_context(
+            callback_display_id,
+            host,
+            identity,
+            tickets,
+            known_domain_authorities,
+        )
 
     async def _latest_download_for_callback(self, cb, name_contains="zip"):
         self.calls.append(("_latest_download", cb, name_contains))
@@ -231,6 +243,59 @@ class _CollectMythic:
         self.calls.append(("ingest_collection", file_uuid, callback_display_id))
         self.ingest_kwargs.append(dict(kw))
         return json.dumps(self._ingest)
+
+
+class _MerlinCollectMythic(_CollectMythic):
+    def __init__(self, ingest, *, whoami_outputs=None, **kwargs):
+        super().__init__(ingest, ticket_output="", **kwargs)
+        self._whoami_outputs = iter(whoami_outputs or [(
+            "Process (Primary) Token:\n"
+            "\tUser: NORTH\\samwell.tarly,Token ID: 0x1,Logon ID: 0x123,Privilege Count: 1,"
+            "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High\n"
+            "Thread (Primary) Token:\n"
+            "\tUser: NORTH\\samwell.tarly,Token ID: 0x2,Logon ID: 0x123,Privilege Count: 1,"
+            "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High"
+        )])
+
+    async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+        self.calls.append((command, parameters, callback_display_id))
+        if command == "token":
+            return next(self._whoami_outputs)
+        if command == "rev2Self":
+            return "Successfully reverted to self and dropped the impersonation token"
+        if command == "execute-assembly":
+            mt = re.search(r"--ZipFilename\s+(\S+)", parameters.get("arguments", ""))
+            self._zipname = mt.group(1) if mt else None
+            return "SharpHound enumeration completed"
+        if command == "ls":
+            on_disk = f"20260101000000_{self._zipname}" if self._ts else self._zipname
+            rows = ["-rw-rw-rw-\t2026-01-01 00:00:00\t123\tmerlin.exe"]
+            if self._ls_has_zip and self._zipname:
+                rows.insert(0, f"-rw-rw-rw-\t2026-01-01 00:00:00\t123\t{on_disk}")
+            return "Directory listing for: C:\\Users\\Public\r\n\r\n" + "\n".join(rows)
+        return "task output"
+
+    async def probe_authentication_context(
+        self,
+        callback_display_id,
+        host="",
+        adapter=None,
+        known_domain_authorities=(),
+    ):
+        from ai.langgraph import auth_context
+        identity = await self.issue_task_and_waitfor_task_output(
+            "token",
+            {"method": "whoami"},
+            callback_display_id,
+        )
+        return auth_context.build_authentication_context(
+            callback_display_id,
+            host,
+            identity,
+            "",
+            known_domain_authorities,
+            identity_parser="merlin-token",
+        )
 
 
 def test_collect_discovers_timestamped_zip_and_ingests_it():
@@ -418,8 +483,62 @@ def test_collect_already_ingested_is_ok():
     assert result["ok"] is True, result
 
 
-def test_collect_skips_non_apollo_foothold(monkeypatch):
-    """Forge N2: a non-Apollo missing foothold is NOT selected (so no slot is burned). With only a beacon
+def test_collect_merlin_uses_profiled_command_forms_and_text_ls():
+    m = object.__new__(model.Model)
+    fake = _MerlinCollectMythic({"status": "ingested", "graph_verified": True})
+    m.mythic_client = fake
+
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2", agent="merlin")))
+
+    assert result["ok"] is True, result
+    issued = [call[0] for call in fake.calls if call[0] in ("token", "execute-assembly", "ls", "download")]
+    assert issued == ["token", "execute-assembly", "ls", "download"], issued
+    execute = next(call for call in fake.calls if call[0] == "execute-assembly")
+    assert execute[1]["filename"] == "SharpHound.exe"
+    assert "--ZipFilename bloodhound_" in execute[1]["arguments"]
+    download = next(call for call in fake.calls if call[0] == "download")
+    assert download[1]["file"].startswith("C:\\Users\\Public\\20260101000000_bloodhound_")
+
+
+def test_collect_merlin_uses_profiled_revert_command_for_local_token():
+    local = (
+        "Process (Primary) Token:\n"
+        "\tUser: BRAAVOS\\Administrator,Token ID: 0x1,Logon ID: 0x456,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High\n"
+        "Thread (Primary) Token:\n"
+        "\tUser: BRAAVOS\\Administrator,Token ID: 0x2,Logon ID: 0x456,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High"
+    )
+    domain = (
+        "Process (Primary) Token:\n"
+        "\tUser: NORTH\\samwell.tarly,Token ID: 0x1,Logon ID: 0x123,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High\n"
+        "Thread (Primary) Token:\n"
+        "\tUser: NORTH\\samwell.tarly,Token ID: 0x2,Logon ID: 0x123,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High"
+    )
+    m = object.__new__(model.Model)
+    fake = _MerlinCollectMythic(
+        {"status": "ingested", "graph_verified": True},
+        whoami_outputs=[local, domain],
+    )
+    m.mythic_client = fake
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[_foothold("2", agent="merlin", host="braavos", identity="BRAAVOS\\Administrator")],
+        hops=[],
+        graph_facts=[],
+    )
+
+    result = asyncio.run(m._controller_collect(state))
+
+    assert result["ok"] is True, result
+    issued = [call[0] for call in fake.calls]
+    assert issued[:4] == ["token", "rev2Self", "token", "execute-assembly"], issued
+
+
+def test_collect_skips_unprofiled_foothold(monkeypatch):
+    """Forge N2: an unprofiled missing foothold is NOT selected (so no slot is burned). With only a beacon
     foothold, the target resolver yields nothing -> no_target, and SharpHound is never even issued."""
     monkeypatch.setattr(model.asyncio, "sleep", _nosleep)
     m = object.__new__(model.Model)
@@ -427,7 +546,7 @@ def test_collect_skips_non_apollo_foothold(monkeypatch):
     m.mythic_client = fake
     result = asyncio.run(m._controller_collect(_live_foothold_state("2", agent="beacon")))
     assert result["ok"] is False and result["status"] == "no_target", result
-    assert not any(c[0] == "execute_assembly" for c in fake.calls), "must not run SharpHound on a non-Apollo foothold"
+    assert not any(c[0] == "execute_assembly" for c in fake.calls), "must not run SharpHound on an unprofiled foothold"
 
 
 def test_collect_no_target():
@@ -467,6 +586,17 @@ def test_find_token_zip_path_handles_concatenated_json_objects():
     """Apollo streams >1 JSON object in one task output; the parser must walk them all."""
     doubled = _LS_SAMPLE + '{"files":[],"success":true}'
     assert model._find_token_zip_path(doubled, "ab12cd34").endswith("bloodhound_ab12cd34.zip")
+
+
+def test_find_token_zip_path_handles_merlin_text_listing():
+    listing = (
+        "Directory listing for: C:\\Users\\Public\r\n\r\n"
+        "-rw-rw-rw-\t2026-06-22 10:22:31\t1234\t20260622_bloodhound_ab12cd34.zip\n"
+        "-rw-rw-rw-\t2026-06-22 10:22:31\t1234\tmerlin.exe\n"
+    )
+    assert model._find_token_zip_path(listing, "ab12cd34") == (
+        "C:\\Users\\Public\\20260622_bloodhound_ab12cd34.zip"
+    )
 
 
 def test_collection_target_picks_the_missing_foothold_not_the_first():
@@ -579,6 +709,68 @@ def test_collection_request_prefers_objective_scope_over_optional_authority_reco
     assert authority_request is not None
     assert authority_request.scope_domain == ""
     assert authority_request.reason == "authority-change"
+
+
+def test_trusted_objective_scope_collection_wins_after_broad_account_frontier_is_suppressed():
+    from ai.langgraph import capabilities
+
+    def achieved(hop_id, effect):
+        return es.Hop(
+            id=hop_id,
+            technique="seed",
+            target="lab.local",
+            effect=effect,
+            status="achieved",
+            evidence={},
+            preconditions=[],
+            satisfied_effects=[effect],
+            source="test",
+            timestamp="",
+        )
+
+    foothold = _foothold(callback_id="2", host="dc01", identity="lab\\operator", forest="lab.local")
+    base = es.EngagementState(objective="obtain administrative control of child.lab.local", footholds=[foothold])
+    baseline_key = es.collection_target_key(base, foothold)
+    baseline_hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=baseline_key,
+        effect=f"graph-built:{baseline_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["lab.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{baseline_key}"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of child.lab.local",
+        footholds=[foothold],
+        hops=[
+            baseline_hop,
+            achieved("rights", "ds-replication-rights:lab.local"),
+            achieved("hash", "krbtgt-hash:lab.local"),
+            achieved("da", "da:lab.local"),
+            achieved("ctx", "kerberos-context:lab.local@callback:2"),
+        ],
+        graph_facts=[
+            es.GraphFact("domain-collected:lab.local", "test", "", 600),
+            es.GraphFact("trust-reachable:lab.local:child.lab.local", "test", "", 600),
+            es.GraphFact("credential-target:alice@lab.local", "test", "", 600),
+            es.GraphFact("credential-target:bob@lab.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    assert capabilities.actions_from_state(state) == []
+    request = m._controller_collection_request(
+        state,
+        include_trusted_scope=True,
+        include_optional_recollection=True,
+    )
+    assert request is not None
+    assert request.scope_domain == "child.lab.local"
+    assert request.reason == "objective-scope-expansion"
 
 
 def test_collection_request_does_not_recollect_authority_after_objective_domain_is_collected():

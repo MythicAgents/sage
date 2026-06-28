@@ -26,6 +26,24 @@ def _task(user="krbtgt"):
     }
 
 
+def _assembly_wrapped_dcsync_task(user="krbtgt", command_name="invoke-assembly"):
+    return {
+        "display_id": 451,
+        "command_name": command_name,
+        "original_params": json.dumps({
+            "assembly": "DirectoryTool.exe",
+            "arguments": (
+                f"--Command dcsync --User SEVENKINGDOMS\\{user} --Domain {DOM} "
+                "--DomainController kingslanding.sevenkingdoms.local"
+            ),
+        }),
+        "status": "completed",
+        "completed": True,
+        "operator": {"username": "mythic_admin"},
+        "callback": {"display_id": 13, "host": "CASTELBLACK", "user": "samwell.tarly"},
+    }
+
+
 def _dcsync_output():
     return f"""
 Object RDN           : krbtgt
@@ -139,6 +157,26 @@ def test_reconcile_manual_user_dcsync_keeps_user_target_distinct():
     assert record.target == f"cersei.lannister@{DOM}"
     assert {item["account"] for item in record.credential_material} == {"cersei.lannister"}
     assert {item["realm"] for item in record.credential_material} == {DOM}
+
+
+def test_reconcile_assembly_wrapped_dcsync_records_verified_effect():
+    record = task_reconciler.reconcile_task(_assembly_wrapped_dcsync_task(), _dcsync_output(), TS)
+
+    assert record is not None
+    assert record.technique == "dcsync"
+    assert record.target == DOM
+    assert record.evidence["mythic_task_id"] == 451
+
+
+def test_reconcile_assembly_wrapped_dcsync_requires_secret_material_and_effect_command():
+    error_output = "ERROR GetNCChanges failed before any secret material was returned"
+
+    assert task_reconciler.reconcile_task(_assembly_wrapped_dcsync_task(), error_output, TS) is None
+    assert task_reconciler.reconcile_task(
+        _assembly_wrapped_dcsync_task(command_name="load-assembly"),
+        _dcsync_output(),
+        TS,
+    ) is None
 
 
 def test_reconcile_extracts_wrapped_aes_material_without_ntlm_line():

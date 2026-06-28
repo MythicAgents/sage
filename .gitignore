@@ -14,6 +14,7 @@ Payload_Type/sage/sage*.db*
 tasks/
 .env
 skills/sage-callback-bootstrap/apollo_callback_config.json
+skills/sage-callback-bootstrap/merlin_callback_config.json
 .evals/
 .mcp.json
 .envrc

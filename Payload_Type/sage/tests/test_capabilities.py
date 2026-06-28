@@ -2111,7 +2111,7 @@ def test_build_ensure_kerberos_context_plan_reuses_forge_builder_inputs():
     _assert_payload_agnostic_plan(plan)
 
 
-def test_forge_golden_ticket_cross_domain_plan_uses_referral_hop_and_parent_dcsync():
+def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_acquisition_and_parent_dcsync():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=child.root.local;target_domain=root.local",
@@ -2134,35 +2134,24 @@ def test_forge_golden_ticket_cross_domain_plan_uses_referral_hop_and_parent_dcsy
     assert plan.ok is True
     operations = [step.operation for step in plan.steps]
     assert operations[2] == "kerberos-ticket-forge"
-    assert operations[3] == "kerberos-inter-realm-referral"
-    assert operations[4] == "kerberos-service-ticket-request"
+    assert "kerberos-inter-realm-referral" not in operations
+    assert "kerberos-service-ticket-request" not in operations
     assert operations[-1] == "drsuapi-dcsync"
-    # No netonly logon fork on the cross-domain path — the referral ticket loads into the current context.
+    # No netonly logon fork on the cross-domain path — the forged child TGT loads into the current context and
+    # Windows acquires the parent referral/service tickets when DCSync authenticates.
     assert "kerberos-logon-session-create" not in operations
-    referral = plan.steps[3]
-    assert referral.parameters["service"] == "krbtgt/root.local"
-    assert referral.parameters["child_dc"] == "dc01.child.root.local"
-    assert referral.parameters["ticket_base64"] == "{{kerberos_ticket_base64}}"
-    service_ticket = plan.steps[4]
-    assert service_ticket.parameters == {
-        "target_domain": "root.local",
-        "service": "ldap/dc01.root.local",
-        "ticket_base64": "{{kerberos_ticket_base64}}",
-        "dc": "dc01.root.local",
-        "nowrap": True,
-    }
-    assert plan.steps[5].parameters == {
+    assert plan.steps[3].parameters == {
         "domain": "root.local",
         "target_context": "current",
         "store": "agent-cache",
     }
-    assert plan.steps[6].parameters == {
-        "domain": "root.local",
+    assert plan.steps[4].parameters == {
+        "domain": "child.root.local",
         "ticket_artifact": "{{kerberos_ticket_base64}}",
         "target_context": "current",
         "store": "agent-cache",
     }
-    assert plan.steps[7].parameters == {
+    assert plan.steps[5].parameters == {
         "domain": "root.local",
         "target_context": "current",
         "store": "agent-cache",
@@ -2174,6 +2163,41 @@ def test_forge_golden_ticket_cross_domain_plan_uses_referral_hop_and_parent_dcsy
         "executor": "native",
         "dc": "dc01.root.local",
     }
+    _assert_payload_agnostic_plan(plan)
+
+
+def test_forge_golden_ticket_cross_domain_plan_can_opt_into_explicit_asktgs_fallback():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=child.root.local;target_domain=root.local",
+        preconditions=["krbtgt-hash:child.root.local"],
+        effects=["da:root.local"],
+        intent={
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+    )
+    plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "extra_sids": ["S-1-5-21-444-555-666-519"],
+        "proof_host": "dc01.root.local",
+        "child_dc": "dc01.child.root.local",
+        "kerberos_ticket_acquisition_strategy": "explicit-asktgs",
+    })
+
+    assert plan.ok is True
+    operations = [step.operation for step in plan.steps]
+    assert operations[3] == "kerberos-inter-realm-referral"
+    assert operations[4] == "kerberos-service-ticket-request"
+    referral = plan.steps[3]
+    assert referral.parameters["service"] == "krbtgt/root.local"
+    assert referral.parameters["child_dc"] == "dc01.child.root.local"
+    service_ticket = plan.steps[4]
+    assert service_ticket.parameters["service"] == "ldap/dc01.root.local"
+    assert plan.steps[6].parameters["domain"] == "root.local"
+    assert operations[-1] == "drsuapi-dcsync"
     _assert_payload_agnostic_plan(plan)
 
 
@@ -2225,6 +2249,7 @@ def test_build_ensure_kerberos_context_refresh_plan_purges_and_proves_current_co
         "kerberos-ticket-list",
         "kerberos-ticket-purge",
         "kerberos-ticket-list",
+        "kerberos-service-ticket-acquire",
         "kerberos-context-service-proof",
     ]
     assert {step.capability for step in plan.steps} == {"ensure-kerberos-context"}
@@ -2233,7 +2258,9 @@ def test_build_ensure_kerberos_context_refresh_plan_purges_and_proves_current_co
         "target_context": "current",
         "store": "current",
     }
+    assert plan.steps[-2].parameters["resource"] == "\\\\dc01.lab.local\\C$"
     assert plan.steps[-1].parameters["requires_import"] is False
+    assert plan.steps[-1].parameters["requires_acquisition"] is True
     assert plan.steps[-1].parameters["resource"] == "\\\\dc01.lab.local\\C$"
     assert "kerberos-ticket-forge" not in [step.operation for step in plan.steps]
     assert "kerberos-logon-session-create" not in [step.operation for step in plan.steps]
@@ -2262,8 +2289,10 @@ def test_build_ensure_kerberos_context_without_key_defaults_to_current_refresh()
         "kerberos-ticket-list",
         "kerberos-ticket-purge",
         "kerberos-ticket-list",
+        "kerberos-service-ticket-acquire",
         "kerberos-context-service-proof",
     ]
+    assert plan.steps[-2].parameters["resource"] == "\\\\dc01.lab.local\\C$"
     assert plan.steps[-1].parameters["resource"] == "\\\\dc01.lab.local\\C$"
     assert "key" not in plan.missing
     assert "kerberos-ticket-forge" not in [step.operation for step in plan.steps]
@@ -2390,6 +2419,80 @@ def test_graph_selected_laps_reader_unlocks_dcsync_account():
     assert action.target == "domain=lab.local;account=alice"
     assert action.effects == ["creds:alice@lab.local"]
     assert "credential-target:alice@lab.local" in action.source_facts
+
+
+def test_trusted_uncollected_objective_scope_suppresses_generic_account_harvest():
+    state = es.EngagementState(
+        objective="obtain administrative control of child.lab.local",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("ds-replication-rights:lab.local"),
+            _hop("krbtgt-hash:lab.local"),
+            _hop("da:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+        ],
+        graph_facts=[
+            _fact("domain-collected:lab.local"),
+            _fact("trust-reachable:lab.local:child.lab.local"),
+            _fact("credential-target:alice@lab.local"),
+            _fact("credential-target:bob@lab.local"),
+        ],
+    )
+
+    assert capabilities.actions_from_state(state) == []
+
+
+def test_trusted_uncollected_objective_scope_keeps_downstream_account_route():
+    state = es.EngagementState(
+        objective="obtain administrative control of child.lab.local",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("ds-replication-rights:lab.local"),
+            _hop("krbtgt-hash:lab.local"),
+            _hop("da:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+        ],
+        graph_facts=[
+            _fact("domain-collected:lab.local"),
+            _fact("trust-reachable:lab.local:child.lab.local"),
+            _fact("credential-target:alice@lab.local"),
+            _fact("credential-target:bob@lab.local"),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+        ],
+    )
+
+    actions = [action for action in capabilities.actions_from_state(state) if action.name == "dcsync-account"]
+
+    assert [action.target for action in actions] == ["domain=lab.local;account=alice"]
+
+
+def test_trusted_uncollected_objective_scope_keeps_explicit_account_target():
+    state = es.EngagementState(
+        objective=(
+            "obtain administrative control of child.lab.local "
+            "credential-target:alice@lab.local"
+        ),
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("ds-replication-rights:lab.local"),
+            _hop("krbtgt-hash:lab.local"),
+            _hop("da:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+        ],
+        graph_facts=[
+            _fact("domain-collected:lab.local"),
+            _fact("trust-reachable:lab.local:child.lab.local"),
+            _fact("credential-target:alice@lab.local"),
+            _fact("credential-target:bob@lab.local"),
+        ],
+    )
+
+    actions = [action for action in capabilities.actions_from_state(state) if action.name == "dcsync-account"]
+
+    assert [action.target for action in actions] == ["domain=lab.local;account=alice"]
 
 
 def test_downstream_account_edge_suppresses_sibling_dcsync_targets():

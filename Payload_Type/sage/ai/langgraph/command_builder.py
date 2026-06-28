@@ -28,6 +28,11 @@ _CONSTRUCTION_SIGNATURES = (
     "valid parameters are group",
     "required parameter",
     "takes no command line arguments",
+    "parseargstring",
+    "parseargdictionary",
+    "loadargsfromjson",
+    "one or more '/service:sname/server.domain.com' specifications are needed",
+    "/ticket:x must either be a .kirbi file or a base64 encoded .kirbi",
     "operating_system",
     "not registered",
     "ensure_tool_uploaded",
@@ -134,7 +139,7 @@ def resolve_params(command_parameters: list[dict], supplied: dict, *, command: s
 
         mapped, sources, alias_notes = _alias_supplied(schema, supplied_items, command)
         notes.extend(alias_notes)
-        _reroute_registered_file_refs(schema, mapped, sources, notes)
+        _reroute_registered_file_refs(schema, mapped, sources, notes, command=command)
         candidates = _candidate_groups(schema)
         if not candidates:
             for key, _value in supplied_items:
@@ -174,6 +179,8 @@ def _reroute_registered_file_refs(
     mapped: dict[str, Any],
     sources: dict[str, str],
     notes: list[str],
+    *,
+    command: str = "",
 ) -> None:
     """Move a registered-file reference off a `File` upload param onto the ChooseOne registered-selector.
 
@@ -185,8 +192,14 @@ def _reroute_registered_file_refs(
     the File param selects the "New File"/upload group, which (with a registered UUID) crashes Merlin and
     misbehaves on Apollo. Reroute so the registered group is chosen; ChooseOne validation then either accepts
     a valid registered name or returns a repair hint listing the valid names.
+
+    The Mythic `upload` operation is the inverse case: its File parameter is the intended transport for a
+    Mythic file UUID, even when the schema also exposes a registered-file selector. Do not reroute transport
+    uploads into a selector group that expects a display string.
     """
     try:
+        if _is_file_transport_command(command):
+            return
         file_params = [p for p in schema if p.get("type") == "File"]
         if not file_params:
             return
@@ -211,6 +224,11 @@ def _reroute_registered_file_refs(
                 notes.append(f"rerouted '{fcli}' (upload arg) -> '{sel_cli}' (registered selector)")
     except Exception:
         return
+
+
+def _is_file_transport_command(command: str) -> bool:
+    normalized = _lower(command).replace("-", "_")
+    return normalized in {"upload", "upload_file", "file_upload"}
 
 
 def _clean_schema(command_parameters: Any) -> list[dict]:

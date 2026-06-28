@@ -1,14 +1,14 @@
 ---
 name: sage-callback-bootstrap
-description: Repo-local post-Mythic-reset Sage/Apollo callback bootstrap workflow. Use when Codex, Claude Code, or an operator needs to create fresh Sage/Apollo payloads after Mythic reset, launch Apollo on CASTELBLACK in a Samwell interactive session, check callback readiness, or rediscover live callback IDs for a Sage GOAD solve.
+description: Repo-local post-Mythic-reset Sage/foothold callback bootstrap workflow. Use when Codex, Claude Code, or an operator needs to create fresh Sage/Apollo payloads after Mythic reset, import a retained foothold callback config such as Merlin, launch a foothold on CASTELBLACK, check callback readiness, or rediscover live callback IDs for a Sage GOAD solve.
 ---
 
 # Sage Callback Bootstrap
 
 Use after `$sage-goad-reset` archives the active runtime databases, resets Mythic, and restarts local Sage.
-Mythic reset changes payload crypto keys, so old payload files are invalid. The current clean-baseline workflow
-creates a fresh Apollo payload on every reset and launches it inside a real `NORTH\samwell.tarly` interactive
-session on CASTELBLACK.
+Mythic reset changes payload crypto keys, so old payload files are invalid unless their exported callback config
+is explicitly imported back into Mythic. The current clean-baseline workflow creates a fresh Apollo payload on
+every reset and launches it inside a real `NORTH\samwell.tarly` interactive session on CASTELBLACK.
 
 ## Credentials
 
@@ -33,6 +33,38 @@ The file stores Sage model/API settings plus Apollo filename, callback, C2 timin
 Set `APOLLO_CALLBACK_HOST` to the Mythic address reachable from GOAD. Shell variables and CLI arguments still
 override the file for one-off builds.
 
+## Retained Callback Setup
+
+Use retained callback import only when the operator intentionally wants to reuse an existing payload binary after
+Mythic reset. Export the live callback config before reset:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py export-callback-config \
+  --callback <foothold-display-id> \
+  --output skills/sage-callback-bootstrap/merlin_callback_config.json
+```
+
+The exported config is gitignored, contains sensitive callback cryptographic material, and is written mode
+`0600`. The import path is payload-agnostic: `bootstrap-reset` infers the payload type from the exported config
+rather than taking a Merlin/Apollo-specific branch.
+
+For the current Merlin R-C2 flow, run:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset \
+  --use-retained-callback \
+  --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
+```
+
+This creates Sage first, imports the retained Merlin callback config, and stops before any target-side payload
+execution. After the operator launches the retained Merlin payload, check:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness \
+  --runtime-dbs-archived \
+  --foothold-payload-type merlin
+```
+
 ## Legacy Baked Apollo Setup
 
 The old RAM-backed `eval-defender-apollo` workflow is retained only as an opt-in legacy path. Export the live
@@ -42,8 +74,7 @@ Apollo callback config once, before taking a snapshot that contains the running 
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py export-callback-config --callback <apollo-display-id>
 ```
 
-The default output is `skills/sage-callback-bootstrap/apollo_callback_config.json`. It is gitignored, contains
-sensitive callback cryptographic material, and is written mode `0600`.
+The default output is `skills/sage-callback-bootstrap/apollo_callback_config.json`.
 
 ## Workflow
 

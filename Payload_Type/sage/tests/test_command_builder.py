@@ -282,6 +282,27 @@ def test_file_vs_registered_filename_selects_exact_group():
     assert uuid_ref.group != "New File"
 
 
+def test_upload_file_uuid_stays_on_file_transport_group():
+    schema = [
+        _param("filename", "Default", kind="ChooseOne", required=True, choices=["ca.pfx"]),
+        _param("path", "Default", required=True),
+        _param("file", "New File", kind="File", required=True),
+        _param("path", "New File", required=True),
+    ]
+    file_uuid = "39a20f95-4065-4cdd-9084-ce88c1d132fc"
+
+    result = resolve_params(
+        schema,
+        {"file": file_uuid, "path": r"C:\Windows\Temp\ca.pfx"},
+        command="upload",
+    )
+
+    assert result.ok is True
+    assert result.group == "New File"
+    assert result.params == {"file": file_uuid, "path": r"C:\Windows\Temp\ca.pfx"}
+    assert not any("rerouted" in note for note in result.notes)
+
+
 def test_classify_parameter_group_mismatch_as_construction():
     output = "Supplied Arguments {'foo': 'bar'} don't match any parameter group for this command"
 
@@ -310,6 +331,18 @@ def test_classify_argumentless_command_failure_as_construction():
     output = "ps takes no command line arguments"
 
     assert classify_result("ps", output) == ResultClass.CONSTRUCTION
+
+
+def test_classify_rubeus_missing_service_specification_as_construction():
+    output = "[X] One or more '/service:sname/server.domain.com' specifications are needed"
+
+    assert classify_result("execute-assembly", output) == ResultClass.CONSTRUCTION
+
+
+def test_classify_rubeus_invalid_ticket_argument_as_construction():
+    output = "[X]/ticket:X must either be a .kirbi file or a base64 encoded .kirbi"
+
+    assert classify_result("execute-assembly", output) == ResultClass.CONSTRUCTION
 
 
 def test_classify_normal_task_output_as_success():

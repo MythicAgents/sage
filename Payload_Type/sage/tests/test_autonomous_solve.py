@@ -80,7 +80,24 @@ def _fake_foothold(es, forest="north.sevenkingdoms.local", callback_id="3"):
 
 
 @pytest.mark.parametrize("autonomous_solve", [False, True])
-def test_bounded_one_action_execute_capability_result_ends_graph(autonomous_solve):
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        (
+            "Continue by executing exactly one next grounded capability action using "
+            "the generic execute_capability tool. Retry at most once, then stop."
+        ),
+        (
+            "Call execute_capability exactly once for ensure-kerberos-context on callback 2. "
+            "Stop after the result."
+        ),
+        (
+            "Call execute_capability exactly once for ensure-kerberos-context on callback 2; "
+            "report the single result and stop."
+        ),
+    ],
+)
+def test_bounded_one_action_execute_capability_result_ends_graph(autonomous_solve, instruction):
     mod = _load_model_module()
     Model = mod.Model
 
@@ -116,14 +133,7 @@ def test_bounded_one_action_execute_capability_result_ends_graph(autonomous_solv
     m.llm = None
     m.mythic_client = None
 
-    channel = [
-        HumanMessage(
-            content=(
-                "Continue by executing exactly one next grounded capability action using "
-                "the generic execute_capability tool. Retry at most once, then stop."
-            )
-        )
-    ]
+    channel = [HumanMessage(content=instruction)]
     state = {
         "_message_seq": 3,
         "supervisor_messages": [],
@@ -147,6 +157,74 @@ def test_bounded_one_action_execute_capability_result_ends_graph(autonomous_solv
     assert "Executor verdict: `failed`" in update["supervisor_messages"][0].content
     assert "account key material is missing" in update["supervisor_messages"][0].content
     assert "This was a bounded one-action capability request" in update["supervisor_messages"][0].content
+
+
+def test_worker_handoff_prefers_terminal_execute_capability_report_over_narration():
+    mod = _load_model_module()
+    Model = mod.Model
+
+    class FakeAgent:
+        async def ainvoke(self, args, config=None):
+            payload = {
+                "ok": True,
+                "verdict": "achieved",
+                "capability": "ensure-kerberos-context",
+                "reason": "requested capability effect verified",
+                "issued": [
+                    {"task_id": 79, "command": "run"},
+                    {"task_id": 80, "command": "ls"},
+                ],
+                "recorded_effects": ["kerberos-context:north.sevenkingdoms.local@callback:2"],
+                "achieved_effects": ["kerberos-context:north.sevenkingdoms.local@callback:2"],
+            }
+            return {
+                "messages": list(args["messages"]) + [
+                    AIMessage(
+                        content="Callback 2 is alive. I am using deterministic ensure-kerberos-context now.",
+                        name="Mythic_Operator",
+                        tool_calls=[{
+                            "name": "execute_capability",
+                            "args": {},
+                            "id": "call_1",
+                            "type": "tool_call",
+                        }],
+                    ),
+                    ToolMessage(
+                        content=json.dumps(payload, sort_keys=True),
+                        name="execute_capability",
+                        tool_call_id="call_1",
+                    ),
+                ]
+            }
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = False
+    m._message_seq = 3
+    m.state = {"_message_seq": 3}
+    m.llm = None
+    m.mythic_client = None
+
+    state = {
+        "_message_seq": 3,
+        "supervisor_messages": [],
+        "generalist_messages": [],
+        "mythic_operator_messages": [
+            HumanMessage(content="Continue toward the current objective using the current state.")
+        ],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+    }
+
+    wrapped = m._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")
+    update = asyncio.run(wrapped(state, {}))
+
+    summary = update["supervisor_messages"][1].content
+    assert "Executor verdict: `achieved` for `ensure-kerberos-context`." in summary
+    assert "Task IDs: 79 `run`, 80 `ls`" in summary
+    assert "`kerberos-context:north.sevenkingdoms.local@callback:2`" in summary
+    assert "Callback 2 is alive" not in summary
+    assert "bounded one-action capability request" not in summary
 
 
 def test_autonomous_handoff_redirects_stale_gpo_redelegation_to_bloodhound():

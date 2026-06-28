@@ -39,7 +39,11 @@ def classify_tool_call(command: str, params, callback_host: str | None = None) -
         if _is_domain_admin_membership_check(command_text, parsed, combined_cf):
             return ("domain-admin-membership-check", "")
 
-        if "lsadump::dcsync" in combined_cf or (_apollo_dcsync(command_text, tokens, token_set)):
+        if (
+            "lsadump::dcsync" in combined_cf
+            or _apollo_dcsync(command_text, tokens, token_set)
+            or _assembly_wrapped_dcsync(command_text, parsed)
+        ):
             user_raw = _flag_value(parsed, "user")
             domain = (_domain_value(parsed) or (_fqdn_from_dn(user_raw) if _is_domain_dn(user_raw) else "")).casefold()
             user = user_raw.casefold()
@@ -290,6 +294,20 @@ def _fqdn_from_dn(value: str) -> str:
 def _apollo_dcsync(command: str, tokens: list[str], token_set: set[str]) -> bool:
     command_cf = _text(command).casefold()
     return command_cf == "dcsync" or ("apollo" in token_set and "dcsync" in token_set)
+
+
+def _assembly_wrapped_dcsync(command: str, parsed: dict[str, Any]) -> bool:
+    command_cf = _text(command).casefold()
+    if command_cf not in {
+        "execute_assembly",
+        "execute-assembly",
+        "inline_assembly",
+        "inline-assembly",
+        "invoke_assembly",
+        "invoke-assembly",
+    }:
+        return False
+    return _flag_value(parsed, "command").casefold() == "dcsync"
 
 
 def _is_lsass_dump(combined_cf: str, token_set: set[str]) -> bool:

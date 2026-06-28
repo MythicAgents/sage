@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Bootstrap Sage and Apollo callbacks after a Mythic reset.
+"""Bootstrap Sage and foothold callbacks after a Mythic reset.
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
 active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
 this helper creates fresh Sage/Apollo payloads before Apollo is launched on CASTELBLACK.
-The older baked-callback import flow is still available behind --use-baked-apollo.
+Retained callback configs can be imported explicitly for any foothold payload type. The
+older baked-Apollo flow remains available behind --use-baked-apollo.
 
 Examples:
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py export-callback-config --callback 2
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py import-callback-config
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
+  .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset --use-retained-callback --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-sage --provider Bedrock --model us.anthropic.claude-3-5-sonnet-20241022-v2:0
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-apollo --callback-host https://10.4.10.1 --download-dir /tmp/sage_payloads
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py create-all --callback-host https://10.4.10.1 --download-dir /tmp/sage_payloads
@@ -224,6 +226,17 @@ def load_callback_config(path: Path) -> Any:
     return normalize_callback_config(document)
 
 
+def callback_config_payload_type(config: Any) -> str | None:
+    normalized = normalize_callback_config(config)
+    if not isinstance(normalized, dict):
+        return None
+    payload_type = normalized.get("payload_type")
+    if isinstance(payload_type, dict):
+        payload_type = payload_type.get("name")
+    text = str(payload_type or "").strip().casefold()
+    return text or None
+
+
 def _build_parameters(values: dict[str, Any], *, keep_empty: set[str] | None = None) -> list[dict[str, str]]:
     keep_empty = keep_empty or set()
     params: list[dict[str, str]] = []
@@ -349,7 +362,12 @@ def runtime_db_status(
 def summarize_callback_readiness(
     callbacks: list[dict[str, Any]],
     liveness_by_display_id: dict[int, dict[str, Any]],
+    *,
+    foothold_payload_type: str = "apollo",
 ) -> dict[str, Any]:
+    foothold_payload_type = str(foothold_payload_type or "").strip().casefold()
+    if not foothold_payload_type:
+        raise ValueError("foothold_payload_type cannot be empty")
     rows = []
     for callback in callbacks:
         display_id = callback.get("display_id")
@@ -369,19 +387,25 @@ def summarize_callback_readiness(
         row for row in rows
         if row["payloadtype"] == "sage" and row["live"]
     ]
-    live_apollo = [
+    live_foothold = [
         row for row in rows
-        if row["payloadtype"] == "apollo"
+        if row["payloadtype"] == foothold_payload_type
         and row["live"]
         and str(row.get("host") or "").casefold() == "castelblack"
         and "samwell" in str(row.get("user") or "").casefold()
     ]
+    selected_foothold_cb = max((row["display_id"] for row in live_foothold), default=None)
     return {
-        "ready": bool(live_sage and live_apollo),
+        "ready": bool(live_sage and live_foothold),
         "callbacks": rows,
         "selected_sage_cb": max((row["display_id"] for row in live_sage), default=None),
-        "selected_apollo_cb": max((row["display_id"] for row in live_apollo), default=None),
-        "required": "fresh live sage callback plus live apollo callback on CASTELBLACK as samwell.tarly",
+        "foothold_payload_type": foothold_payload_type,
+        "selected_foothold_cb": selected_foothold_cb,
+        "selected_apollo_cb": selected_foothold_cb if foothold_payload_type == "apollo" else None,
+        "required": (
+            "fresh live sage callback plus live "
+            f"{foothold_payload_type} callback on CASTELBLACK as samwell.tarly"
+        ),
     }
 
 
@@ -444,16 +468,20 @@ async def readiness(
     *,
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
+    foothold_payload_type: str = "apollo",
 ) -> dict[str, Any]:
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
+    foothold_payload_type = str(foothold_payload_type or "").strip().casefold()
+    if not foothold_payload_type:
+        raise ValueError("foothold_payload_type cannot be empty")
     observed = await inspect(client)
     liveness_by_display_id: dict[int, dict[str, Any]] = {}
     for callback in observed.get("callbacks", []):
         display_id = callback.get("display_id")
         if not isinstance(display_id, int):
             continue
-        if payload_type_name(callback).lower() not in {"sage", "apollo"}:
+        if payload_type_name(callback).lower() not in {"sage", foothold_payload_type}:
             continue
         try:
             liveness_by_display_id[display_id] = await assess_callback_liveness(client, display_id)
@@ -461,12 +489,18 @@ async def readiness(
             liveness_by_display_id[display_id] = {"alive": False, "reason": f"liveness check failed: {exc}"}
 
     runtime = runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
-    callbacks = summarize_callback_readiness(observed.get("callbacks", []), liveness_by_display_id)
+    callbacks = summarize_callback_readiness(
+        observed.get("callbacks", []),
+        liveness_by_display_id,
+        foothold_payload_type=foothold_payload_type,
+    )
     blockers = []
     if not runtime["ready"]:
         blockers.append("archive stale Sage/Phoenix runtime DBs before restarting Sage")
     if not callbacks["ready"]:
-        blockers.append("fresh live Sage and Apollo callbacks are not both present")
+        blockers.append(
+            f"fresh live Sage and {foothold_payload_type} callbacks are not both present"
+        )
     return {
         "ready": not blockers,
         "blockers": blockers,
@@ -731,6 +765,7 @@ async def command_readiness(args: argparse.Namespace) -> None:
             client,
             Path(args.repo_root),
             runtime_dbs_archived=args.runtime_dbs_archived,
+            foothold_payload_type=args.foothold_payload_type,
         ),
         indent=2,
         sort_keys=True,
@@ -804,13 +839,58 @@ def fresh_apollo_bootstrap_instructions(apollo: dict[str, Any]) -> dict[str, Any
     }
 
 
+def retained_callback_bootstrap_instructions(payload_type: str) -> dict[str, Any]:
+    return {
+        "required": True,
+        "payload_type": payload_type,
+        "notes": [
+            "Launch the retained payload process after Mythic imports its callback config; this helper does not execute target-side payloads.",
+            (
+                "After the callback appears, run readiness --runtime-dbs-archived "
+                f"--foothold-payload-type {payload_type} before a solve."
+            ),
+        ],
+    }
+
+
 async def command_bootstrap_reset(args: argparse.Namespace) -> None:
-    client = await login(args)
-    path = callback_config_path(args.callback_config)
-    result: dict[str, Any] = {"sage": await create_sage(client, args)}
-    if getattr(args, "use_baked_apollo", False):
+    use_baked_apollo = bool(getattr(args, "use_baked_apollo", False))
+    use_retained_callback = bool(getattr(args, "use_retained_callback", False))
+    if use_baked_apollo and use_retained_callback:
+        raise ValueError("--use-baked-apollo and --use-retained-callback are mutually exclusive")
+
+    path = callback_config_path(getattr(args, "callback_config", None))
+    retained_path: Path | None = None
+    retained_config: Any = None
+    retained_payload_type: str | None = None
+    if use_baked_apollo:
         if not path.exists():
             raise RuntimeError(f"--use-baked-apollo requires callback config at {path}")
+    elif use_retained_callback:
+        retained_value = (
+            getattr(args, "retained_callback_config", None)
+            or os.environ.get("RETAINED_CALLBACK_CONFIG_PATH")
+        )
+        if not retained_value:
+            raise RuntimeError(
+                "--use-retained-callback requires --retained-callback-config "
+                "or RETAINED_CALLBACK_CONFIG_PATH"
+            )
+        retained_path = Path(retained_value).expanduser()
+        if not retained_path.exists():
+            raise RuntimeError(
+                f"--use-retained-callback requires callback config at {retained_path}"
+            )
+        retained_config = load_callback_config(retained_path)
+        retained_payload_type = callback_config_payload_type(retained_config)
+        if not retained_payload_type:
+            raise RuntimeError(
+                f"Retained callback config at {retained_path} has no payload_type.name"
+            )
+
+    client = await login(args)
+    result: dict[str, Any] = {"sage": await create_sage(client, args)}
+    if use_baked_apollo:
         result["apollo_callback_import"] = await import_callback_config(
             client,
             load_callback_config(path),
@@ -821,6 +901,19 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
             client,
             timeout_seconds=args.post_callback_timeout,
             max_skew_seconds=args.max_clock_skew_seconds,
+        )
+    elif use_retained_callback:
+        assert retained_path is not None
+        assert retained_payload_type is not None
+        result["retained_callback_import"] = await import_callback_config(
+            client,
+            retained_config,
+        )
+        result["retained_callback_config"] = str(retained_path)
+        result["retained_payload_type"] = retained_payload_type
+        result["mode"] = "imported-retained-callback"
+        result["retained_callback_bootstrap"] = retained_callback_bootstrap_instructions(
+            retained_payload_type
         )
     else:
         apollo = await create_apollo(client, args)
@@ -930,6 +1023,11 @@ def build_parser() -> argparse.ArgumentParser:
             "The old --operator-db-cleanup-confirmed spelling remains as a compatibility alias."
         ),
     )
+    readiness_parser.add_argument(
+        "--foothold-payload-type",
+        default=os.environ.get("FOOTHOLD_PAYLOAD_TYPE", "apollo"),
+        help="Payload type expected on CASTELBLACK as samwell.tarly (default: apollo).",
+    )
     readiness_parser.set_defaults(func=command_readiness)
 
     export_parser = sub.add_parser(
@@ -951,7 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_parser = sub.add_parser(
         "import-callback-config",
-        help="Import the retained baked Apollo callback config into Mythic.",
+        help="Import a retained callback config into Mythic.",
     )
     add_common(import_parser)
     import_parser.add_argument(
@@ -979,7 +1077,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset_parser = sub.add_parser(
         "bootstrap-reset",
-        help="Create fresh Sage/Apollo payloads for the clean-baseline workflow; legacy baked Apollo is opt-in.",
+        help="Create fresh Sage/Apollo payloads or explicitly import a retained foothold callback config.",
     )
     add_common(reset_parser)
     add_sage_args(reset_parser)
@@ -996,6 +1094,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Legacy opt-in: import a retained baked Apollo callback config and wait for reconnect. "
             "The clean-baseline workflow creates a fresh Apollo payload instead."
+        ),
+    )
+    reset_parser.add_argument(
+        "--retained-callback-config",
+        default=os.environ.get("RETAINED_CALLBACK_CONFIG_PATH"),
+        help="Retained callback config path for --use-retained-callback.",
+    )
+    reset_parser.add_argument(
+        "--use-retained-callback",
+        action="store_true",
+        default=env_bool("USE_RETAINED_CALLBACK"),
+        help=(
+            "Opt in to importing a retained foothold callback config instead of creating Apollo. "
+            "The payload type is inferred from the exported config."
         ),
     )
     reset_parser.add_argument(

@@ -1,6 +1,6 @@
 ---
 name: sage-goad-reset
-description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness workflow. Use when Codex, Claude Code, or an operator asks to reset everything, perform a full reset, archive Sage/Phoenix runtime databases, reset Docker-backed Mythic, reset or verify Ludus GOAD, wipe/check BloodHound CE, restart local Sage safely, generate fresh payloads, establish a Samwell Apollo callback, or preflight before a guided Sage GOAD solve.
+description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness workflow. Use when Codex, Claude Code, or an operator asks to reset everything, perform a full reset, archive Sage/Phoenix runtime databases, reset Docker-backed Mythic, reset or verify Ludus GOAD, wipe/check BloodHound CE, restart local Sage safely, generate fresh payloads, import a retained foothold config, establish a Samwell callback, or preflight before a guided Sage GOAD solve.
 ---
 
 # Sage GOAD Reset
@@ -59,6 +59,17 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 
    This creates Sage first, then builds/downloads a fresh Apollo payload for the clean-baseline workflow. On a
    clean Mythic database, Sage is callback `1`.
+
+   For an intentional retained foothold reuse such as the current Merlin R-C2 flow, replace that command with:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset \
+  --use-retained-callback \
+  --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
+```
+
+   This imports the exported callback config and stops before target-side payload execution. After the operator
+   launches the retained payload, use `readiness --runtime-dbs-archived --foothold-payload-type merlin`.
 7. Open an RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then launch the fresh Apollo
    payload with `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
    `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged

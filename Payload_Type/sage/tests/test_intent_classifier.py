@@ -73,6 +73,32 @@ def test_apollo_dcsync_command_extracts_dict_domain():
     ) == ("dcsync", "north.sevenkingdoms.local")
 
 
+def test_assembly_wrapped_dcsync_command_extracts_domain():
+    assert intent_classifier.classify_tool_call(
+        "invoke-assembly",
+        {
+            "assembly": "DirectoryTool.exe",
+            "arguments": (
+                "--Command dcsync --User LAB\\krbtgt --Domain lab.local "
+                "--DomainController dc01.lab.local"
+            ),
+        },
+    ) == ("dcsync", "lab.local")
+
+
+def test_assembly_wrapped_dcsync_keeps_user_target_distinct():
+    assert intent_classifier.classify_tool_call(
+        "execute_assembly",
+        {
+            "assembly": "DirectoryTool.exe",
+            "arguments": (
+                "--Command dcsync --User LAB\\alice --Domain lab.local "
+                "--DomainController dc01.lab.local"
+            ),
+        },
+    ) == ("dcsync-user", "lab\\alice@lab.local")
+
+
 def test_dcsync_krbtgt_dn_target_is_domain_krbtgt_not_user_dcsync():
     assert intent_classifier.classify_tool_call(
         "dcsync",

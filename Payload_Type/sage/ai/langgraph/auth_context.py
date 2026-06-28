@@ -74,9 +74,16 @@ def build_authentication_context(
     identity_output: Any,
     ticket_output: Any,
     known_domain_authorities: tuple[str, ...] | set[str] = (),
+    identity_parser: str = "apollo",
 ) -> AuthenticationContext:
-    primary, impersonation = parse_apollo_identity_output(identity_output)
+    parser = _normalize_parser(identity_parser)
+    identity_luid = ""
+    if parser in {"merlin", "merlin-token", "merlin_token"}:
+        primary, impersonation, identity_luid = parse_merlin_token_identity_output(identity_output)
+    else:
+        primary, impersonation = parse_apollo_identity_output(identity_output)
     current_luid, tickets = parse_apollo_ticket_cache_output(ticket_output)
+    current_luid = current_luid or identity_luid
     current_tickets = tuple(
         ticket
         for ticket in tickets
@@ -110,6 +117,20 @@ def parse_apollo_identity_output(output: Any) -> tuple[str, str]:
     )
     fallback = identities[-1] if identities else ""
     return fallback, fallback
+
+
+def parse_merlin_token_identity_output(output: Any) -> tuple[str, str, str]:
+    """Return process identity, effective thread identity, and effective LUID from `token whoami` output."""
+    text = _text(output)
+    process = _merlin_token_section(text, "Process")
+    thread = _merlin_token_section(text, "Thread")
+    primary = _merlin_token_value(process, "User")
+    impersonation = _merlin_token_value(thread, "User") or primary
+    luid = _normalize_luid(_merlin_token_value(thread, "Logon ID") or _merlin_token_value(process, "Logon ID"))
+    if primary or impersonation:
+        return primary, impersonation, luid
+    fallback_primary, fallback_impersonation = parse_apollo_identity_output(text)
+    return fallback_primary, fallback_impersonation, luid
 
 
 def parse_apollo_ticket_cache_output(output: Any) -> tuple[str, tuple[KerberosTicket, ...]]:
@@ -194,11 +215,14 @@ def _observed_domain_authorities(
     active_identity: str,
     tickets: tuple[KerberosTicket, ...],
 ) -> set[str]:
-    authorities = {
-        str(item or "").strip().casefold()
-        for item in existing
-        if str(item or "").strip()
-    }
+    authorities: set[str] = set()
+    for item in existing:
+        normalized = str(item or "").strip().casefold()
+        if not normalized:
+            continue
+        authorities.add(normalized)
+        if "." in normalized:
+            authorities.add(normalized.split(".", 1)[0])
     for ticket in tickets:
         for realm in (ticket.client_realm, ticket.service_realm):
             normalized = str(realm or "").strip().casefold()
@@ -222,6 +246,23 @@ def _normalize_luid(value: Any) -> str:
         return f"0x{int(text, 0):x}"
     except ValueError:
         return text
+
+
+def _normalize_parser(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _merlin_token_section(text: str, label: str) -> str:
+    match = re.search(
+        rf"(?ims)^\s*{re.escape(label)}\s+\([^)]*\)\s+Token:\s*(.*?)(?=^\s*(?:Process|Thread)\s+\([^)]*\)\s+Token:|\Z)",
+        text,
+    )
+    return match.group(1) if match else ""
+
+
+def _merlin_token_value(section: str, label: str) -> str:
+    match = re.search(rf"(?i)\b{re.escape(label)}\s*:\s*([^,\r\n]+)", section)
+    return match.group(1).strip() if match else ""
 
 
 def _text(value: Any) -> str:

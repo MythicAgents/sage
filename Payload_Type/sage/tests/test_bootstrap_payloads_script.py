@@ -247,6 +247,13 @@ def test_import_callback_config_passes_jsonb_object(monkeypatch):
     assert "$config: jsonb!" in observed["query"]
 
 
+def test_callback_config_payload_type_reads_exported_payload_type():
+    assert bootstrap_payloads.callback_config_payload_type({
+        "payload_type": {"name": "Merlin"},
+    }) == "merlin"
+    assert bootstrap_payloads.callback_config_payload_type({"payload_type": {}}) is None
+
+
 def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     monkeypatch,
     tmp_path,
@@ -307,6 +314,97 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     assert output["mode"] == "legacy-imported-baked-apollo"
     assert output["post_callback_preflight"]["ready"] is True
     assert "apollo" not in output
+
+
+def test_bootstrap_reset_imports_retained_merlin_without_creating_apollo(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = tmp_path / "merlin_callback_config.json"
+    config_path.write_text(
+        json.dumps({
+            "config": {
+                "uuid": "payload-uuid",
+                "key": "secret",
+                "payload_type": {"name": "merlin"},
+            }
+        }),
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def fake_login(args):
+        return object()
+
+    async def fake_import(client, config):
+        calls.append(("import", config))
+        return {"status": "success", "error": None}
+
+    async def fake_create_sage(client, args):
+        calls.append(("sage", None))
+        return {"build_phase": "success", "uuid": "sage-uuid"}
+
+    async def fail_create_apollo(client, args):
+        raise AssertionError("Apollo payload creation must be skipped")
+
+    async def fail_preflight(client, *, timeout_seconds, max_skew_seconds):
+        raise AssertionError("Apollo post-callback preflight must be skipped")
+
+    async def fake_query(client, query, variables=None):
+        return {"callback": []}
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
+    monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
+    monkeypatch.setattr(bootstrap_payloads, "create_sage", fake_create_sage)
+    monkeypatch.setattr(bootstrap_payloads, "create_apollo", fail_create_apollo)
+    monkeypatch.setattr(bootstrap_payloads, "post_callback_preflight", fail_preflight)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    asyncio.run(
+        bootstrap_payloads.command_bootstrap_reset(
+            argparse.Namespace(
+                callback_config=None,
+                retained_callback_config=str(config_path),
+                use_baked_apollo=False,
+                use_retained_callback=True,
+            )
+        )
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert calls == [
+        ("sage", None),
+        ("import", {
+            "uuid": "payload-uuid",
+            "key": "secret",
+            "payload_type": {"name": "merlin"},
+        }),
+    ]
+    assert output["mode"] == "imported-retained-callback"
+    assert output["retained_payload_type"] == "merlin"
+    assert output["retained_callback_config"] == str(config_path)
+    assert output["retained_callback_bootstrap"]["payload_type"] == "merlin"
+    assert "apollo" not in output
+
+
+def test_bootstrap_reset_rejects_conflicting_retained_and_baked_modes(monkeypatch):
+    async def fail_login(args):
+        raise AssertionError("Validation must fail before Mythic login")
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fail_login)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        asyncio.run(
+            bootstrap_payloads.command_bootstrap_reset(
+                argparse.Namespace(
+                    callback_config=None,
+                    retained_callback_config=None,
+                    use_baked_apollo=True,
+                    use_retained_callback=True,
+                )
+            )
+        )
 
 
 def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_config_exists(
@@ -634,7 +732,51 @@ def test_callback_readiness_selects_fresh_live_sage_and_castelblack_apollo():
 
     assert status["ready"] is True
     assert status["selected_sage_cb"] == 7
+    assert status["selected_foothold_cb"] == 9
     assert status["selected_apollo_cb"] == 9
+
+
+def test_callback_readiness_selects_merlin_when_requested():
+    callbacks = [
+        {
+            "display_id": 1,
+            "host": "SAGE",
+            "user": "Sage",
+            "active": True,
+            "payload": {"payloadtype": {"name": "sage"}},
+        },
+        {
+            "display_id": 2,
+            "host": "CASTELBLACK",
+            "user": "NORTH\\samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "merlin"}},
+        },
+        {
+            "display_id": 3,
+            "host": "CASTELBLACK",
+            "user": "NORTH\\samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+    ]
+    liveness = {
+        1: {"alive": True, "reason": "fresh"},
+        2: {"alive": True, "reason": "fresh"},
+        3: {"alive": True, "reason": "fresh"},
+    }
+
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        foothold_payload_type="merlin",
+    )
+
+    assert status["ready"] is True
+    assert status["foothold_payload_type"] == "merlin"
+    assert status["selected_sage_cb"] == 1
+    assert status["selected_foothold_cb"] == 2
+    assert status["selected_apollo_cb"] is None
 
 
 def test_callback_readiness_rejects_dead_or_wrong_foothold():

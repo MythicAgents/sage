@@ -24,8 +24,8 @@ def test_project_access_maps_live_apollo_and_merlin_to_north_footholds():
             "id": "11",
             "payloadtype": "Merlin",
             "host": "CASTLEBLACK",
-            "domain": "NORTH",
-            "user": "NORTH\\samwell.tarly@CASTELBLACK",
+            "domain": "",
+            "user": "NORTH\\samwell.tarly",
             "integrity_level": "3",
         },
     ]
@@ -41,6 +41,7 @@ def test_project_access_maps_live_apollo_and_merlin_to_north_footholds():
         "north.sevenkingdoms.local",
         "north.sevenkingdoms.local",
     ]
+    assert footholds[1].identity == "NORTH\\samwell.tarly"
     assert all(foothold.alive is True for foothold in footholds)
 
 

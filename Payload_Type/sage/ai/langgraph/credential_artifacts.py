@@ -373,6 +373,7 @@ _TGT_TOKENS = (
 # proof requires an actual directory-listing marker, optionally domain-correlated (see _service_access_proven).
 _SERVICE_ACCESS_TOKENS = (
     "directory of \\\\",
+    "directory listing for: \\\\",
     "volume in drive",
     "successfully listed",
 )

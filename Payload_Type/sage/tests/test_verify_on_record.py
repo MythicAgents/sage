@@ -641,6 +641,18 @@ def test_ticket_probe_apollo_bytes_repr_directory_listing_proves_service_access(
     assert probe["ticket_valid"] is True
 
 
+def test_ticket_probe_merlin_native_directory_listing_proves_service_access():
+    output = (
+        "Directory listing for: \\\\KINGSLANDING.SEVENKINGDOMS.LOCAL\\C$\r\n\r\n"
+        "drwxrwxrwx\t2026-06-25 15:12:14\t0\tWindows\r\n"
+    )
+
+    probe = ca.extract_ticket_probe(output, expected_domain=ROOT_DOM)
+
+    assert probe["service_access_proven"] is True
+    assert probe["ticket_valid"] is True
+
+
 def test_ticket_probe_negated_membership_not_achieved():
     probe = ca.extract_ticket_probe(NEGATED_MEMBERSHIP, expected_domain=DOM)
     assert probe["domain_admin"] is False
