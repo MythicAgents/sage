@@ -2605,6 +2605,49 @@ class Model:
             and _controller_flag_enabled()
         )
 
+    def _queue_controller_verbose_event(self, message: str) -> None:
+        """Stream controller progress without making deterministic control depend on Mythic response RPCs.
+
+        Controller seams are intentionally synchronous logger callbacks, so they cannot await the existing Mythic
+        stream function directly. Chain background sends behind one tail task instead: events stay ordered for the
+        watcher, but a failed response send cannot change action selection, tasking, or verifier behavior.
+        """
+        if not getattr(self, "verbose", False):
+            return
+
+        formatted = f"📊[Autonomous_Controller]> {message}\n"
+        previous = getattr(self, "_controller_verbose_stream_tail", None)
+
+        async def _send_after_previous() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except Exception:
+                    pass
+            try:
+                await self._stream_message_to_mythic(formatted)
+            except Exception as e:
+                logger.debug(f"Autonomous controller verbose stream failed: {e}")
+
+        try:
+            self._controller_verbose_stream_tail = asyncio.create_task(_send_after_previous())
+        except RuntimeError:
+            # The runtime controller always runs inside an event loop. This only protects atypical direct callers.
+            logger.debug("Autonomous controller verbose stream skipped: no running event loop")
+
+    async def _flush_controller_verbose_events(self) -> None:
+        """Wait for queued controller progress before emitting the terminal report."""
+        tail = getattr(self, "_controller_verbose_stream_tail", None)
+        if tail is None:
+            return
+        try:
+            await tail
+        except Exception as e:
+            logger.debug(f"Autonomous controller verbose flush failed: {e}")
+        finally:
+            if getattr(self, "_controller_verbose_stream_tail", None) is tail:
+                self._controller_verbose_stream_tail = None
+
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the deterministic AutonomousController for a feature-flagged autonomous solve.
 
@@ -2627,8 +2670,11 @@ class Model:
             import capabilities as _cap
             import engagement_state as _es
 
+        self._controller_verbose_stream_tail = None
+
         def fire(msg: str) -> None:
             logger.info(f"[autonomous-controller] {msg}")
+            self._queue_controller_verbose_event(msg)
 
         snap = {"state": None, "collection_request": None}
 
@@ -2746,6 +2792,7 @@ class Model:
         except Exception:
             pass
         try:
+            await self._flush_controller_verbose_events()
             formatted = self._format_message_for_streaming(report_msg, agent_name="Autonomous_Controller")
             if formatted:
                 await self._stream_message_to_mythic(formatted)
@@ -2958,6 +3005,7 @@ class Model:
 
         def fire(msg: str) -> None:
             logger.info(f"[autonomous-controller:collect] {msg}")
+            self._queue_controller_verbose_event(f"collect: {msg}")
 
         request = request or self._controller_collection_request(state)
         foothold = getattr(request, "foothold", None)

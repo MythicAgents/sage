@@ -89,6 +89,48 @@ def test_observe_none_halts_cleanly_without_crash():
     assert calls == []  # never executed anything without a state
 
 
+def test_verbose_controller_streams_progress_before_terminal_report():
+    """Auto-mode controller progress must be visible in Mythic when verbose is enabled, not just in tmux logs."""
+    calls = []
+    blocked_string = json.dumps({"ok": False, "verdict": "blocked", "capability": "adcs-ca-private-key-export",
+                                 "reason": "CA host enumeration failed"})
+    m = _bare_model(blocked_string, _state_with_remote_exec(), calls)
+    m.verbose = True
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    m._stream_message_to_mythic = _stream
+    report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    assert streamed[-1] == report
+    assert any("START (flagged)" in item for item in streamed[:-1]), streamed
+    assert any("execute adcs-ca-private-key-export" in item for item in streamed[:-1]), streamed
+    assert any("cycle 1:" in item for item in streamed[:-1]), streamed
+    assert all(item.startswith("📊[Autonomous_Controller]>") for item in streamed[:-1]), streamed
+
+
+def test_non_verbose_controller_only_streams_terminal_report():
+    """Verbose-off behavior stays quiet: controller internals do not leak into normal parent-task output."""
+    calls = []
+    blocked_string = json.dumps({"ok": False, "verdict": "blocked", "capability": "adcs-ca-private-key-export",
+                                 "reason": "CA host enumeration failed"})
+    m = _bare_model(blocked_string, _state_with_remote_exec(), calls)
+    m.verbose = False
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    m._stream_message_to_mythic = _stream
+    report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    assert streamed == [report]
+
+
 def test_gate_defaults_on_but_blocks_supervised_and_interactive():
     """Forge CRITICAL: the controller must NOT run in supervised mode (guarded tools need operator HITL
     approval there) nor on interactive follow-up turns. Auto-mode autonomous one-shots use it by default."""
@@ -312,6 +354,32 @@ def test_collect_discovers_timestamped_zip_and_ingests_it():
     dl_path = next(c[1]["path"] for c in fake.calls if c[0] == "download")
     assert dl_path.startswith("C:\\Users\\Public\\20260101000000_bloodhound_"), dl_path
     assert ("ingest_collection", 11, 2) in fake.calls
+
+
+def test_collect_verbose_streams_progress_to_parent_task():
+    """Initial controller collection must not be silent in Mythic when verbose output is enabled."""
+    m = object.__new__(model.Model)
+    m.verbose = True
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True}, timestamp_prefix=True)
+    m.mythic_client = fake
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    async def _run():
+        result = await m._controller_collect(_live_foothold_state("2"))
+        await m._flush_controller_verbose_events()
+        return result
+
+    m._stream_message_to_mythic = _stream
+    result = asyncio.run(_run())
+
+    assert result["ok"] is True, result
+    assert any("collect: SharpHound execute_assembly" in item for item in streamed), streamed
+    assert any("collect: discovered collection artifact:" in item for item in streamed), streamed
+    assert any("collect: ingest status=ingested graph_verified=True" in item for item in streamed), streamed
 
 
 def test_collect_restores_domain_identity_before_sharphound_when_callback_is_host_local():
