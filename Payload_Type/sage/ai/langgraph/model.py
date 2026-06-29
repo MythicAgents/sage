@@ -79,6 +79,14 @@ def _controller_flag_enabled() -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _controller_hitl_flag_enabled() -> bool:
+    """Use controller-native HITL by default for supervised autonomous chat, with an explicit rollback."""
+    value = os.environ.get("SAGE_CONTROLLER_HITL")
+    if value is None or not value.strip():
+        return True
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 _AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT = _env_positive_int(
     "SAGE_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT",
     100000,
@@ -441,6 +449,15 @@ class _OperatorStopRequested(Exception):
     stop, manual kill; the log shows request_stop DID fire). This exception, raised by
     _StopCheckMiddleware at each model/tool boundary inside the agent, breaks out promptly; the outer
     invoke() try/except catches it and ends the session cleanly.
+    """
+
+
+class _ControllerHitlPause(BaseException):
+    """Escape the controller loop without classifying a pending approval as a capability failure.
+
+    AutonomousController intentionally catches ordinary Exceptions at its injected seams and converts them into
+    diagnostic blockers. A pending operator approval is neither a blocker nor a failure, so it must escape that
+    catch boundary and return control to Mythic without touching loop-breaker/no-progress state.
     """
 
 
@@ -1282,6 +1299,9 @@ class Model:
         self._global_step_count = 0
         self._global_step_limit_hit = False
         self._objective_completion_report_streamed = False
+        self._controller_hitl_pending = None
+        self._controller_hitl_approved_key = ""
+        self._controller_hitl_objective = ""
         # Autonomous-solve stall detector state (reset per solve in invoke() so counters never cross objectives).
         self._autonomous_stall_progress = None
         self._autonomous_stall_count = 0
@@ -2596,14 +2616,167 @@ class Model:
 
     def _should_use_controller(self, is_interactive: bool) -> bool:
         """Whether the deterministic autonomous controller should handle this solve. ALL must hold:
-        autonomous_solve, AUTO mode (supervised keeps operator HITL approval for guarded tools — the controller
-        would bypass it), the FIRST/non-interactive turn, and no explicit rollback override."""
+        autonomous_solve, a controller-owned execution mode, the FIRST/non-interactive turn, and no explicit
+        rollback override. Auto mode runs unattended. Supervised mode runs controller-native HITL only on `chat`,
+        because `query` has no interactive reply channel for approve/deny."""
         return bool(
             getattr(self, "_autonomous_solve", False)
-            and getattr(self, "mode", "auto") == "auto"
             and not is_interactive
             and _controller_flag_enabled()
+            and (
+                getattr(self, "mode", "auto") == "auto"
+                or self._controller_hitl_enabled()
+            )
         )
+
+    def _controller_hitl_enabled(self) -> bool:
+        """Whether supervised autonomous chat should pause controller moves for operator approval."""
+        return bool(
+            getattr(self, "_autonomous_solve", False)
+            and getattr(self, "mode", "auto") == "supervised"
+            and getattr(self, "command_name", "") == "chat"
+            and _controller_hitl_flag_enabled()
+        )
+
+    def _controller_hitl_key(self, kind: str, args: dict[str, Any]) -> str:
+        """Stable fingerprint for the exact controller move shown to the operator."""
+        return json.dumps(
+            {"kind": str(kind or ""), "args": _jsonable_value(args or {})},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _controller_hitl_capability_request(
+        self,
+        payload: dict[str, Any],
+        inputs: dict[str, Any],
+        objective: str,
+    ) -> dict[str, Any]:
+        args = {
+            "capability": _jsonable_value(payload or {}),
+            "inputs": _jsonable_value(inputs or {}),
+        }
+        return {
+            "kind": "capability",
+            "key": self._controller_hitl_key("capability", args),
+            "tool": "execute_capability",
+            "args": args,
+            "objective": str(objective or ""),
+        }
+
+    def _controller_hitl_collection_request(self, request: Any, objective: str) -> dict[str, Any]:
+        foothold = getattr(request, "foothold", None)
+        args = {
+            "collection_key": str(getattr(request, "collection_key", "") or ""),
+            "scope_domain": str(getattr(request, "scope_domain", "") or ""),
+            "reason": str(getattr(request, "reason", "") or ""),
+            "support": str(getattr(request, "support", "") or ""),
+            "callback_id": str(getattr(foothold, "callback_id", "") or ""),
+            "host": str(getattr(foothold, "host", "") or ""),
+            "agent": str(getattr(foothold, "agent", "") or ""),
+        }
+        return {
+            "kind": "collection",
+            "key": self._controller_hitl_key("collection", args),
+            "tool": "collect_graph",
+            "args": args,
+            "objective": str(objective or ""),
+        }
+
+    async def _surface_controller_hitl_request(self, pending: dict[str, Any]) -> None:
+        """Stream the same default-deny operator UX for a controller-owned pending move."""
+        kind = str(pending.get("kind") or "")
+        args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
+        lines: list[str] = []
+        if kind == "capability":
+            payload = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+            inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
+            lines = [
+                "  * `execute_capability`",
+                f"    capability: `{payload.get('name', '')}`",
+                f"    target: `{payload.get('target', '')}`",
+                f"    callback: `{inputs.get('callback_id', '')}`",
+                f"    preconditions: `{json.dumps(payload.get('preconditions', []), default=str)}`",
+                f"    expected effects: `{json.dumps(payload.get('effects', []), default=str)}`",
+            ]
+        elif kind == "collection":
+            lines = [
+                "  * `collect_graph`",
+                f"    callback: `{args.get('callback_id', '')}`",
+                f"    host: `{args.get('host', '')}`",
+                f"    agent: `{args.get('agent', '')}`",
+                f"    scope: `{args.get('scope_domain', '') or 'current-forest'}`",
+                f"    reason: `{args.get('reason', '')}`",
+                f"    support: `{args.get('support', '')}`",
+            ]
+        body = "\n".join(lines) if lines else "  * (a guarded controller action)"
+        msg = (
+            "⏸️ **Approval required — supervised mode**\n\n"
+            "Sage wants to run the following guarded controller action:\n"
+            f"{body}\n\n"
+            "Reply **`approve`** to run it, or **`deny`** to skip it. "
+            "Anything other than an explicit approval is treated as a denial."
+        )
+        try:
+            await self._stream_message_to_mythic(msg)
+        except Exception as e:
+            logger.warning(f"HITL: failed to stream controller approval prompt ({e})")
+        logger.info(f"HITL controller interrupt surfaced to operator ({kind or 'unknown'}); awaiting approve/deny")
+
+    async def _require_controller_hitl_approval(self, pending: dict[str, Any]) -> None:
+        """Consume one matching approval token or pause before the controller move executes."""
+        if not self._controller_hitl_enabled():
+            return
+        key = str(pending.get("key") or "")
+        if key and getattr(self, "_controller_hitl_approved_key", "") == key:
+            self._controller_hitl_approved_key = ""
+            self._controller_hitl_pending = None
+            logger.info(f"HITL controller approval consumed for {pending.get('tool', 'unknown')}")
+            return
+
+        # A stale approval must never authorize a different freshly-selected action.
+        self._controller_hitl_approved_key = ""
+        self._controller_hitl_pending = pending
+        await self._flush_controller_verbose_events()
+        await self._surface_controller_hitl_request(pending)
+        raise _ControllerHitlPause()
+
+    async def handle_controller_hitl_resume(self, response: str) -> str:
+        """Resume or deny a controller-owned pending move with the existing default-deny semantics."""
+        pending = getattr(self, "_controller_hitl_pending", None)
+        if not isinstance(pending, dict):
+            return ""
+
+        approved = _hitl_is_approved(response)
+        decision_word = "approve" if approved else "deny"
+        tool = str(pending.get("tool") or "unknown")
+        args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
+        self._write_hitl_audit(tool, args, decision_word)
+
+        objective = str(pending.get("objective") or getattr(self, "_controller_hitl_objective", "") or "")
+        key = str(pending.get("key") or "")
+        self._controller_hitl_pending = None
+
+        if not approved:
+            self._controller_hitl_approved_key = ""
+            self._controller_hitl_objective = ""
+            msg = (
+                f"🛑[Autonomous_Controller]> Operator denied `{tool}`; "
+                "controller stopped before execution.\n"
+            )
+            try:
+                await self._stream_message_to_mythic(msg)
+            except Exception as e:
+                logger.warning(f"HITL: failed to stream controller deny result ({e})")
+            logger.info(f"HITL controller resume: deny for {tool}")
+            return ""
+
+        self._controller_hitl_approved_key = key
+        self._controller_hitl_objective = objective
+        self._seed_autonomous_objective(objective)
+        logger.info(f"HITL controller resume: approve for {tool}")
+        return await self._run_autonomous_controller(objective)
 
     def _queue_controller_verbose_event(self, message: str) -> None:
         """Stream controller progress without making deterministic control depend on Mythic response RPCs.
@@ -2670,6 +2843,8 @@ class Model:
             import capabilities as _cap
             import engagement_state as _es
 
+        if self._controller_hitl_enabled():
+            self._controller_hitl_objective = str(prompt or "")
         self._controller_verbose_stream_tail = None
 
         def fire(msg: str) -> None:
@@ -2700,6 +2875,9 @@ class Model:
         async def execute(action):
             payload = _capability_action_payload(action)
             inputs = _autonomous_capability_inputs(action, snap["state"])
+            await self._require_controller_hitl_approval(
+                self._controller_hitl_capability_request(payload, inputs, prompt)
+            )
             fire(f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}")
             result = await self.mythic_client.execute_capability(payload, inputs)
             kind = type(result).__name__
@@ -2730,6 +2908,9 @@ class Model:
         async def collect(state):
             request = snap.get("collection_request")
             snap["collection_request"] = None
+            await self._require_controller_hitl_approval(
+                self._controller_hitl_collection_request(request, prompt)
+            )
             return await self._controller_collect(state, request=request)
 
         def objective_met(state):
@@ -2773,7 +2954,11 @@ class Model:
             config=cfg,
             logger=fire,
         )
-        result = await controller.run()
+        try:
+            result = await controller.run()
+        except _ControllerHitlPause:
+            await self._flush_controller_verbose_events()
+            return ""
         fire(f"DONE status={result.status} cycles={result.cycle_count} "
              f"effects={len(result.achieved_effects)} reason={result.reason}")
 
@@ -2798,6 +2983,10 @@ class Model:
                 await self._stream_message_to_mythic(formatted)
         except Exception:
             pass
+        if self._controller_hitl_enabled():
+            self._controller_hitl_pending = None
+            self._controller_hitl_approved_key = ""
+            self._controller_hitl_objective = ""
         return report
 
     def _controller_terminal_report(self, result) -> str:
@@ -4258,6 +4447,21 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """
         # Store for use in streaming formatter
         self.is_interactive = is_interactive
+        try:
+            self._register_running_task(asyncio.current_task())
+        except RuntimeError:
+            pass
+        if not self.graph:
+            raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
+
+        thread_id = f"{self.agent_task_id}-{self.task_id}"
+        if isinstance(getattr(self, "_controller_hitl_pending", None), dict):
+            logger.info("HITL controller approval pending — routing operator reply to controller resume")
+            return await self.handle_controller_hitl_resume(prompt)
+        if await self._hitl_interrupt_pending(thread_id):
+            logger.info(f"HITL interrupt pending on thread {thread_id} — routing operator reply to approve/deny resume")
+            return await self.handle_hitl_resume(prompt, thread_id)
+
         # Fresh stall-detector window per solve — never carry a prior objective's counters into this one
         # (a Sage session may reuse one Model across invoke() calls).
         self._autonomous_stall_progress = None
@@ -4276,12 +4480,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # (which is never completable) — the root cause of post-objective over-reach. Generic to any caller;
         # never overwrites an operator/env objective. No I/O here (deferred to the resolved-key write).
         self._seed_autonomous_objective(prompt)
-        try:
-            self._register_running_task(asyncio.current_task())
-        except RuntimeError:
-            pass
-        if not self.graph:
-            raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
         logger.debug(f"Invoking LLM with provider: '{self.provider}', model: '{self.model}', prompt: '{prompt}'")
 
         # Ensure per-agent channels exist
@@ -4297,11 +4495,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         if "messages" not in self.state:
             self.state["messages"] = []
-
-        thread_id = f"{self.agent_task_id}-{self.task_id}"
-        if await self._hitl_interrupt_pending(thread_id):
-            logger.info(f"HITL interrupt pending on thread {thread_id} — routing operator reply to approve/deny resume")
-            return await self.handle_hitl_resume(prompt, thread_id)
 
         # Check if we're responding to a recursion limit continuation request
         # If so, delegate to handle_continuation_response() instead of normal flow
@@ -4344,14 +4537,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         ):
             return ""
 
-        # Deterministic autonomous controller. For autonomous auto one-shots, OWN the
+        # Deterministic autonomous controller. For autonomous auto one-shots, or supervised autonomous chat with
+        # controller-native HITL, OWN the
         # observe->frontier->select->execute->verify->stop cycle in deterministic code, bypassing the
         # Supervisor/worker astream negotiation entirely. SAGE_AUTONOMOUS_CONTROLLER=0 is the rollback path.
-        # SAFETY GATE (Forge CRITICAL): only in AUTO mode and only on the FIRST (non-interactive) turn. In
-        # supervised mode guarded tools (execute_capability) require operator HITL approval via the astream
-        # middleware path — the controller calls execute_capability directly, so it MUST NOT run in supervised
-        # mode or it would fire live offensive capabilities without approval. Interactive follow-ups also fall
-        # through to the normal path.
+        # SAFETY GATE: supervised controller execution is chat-only and pauses inside the controller seams before
+        # any capability or collection move; query remains one-shot and falls through to the legacy graph HITL
+        # path because it has no interactive approve/deny transport. Interactive approval replies are handled
+        # above before a fresh solve is seeded.
         if self._should_use_controller(is_interactive):
             try:
                 return await self._run_autonomous_controller(prompt)

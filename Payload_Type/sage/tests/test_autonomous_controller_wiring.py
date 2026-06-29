@@ -131,17 +131,47 @@ def test_non_verbose_controller_only_streams_terminal_report():
     assert streamed == [report]
 
 
-def test_gate_defaults_on_but_blocks_supervised_and_interactive():
-    """Forge CRITICAL: the controller must NOT run in supervised mode (guarded tools need operator HITL
-    approval there) nor on interactive follow-up turns. Auto-mode autonomous one-shots use it by default."""
+def test_supervised_chat_controller_pauses_before_execute_capability():
+    """Controller-native HITL must escape the controller loop before the real capability seam fires."""
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.verbose = False
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    m._stream_message_to_mythic = _stream
+    report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    assert report == ""
+    assert calls == []
+    assert m._controller_hitl_pending["tool"] == "execute_capability"
+    assert m._controller_hitl_pending["args"]["capability"]["name"] == "adcs-ca-private-key-export"
+    assert any("Approval required" in item for item in streamed), streamed
+
+
+def test_gate_defaults_on_for_auto_and_supervised_chat_but_not_query_or_interactive():
+    """Controller-native HITL allows supervised autonomous chat, while query remains one-shot and interactive
+    replies are routed through the pending-approval resume path instead of starting a fresh controller run."""
     import os
-    saved = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    saved_controller = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    saved_hitl = os.environ.get("SAGE_CONTROLLER_HITL")
     os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+    os.environ.pop("SAGE_CONTROLLER_HITL", None)
     try:
         m = object.__new__(model.Model)
         m._autonomous_solve = True
-        # supervised mode -> never use the controller, even non-interactive
+        m.command_name = "chat"
+        # supervised autonomous chat -> controller-native HITL
         m.mode = "supervised"
+        assert m._should_use_controller(is_interactive=False) is True
+        # supervised query has no interactive approval transport -> legacy graph path
+        m.command_name = "query"
         assert m._should_use_controller(is_interactive=False) is False
         # auto mode but interactive follow-up -> fall through to normal path
         m.mode = "auto"
@@ -155,11 +185,21 @@ def test_gate_defaults_on_but_blocks_supervised_and_interactive():
         m._autonomous_solve = True
         os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = "0"
         assert m._should_use_controller(is_interactive=False) is False
+        # controller-native HITL has its own rollback flag
+        os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+        m.mode = "supervised"
+        m.command_name = "chat"
+        os.environ["SAGE_CONTROLLER_HITL"] = "0"
+        assert m._should_use_controller(is_interactive=False) is False
     finally:
-        if saved is None:
+        if saved_controller is None:
             os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
         else:
-            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved
+            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved_controller
+        if saved_hitl is None:
+            os.environ.pop("SAGE_CONTROLLER_HITL", None)
+        else:
+            os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
 
 
 def test_observe_attaches_graph_facts():
