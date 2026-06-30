@@ -1059,6 +1059,141 @@ def test_same_domain_da_with_krbtgt_still_prefers_current_context_refresh():
     assert "krbtgt-hash:lab.local" not in contexts[0].preconditions
 
 
+def test_multi_callback_context_frontier_prefers_latest_proven_execution_callback():
+    state = es.EngagementState(
+        objective="compromise trusted parent",
+        footholds=[
+            _foothold("north.sevenkingdoms.local", callback_id="4", agent="merlin"),
+            _foothold("north.sevenkingdoms.local", callback_id="5", agent="apollo"),
+        ],
+        hops=[
+            _hop("da:north.sevenkingdoms.local"),
+            _hop("krbtgt-hash:north.sevenkingdoms.local"),
+            _hop("kerberos-context:north.sevenkingdoms.local@callback:5"),
+            _hop("da:sevenkingdoms.local"),
+            _hop("krbtgt-hash:sevenkingdoms.local"),
+        ],
+    )
+    state.hops[-1].evidence["callback_id"] = "5"
+
+    contexts = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "ensure-kerberos-context"
+    ]
+
+    assert contexts
+    assert contexts[0].target == "domain=sevenkingdoms.local;callback=5"
+    assert all("callback=5" in action.target for action in contexts)
+
+
+def test_multi_callback_context_frontier_falls_back_when_latest_callback_is_dead():
+    state = es.EngagementState(
+        objective="compromise trusted parent",
+        footholds=[
+            _foothold("north.sevenkingdoms.local", callback_id="4", agent="merlin"),
+            _foothold("north.sevenkingdoms.local", callback_id="5", agent="apollo", alive=False),
+        ],
+        hops=[
+            _hop("da:north.sevenkingdoms.local"),
+            _hop("krbtgt-hash:north.sevenkingdoms.local"),
+            _hop("kerberos-context:north.sevenkingdoms.local@callback:5"),
+            _hop("da:sevenkingdoms.local"),
+            _hop("krbtgt-hash:sevenkingdoms.local"),
+        ],
+    )
+    state.hops[-1].evidence["callback_id"] = "5"
+
+    contexts = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "ensure-kerberos-context"
+    ]
+
+    assert contexts
+    assert all("callback=5" not in action.target for action in contexts)
+    assert all("callback=4" in action.target for action in contexts)
+
+
+def test_dcsync_uses_newest_live_current_context_when_multiple_callbacks_are_valid():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[
+            _foothold("child.root.local", callback_id="4", agent="merlin"),
+            _foothold("child.root.local", callback_id="5", agent="apollo"),
+        ],
+        hops=[
+            _hop("krbtgt-hash:child.root.local"),
+            _hop("da:root.local"),
+            _hop("kerberos-context:root.local@callback:4"),
+            _hop("kerberos-context:root.local@callback:5"),
+        ],
+    )
+
+    dcsync = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "dcsync-krbtgt" and "root.local" in action.target
+    ]
+
+    assert len(dcsync) == 1
+    assert "kerberos-context:root.local@callback:5" in dcsync[0].preconditions
+
+
+def test_proven_context_lane_does_not_backfill_secondary_callback_before_downstream_work():
+    state = es.EngagementState(
+        objective="compromise trusted parent",
+        footholds=[
+            _foothold("north.sevenkingdoms.local", callback_id="4", agent="merlin"),
+            _foothold("north.sevenkingdoms.local", callback_id="5", agent="apollo"),
+        ],
+        hops=[
+            _hop("da:north.sevenkingdoms.local"),
+            _hop("krbtgt-hash:north.sevenkingdoms.local"),
+            _hop("kerberos-context:north.sevenkingdoms.local@callback:5"),
+            _hop("da:sevenkingdoms.local"),
+            _hop("krbtgt-hash:sevenkingdoms.local"),
+            _hop("kerberos-context:sevenkingdoms.local@callback:5"),
+        ],
+        graph_facts=[_fact("credential-target:cersei.lannister@sevenkingdoms.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert not any(action.name == "ensure-kerberos-context" for action in actions)
+    dcsync = [action for action in actions if action.name == "dcsync-account"]
+    assert dcsync
+    assert dcsync[0].target == "domain=sevenkingdoms.local;account=cersei.lannister"
+    assert "kerberos-context:sevenkingdoms.local@callback:5" in dcsync[0].preconditions
+
+
+def test_account_context_lane_does_not_backfill_secondary_callback_before_downstream_work():
+    state = es.EngagementState(
+        objective="obtain administrative control of child.lab.local",
+        footholds=[
+            _foothold("lab.local", callback_id="4", agent="merlin"),
+            _foothold("lab.local", callback_id="5", agent="apollo"),
+        ],
+        hops=[
+            _hop("creds:alice@lab.local"),
+            _hop("kerberos-account-context:alice@lab.local@callback:5"),
+        ],
+        graph_facts=[
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
+            ),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert not any(action.name == "ensure-account-kerberos-context" for action in actions)
+    reads = [action for action in actions if action.name == "read-managed-local-admin-secret"]
+    assert reads
+    assert reads[0].target.endswith("callback=5")
+
+
 def test_sage_control_callback_is_not_a_target_tradecraft_callback():
     state = es.EngagementState(
         objective="domain admin",
@@ -2136,9 +2271,10 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
     assert operations[2] == "kerberos-ticket-forge"
     assert "kerberos-inter-realm-referral" not in operations
     assert "kerberos-service-ticket-request" not in operations
+    assert operations[-2] == "kerberos-service-ticket-acquire"
     assert operations[-1] == "drsuapi-dcsync"
     # No netonly logon fork on the cross-domain path — the forged child TGT loads into the current context and
-    # Windows acquires the parent referral/service tickets when DCSync authenticates.
+    # Sage asks the operating system to acquire the parent LDAP ticket before DCSync authenticates.
     assert "kerberos-logon-session-create" not in operations
     assert plan.steps[3].parameters == {
         "domain": "root.local",
@@ -2156,6 +2292,13 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
         "target_context": "current",
         "store": "agent-cache",
     }
+    assert plan.steps[6].parameters == {
+        "domain": "root.local",
+        "service": "ldap/dc01.root.local",
+        "target_context": "current",
+        "store": "agent-cache",
+    }
+    assert plan.steps[6].prerequisites == ["ticket:kerberos_ticket_imported"]
     dcsync = plan.steps[-1]
     assert dcsync.parameters == {
         "domain": "root.local",
@@ -2191,6 +2334,7 @@ def test_forge_golden_ticket_cross_domain_plan_can_opt_into_explicit_asktgs_fall
     operations = [step.operation for step in plan.steps]
     assert operations[3] == "kerberos-inter-realm-referral"
     assert operations[4] == "kerberos-service-ticket-request"
+    assert "kerberos-service-ticket-acquire" not in operations
     referral = plan.steps[3]
     assert referral.parameters["service"] == "krbtgt/root.local"
     assert referral.parameters["child_dc"] == "dc01.child.root.local"

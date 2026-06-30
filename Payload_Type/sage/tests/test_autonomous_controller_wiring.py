@@ -760,6 +760,58 @@ def test_collection_request_targets_trusted_domain_only_after_default_scope_is_c
     assert request.reason == "objective-scope-expansion"
 
 
+def test_collection_request_prefers_latest_proven_callback_lane_for_scope_expansion():
+    older = _foothold(callback_id="4", agent="merlin", host="castelblack", identity="north\\samwell.tarly")
+    newer = _foothold(callback_id="5", agent="apollo", host="castelblack", identity="north\\samwell.tarly")
+    base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[older, newer])
+    baseline_key = es.collection_target_key(base, older)
+    baseline_hop = es.Hop(
+        id="collect-default",
+        technique="collect-graph",
+        target=baseline_key,
+        effect=f"graph-built:{baseline_key}",
+        status="achieved",
+        evidence={"graph_verified": True, "covered_domains": ["north.local"]},
+        preconditions=[],
+        satisfied_effects=[f"graph-built:{baseline_key}"],
+        source="test",
+        timestamp="",
+    )
+    latest_hop = es.Hop(
+        id="ctx",
+        technique="capability:ensure-kerberos-context",
+        target="domain=sevenkingdoms.local;callback=5",
+        effect="kerberos-context:sevenkingdoms.local@callback:5",
+        status="achieved",
+        evidence={"callback_id": "5"},
+        preconditions=[],
+        satisfied_effects=["kerberos-context:sevenkingdoms.local@callback:5"],
+        source="test",
+        timestamp="",
+    )
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[older, newer],
+        hops=[baseline_hop, latest_hop],
+        graph_facts=[
+            es.GraphFact("domain-collected:north.local", "test", "", 600),
+            es.GraphFact("trust-reachable:north.local:essos.local", "test", "", 600),
+        ],
+    )
+    m = object.__new__(model.Model)
+
+    request = m._controller_collection_request(
+        state,
+        include_trusted_scope=True,
+        include_optional_recollection=True,
+    )
+
+    assert request is not None
+    assert request.foothold.callback_id == "5"
+    assert request.scope_domain == "essos.local"
+    assert request.reason == "objective-scope-expansion"
+
+
 def test_collection_request_prefers_objective_scope_over_optional_authority_recollection():
     foothold = _foothold(callback_id="2", host="castelblack", identity="north\\samwell.tarly")
     base = es.EngagementState(objective="obtain administrative control of essos.local", footholds=[foothold])
@@ -1033,6 +1085,127 @@ def test_capability_inputs_pass_controlled_principal():
     inputs = model._autonomous_capability_inputs(action, snap)
     assert inputs.get("controlled_principal") == "north\\samwell.tarly", inputs
     assert inputs.get("current_user") == "north\\samwell.tarly", inputs
+
+
+def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():
+    """A stale achieved Kerberos context must not retarget a fresh capability to a dead callback."""
+    from ai.langgraph import capabilities as cap
+
+    action = cap.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=north.sevenkingdoms.local;target_domain=sevenkingdoms.local",
+        intent={"domain": "north.sevenkingdoms.local", "target_domain": "sevenkingdoms.local"},
+    )
+    dead = _foothold("3", "merlin", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    dead.alive = False
+    live = _foothold("4", "merlin", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    snap = es.EngagementState(
+        objective="x",
+        footholds=[dead, live],
+        hops=[
+            es.Hop(
+                id="ctx",
+                technique="capability:ensure-kerberos-context",
+                target="domain=north.sevenkingdoms.local;callback=3",
+                effect="kerberos-context:north.sevenkingdoms.local@callback:3",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["kerberos-context:north.sevenkingdoms.local@callback:3"],
+                source="test",
+                timestamp="",
+            )
+        ],
+        graph_facts=[],
+    )
+
+    inputs = model._autonomous_capability_inputs(action, snap)
+
+    assert inputs.get("callback_id") == "4", inputs
+
+
+def test_capability_inputs_reuse_live_callback_scoped_context_fallback():
+    """A still-live achieved Kerberos context remains the preferred callback for the next capability."""
+    from ai.langgraph import capabilities as cap
+
+    action = cap.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=north.sevenkingdoms.local;target_domain=sevenkingdoms.local",
+        intent={"domain": "north.sevenkingdoms.local", "target_domain": "sevenkingdoms.local"},
+    )
+    live_context = _foothold("3", "merlin", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    other_live = _foothold("4", "merlin", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    snap = es.EngagementState(
+        objective="x",
+        footholds=[live_context, other_live],
+        hops=[
+            es.Hop(
+                id="ctx",
+                technique="capability:ensure-kerberos-context",
+                target="domain=north.sevenkingdoms.local;callback=3",
+                effect="kerberos-context:north.sevenkingdoms.local@callback:3",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["kerberos-context:north.sevenkingdoms.local@callback:3"],
+                source="test",
+                timestamp="",
+            )
+        ],
+        graph_facts=[],
+    )
+
+    inputs = model._autonomous_capability_inputs(action, snap)
+
+    assert inputs.get("callback_id") == "3", inputs
+
+
+def test_capability_inputs_reuse_newest_live_callback_scoped_context_fallback():
+    """When multiple live callbacks hold the same context, the newest proof wins over the lowest callback id."""
+    from ai.langgraph import capabilities as cap
+
+    action = cap.CapabilityAction(
+        name="forge-golden-ticket",
+        target="domain=north.sevenkingdoms.local;target_domain=sevenkingdoms.local",
+        intent={"domain": "north.sevenkingdoms.local", "target_domain": "sevenkingdoms.local"},
+    )
+    older_live = _foothold("4", "merlin", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    newer_live = _foothold("5", "apollo", "castelblack", "north\\samwell.tarly", "north.sevenkingdoms.local")
+    snap = es.EngagementState(
+        objective="x",
+        footholds=[older_live, newer_live],
+        hops=[
+            es.Hop(
+                id="ctx-old",
+                technique="capability:ensure-kerberos-context",
+                target="domain=north.sevenkingdoms.local;callback=4",
+                effect="kerberos-context:north.sevenkingdoms.local@callback:4",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["kerberos-context:north.sevenkingdoms.local@callback:4"],
+                source="test",
+                timestamp="",
+            ),
+            es.Hop(
+                id="ctx-new",
+                technique="capability:ensure-kerberos-context",
+                target="domain=north.sevenkingdoms.local;callback=5",
+                effect="kerberos-context:north.sevenkingdoms.local@callback:5",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["kerberos-context:north.sevenkingdoms.local@callback:5"],
+                source="test",
+                timestamp="",
+            ),
+        ],
+        graph_facts=[],
+    )
+
+    inputs = model._autonomous_capability_inputs(action, snap)
+
+    assert inputs.get("callback_id") == "5", inputs
 
 
 def test_graph_reconciler_gpo_scope_query_is_ce_compatible():

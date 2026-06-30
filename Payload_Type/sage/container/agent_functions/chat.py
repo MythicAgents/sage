@@ -1,7 +1,7 @@
 from mythic_container.MythicCommandBase import TaskArguments, CommandBase, CommandParameter, ParameterType, ParameterGroupInfo, SupportedUIFeature, PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse
 from mythic_container.MythicRPC import MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate, MythicRPCCallbackUpdateMessage, SendMythicRPCCallbackUpdate, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage, SendMythicRPCTaskUpdate, MythicRPCTaskUpdateMessage 
 from mythic_container.logging import logger
-from .utils import get_secret
+from .utils import get_secret, ensure_bloodhound_task_preflight
 from ai.langgraph.model import Model, add_session, get_session, remove_session
 
 class ChatArguments(TaskArguments):
@@ -273,6 +273,9 @@ class ChatCommand(CommandBase):
                     config["configurable"]["aws_session_token"] = aws_session_token
                 if aws_region is not None:
                     config["configurable"]["region"] = aws_region
+            # Initial chat sessions build the same graph-backed runtime as query. Connect BloodHound before
+            # Model.initialize() so deterministic capability enrichment can resolve graph facts and SIDs.
+            await ensure_bloodhound_task_preflight(taskData.Task.ID)
             llm = Model(provider=provider.lower(), model=model.lower(), system_prompt=system_prompt, config=config, task_id=taskData.Task.ID, agent_task_id=taskData.Task.AgentTaskID, mode=mode, autonomous_solve=autonomous_solve, max_steps=max_steps)
             llm.command_name = "chat"
             llm.task_display_id = (

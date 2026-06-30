@@ -3020,11 +3020,7 @@ class Model:
         except ImportError:
             import engagement_state as _es
         try:
-            for fh in (getattr(state, "footholds", []) or []):
-                if not _es._is_live_target_foothold(fh):
-                    continue
-                if self._controller_collection_adapter(fh) is None:
-                    continue  # N2: skip unsupported agents at SELECTION, never select-then-reject
+            for fh in self._controller_ordered_supported_footholds(state):
                 if not _es.graph_collection_covers_foothold(state, fh):
                     return fh
         except Exception:
@@ -3041,6 +3037,37 @@ class Model:
             return _adapter.collection_adapter_for_payload_type(getattr(foothold, "agent", ""))
         except Exception:
             return None
+
+    def _controller_ordered_supported_footholds(self, state) -> list[Any]:
+        """Return collectable footholds with the latest proven callback lane first."""
+        try:
+            from . import capabilities as _cap
+            from . import engagement_state as _es
+        except ImportError:
+            import capabilities as _cap
+            import engagement_state as _es
+        candidates = [
+            foothold
+            for foothold in (getattr(state, "footholds", []) or [])
+            if _es._is_live_target_foothold(foothold)
+            and self._controller_collection_adapter(foothold) is not None
+        ]
+        if not candidates:
+            return []
+        live_callback_ids = {
+            _cap._normalize_callback_id(getattr(foothold, "callback_id", ""))
+            for foothold in candidates
+            if _cap._normalize_callback_id(getattr(foothold, "callback_id", ""))
+        }
+        preferred_callback_id = _cap._preferred_live_callback_id(state, live_callback_ids)
+        if not preferred_callback_id:
+            return candidates
+        return sorted(
+            candidates,
+            key=lambda foothold: (
+                _cap._normalize_callback_id(getattr(foothold, "callback_id", "")) != preferred_callback_id,
+            ),
+        )
 
     def _controller_latest_capability_failure_is_retryable(self, state) -> bool:
         """Do not turn a repairable capability failure into an unrelated graph collection.
@@ -3086,11 +3113,7 @@ class Model:
             from . import engagement_state as _es
         except ImportError:
             import engagement_state as _es
-        supported_footholds = [
-            fh for fh in (getattr(state, "footholds", []) or [])
-            if _es._is_live_target_foothold(fh)
-            and self._controller_collection_adapter(fh) is not None
-        ]
+        supported_footholds = self._controller_ordered_supported_footholds(state)
         if not supported_footholds:
             return None
 
@@ -6127,19 +6150,33 @@ def _autonomous_callback_id_for_action(action: Any, engagement_snapshot: Any) ->
         or target_fields.get("source_domain")
         or ""
     ).strip().casefold()
+    footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
+    live_callback_ids = {
+        str(getattr(foothold, "callback_id", "") or "").strip().casefold().lstrip("#").removeprefix("cb")
+        for foothold in footholds
+        if _is_live_tradecraft_foothold(foothold)
+    }
     achieved = set()
     try:
         achieved = set(engagement_snapshot.achieved_effects())
     except Exception:
         achieved = set()
     if domain:
+        callback_id = _latest_live_kerberos_context_callback(
+            domain,
+            engagement_snapshot,
+            live_callback_ids,
+        )
+        if callback_id:
+            return callback_id
         prefix = f"kerberos-context:{domain}@callback:"
         for effect in sorted(achieved):
             text = str(effect or "").strip().casefold()
             if text.startswith(prefix):
-                return text[len(prefix):].split(None, 1)[0].strip()
+                callback_id = text[len(prefix):].split(None, 1)[0].strip().lstrip("#").removeprefix("cb")
+                if callback_id in live_callback_ids:
+                    return callback_id
 
-    footholds = list(getattr(engagement_snapshot, "footholds", []) or [])
     if domain:
         for foothold in footholds:
             if not _is_live_tradecraft_foothold(foothold):
@@ -6155,6 +6192,39 @@ def _autonomous_callback_id_for_action(action: Any, engagement_snapshot: Any) ->
         callback = str(getattr(foothold, "callback_id", "") or "").strip()
         if callback:
             return callback
+    return ""
+
+
+def _latest_live_kerberos_context_callback(
+    domain: str,
+    engagement_snapshot: Any,
+    live_callback_ids: set[str],
+) -> str:
+    """Return the newest live callback whose latest context proof matches ``domain``."""
+    domain = str(domain or "").strip().casefold()
+    if not domain or not live_callback_ids:
+        return ""
+    seen_callbacks: set[str] = set()
+    for hop in reversed(list(getattr(engagement_snapshot, "hops", []) or [])):
+        if str(getattr(hop, "status", "") or "").strip().casefold() != "achieved":
+            continue
+        effects = list(getattr(hop, "satisfied_effects", []) or [])
+        if not effects:
+            effects = [getattr(hop, "effect", "")]
+        for effect in effects:
+            match = re.match(
+                r"^kerberos-context:([^@\s]+)@callback:(\d+)$",
+                str(effect or "").strip(),
+                re.IGNORECASE,
+            )
+            if not match:
+                continue
+            callback_id = match.group(2).strip().casefold().lstrip("#").removeprefix("cb")
+            if callback_id not in live_callback_ids or callback_id in seen_callbacks:
+                continue
+            seen_callbacks.add(callback_id)
+            if match.group(1).strip().casefold() == domain:
+                return callback_id
     return ""
 
 

