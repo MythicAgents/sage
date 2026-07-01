@@ -65,6 +65,34 @@ def _norm_effects(effects) -> set[str]:
     return out
 
 
+def _admin_effect_parts(effect: str) -> tuple[str, str] | None:
+    """Return ``(kind, domain)`` for DA/EA effects so replay can compare NetBIOS/FQDN aliases."""
+    normalized = _canon_effect(effect)
+    if ":" not in normalized:
+        return None
+    kind, domain = normalized.split(":", 1)
+    if kind not in {"da", "ea"} or not domain:
+        return None
+    return kind, domain
+
+
+def _effects_equivalent(left: str, right: str) -> bool:
+    """Whether two replay effects denote the same proof across ledger/action spellings."""
+    left_normalized = _canon_effect(left)
+    right_normalized = _canon_effect(right)
+    if left_normalized == right_normalized:
+        return True
+    left_admin = _admin_effect_parts(left_normalized)
+    right_admin = _admin_effect_parts(right_normalized)
+    if not left_admin or not right_admin or left_admin[0] != right_admin[0]:
+        return False
+    return es._domains_equivalent(left_admin[1], right_admin[1])
+
+
+def _effect_sets_overlap(left: set[str], right: set[str]) -> bool:
+    return any(_effects_equivalent(a, b) for a in left for b in right)
+
+
 def reconstruct_foothold(callback_id: str, host: str, forest: str, identity: str,
                          integrity: str = "high") -> es.Foothold:
     """The run's single live Apollo foothold — the predicates the ledger drops. Stated, not hidden."""
@@ -88,27 +116,52 @@ def load_chain(path: str):
     return objective, achieved, facts
 
 
-def _benign_reason(truth, prefix, achieved_tail) -> str:
+def _legacy_row_is_nested_under_selected_capability(truth, frontier, achieved_tail) -> bool:
+    """A legacy proof row can be emitted inside the next explicit capability transaction.
+
+    Some capability executors record an inner verifier/proof hop before recording the outer
+    ``capability:<name>`` row. That inner row is not a separate frontier decision when the
+    frontier already selected the matching outer capability.
+    """
+    technique = (getattr(truth, "technique", "") or "").casefold()
+    if technique.startswith("capability:") or not _is_capability_hop(technique) or not frontier:
+        return False
+    selected_name = str(getattr(frontier[0], "name", "") or "").casefold()
+    if not selected_name:
+        return False
+    for later in achieved_tail:
+        later_technique = (getattr(later, "technique", "") or "").casefold()
+        if not later_technique.startswith("capability:"):
+            continue
+        return later_technique == f"capability:{selected_name}"
+    return False
+
+
+def _benign_reason(truth, prefix, achieved_tail, frontier=None) -> str:
     """Classify a frontier MISS that is NOT a capability-model gap (so the instrument doesn't cry F3 on
     cases where the frontier is correctly more parsimonious, or where ledger timestamp order presents the
     effect's downstream as already-achieved). Returns "" if the miss is a genuine F3 gap.
 
       - ordering_artifact: the effect (or its domain's DA) is ALREADY achieved in the prefix — the run
         recorded this hop out of causal order, and the frontier has correctly moved to the next step.
+      - nested_capability_proof: a legacy proof row was recorded inside the next explicit capability
+        transaction already selected by the frontier.
       - omitted_offpath: a `creds:` account dump the guided run made but NO later achieved hop consumes
         (the account is never referenced downstream). Omitting it is correct parsimony, not a gap."""
     prefix_eff = set()
     for h in prefix:
         prefix_eff |= _norm_effects(h.satisfied_effects or [h.effect])
     truth_eff = _norm_effects(truth.satisfied_effects or [truth.effect])
-    if truth_eff & prefix_eff:
+    if _effect_sets_overlap(truth_eff, prefix_eff):
         return "ordering_artifact"
     # system-exec/gpo whose domain DA is already held -> the DA-granting step is moot
     for e in truth_eff:
         if e.startswith("system-exec:gpo:") and "@" in e:
             dom = e.rsplit("@", 1)[1]
-            if f"da:{dom}" in prefix_eff:
+            if any(_effects_equivalent(f"da:{dom}", effect) for effect in prefix_eff):
                 return "ordering_artifact"
+    if _legacy_row_is_nested_under_selected_capability(truth, frontier or [], achieved_tail):
+        return "nested_capability_proof"
     creds = [e for e in truth_eff if e.startswith("creds:")]
     if creds:
         # Domain-AWARE identity match: north\administrator is NOT "consumed" by a later
@@ -149,7 +202,7 @@ def replay(path: str, foothold: es.Foothold) -> dict:
         truth_eff = _norm_effects(truth.satisfied_effects or [truth.effect])
         rank = None
         for idx, a in enumerate(frontier):
-            if _norm_effects(a.effects) & truth_eff:
+            if _effect_sets_overlap(_norm_effects(a.effects), truth_eff):
                 rank = idx
                 break
         top_priorities = [cap._capability_action_priority(frontier[0])] if frontier else []
@@ -157,7 +210,7 @@ def replay(path: str, foothold: es.Foothold) -> dict:
             rank is not None and rank > 0 and frontier
             and cap._capability_action_priority(frontier[rank]) in top_priorities
         )
-        benign = _benign_reason(truth, prefix, achieved[i + 1:]) if rank is None else ""
+        benign = _benign_reason(truth, prefix, achieved[i + 1:], frontier=frontier) if rank is None else ""
         rows.append({
             "i": i,
             "technique": truth.technique,
