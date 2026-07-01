@@ -37,6 +37,23 @@ as samwell.tarly, then issues exactly one Sage `query` with the fixed objective-
 pre-query `state` task and does not inject guided route facts or typed route hints. Use `--sage-cb` or
 `--apollo-cb` only when intentionally overriding discovery.
 
+Run the same strict one-shot contract against a renamed GOAD variant:
+
+```bash
+.venv/bin/python skills/sage-live-runner/scripts/sage_task.py task-callback <sage_cb> query \
+  '{"prompt":"From the current foothold, achieve administrative control of <target-domain>.","verbose":true,"autonomous_solve":true,"max_steps":0,"mode":"auto"}' \
+  1800 --verbose true
+```
+
+Only replace `<target-domain>` with the variant's objective domain from its `mapping.json`; do not include
+renamed foothold host/user names, route facts, or hop guidance. The stock strict runner above is currently
+hard-coded to `essos.local`, so use the explicit `query` form for renamed ranges. For the current
+`sage-variant-1` range, the objective prompt is:
+
+```text
+From the current foothold, achieve administrative control of stellarcorp.local.
+```
+
 Show engagement state:
 
 ```bash

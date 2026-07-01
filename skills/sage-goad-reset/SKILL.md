@@ -101,9 +101,12 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 Use `--include-ram` only when a snapshot must preserve running process state. The current clean-baseline workflow
 does not require RAM-backed snapshots.
 
-The default rollback snapshot is `clean-baseline`. Pass an explicit snapshot name before `--yes` only when
-intentionally selecting another baseline. The old `eval-defender-apollo` RAM-backed path is retired for normal
-rehearsals.
+`rollback --yes` resolves the target snapshot automatically — there is no hardcoded default. If the range has
+exactly one snapshot it uses it; if several, it prompts at a TTY, otherwise it prints the snapshot names to
+stdout and exits `3` (the caller must pick one and re-invoke as `rollback <name> --yes`). An explicit `<name>`
+before `--yes` is validated against the live list — an unknown name exits `2` with the available names. Pass an
+explicit name only when intentionally selecting a non-obvious baseline. The old `eval-defender-apollo` RAM-backed
+path is retired for normal rehearsals.
 
 Expected IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`, CASTELBLACK/SRV02 `.22`,
 BRAAVOS/SRV03 `.23`. Poll until Windows guest IPs populate.
