@@ -11,7 +11,7 @@ on-disk ledger with the running agent via `ai.langgraph.engagement_ledger` (sing
 """
 from mythic_container.MythicCommandBase import (
     TaskArguments, CommandBase, CommandParameter, ParameterType, ParameterGroupInfo,
-    PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse,
+    PTTaskMessageAllData, PTTaskCreateTaskingMessageResponse, BrowserScript,
 )
 from mythic_container.MythicRPC import (
     MythicRPCResponseCreateMessage, SendMythicRPCResponseCreate,
@@ -512,9 +512,37 @@ def _truncate(value, n=70) -> str:
     return text[: n - 1] + "…" if len(text) > n else text
 
 
-def _render_ledger(data: dict, engagement_id: str, path: str, footholds: list | None = None) -> str:
+# Sentinel that separates the human-readable ledger text from the machine-readable JSON payload the `state`
+# browser script consumes (Option A). The script parses only what follows this marker and ignores the ASCII;
+# if the browser script is disabled the operator still sees the full text view above it. See browser_scripts/state.js.
+_STATE_JSON_MARKER = "@@@SAGE_STATE_JSON@@@"
+
+
+def _hop_rows_for_payload(hops: list) -> list:
+    """Structured rows for the browser-script table — same fields as the ASCII render, identifiers verbatim
+    (effect/label/task/cb are never truncated here so the UI can copy them exactly)."""
+    rows = []
+    for i, hop in enumerate(hops, 1):
+        ev = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+        rows.append({
+            "n": i,
+            "label": engagement_ledger.hop_label(hop),
+            "effect": hop.get("effect") or "",
+            "status": str(hop.get("status") or ""),
+            "prov": str(ev.get("provenance") or ""),
+            "task": ev.get("mythic_task_id"),
+            "cb": ev.get("callback_id"),
+            "evidence": ev.get("result_preview") or ev.get("source") or "",
+        })
+    return rows
+
+
+def _render_ledger(data: dict, engagement_id: str, path: str, footholds: list | None = None, notice: str = "") -> str:
     hops = data.get("hops") or []
-    lines = [
+    lines = []
+    if notice:
+        lines += [notice, ""]
+    lines += [
         f"=== ENGAGEMENT STATE: {engagement_id} ===",
         f"path: {path}",
         f"hops: {len(hops)}",
@@ -538,6 +566,7 @@ def _render_ledger(data: dict, engagement_id: str, path: str, footholds: list | 
                 f"{str(cb_id if cb_id is not None else '-'):4}  {_truncate(evidence, 36)}"
             )
     # Agent's-eye view (exactly what gets injected into the model each turn), best-effort.
+    agent_view_text = ""
     if _es is not None:
         try:
             state = _es.EngagementState(
@@ -546,7 +575,8 @@ def _render_ledger(data: dict, engagement_id: str, path: str, footholds: list | 
                 hops=_es.hops_from_dicts(hops),
                 graph_facts=_es.graph_facts_from_dicts(data.get("graph_facts")),
             )
-            lines += ["", "--- agent view (rendered into the model each turn) ---", _es.render_engagement_state(state)]
+            agent_view_text = _es.render_engagement_state(state)
+            lines += ["", "--- agent view (rendered into the model each turn) ---", agent_view_text]
         except Exception:
             pass
     lines += [
@@ -554,6 +584,19 @@ def _render_ledger(data: dict, engagement_id: str, path: str, footholds: list | 
         "Edit: `state objective <text>` | `state remove <hop[,hop,...]>` | `state set <hop> <status>` | `state wipe`",
         "(<hop> = ROW NUMBER(s) (#) above, or id/effect/technique; CSV ok: `state remove 5,9` ; `state remove 9` drops the junk hop.)",
     ]
+
+    # Machine-readable payload for the `state` browser script (Option A), appended behind the marker.
+    payload = {
+        "engagement_id": engagement_id,
+        "path": path,
+        "objective": data.get("objective") or "",
+        "objective_source": data.get("objective_source") or "",
+        "hop_count": len(hops),
+        "hops": _hop_rows_for_payload(hops),
+        "agent_view": agent_view_text,
+        "notice": notice or "",
+    }
+    lines += [_STATE_JSON_MARKER, json.dumps(payload, default=str)]
     return "\n".join(lines)
 
 
@@ -568,6 +611,12 @@ class StateCommand(CommandBase):
     version = 1
     author = "@sage"
     argument_class = StateArguments
+    # Renders the machine-readable ledger payload (behind _STATE_JSON_MARKER) as an interactive Mythic table;
+    # falls back to plaintext for actions with no payload (wipe / usage errors). See browser_scripts/state.js.
+    browser_script = BrowserScript(script_name="state", author="@sage")
+    # Lets the Hops-table action buttons (delete/set-status) re-task this command from the browser script.
+    # The buttons pass a dictionary keyed on the stable hop label, routed here via parse_dictionary.
+    supported_ui_features = ["state:edit"]
 
     async def create_go_tasking(self, taskData: PTTaskMessageAllData) -> PTTaskCreateTaskingMessageResponse:
         response = PTTaskCreateTaskingMessageResponse(TaskID=taskData.Task.ID, Success=True)
@@ -583,6 +632,22 @@ class StateCommand(CommandBase):
             engagement_id = await _resolve_engagement_id(taskData)
             path = engagement_ledger.ledger_path(engagement_id)
 
+            # Task-list display: replace the empty-JSON ('state {}') with a clean summary — a bare `state`
+            # (action=show, no selectors) shows as just `state`; edits show e.g. `remove 9`, `set 9 achieved`.
+            _disp: list[str] = [] if action == "show" else [action]
+            if action in ("remove", "objective") and hop:
+                _disp.append(hop)
+            elif action == "set":
+                _disp += [p for p in (hop, status) if p]
+            elif action == "reconcile":
+                if task_id or hop:
+                    _disp.append(task_id or hop)
+                if bool(taskData.args.get_arg("apply")):
+                    _disp.append("apply")
+            elif action == "wipe" and (hop or status):
+                _disp.append((hop or status).strip())
+            response.DisplayParams = " ".join(str(p) for p in _disp if str(p).strip())
+
             if action == "show":
                 footholds = await _reconcile_state_footholds(taskData)
                 out = _render_ledger(engagement_ledger.load(engagement_id), engagement_id, path, footholds)
@@ -594,8 +659,8 @@ class StateCommand(CommandBase):
                 else:
                     data, n = engagement_ledger.remove_hops(engagement_ledger.load(engagement_id), selectors)
                     engagement_ledger.save(data, engagement_id)
-                    out = f"Removed {n} hop(s) matching {selectors} from engagement '{engagement_id}'.\n\n" + \
-                          _render_ledger(data, engagement_id, path)
+                    out = _render_ledger(data, engagement_id, path,
+                                         notice=f"Removed {n} hop(s) matching {selectors} from engagement '{engagement_id}'.")
 
             elif action == "set":
                 if not hop or not status:
@@ -603,8 +668,8 @@ class StateCommand(CommandBase):
                 else:
                     data, n = engagement_ledger.set_hop_status(engagement_ledger.load(engagement_id), hop, status)
                     engagement_ledger.save(data, engagement_id)
-                    out = f"Set {n} hop(s) matching '{hop}' to status '{status}' in engagement '{engagement_id}'.\n\n" + \
-                          _render_ledger(data, engagement_id, path)
+                    out = _render_ledger(data, engagement_id, path,
+                                         notice=f"Set {n} hop(s) matching '{hop}' to status '{status}' in engagement '{engagement_id}'.")
 
             elif action == "objective":
                 if not hop:
@@ -618,8 +683,8 @@ class StateCommand(CommandBase):
                     data["updated"] = datetime.now(timezone.utc).isoformat()
                     engagement_ledger.save(data, engagement_id)
                     footholds = await _reconcile_state_footholds(taskData)
-                    out = f"Set objective for engagement '{engagement_id}' to: {hop}\n\n" + \
-                          _render_ledger(data, engagement_id, path, footholds)
+                    out = _render_ledger(data, engagement_id, path, footholds,
+                                         notice=f"Set objective for engagement '{engagement_id}' to: {hop}")
 
             elif action == "wipe":
                 if (hop or status).strip().lower() != "confirm":
@@ -647,7 +712,7 @@ class StateCommand(CommandBase):
                     )
                     engagement_ledger.save(data, engagement_id)
                     footholds = await _reconcile_state_footholds(taskData)
-                    out = "\n".join(notes) + "\n\n" + _render_ledger(data, engagement_id, path, footholds)
+                    out = _render_ledger(data, engagement_id, path, footholds, notice="\n".join(notes))
 
             else:
                 out = f"Unknown action '{action}'. Use: show | reconcile [task_id] | remove <hop> | set <hop> <status> | objective <text> | wipe."

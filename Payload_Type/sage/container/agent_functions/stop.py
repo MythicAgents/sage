@@ -55,6 +55,8 @@ class StopCommand(CommandBase):
     async def create_go_tasking(self, taskData: PTTaskMessageAllData) -> PTTaskCreateTaskingMessageResponse:
         response = PTTaskCreateTaskingMessageResponse(TaskID=taskData.Task.ID, Success=True)
         target = (taskData.args.get_arg("task_id") or "").strip()
+        # Task-list display: a bare `stop` shows as `stop`, not `stop {}`; with a target, `stop <target>`.
+        response.DisplayParams = target
 
         before = await list_sessions()
         stopped = await request_stop_for_sessions(target or None)
