@@ -692,6 +692,121 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     assert calls2["issue"] == 0
 
 
+def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypatch):
+    foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
+    state = engagement_state.EngagementState(objective="test", footholds=[foothold])
+    access_key = engagement_state.access_context_key(state, foothold)
+
+    async def fake_reconcile(mythic_tools_obj, now):
+        return [foothold]
+
+    async def fake_tasks(*args, **kwargs):
+        return []
+
+    achieved = engagement_state.record_hop_result(
+        engagement_state.EngagementState(objective="test"),
+        "collect-graph",
+        access_key,
+        "achieved",
+        {
+            "source": "ingest_collection",
+            "graph_verified": True,
+            "covered_domains": ["north.sevenkingdoms.local"],
+        },
+        "2026-06-17T00:00:00Z",
+    )
+
+    mt = _make_tools()
+    mt._assembly_file_checks.add("sharphound.exe")
+    mt._engagement_hops = achieved.hops
+    mt._engagement_graph_facts = [
+        engagement_state.GraphFact(
+            "domain-collected:north.sevenkingdoms.local",
+            "bloodhound:domain_info",
+            "2026-06-17T00:00:00Z",
+            600,
+        )
+    ]
+    mt.begin_operator_turn(
+        "Run a SharpHound collection against north.sevenkingdoms.local and ingest the data into BloodHound."
+    )
+    calls = {"issue": 0}
+    with patch.object(access_reconciler, "reconcile_access", fake_reconcile), \
+        patch.object(mythic_tools.mythic, "get_all_tasks", fake_tasks), \
+        _split_issue("SharpHound completed", calls, display_id=780):
+        result = asyncio.run(
+            mt.issue_task_and_waitfor_task_output(
+                "execute_assembly",
+                {
+                    "assembly": "SharpHound.exe",
+                    "arguments": "-c All --SearchForest --ZipFilename bloodhound_fresh.zip",
+                },
+                50,
+                timeout=5,
+            )
+        )
+
+    assert result == "SharpHound completed"
+    assert calls["issue"] == 1
+    assert mt._operator_collection_request["launched_task_id"] == "780"
+    assert mt._operator_collection_request["expected_zip_suffix"] == "bloodhound_fresh.zip"
+
+
+def test_operator_collection_request_classifier_ignores_questions_and_inhibits():
+    assert mythic_tools._operator_requested_collection(
+        "Run a SharpHound collection against lab.local and ingest it."
+    ) is True
+    assert mythic_tools._operator_requested_collection(
+        "I need to run a SharpHound collection against lab.local."
+    ) is True
+    assert mythic_tools._operator_requested_collection(
+        "Why did Sage refuse to run a SharpHound collection?"
+    ) is False
+    assert mythic_tools._operator_requested_collection(
+        "Do not run a SharpHound collection; just explain the prior result."
+    ) is False
+
+
+def test_operator_requested_collection_rejects_historical_ingest_before_new_launch():
+    mt = _make_tools()
+    mt.begin_operator_turn(
+        "Run a SharpHound collection against north.sevenkingdoms.local and ingest the data into BloodHound."
+    )
+
+    result = json.loads(asyncio.run(mt.ingest_collection(file_uuid="old-file-uuid")))
+
+    assert result["status"] == "fresh_collection_required"
+    assert result["operator_requested_recollection"] is True
+    assert "historical ZIP" in result["error"]
+
+
+def test_operator_requested_collection_rejects_wrong_zip_after_new_launch(monkeypatch):
+    mt = _make_tools()
+    mt.begin_operator_turn(
+        "Run a SharpHound collection against north.sevenkingdoms.local and ingest the data into BloodHound."
+    )
+    mt._operator_collection_request.update({
+        "launched_task_id": "780",
+        "callback_id": "50",
+        "expected_zip_suffix": "bloodhound_fresh.zip",
+    })
+
+    async def fake_meta(file_uuid):
+        return {
+            "filename_utf8": "20260701170726_bloodhound_old.zip",
+            "task": {"callback": {"display_id": 50}},
+        }
+
+    monkeypatch.setattr(mt, "_get_file_metadata", fake_meta)
+
+    result = json.loads(asyncio.run(mt.ingest_collection(file_uuid="old-file-uuid")))
+
+    assert result["status"] == "fresh_collection_artifact_required"
+    assert result["collector_task_id"] == "780"
+    assert result["expected_zip_suffix"] == "bloodhound_fresh.zip"
+    assert result["actual_filename"] == "20260701170726_bloodhound_old.zip"
+
+
 def test_stage_b_dcsync_precheck_blocks_then_caps_through_issue_hook(monkeypatch):
     foothold = _foothold(host="CASTELBLACK", forest="north.sevenkingdoms.local")
 

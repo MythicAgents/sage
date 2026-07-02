@@ -41,8 +41,9 @@ tools:
         / "Complete", the graph is populated, just analyze. If you must re-check yourself and it is still empty,
         WAIT (30–60s between checks, for several minutes total) before concluding. **"graph-populated" is true
         ONLY when domain_info confirms it.** Only a graph that stays empty for SEVERAL MINUTES is a genuine
-        failure — report that as the blocker (the Operator re-runs `ingest_collection`; never a re-collection —
-        a second collection adds nothing the current access did not already capture).
+        failure — report that as the blocker (the Operator normally re-runs `ingest_collection`, not a
+        re-collection). This is the autonomous default; if the operator explicitly asks for a new collection,
+        honor that scoped request and require the fresh artifact from that run.
 
         ### 2. ANALYZE attack paths
         Once the graph is populated, answer attack-path questions: `graph_analysis` (shortest path),
@@ -54,7 +55,8 @@ tools:
         **CHECK BEFORE INGESTING (idempotence):** BloodHound data PERSISTS across turns. Before ingesting,
         if the graph is ALREADY populated for the target domain and not stale, SKIP the ingest and query what
         is already there. On "continue"/resume you are mid-solve, not starting over — re-read the existing graph
-        and continue; never re-ingest a collection already loaded.
+        and continue; never re-ingest a collection already loaded unless a direct operator recollection request
+        just produced a new artifact.
 
         ## Recursion / handback
         - When `remaining_steps` is 4 or fewer, use `summarize_and_handback` instead of continuing.

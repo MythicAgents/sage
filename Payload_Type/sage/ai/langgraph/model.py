@@ -4527,6 +4527,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # Reset the flag before handling
             self.state["recursion_summary_requested"] = False
             return await self.handle_continuation_response(prompt)
+        try:
+            if self.mythic_client is not None:
+                self.mythic_client.begin_operator_turn(prompt)
+        except Exception:
+            pass
 
         # CRITICAL: Reset recursion flags before each invocation
         # Without this, the graph sees stale flags from previous runs and
@@ -5254,6 +5259,11 @@ Continue now.""")
         else:
             # User provided new instructions or redirection
             logger.info("User provided new instructions for continuation")
+            try:
+                if self.mythic_client is not None:
+                    self.mythic_client.begin_operator_turn(response)
+            except Exception:
+                pass
 
             # Add user's custom instruction to supervisor channel
             redirect_msg = HumanMessage(content=response)

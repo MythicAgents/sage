@@ -90,6 +90,47 @@ SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY = r"C:\Users\Public"
 SHARPHOUND_CANONICAL_ZIP_FILENAME = "bloodhound.zip"
 
 
+def _operator_requested_collection(prompt: str) -> bool:
+    """True when the operator is explicitly asking Sage to launch a collection this turn.
+
+    Collection dedupe is an autonomous efficiency rule, not a reason to ignore a direct operator
+    instruction. Keep this classifier intentionally narrow: it recognizes imperative collection
+    requests and ignores questions, summaries, and explicit inhibit wording.
+    """
+    text = str(prompt or "").strip().casefold()
+    if not text:
+        return False
+    tool = r"(?:sharphound|azurehound|bloodhound(?:\s+graph)?\s+collection)"
+    action = r"(?:run|re[- ]?run|execute|launch|perform|start|collect|re[- ]?collect|gather)"
+    inhibit = rf"\b(?:do not|don't|dont|never|did not|didn't|didnt|should not|shouldn't|shouldnt)\b.{{0,80}}\b{action}\b.{{0,80}}\b{tool}\b"
+    if _re_mod.search(inhibit, text):
+        return False
+    request = (
+        rf"(?:^|[.!?]\s+|\b(?:please|need|want|go ahead and|let's|lets|can you|could you)\s+)"
+        rf"(?:(?:you\s+)?to\s+)?\b{action}\b.{{0,80}}\b{tool}\b"
+    )
+    return bool(_re_mod.search(request, text))
+
+
+def _sharphound_zip_suffix(parameters) -> str:
+    """Return the collector-requested ZIP basename, if the task supplied one."""
+    try:
+        if isinstance(parameters, dict):
+            text = " ".join(str(value) for value in parameters.values() if value is not None)
+        else:
+            text = str(parameters or "")
+        match = _re_mod.search(
+            r"(?i)(?:^|\s)--zipfilename(?:\s+|=|:)(\"[^\"]+\"|'[^']+'|\S+)",
+            text,
+        )
+        if not match:
+            return ""
+        value = match.group(1).strip().strip("\"'").rstrip("]},)")
+        return value.replace("\\", "/").rsplit("/", 1)[-1].strip().casefold()
+    except Exception:
+        return ""
+
+
 def build_sharphound_arguments(
     output_directory: str = SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY,
     zip_filename: str = SHARPHOUND_CANONICAL_ZIP_FILENAME,
@@ -1014,6 +1055,11 @@ class MythicTools:
         # post-issue path can commit operational transient state.
         self._collection_in_flight: dict[str, dict] = {}
         self._pending_task_backed_transition: dict | None = None
+        # Per-user-turn collection intent. Collect-once is the autonomous default, but an explicit operator
+        # request to run/re-run SharpHound must be allowed to launch one fresh collection transaction instead
+        # of being silently satisfied from history. This state is reset by Model.invoke() for each real user
+        # turn and never set by synthetic autonomous nudges.
+        self._operator_collection_request: dict | None = None
         # Deliberation-drain guards. Command schemas are STATIC per payloadtype -> cache (a 2026-06-09 solve
         # re-fetched + re-dumped them 27×, bloating context).
         self._command_schema_cache: dict = {}
@@ -1071,6 +1117,115 @@ class MythicTools:
     def set_mechanic_repair_resolver(self, resolver) -> None:
         """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
         self._mechanic_repair_resolver = resolver if callable(resolver) else None
+
+    def begin_operator_turn(self, prompt: str) -> None:
+        """Reset per-turn operator intent and arm one fresh collection transaction when explicitly requested."""
+        self._operator_collection_request = None
+        if not _operator_requested_collection(prompt):
+            return
+        self._operator_collection_request = {
+            "requested": True,
+            "prompt_preview": str(prompt or "")[:300],
+            "authorized_key": "",
+            "launched_key": "",
+            "launched_task_id": "",
+            "callback_id": "",
+            "expected_zip_suffix": "",
+            "completed": False,
+        }
+        logger.info("🧭 [operator-collection] explicit collection request armed for this user turn")
+
+    def _operator_collection_override_available(self) -> bool:
+        request = getattr(self, "_operator_collection_request", None)
+        return bool(
+            isinstance(request, dict)
+            and request.get("requested") is True
+            and request.get("completed") is not True
+        )
+
+    def _authorize_operator_collection(self, collection_key: str, callback_display_id, parameters) -> None:
+        request = getattr(self, "_operator_collection_request", None)
+        if not self._operator_collection_override_available() or not isinstance(request, dict):
+            return
+        request["authorized_key"] = str(collection_key or "")
+        request["callback_id"] = str(callback_display_id or "")
+        request["expected_zip_suffix"] = _sharphound_zip_suffix(parameters)
+
+    def _mark_operator_collection_launched(self, key: str, task_display_id, callback_display_id, parameters) -> None:
+        request = getattr(self, "_operator_collection_request", None)
+        if not isinstance(request, dict) or request.get("requested") is not True:
+            return
+        authorized_key = str(request.get("authorized_key") or "")
+        if authorized_key and authorized_key != str(key or ""):
+            return
+        request["launched_key"] = str(key or "")
+        request["launched_task_id"] = str(task_display_id or "")
+        request["callback_id"] = str(callback_display_id or "")
+        request["expected_zip_suffix"] = (
+            _sharphound_zip_suffix(parameters)
+            or str(request.get("expected_zip_suffix") or "")
+        )
+        logger.info(
+            "🧭 [operator-collection] fresh collector launched key=%s task=%s callback=%s",
+            key,
+            task_display_id,
+            callback_display_id,
+        )
+
+    def _complete_operator_collection_request(self) -> None:
+        request = getattr(self, "_operator_collection_request", None)
+        if isinstance(request, dict) and request.get("requested") is True:
+            request["completed"] = True
+
+    def _operator_collection_ingest_blocker(
+        self,
+        *,
+        callback_display_id,
+        source_filename: str,
+    ) -> str | None:
+        """Require an explicit operator recollection request to consume the fresh artifact it launched."""
+        request = getattr(self, "_operator_collection_request", None)
+        if not self._operator_collection_override_available() or not isinstance(request, dict):
+            return None
+        task_id = str(request.get("launched_task_id") or "").strip()
+        if not task_id:
+            return json.dumps({
+                "status": "fresh_collection_required",
+                "operator_requested_recollection": True,
+                "error": (
+                    "The operator explicitly requested a new SharpHound/AzureHound collection this turn. "
+                    "Do not satisfy that request with a historical ZIP or prior ingest. Launch a new collector "
+                    "task first, verify the artifact produced by that task, then ingest that fresh ZIP."
+                ),
+            }, sort_keys=True)
+        expected_callback = str(request.get("callback_id") or "").strip()
+        actual_callback = str(callback_display_id or "").strip()
+        if expected_callback and actual_callback and expected_callback != actual_callback:
+            return json.dumps({
+                "status": "fresh_collection_artifact_required",
+                "operator_requested_recollection": True,
+                "collector_task_id": task_id,
+                "error": (
+                    f"The explicit collection request launched on callback {expected_callback} as Mythic task "
+                    f"#{task_id}; ingest the ZIP from that callback, not callback {actual_callback}."
+                ),
+            }, sort_keys=True)
+        expected_suffix = str(request.get("expected_zip_suffix") or "").strip().casefold()
+        actual_name = str(source_filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip().casefold()
+        if expected_suffix and actual_name and not actual_name.endswith(expected_suffix):
+            return json.dumps({
+                "status": "fresh_collection_artifact_required",
+                "operator_requested_recollection": True,
+                "collector_task_id": task_id,
+                "expected_zip_suffix": expected_suffix,
+                "actual_filename": actual_name,
+                "error": (
+                    f"The operator requested a fresh collection and Mythic task #{task_id} produced a ZIP "
+                    f"with suffix '{expected_suffix}'. Do not ingest historical artifact '{actual_name}'; "
+                    "download and ingest the ZIP produced by the new collector task."
+                ),
+            }, sort_keys=True)
+        return None
 
     async def login(self):
         """Create the Mythic API client connection asynchronously."""
@@ -2842,10 +2997,13 @@ class MythicTools:
         except Exception:
             pass
 
-        # collect-graph: deterministic collect-once-per-privilege. Rebind the empty target to the issuing
-        # callback's access-context key; block only if a collection is in-flight or a verified graph exists
-        # for this access level and the cached graph corroborates that collection. graph-built is recorded
-        # by ingest_collection on graph_verified (not on SharpHound success), so we do NOT set a pending hop here.
+        # collect-graph: deterministic collect-once-per-privilege for autonomous progression. Rebind the empty
+        # target to the issuing callback's access-context key; block only if a collection is in-flight or a
+        # verified graph exists for this access level and the cached graph corroborates that collection. A real
+        # user turn that explicitly requests a new collection gets one fresh transaction override; that keeps
+        # collect-once as the default without turning it into a veto against operator intent. graph-built is
+        # recorded by ingest_collection on graph_verified (not on SharpHound success), so we do NOT set a pending
+        # hop here.
         if technique == "collect-graph":
             graph_facts = list(getattr(self, "_engagement_graph_facts", []) or [])
             cg_state = engagement_state.EngagementState(
@@ -2868,8 +3026,14 @@ class MythicTools:
             if in_flight_blocker:
                 return in_flight_blocker
             if engagement_state.graph_collection_covers_scope(cg_state, fh, scope_domain):
-                return (f"[engagement-gate] skipped: graph already built for this auth context/scope ({collection_key}) "
-                        "— analyze the existing graph or escalate; do NOT re-collect.")
+                if not self._operator_collection_override_available():
+                    return (f"[engagement-gate] skipped: graph already built for this auth context/scope ({collection_key}) "
+                            "— analyze the existing graph or escalate; do NOT re-collect.")
+                logger.info(
+                    "🧭 [operator-collection] overriding graph-built skip for explicit user request key=%s",
+                    collection_key,
+                )
+            self._authorize_operator_collection(collection_key, callback_display_id, parameters)
             self._queue_task_backed_transition(
                 kind="collect-graph",
                 key=collection_key,
@@ -3367,6 +3531,7 @@ class MythicTools:
                 "parameters_preview": str(parameters)[:300],
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
+            self._mark_operator_collection_launched(key, task_display_id, callback_display_id, parameters)
             logger.info(
                 "🧭 [task-backed-transition] collect-graph in-flight key=%s task=%s callback=%s",
                 key,
@@ -11738,20 +11903,28 @@ class MythicTools:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ingest_collection (file_uuid={file_uuid!r}, callback={callback_display_id})")
         source_filename = ""
+        blocker = self._operator_collection_ingest_blocker(
+            callback_display_id=callback_display_id,
+            source_filename=source_filename,
+        )
+        if blocker:
+            return blocker
         # 1. Resolve the Mythic file UUID (by UUID, or the latest completed download on a callback).
         if file_uuid:
             resolved_by = "uuid"
-            if callback_display_id is None:
-                try:
-                    meta = await self._get_file_metadata(file_uuid)
-                    source_callback = (
-                        ((meta or {}).get("task") or {}).get("callback") or {}
-                    ).get("display_id")
-                    if source_callback is not None:
-                        callback_display_id = int(source_callback)
-                        resolved_by = f"uuid:callback:{callback_display_id}"
-                except Exception:
-                    pass
+            try:
+                meta = await self._get_file_metadata(file_uuid)
+                source_filename = str((meta or {}).get("filename_utf8") or "")
+                if not file_name and source_filename:
+                    file_name = os.path.basename(source_filename)
+                source_callback = (
+                    ((meta or {}).get("task") or {}).get("callback") or {}
+                ).get("display_id")
+                if callback_display_id is None and source_callback is not None:
+                    callback_display_id = int(source_callback)
+                    resolved_by = f"uuid:callback:{callback_display_id}"
+            except Exception:
+                pass
         elif callback_display_id is not None:
             row = await self._latest_download_for_callback(callback_display_id, name_contains)
             if row is None:
@@ -11770,6 +11943,12 @@ class MythicTools:
             resolved_by = "callback:" + str(callback_display_id)
         else:
             return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
+        blocker = self._operator_collection_ingest_blocker(
+            callback_display_id=callback_display_id,
+            source_filename=source_filename or file_name,
+        )
+        if blocker:
+            return blocker
         # 2. Fetch the collection bytes from Mythic.
         try:
             file_content = await mythic.download_file(mythic=self.client, file_uuid=file_uuid)
@@ -11815,6 +11994,7 @@ class MythicTools:
                 )
             except Exception:
                 pass
+            self._complete_operator_collection_request()
             return json.dumps({
                 "status": "already_ingested", "file_uuid": file_uuid, "filename": safe_name,
                 "bytes": len(file_content), "content_sha256": content_hash[:16],
@@ -11905,6 +12085,7 @@ class MythicTools:
             pass
         if verified:
             self._record_collection_ingested(content_hash, job_id_bh)  # idempotency: don't re-ingest this artifact
+            self._complete_operator_collection_request()
         return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
                            "bytes": len(file_content), "resolved_by": resolved_by,
                            "source_callback_display_id": callback_display_id,
