@@ -16,9 +16,15 @@ from typing import Any
 
 from mythic_container.ChatBase import ChatRequest, ChatSlashCommandDefinition
 
+try:  # match the rest of the container's logging
+    from mythic_container.logging import logger
+except Exception:  # pragma: no cover
+    import logging
+    logger = logging.getLogger(__name__)
+
 # Declared to Mythic via model metadata. Names have no leading slash.
 SLASH_COMMANDS = [
-    ChatSlashCommandDefinition(Name="state", Description="Show this channel's Sage session (mode, provider/model, turns)."),
+    ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(Name="mode", Description="Show or set the agent mode: /mode [supervised|auto]."),
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
@@ -43,21 +49,177 @@ def _handle_mode(model: Any, arg: str) -> str:
     )
 
 
-def _handle_state(model: Any, request: ChatRequest) -> str:
-    if model is None:
-        return "No active Sage session on this channel yet — send a message to start one."
-    turns = len(getattr(model, "messages", []) or [])
-    # Mythic chat renders markdown — present the session state as a table.
-    return (
-        "**Sage session — this channel**\n\n"
-        "| Field | Value |\n"
-        "|---|---|\n"
-        f"| Channel | `{request.ChannelID}` |\n"
-        f"| Mode | `{getattr(model, 'mode', 'supervised')}` |\n"
-        f"| Provider | `{getattr(model, 'provider', '?')}` |\n"
-        f"| Model | `{getattr(model, 'model', '?')}` |\n"
-        f"| Captured messages | `{turns}` |"
+async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
+    """Show or edit Sage's durable engagement state — the hop ledger of achieved effects that grounds
+    the autonomous solve. Re-homed from the PayloadType `state` command; `ai.langgraph.engagement_ledger`
+    is the single source of truth (the running model publishes its active engagement id there).
+
+    Usage: `/state` (show) · `/state remove <row|id[,…]>` · `/state set <row|id> <status>` ·
+    `/state objective <text>` · `/state wipe`.
+    """
+    try:
+        from ai.langgraph import engagement_ledger
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph import engagement_ledger  # type: ignore
+
+    engagement_id = engagement_ledger.active_engagement_id()
+    if not engagement_id:
+        # The live process hasn't frozen an engagement key yet (e.g. right after a reboot, before any
+        # turn). Resolve it from Mythic now so /state works WITHOUT sending a message first — the durable
+        # ledger already exists on disk; only Mythic knows which uuid is current (many historical ones).
+        engagement_id = await _resolve_chat_engagement_id(model, request)
+    if not engagement_id:
+        return ("Couldn't resolve this channel's engagement from Mythic (no operation context yet). "
+                "Send one message to start a session, then try `/state` again.")
+    parts = (arg or "").strip().split(maxsplit=1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "wipe":
+        engagement_ledger.wipe(engagement_id)
+        return _render_ledger_markdown(engagement_ledger.load(engagement_id), engagement_id, model, request,
+                                       notice="🧹 Wiped the ledger.")
+    if sub == "objective":
+        if not rest:
+            return "Usage: `/state objective <text>` — set the engagement objective."
+        data = engagement_ledger.load(engagement_id)
+        data["objective"] = rest
+        data["objective_source"] = "operator"
+        engagement_ledger.save(data, engagement_id)
+        return _render_ledger_markdown(data, engagement_id, model, request, notice="🎯 Objective updated.")
+    if sub == "remove":
+        if not rest:
+            return "Usage: `/state remove <row|id[,…]>` — remove hop(s) by row number (the # column) or id/effect/technique."
+        data = engagement_ledger.load(engagement_id)
+        selectors = [s.strip() for s in rest.split(",") if s.strip()]
+        data, removed = engagement_ledger.remove_hops(data, selectors)
+        engagement_ledger.save(data, engagement_id)
+        return _render_ledger_markdown(data, engagement_id, model, request, notice=f"🗑️ Removed {removed} hop(s).")
+    if sub == "set":
+        bits = rest.split(maxsplit=1)
+        if len(bits) < 2:
+            return "Usage: `/state set <row|id> <status>` — change a hop's status (e.g. `/state set 9 pending`)."
+        selector, status = bits[0].strip(), bits[1].strip()
+        data = engagement_ledger.load(engagement_id)
+        data, changed = engagement_ledger.set_hop_status(data, selector, status)
+        engagement_ledger.save(data, engagement_id)
+        return _render_ledger_markdown(data, engagement_id, model, request, notice=f"✏️ Set status on {changed} hop(s) → `{status}`.")
+    if sub and sub != "show":
+        return ("Unknown `/state` subcommand. Usage:\n"
+                "- `/state` — show the engagement ledger\n"
+                "- `/state remove <row|id[,…]>`\n"
+                "- `/state set <row|id> <status>`\n"
+                "- `/state objective <text>`\n"
+                "- `/state wipe`")
+
+    return _render_ledger_markdown(engagement_ledger.load(engagement_id), engagement_id, model, request)
+
+
+async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
+    """Resolve this channel's durable engagement key from Mythic WITHOUT needing a chat turn first.
+
+    The key is `<Operation>_<id>_<uuid>`; the uuid is a per-operation durable marker only Mythic holds
+    (there can be many historical ledgers for one operation), so resolution needs a Mythic client.
+    Prefer the live session's already-logged-in client; otherwise build a short-lived one from the chat
+    request's API token (the same MythicTools init the model uses). `_ensure_engagement_key` publishes the
+    resolved key via `set_active_engagement_id`, so later `/state` calls are instant. Returns "" on failure.
+    """
+    try:
+        from ai.langgraph import engagement_ledger
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph import engagement_ledger  # type: ignore
+
+    # 1) Reuse the live session's client — cheap, already authenticated/scoped.
+    client = getattr(model, "mythic_client", None) if model is not None else None
+    if client is not None:
+        try:
+            await client._ensure_engagement_key()
+            key = engagement_ledger.active_engagement_id()
+            if key:
+                return key
+        except Exception as e:
+            logger.debug(f"/state: session-client engagement resolution failed: {e}")
+
+    # 2) No session yet (e.g. right after a reboot) — build a short-lived client from the request token.
+    try:
+        try:
+            from ai.langgraph.mythic_tools import MythicTools
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph.mythic_tools import MythicTools  # type: ignore
+        tools = MythicTools(
+            operation_id=getattr(request, "OperationID", None),
+            channel_id=getattr(request, "ChannelID", None),
+            apitoken_id=getattr(request, "APITokenID", 0),
+        )
+        await tools.login()
+        await tools._ensure_engagement_key()
+        return engagement_ledger.active_engagement_id()
+    except Exception as e:
+        logger.debug(f"/state: short-lived-client engagement resolution failed: {e}")
+    return ""
+
+
+def _md_cell(value: Any, limit: int = 40) -> str:
+    """Sanitize a value for a SINGLE markdown table cell.
+
+    Ledger evidence is often a bytes-repr (`b'...\\r\\n...'`) or multi-line tool output. A raw CR/LF/tab
+    in a cell makes Mythic's markdown renderer split the row into phantom lines (the "[+] Domain Controll…"
+    orphan row and the ascii-art-without-a-number row). So: unwrap the bytes-repr, drop its literal escapes,
+    collapse EVERY real whitespace run to one space, escape pipes, and hard-truncate.
+    """
+    s = str(value if value is not None else "")
+    if len(s) >= 3 and s[0] == "b" and s[1] in ("'", '"') and s[-1] == s[1]:
+        s = s[2:-1]                                                      # b'...' / b"..." → inner text
+    s = s.replace("\\r", " ").replace("\\n", " ").replace("\\t", " ")    # literal escapes from the repr
+    s = " ".join(s.split())                                             # collapse real CR/LF/tab/space runs
+    s = s.replace("|", "\\|")                                            # escape the markdown column pipe
+    if len(s) > limit:
+        s = s[: limit - 1] + "…"
+    return s or "-"
+
+
+def _render_ledger_markdown(data: dict, engagement_id: str, model: Any, request: ChatRequest, notice: str = "") -> str:
+    """Render the engagement ledger as a Mythic-chat markdown view (+ a compact session footer)."""
+    try:
+        from ai.langgraph import engagement_ledger
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph import engagement_ledger  # type: ignore
+
+    hops = data.get("hops") or []
+    out: list[str] = []
+    if notice:
+        out.append(notice + "\n")
+    out.append(f"**Engagement state — `{engagement_id}`**")
+    objective = str(data.get("objective") or "").strip()
+    if objective:
+        out.append(f"\n**Objective:** {objective}")
+    out.append(f"\n**Achieved hops:** {len(hops)}\n")
+    if not hops:
+        out.append("_(empty — no achieved hops recorded yet)_")
+    else:
+        out.append("| # | Hop | Effect | Status | Task | CB | Evidence |")
+        out.append("|---|---|---|---|---|---|---|")
+        for i, hop in enumerate(hops, 1):
+            ev = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+            task_id = ev.get("mythic_task_id")
+            cb_id = ev.get("callback_id")
+            evidence = ev.get("result_preview") or ev.get("source") or ""
+            out.append(
+                f"| {i} | `{_md_cell(engagement_ledger.hop_label(hop), 48)}` | {_md_cell(hop.get('effect'))} | "
+                f"`{_md_cell(hop.get('status') or '-', 16)}` | {task_id if task_id is not None else '-'} | "
+                f"{cb_id if cb_id is not None else '-'} | {_md_cell(evidence, 60)} |"
+            )
+    out.append(
+        "\n**Edit:** `/state remove <row|id[,…]>` · `/state set <row|id> <status>` · "
+        "`/state objective <text>` · `/state wipe`  _(row = the # column, or a hop id/effect/technique)_"
     )
+    # Compact session footer so the old /state's session info isn't lost.
+    if model is not None:
+        out.append(
+            f"\n<sub>session: channel `{request.ChannelID}` · mode `{getattr(model, 'mode', 'supervised')}` · "
+            f"`{getattr(model, 'provider', '?')}/{getattr(model, 'model', '?')}`</sub>"
+        )
+    return "\n".join(out)
 
 
 async def _handle_list() -> str:
@@ -192,7 +354,7 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     if name == "mode":
         text = _handle_mode(model, arg)
     elif name == "state":
-        text = _handle_state(model, request)
+        text = await _handle_state(model, request, arg)
     elif name == "list":
         text = await _handle_list()
     elif name == "stop":

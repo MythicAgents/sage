@@ -167,12 +167,29 @@ def make_card_emitter(
 
 
 def resume_decision_for_request(request: ChatRequest) -> str:
-    """Phase 2 decision from the operator's input response: `accept` → approve; everything else → deny.
+    """Decision from the operator's input response: `accept` → approve; everything else → deny.
 
     `handle_hitl_resume` classifies this string with `_hitl_is_approved` (default-deny), so mapping only
-    an explicit `accept` to "approve" is exactly the safe behavior. `respond`/`select` (Phase 3 steer)
-    default-deny for now.
+    an explicit `accept` to "approve" is exactly the safe behavior. `respond`/`select` also map to deny
+    HERE (the guarded action is never blind-run) — their steering text is delivered separately via
+    `resume_steer_message_for_request`.
     """
     ir = getattr(request, "InputResponse", None)
     action = str(getattr(ir, "Action", "") or "").strip().lower() if ir is not None else ""
     return "approve" if action == "accept" else "deny"
+
+
+def resume_steer_message_for_request(request: ChatRequest) -> str:
+    """The operator's free-text steering message from a `respond`/`select` input response (Phase 3).
+
+    On `respond`/`select`, `InputResponse.Response` carries what the operator typed or chose. We hand it
+    to the agent as the guarded action's REJECTION message, so the agent replans WITH the guidance — the
+    guarded action itself is never executed (steering is "deny this, but here's what to do instead", not a
+    blind run). Returns "" for `accept`/`reject` and when there is no response text, so those paths keep
+    the plain default-deny message.
+    """
+    ir = getattr(request, "InputResponse", None)
+    action = str(getattr(ir, "Action", "") or "").strip().lower() if ir is not None else ""
+    if action in ("respond", "select"):
+        return str(getattr(ir, "Response", "") or "").strip()
+    return ""

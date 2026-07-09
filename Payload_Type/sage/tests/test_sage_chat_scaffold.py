@@ -551,12 +551,18 @@ def test_slash_commands_declared():
     assert {c.Name for c in SLASH_COMMANDS} == {"state", "list", "mode", "stop", "mcp", "bloodhound"}
 
 
-def test_slash_state_no_session_is_handled_with_one_terminal():
+def test_slash_state_no_session_is_handled_with_one_terminal(monkeypatch):
+    from sage_chat import slash
+
+    async def _no_resolve(model, request):  # no Mythic in unit tests — simulate an unresolvable operation
+        return ""
+
+    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _no_resolve)
     chat = HeadlessSageChat()
     handled = _run(handle_slash(chat, _slash_req("state"), None, "slash:1"))
     assert handled is True
     assert len(chat.terminal_emissions) == 1
-    assert "No active Sage session" in chat.emissions[-1]["content"]
+    assert "start a session" in chat.emissions[-1]["content"]
 
 
 def test_slash_mode_show_then_set():
@@ -747,8 +753,9 @@ class _HitlModel:
         self._hitl_card_pending = True
         self._pending = True
 
-    async def handle_hitl_resume(self, decision, thread_id):
+    async def handle_hitl_resume(self, decision, thread_id, operator_message=""):
         self.resumed_with = decision
+        self.steered_with = operator_message
         self._pending = False
         await self._response_emitter(f"🤖> resume:{decision}")
         return ""
@@ -1244,3 +1251,97 @@ def test_tool_result_is_error_ignores_nested_errors_in_a_listing():
     assert _tool_result_is_error("Error: something blew up") is True
     # Top-level success payloads unaffected:
     assert _tool_result_is_error(_json.dumps({"status": "success"})) is False
+
+
+# --------------------------------------------------------------------------------------
+# /state slash command — re-homed engagement-ledger show + edit
+# --------------------------------------------------------------------------------------
+
+def test_handle_state_shows_engagement_ledger(monkeypatch):
+    """/state (no arg) renders the engagement hop ledger, not just session info."""
+    from sage_chat import slash
+    from ai.langgraph import engagement_ledger
+
+    ledger = {
+        "objective": "compromise CORP",
+        "hops": [
+            {"id": "da:corp.local", "effect": "da:corp.local", "status": "achieved",
+             "evidence": {"mythic_task_id": 31, "callback_id": 1, "result_preview": "dcsync ok"}},
+        ],
+    }
+    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "Operation_Chimera_1")
+    monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"objective": ledger["objective"],
+                                                                     "hops": [dict(h) for h in ledger["hops"]]})
+    text = _run(slash._handle_state(None, build_chat_request("x"), ""))
+    assert "Operation_Chimera_1" in text          # the engagement, not the channel
+    assert "compromise CORP" in text              # objective surfaced
+    assert "da:corp.local" in text                # a hop row
+    assert "Achieved hops:** 1" in text
+
+
+def test_handle_state_remove_mutates_and_saves(monkeypatch):
+    """/state remove <row> drops the hop and persists via engagement_ledger.save."""
+    from sage_chat import slash
+    from ai.langgraph import engagement_ledger
+
+    hops = [{"id": "a", "effect": "e1", "status": "x"}, {"id": "b", "effect": "e2", "status": "y"}]
+    saved = {}
+    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"hops": [dict(h) for h in hops]})
+    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
+
+    text = _run(slash._handle_state(None, build_chat_request("x"), "remove 1"))
+    assert "Removed 1 hop" in text
+    assert [h["id"] for h in saved["data"]["hops"]] == ["b"]   # row 1 (1-based) removed
+
+
+def test_handle_state_set_status_mutates_and_saves(monkeypatch):
+    """/state set <row> <status> flips a hop's status and persists it."""
+    from sage_chat import slash
+    from ai.langgraph import engagement_ledger
+
+    saved = {}
+    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    monkeypatch.setattr(engagement_ledger, "load",
+                        lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "achieved"}]})
+    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
+
+    text = _run(slash._handle_state(None, build_chat_request("x"), "set 1 pending"))
+    assert saved["data"]["hops"][0]["status"] == "pending"
+    assert "pending" in text
+
+
+# --------------------------------------------------------------------------------------
+# HITL Respond/Select steering (Phase 3)
+# --------------------------------------------------------------------------------------
+
+def test_hitl_respond_select_steer_deny_and_carry_text():
+    """Respond/Select must NEVER approve the guarded action (safety) — they map to deny AND surface the
+    operator's free-text as the steering message. Accept → approve; Reject → deny with no steer text."""
+    from sage_chat.hitl import resume_decision_for_request, resume_steer_message_for_request
+
+    class _IR:
+        def __init__(self, action, response=""):
+            self.Action, self.Response = action, response
+
+    class _Req:
+        def __init__(self, ir):
+            self.InputResponse = ir
+
+    for act in ("respond", "select"):
+        req = _Req(_IR(act, "use aes256, not rc4"))
+        assert resume_decision_for_request(req) == "deny"                       # never blind-run
+        assert resume_steer_message_for_request(req) == "use aes256, not rc4"   # guidance carried
+
+    accept = _Req(_IR("accept", "ignored"))
+    assert resume_decision_for_request(accept) == "approve"
+    assert resume_steer_message_for_request(accept) == ""
+
+    reject = _Req(_IR("reject"))
+    assert resume_decision_for_request(reject) == "deny"
+    assert resume_steer_message_for_request(reject) == ""
+
+    class _Bare:
+        InputResponse = None
+    assert resume_decision_for_request(_Bare()) == "deny"                        # default-deny, safe
+    assert resume_steer_message_for_request(_Bare()) == ""

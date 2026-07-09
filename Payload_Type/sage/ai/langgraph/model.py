@@ -5365,8 +5365,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 return True
         return False
 
-    async def handle_hitl_resume(self, response: str, thread_id: str) -> str:
+    async def handle_hitl_resume(self, response: str, thread_id: str, operator_message: str = "") -> str:
         """Resume a graph paused on a guarded-tool approval interrupt with a DEFAULT-DENY decision map.
+
+        Steering (Phase 3): when ``operator_message`` is non-empty (the operator hit Respond/Select with
+        free-text), the guarded action is still rejected — never blind-run — but the operator's text becomes
+        the rejection message, so the agent replans WITH the guidance instead of seeing a bare denial.
 
         Reads the pending interrupt to learn how many tool calls were interrupted (the middleware
         requires exactly one decision per interrupted tool call, else it raises ValueError), classifies
@@ -5384,9 +5388,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         action_requests = _collect_hitl_action_requests(snapshot)
 
         approved = _hitl_is_approved(response)
-        decision_word = "approve" if approved else "deny"
+        steer = (operator_message or "").strip()
+        decision_word = "approve" if approved else ("steer" if steer else "deny")
 
-        # One audit line + one Decision per interrupted tool call.
+        # One audit line + one Decision per interrupted tool call. On a steer, the guarded action is still
+        # rejected (never blind-run), but the operator's text becomes the rejection message.
         decisions: list[dict] = []
         if action_requests:
             for ar in action_requests:
@@ -5396,16 +5402,18 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 if approved:
                     decisions.append({"type": "approve"})
                 else:
-                    decisions.append({"type": "reject",
-                                      "message": f"[DENIED by operator] {tool_name} was not executed."})
+                    message = (f"[Operator steering] {steer}" if steer
+                               else f"[DENIED by operator] {tool_name} was not executed.")
+                    decisions.append({"type": "reject", "message": message})
         else:
-            # No structured action_requests recovered — still resume default-deny safely with a single
-            # decision so the graph does not hang. Audit it as an unknown-tool deny/approve.
+            # No structured action_requests recovered — still resume safely with a single decision so the
+            # graph does not hang. Audit it as an unknown-tool deny/steer/approve.
             self._write_hitl_audit("unknown", {}, decision_word)
             if approved:
                 decisions.append({"type": "approve"})
             else:
-                decisions.append({"type": "reject", "message": "[DENIED by operator]"})
+                message = f"[Operator steering] {steer}" if steer else "[DENIED by operator]"
+                decisions.append({"type": "reject", "message": message})
 
         logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
 

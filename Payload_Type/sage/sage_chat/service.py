@@ -21,7 +21,7 @@ from mythic_container.ChatBase import Chat, ChatRequest
 from mythic_container.logging import logger
 
 from .config import build_model_kwargs
-from .hitl import make_card_emitter, resume_decision_for_request
+from .hitl import make_card_emitter, resume_decision_for_request, resume_steer_message_for_request
 from .models import SAGE_MODELS
 from .session import channel_session_key, get_channel_session, put_channel_session
 from .slash import handle_slash
@@ -150,9 +150,13 @@ class SageChat(Chat):
                     await model.handle_controller_hitl_resume(resume_decision_for_request(request))
                 elif await model._hitl_interrupt_pending(thread_id):
                     # A prior turn raised a confirmation card and finished; this request is the operator's
-                    # answer. Resume the paused graph in place (Section 6): Confirm → approve, anything
-                    # else → default-deny (reject). Reuses the existing resume core unchanged.
-                    await model.handle_hitl_resume(resume_decision_for_request(request), thread_id)
+                    # answer. Resume the paused graph in place (Section 6): Confirm → approve; Reject →
+                    # default-deny; Respond/Select → deny the guarded action but steer the replan with the
+                    # operator's free-text (Phase 3).
+                    await model.handle_hitl_resume(
+                        resume_decision_for_request(request), thread_id,
+                        operator_message=resume_steer_message_for_request(request),
+                    )
                 else:
                     await model.invoke(prompt, is_interactive=preexisted)
             except asyncio.CancelledError:

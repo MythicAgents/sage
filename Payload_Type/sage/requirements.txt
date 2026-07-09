@@ -15,7 +15,7 @@ langgraph-prebuilt==1.0.8
 langgraph-checkpoint-sqlite==3.0.3
 langsmith==0.7.22
 mythic==0.3.0rc5
-mythic-container==0.7.0rc3
+mythic-container==0.7.0rc4
 # mythic-container 0.7.0rc1's generated gRPC stubs require grpcio>=1.78.0 (its metadata leaves grpcio
 # unpinned). Pin both so the container build is deterministic and doesn't regress to 1.76.x.
 grpcio==1.78.0
