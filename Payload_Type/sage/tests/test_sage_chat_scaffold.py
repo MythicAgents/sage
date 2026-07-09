@@ -829,9 +829,9 @@ def test_approval_cards_use_unique_keys_and_optional_delegation_tags():
         and emitted.get("metadata", {}).get("special_type") == "input_requested"
     ]
     assert len(input_reqs) == 2
-    assert input_reqs[0]["response_key"] != input_reqs[1]["response_key"]
+    assert input_reqs[0]["response_key"] != input_reqs[1]["response_key"]   # each approval is a fresh card
     assert all(
-        emitted["response_key"].startswith("input_requested:approval:9:")
+        emitted["response_key"].startswith("input_requested:")             # SDK's unique input_requested:{uuid}
         for emitted in input_reqs
     )
     assert all(emitted["complete_request"] is False for emitted in input_reqs)

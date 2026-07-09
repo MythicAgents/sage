@@ -113,37 +113,16 @@ def make_card_emitter(
 ) -> Callable[[list[dict[str, Any]]], Awaitable[None]]:
     """Return an async `(action_requests) -> None` that raises the approval request for this turn.
 
-    Bound per turn (like the stream emitter). This emits the same normalized `input_requested` block
-    as `send_approval_request`, but uses a per-channel unique response key so repeated approvals for
-    one tool append at the current timeline position. `complete_request=False` releases the channel;
-    it is NOT a terminal `complete`, so the chat handler must return None.
+    Bound per turn (like the stream emitter). Delegates to the SDK's `send_approval_request`, which owns
+    the `input_requested` assembly and generates a unique default `response_key` (`input_requested:{uuid}`)
+    — so repeated approvals never collide and each appends at the current timeline position. It sends with
+    `complete_request=False` (channel-release, not a terminal `complete`), so the chat handler returns None
+    while the graph waits on the operator.
     """
     async def _emit(action_requests: list[dict[str, Any]]) -> None:
         try:
             kwargs = build_approval_request(action_requests)
-            input_request = {
-                "status": "pending",
-                "input_type": "approval",
-                "title": kwargs["title"],
-                "prompt": kwargs["prompt"],
-                "description": kwargs["description"],
-                "data": kwargs["data"],
-            }
-            normalized = chat.normalize_input_request(input_request)
-
-            seqs = getattr(chat, "_approval_request_seqs", None)
-            if seqs is None:
-                seqs = {}
-                setattr(chat, "_approval_request_seqs", seqs)
-            channel = getattr(request, "ChannelID", 0)
-            n = seqs.get(channel, 0) + 1
-            seqs[channel] = n
-            response_key = f"input_requested:approval:{getattr(request, 'RequestID', 0)}:{n}"
-
-            metadata = {
-                "special_type": CHAT_INPUT_REQUESTED_SPECIAL_TYPE,
-                "input_requested": normalized,
-            }
+            metadata: dict[str, Any] = {}
             if delegation_lookup is not None:
                 try:
                     active = delegation_lookup()
@@ -152,14 +131,17 @@ def make_card_emitter(
                         metadata["delegation_name"] = active[1]
                 except Exception as e:
                     logger.debug(f"approval delegation lookup failed (non-fatal): {e}")
-
-            content = normalized.get("prompt") or normalized.get("description") or "Input is required before continuing."
-            await chat.send_complete(
+            # rc4 exposes a settable `response_key`; omitting it lets the SDK mint a unique
+            # `input_requested:{uuid}`. That retires sage's old workaround — the hand-built input_requested
+            # block, the per-channel `_approval_request_seqs` counter, and the raw `send_complete` — which
+            # only existed to dodge the previous title-derived-key collisions.
+            await chat.send_approval_request(
                 request,
-                response_key,
-                content=content,
-                complete_request=False,
-                metadata=metadata,
+                title=kwargs["title"],
+                prompt=kwargs["prompt"],
+                description=kwargs["description"],
+                data=kwargs["data"],
+                metadata=metadata or None,
             )
         except Exception as e:
             logger.debug(f"approval card emit failed (non-fatal): {e}")
