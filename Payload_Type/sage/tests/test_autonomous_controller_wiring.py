@@ -21,6 +21,7 @@ async def _nosleep(*_a, **_k):
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ai.langgraph import model  # noqa: E402
 from ai.langgraph import engagement_state as es  # noqa: E402
+from ai.langgraph import mythic_tools as mt  # noqa: E402
 
 
 def _state_with_remote_exec():
@@ -566,6 +567,28 @@ def test_collect_no_zip_in_output_is_no_artifact(monkeypatch):
     result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
     assert result["ok"] is False and result["status"] == "no_collection_artifact", result
     assert not any(c[0] in ("download", "ingest_collection") for c in fake.calls), fake.calls
+
+
+def test_collect_stops_immediately_when_registered_file_preflight_fails():
+    class _PreflightFailCollectMythic(_CollectMythic):
+        async def issue_task_and_waitfor_task_output(self, command, parameters, callback_display_id, **kw):
+            if command == "execute_assembly":
+                self.calls.append((command, parameters, callback_display_id))
+                return (
+                    f"{mt._REGISTERED_FILE_PREFLIGHT_PREFIX} could not register 'SharpHound.exe' "
+                    "before 'execute_assembly': upload failed"
+                )
+            return await super().issue_task_and_waitfor_task_output(command, parameters, callback_display_id, **kw)
+
+    m = object.__new__(model.Model)
+    fake = _PreflightFailCollectMythic({"status": "ingested", "graph_verified": True})
+    m.mythic_client = fake
+
+    result = asyncio.run(m._controller_collect(_live_foothold_state("2")))
+
+    assert result["ok"] is False and result["status"] == "tool_preflight_failed", result
+    assert "SharpHound.exe" in result["reason"]
+    assert not any(c[0] in ("ls", "download", "ingest_collection") for c in fake.calls), fake.calls
 
 
 def test_collect_ingest_failed_is_not_ok():

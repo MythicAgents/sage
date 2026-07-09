@@ -236,6 +236,7 @@ import hashlib
 import inspect
 import re
 from typing import Annotated, List, Dict, TypedDict
+import aiohttp
 from mythic import mythic, mythic_classes
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
 from mythic_container.logging import logger
@@ -321,6 +322,8 @@ _RECORD_FAILURE_SIGNATURES = _READ_FAILURE_SIGNATURES + (
     "no payload by that name",
     "error: command not found",
 )
+
+_REGISTERED_FILE_PREFLIGHT_PREFIX = "[registered-file-preflight]"
 
 
 def _record_output_is_failure(output: str) -> bool:
@@ -920,6 +923,62 @@ GUARDED_TOOLS: set[str] = {
     "add_credential",
 }
 
+# Upper bound (seconds) on the chat bot-token mint. The SDK's RabbitMQ connect retries unboundedly, so
+# without this login() would hang forever when Mythic is unreachable instead of degrading fail-closed.
+_CHAT_TOKEN_MINT_TIMEOUT = 15
+
+
+# Chat bot-token scope required per guarded tool (Section 8A P1). A chat channel's bot token is
+# operator-scoped at setup, so a guarded tool whose scope isn't granted is preflight-disabled (fail cheap)
+# rather than erroring mid-run. All scope strings verified against auth-adjustments
+# `authentication/mythicjwt/scopes.go` (incl. `credential.write` — PRD §14k resolved).
+SCOPE_REQUIREMENTS: dict[str, str] = {
+    "issue_task_and_waitfor_task_output": "callback.write",
+    "upload_file_by_file_uuid": "callback.write",
+    "materialize_capability_inputs": "callback.write",
+    "execute_capability": "callback.write",
+    "ingest_collection": "callback.write",
+    "sandbox_exec": "callback.write",
+    "create_payload": "payload.write",
+    "delete_payload": "payload.write",
+    "download_tool": "file.write",
+    "file_upload": "file.write",
+    "add_credential": "credential.write",
+}
+
+
+def _allows_scope(granted: "set[str]", required: str) -> bool:
+    """Mirror of the server's `mythicjwt.AllowsScope` for the cases our tool requirements hit.
+
+    A required scope is granted if the token holds `*` (all), the exact scope, or a matching
+    `resource.*` wildcard. (The write→read `Includes` relationship in the server is irrelevant here:
+    every SCOPE_REQUIREMENTS value is a `.write`, and no scope *includes* a `.write`.) Passing the
+    server's `effective_scopes` (already `*`/wildcard-expanded) also works — exact match then suffices.
+    """
+    required = required.strip().lower()
+    for scope in granted:
+        scope = str(scope).strip().lower()
+        if not scope:
+            continue
+        if scope == "*" or scope == required:
+            return True
+        if scope.endswith(".*") and required.startswith(scope[:-2] + "."):
+            return True
+    return False
+
+
+def tools_missing_scope(granted_scopes: "set[str] | list[str] | None") -> set[str]:
+    """Guarded tools to disable given the token's granted scopes.
+
+    ``None`` means the scopes are unknown (the introspection query failed / no client) — return an empty
+    set so nothing is gated on scope; the login fail-closed already protects the no-token case. Honors
+    `*` and `resource.*` wildcards via `_allows_scope` (matches the server's `AllowsScope`).
+    """
+    if granted_scopes is None:
+        return set()
+    granted = set(granted_scopes)
+    return {tool for tool, scope in SCOPE_REQUIREMENTS.items() if not _allows_scope(granted, scope)}
+
 
 # Volatile substrings stripped before hashing a command's output for the unproductive-repeat loop-guard, so
 # two runs of the same command that differ ONLY in drifting values (ticket timestamps, LUIDs/handles) hash
@@ -952,11 +1011,25 @@ class MythicTools:
     client: mythic_classes.Mythic | None
     agent_task_id: str
 
-    def __init__(self, agent_task_id: str):
-        """Initialize the MythicTools with the Mythic taskData.Task.AgentTaskID. Call create() to establish connection."""
-        logger.debug(f"Initializing MythicAPIClient with task ID: {agent_task_id}")
+    def __init__(self, agent_task_id: str = "", *, operation_id: int | None = None,
+                 channel_id: int | None = None, apitoken_id: int = 0):
+        """Initialize the MythicTools auth context. Call login() to establish the connection.
+
+        Two auth modes (Section 8A P0):
+        - **Task path (PayloadType):** pass ``agent_task_id``; ``login()`` mints via that AgentTaskID.
+        - **Chat path (chat container):** pass ``channel_id`` (+ ``operation_id``/``apitoken_id``);
+          ``login()`` mints a channel-scoped bot token via ``ChatAPITokenProvider``. ``channel_id`` is
+          the selector — when it's set the chat branch runs regardless of ``agent_task_id``.
+        """
+        logger.debug(f"Initializing MythicAPIClient (task_id={agent_task_id!r} channel_id={channel_id})")
         self.agent_task_id = agent_task_id
+        self.operation_id = operation_id
+        self.channel_id = channel_id
+        self.apitoken_id = apitoken_id
         self.client = None
+        # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
+        # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
+        self.disabled_tools: set[str] = set()
         # Circuit breaker for repeated identical task failures. Keyed by
         # (command, callback_display_id, normalized_params); incremented on each failed
         # issue_task_and_waitfor_task_output, reset on success. Prevents the agent from
@@ -1228,19 +1301,99 @@ class MythicTools:
         return None
 
     async def login(self):
-        """Create the Mythic API client connection asynchronously."""
-        logger.info(f"Calling MythicRPCAPITokenCreateMessage with: {self.agent_task_id}")
+        """Create the Mythic API client connection asynchronously (Section 8A P0).
 
-        resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=self.agent_task_id))
-        if resp.Success:
-            api_key = resp.APIToken
+        Two auth paths, selected by which context was supplied:
+        - **Chat path** (``channel_id`` set): mint a channel-scoped bot token via ``ChatAPITokenProvider``
+          (keyed on ``ChatChannelID``), not the task's AgentTaskID. This is the P0 rewrite — all 28 tools
+          authenticate through this one chokepoint, so re-sourcing it here fixes the whole tool surface.
+        - **Task path** (``agent_task_id`` set, no channel): unchanged — mint from the AgentTaskID.
+
+        Degrade gracefully when Mythic is unreachable (offline/headless/eval) or no context was given:
+        leave ``self.client`` None so guarded tools fail closed via their "not initialized" guard and
+        ``_fetch_dynamic_data`` falls back to defaults, instead of crashing ``Model.initialize()``.
+        """
+        api_key = None
+        if self.channel_id is not None:
+            # Chat bot-token path — the primary consumer of ChatAPITokenProvider (corrects the earlier
+            # PRD claim that sage's tools didn't need it; they are its primary consumer).
+            # Time-box the mint: the underlying SendMythicRPCAPITokenCreate connects to RabbitMQ with an
+            # UNBOUNDED retry loop, so if Mythic is unreachable/misconfigured this would hang forever
+            # instead of degrading. Bound it and fail closed on timeout (fixes headless/eval + a
+            # misconfigured-container-hangs-at-startup edge).
+            async def _mint_chat_token() -> str:
+                from mythic_container.ChatBase import ChatAPITokenProvider
+                provider = await ChatAPITokenProvider.create(
+                    int(self.operation_id or 0), int(self.channel_id), int(self.apitoken_id or 0)
+                )
+                return await provider.get_token()
+            try:
+                api_key = await asyncio.wait_for(_mint_chat_token(), timeout=_CHAT_TOKEN_MINT_TIMEOUT)
+            except Exception as e:  # includes asyncio.TimeoutError
+                logger.warning(
+                    f"MythicTools.login(): chat-channel token mint failed/timed out ({e}) — leaving client "
+                    "unauthenticated; guarded Mythic tools fail closed until a scoped bot token is available."
+                )
+                return
+        elif self.agent_task_id:
+            logger.info(f"Calling MythicRPCAPITokenCreateMessage with: {self.agent_task_id}")
+            resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=self.agent_task_id))
+            if resp.Success:
+                api_key = resp.APIToken
+            else:
+                raise Exception(f"Failed to get API token for AgentTaskID {self.agent_task_id}: {resp.Error}")
         else:
-            raise Exception(f"Failed to get API token for AgentTaskID {self.agent_task_id}: {resp.Error}")
+            logger.warning(
+                "MythicTools.login(): no task or channel auth context — skipping token mint. "
+                "Mythic action tools stay unauthenticated (fail closed)."
+            )
+            return
 
         ip = os.environ.get("NGINX_HOST", "127.0.0.1")
         port = int(os.environ.get("NGINX_PORT", 7443))
         ssl = True if os.environ.get("NGINX_SSL", "true").lower() in ['true', '1', 'yes'] else False
         self.client = await mythic.login(apitoken=api_key, server_ip=ip, server_port=port, ssl=ssl)
+
+    async def whoami_scopes(self) -> "set[str] | None":
+        """Introspect the token's granted scopes for preflight tool-gating (Section 8A P1).
+
+        Queries the `whoami` Hasura action, which on the auth-adjustments branch exposes
+        `effective_scopes` (the server-side `*`/wildcard/includes-expanded set) — verified against
+        `hasura-docker/metadata/actions.graphql` (`whoamiOutput.effective_scopes`) and
+        `scope_check_webhook.go`. The scripting lib's built-in `whoami` only SELECTs
+        username/operation, so we run a custom query selecting the scope fields. No extra scope is
+        needed — a token can always read its own claims.
+
+        [VERIFY-LIVE] The query is source-verified but not yet run against a live v4 server (v4 is
+        currently down on the Hasura metadata bug). Returns None on no-client/failure → `tools_missing_scope`
+        gates nothing (login fail-closed still protects the no-token case). An empty set (token genuinely
+        has no scopes) correctly gates ALL guarded tools.
+        """
+        if self.client is None:
+            return None
+        try:
+            resp = await mythic.execute_custom_query(
+                mythic=self.client,
+                query="query sageWhoamiScopes { whoami { effective_scopes scopes } }",
+            )
+            who = (resp or {}).get("whoami") or {}
+            scopes = who.get("effective_scopes")
+            if scopes is None:
+                scopes = who.get("scopes")
+            return set(scopes) if scopes is not None else set()
+        except Exception as e:
+            logger.warning(f"whoami_scopes introspection failed ({e}); scope gating disabled this session")
+            return None
+
+    def apply_scope_gating(self, granted_scopes: "set[str] | list[str] | None") -> set[str]:
+        """Set `self.disabled_tools` from the token's granted scopes (see `tools_missing_scope`)."""
+        self.disabled_tools = tools_missing_scope(granted_scopes)
+        if self.disabled_tools:
+            logger.info(
+                f"Scope preflight: disabling {len(self.disabled_tools)} guarded tool(s) lacking a granted "
+                f"scope: {sorted(self.disabled_tools)}"
+            )
+        return self.disabled_tools
     
     def get_tools(self, method_names: list[str]) -> list[StructuredTool]:
         """Get Mythic tools by method names and return them as LangChain StructuredTool instances.
@@ -1252,7 +1405,13 @@ class MythicTools:
             method_names = [*method_names, "list_open_artifacts"]
 
         tools = []
+        disabled = getattr(self, "disabled_tools", set())
         for method_name in method_names:
+            if method_name in disabled:
+                # Scope preflight (Section 8A P1): the bot token lacks the scope this tool needs. Skip it
+                # so the LLM never sees a tool it can't use — fail cheap, not mid-run.
+                logger.debug(f"Scope-gated: omitting `{method_name}` (required scope not granted)")
+                continue
             if hasattr(self, method_name):
                 method = getattr(self, method_name)
                 if asyncio.iscoroutinefunction(method):
@@ -2676,9 +2835,19 @@ class MythicTools:
         # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
         # can reject an unregistered tool name before Sage gets a chance to register it.
         try:
-            await self._ensure_registered_file_available(command, parameters, callback_display_id)
-        except Exception:
-            pass
+            registered_file_blocker = await self._ensure_registered_file_available(
+                command,
+                parameters,
+                callback_display_id,
+            )
+        except Exception as e:
+            registered_file_blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not verify registered-file prerequisites "
+                f"for command {command!r}: {type(e).__name__}: {e}"
+            )
+            logger.warning(registered_file_blocker)
+        if registered_file_blocker:
+            return registered_file_blocker
 
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
@@ -4136,7 +4305,7 @@ class MythicTools:
                     return raw
         return ""
 
-    async def _ensure_registered_file_available(self, command, parameters, callback_display_id) -> None:
+    async def _ensure_registered_file_available(self, command, parameters, callback_display_id) -> str | None:
         """Ensure a schema-selected registered file exists in Mythic before task creation.
 
         This is a Mythic control-plane prerequisite, not a payload-specific command behavior. Commands that
@@ -4156,14 +4325,37 @@ class MythicTools:
             self._registered_file_checks.add(key)
             return
         try:
-            up = json.loads(await self.ensure_tool_uploaded(name))
+            raw_upload = await self.ensure_tool_uploaded(name)
+            up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
         except Exception as e:
-            logger.debug(f"registered-file-preflight: ensure_tool_uploaded({name}) failed: {e}")
-            return
-        if up.get("status") not in {"uploaded", "already_present"} or not up.get("file_uuid"):
-            return
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                f"ensure_tool_uploaded raised {type(e).__name__}: {e}. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
+        if not isinstance(up, dict):
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                "ensure_tool_uploaded returned an invalid response. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
+        status = str(up.get("status") or "unknown")
+        if status not in {"uploaded", "already_present"} or not up.get("file_uuid"):
+            detail = str(up.get("error") or up.get("note") or "no Mythic file UUID returned")
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                f"ensure_tool_uploaded returned {status}: {detail}. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
         self._registered_file_checks.add(key)
         await self._invalidate_command_schema_cache(command, callback_display_id)
+        return None
 
     def _registered_file_available_in_schema(self, schema, name: str) -> bool:
         """Return true when Mythic already exposes the file in registered-selector choices.
@@ -6265,7 +6457,7 @@ class MythicTools:
 
             # NOT _register_file_dedup: the CA PFX is an engagement secret artifact. Content-hash dedup could bind
             # this operation to another engagement's file; hash-dedup is for static tool binaries only.
-            file_uuid = await mythic.register_file(self.client, filename=local_path.name, contents=local_path.read_bytes())
+            file_uuid = await self._register_file(local_path.name, local_path.read_bytes())
             adapter_inputs = (
                 merged_inputs.get("mythic_adapter")
                 if isinstance(merged_inputs.get("mythic_adapter"), dict)
@@ -11934,8 +12126,22 @@ class MythicTools:
                     if row is not None:
                         break
             if row is None:
-                return json.dumps({"status": "error", "callback_display_id": callback_display_id,
-                                   "error": "No completed agent-download found on this callback. Run the Mythic `download` command for the collection first."}, sort_keys=True)
+                return json.dumps({
+                    "status": "no_collection_artifact",
+                    "callback_display_id": callback_display_id,
+                    "retryable_by_reingest": False,
+                    "error": (
+                        "No completed agent-download found on this callback. There is no existing collection "
+                        "artifact to ingest."
+                    ),
+                    "next_action": (
+                        "Do not retry ingest_collection with broader selectors or re-read unchanged task "
+                        "history. If the current scoped task is read-only, report that BloodHound has no "
+                        "collection artifact and stop. If the operator or objective explicitly requires new "
+                        "BloodHound data, run one fresh SharpHound/AzureHound collection, download its new "
+                        "artifact, then call ingest_collection once on that fresh artifact."
+                    ),
+                }, sort_keys=True)
             file_uuid = row["agent_file_id"]
             source_filename = row.get("filename_utf8") or ""
             if not file_name:
@@ -12763,6 +12969,59 @@ class MythicTools:
             logger.debug(f"get_latest_uploaded_file_by_name failed for {filename}: {e}")
             return None
 
+    async def _post_registered_file_webhook(self, path: str, filename: str, content: bytes) -> tuple[int, str]:
+        """POST one file-registration attempt and return the raw HTTP status/body.
+
+        Mythic v4 serves this webhook at the root path. Older scripting clients still hardcode the
+        legacy `/api/v1.4/` prefix, so Sage owns the tiny HTTP seam instead of inheriting that stale route.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        form = aiohttp.FormData()
+        form.add_field("file", value=content, filename=filename)
+        token = getattr(self.client, "apitoken", None) or getattr(self.client, "access_token", None)
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = f"{self.client.http}{self.client.server_ip}:{self.client.server_port}{path}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=form, headers=headers, ssl=False) as response:
+                return response.status, await response.text()
+
+    async def _register_file(self, filename: str, content: bytes) -> str:
+        """Register a file against the live Mythic webhook, with a legacy route fallback.
+
+        Mythic v4's UI and server use `/task_upload_file_webhook`; the Python SDK version pinned by this
+        repo still posts to `/api/v1.4/task_upload_file_webhook`. Try the live v4 route first and retain the
+        legacy path only for older Mythic deployments.
+        """
+        route_errors: list[str] = []
+        for path in ("/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"):
+            try:
+                status, body = await self._post_registered_file_webhook(path, filename, content)
+            except Exception as exc:
+                route_errors.append(f"{path}: {type(exc).__name__}: {exc}")
+                continue
+            if status in {404, 405}:
+                route_errors.append(f"{path}: HTTP {status}")
+                continue
+            try:
+                response = json.loads(body)
+            except Exception:
+                preview = " ".join(str(body or "").split())[:200] or "<empty response>"
+                raise RuntimeError(
+                    f"Mythic file upload {path} returned HTTP {status} with a non-JSON response: {preview}"
+                )
+            if status >= 400:
+                error = response.get("message") or response.get("error") or response
+                raise RuntimeError(f"Mythic file upload {path} returned HTTP {status}: {error}")
+            if response.get("status") == "success" and response.get("agent_file_id"):
+                return str(response["agent_file_id"])
+            error = response.get("error") or response
+            raise RuntimeError(f"Mythic file upload {path} failed: {error}")
+        raise RuntimeError(
+            "Mythic file upload endpoint was not found; tried "
+            + ", ".join(route_errors or ["/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"])
+        )
+
     async def _register_file_dedup(self, filename: str, content: bytes) -> tuple[str, bool]:
         """Register a file with Mythic, but reuse an existing upload only when exact content AND filename match.
 
@@ -12786,7 +13045,7 @@ class MythicTools:
                 f"🔁 [upload-dedup] {filename}: identical md5/sha1 exists as {existing_name!r}, "
                 "but by-name tasking needs the requested filename — uploading a new filemeta row."
             )
-        file_uuid = await mythic.register_file(self.client, filename=filename, contents=content)
+        file_uuid = await self._register_file(filename, content)
         return file_uuid, False
 
     async def ensure_tool_uploaded(

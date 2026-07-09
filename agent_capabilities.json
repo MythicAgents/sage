@@ -2,6 +2,6 @@
     "languages" : ["python"],
     "payload_output" : "N/A",
     "c2" : "N/A",
-    "mythic_version" : "v3.4.31",
+    "mythic_version" : "v4.0.0",
     "agent_version" : "1.0"
 }

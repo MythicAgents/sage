@@ -27,7 +27,7 @@ from mythic_container.MythicRPC import (
     MythicRPCTaskUpdateMessage,
     SendMythicRPCTaskUpdate
 )
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 from typing_extensions import NotRequired
 from uuid import UUID
 from .mythic_tools import MythicTools, GUARDED_TOOLS
@@ -527,8 +527,15 @@ class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
         if connected:
             return None
         await self._model._notify_bloodhound_not_connected()
+        # create_agent drops a before_model-injected message from the node's returned channel when we jump
+        # straight to "end" (no LLM call → the capture callback records nothing), which left the BloodHound
+        # node returning 0 messages and the Supervisor re-delegating forever. Stash the message on the Model
+        # so _ainvoke surfaces it as the node's result (seq-tagged + copied to the Supervisor channel) → the
+        # operator sees the connect steps and the turn terminates instead of looping.
+        guard_msg = AIMessage(content=_BLOODHOUND_CONNECT_STEPS, name="BloodHound")
+        self._model._pending_guard_message = guard_msg
         logger.info("🩸 [bloodhound-guard] BloodHound MCP not connected → EventFeed notice + returning steps to user")
-        return {"jump_to": "end", "messages": [AIMessage(content=_BLOODHOUND_CONNECT_STEPS)]}
+        return {"jump_to": "end", "messages": [guard_msg]}
 
 
 # Imperative directive paired with the observed-state block. A bare status LIST is informational; the
@@ -905,6 +912,58 @@ def _tag_msg(msg: AnyMessage, seq: int) -> AnyMessage:
     return msg
 
 
+def _is_control_tool(tool_name: str) -> bool:
+    """Internal orchestration/handoff tools that must not render as operator-facing tool cards."""
+    if not tool_name:
+        return False
+    if tool_name.startswith("transfer_to_"):
+        return True
+    return tool_name in {
+        "handback_to_supervisor",
+        "summarize_and_handback",
+        "request_continuation",
+        "respond_to_user",
+    }
+
+
+def _tool_result_is_error(content: str) -> bool:
+    """Best-effort detection of a FAILED tool result, for the card's Finished/Failed badge.
+
+    Catches both string errors ("Error: ...") AND structured results whose TOP-LEVEL shape signals
+    failure — a dict with status == "error" or a non-empty "error" field. Mythic tools commonly return
+    e.g. {"status": "error", "error": "..."} which does NOT start with "error", so the old startswith
+    check tagged it green/Finished. Conservative: only the top-level object is inspected (parsed JSON
+    first, then a python-repr fallback), so a SUCCESS payload that merely lists nested errors isn't
+    misflagged.
+    """
+    s = (content or "").strip()
+    if not s:
+        return False
+    if s.lower().startswith("error"):
+        return True
+    if s[:1] in ("{", "["):
+        obj = None
+        try:
+            import json
+            obj = json.loads(s)
+        except Exception:
+            try:
+                import ast
+                obj = ast.literal_eval(s)
+            except Exception:
+                obj = None
+        if obj is not None:
+            def _is_err(d: Any) -> bool:
+                return isinstance(d, dict) and (
+                    str(d.get("status", "")).strip().lower() == "error" or bool(d.get("error"))
+                )
+            if _is_err(obj):
+                return True
+            if isinstance(obj, list) and any(_is_err(x) for x in obj):
+                return True
+    return False
+
+
 def _is_internal_human_message(msg: AnyMessage) -> bool:
     """True for provider/control nudges that must not be treated as operator input."""
     return isinstance(msg, HumanMessage) and bool(msg.additional_kwargs.get("_hide_from_stream"))
@@ -1101,12 +1160,28 @@ class MessageCaptureCallback(AsyncCallbackHandler):
     Now also streams messages to Mythic in real-time as they're captured.
     """
 
-    def __init__(self, agent_name: str, stream_func=None, format_func=None):
+    def __init__(
+        self,
+        agent_name: str,
+        stream_func=None,
+        format_func=None,
+        tool_use_func=None,
+        agent_text_func=None,
+        handback_summary_func=None,
+        delegation_id: str | None = None,
+        delegation_name: str | None = None,
+    ):
         self.agent_name = agent_name
+        self.delegation_id = delegation_id
+        self.delegation_name = delegation_name
         self.captured_messages: list[AnyMessage] = []
         self._tool_call_to_name: dict[str, str] = {}  # Map tool_call_id to tool name
+        self._tool_call_to_args: dict[str, Any] = {}  # Map tool_call_id to its request args (for the card)
         self._stream_func = stream_func  # Function to stream formatted messages to Mythic
         self._format_func = format_func  # Function to format messages for streaming
+        self._tool_use_func = tool_use_func  # Function to stream tool-use cards to Mythic chat
+        self._agent_text_func = agent_text_func  # Function to stream delegated specialist text to its drill-down
+        self._handback_summary_func = handback_summary_func  # Function to retain control-tool handback summaries
         # Track run_ids for SummarizationMiddleware's internal model.invoke calls.
         # Those produce a summary AIMessage that must NOT be captured or streamed:
         # capturing it would leak the summary to Mythic as fake agent output and
@@ -1118,6 +1193,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         """Clear captured messages for reuse."""
         self.captured_messages = []
         self._tool_call_to_name = {}
+        self._tool_call_to_args = {}
         self._summarization_run_ids = set()
 
     async def on_chat_model_start(
@@ -1186,6 +1262,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                 tc_name = tc.get('name')
                                 if tc_id and tc_name:
                                     self._tool_call_to_name[tc_id] = tc_name
+                                    self._tool_call_to_args[tc_id] = tc.get('args')
 
                             logger.debug(f"📨 [Callback:{self.agent_name}] Captured AIMessage: "
                                        f"content={str(msg.content)[:50]!r}, "
@@ -1202,10 +1279,60 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                 logger.debug(f"📨 [Callback:Supervisor] Suppressing Supervisor message from streaming (internal orchestrator)")
                                 should_stream = False
 
-                            if should_stream and self._stream_func and self._format_func:
+                            if should_stream and self._tool_use_func:
+                                for tc in getattr(msg, 'tool_calls', []) or []:
+                                    tc_id = tc.get('id')
+                                    tc_name = tc.get('name')
+                                    if not (tc_id and tc_name):
+                                        continue
+                                    if _is_control_tool(tc_name):
+                                        if (
+                                            self.delegation_id is not None
+                                            and self._handback_summary_func is not None
+                                            and tc_name in ("handback_to_supervisor", "summarize_and_handback", "respond_to_user")
+                                        ):
+                                            try:
+                                                args = tc.get('args')
+                                                if isinstance(args, dict):
+                                                    summary = next(
+                                                        (
+                                                            value.strip()
+                                                            for key in ("summary", "final_response", "progress_summary", "reason", "text")
+                                                            for value in [args.get(key)]
+                                                            if isinstance(value, str) and value.strip()
+                                                        ),
+                                                        "",
+                                                    )
+                                                    if summary:
+                                                        await self._handback_summary_func(self.delegation_name, summary)
+                                            except Exception as e:
+                                                logger.debug(f"handback summary capture failed (non-fatal): {e}")
+                                        continue
+                                    try:
+                                        await self._tool_use_func(
+                                            tool_call_id=tc_id,
+                                            tool_name=tc_name,
+                                            status="started",
+                                            complete=False,
+                                            arguments_present=bool(tc.get('args')),
+                                            arguments=tc.get('args'),
+                                            delegation_id=self.delegation_id,
+                                            delegation_name=self.delegation_name,
+                                        )
+                                    except Exception as e:
+                                        logger.debug(f"tool_use started card failed (non-fatal): {e}")
+
+                            if should_stream and self._format_func:
                                 formatted = self._format_func(msg, agent_name=self.agent_name)
                                 if formatted:
-                                    await self._stream_func(formatted)
+                                    if self.delegation_id is not None and self._agent_text_func is not None:
+                                        await self._agent_text_func(
+                                            content=formatted,
+                                            delegation_id=self.delegation_id,
+                                            delegation_name=self.delegation_name,
+                                        )
+                                    elif self._stream_func:
+                                        await self._stream_func(formatted)
                     else:
                         # Log what we got if it's not a ChatGeneration
                         logger.debug(f"📨 [Callback:{self.agent_name}] Got generation type: {type(generation).__name__}")
@@ -1229,6 +1356,38 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                 self.captured_messages.append(output)
                 logger.debug(f"📨 [Callback:{self.agent_name}] Captured ToolMessage: "
                            f"tool={output.name}, tool_call_id={output.tool_call_id}")
+
+                if self._tool_use_func and self.agent_name != "Supervisor" and not _is_control_tool(output.name):
+                    content_str = output.content if isinstance(output.content, str) else str(output.content)
+                    # Structured-first error detection (not a brittle string match):
+                    #   1. ToolMessage.status — LangChain's first-class flag, set to "error" when a tool RAISES.
+                    #   2. Sage's Mythic tools mostly RETURN a structured {"status":"error","error":...} payload
+                    #      instead of raising (so .status stays "success") — _tool_result_is_error reads those
+                    #      top-level fields. The startswith("error") case is only the last-resort fallback for a
+                    #      genuinely unstructured plain-string tool error.
+                    errored = getattr(output, "status", None) == "error" or _tool_result_is_error(content_str)
+                    # Show the FULL tool result in the card's Details (Russel's call). Newlines preserved —
+                    # the UI renders result_preview in a <pre>. High backstop only guards against a
+                    # pathological multi-MB payload wedging one chat message; real tool output is far under it.
+                    _CARD_RESULT_CAP = 100_000
+                    preview = content_str if len(content_str) <= _CARD_RESULT_CAP else (
+                        content_str[:_CARD_RESULT_CAP]
+                        + f"\n…[truncated {len(content_str) - _CARD_RESULT_CAP} of {len(content_str)} chars]"
+                    )
+                    try:
+                        await self._tool_use_func(
+                            tool_call_id=output.tool_call_id,
+                            tool_name=output.name,
+                            status="error" if errored else "completed",
+                            complete=True,
+                            arguments_present=bool(self._tool_call_to_args.get(output.tool_call_id)),
+                            arguments=self._tool_call_to_args.get(output.tool_call_id),
+                            result_preview=preview,
+                            delegation_id=self.delegation_id,
+                            delegation_name=self.delegation_name,
+                        )
+                    except Exception as e:
+                        logger.debug(f"tool_use finished card failed (non-fatal): {e}")
 
                 # Stream message immediately to Mythic
                 if self._stream_func and self._format_func:
@@ -1266,14 +1425,36 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
         :param model: The model string (e.g., 'claude-3-5-sonnet-latest').
         :param system_prompt: The system prompt to use for the model.
         :param config: A dictionary containing configuration options for the model {"configurable": {}}.
+        :param response_emitter: Optional async sink for outbound formatted messages. The native chat
+            container (sage_chat) injects a ChatTurnContext-backed emitter here so streaming egress goes
+            to Mythic's chat_response queue instead of the PayloadType task RPC. When None (the legacy
+            PayloadType path), _stream_message_to_mythic falls back to SendMythicRPCResponseCreate.
+        :param operation_id: Chat-path OperationID, threaded explicitly since a chat request has no task
+            to infer it from (Section 7). None on the legacy task path, where operation is task-derived.
         """
+        # Native-chat streaming seam (Section 7): the single egress (_stream_message_to_mythic) prefers
+        # this when set. Kept as a plain attribute so a chat turn can swap it per-request if ever needed.
+        self._response_emitter = response_emitter
+        self._active_delegations: dict[str, dict[str, Any]] = {}
+        self._delegation_seq: int = 0
+        self.operation_id = operation_id
+        # Chat-path Mythic auth context (Section 7 / 8A-P0): the numeric channel id and the per-channel
+        # bot API token id, threaded so MythicTools can mint a channel-scoped token via
+        # ChatAPITokenProvider instead of the task's AgentTaskID. None/0 on the legacy task path.
+        self.channel_id = channel_id
+        self.apitoken_id = apitoken_id
+        # Chat-path checkpointer thread key (Section 7 / 8A-P1). The legacy task path derives the
+        # LangGraph thread_id from f"{agent_task_id}-{task_id}", but a chat channel has no task and must
+        # persist multi-turn state under a channel-stable key (str(ChannelID)). sage_chat sets this so
+        # _session_thread_id() returns it; None keeps the task-derived key for the PayloadType path.
+        self._thread_id_override = None
         self.provider = provider
         self.model = model
         self.mode = mode if mode in ("auto", "supervised") else "supervised"
@@ -1360,6 +1541,17 @@ class Model:
             "configurable": {"thread_id": thread_id},
             "recursion_limit": self._graph_recursion_limit(),
         }
+
+    def _session_thread_id(self) -> str:
+        """The LangGraph checkpointer thread key for this session.
+
+        Task path: f"{agent_task_id}-{task_id}" (unchanged). Chat path: the channel-stable override
+        set by sage_chat (str(ChannelID)), so multi-turn SageState survives across one-shot chat
+        requests (Section 7). Centralizing this is the P1 "thread key" re-source from Section 8A.
+        """
+        if getattr(self, "_thread_id_override", None):
+            return self._thread_id_override
+        return f"{self.agent_task_id}-{self.task_id}"
 
     def _next_seq(self) -> int:
         """Get next sequence number and increment counter. Also syncs to state."""
@@ -1500,6 +1692,250 @@ class Model:
             self._cached_commands = {}
             self._dynamic_data_loaded = True
 
+    def _classify_tool_source(self, tool_name: str) -> str:
+        """Classify a tool as MCP-backed or Sage's default Mythic tool source."""
+        try:
+            for server in MCPManager.get_connected_servers():
+                for tool_item in MCPManager.get_tools_by_server(server):
+                    if getattr(tool_item, "name", None) == tool_name:
+                        return "mcp"
+        except Exception as e:
+            logger.debug(f"tool source classification failed (non-fatal): {e}")
+        return "mythic"
+
+    async def _emit_tool_use_card(
+        self,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        status: str,
+        complete: bool,
+        arguments_present: bool = False,
+        arguments: Any = None,
+        result_preview: str | None = None,
+        delegation_id: str | None = None,
+        delegation_name: str | None = None,
+    ) -> None:
+        """Bridge a captured tool call/result to the chat emitter as a collapsible card.
+
+        The card's `content` (rendered in the UI Details) carries the tool REQUEST — the tool name and
+        its arguments — so the operator sees what was called alongside the `result_preview` response.
+        """
+        emitter = self._response_emitter
+        if emitter is None or not hasattr(emitter, "emit_tool_use"):
+            return
+        try:
+            source = self._classify_tool_source(tool_name)
+            source_label = "MCP" if source == "mcp" else "Mythic"
+            name = tool_name or "unknown_tool"
+            args_str = ""
+            if arguments:
+                try:
+                    import json as _json
+                    args_str = _json.dumps(arguments, default=str, ensure_ascii=False)
+                except Exception:
+                    args_str = str(arguments)
+                if len(args_str) > 4000:
+                    args_str = args_str[:4000] + "…"
+            request_line = f"Request: {name}({args_str})" if args_str else ""
+            if status == "started":
+                content = f"Using {source_label} tool `{name}`..."
+                if request_line:
+                    content += f"\n{request_line}"
+            elif status == "error":
+                content = request_line + ("\n\n" if request_line else "") + f"Tool `{name}` failed."
+            else:
+                content = request_line or f"Tool `{name}` finished."
+            await emitter.emit_tool_use(
+                tool_call_id=tool_call_id or "",
+                tool_name=name,
+                tool_source=source,
+                status=status,
+                content=content,
+                complete=complete,
+                arguments_present=arguments_present or bool(args_str),
+                arguments=args_str or None,
+                result_preview=result_preview,
+                delegation_id=delegation_id,
+                delegation_name=delegation_name,
+            )
+            if delegation_id is not None and delegation_name is not None and status == "started":
+                await self._bump_delegation_progress(delegation_name)
+        except Exception as e:
+            logger.debug(f"_emit_tool_use_card failed (non-fatal): {e}")
+
+    async def _emit_subagent_status(
+        self,
+        *,
+        title: str,
+        delegation_id: str,
+        delegation_name: str,
+        status: str = "running",
+        tool_count: int | None = None,
+        tool_total: int | None = None,
+        icon: str = "",
+        icon_color: str = "",
+        content: str = "",
+        complete: bool = False,
+    ) -> None:
+        emitter = self._response_emitter
+        if emitter is None or not hasattr(emitter, "emit_subagent_status"):
+            return
+        try:
+            await emitter.emit_subagent_status(
+                title=title,
+                delegation_id=delegation_id,
+                delegation_name=delegation_name,
+                status=status,
+                tool_count=tool_count,
+                tool_total=tool_total,
+                icon=icon,
+                icon_color=icon_color,
+                content=content,
+                complete=complete,
+            )
+        except Exception as e:
+            logger.debug(f"_emit_subagent_status failed (non-fatal): {e}")
+
+    async def _emit_agent_text(
+        self,
+        *,
+        content: str,
+        delegation_id: str,
+        delegation_name: str,
+    ) -> None:
+        emitter = getattr(self, "_response_emitter", None)
+        if emitter is None or not hasattr(emitter, "emit_agent_text"):
+            return
+        try:
+            await emitter.emit_agent_text(
+                content=content,
+                delegation_id=delegation_id,
+                delegation_name=delegation_name,
+            )
+            if content.strip():
+                delegation = getattr(self, "_active_delegations", {}).get(delegation_name)
+                if delegation is not None:
+                    delegation["last_text"] = content.strip()
+        except Exception as e:
+            logger.debug(f"_emit_agent_text failed (non-fatal): {e}")
+
+    @staticmethod
+    def _delegation_icon(agent_name: str) -> str:
+        icons = {
+            "BloodHound": "BH",
+            "Mythic_Operator": "MO",
+            "Mythic_Payload": "MP",
+            "Generalist": "GN",
+            "MCP_Manager": "MM",
+        }
+        return icons.get(agent_name, agent_name[:2].upper())
+
+    def current_delegation_id(self, agent_name: str) -> str | None:
+        # Fail-soft: a Model built via __new__ (tests, partial harnesses) never ran __init__, so
+        # _active_delegations may be absent. Missing state simply means "no active delegation".
+        delegation = getattr(self, "_active_delegations", {}).get(agent_name)
+        if delegation is None:
+            return None
+        delegation_id = delegation.get("id")
+        return delegation_id if isinstance(delegation_id, str) else None
+
+    def _single_active_delegation(self) -> tuple[str, str] | None:
+        try:
+            active = getattr(self, "_active_delegations", {}) or {}
+            if len(active) != 1:
+                return None
+            delegation = next(iter(active.values()))
+            delegation_id = delegation.get("id")
+            delegation_name = delegation.get("name")
+            if isinstance(delegation_id, str) and isinstance(delegation_name, str):
+                return (delegation_id, delegation_name)
+            return None
+        except Exception:
+            return None
+
+    async def _capture_delegation_final_summary(self, agent_name: str | None, summary: str) -> None:
+        try:
+            delegation = getattr(self, "_active_delegations", {}).get(agent_name)
+            if delegation is not None and isinstance(summary, str) and summary.strip():
+                delegation["final_summary"] = summary.strip()
+        except Exception as e:
+            logger.debug(f"_capture_delegation_final_summary failed (non-fatal): {e}")
+
+    async def _open_delegation(self, agent_name: str, instruction: str, source_seq: int) -> None:
+        emitter = getattr(self, "_response_emitter", None)
+        if emitter is None or not hasattr(emitter, "emit_subagent_status") or agent_name == "Supervisor":
+            return
+        try:
+            existing = self._active_delegations.get(agent_name)
+            if existing is not None and existing.get("source_seq") == source_seq:
+                return
+            if existing is not None:
+                await self._close_delegation(agent_name)
+            self._delegation_seq += 1
+            delegation_id = f"{agent_name.lower()}:{self._delegation_seq}"
+            icon = self._delegation_icon(agent_name)
+            self._active_delegations[agent_name] = {
+                "id": delegation_id,
+                "name": agent_name,
+                "title": instruction,
+                "tool_count": 0,
+                "icon": icon,
+                "source_seq": source_seq,
+                "last_text": "",
+                "final_summary": "",
+            }
+            await self._emit_subagent_status(
+                title=instruction,
+                delegation_id=delegation_id,
+                delegation_name=agent_name,
+                status="running",
+                tool_count=0,
+                icon=icon,
+                content="",
+            )
+        except Exception as e:
+            logger.debug(f"_open_delegation failed (non-fatal): {e}")
+
+    async def _bump_delegation_progress(self, agent_name: str) -> None:
+        try:
+            delegation = self._active_delegations.get(agent_name)
+            if delegation is None:
+                return
+            tool_count = int(delegation.get("tool_count", 0)) + 1
+            delegation["tool_count"] = tool_count
+            await self._emit_subagent_status(
+                title=str(delegation.get("title", "")),
+                delegation_id=str(delegation.get("id", "")),
+                delegation_name=str(delegation.get("name", agent_name)),
+                status="running",
+                tool_count=tool_count,
+                icon=str(delegation.get("icon", "")),
+                content="",
+            )
+        except Exception as e:
+            logger.debug(f"_bump_delegation_progress failed (non-fatal): {e}")
+
+    async def _close_delegation(self, agent_name: str, content: str = "", status: str = "finished") -> None:
+        try:
+            delegation = self._active_delegations.pop(agent_name, None)
+            if delegation is None:
+                return
+            if not content:
+                content = str(delegation.get("final_summary") or delegation.get("last_text") or "")
+            await self._emit_subagent_status(
+                title=str(delegation.get("title", "")),
+                delegation_id=str(delegation.get("id", "")),
+                delegation_name=str(delegation.get("name", agent_name)),
+                status=status,
+                tool_count=int(delegation.get("tool_count", 0)),
+                icon=str(delegation.get("icon", "")),
+                content=content,
+                complete=True,
+            )
+        except Exception as e:
+            logger.debug(f"_close_delegation failed (non-fatal): {e}")
+
     async def _stream_message_to_mythic(self, formatted_message: str) -> bool:
         """
         Stream a formatted message chunk to the Mythic task.
@@ -1512,33 +1948,21 @@ class Model:
         """
         try:
             if self.verbose:
-                import time as _t
-                # Verbose timestamps: a logger copy for the Sage stdout/tmux pane (logger adds its own
-                # timestamp), and an explicit HH:MM:SS clock on the message sent back to Mythic. Lets the
-                # operator see the gap between each Sage message (e.g. to localize per-turn latency).
-                #
-                # A single AIMessage is formatted as ONE blob that can carry several display lines
-                # (e.g. "🤖[Agent]> reasoning\n🛠️[Agent:call_x]> Tool Request: ...") streamed in one send.
-                # Stamping only the front would leave every line after the first (the 🛠️ tool-request
-                # lines) un-timestamped. So stamp the first non-empty line AND any later line that begins
-                # with a Sage display marker, while leaving content-continuation lines (wrapped text,
-                # multi-line tool output) untouched.
+                # Verbose copy for the Sage stdout/tmux pane (the logger adds its own timestamp for the
+                # pane). The message streamed to Mythic is NOT stamped: Mythic's chat UI renders its own
+                # native timestamp, so Sage must not prepend its own [HH:MM:SS] to the outbound content.
                 logger.info(f"📤 {formatted_message.rstrip()}")
-                _ts = _t.strftime('%H:%M:%S')
-                _markers = ("🤖", "🛠️", "🔧", "📋", "👤", "🛑", "📊")
-                _stamped_lines = []
-                _first_done = False
-                for _ln in formatted_message.split("\n"):
-                    if not _ln.strip():
-                        _stamped_lines.append(_ln)
-                    elif not _first_done:
-                        _stamped_lines.append(f"[{_ts}] {_ln}")
-                        _first_done = True
-                    elif _ln.startswith(_markers):
-                        _stamped_lines.append(f"[{_ts}] {_ln}")
-                    else:
-                        _stamped_lines.append(_ln)
-                formatted_message = "\n".join(_stamped_lines)
+            # Native-chat seam (Section 7): when a response_emitter is injected (sage_chat path), route
+            # this — the ONLY egress — to the chat_response queue instead of the PayloadType task RPC.
+            # Same empty-guard so a blank block never streams (mirrors the "actual bytes" RPC guard).
+            if self._response_emitter is not None:
+                if not formatted_message:
+                    return False
+                try:
+                    return await self._response_emitter(formatted_message)
+                except Exception as e:
+                    logger.error(f"Exception streaming to chat emitter: {e}")
+                    return False
             encoded = formatted_message.encode()
             if not encoded:
                 logger.warning(f"⚠️  Skipping empty response to Mythic task {self.task_id} (would cause 'Response must have actual bytes' error)")
@@ -1595,8 +2019,18 @@ class Model:
                         formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(f"\n\n{formatted}")
+                    elif str(msg.content).strip() and not (getattr(msg, "tool_calls", None) or []):
+                        # Supervisor DIRECT answer: plain text, no tool call, not routed through
+                        # respond_to_user. This happens when the Supervisor handles a trivial prompt inline
+                        # instead of delegating — previously suppressed here (and in on_llm_end), so the
+                        # operator saw nothing. Surface it as the turn's response. Routing/handoff/
+                        # respond_to_user messages (all carry tool_calls or the _is_final_report tag) are
+                        # unaffected, so the delegation path does not double-stream.
+                        formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
+                        if formatted:
+                            await self._stream_message_to_mythic(formatted)
                     else:
-                        logger.debug(f"📨 [Stream] Suppressing Supervisor respond_to_user message from user output")
+                        logger.debug(f"📨 [Stream] Suppressing Supervisor routing/respond_to_user message from user output")
 
     async def _extract_new_messages_from_event(self, state_update: dict) -> list[BaseMessage]:
         """
@@ -1660,16 +2094,19 @@ class Model:
             delegated_to = message.additional_kwargs.get("_delegated_to")
 
             if delegated_to:
+                if getattr(self, "channel_id", None) is not None:
+                    return ""  # chat path: the sub-agent card replaces this delegation line
                 # Show agent handoffs: "📋[Task → Mythic_Operator]> Query active callbacks"
                 return f"📋[Task → {delegated_to}]> {content}\n"
             else:
-                # User prompts: Show for non-interactive tasks, skip for interactive tasks
-                # - Non-interactive (first turn): Mythic doesn't echo the prompt, so we show it
-                # - Interactive (subsequent turns): Mythic echoes it, so we skip to avoid duplication
-                if self.is_interactive:
-                    return ""  # Skip - Mythic already shows it
-                else:
-                    return f"👤> {content}\n"  # Show it
+                # User prompts:
+                # - Chat container (first-class): Mythic ALWAYS renders the operator's own message in the
+                #   channel, so we must never echo it back. channel_id is set only on the chat path.
+                # - Interactive PayloadType task (subsequent turns): Mythic echoes it → skip to avoid dupes.
+                # - Non-interactive PayloadType task (first turn): Mythic doesn't echo → show it.
+                if getattr(self, "channel_id", None) is not None or self.is_interactive:
+                    return ""  # Mythic already shows the operator's message
+                return f"👤> {content}\n"  # PayloadType first turn only
 
         elif isinstance(message, AIMessage):
             # Handle AIMessages with content and/or tool calls
@@ -1690,10 +2127,16 @@ class Model:
 
             # Show text content with agent name in brackets (matches existing format)
             if text_content:
-                output += f"🤖[{msg_agent_name}]> {text_content}\n"
+                if getattr(self, "channel_id", None) is not None:
+                    output += f"{text_content}\n"
+                else:
+                    output += f"🤖[{msg_agent_name}]> {text_content}\n"
 
-            # Show tool calls with agent name and tool ID in brackets (only in verbose mode)
-            if self.verbose and hasattr(message, "tool_calls") and message.tool_calls:
+            # Show tool calls as text (verbose PayloadType task path only). On the chat path the
+            # collapsible tool-use card renders each request+response, so suppress the redundant
+            # `🛠️ Tool Request` text here — otherwise the operator sees the card AND duplicate text.
+            _chat_path = getattr(self, "channel_id", None) is not None
+            if self.verbose and not _chat_path and hasattr(message, "tool_calls") and message.tool_calls:
                 for tc in message.tool_calls:
                     tool_name = tc.get("name", "unknown")
                     tool_args = tc.get("args", {})
@@ -1703,7 +2146,10 @@ class Model:
             return output
 
         elif isinstance(message, ToolMessage):
-            # Show tool execution results (only in verbose mode)
+            # Tool results: the chat path renders these inside the tool-use card's Details (result_preview),
+            # so suppress the redundant `🔧 Tool Response` text there. Task path keeps the verbose line.
+            if getattr(self, "channel_id", None) is not None:
+                return ""
             if not self.verbose:
                 return ""
             tool_id = message.tool_call_id or "unknown"
@@ -1728,9 +2174,22 @@ class Model:
         # Initialize tool cache
         await self.tool_cache.initialize()
 
-        self.mythic_client = MythicTools(agent_task_id=self.agent_task_id)
+        self.mythic_client = MythicTools(
+            agent_task_id=self.agent_task_id,
+            operation_id=self.operation_id,
+            channel_id=self.channel_id,
+            apitoken_id=self.apitoken_id,
+        )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
         await self.mythic_client.login()
+        # Scope preflight (Section 8A P1): learn the bot token's granted scopes and disable guarded tools
+        # it can't use BEFORE the graph attaches them (get_tools skips disabled ones). No-op on the task
+        # path and whenever scopes are unknown (whoami_scopes returns None). Never blocks initialize().
+        try:
+            granted = await self.mythic_client.whoami_scopes()
+            self.mythic_client.apply_scope_gating(granted)
+        except Exception as e:
+            logger.debug(f"Scope preflight skipped during initialization: {e}")
         try:
             await self.mythic_client._ensure_engagement_key()
         except Exception as e:
@@ -1936,14 +2395,45 @@ class Model:
                     cleaned_channel.append(msg)
             channel = cleaned_channel
 
+            try:
+                if node_name == "Supervisor":
+                    for active_agent in list(self._active_delegations):
+                        await self._close_delegation(active_agent)
+                elif (
+                    state_key != "supervisor_messages"
+                    and self._response_emitter is not None
+                    and hasattr(self._response_emitter, "emit_subagent_status")
+                ):
+                    delegated_message = next(
+                        (
+                            msg
+                            for msg in reversed(channel)
+                            if isinstance(msg, HumanMessage)
+                            and msg.additional_kwargs.get("_delegated_to") == node_name
+                        ),
+                        None,
+                    )
+                    if delegated_message is not None:
+                        instruction = _message_content_as_text(delegated_message.content).strip()
+                        source_seq = _get_seq(delegated_message)
+                        await self._open_delegation(node_name, instruction, source_seq)
+            except Exception as e:
+                logger.debug(f"delegation lifecycle entry failed (non-fatal): {e}")
+
             # Create callback handler to capture ALL messages during agent execution
             # This captures the first AIMessage (with tool_calls) that LangChain's react agent
             # would otherwise "consume" during its internal tool execution loop
             # Pass streaming functions so messages are streamed immediately as they're captured
+            delegation_id = self.current_delegation_id(node_name)
             callback_handler = MessageCaptureCallback(
                 agent_name=node_name,
                 stream_func=self._stream_message_to_mythic,
-                format_func=self._format_message_for_streaming
+                format_func=self._format_message_for_streaming,
+                tool_use_func=self._emit_tool_use_card,
+                agent_text_func=self._emit_agent_text,
+                handback_summary_func=self._capture_delegation_final_summary,
+                delegation_id=delegation_id,
+                delegation_name=node_name if delegation_id is not None else None,
             )
 
             # Merge callback into config - handle both list and CallbackManager types
@@ -2110,6 +2600,18 @@ class Model:
                     new_messages_from_agent.append(msg)
                     logger.debug(f"➕ [{node_name}] Added non-captured message: {type(msg).__name__}")
 
+            # A guard middleware (e.g. BloodHound-not-connected) can short-circuit BEFORE the model runs:
+            # nothing is captured and create_agent does not return its before_model-injected message, so the
+            # node would otherwise produce 0 messages and the Supervisor would re-delegate forever. If a node
+            # stashed a pending guard message and produced nothing, surface it here as the node's result so it
+            # gets seq-tagged and copied to the Supervisor channel below — breaking the loop.
+            _guard_msg = getattr(self, "_pending_guard_message", None)
+            if _guard_msg is not None:
+                self._pending_guard_message = None
+                if not new_messages_from_agent:
+                    new_messages_from_agent = [_guard_msg]
+                    logger.info(f"🩸 [{node_name}] surfaced pending guard message (agent produced no messages)")
+
             # Tag new messages with sequence numbers for chronological ordering
             # Compute from max of existing messages to avoid collisions with handoff-created messages
             max_seq = 0
@@ -2150,11 +2652,12 @@ class Model:
             if _mythic_operator and _bounded_one_action_request:
                 terminal_payload = _terminal_execute_capability_payload(new_messages_from_agent)
                 if terminal_payload is not None:
+                    terminal_report = _terminal_execute_capability_report(
+                        terminal_payload,
+                        bounded_one_action=True,
+                    )
                     final_msg = AIMessage(
-                        content=_terminal_execute_capability_report(
-                            terminal_payload,
-                            bounded_one_action=True,
-                        ),
+                        content=terminal_report,
                         name="Supervisor",
                         additional_kwargs={
                             "_is_final_report": True,
@@ -2179,6 +2682,7 @@ class Model:
                     logger.info(
                         f"✅ [{node_name}] bounded one-action execute_capability result is terminal; ending graph"
                     )
+                    await self._close_delegation(node_name, content=terminal_report, status="finished")
                     return Command(goto=END, update=terminal_update)
 
             # CRITICAL FIX: If this is a worker agent (not Supervisor), copy its response
@@ -2276,6 +2780,7 @@ class Model:
                             else:
                                 summary_text = "[summary synthesis unavailable — raw tool output preview]\n[no tool output captured]"
 
+                        await self._close_delegation(node_name, content=summary_text, status="finished")
                         summary_ai_msg = AIMessage(content=summary_text, name=node_name)
                         _tag_msg(summary_ai_msg, self._next_seq())
 
@@ -3310,11 +3815,14 @@ class Model:
             scope_note = f" scope={scope_domain}" if scope_domain else " scope=current-forest"
             reason_note = f" reason={collection_reason}" if collection_reason else ""
             fire(f"SharpHound {runner_command} on cb={cb_int}:{scope_note}{reason_note} {args}")
-            await self.mythic_client.issue_task_and_waitfor_task_output(
+            runner_output = await self.mythic_client.issue_task_and_waitfor_task_output(
                 runner_command,
                 {runner_tool_param: "SharpHound.exe", runner_args_param: args},
                 cb_int,
             )
+            if str(runner_output or "").startswith(_mt._REGISTERED_FILE_PREFLIGHT_PREFIX):
+                fire(f"SharpHound tool preflight failed: {runner_output}")
+                return outcome(False, "tool_preflight_failed", str(runner_output))
             # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
             # output dir, find the file carrying our token. Bounded retry for filesystem latency.
             real_path = ""
@@ -4409,6 +4917,25 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         interrupts = event.get("__interrupt__") if isinstance(event, dict) else None
         if not interrupts:
             return False
+        # Chat path (Option C): a native confirmation card replaces the text approve/deny prompt. sage_chat
+        # injects _hitl_card_emitter per turn; it emits an input_requested card with complete_request=False,
+        # releasing the channel while the graph waits on disk. _hitl_card_pending tells the chat handler a
+        # card already released the request, so it must NOT send a terminal completion.
+        if getattr(self, "_hitl_card_emitter", None) is not None:
+            action_requests = []
+            for itr in interrupts:
+                val = getattr(itr, "value", None)
+                if isinstance(val, dict):
+                    for ar in (val.get("action_requests") or []):
+                        if isinstance(ar, dict):
+                            action_requests.append(ar)
+            try:
+                await self._hitl_card_emitter(action_requests)
+                self._hitl_card_pending = True
+            except Exception as e:
+                logger.warning(f"HITL: failed to emit confirmation card ({e})")
+            logger.info(f"HITL interrupt surfaced as native card ({len(action_requests)} action(s))")
+            return True
         lines = []
         for itr in interrupts:
             val = getattr(itr, "value", None)
@@ -4477,7 +5004,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if not self.graph:
             raise ValueError("No graph defined for the model. Ensure the model's initialize() method has been called.")
 
-        thread_id = f"{self.agent_task_id}-{self.task_id}"
+        thread_id = self._session_thread_id()
         if isinstance(getattr(self, "_controller_hitl_pending", None), dict):
             logger.info("HITL controller approval pending — routing operator reply to controller resume")
             return await self.handle_controller_hitl_resume(prompt)
@@ -4596,7 +5123,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             hitl_interrupted = False
             async for event in self.graph.astream(
                 self.state,
-                self._graph_run_config(f"{self.agent_task_id}-{self.task_id}")
+                self._graph_run_config(self._session_thread_id())
             ):
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
                 # Model; halt before driving the next super-step so the session can't run away.
@@ -4777,7 +5304,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # The current node (e.g., Mythic_Operator) was terminated mid-execution, so its messages
             # are NOT in self.state. We MUST restore from checkpoint to get partial progress.
 
-            thread_id = f"{self.agent_task_id}-{self.task_id}"
+            thread_id = self._session_thread_id()
             config = RunnableConfig(configurable={"thread_id": thread_id})
 
             # DEBUG: Log what's in self.state BEFORE checkpoint recovery
@@ -4994,7 +5521,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.error(f"Error during graph execution: {e}", exc_info=True)
 
             # Collect partial work from state/checkpoints
-            thread_id = f"{self.agent_task_id}-{self.task_id}"
+            thread_id = self._session_thread_id()
             config = RunnableConfig(configurable={"thread_id": thread_id})
 
             all_messages = []
@@ -5112,7 +5639,7 @@ The conversation history below shows all work completed before the error occurre
         if "recursion_handback" in self.state:
             self.state["recursion_handback"] = False
 
-        thread_id = f"{self.agent_task_id}-{self.task_id}"
+        thread_id = self._session_thread_id()
         config = RunnableConfig(configurable={"thread_id": thread_id})
 
         # Classify intent so natural-language stop/inhibit instructions ("don't run any tasks,

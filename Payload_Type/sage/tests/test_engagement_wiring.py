@@ -780,6 +780,27 @@ def test_operator_requested_collection_rejects_historical_ingest_before_new_laun
     assert "historical ZIP" in result["error"]
 
 
+def test_ingest_collection_no_download_reports_non_retryable_fresh_collection_path(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_latest_download(callback_display_id, name_contains):
+        return None
+
+    async def fake_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mt, "_latest_download_for_callback", fake_latest_download)
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+
+    result = json.loads(asyncio.run(mt.ingest_collection(callback_display_id=1)))
+
+    assert result["status"] == "no_collection_artifact"
+    assert result["retryable_by_reingest"] is False
+    assert "no existing collection artifact" in result["error"]
+    assert "Do not retry ingest_collection" in result["next_action"]
+    assert "run one fresh SharpHound/AzureHound collection" in result["next_action"]
+
+
 def test_operator_requested_collection_rejects_wrong_zip_after_new_launch(monkeypatch):
     mt = _make_tools()
     mt.begin_operator_turn(
@@ -5184,7 +5205,7 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
     mt._engagement_key = "test-op"
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         calls["registered_filename"] = filename
         calls["registered_contents"] = contents
         return "file-uuid-1"
@@ -5200,7 +5221,7 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
         }
         return "Uploaded forged PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5279,7 +5300,7 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     mt._engagement_key = "test-op"
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         return "ca-file-uuid"
 
     async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
@@ -5292,7 +5313,7 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
         }
         return "Uploaded CA PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5359,7 +5380,7 @@ def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issue
     mt._engagement_key = "test-op"
     mt._last_issued_task_display_id = 8999
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         return "file-uuid-1"
 
     async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
@@ -5368,7 +5389,7 @@ def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issue
             "selectable DISPLAY STRING, NOT a bare UUID."
         )
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5440,7 +5461,7 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
     mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result="S-1-5-21-111-222-333")
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         calls["registered_contents"] = contents
         return "file-uuid-1"
 
@@ -5448,7 +5469,7 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
         mt._last_issued_task_display_id = 9001
         return "Uploaded forged PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -6378,13 +6399,47 @@ def test_register_file_dedup_reuses_on_hash_match(monkeypatch):
         return {"agent_file_id": "existing-uuid", "filename_utf8": "SharpHound.exe"}
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
     called = {"register": 0}
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         return "new-uuid"
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
     uuid, reused = asyncio.run(mt._register_file_dedup("SharpHound.exe", b"abc"))
     assert reused is True and uuid == "existing-uuid"
     assert called["register"] == 0  # the identical-hash file is reused, NOT re-uploaded
+
+
+def test_register_file_prefers_v4_root_webhook(monkeypatch):
+    mt = _make_tools()
+    calls = []
+
+    async def fake_post(path, filename, content):
+        calls.append((path, filename, content))
+        return 200, json.dumps({"status": "success", "agent_file_id": "v4-uuid"})
+
+    monkeypatch.setattr(mt, "_post_registered_file_webhook", fake_post)
+
+    uuid = asyncio.run(mt._register_file("SharpHound.exe", b"abc"))
+
+    assert uuid == "v4-uuid"
+    assert calls == [("/task_upload_file_webhook", "SharpHound.exe", b"abc")]
+
+
+def test_register_file_falls_back_to_legacy_webhook_only_when_v4_route_missing(monkeypatch):
+    mt = _make_tools()
+    calls = []
+
+    async def fake_post(path, filename, content):
+        calls.append(path)
+        if path == "/task_upload_file_webhook":
+            return 404, "404 page not found"
+        return 200, json.dumps({"status": "success", "agent_file_id": "legacy-uuid"})
+
+    monkeypatch.setattr(mt, "_post_registered_file_webhook", fake_post)
+
+    uuid = asyncio.run(mt._register_file("SharpHound.exe", b"abc"))
+
+    assert uuid == "legacy-uuid"
+    assert calls == ["/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"]
 
 
 def test_register_file_dedup_uploads_on_hash_miss(monkeypatch):
@@ -6393,10 +6448,10 @@ def test_register_file_dedup_uploads_on_hash_miss(monkeypatch):
         return None
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
     called = {"register": 0}
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         return "new-uuid"
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
     uuid, reused = asyncio.run(mt._register_file_dedup("Changed.exe", b"xyz"))
     assert reused is False and uuid == "new-uuid"
     assert called["register"] == 1  # a changed/new-hash binary uploads normally
@@ -6410,13 +6465,13 @@ def test_register_file_dedup_uploads_when_hash_match_has_different_filename(monk
 
     called = {"register": 0}
 
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         assert filename == "Rubeus.exe"
         return "rubeus-uuid"
 
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
 
     uuid, reused = asyncio.run(mt._register_file_dedup("Rubeus.exe", b"same-bytes"))
 
@@ -6620,6 +6675,36 @@ def test_issue_path_registers_schema_selected_file_before_resolver(monkeypatch):
     assert invalidated == [("custom-runner", 2)]
     assert "sharphound.exe" in mt._registered_file_checks
     assert calls["issued"][0]["parameters"] == {"tool": "SharpHound.exe"}
+
+
+def test_issue_path_blocks_when_registered_file_upload_fails(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_schema(command, callback_display_id):
+        return _registered_file_schema([])
+
+    async def fake_ensure(name):
+        return json.dumps({
+            "status": "error",
+            "binary_filename": name,
+            "error": "Mythic file upload /task_upload_file_webhook returned HTTP 404",
+        })
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
+    monkeypatch.setattr(mt, "ensure_tool_uploaded", fake_ensure)
+
+    calls = {"issue": 0}
+    with _split_issue("should not run", calls):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "custom-runner",
+            {"tool": "SharpHound.exe"},
+            2,
+        ))
+
+    assert result.startswith(mythic_tools._REGISTERED_FILE_PREFLIGHT_PREFIX)
+    assert "SharpHound.exe" in result
+    assert "Do not retry" in result
+    assert calls["issue"] == 0
 
 
 def test_registered_file_preflight_skips_when_schema_already_has_choice(monkeypatch):

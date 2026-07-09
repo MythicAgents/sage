@@ -84,6 +84,30 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
   high-risk edit is blocked, prepare the gate brief, get explicit user approval, then open a short-lived
   scoped token with `python3 skills/sage-architecture-governor/scripts/open_gate.py open ...`.
 
+## Mythic Chat Container — Output Rendering
+
+Sage now runs as a **native Mythic v4 chat container** (`Payload_Type/sage/sage_chat/`), and the Mythic
+chat UI renders operator-facing output richly. Leverage this; don't fight it.
+
+- **Markdown is rendered.** Tables, fenced code blocks, bold/inline code, and lists all display. Prefer
+  **tables for enumerations** (callbacks, credentials, hosts, domains, users) and **fenced code blocks**
+  for commands, payloads, and raw output. Slash commands already do this (`/state`, `/list`, `/mcp tools`).
+- **Do NOT add self-timestamps.** Mythic renders a native per-message timestamp. Sage no longer stamps
+  `[HH:MM:SS]` on outbound messages (removed from `Model._stream_message_to_mythic`); don't reintroduce it.
+- **Tool calls render as collapsible cards, not text.** Emitting a `ChatResponse` with
+  `metadata.special_type="tool_use"` + a `tool_use` snapshot (`status` started/completed/error,
+  `tool_name`, `tool_source` mythic|mcp, `tool_call_id`, `arguments`, `result_preview`) makes the React UI
+  (`ChatToolUseEvent`) draw a "Running/Finished/Failed" card with a collapsible Details pane. Started and
+  finished emissions reuse one `response_key` (`tool_use:{id}:{name}`) so the card updates in place. The
+  card's `content` + `result_preview` are what show in Details — put the request (name+args) and the
+  response there. Wired in `MessageCaptureCallback.on_llm_end`/`on_tool_end` → `Model._emit_tool_use_card`
+  → `ChatStreamEmitter.emit_tool_use`. On the chat path the legacy verbose `🛠️`/`🔧` text is suppressed so
+  the card is the single representation; the PayloadType task path keeps the verbose text.
+- **LLMs already emit markdown by default**, and the Supervisor prompt already asks for a "well-formatted
+  markdown" final report — so a blanket "use markdown" prompt line is redundant. The only prompt nudge worth
+  adding is *structure*: tell the Supervisor's `respond_to_user` to use a table for enumerations and code
+  fences for commands/output (targeted, not generic).
+
 ## Lab Reset Tools
 
 Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
