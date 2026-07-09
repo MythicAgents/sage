@@ -156,7 +156,7 @@ tools:
             - Clearly specify the task, context, and expected output.
             - Use structured communication to ensure clarity and avoid misunderstandings.
             - Handle any errors or unexpected behavior by reassigning tasks or consulting other agents.
-            - When using any transfer_to_* tool, ALWAYS supply a concise handoff_instruction telling the target agent exactly what to do next (no pronouns, be explicit).
+            - When using any transfer_to_* tool, ALWAYS supply both: a short `handoff_title` for the operator-facing sub-agent card (3-8 words, not the full sentence) and a complete `handoff_instruction` telling the target agent exactly what to do next (no pronouns, be explicit).
             - **CRITICAL**: When user says "continue" after a handback, construct your handoff_instruction by combining:
               1. The original task goal
               2. What the agent already completed (from the handback summary)

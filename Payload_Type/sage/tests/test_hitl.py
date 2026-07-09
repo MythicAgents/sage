@@ -228,6 +228,35 @@ def test_controller_hitl_collection_pauses_with_scope_and_reason():
     assert "merlin" in sent[0]
 
 
+def test_controller_hitl_uses_native_input_card_when_chat_emitter_is_bound():
+    m = _controller_hitl_model()
+    emitted = []
+    streamed = []
+
+    async def _emit(action_requests):
+        emitted.append(action_requests)
+
+    async def _stream(msg):
+        streamed.append(msg)
+        return True
+
+    m._hitl_card_emitter = _emit
+    m._hitl_card_pending = False
+    m._stream_message_to_mythic = _stream
+    pending = _capability_pending(m)
+
+    with pytest.raises(_ControllerHitlPause):
+        _run(m._require_controller_hitl_approval(pending))
+
+    assert emitted == [[{
+        "name": "execute_capability",
+        "display_name": "gpo-controlled-system-exec",
+        "args": pending["args"],
+    }]]
+    assert m._hitl_card_pending is True
+    assert streamed == []
+
+
 def test_controller_hitl_approve_resumes_exact_pending_move():
     m = _controller_hitl_model()
     pending = _capability_pending(m)
@@ -298,7 +327,7 @@ def test_controller_hitl_default_deny_executes_nothing_and_halts():
     assert ran["controller"] is False
     assert m._controller_hitl_pending is None
     assert m._controller_hitl_approved_key == ""
-    assert "Operator denied `execute_capability`" in sent[0]
+    assert "Operator denied `gpo-controlled-system-exec`" in sent[0]
 
 
 def test_controller_hitl_stale_approval_never_authorizes_different_action():

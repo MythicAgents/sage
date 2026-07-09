@@ -1,5 +1,6 @@
 ---
 name: MCP_Manager
+color: "#F59E0B"   # sub-agent card color (CSS text: #RRGGBB or named).
 description: General-purpose manager for ARBITRARY third-party MCP servers a user has connected to Sage (web fetching, external APIs, custom integrations). BloodHound has its own dedicated agent and is NOT handled here.
 # NOTE: MCP server tools are discovered at runtime and cannot be enumerated here; whichever non-BloodHound
 # MCP servers are connected provide this agent's tools. The 'tools' list governs only Sage's static tools.

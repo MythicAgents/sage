@@ -96,6 +96,9 @@ class SageChat(Chat):
 
         kwargs = build_model_kwargs(request)
         model = Model(**kwargs)
+        # Native chat is a real interactive approval transport. Set this before graph construction so any
+        # runtime checks see the same command identity as the legacy `chat` task path.
+        model.command_name = "chat"
         model._thread_id_override = channel_session_key(request)
         # Auto-connect the BloodHound MCP BEFORE the graph is built — Model.initialize() wires the
         # BloodHound agent's tools from the currently-connected MCP servers, so a later connect wouldn't
@@ -124,6 +127,9 @@ class SageChat(Chat):
 
             model, preexisted = await self._get_or_create_model(request)
             thread_id = channel_session_key(request)
+            # Reassert on reused sessions too; older in-memory sessions created before this field was wired
+            # should gain controller-native HITL without requiring a process restart.
+            model.command_name = "chat"
             # Re-bind per-turn: the stream + card emitters are scoped to THIS request; the thread key is the
             # stable channel id. Never cache emitters across turns (Section 7 / Cody c). _hitl_card_pending
             # is reset each turn; the interrupt surface sets it True when it emits a channel-release card,
@@ -137,7 +143,12 @@ class SageChat(Chat):
             model._hitl_card_pending = False
             model._thread_id_override = thread_id
             try:
-                if await model._hitl_interrupt_pending(thread_id):
+                if isinstance(getattr(model, "_controller_hitl_pending", None), dict):
+                    # Controller-native HITL is not a LangGraph checkpoint interrupt, so it has its own pending
+                    # marker and resume seam. Native input cards still map accept -> approve, everything else
+                    # -> deny, preserving the same default-deny policy.
+                    await model.handle_controller_hitl_resume(resume_decision_for_request(request))
+                elif await model._hitl_interrupt_pending(thread_id):
                     # A prior turn raised a confirmation card and finished; this request is the operator's
                     # answer. Resume the paused graph in place (Section 6): Confirm → approve, anything
                     # else → default-deny (reject). Reuses the existing resume core unchanged.

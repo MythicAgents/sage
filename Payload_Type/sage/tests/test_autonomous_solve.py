@@ -337,6 +337,7 @@ def test_autonomous_handoff_redirects_verified_collection_regression_to_bloodhou
     assert redirect is not None
     target, instruction = redirect
     assert target == "BloodHound"
+    assert redirect.title == "Analyze verified graph"
     assert "already shows `graph_verified=true`" in instruction
     assert "Analyze the verified BloodHound graph" in instruction
 
@@ -925,6 +926,73 @@ def test_handoff_tool_uses_autonomous_redirect_target_channel():
     assert "autonomous_executor_messages" in command.update
     assert "bloodhound_messages" not in command.update
     assert command.update["autonomous_executor_messages"][1].content == "compiled deterministic capability instruction"
+
+
+def test_handoff_tool_keeps_short_title_separate_from_full_instruction():
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(agent_name="Mythic_Operator")
+    runtime = SimpleNamespace(
+        state={
+            "messages": [],
+            "supervisor_messages": [],
+            "mythic_operator_messages": [],
+            "generalist_messages": [],
+            "mythic_payload_messages": [],
+            "mcp_manager_messages": [],
+            "bloodhound_messages": [],
+        },
+        tool_call_id="handoff-title",
+    )
+
+    command = tool.func(
+        runtime,
+        "List all active Mythic callbacks and report each host, user, and integrity level.",
+        "List active callbacks",
+    )
+
+    delegated = command.update["mythic_operator_messages"][1]
+    assert delegated.content == "List all active Mythic callbacks and report each host, user, and integrity level."
+    assert delegated.additional_kwargs["_handoff_title"] == "List active callbacks"
+
+
+def test_handoff_tool_schema_exposes_title_and_instruction_in_one_call():
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(agent_name="BloodHound")
+
+    assert set(tool.args) >= {"handoff_title", "handoff_instruction"}
+    assert "short operator-facing title" in tool.args["handoff_title"]["description"]
+    assert "complete, self-contained instruction" in tool.args["handoff_instruction"]["description"]
+
+
+def test_handoff_redirect_replaces_stale_caller_title():
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(
+        agent_name="BloodHound",
+        autonomous_redirect=lambda agent, instruction, state: mod._handoff_directive(
+            "Autonomous_Executor",
+            "AUTONOMOUS STEP DRIVER: execute the selected capability.",
+            "Execute selected capability",
+        ),
+    )
+    runtime = SimpleNamespace(
+        state={
+            "messages": [],
+            "supervisor_messages": [],
+            "mythic_operator_messages": [],
+            "generalist_messages": [],
+            "mythic_payload_messages": [],
+            "mcp_manager_messages": [],
+            "bloodhound_messages": [],
+            "autonomous_executor_messages": [],
+        },
+        tool_call_id="handoff-redirect-title",
+    )
+
+    command = tool.func(runtime, "Analyze the graph.", "Analyze BloodHound graph")
+
+    delegated = command.update["autonomous_executor_messages"][1]
+    assert delegated.content == "AUTONOMOUS STEP DRIVER: execute the selected capability."
+    assert delegated.additional_kwargs["_handoff_title"] == "Execute selected capability"
 
 
 def test_handoff_tool_terminal_redirect_sets_recursion_handback():

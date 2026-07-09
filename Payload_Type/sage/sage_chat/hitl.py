@@ -54,6 +54,17 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
     first = action_requests[0] if action_requests else {}
     tool_name = str(first.get("name") or "guarded_tool")
     arguments = first.get("args") if isinstance(first.get("args"), dict) else {}
+    display_name = str(first.get("display_name") or "").strip()
+    if not display_name and tool_name == "execute_capability":
+        for key in ("action", "capability"):
+            candidate = arguments.get(key)
+            if isinstance(candidate, dict):
+                display_name = str(candidate.get("name") or candidate.get("capability") or "").strip()
+            elif isinstance(candidate, str):
+                display_name = candidate.strip()
+            if display_name:
+                break
+    display_name = display_name or tool_name
     count = len(action_requests)
     extra = count - 1
     suffix = f"  (+{extra} more guarded action{'s' if extra != 1 else ''} queued behind it)" if extra > 0 else ""
@@ -80,14 +91,15 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
         args_block = "  • (no arguments)"
 
     return {
-        "title": f"Approve: {tool_name}",
+        "title": f"Approve: {display_name}",
         "prompt": (
-            f"Sage wants to run the guarded action {tool_name}{target}.{suffix}\n"
+            f"Sage wants to run the guarded action {display_name}{target}.{suffix}\n"
             "Accept to execute · Reject to skip (Sage replans without it)."
         ),
         "description": f"Arguments\n{args_block}",
         "data": {
             "tool_name": tool_name,
+            "display_name": display_name,
             "arguments": arguments,
             "guarded_action_count": count,
         },

@@ -38,8 +38,8 @@ def _handle_mode(model: Any, arg: str) -> str:
         return f"No active session yet — send a message first, then `/mode {choice}`."
     model.mode = choice
     return (
-        f"Mode set to **{choice}** for this channel. Note: the guarded-tool interrupt is wired at graph "
-        "build, so a supervised↔auto switch fully applies on the next fresh session."
+        f"Mode set to **{choice}** for this channel. Controller-owned objective turns use the new mode "
+        "immediately; the legacy graph guarded-tool middleware is rebuilt on the next fresh session."
     )
 
 

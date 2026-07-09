@@ -91,7 +91,7 @@ def test_observe_none_halts_cleanly_without_crash():
 
 
 def test_verbose_controller_streams_progress_before_terminal_report():
-    """Auto-mode controller progress must be visible in Mythic when verbose is enabled, not just in tmux logs."""
+    """Verbose controller progress is visible as Sage-owned execution updates, not a second agent persona."""
     calls = []
     blocked_string = json.dumps({"ok": False, "verdict": "blocked", "capability": "adcs-ca-private-key-export",
                                  "reason": "CA host enumeration failed"})
@@ -107,10 +107,12 @@ def test_verbose_controller_streams_progress_before_terminal_report():
     report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
 
     assert streamed[-1] == report
-    assert any("START (flagged)" in item for item in streamed[:-1]), streamed
-    assert any("execute adcs-ca-private-key-export" in item for item in streamed[:-1]), streamed
-    assert any("cycle 1:" in item for item in streamed[:-1]), streamed
-    assert all(item.startswith("📊[Autonomous_Controller]>") for item in streamed[:-1]), streamed
+    assert any("**Execution started**" in item for item in streamed[:-1]), streamed
+    assert any("**Selected action**" in item and "adcs-ca-private-key-export" in item for item in streamed[:-1]), streamed
+    assert any("**Executing action**" in item and "adcs-ca-private-key-export" in item for item in streamed[:-1]), streamed
+    assert any("**Verification**" in item for item in streamed[:-1]), streamed
+    assert all("Autonomous_Controller" not in item for item in streamed), streamed
+    assert "Autonomous controller" not in report
 
 
 def test_non_verbose_controller_only_streams_terminal_report():
@@ -130,6 +132,40 @@ def test_non_verbose_controller_only_streams_terminal_report():
     report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
 
     assert streamed == [report]
+    assert "Autonomous controller" not in report
+
+
+def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
+    """A denied controller-native approval is surfaced as Sage stopping, not as a second chat speaker."""
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m._controller_hitl_pending = {
+        "tool": "execute_capability",
+        "args": {},
+        "objective": "obtain administrative control of essos.local",
+        "key": "pending-key",
+    }
+    m._controller_hitl_objective = "obtain administrative control of essos.local"
+    m._supervised_objective_active = False
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    m._stream_message_to_mythic = _stream
+    m._write_hitl_audit = lambda *_args, **_kwargs: None
+
+    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    assert calls == []
+    assert streamed == [
+        "**Execution stopped**\n"
+        "Operator denied `execute_capability`. Sage stopped before execution.\n"
+    ]
+    assert "Autonomous_Controller" not in streamed[0]
 
 
 def test_supervised_chat_controller_pauses_before_execute_capability():
@@ -201,6 +237,92 @@ def test_gate_defaults_on_for_auto_and_supervised_chat_but_not_query_or_interact
             os.environ.pop("SAGE_CONTROLLER_HITL", None)
         else:
             os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
+
+
+def test_supervised_explicit_objective_turn_routes_to_controller_without_autonomous_toggle():
+    """A normal supervised chat objective should borrow the controller, while scoped prompts stay on graph."""
+    import os
+    saved_controller = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    saved_hitl = os.environ.get("SAGE_CONTROLLER_HITL")
+    os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+    os.environ.pop("SAGE_CONTROLLER_HITL", None)
+    try:
+        m = object.__new__(model.Model)
+        m.mode = "supervised"
+        m.command_name = "chat"
+        m._autonomous_solve = False
+
+        assert m._looks_like_explicit_objective_prompt("Compromise the CORP domain") is True
+        assert m._looks_like_explicit_objective_prompt(
+            "From the current foothold, achieve administrative control of child.lab.local."
+        ) is True
+        assert m._looks_like_explicit_objective_prompt("list callbacks") is False
+        assert m._looks_like_explicit_objective_prompt("How would you compromise the CORP domain?") is False
+        assert m._looks_like_explicit_objective_prompt("Obtain information about the CORP domain") is False
+
+        m._supervised_objective_active = m._supervised_objective_controller_enabled_for_prompt(
+            "Compromise the CORP domain"
+        )
+        assert m._controller_owned_solve() is True
+        # Native chat marks any reused channel turn as interactive; that must not block a fresh objective.
+        assert m._should_use_controller(is_interactive=True) is True
+
+        m._supervised_objective_active = m._supervised_objective_controller_enabled_for_prompt("list callbacks")
+        assert m._controller_owned_solve() is False
+        assert m._should_use_controller(is_interactive=False) is False
+    finally:
+        if saved_controller is None:
+            os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+        else:
+            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved_controller
+        if saved_hitl is None:
+            os.environ.pop("SAGE_CONTROLLER_HITL", None)
+        else:
+            os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
+
+
+def test_invoke_routes_reused_supervised_objective_turn_into_controller(monkeypatch):
+    """The invoke seam itself must activate the controller before it would enter LangGraph."""
+    monkeypatch.delenv("SAGE_AUTONOMOUS_CONTROLLER", raising=False)
+    monkeypatch.delenv("SAGE_CONTROLLER_HITL", raising=False)
+    m = object.__new__(model.Model)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = False
+    m._supervised_objective_active = False
+    m._controller_hitl_pending = None
+    m._thread_id_override = "channel-7"
+    m._running_tasks = set()
+    m._message_seq = 1
+    m.graph = object()
+    m.state = {"messages": [], "_message_seq": 1}
+    m.mythic_client = None
+    m.provider = "test"
+    m.model = "test"
+    seen = {}
+
+    async def _no_interrupt(_thread_id):
+        return False
+
+    async def _no_completion(**_kwargs):
+        return False
+
+    async def _run_controller(prompt):
+        seen["controller_prompt"] = prompt
+        seen["active"] = m._supervised_objective_active
+        return "controller"
+
+    m._hitl_interrupt_pending = _no_interrupt
+    m._maybe_stream_objective_completion_stop = _no_completion
+    m._seed_autonomous_objective = lambda prompt: seen.setdefault("seeded", prompt)
+    m._run_autonomous_controller = _run_controller
+
+    assert asyncio.run(m.invoke("Compromise the CORP domain", is_interactive=True)) == "controller"
+    assert seen == {
+        "seeded": "Compromise the CORP domain",
+        "controller_prompt": "Compromise the CORP domain",
+        "active": True,
+    }
 
 
 def test_observe_attaches_graph_facts():
@@ -418,9 +540,10 @@ def test_collect_verbose_streams_progress_to_parent_task():
     result = asyncio.run(_run())
 
     assert result["ok"] is True, result
-    assert any("collect: SharpHound execute_assembly" in item for item in streamed), streamed
-    assert any("collect: discovered collection artifact:" in item for item in streamed), streamed
-    assert any("collect: ingest status=ingested graph_verified=True" in item for item in streamed), streamed
+    assert any("**Collection started**" in item and "SharpHound collection" in item for item in streamed), streamed
+    assert any("**Collection artifact**" in item and "fresh collection artifact" in item for item in streamed), streamed
+    assert any("**Collection verified**" in item and "graph_verified=true" in item for item in streamed), streamed
+    assert all("Autonomous_Controller" not in item for item in streamed), streamed
 
 
 def test_collect_restores_domain_identity_before_sharphound_when_callback_is_host_local():

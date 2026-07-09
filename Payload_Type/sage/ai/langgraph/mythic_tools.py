@@ -1,4 +1,5 @@
 import os
+import inspect
 from dataclasses import asdict, is_dataclass
 try:
     from . import auth_context
@@ -1063,6 +1064,10 @@ class MythicTools:
         # task AND the callback that proved it.
         self._last_issued_task_display_id = None
         self._last_issued_callback_id = None
+        # Presentation-only observer for deterministic capability child commands. The capability executor
+        # remains the only execution boundary; this reports real callback tasks to the chat surface.
+        self._capability_command_observer = None
+        self._capability_command_trace_seq = 0
         self._engagement_hops: list = []
         self._engagement_objective_text: str = ""
         # Provenance of the cached ledger objective: "operator" (set via `state objective`), "autonomous_seed"
@@ -1190,6 +1195,50 @@ class MythicTools:
     def set_mechanic_repair_resolver(self, resolver) -> None:
         """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
         self._mechanic_repair_resolver = resolver if callable(resolver) else None
+
+    def set_capability_command_observer(self, observer) -> None:
+        """Install a fail-soft presentation observer for callback tasks issued inside a capability."""
+        self._capability_command_observer = observer if callable(observer) else None
+
+    def _next_capability_command_trace_id(self) -> str:
+        self._capability_command_trace_seq = int(getattr(self, "_capability_command_trace_seq", 0) or 0) + 1
+        return f"capability_command:{self._capability_command_trace_seq}"
+
+    async def _notify_capability_command_observer(
+        self,
+        *,
+        trace_id: str,
+        status: str,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        capability_name: str = "",
+        task_id=None,
+        result_preview: str | None = None,
+    ) -> None:
+        observer = getattr(self, "_capability_command_observer", None)
+        if observer is None:
+            return
+        event = {
+            "trace_id": trace_id,
+            "status": status,
+            "command": command_name,
+            "capability": self._capability_text(capability_name),
+            "callback_id": callback_id,
+            "parameters": self._capability_executor_safe_parameters(parameters),
+            "purpose": self._capability_text(command_obj.get("purpose")),
+        }
+        if task_id not in (None, ""):
+            event["task_id"] = task_id
+        if result_preview:
+            event["result_preview"] = result_preview
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"capability command observer failed (non-fatal): {exc}")
 
     def begin_operator_turn(self, prompt: str) -> None:
         """Reset per-turn operator intent and arm one fresh collection transaction when explicitly requested."""
@@ -5946,6 +5995,7 @@ class MythicTools:
                     command_obj,
                     int(callback_id),
                     timeout,
+                    capability_name=self._capability_text(getattr(action_obj, "name", "")),
                 )
                 all_issued.append(issued_item)
                 if (
@@ -6079,6 +6129,7 @@ class MythicTools:
                                 command_obj,
                                 int(callback_id),
                                 timeout,
+                                capability_name=self._capability_text(getattr(action_obj, "name", "")),
                             )
                             retry_item["retry_attempt"] = retry_attempt
                             retry_item["retry_reason"] = "final proof was not available yet"
@@ -7145,7 +7196,12 @@ class MythicTools:
                     "issued": issued,
                     "ran": ran,
                 }
-            item = await self._execute_capability_command(command_obj, callback_id, timeout)
+            item = await self._execute_capability_command(
+                command_obj,
+                callback_id,
+                timeout,
+                capability_name=self._capability_text(getattr(action, "name", "")),
+            )
             item["preflight"] = True
             issued.append(item)
             ran = True
@@ -7215,11 +7271,76 @@ class MythicTools:
                 }
         return {"status": "not_achieved", "issued": issued, "ran": ran}
 
+    async def _issue_capability_callback_command(
+        self,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        timeout: int | None,
+        capability_name: str = "",
+    ) -> tuple[str, object, str]:
+        """Issue one real callback task and report its presentation lifecycle without owning policy."""
+        trace_id = self._next_capability_command_trace_id()
+        await self._notify_capability_command_observer(
+            trace_id=trace_id,
+            status="started",
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+        )
+        try:
+            output = await self.issue_task_and_waitfor_task_output(
+                command_name,
+                parameters,
+                callback_id,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            await self._notify_capability_command_observer(
+                trace_id=trace_id,
+                status="error",
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+                result_preview=self._capability_executor_output_preview(str(exc)),
+            )
+            raise
+        return output, getattr(self, "_last_issued_task_display_id", None), trace_id
+
+    async def _complete_capability_command_trace(
+        self,
+        *,
+        trace_id: str,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        capability_name: str,
+        item: dict,
+    ) -> None:
+        await self._notify_capability_command_observer(
+            trace_id=trace_id,
+            status="error" if self._capability_executor_task_failed(item) else "completed",
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+            task_id=item.get("task_id"),
+            result_preview=self._capability_text(item.get("output_preview")),
+        )
+
     async def _execute_capability_command(
         self,
         command_obj: dict,
         callback_id: int,
         timeout: int | None,
+        capability_name: str = "",
     ) -> dict:
         original_command = self._capability_text(command_obj.get("command"))
         original_parameters = command_obj.get("parameters", "")
@@ -7259,6 +7380,7 @@ class MythicTools:
                 reason = self._capability_text(parameters.get("reason"))
             output = await self.wait_for_seconds(seconds or 300, reason=reason)
             task_id = None
+            trace_id = ""
         else:
             if self._capability_executor_allows_repeated_probe(command_obj):
                 try:
@@ -7268,13 +7390,14 @@ class MythicTools:
                     )
                 except Exception:
                     pass
-            output = await self.issue_task_and_waitfor_task_output(
+            output, task_id, trace_id = await self._issue_capability_callback_command(
+                command_obj,
                 command_name,
                 parameters,
                 callback_id,
-                timeout=timeout,
+                timeout,
+                capability_name,
             )
-            task_id = getattr(self, "_last_issued_task_display_id", None)
         item = self._capability_executor_command_item(
             command_obj,
             command_name,
@@ -7293,6 +7416,16 @@ class MythicTools:
             item["repair_attempt"] = 1
             item["repair_kind"] = "payload_mechanic_substitute"
             item["repair_reason"] = binding.get("reason") or "replaced missing payload mechanic from live command surface"
+        if trace_id:
+            await self._complete_capability_command_trace(
+                trace_id=trace_id,
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+                item=item,
+            )
         if command_name == "wait_for_seconds" or not self._capability_executor_task_failed(item):
             return item
 
@@ -7305,13 +7438,14 @@ class MythicTools:
         if repair is None:
             return item
         repaired_parameters, repair_kind = repair
-        retry_output = await self.issue_task_and_waitfor_task_output(
+        retry_output, retry_task_id, retry_trace_id = await self._issue_capability_callback_command(
+            command_obj,
             command_name,
             repaired_parameters,
             callback_id,
-            timeout=timeout,
+            timeout,
+            capability_name,
         )
-        retry_task_id = getattr(self, "_last_issued_task_display_id", None)
         retry_item = self._capability_executor_command_item(
             command_obj,
             command_name,
@@ -7330,6 +7464,15 @@ class MythicTools:
         if task_id is not None:
             retry_item["retry_of_task_id"] = task_id
         retry_item["repair_history"] = [self._capability_executor_public_issued([item])[0]]
+        await self._complete_capability_command_trace(
+            trace_id=retry_trace_id,
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=repaired_parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+            item=retry_item,
+        )
         return retry_item
 
     async def _prepare_capability_command_binding(self, command_obj: dict, callback_id: int) -> dict:
@@ -8621,6 +8764,7 @@ class MythicTools:
                 fallback_command,
                 callback_id,
                 timeout,
+                capability_name=self._capability_text(getattr(action, "name", "")),
             )
             fallback_item["fallback"] = "schannel-ldap"
             fallback_item["fallback_reason"] = "PKINIT returned an explicit certificate-auth compatibility error"

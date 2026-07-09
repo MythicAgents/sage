@@ -97,6 +97,13 @@ def test_preexisting_session_is_interactive():
     assert model.invoked_with[1] is True
 
 
+def test_native_chat_marks_model_command_name_chat():
+    model = _FakeModel()
+    chat = _DriverChat(model)
+    _run(chat.chat(build_chat_request("first turn", channel_id=5, request_id=10)))
+    assert model.command_name == "chat"
+
+
 # --------------------------------------------------------------------------------------
 # Cancel + error paths
 # --------------------------------------------------------------------------------------
@@ -197,6 +204,39 @@ def test_emit_subagent_status_produces_subagent_card():
     assert subagent["status"] == "running"
     assert subagent["tool_count"] == 0
     assert subagent["icon"] == "BH"
+
+
+def test_emit_subagent_status_forwards_icon_color():
+    """A provided icon_color reaches the subagent card metadata (fixes per-card random colors)."""
+    chat = HeadlessSageChat()
+    req = build_chat_request("x")
+    emitter = ChatStreamEmitter(chat, req)
+
+    assert _run(emitter.emit_subagent_status(
+        title="List all domains",
+        delegation_id="bloodhound:1",
+        delegation_name="BloodHound",
+        status="running",
+        tool_count=0,
+        icon="BH",
+        icon_color="#E5484D",
+    )) is True
+
+    subagent = chat.emissions[0]["metadata"]["subagent"]
+    assert subagent["icon_color"] == "#E5484D"
+
+
+def test_delegation_color_is_deterministic_and_frontmatter_driven():
+    """Model._delegation_color pins one stable color per agent; BloodHound resolves to red
+    from its prompt frontmatter, and an unknown agent yields '' (Mythic auto-derives)."""
+    from ai.langgraph.model import Model
+
+    assert Model._delegation_color("BloodHound") == "#E5484D"   # from prompts/bloodhound.md
+    assert Model._delegation_color("Mythic_Operator") == "#3B82F6"
+    # Same agent → same color every call (the whole point — no per-card drift).
+    assert Model._delegation_color("BloodHound") == Model._delegation_color("BloodHound")
+    # Unknown agent with no prompt file / no frontmatter color → empty (UI derives).
+    assert Model._delegation_color("Nonexistent_Agent") == ""
 
 
 def test_emit_agent_text_is_delegation_tagged_not_main_text():
@@ -385,6 +425,23 @@ def test_delegation_reentry_same_source_seq_keeps_one_card():
         "mythic_operator:2",
     ]
     assert model._active_delegations["Mythic_Operator"]["source_seq"] == 9
+
+
+def test_delegation_card_uses_short_title_but_retains_full_instruction():
+    from ai.langgraph.model import Model
+
+    emitter = _SubagentStatusRecorder()
+    model = Model.__new__(Model)
+    model._active_delegations = {}
+    model._delegation_seq = 0
+    model._response_emitter = emitter
+
+    instruction = "List all active Mythic callbacks and report each host, user, and integrity level."
+    _run(model._open_delegation("Mythic_Operator", instruction, 7, title="List active callbacks"))
+
+    assert emitter.calls[0]["title"] == "List active callbacks"
+    assert model._active_delegations["Mythic_Operator"]["title"] == "List active callbacks"
+    assert model._active_delegations["Mythic_Operator"]["instruction"] == instruction
 
 
 def test_delegation_safety_close_falls_back_to_last_text():
@@ -709,6 +766,20 @@ class _HitlDriverChat(HeadlessSageChat):
         return self._model, self._model._pending  # preexisted-ish; routing uses interrupt_pending anyway
 
 
+class _ControllerHitlModel(_HitlModel):
+    """Stub controller-owned approval that is pending outside LangGraph checkpoint state."""
+
+    def __init__(self):
+        super().__init__()
+        self._controller_hitl_pending = {"tool": "execute_capability", "args": {"target": "DC01"}}
+
+    async def handle_controller_hitl_resume(self, decision):
+        self.resumed_with = decision
+        self._controller_hitl_pending = None
+        await self._response_emitter(f"🤖> controller-resume:{decision}")
+        return ""
+
+
 def test_should_confirm_policy():
     assert should_confirm("execute_capability") is True
     assert should_confirm("list_callbacks") is False          # not guarded
@@ -720,8 +791,20 @@ def test_approval_request_shape():
     assert set(req) == {"title", "prompt", "description", "data"}
     assert "create_payload" in req["title"]
     assert req["data"]["tool_name"] == "create_payload"
+    assert req["data"]["display_name"] == "create_payload"
     assert req["data"]["arguments"] == {"os": "windows"}
     assert req["data"]["guarded_action_count"] == 1
+
+
+def test_approval_request_uses_capability_display_name_without_changing_guarded_tool():
+    req = build_approval_request([{
+        "name": "execute_capability",
+        "args": {"action": {"name": "forge-golden-ticket"}, "inputs": {"callback_id": "3"}},
+    }])
+    assert req["title"] == "Approve: forge-golden-ticket"
+    assert "forge-golden-ticket" in req["prompt"]
+    assert req["data"]["tool_name"] == "execute_capability"
+    assert req["data"]["display_name"] == "forge-golden-ticket"
 
 
 def test_approval_cards_use_unique_keys_and_optional_delegation_tags():
@@ -789,6 +872,17 @@ def test_hitl_reject_resumes_deny():
     reqR.InputResponse = ChatInputResponse(action="reject")
     _run(chat.chat(reqR))
     assert model.resumed_with == "deny"
+    assert len(chat.terminal_emissions) == 1
+
+
+def test_controller_hitl_card_response_resumes_controller_pending_move():
+    model = _ControllerHitlModel()
+    chat = _HitlDriverChat(model)
+    req = build_chat_request("", channel_id=5, request_id=3)
+    req.InputResponse = ChatInputResponse(action="accept")
+    _run(chat.chat(req))
+    assert model.resumed_with == "approve"
+    assert model._controller_hitl_pending is None
     assert len(chat.terminal_emissions) == 1
 
 
@@ -966,3 +1060,187 @@ def test_bedrock_aws_quad_resolves_from_config():
     assert configurable["aws_secret_access_key"] == "secret"
     assert configurable["aws_session_token"] == "token"
     assert configurable["region"] == "us-west-2"
+
+
+# --------------------------------------------------------------------------------------
+# Sub-agent card close: operator-stop badge + handback-summary echo into the drill-down
+# --------------------------------------------------------------------------------------
+
+class _RecEmitter:
+    """Minimal response_emitter double: callable (text egress) + the two card-emit coroutines."""
+
+    def __init__(self):
+        self.subagent_calls = []
+        self.agent_text_calls = []
+        self.tool_use_calls = []
+        self.text_sends = []
+
+    async def __call__(self, formatted_message):
+        self.text_sends.append(formatted_message)
+        return True
+
+    async def emit_subagent_status(self, **kw):
+        self.subagent_calls.append(kw)
+        return True
+
+    async def emit_agent_text(self, **kw):
+        self.agent_text_calls.append(kw)
+        return True
+
+    async def emit_tool_use(self, **kw):
+        self.tool_use_calls.append(kw)
+        return True
+
+
+def _bare_model_with(emitter, delegations):
+    """A Model with just the attributes the close-path touches (no heavy __init__)."""
+    from ai.langgraph.model import Model
+    m = Model.__new__(Model)
+    m._response_emitter = emitter
+    m._active_delegations = delegations
+    m.verbose = False
+    return m
+
+
+def test_close_all_delegations_marks_open_cards_stopped():
+    """Operator stop closes every still-open card with status 'stopped' (was: stuck 'running')."""
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "Mythic_Operator": {"id": "mythic_operator:1", "name": "Mythic_Operator", "title": "t",
+                            "tool_count": 3, "icon": "MO", "icon_color": "#3B82F6",
+                            "final_summary": "", "last_text": ""},
+    })
+
+    _run(m._close_all_delegations(status="stopped"))
+
+    assert m._active_delegations == {}                     # all closed, none left running
+    assert len(emitter.subagent_calls) == 1
+    call = emitter.subagent_calls[0]
+    assert call["status"] == "stopped"
+    assert call["complete"] is True
+    assert call["icon_color"] == "#3B82F6"                 # color still applied on the stopped card
+
+
+def test_close_delegation_echoes_handback_summary_to_drilldown():
+    """The captured handback summary lands in BOTH the card content and the Open drill-down."""
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "BloodHound": {"id": "bloodhound:1", "name": "BloodHound", "title": "t", "tool_count": 1,
+                       "icon": "BH", "icon_color": "#E5484D",
+                       "final_summary": "DONE — ingested job 228.", "last_text": "streamed reasoning"},
+    })
+
+    _run(m._close_delegation("BloodHound"))
+
+    assert emitter.subagent_calls[0]["content"] == "DONE — ingested job 228."   # card summary
+    assert len(emitter.agent_text_calls) == 1                                    # echoed to drill-down
+    assert emitter.agent_text_calls[0]["content"] == "DONE — ingested job 228."
+    assert emitter.agent_text_calls[0]["delegation_id"] == "bloodhound:1"
+
+
+def test_close_delegation_does_not_reecho_streamed_last_text():
+    """With no handback summary (only streamed last_text), nothing is re-echoed — last_text was
+    already streamed to the drill-down live, so re-emitting it would duplicate the block."""
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "Generalist": {"id": "generalist:1", "name": "Generalist", "title": "t", "tool_count": 0,
+                       "icon": "GN", "icon_color": "#10B981",
+                       "final_summary": "", "last_text": "already streamed"},
+    })
+
+    _run(m._close_delegation("Generalist"))
+
+    assert emitter.agent_text_calls == []                                        # no re-echo
+    assert emitter.subagent_calls[0]["content"] == "already streamed"            # still the card content
+
+
+def test_run_operator_stop_shielded_streams_notice_and_stops_cards():
+    """The shielded operator-stop cleanup streams the stop notice AND flips every open card to
+    'stopped' — the fix for a mid-run card left stuck on 'running' after the operator hits stop."""
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "BloodHound": {"id": "bloodhound:1", "name": "BloodHound", "title": "t", "tool_count": 1,
+                       "icon": "BH", "icon_color": "#E5484D", "final_summary": "", "last_text": ""},
+    })
+
+    _run(m._run_operator_stop_shielded("\n🛑> Session stopped by operator.\n"))
+
+    assert any("stopped by operator" in t for t in emitter.text_sends)   # notice reached egress
+    assert m._active_delegations == {}                                    # card closed
+    assert emitter.subagent_calls[-1]["status"] == "stopped"              # ...as stopped
+
+
+def test_execute_capability_tool_card_uses_semantic_capability_header():
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {})
+    m._classify_tool_source = lambda _tool_name: "mythic"
+
+    _run(m._emit_tool_use_card(
+        tool_call_id="call-capability",
+        tool_name="execute_capability",
+        status="started",
+        complete=False,
+        arguments={"action": {"name": "forge-golden-ticket"}, "inputs": {"callback_id": "3"}},
+    ))
+
+    assert len(emitter.tool_use_calls) == 1
+    call = emitter.tool_use_calls[0]
+    assert call["tool_name"] == "forge-golden-ticket"
+    assert "Request: execute_capability(" in call["content"]
+
+
+def test_capability_command_observer_surfaces_real_callback_command_name():
+    from ai.langgraph.mythic_tools import MythicTools
+
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {})
+    m._classify_tool_source = lambda _tool_name: "mythic"
+    mt = MythicTools(agent_task_id="test")
+    mt.set_capability_command_observer(m._emit_capability_command_card)
+
+    async def _binding(command_obj, _callback_id):
+        return {
+            "ok": True,
+            "command": command_obj["command"],
+            "parameters": command_obj["parameters"],
+        }
+
+    async def _issue(_command, _parameters, _callback_id, token_id=None, timeout=None):
+        mt._last_issued_task_display_id = 42
+        return "Ticket cache purged."
+
+    mt._prepare_capability_command_binding = _binding
+    mt.issue_task_and_waitfor_task_output = _issue
+
+    item = _run(mt._execute_capability_command(
+        {"command": "ticket_cache_purge", "parameters": "", "purpose": "clear stale tickets"},
+        3,
+        timeout=5,
+        capability_name="forge-golden-ticket",
+    ))
+
+    assert item["command"] == "ticket_cache_purge"
+    assert [call["status"] for call in emitter.tool_use_calls] == ["started", "completed"]
+    assert [call["tool_name"] for call in emitter.tool_use_calls] == ["ticket_cache_purge", "ticket_cache_purge"]
+    assert emitter.tool_use_calls[0]["tool_call_id"] == emitter.tool_use_calls[1]["tool_call_id"]
+    assert "forge-golden-ticket" in emitter.tool_use_calls[0]["arguments"]
+    assert emitter.tool_use_calls[1]["result_preview"] == "Ticket cache purged."
+
+
+def test_tool_result_is_error_ignores_nested_errors_in_a_listing():
+    """A data-listing result (e.g. get_task_history_for_callback) whose records include a historical
+    'error' status must NOT tag the call Failed — only the TOP-LEVEL shape signals tool failure."""
+    from ai.langgraph.model import _tool_result_is_error
+    import json as _json
+
+    listing = _json.dumps([
+        {"command_name": "whoami", "status": "success"},
+        {"command_name": "net_dclist", "status": "error"},    # a historical task, not this call
+        {"command_name": "ls", "status": "completed"},
+    ])
+    assert _tool_result_is_error(listing) is False                        # the reported false-positive
+    # Genuine failures are still detected:
+    assert _tool_result_is_error(_json.dumps({"status": "error", "error": "boom"})) is True
+    assert _tool_result_is_error("Error: something blew up") is True
+    # Top-level success payloads unaffected:
+    assert _tool_result_is_error(_json.dumps({"status": "success"})) is False

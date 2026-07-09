@@ -59,7 +59,10 @@ _CONFIG_OPTIONS = [
         Name="mode",
         DisplayName="Mode",
         Type=OptType.Choice,
-        Description="Supervised routes through the multi-agent supervisor; Autonomous runs the self-driving solver.",
+        Description=(
+            "Supervised keeps scoped questions on the multi-agent supervisor and runs explicit objectives "
+            "through the deterministic solver with approvals. Autonomous runs the same solver unattended."
+        ),
         Required=False,
         DefaultValue="supervised",
         Choices=[
@@ -72,8 +75,9 @@ _CONFIG_OPTIONS = [
         DisplayName="Autonomous Solve",
         Type=OptType.Boolean,
         Description=(
-            "Opt-in autonomous mode: drive an objective through multi-hop solving without per-step "
-            "operator confirmation. Off (default) = scoped, confirm-first. Equivalent to Mode=Autonomous."
+            "Force deterministic multi-hop solving for this session. In supervised mode, controller moves "
+            "still require approval; off leaves scoped prompts on the supervisor while explicit objectives "
+            "still use approved solving. Equivalent to Mode=Autonomous when mode is auto."
         ),
         Required=False,
         DefaultValue=False,

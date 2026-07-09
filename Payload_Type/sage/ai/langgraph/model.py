@@ -32,7 +32,7 @@ from typing_extensions import NotRequired
 from uuid import UUID
 from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
-from .prompt_loader import load_prompt, filter_tools_by_frontmatter
+from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
 from . import prompt_context
 from ai.mcp import MCPManager
 
@@ -102,8 +102,88 @@ class _ControllerCollectionRequest:
     support: str = ""
 
 
+@dataclass(frozen=True)
+class _HandoffDirective:
+    """One delegated task: where it goes, what the card says, and what the worker receives.
+
+    `__iter__` preserves the historical `(agent, instruction)` unpacking used by tests and older helpers while
+    giving runtime redirects a first-class place to own the visible title after rewriting a handoff.
+    """
+
+    agent_name: str
+    title: str
+    instruction: str
+
+    def __iter__(self):
+        yield self.agent_name
+        yield self.instruction
+
+
+_HANDOFF_TITLE_MAX_CHARS = 72
+
+
+def _normalize_handoff_title(title: Any, instruction: Any, agent_name: str = "") -> str:
+    """Return a short one-line card title, falling back deterministically when older calls omit one."""
+    raw_title = re.sub(r"\s+", " ", str(title or "").strip())
+    if not raw_title:
+        raw_instruction = re.sub(r"\s+", " ", _message_content_as_text(instruction).strip())
+        if raw_instruction:
+            raw_title = re.split(r"(?<=[.!?])\s+", raw_instruction, maxsplit=1)[0].rstrip(".!?")
+        else:
+            raw_title = f"Delegate to {agent_name}" if agent_name else "Delegated task"
+    if len(raw_title) > _HANDOFF_TITLE_MAX_CHARS:
+        raw_title = raw_title[: _HANDOFF_TITLE_MAX_CHARS - 3].rstrip() + "..."
+    return raw_title
+
+
+def _handoff_directive(agent_name: str, instruction: Any, title: Any = "") -> _HandoffDirective:
+    instruction_text = _message_content_as_text(instruction).strip()
+    return _HandoffDirective(
+        agent_name=str(agent_name or "").strip(),
+        title=_normalize_handoff_title(title, instruction_text, str(agent_name or "").strip()),
+        instruction=instruction_text,
+    )
+
+
+def _coerce_handoff_directive(
+    value: Any,
+    *,
+    fallback_agent_name: str,
+    fallback_instruction: str,
+    fallback_title: str = "",
+) -> _HandoffDirective:
+    """Accept new directives plus legacy tuple/dict redirect shapes during the transition."""
+    if isinstance(value, _HandoffDirective):
+        return _handoff_directive(value.agent_name, value.instruction, value.title)
+    if isinstance(value, dict):
+        return _handoff_directive(
+            value.get("agent_name") or value.get("agent") or fallback_agent_name,
+            value.get("instruction") or fallback_instruction,
+            value.get("title") or "",
+        )
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        return _handoff_directive(value[0], value[1], "")
+    return _handoff_directive(fallback_agent_name, fallback_instruction, fallback_title)
+
+
 def _is_scalar_tool_value(value: Any) -> bool:
     return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _capability_name_from_tool_arguments(arguments: Any) -> str:
+    """Extract a semantic capability name from controller or LangChain tool-call args."""
+    if not isinstance(arguments, dict):
+        return ""
+    for key in ("action", "capability"):
+        candidate = arguments.get(key)
+        if isinstance(candidate, dict):
+            name = candidate.get("name") or candidate.get("capability")
+        else:
+            name = candidate
+        text = str(name or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _stringify_toon_cell(value: Any) -> str:
@@ -957,9 +1037,12 @@ def _tool_result_is_error(content: str) -> bool:
                 return isinstance(d, dict) and (
                     str(d.get("status", "")).strip().lower() == "error" or bool(d.get("error"))
                 )
+            # ONLY the top-level object signals tool failure. A top-level LIST is a data listing
+            # (e.g. get_task_history_for_callback returns many task records, and a historical task
+            # legitimately having status "error" does NOT mean THIS call failed) — inspecting list
+            # elements here misflagged successful listings as Failed. Mythic's error envelope is a
+            # dict ({"status":"error",...}), never a bare list, so a list is never an error by shape.
             if _is_err(obj):
-                return True
-            if isinstance(obj, list) and any(_is_err(x) for x in obj):
                 return True
     return False
 
@@ -1483,6 +1566,10 @@ class Model:
         self._controller_hitl_pending = None
         self._controller_hitl_approved_key = ""
         self._controller_hitl_objective = ""
+        # A supervised chat turn can opt into the deterministic controller without globally enabling
+        # autonomous_solve. This flag stays true across controller-native approval pauses, then is reset
+        # before the next fresh operator turn.
+        self._supervised_objective_active = False
         # Autonomous-solve stall detector state (reset per solve in invoke() so counters never cross objectives).
         self._autonomous_stall_progress = None
         self._autonomous_stall_count = 0
@@ -1725,9 +1812,11 @@ class Model:
         if emitter is None or not hasattr(emitter, "emit_tool_use"):
             return
         try:
-            source = self._classify_tool_source(tool_name)
+            raw_name = tool_name or "unknown_tool"
+            source = self._classify_tool_source(raw_name)
             source_label = "MCP" if source == "mcp" else "Mythic"
-            name = tool_name or "unknown_tool"
+            capability_name = _capability_name_from_tool_arguments(arguments) if raw_name == "execute_capability" else ""
+            name = capability_name or raw_name
             args_str = ""
             if arguments:
                 try:
@@ -1737,7 +1826,7 @@ class Model:
                     args_str = str(arguments)
                 if len(args_str) > 4000:
                     args_str = args_str[:4000] + "…"
-            request_line = f"Request: {name}({args_str})" if args_str else ""
+            request_line = f"Request: {raw_name}({args_str})" if args_str else ""
             if status == "started":
                 content = f"Using {source_label} tool `{name}`..."
                 if request_line:
@@ -1763,6 +1852,37 @@ class Model:
                 await self._bump_delegation_progress(delegation_name)
         except Exception as e:
             logger.debug(f"_emit_tool_use_card failed (non-fatal): {e}")
+
+    async def _emit_capability_command_card(self, event: dict[str, Any]) -> None:
+        """Render one deterministic capability child command through the normal chat tool-card surface."""
+        if not isinstance(event, dict):
+            return
+        command_name = str(event.get("command") or "").strip()
+        trace_id = str(event.get("trace_id") or "").strip()
+        if not command_name or not trace_id:
+            return
+        arguments: dict[str, Any] = {
+            "callback_id": event.get("callback_id"),
+            "parameters": event.get("parameters"),
+        }
+        capability_name = str(event.get("capability") or "").strip()
+        if capability_name:
+            arguments["capability"] = capability_name
+        purpose = str(event.get("purpose") or "").strip()
+        if purpose:
+            arguments["purpose"] = purpose
+        task_id = event.get("task_id")
+        if task_id not in (None, ""):
+            arguments["task_id"] = task_id
+        await self._emit_tool_use_card(
+            tool_call_id=trace_id,
+            tool_name=command_name,
+            status=str(event.get("status") or "completed"),
+            complete=str(event.get("status") or "") != "started",
+            arguments_present=True,
+            arguments=arguments,
+            result_preview=str(event.get("result_preview") or "") or None,
+        )
 
     async def _emit_subagent_status(
         self,
@@ -1831,6 +1951,31 @@ class Model:
         }
         return icons.get(agent_name, agent_name[:2].upper())
 
+    @staticmethod
+    def _delegation_color(agent_name: str) -> str:
+        """Deterministic per-agent sub-agent-card color (CSS color text).
+
+        Resolution order: the agent's prompt-file frontmatter ``color:`` (operator-editable),
+        then a fixed fallback palette, then ``""`` — which lets Mythic auto-derive a color.
+        Auto-derivation is the OLD behavior: it hashes per-card, so every card for the same
+        agent came out a different color. Returning one deterministic color per agent_name is
+        what pins each specialist to a single, stable color (e.g. BloodHound = red).
+        """
+        fallback = {
+            "BloodHound": "#E5484D",       # red (operator request)
+            "Mythic_Operator": "#3B82F6",  # blue
+            "Mythic_Payload": "#A855F7",   # purple
+            "Generalist": "#10B981",       # green
+            "MCP_Manager": "#F59E0B",      # amber
+        }
+        try:
+            color = load_prompt_meta(agent_name.lower()).get("color")
+            if isinstance(color, str) and color.strip():
+                return color.strip()
+        except Exception as e:
+            logger.debug(f"_delegation_color frontmatter read failed for {agent_name} (non-fatal): {e}")
+        return fallback.get(agent_name, "")
+
     def current_delegation_id(self, agent_name: str) -> str | None:
         # Fail-soft: a Model built via __new__ (tests, partial harnesses) never ran __init__, so
         # _active_delegations may be absent. Missing state simply means "no active delegation".
@@ -1862,7 +2007,13 @@ class Model:
         except Exception as e:
             logger.debug(f"_capture_delegation_final_summary failed (non-fatal): {e}")
 
-    async def _open_delegation(self, agent_name: str, instruction: str, source_seq: int) -> None:
+    async def _open_delegation(
+        self,
+        agent_name: str,
+        instruction: str,
+        source_seq: int,
+        title: str = "",
+    ) -> None:
         emitter = getattr(self, "_response_emitter", None)
         if emitter is None or not hasattr(emitter, "emit_subagent_status") or agent_name == "Supervisor":
             return
@@ -1875,23 +2026,28 @@ class Model:
             self._delegation_seq += 1
             delegation_id = f"{agent_name.lower()}:{self._delegation_seq}"
             icon = self._delegation_icon(agent_name)
+            icon_color = self._delegation_color(agent_name)
+            card_title = _normalize_handoff_title(title, instruction, agent_name)
             self._active_delegations[agent_name] = {
                 "id": delegation_id,
                 "name": agent_name,
-                "title": instruction,
+                "title": card_title,
+                "instruction": instruction,
                 "tool_count": 0,
                 "icon": icon,
+                "icon_color": icon_color,
                 "source_seq": source_seq,
                 "last_text": "",
                 "final_summary": "",
             }
             await self._emit_subagent_status(
-                title=instruction,
+                title=card_title,
                 delegation_id=delegation_id,
                 delegation_name=agent_name,
                 status="running",
                 tool_count=0,
                 icon=icon,
+                icon_color=icon_color,
                 content="",
             )
         except Exception as e:
@@ -1911,6 +2067,7 @@ class Model:
                 status="running",
                 tool_count=tool_count,
                 icon=str(delegation.get("icon", "")),
+                icon_color=str(delegation.get("icon_color", "")),
                 content="",
             )
         except Exception as e:
@@ -1921,8 +2078,21 @@ class Model:
             delegation = self._active_delegations.pop(agent_name, None)
             if delegation is None:
                 return
+            final_summary = str(delegation.get("final_summary") or "").strip()
             if not content:
-                content = str(delegation.get("final_summary") or delegation.get("last_text") or "")
+                content = final_summary or str(delegation.get("last_text") or "")
+            # The handback summary is captured from the control-tool args and, until now, only landed
+            # in the card's close content — it never went through emit_agent_text, so the expanded
+            # sub-agent (Open) view never showed the agent's final message. Echo it into the drill-down
+            # too, so the final message appears in BOTH the card summary and the Open view. Guarded on
+            # final_summary specifically: last_text was already streamed to the drill-down as it happened,
+            # so echoing that instead would duplicate it.
+            if final_summary:
+                await self._emit_agent_text(
+                    content=final_summary,
+                    delegation_id=str(delegation.get("id", "")),
+                    delegation_name=str(delegation.get("name", agent_name)),
+                )
             await self._emit_subagent_status(
                 title=str(delegation.get("title", "")),
                 delegation_id=str(delegation.get("id", "")),
@@ -1930,11 +2100,52 @@ class Model:
                 status=status,
                 tool_count=int(delegation.get("tool_count", 0)),
                 icon=str(delegation.get("icon", "")),
+                icon_color=str(delegation.get("icon_color", "")),
                 content=content,
                 complete=True,
             )
         except Exception as e:
             logger.debug(f"_close_delegation failed (non-fatal): {e}")
+
+    async def _close_all_delegations(self, status: str = "finished") -> None:
+        """Close every still-open sub-agent card with ``status``.
+
+        Called on operator stop so a card that was mid-run does not stay stuck on the
+        "running" badge (it becomes "stopped"). Safe to call repeatedly and from multiple
+        stop paths — _close_delegation pops each entry, so a second call is a no-op.
+        """
+        names = list(getattr(self, "_active_delegations", {}))
+        logger.info(f"🛑 _close_all_delegations(status={status!r}): closing {len(names)} open card(s): {names}")
+        for agent_name in names:
+            await self._close_delegation(agent_name, status=status)
+
+    async def _emit_operator_stop(self, stop_message: str) -> None:
+        """Stream the operator-stop notice and mark every open sub-agent card 'stopped'.
+
+        Grouped into one coroutine so the hard-cancel path can drive it under
+        ``asyncio.shield``: when the stop arrives as a task cancel, these emits run *after*
+        we've caught the CancelledError while the task is still being torn down, and an
+        un-shielded emit can be cut off before it reaches Mythic — leaving a card stuck on
+        "running". Shielding lets the whole notice+close sequence complete on the loop.
+        """
+        try:
+            await self._stream_message_to_mythic(stop_message)
+        except Exception:
+            pass
+        await self._close_all_delegations(status="stopped")
+
+    async def _run_operator_stop_shielded(self, stop_message: str) -> None:
+        """Run _emit_operator_stop to completion even if the caller's task is being cancelled."""
+        cleanup = asyncio.ensure_future(self._emit_operator_stop(stop_message))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # Cancelled again while the shielded cleanup ran; wait it out so its emits land
+            # BEFORE we return and the request terminal is sent.
+            try:
+                await cleanup
+            except asyncio.CancelledError:
+                pass
 
     async def _stream_message_to_mythic(self, formatted_message: str) -> bool:
         """
@@ -2181,6 +2392,7 @@ class Model:
             apitoken_id=self.apitoken_id,
         )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
+        self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)
         await self.mythic_client.login()
         # Scope preflight (Section 8A P1): learn the bot token's granted scopes and disable guarded tools
         # it can't use BEFORE the graph attaches them (get_tools skips disabled ones). No-op on the task
@@ -2415,8 +2627,9 @@ class Model:
                     )
                     if delegated_message is not None:
                         instruction = _message_content_as_text(delegated_message.content).strip()
+                        title = str(delegated_message.additional_kwargs.get("_handoff_title") or "").strip()
                         source_seq = _get_seq(delegated_message)
-                        await self._open_delegation(node_name, instruction, source_seq)
+                        await self._open_delegation(node_name, instruction, source_seq, title=title)
             except Exception as e:
                 logger.debug(f"delegation lifecycle entry failed (non-fatal): {e}")
 
@@ -2931,7 +3144,7 @@ class Model:
         agent_name: str,
         handoff_instruction: str,
         state: dict,
-    ) -> tuple[str, str] | None:
+    ) -> _HandoffDirective | None:
         """Compile autonomous handoffs from the ledger-selected next capability.
 
         Specialist handbacks and Supervisor routing are useful for coordination, but
@@ -2968,7 +3181,7 @@ class Model:
                         requested_agent=agent_name,
                     )
                     if instruction:
-                        return "Mythic_Operator", instruction
+                        return _handoff_directive("Mythic_Operator", instruction, "Collect BloodHound graph")
                 phase = str(_es.engagement_phase(snapshot))
                 if phase.startswith("BLOCKED"):
                     if _recent_bloodhound_blocker_observed(state):
@@ -2978,7 +3191,7 @@ class Model:
                             requested_agent=agent_name,
                         )
                         if instruction:
-                            return "__terminal__", instruction
+                            return _handoff_directive("__terminal__", instruction, "Report blocked objective")
                     if agent_name == "Mythic_Operator":
                         instruction = _compiled_autonomous_blocked_bloodhound_instruction(
                             snapshot,
@@ -2986,7 +3199,7 @@ class Model:
                             requested_agent=agent_name,
                         )
                         if instruction:
-                            return "BloodHound", instruction
+                            return _handoff_directive("BloodHound", instruction, "Analyze graph blocker")
             except Exception:
                 return None
             return None
@@ -3008,14 +3221,18 @@ class Model:
         except Exception:
             _complete = False
         if not _complete and self._autonomous_stall_halt(_progress, _action_signature(action)):
-            return "__terminal__", _autonomous_stall_report(snapshot)
+            return _handoff_directive("__terminal__", _autonomous_stall_report(snapshot), "Report stalled objective")
         instruction = _compiled_autonomous_capability_instruction(
             action,
             snapshot,
             handoff_instruction=handoff_instruction,
             requested_agent=agent_name,
         )
-        return "Autonomous_Executor", instruction
+        return _handoff_directive(
+            "Autonomous_Executor",
+            instruction,
+            _autonomous_capability_handoff_title(action),
+        )
 
     def _note_capability_outcome(self, payload, turn_key: str = "") -> None:
         """Observe a terminal execute_capability result (control-state P0 loop-breaker).
@@ -3119,25 +3336,104 @@ class Model:
         except Exception:
             return None
 
-    def _should_use_controller(self, is_interactive: bool) -> bool:
-        """Whether the deterministic autonomous controller should handle this solve. ALL must hold:
-        autonomous_solve, a controller-owned execution mode, the FIRST/non-interactive turn, and no explicit
-        rollback override. Auto mode runs unattended. Supervised mode runs controller-native HITL only on `chat`,
-        because `query` has no interactive reply channel for approve/deny."""
+    @staticmethod
+    def _looks_like_explicit_objective_prompt(prompt: str) -> bool:
+        """Conservatively detect a chat turn that asks Sage to pursue an engagement objective.
+
+        This is routing only, not planning. It deliberately recognizes generic operator phrasing such as
+        "Compromise the CORP domain" and "From the foothold, achieve administrative control of child.lab.local"
+        while leaving read-only/scoped questions on the normal supervisor graph.
+        """
+        text = re.sub(r"\s+", " ", str(prompt or "").strip().casefold())
+        if not text:
+            return False
+
+        # Read-only questions and negative instructions must not silently become execution requests.
+        if re.match(
+            r"^(?:why|what|when|where|who|which|how|explain|describe|summarize|show|list|inspect|"
+            r"analy[sz]e|report|did|does|is|are|was|were|should)\b",
+            text,
+        ):
+            return False
+        if re.search(
+            r"\b(?:do not|don't|never|avoid|stop|without)\b.{0,48}"
+            r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue)\b",
+            text,
+        ):
+            return False
+
+        # Common request wrappers should not hide an otherwise imperative objective.
+        candidate = re.sub(
+            r"^(?:(?:please|kindly)\s+|(?:can|could|would)\s+you\s+|(?:i\s+want\s+you\s+to)\s+)+",
+            "",
+            text,
+        )
+        if not re.search(
+            r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue)\b",
+            candidate,
+        ):
+            return False
+
+        try:
+            try:
+                from . import engagement_state as _es
+            except ImportError:
+                import engagement_state as _es
+            if _es._objective_target_domains(candidate):
+                return True
+        except Exception:
+            pass
+
+        if re.search(
+            r"\b(?:domain admin(?:istrator)?s?|enterprise admin(?:istrator)?s?|"
+            r"administrative control|engagement objective)\b",
+            candidate,
+        ):
+            return True
+        return bool(
+            re.search(r"\b(?:compromise|pwn|own|take over)\b", candidate)
+            and re.search(r"\b(?:domain|forest|enterprise)\b", candidate)
+        )
+
+    def _supervised_objective_controller_enabled_for_prompt(self, prompt: str) -> bool:
+        """Whether this fresh supervised chat turn should use controller-native HITL."""
+        return bool(
+            getattr(self, "mode", "auto") == "supervised"
+            and getattr(self, "command_name", "") == "chat"
+            and _controller_flag_enabled()
+            and _controller_hitl_flag_enabled()
+            and self._looks_like_explicit_objective_prompt(prompt)
+        )
+
+    def _controller_owned_solve(self) -> bool:
+        """Whether deterministic controller code owns the current solve."""
         return bool(
             getattr(self, "_autonomous_solve", False)
-            and not is_interactive
-            and _controller_flag_enabled()
-            and (
-                getattr(self, "mode", "auto") == "auto"
-                or self._controller_hitl_enabled()
-            )
+            or getattr(self, "_supervised_objective_active", False)
+        )
+
+    def _should_use_controller(self, is_interactive: bool) -> bool:
+        """Whether the deterministic controller should handle this solve.
+
+        Existing autonomous solves keep their first-turn behavior. A supervised chat objective turn is the
+        exception: it may begin on an already-open chat session because `is_interactive` there means "reused
+        channel", not "approval response". Pending approvals are routed before this method is reached.
+        """
+        if not self._controller_owned_solve() or not _controller_flag_enabled():
+            return False
+        if getattr(self, "_supervised_objective_active", False):
+            return self._controller_hitl_enabled()
+        if is_interactive:
+            return False
+        return bool(
+            getattr(self, "mode", "auto") == "auto"
+            or self._controller_hitl_enabled()
         )
 
     def _controller_hitl_enabled(self) -> bool:
-        """Whether supervised autonomous chat should pause controller moves for operator approval."""
+        """Whether supervised controller-owned chat should pause moves for operator approval."""
         return bool(
-            getattr(self, "_autonomous_solve", False)
+            self._controller_owned_solve()
             and getattr(self, "mode", "auto") == "supervised"
             and getattr(self, "command_name", "") == "chat"
             and _controller_hitl_flag_enabled()
@@ -3166,6 +3462,7 @@ class Model:
             "kind": "capability",
             "key": self._controller_hitl_key("capability", args),
             "tool": "execute_capability",
+            "display_name": str(payload.get("name") or "execute_capability"),
             "args": args,
             "objective": str(objective or ""),
         }
@@ -3193,12 +3490,25 @@ class Model:
         """Stream the same default-deny operator UX for a controller-owned pending move."""
         kind = str(pending.get("kind") or "")
         args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
+        if getattr(self, "_hitl_card_emitter", None) is not None:
+            try:
+                await self._hitl_card_emitter([{
+                    "name": str(pending.get("tool") or "guarded_controller_action"),
+                    "display_name": str(pending.get("display_name") or ""),
+                    "args": args,
+                }])
+                self._hitl_card_pending = True
+            except Exception as e:
+                logger.warning(f"HITL: failed to emit controller confirmation card ({e})")
+            logger.info(f"HITL controller interrupt surfaced as native card ({kind or 'unknown'})")
+            return
+
         lines: list[str] = []
         if kind == "capability":
             payload = args.get("capability") if isinstance(args.get("capability"), dict) else {}
             inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
             lines = [
-                "  * `execute_capability`",
+                f"  * `{pending.get('display_name') or 'execute_capability'}`",
                 f"    capability: `{payload.get('name', '')}`",
                 f"    target: `{payload.get('target', '')}`",
                 f"    callback: `{inputs.get('callback_id', '')}`",
@@ -3215,10 +3525,10 @@ class Model:
                 f"    reason: `{args.get('reason', '')}`",
                 f"    support: `{args.get('support', '')}`",
             ]
-        body = "\n".join(lines) if lines else "  * (a guarded controller action)"
+        body = "\n".join(lines) if lines else "  * (a guarded action)"
         msg = (
             "⏸️ **Approval required — supervised mode**\n\n"
-            "Sage wants to run the following guarded controller action:\n"
+            "Sage wants to run the following guarded action:\n"
             f"{body}\n\n"
             "Reply **`approve`** to run it, or **`deny`** to skip it. "
             "Anything other than an explicit approval is treated as a denial."
@@ -3256,6 +3566,7 @@ class Model:
         approved = _hitl_is_approved(response)
         decision_word = "approve" if approved else "deny"
         tool = str(pending.get("tool") or "unknown")
+        display_name = str(pending.get("display_name") or tool)
         args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
         self._write_hitl_audit(tool, args, decision_word)
 
@@ -3266,9 +3577,10 @@ class Model:
         if not approved:
             self._controller_hitl_approved_key = ""
             self._controller_hitl_objective = ""
+            self._supervised_objective_active = False
             msg = (
-                f"🛑[Autonomous_Controller]> Operator denied `{tool}`; "
-                "controller stopped before execution.\n"
+                "**Execution stopped**\n"
+                f"Operator denied `{display_name}`. Sage stopped before execution.\n"
             )
             try:
                 await self._stream_message_to_mythic(msg)
@@ -3283,8 +3595,110 @@ class Model:
         logger.info(f"HITL controller resume: approve for {tool}")
         return await self._run_autonomous_controller(objective)
 
-    def _queue_controller_verbose_event(self, message: str) -> None:
-        """Stream controller progress without making deterministic control depend on Mythic response RPCs.
+    @staticmethod
+    def _controller_inline_values(values: Any) -> str:
+        """Render compact controller metadata for operator-facing progress messages."""
+        if values in (None, "", []):
+            return "none"
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        rendered = [str(item).strip() for item in values if str(item).strip()]
+        return ", ".join(f"`{item}`" for item in rendered) if rendered else "none"
+
+    @staticmethod
+    def _controller_result_payload(result: Any) -> dict[str, Any]:
+        """Best-effort parse of a capability result for presentation only."""
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @classmethod
+    def _controller_selected_action_progress(cls, payload: dict[str, Any], inputs: dict[str, Any]) -> str:
+        name = str(payload.get("name") or "unknown capability")
+        target = str(payload.get("target") or "").strip()
+        callback_id = str(inputs.get("callback_id") or "").strip()
+        lines = [f"Sage selected `{name}`" + (f" for `{target}`." if target else ".")]
+        if callback_id:
+            lines.append(f"Callback: `{callback_id}`")
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            lines.append(f"Reason: {reason}")
+        lines.append(f"Preconditions: {cls._controller_inline_values(payload.get('preconditions'))}")
+        lines.append(f"Expected effects: {cls._controller_inline_values(payload.get('effects'))}")
+        return "**Selected action**\n" + "\n".join(lines)
+
+    @classmethod
+    def _controller_capability_result_progress(cls, payload: dict[str, Any], result: Any) -> str:
+        name = str(payload.get("name") or "unknown capability")
+        parsed = cls._controller_result_payload(result)
+        lines = [f"Sage received the result for `{name}` and will verify it against observed state."]
+        status_bits = []
+        for key in ("ok", "verdict", "status"):
+            if key in parsed and parsed.get(key) not in (None, ""):
+                status_bits.append(f"{key}={parsed.get(key)}")
+        if status_bits:
+            lines.append("Result: " + ", ".join(f"`{bit}`" for bit in status_bits))
+        reason = str(parsed.get("reason") or parsed.get("error") or "").strip()
+        if reason:
+            lines.append(f"Reason: {reason}")
+        return "**Capability result**\n" + "\n".join(lines)
+
+    @staticmethod
+    def _controller_collection_selection_progress(request: Any) -> str:
+        foothold = getattr(request, "foothold", None)
+        callback_id = str(getattr(foothold, "callback_id", "") or "").strip()
+        host = str(getattr(foothold, "host", "") or "").strip()
+        scope_domain = str(getattr(request, "scope_domain", "") or "").strip() or "current forest"
+        reason = str(getattr(request, "reason", "") or "").strip()
+        support = str(getattr(request, "support", "") or "").strip()
+        lines = [f"Sage selected graph collection for `{scope_domain}`."]
+        if callback_id:
+            lines.append(f"Callback: `{callback_id}`" + (f" on `{host}`" if host else ""))
+        if reason:
+            lines.append(f"Reason: {reason}")
+        if support:
+            lines.append(f"Support: {support}")
+        return "**Selected collection**\n" + "\n".join(lines)
+
+    @staticmethod
+    def _controller_operator_progress_from_raw(message: str) -> str:
+        """Translate stable controller fire-log messages into Sage-owned operator updates."""
+        text = str(message or "").strip()
+        match = re.match(
+            r"^cycle (?P<cycle>\d+): (?P<phase>\S+) (?P<action>[^ ]+)->(?P<target>.*?) "
+            r"ok=(?P<ok>\S+) progressed=(?P<progressed>\S+) new_effects=(?P<effects>.*)$",
+            text,
+        )
+        if match:
+            action = match.group("action")
+            target = match.group("target")
+            ok = match.group("ok").casefold() == "true"
+            progressed = match.group("progressed").casefold() == "true"
+            effects = match.group("effects").strip()
+            lines = [
+                f"Sage verified `{action}` for `{target}`: "
+                f"execution {'reported success' if ok else 'did not report success'}; "
+                f"{'verified progress' if progressed else 'no new expected effect was verified'}."
+            ]
+            lines.append(f"New verified effects: `{effects}`" if effects and effects != "[]" else "New verified effects: none.")
+            return "**Verification**\n" + "\n".join(lines)
+        if text == "route_discovery candidate failed precondition check; rejected":
+            return (
+                "**Route discovery**\n"
+                "Sage rejected a proposed route-discovery action because its preconditions were not satisfied."
+            )
+        if text.startswith("collect: "):
+            return "**Collection detail**\n" + text.removeprefix("collect: ")
+        return "**Execution detail**\n" + text
+
+    def _queue_controller_verbose_event(self, message: str, *, operator_message: str | None = None) -> None:
+        """Stream Sage-owned progress without making deterministic control depend on Mythic response RPCs.
 
         Controller seams are intentionally synchronous logger callbacks, so they cannot await the existing Mythic
         stream function directly. Chain background sends behind one tail task instead: events stay ordered for the
@@ -3293,7 +3707,7 @@ class Model:
         if not getattr(self, "verbose", False):
             return
 
-        formatted = f"📊[Autonomous_Controller]> {message}\n"
+        formatted = f"{operator_message or self._controller_operator_progress_from_raw(message)}\n"
         previous = getattr(self, "_controller_verbose_stream_tail", None)
 
         async def _send_after_previous() -> None:
@@ -3351,10 +3765,11 @@ class Model:
         if self._controller_hitl_enabled():
             self._controller_hitl_objective = str(prompt or "")
         self._controller_verbose_stream_tail = None
+        resumed_after_approval = bool(getattr(self, "_controller_hitl_approved_key", ""))
 
-        def fire(msg: str) -> None:
+        def fire(msg: str, *, operator_message: str | None = None) -> None:
             logger.info(f"[autonomous-controller] {msg}")
-            self._queue_controller_verbose_event(msg)
+            self._queue_controller_verbose_event(msg, operator_message=operator_message)
 
         snap = {"state": None, "collection_request": None}
 
@@ -3374,20 +3789,44 @@ class Model:
             snap["state"] = state
             hops = len(getattr(state, "hops", []) or []) if state is not None else -1
             gf = len(getattr(state, "graph_facts", []) or []) if state is not None else -1
-            fire(f"observe -> {'None' if state is None else f'{hops} hops, {gf} graph_facts'}")
+            if state is None:
+                progress = "**Observed state**\nSage could not build the current engagement state."
+            else:
+                progress = f"**Observed state**\nSage observed {hops} ledger hops and {gf} graph facts."
+            fire(
+                f"observe -> {'None' if state is None else f'{hops} hops, {gf} graph_facts'}",
+                operator_message=progress,
+            )
             return state
 
         async def execute(action):
             payload = _capability_action_payload(action)
             inputs = _autonomous_capability_inputs(action, snap["state"])
-            await self._require_controller_hitl_approval(
-                self._controller_hitl_capability_request(payload, inputs, prompt)
+            pending = self._controller_hitl_capability_request(payload, inputs, prompt)
+            if (
+                not self._controller_hitl_enabled()
+                or str(getattr(self, "_controller_hitl_approved_key", "") or "") != str(pending.get("key") or "")
+            ):
+                self._queue_controller_verbose_event(
+                    f"selected {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}",
+                    operator_message=self._controller_selected_action_progress(payload, inputs),
+                )
+            await self._require_controller_hitl_approval(pending)
+            fire(
+                f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}",
+                operator_message=(
+                    "**Executing action**\n"
+                    f"Sage started `{payload.get('name')}`"
+                    + (f" for `{payload.get('target')}`." if payload.get("target") else ".")
+                ),
             )
-            fire(f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}")
             result = await self.mythic_client.execute_capability(payload, inputs)
             kind = type(result).__name__
             size = len(result) if isinstance(result, str) else "n/a"
-            fire(f"execute returned {kind} (len={size})")  # PROVE the real string-return boundary fired
+            fire(
+                f"execute returned {kind} (len={size})",
+                operator_message=self._controller_capability_result_progress(payload, result),
+            )  # PROVE the real string-return boundary fired
             return result
 
         def needs_collection(state):
@@ -3413,9 +3852,16 @@ class Model:
         async def collect(state):
             request = snap.get("collection_request")
             snap["collection_request"] = None
-            await self._require_controller_hitl_approval(
-                self._controller_hitl_collection_request(request, prompt)
-            )
+            pending = self._controller_hitl_collection_request(request, prompt)
+            if (
+                not self._controller_hitl_enabled()
+                or str(getattr(self, "_controller_hitl_approved_key", "") or "") != str(pending.get("key") or "")
+            ):
+                self._queue_controller_verbose_event(
+                    "selected collect_graph",
+                    operator_message=self._controller_collection_selection_progress(request),
+                )
+            await self._require_controller_hitl_approval(pending)
             return await self._controller_collect(state, request=request)
 
         def objective_met(state):
@@ -3445,8 +3891,25 @@ class Model:
             max_cycles=_env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
         )
 
-        fire(f"START (flagged) objective_seed='{(prompt or '')[:80]}' "
-             f"seam_timeout={cfg.seam_timeout_s}s wall={cfg.wall_clock_budget_s}s")
+        objective_text = str(prompt or "").strip()
+        if resumed_after_approval:
+            start_progress = (
+                "**Execution resumed**\n"
+                f"Sage resumed deterministic execution for `{objective_text}` after the latest approval."
+            )
+        else:
+            approval_policy = (
+                "with operator approvals" if self._controller_hitl_enabled() else "without per-step approvals"
+            )
+            start_progress = (
+                "**Execution started**\n"
+                f"Sage is pursuing `{objective_text}` using deterministic execution {approval_policy}."
+            )
+        fire(
+            f"START (flagged) objective_seed='{(prompt or '')[:80]}' "
+            f"seam_timeout={cfg.seam_timeout_s}s wall={cfg.wall_clock_budget_s}s",
+            operator_message=start_progress,
+        )
         controller = _ctrl.AutonomousController(
             observe=observe,
             execute=execute,
@@ -3464,8 +3927,15 @@ class Model:
         except _ControllerHitlPause:
             await self._flush_controller_verbose_events()
             return ""
-        fire(f"DONE status={result.status} cycles={result.cycle_count} "
-             f"effects={len(result.achieved_effects)} reason={result.reason}")
+        fire(
+            f"DONE status={result.status} cycles={result.cycle_count} "
+            f"effects={len(result.achieved_effects)} reason={result.reason}",
+            operator_message=(
+                "**Execution finished**\n"
+                f"Sage finished deterministic execution with status `{result.status}`. "
+                f"Verified effects: {len(result.achieved_effects)}. Reason: {result.reason}"
+            ),
+        )
 
         report = None
         if result.status == _ctrl.STATUS_COMPLETE:
@@ -3474,7 +3944,7 @@ class Model:
             report = self._controller_terminal_report(result)
         # Persist the assistant turn to state so a reused Model on a later interactive turn does not see a
         # human prompt with no recorded reply (Forge MEDIUM: dangling-turn hazard).
-        report_msg = AIMessage(content=report, name="Autonomous_Controller")
+        report_msg = AIMessage(content=report, name="Supervisor")
         try:
             _tag_msg(report_msg, self._next_seq())
             self.state.setdefault("messages", []).append(report_msg)
@@ -3483,7 +3953,7 @@ class Model:
             pass
         try:
             await self._flush_controller_verbose_events()
-            formatted = self._format_message_for_streaming(report_msg, agent_name="Autonomous_Controller")
+            formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
             if formatted:
                 await self._stream_message_to_mythic(formatted)
         except Exception:
@@ -3492,13 +3962,14 @@ class Model:
             self._controller_hitl_pending = None
             self._controller_hitl_approved_key = ""
             self._controller_hitl_objective = ""
+            self._supervised_objective_active = False
         return report
 
     def _controller_terminal_report(self, result) -> str:
         """Render a terminal controller result as an operator-facing report. Range-agnostic: lists status,
         reason, the precise blocker (if any), and achieved effects. Scenario 'wall' mapping is the eval layer's
         job (ai/hillclimb/wall_checkpoints.py), not the runtime's."""
-        lines = [f"Autonomous controller halted: **{result.status}** — {result.reason}.",
+        lines = [f"Sage halted deterministic execution: **{result.status}** — {result.reason}.",
                  f"Cycles: {result.cycle_count}. Verified effects: {len(result.achieved_effects)}."]
         blocker = result.blocker or {}
         if blocker:
@@ -3720,9 +4191,9 @@ class Model:
         except ImportError:
             import mythic_tools as _mt
 
-        def fire(msg: str) -> None:
+        def fire(msg: str, *, operator_message: str | None = None) -> None:
             logger.info(f"[autonomous-controller:collect] {msg}")
-            self._queue_controller_verbose_event(f"collect: {msg}")
+            self._queue_controller_verbose_event(f"collect: {msg}", operator_message=operator_message)
 
         request = request or self._controller_collection_request(state)
         foothold = getattr(request, "foothold", None)
@@ -3774,7 +4245,15 @@ class Model:
             return outcome(False, "identity_probe_failed", f"{type(e).__name__}: {e}")
 
         if not context.domain_capable:
-            fire(f"callback authentication context is local-only ({context.evidence}); restoring process context")
+            fire(
+                f"callback authentication context is local-only ({context.evidence}); restoring process context",
+                operator_message=(
+                    "**Collection preparation**\n"
+                    "Sage found a local-only callback authentication context and is restoring process context "
+                    "before graph collection.\n"
+                    f"Evidence: {context.evidence}"
+                ),
+            )
             try:
                 revert_command = _collection_profile_text(adapter, "collection_revert_command", "rev2self")
                 await self.mythic_client.issue_task_and_waitfor_task_output(revert_command, "", cb_int)
@@ -3794,7 +4273,13 @@ class Model:
                 )
         fire(
             f"verified callback authentication context luid={context.current_luid or 'unknown'} "
-            f"evidence={context.evidence}"
+            f"evidence={context.evidence}",
+            operator_message=(
+                "**Collection preparation**\n"
+                "Sage verified the callback authentication context needed for graph collection.\n"
+                f"LUID: `{context.current_luid or 'unknown'}`\n"
+                f"Evidence: {context.evidence}"
+            ),
         )
 
         # UNIQUE per-run ZIP name: good opsec (controlled name) + a random anchor so discovery cannot match any
@@ -3814,14 +4299,30 @@ class Model:
         try:
             scope_note = f" scope={scope_domain}" if scope_domain else " scope=current-forest"
             reason_note = f" reason={collection_reason}" if collection_reason else ""
-            fire(f"SharpHound {runner_command} on cb={cb_int}:{scope_note}{reason_note} {args}")
+            fire(
+                f"SharpHound {runner_command} on cb={cb_int}:{scope_note}{reason_note} {args}",
+                operator_message=(
+                    "**Collection started**\n"
+                    f"Sage started SharpHound collection on callback `{cb_int}` for "
+                    f"`{scope_domain or 'current forest'}`.\n"
+                    + (f"Reason: {collection_reason}\n" if collection_reason else "")
+                    + f"Arguments: `{args}`"
+                ),
+            )
             runner_output = await self.mythic_client.issue_task_and_waitfor_task_output(
                 runner_command,
                 {runner_tool_param: "SharpHound.exe", runner_args_param: args},
                 cb_int,
             )
             if str(runner_output or "").startswith(_mt._REGISTERED_FILE_PREFLIGHT_PREFIX):
-                fire(f"SharpHound tool preflight failed: {runner_output}")
+                fire(
+                    f"SharpHound tool preflight failed: {runner_output}",
+                    operator_message=(
+                        "**Collection failed**\n"
+                        "Sage could not start SharpHound because the tool preflight failed.\n"
+                        f"Result: {runner_output}"
+                    ),
+                )
                 return outcome(False, "tool_preflight_failed", str(runner_output))
             # DISCOVER the real on-disk path (SharpHound prepends a timestamp; never predict the name). `ls` the
             # output dir, find the file carrying our token. Bounded retry for filesystem latency.
@@ -3834,10 +4335,22 @@ class Model:
                     break
                 await asyncio.sleep(2)
             if not real_path:
-                fire("no token-bearing SharpHound ZIP found in the output dir -> collection failed (not ingesting)")
+                fire(
+                    "no token-bearing SharpHound ZIP found in the output dir -> collection failed (not ingesting)",
+                    operator_message=(
+                        "**Collection failed**\n"
+                        "Sage did not find a fresh SharpHound ZIP for this run, so it will not ingest stale data."
+                    ),
+                )
                 return outcome(False, "no_collection_artifact",
                                "SharpHound produced no collection ZIP carrying this run's token")
-            fire(f"discovered collection artifact: {real_path}")
+            fire(
+                f"discovered collection artifact: {real_path}",
+                operator_message=(
+                    "**Collection artifact**\n"
+                    f"Sage found the fresh collection artifact `{real_path}`."
+                ),
+            )
             await self.mythic_client.issue_task_and_waitfor_task_output(
                 download_command, {download_path_param: real_path}, cb_int,
             )
@@ -3851,11 +4364,24 @@ class Model:
                 await asyncio.sleep(2)
             file_uuid = row.get("agent_file_id") if isinstance(row, dict) else None
             if not file_uuid:
-                fire("downloaded artifact not visible in Mythic filemeta -> not ingesting")
+                fire(
+                    "downloaded artifact not visible in Mythic filemeta -> not ingesting",
+                    operator_message=(
+                        "**Collection failed**\n"
+                        "Sage downloaded the collection artifact but could not find it in Mythic file metadata, "
+                        "so it will not ingest it."
+                    ),
+                )
                 return outcome(False, "no_fresh_collection",
                                "the downloaded collection ZIP was not found in Mythic")
             file_name = (row.get("filename_utf8") if isinstance(row, dict) else "") or zip_name
-            fire(f"ingest_collection(file_uuid={file_uuid}, callback_display_id={cb_int})")
+            fire(
+                f"ingest_collection(file_uuid={file_uuid}, callback_display_id={cb_int})",
+                operator_message=(
+                    "**Collection ingest**\n"
+                    f"Sage is ingesting `{file_name}` from callback `{cb_int}` into BloodHound."
+                ),
+            )
             # file_uuid wins for RESOLUTION (the exact discovered artifact); callback_display_id lets
             # _record_graph_built flip the collection gate (it early-returns on a None callback).
             ingest_raw = await self.mythic_client.ingest_collection(
@@ -3865,7 +4391,13 @@ class Model:
                 collection_scope_domain=scope_domain,
             )
         except Exception as e:
-            fire(f"collect failed: {type(e).__name__}: {e}")
+            fire(
+                f"collect failed: {type(e).__name__}: {e}",
+                operator_message=(
+                    "**Collection failed**\n"
+                    f"Sage hit `{type(e).__name__}` while collecting graph data: {e}"
+                ),
+            )
             return outcome(False, "error", f"{type(e).__name__}: {e}")
 
         try:
@@ -3874,7 +4406,14 @@ class Model:
             parsed = {}
         ok = bool(parsed.get("graph_verified")) if isinstance(parsed, dict) else False
         status = str(parsed.get("status", "")) if isinstance(parsed, dict) else ""
-        fire(f"ingest status={status} graph_verified={ok}")
+        fire(
+            f"ingest status={status} graph_verified={ok}",
+            operator_message=(
+                "**Collection verified**\n"
+                f"Sage finished graph ingest with status `{status or 'unknown'}` and "
+                f"`graph_verified={str(ok).lower()}`."
+            ),
+        )
         return outcome(ok, status or "unknown")
 
     async def _autonomous_executor_node(self, state: SageState | dict, config=None):
@@ -4027,8 +4566,8 @@ class Model:
         return True
 
     def _objective_completion_preflight_allowed(self, prompt: str) -> bool:
-        """Whether a non-autonomous prompt is explicitly asking to continue/report the engagement objective."""
-        if bool(getattr(self, "_autonomous_solve", False)):
+        """Whether this prompt should check for already-recorded objective completion before more work."""
+        if self._controller_owned_solve():
             return True
         text = str(prompt or "").casefold()
         if not text:
@@ -4965,15 +5504,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         return True
 
     def _seed_autonomous_objective(self, prompt: str) -> None:
-        """For an autonomous solve the prompt IS the mission: seed it on the client so
+        """For a controller-owned solve the prompt IS the mission: seed it on the client so
         MythicTools._engagement_objective() adopts it when no operator/env/ledger objective exists. Clearing
         the one-shot persist latch on a NEW prompt lets a reused client re-adopt per solve (an operator-set
         objective stays sticky — the persist path refuses to clobber it). Then a LOUD guard: if the objective
         STILL resolves opaque (blank/opaque prompt AND no operator/env objective), warn once — in that case
         completion-recognition (engagement_state._objective_is_complete) is unreachable and the solve would
-        silently over-reach until the stall detector halts it. No-op unless this is an autonomous solve with a
+        silently over-reach until the stall detector halts it. No-op unless this is a controller-owned solve with a
         live client. Fail-open: never breaks the solve."""
-        if not getattr(self, "_autonomous_solve", False) or self.mythic_client is None:
+        if not self._controller_owned_solve() or self.mythic_client is None:
             return
         try:
             if self.mythic_client._autonomous_objective_seed != prompt:
@@ -5012,6 +5551,11 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.info(f"HITL interrupt pending on thread {thread_id} — routing operator reply to approve/deny resume")
             return await self.handle_hitl_resume(prompt, thread_id)
 
+        # Fresh turn only: supervised chat objective prompts borrow the deterministic controller while scoped
+        # questions remain on the normal supervisor graph. Leave the flag alive across a controller-native HITL
+        # pause so the next approval can resume the exact pending move.
+        self._supervised_objective_active = self._supervised_objective_controller_enabled_for_prompt(prompt)
+
         # Fresh stall-detector window per solve — never carry a prior objective's counters into this one
         # (a Sage session may reuse one Model across invoke() calls).
         self._autonomous_stall_progress = None
@@ -5024,7 +5568,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except ImportError:
             import worker_outcome as _wo_init
         self._loop_breaker = _wo_init.LoopBreakerState()
-        # Self-describe the mission: for an autonomous solve the prompt IS the objective, so seed it on the
+        # Self-describe the mission: for a controller-owned solve the prompt IS the objective, so seed it on the
         # client. _engagement_objective() adopts it as the engagement objective when none is set, so
         # completion-recognition has a parseable target instead of the opaque sage-engagement:<task> fallback
         # (which is never completable) — the root cause of post-objective over-reach. Generic to any caller;
@@ -5092,8 +5636,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         ):
             return ""
 
-        # Deterministic autonomous controller. For autonomous auto one-shots, or supervised autonomous chat with
-        # controller-native HITL, OWN the
+        # Deterministic controller. For autonomous auto one-shots, supervised autonomous chat, or an explicit
+        # supervised chat objective turn with controller-native HITL, OWN the
         # observe->frontier->select->execute->verify->stop cycle in deterministic code, bypassing the
         # Supervisor/worker astream negotiation entirely. SAGE_AUTONOMOUS_CONTROLLER=0 is the rollback path.
         # SAFETY GATE: supervised controller execution is chat-only and pauses inside the controller seams before
@@ -5112,7 +5656,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 raise
             except Exception as e:
                 logger.error(f"Autonomous controller failed: {e}", exc_info=True)
-                return f"Autonomous controller error: {type(e).__name__}: {e}"
+                return f"Sage deterministic execution error: {type(e).__name__}: {e}"
 
         try:
             # Use a central graph recursion budget so operator-facing max_steps=0 can mean
@@ -5133,6 +5677,8 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
                     except Exception:
                         pass
+                    # Any sub-agent card still open would otherwise stay stuck on "running".
+                    await self._close_all_delegations(status="stopped")
                     break
 
                 # HITL: in supervised mode a guarded tool call interrupts here. The outer graph
@@ -5271,10 +5817,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             self._stop_requested = True
             stop_message = "\n🛑> Session stopped by operator.\n"
             logger.info("🛑 Operator stop cancelled active invoke task — terminating session")
-            try:
-                await self._stream_message_to_mythic(stop_message)
-            except Exception:
-                pass
+            # Hard cancel: shield the stop notice + card-close so the tearing-down task can't cut
+            # the emits off before they reach Mythic (which left the sub-agent card stuck "running").
+            await self._run_operator_stop_shielded(stop_message)
             return ""
         except _OperatorStopRequested:
             # Kill-switch fired inside an agent turn (finer-grained than the between-super-steps
@@ -5295,6 +5840,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 await self._stream_message_to_mythic(stop_message)
             except Exception:
                 pass
+            await self._close_all_delegations(status="stopped")
             return ""
         except GraphRecursionError as e:
             # Catch recursion limit error and return progress made so far
@@ -5985,7 +6531,7 @@ def _build_esl_summary(mythic_client) -> str:
     return "\n".join(lines[:12])
 
 
-def _deterministic_post_ingest_owner(mythic_client) -> tuple[str, str] | None:
+def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
     """Route verified post-ingest work without asking the Supervisor to classify prose."""
     if mythic_client is None:
         return None
@@ -6025,7 +6571,7 @@ def _deterministic_post_ingest_owner(mythic_client) -> tuple[str, str] | None:
             f"or ingest. Objective: {objective}. Return the next concrete graph-supported hop and its required "
             "Mythic capability, or a specific graph-coverage blocker."
         )
-        return "BloodHound", instruction
+        return _handoff_directive("BloodHound", instruction, "Analyze verified graph")
     except Exception:
         return None
 
@@ -6061,7 +6607,10 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
             owner, instruction = post_ingest_route
             delegated = HumanMessage(
                 content=instruction,
-                additional_kwargs={"_delegated_to": owner},
+                additional_kwargs={
+                    "_delegated_to": owner,
+                    "_handoff_title": post_ingest_route.title,
+                },
             )
             return Command(
                 goto=owner,
@@ -6174,7 +6723,7 @@ def _create_handoff_tool(
     *,
     agent_name: str,
     description: str | None = None,
-    autonomous_redirect: Callable[[str, str, dict], tuple[str, str] | None] | None = None,
+    autonomous_redirect: Callable[[str, str, dict], _HandoffDirective | tuple[str, str] | dict[str, str] | None] | None = None,
 ):
     """
     Create a handoff tool to transfer control to another agent.
@@ -6186,7 +6735,10 @@ def _create_handoff_tool(
     :return: A tool function that performs the handoff.
     """
     name = f"transfer_to_{agent_name}"
-    description = description or f"Delegate a task to {agent_name}. Provide a single 'handoff_instruction' argument containing the complete task."
+    description = description or (
+        f"Delegate a task to {agent_name}. Provide `handoff_title` for the short operator-facing card label "
+        "and `handoff_instruction` for the complete worker task."
+    )
 
     channel_map = {
         "Supervisor": "supervisor_messages",
@@ -6202,8 +6754,10 @@ def _create_handoff_tool(
     @tool(name, description=description)
     def handoff_tool(
         runtime: ToolRuntime,
-        handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.' This is the ONLY argument for this tool — do not invent positional or placeholder argument names (e.g. a, b, c)."],
+        handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.'"],
+        handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
     ) -> Command:
+        requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
         if autonomous_redirect is not None:
             try:
@@ -6212,9 +6766,16 @@ def _create_handoff_tool(
                 redirect = None
         if redirect is None:
             redirect = _autonomous_handoff_redirect(agent_name, handoff_instruction, runtime.state)
-        terminal_redirect = bool(redirect and redirect[0] == "__terminal__")
-        actual_agent_name = "Supervisor" if terminal_redirect else (redirect[0] if redirect else agent_name)
-        actual_instruction = redirect[1] if redirect else handoff_instruction
+        directive = _coerce_handoff_directive(
+            redirect,
+            fallback_agent_name=requested.agent_name,
+            fallback_instruction=requested.instruction,
+            fallback_title=requested.title,
+        )
+        terminal_redirect = directive.agent_name == "__terminal__"
+        actual_agent_name = "Supervisor" if terminal_redirect else directive.agent_name
+        actual_instruction = directive.instruction
+        actual_title = directive.title
         actual_target_channel_key = channel_map.get(actual_agent_name)
 
         # Compute sequence from max of existing messages in all channels
@@ -6245,6 +6806,7 @@ def _create_handoff_tool(
         # Mark as delegated so it displays differently from real user input
         injected_human = HumanMessage(content=actual_instruction)
         injected_human.additional_kwargs["_delegated_to"] = actual_agent_name
+        injected_human.additional_kwargs["_handoff_title"] = actual_title
         _tag_msg(injected_human, current_seq)
         current_seq += 1
 
@@ -6286,6 +6848,16 @@ def _create_handoff_tool(
         )
 
     return handoff_tool
+
+
+def _autonomous_capability_handoff_title(action: Any) -> str:
+    payload = _capability_action_payload(action)
+    name = str(payload.get("name") or "capability").strip()
+    target = str(payload.get("target") or "").strip()
+    title = f"Execute {name}"
+    if target:
+        title += f" on {target}"
+    return _normalize_handoff_title(title, title)
 
 
 def _compiled_autonomous_capability_instruction(
@@ -6802,7 +7374,7 @@ def _is_live_tradecraft_foothold(foothold: Any) -> bool:
     return agent != "sage"
 
 
-def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, state: dict) -> tuple[str, str] | None:
+def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, state: dict) -> _HandoffDirective | None:
     """Deterministically block autonomous handoff regressions from observed progress.
 
     This runs before a delegated task reaches the target agent. It intentionally uses tool-result evidence from
@@ -6829,7 +7401,7 @@ def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, stat
                 verdict = str(terminal.get("verdict") or "failed").strip()
                 reason = str(terminal.get("reason") or "no reason supplied").strip()
                 tasks = _terminal_capability_task_summary(terminal)
-                return (
+                return _handoff_directive(
                     "Mythic_Operator",
                     "Do not perform SharpHound collection confirmation, ZIP discovery, download, or BloodHound "
                     "ingest for this access context. Tool-result evidence in the current run already shows "
@@ -6837,14 +7409,16 @@ def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, stat
                     f"terminal capability result: `{capability}` returned `{verdict}`"
                     f"{tasks}; reason: {reason}. Inspect the referenced task output if needed, repair and retry "
                     "that capability only when the error is recoverable, or replan from the verified graph. "
-                    "Do not regress to collection work."
+                    "Do not regress to collection work.",
+                    f"Recover {capability}",
                 )
-            return (
+            return _handoff_directive(
                 "BloodHound",
                 "Tool-result evidence in the current run already shows `graph_verified=true` for the current "
                 "access context. Do not ask Mythic_Operator to confirm SharpHound completion, list ZIPs, "
                 "download collections, or ingest again. Analyze the verified BloodHound graph and return the "
                 "next concrete graph-supported hop plus the exact Mythic action needed next.",
+                "Analyze verified graph",
             )
 
     if not (
@@ -6867,16 +7441,17 @@ def _autonomous_handoff_redirect(agent_name: str, handoff_instruction: str, stat
     ):
         return None
     callback_id = _extract_callback_id(recent) or "the live CASTELBLACK callback"
-    return (
+    return _handoff_directive(
         "BloodHound",
         "Analyze the current BloodHound graph for the next concrete sevenkingdoms.local -> essos.local hop "
         f"from proven sevenkingdoms administrative control on callback {callback_id}. Do not repeat the "
         "STARKWALLPAPER/GPO hop, do not rerun sevenkingdoms krbtgt DCSync after the recorded 0x20f7/8439 "
         "failures, and return the exact next traversable principal/group/edge plus the Mythic action needed next.",
+        "Analyze next graph hop",
     )
 
 
-def _redirect_stale_gpo_handoff_from_observed_effects(instruction: str, state: dict) -> tuple[str, str] | None:
+def _redirect_stale_gpo_handoff_from_observed_effects(instruction: str, state: dict) -> _HandoffDirective | None:
     """Advance stale GPO handoffs when tool-result effects prove the GPO chain is already past that hop."""
     if not _requests_gpo_domain_admin_add(instruction):
         return None
@@ -6891,7 +7466,7 @@ def _redirect_stale_gpo_handoff_from_observed_effects(instruction: str, state: d
         )) or "the live callback"
         parent = _parent_domain(domain)
         if parent:
-            return (
+            return _handoff_directive(
                 "Mythic_Operator",
                 f"Observed execute_capability results already prove the STARKWALLPAPER/GPO chain is past the "
                 f"GPO hop: `krbtgt-hash:{domain}` is achieved. Do not repeat GPO abuse, Domain Admins "
@@ -6900,41 +7475,46 @@ def _redirect_stale_gpo_handoff_from_observed_effects(instruction: str, state: d
                 f"`target_domain={parent}`, and callback {callback_id}; then issue the returned structured "
                 "commands exactly without editing SID/key/domain fields. Verify administrative control over "
                 f"`{parent}` before any ESSOS trust hop.",
+                "Forge golden ticket",
             )
-        return (
+        return _handoff_directive(
             "Mythic_Operator",
             f"Observed execute_capability results already prove `krbtgt-hash:{domain}` is achieved. Do not "
             "repeat GPO abuse or membership/PAC checks. Replan from the achieved krbtgt hash and execute the "
             "next non-GPO capability toward the objective.",
+            "Advance from krbtgt hash",
         )
 
     for domain, callback_id in sorted(contexts.items()):
         netbios = _netbios_from_domain(domain)
         user = f"{netbios}\\krbtgt" if netbios else f"{domain}\\krbtgt"
-        return (
+        return _handoff_directive(
             "Mythic_Operator",
             f"Observed execute_capability results already prove `kerberos-context:{domain}@callback:{callback_id}`. "
             "Do not repeat STARKWALLPAPER/GPO abuse, Domain Admins membership polling, or PAC refresh. Execute "
             f"NORTH DCSync now from callback {callback_id}: DCSync `{user}` against `{domain}` and record "
             f"`krbtgt-hash:{domain}` from real secret material.",
+            f"DCSync {domain}",
         )
 
     for domain in sorted(_domains_with_effect_prefix(effects, "da:")):
-        return (
+        return _handoff_directive(
             "Mythic_Operator",
             f"Observed execute_capability results already prove `da:{domain}`. Do not repeat STARKWALLPAPER/GPO "
             "abuse or Domain Admins membership polling. Execute `ensure-kerberos-context` for that domain on the "
             "live callback, then proceed to DCSync only after the context effect is recorded.",
+            "Refresh Kerberos context",
         )
 
     system_exec = sorted(_gpo_system_exec_effects(effects))
     if system_exec:
         gpo, domain = system_exec[0]
-        return (
+        return _handoff_directive(
             "Mythic_Operator",
             f"Observed execute_capability results already prove `system-exec:gpo:{gpo}@{domain}`. Do not repeat "
             "the GPO write. Verify/record the durable domain-admin effect if missing, then continue to Kerberos "
             "context refresh and DCSync.",
+            "Verify domain admin effect",
         )
 
     return None
@@ -7064,7 +7644,7 @@ def _parent_domain(domain: str) -> str:
     return ".".join(parts[1:])
 
 
-def _redirect_stale_handoff_after_capability_progress(instruction: str, state: dict) -> tuple[str, str] | None:
+def _redirect_stale_handoff_after_capability_progress(instruction: str, state: dict) -> _HandoffDirective | None:
     """Rewrite stale autonomous handoffs after a capability recorded a new effect.
 
     The supervisor often phrases the next delegation by replaying the previous user prompt. If a just-finished
@@ -7089,7 +7669,7 @@ def _redirect_stale_handoff_after_capability_progress(instruction: str, state: d
                 continue
             netbios = _netbios_from_domain(domain)
             user = f"{netbios}\\krbtgt" if netbios else f"{domain}\\krbtgt"
-            return (
+            return _handoff_directive(
                 "Mythic_Operator",
                 f"Tool-result evidence in this run already recorded `kerberos-context:{domain}@callback:{callback_id}`. "
                 "Do not repeat Domain Admins membership checks, klist/PAC refresh, or C$ proof for that same "
@@ -7099,6 +7679,7 @@ def _redirect_stale_handoff_after_capability_progress(instruction: str, state: d
                 "before ticket forging or any parent/forest hop. If DCSync fails with 8439, fix DN/DC targeting; "
                 "if it fails with 8453 after the recorded Kerberos context, surface that as a rights/context "
                 "blocker instead of re-running the completed Kerberos proof.",
+                f"DCSync {domain}",
             )
 
     return None
