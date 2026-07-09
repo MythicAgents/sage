@@ -43,6 +43,7 @@ _CONFIG_OPTIONS = [
     ChatModelConfigurationOption(
         Name="provider",
         DisplayName="Provider",
+        DisplayAsChip=True,
         Type=OptType.String,
         Description="The model provider to interact with (e.g. anthropic, bedrock, openai, ollama).",
         Required=False,
@@ -85,6 +86,7 @@ _CONFIG_OPTIONS = [
     ChatModelConfigurationOption(
         Name="max_steps",
         DisplayName="Max Steps",
+        DisplayAsChip=True,
         Type=OptType.Number,
         Description="Global cap on model steps for this run; halts a runaway loop. 0 = unlimited.",
         Required=False,

@@ -1345,3 +1345,76 @@ def test_hitl_respond_select_steer_deny_and_carry_text():
         InputResponse = None
     assert resume_decision_for_request(_Bare()) == "deny"                        # default-deny, safe
     assert resume_steer_message_for_request(_Bare()) == ""
+
+
+# --------------------------------------------------------------------------------------
+# Phase 2 header chips — live channel metadata
+# --------------------------------------------------------------------------------------
+
+def test_build_channel_metadata_live_counts(monkeypatch):
+    """The live header chips reflect MCP tool/server counts, session rounds, and BloodHound state."""
+    from sage_chat.metadata import build_channel_metadata
+    from ai import mcp
+
+    monkeypatch.setattr(mcp.MCPManager, "get_tools_summary",
+                        lambda: {"total_tools": 13, "connected_servers": 1}, raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", lambda: ["BloodHound"], raising=False)
+
+    class _M:
+        _global_step_count = 7
+        model = "claude-sonnet-5"
+        mode = "auto"
+        _autonomous_solve = True
+
+    items = {i["key"]: i for i in build_channel_metadata(_M())["items"]}
+    assert items["mcp_tools"]["value"] == 13
+    assert items["mcp_servers"]["value"] == 1
+    assert items["rounds"]["value"] == 7
+    assert items["bloodhound"]["value"] is True
+    assert items["bloodhound"]["display_value"] == "connected"
+    assert "mythic_tools" in items                       # scope-usable Mythic tool count present
+    # Model / Mode / Autonomous render as accented ("info") chips so they stand out from the neutral ones.
+    assert items["cfg_model"]["value"] == "claude-sonnet-5" and items["cfg_model"]["color"] == "info"
+    assert items["cfg_mode"]["value"] == "auto" and items["cfg_mode"]["color"] == "info"
+    assert items["cfg_autonomous"]["display_value"] == "on" and items["cfg_autonomous"]["color"] == "info"
+
+
+def test_scope_usable_mythic_tools_reflects_disabled():
+    """Scope-usable Mythic-tools = the declared universe minus the token's scope-gated tools."""
+    from sage_chat.metadata import scope_usable_mythic_tools, _mythic_tool_universe
+
+    universe = _mythic_tool_universe()
+    assert len(universe) > 0                             # real frontmatter has Mythic tasking tools
+
+    one = next(iter(universe))
+    class _Client:
+        disabled_tools = {one}
+    class _M:
+        mythic_client = _Client()
+    assert scope_usable_mythic_tools(_M()) == len(universe) - 1          # a gated Mythic tool drops the count
+
+    class _Client2:
+        disabled_tools = {"not_a_real_mythic_tool_xyz"}
+    class _M2:
+        mythic_client = _Client2()
+    assert scope_usable_mythic_tools(_M2()) == len(universe)             # gating a non-Mythic name is a no-op
+
+    assert scope_usable_mythic_tools(object()) == len(universe)          # no client → full universe
+
+
+def test_build_channel_metadata_degrades_safely(monkeypatch):
+    """A header must never break a turn: MCP lookups failing → counts fall back to 0/off, no raise."""
+    from sage_chat.metadata import build_channel_metadata
+    from ai import mcp
+
+    def _boom(*a, **k):
+        raise RuntimeError("mcp down")
+
+    monkeypatch.setattr(mcp.MCPManager, "get_tools_summary", _boom, raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", _boom, raising=False)
+
+    items = {i["key"]: i for i in build_channel_metadata(object())["items"]}
+    assert items["mcp_tools"]["value"] == 0
+    assert items["mcp_servers"]["value"] == 0
+    assert items["rounds"]["value"] == 0
+    assert items["bloodhound"]["value"] is False

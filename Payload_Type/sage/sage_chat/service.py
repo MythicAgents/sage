@@ -22,6 +22,7 @@ from mythic_container.logging import logger
 
 from .config import build_model_kwargs
 from .hitl import make_card_emitter, resume_decision_for_request, resume_steer_message_for_request
+from .metadata import build_channel_metadata
 from .models import SAGE_MODELS
 from .session import channel_session_key, get_channel_session, put_channel_session
 from .slash import handle_slash
@@ -167,6 +168,12 @@ class SageChat(Chat):
                 except Exception:
                     logger.warning("request_stop() failed during cancel handling", exc_info=True)
                 raise
+            # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
+            # turn's work is done. Fire-and-forget: a header update must never fail a chat turn.
+            try:
+                await turn.update_channel_metadata(build_channel_metadata(model))
+            except Exception:
+                logger.debug("channel metadata update failed (non-fatal)", exc_info=True)
             if getattr(model, "_hitl_card_pending", False):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.

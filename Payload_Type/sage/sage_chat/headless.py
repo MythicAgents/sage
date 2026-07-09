@@ -29,9 +29,16 @@ class HeadlessSageChat(SageChat):
 
     def __init__(self) -> None:
         self.emissions: list[dict[str, Any]] = []
+        self.channel_metadata_updates: list[dict[str, Any]] = []
 
     def _record(self, kind: str, response_key: str, **fields: Any) -> None:
         self.emissions.append({"kind": kind, "response_key": response_key, **fields})
+
+    async def update_channel_metadata(self, request, channel_metadata):
+        # Capture instead of firing the real Mythic RPC (the base version would hang with no Mythic).
+        # The ChatTurnContext.update_channel_metadata delegates here via self.chat.update_channel_metadata.
+        self.channel_metadata_updates.append(channel_metadata)
+        return None
 
     async def send_streaming(self, request, response_key, content="", metadata=None):
         self._record("streaming", response_key, content=content, metadata=metadata)
