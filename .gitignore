@@ -35,3 +35,5 @@ Payload_Type/sage/evals/results/
 # Sage durable engagement-state ledger (runtime state — never commit)
 .sage_engagement/
 Payload_Type/sage/.trajectory/
+Payload_Type/sage/MEMORY/audit.jsonl
+Payload_Type/sage/Payload_Type/sage/.trajectory/
