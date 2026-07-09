@@ -57,6 +57,7 @@ class ChatStreamEmitter:
         arguments_present: bool = False,
         arguments: str | None = None,
         result_preview: str | None = None,
+        output: str | None = None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
     ) -> bool:
@@ -79,6 +80,11 @@ class ChatStreamEmitter:
             tool_use["arguments"] = arguments
         if result_preview:
             tool_use["result_preview"] = result_preview
+        if output:
+            # Full raw result → Mythic stores it in chat_message.tool_output, strips it from message
+            # metadata, and serves it lazily via "View output" (never in normal subscriptions), so a big
+            # result never inflates the chat message.
+            tool_use["output"] = output
         metadata: dict[str, Any] = {"special_type": "tool_use", "tool_use": tool_use}
         if delegation_id is not None:
             metadata["delegation_id"] = delegation_id

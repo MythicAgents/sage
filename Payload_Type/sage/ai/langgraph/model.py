@@ -1449,14 +1449,25 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                     #      top-level fields. The startswith("error") case is only the last-resort fallback for a
                     #      genuinely unstructured plain-string tool error.
                     errored = getattr(output, "status", None) == "error" or _tool_result_is_error(content_str)
-                    # Show the FULL tool result in the card's Details (Russel's call). Newlines preserved —
-                    # the UI renders result_preview in a <pre>. High backstop only guards against a
-                    # pathological multi-MB payload wedging one chat message; real tool output is far under it.
-                    _CARD_RESULT_CAP = 100_000
-                    preview = content_str if len(content_str) <= _CARD_RESULT_CAP else (
-                        content_str[:_CARD_RESULT_CAP]
-                        + f"\n…[truncated {len(content_str) - _CARD_RESULT_CAP} of {len(content_str)} chars]"
-                    )
+                    # Phase 3 — keep the card lean. Small results stay fully inline as result_preview; large
+                    # ones show a short preview and ship the full raw result via tool_use.output, which Mythic
+                    # stores separately (chat_message.tool_output), strips from metadata, and serves lazily via
+                    # "View output" — so a big result never inflates the chat message / page rendering.
+                    # (`output` here is the ToolMessage; the lazy full result is `full_output`.)
+                    _INLINE_CAP = 4000
+                    _OUTPUT_CAP = 1_000_000  # 1 MB DB backstop on lazy output; real tool output is far under
+                    if len(content_str) <= _INLINE_CAP:
+                        preview = content_str
+                        full_output = None
+                    else:
+                        preview = (
+                            content_str[:_INLINE_CAP]
+                            + f"\n…[{len(content_str):,} chars total — open “View output” for the full result]"
+                        )
+                        full_output = content_str if len(content_str) <= _OUTPUT_CAP else (
+                            content_str[:_OUTPUT_CAP]
+                            + f"\n…[truncated {len(content_str) - _OUTPUT_CAP:,} of {len(content_str):,} chars]"
+                        )
                     try:
                         await self._tool_use_func(
                             tool_call_id=output.tool_call_id,
@@ -1466,6 +1477,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                             arguments_present=bool(self._tool_call_to_args.get(output.tool_call_id)),
                             arguments=self._tool_call_to_args.get(output.tool_call_id),
                             result_preview=preview,
+                            output=full_output,
                             delegation_id=self.delegation_id,
                             delegation_name=self.delegation_name,
                         )
@@ -1800,6 +1812,7 @@ class Model:
         arguments_present: bool = False,
         arguments: Any = None,
         result_preview: str | None = None,
+        output: str | None = None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
     ) -> None:
@@ -1807,6 +1820,7 @@ class Model:
 
         The card's `content` (rendered in the UI Details) carries the tool REQUEST — the tool name and
         its arguments — so the operator sees what was called alongside the `result_preview` response.
+        `output`, when set, is the full raw result shipped lazily (Mythic's "View output").
         """
         emitter = self._response_emitter
         if emitter is None or not hasattr(emitter, "emit_tool_use"):
@@ -1845,6 +1859,7 @@ class Model:
                 arguments_present=arguments_present or bool(args_str),
                 arguments=args_str or None,
                 result_preview=result_preview,
+                output=output,
                 delegation_id=delegation_id,
                 delegation_name=delegation_name,
             )

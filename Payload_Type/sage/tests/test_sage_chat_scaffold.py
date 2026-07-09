@@ -179,6 +179,35 @@ def test_emit_tool_use_produces_tool_use_card():
     assert "delegation_name" not in tool_use
 
 
+def test_emit_tool_use_ships_full_output_lazily():
+    """Large result: result_preview holds a short preview; tool_use.output carries the full raw result
+    (Mythic serves that lazily via 'View output', so it never inflates the chat message)."""
+    chat = HeadlessSageChat()
+    emitter = ChatStreamEmitter(chat, build_chat_request("x"))
+    assert _run(emitter.emit_tool_use(
+        tool_call_id="call_9", tool_name="get_task_history_for_callback", tool_source="mythic",
+        status="completed", content="finished", complete=True,
+        result_preview="preview…[View output]", output="FULL RAW RESULT " * 500,
+    )) is True
+    tool_use = chat.emissions[-1]["metadata"]["tool_use"]
+    assert tool_use["result_preview"] == "preview…[View output]"
+    assert tool_use["output"].startswith("FULL RAW RESULT")
+
+
+def test_emit_tool_use_small_result_has_no_lazy_output():
+    """Small result stays fully inline (result_preview) with no separate lazy output field."""
+    chat = HeadlessSageChat()
+    emitter = ChatStreamEmitter(chat, build_chat_request("x"))
+    assert _run(emitter.emit_tool_use(
+        tool_call_id="call_1", tool_name="whoami", tool_source="mythic",
+        status="completed", content="done", complete=True,
+        result_preview="CORP\\kevin", output=None,
+    )) is True
+    tool_use = chat.emissions[-1]["metadata"]["tool_use"]
+    assert tool_use["result_preview"] == "CORP\\kevin"
+    assert "output" not in tool_use          # nothing lazy for a small result
+
+
 def test_emit_subagent_status_produces_subagent_card():
     chat = HeadlessSageChat()
     req = build_chat_request("x")
