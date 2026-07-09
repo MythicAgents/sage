@@ -137,11 +137,26 @@ uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skil
 The wipe waits 10 seconds before its first verification poll, then polls every 5 seconds until
 `available-domains: count=0`. Do not run a separate immediate status check.
 
+After a target-scope collection on a GOAD-style cross-forest range, use the read-only bridge probe before
+blaming Sage for an empty frontier:
+
+```bash
+uv --directory /home/john/dev/bloodhound_mcp run python \
+  /home/john/dev/sage/skills/sage-goad-reset/scripts/check_cross_forest_laps_bridge.py \
+  --source-domain <controlled-root-domain> \
+  --target-domain <trusted-target-domain>
+```
+
+The probe mirrors Sage's reconciler shape: `User -> MemberOf* -> principal -> ReadLAPSPassword -> Computer`.
+It fails closed when the current BloodHound graph has no cross-forest managed-secret bridge and intentionally
+does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
+
 ## Bundled Scripts
 
 - `_sage_relaunch.py`
 - `archive_runtime_dbs.py`
 - `bh_reset.py`
+- `check_cross_forest_laps_bridge.py`
 - `liveness.py`
 - `ludus.py`
 - `mcp_check.py`
