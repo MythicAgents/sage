@@ -40,7 +40,7 @@ except Exception:
 
 @dataclass
 class Config:
-    sage_cb: int = 1
+    sage_cb: int | None = None  # legacy payload path only
     apollo_cb: int = 4
     engagement_op: str = "Operation_Chimera_1"
     max_steps: int = 0          # 0 = UNLIMITED steps for the bare model (parity with Sage's solve)
@@ -191,7 +191,7 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
             solve = live_seams.make_headless_solver(client, engagement_id=_eng,
                                                     timeout=cfg.solve_timeout, max_steps=0)
         else:
-            solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
+            solve = live_seams.make_native_chat_solver(client, timeout=cfg.solve_timeout)
         _start = time.time()
         _deadline = _start + cfg.solve_timeout
         print(f"[harness/{scenario_name}] started {time.strftime('%H:%M:%S', time.localtime(_start))} · "
@@ -230,6 +230,10 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
            "card": asdict(card)}
+    native_result = getattr(locals().get("solve"), "last_result", None)
+    if isinstance(native_result, dict):
+        rec["chat_channel_id"] = native_result.get("chat_channel_id")
+        rec["chat_request_id"] = native_result.get("chat_request_id")
     p = cfg.results_path
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:

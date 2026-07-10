@@ -26,6 +26,26 @@ from typing import Any, Callable
 DirectProbe = Callable[[], bool]
 
 
+def _resolve_mythic_password() -> str:
+    password = os.environ.get("MYTHIC_ADMIN_PASSWORD")
+    if password:
+        return password
+    candidates = [
+        Path(os.environ["MYTHIC_ENV_PATH"]).expanduser()
+        if os.environ.get("MYTHIC_ENV_PATH")
+        else None,
+        Path("/home/john/dev/mythic_v4/.env"),
+        Path("/home/john/dev/mythic/.env"),
+    ]
+    for path in (candidate for candidate in candidates if candidate is not None):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("MYTHIC_ADMIN_PASSWORD="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    raise RuntimeError("Mythic password not found; set MYTHIC_ADMIN_PASSWORD or MYTHIC_ENV_PATH")
+
+
 # ---------------------------------------------------------------------------------------------------
 # PURE helpers (unit-tested) — the error-prone parsing the seams depend on.
 # ---------------------------------------------------------------------------------------------------
@@ -95,17 +115,13 @@ def make_model_fn(
 def default_mythic_client():
     """Log in to local Mythic the way sage_task.py does (validated path)."""
     from mythic import mythic  # type: ignore
-    import os
-    from pathlib import Path
-
-    pw = os.environ.get("MYTHIC_ADMIN_PASSWORD")
-    if not pw:
-        env = Path("/home/john/dev/mythic/.env")  # FILL IN if your Mythic .env lives elsewhere
-        for line in (env.read_text(encoding="utf-8").splitlines() if env.exists() else []):
-            if line.strip().startswith("MYTHIC_ADMIN_PASSWORD="):
-                pw = line.split("=", 1)[1].strip().strip("'\"")
-                break
-    return asyncio.run(mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw))
+    return asyncio.run(
+        mythic.login(
+            server_ip="127.0.0.1",
+            username="mythic_admin",
+            password=_resolve_mythic_password(),
+        )
+    )
 
 
 def make_tool_executor(
@@ -226,15 +242,12 @@ def apollo_command_catalog(*, timeout: int = 60) -> list:
     VALIDATED 2026-06-18: returns the real Apollo command set (shell, run, mimikatz, ticket_*, ...)."""
     from mythic import mythic  # type: ignore
 
-    pw = os.environ.get("MYTHIC_ADMIN_PASSWORD")
-    if not pw:
-        env = Path("/home/john/dev/mythic/.env")
-        for line in (env.read_text(encoding="utf-8").splitlines() if env.exists() else []):
-            if line.startswith("MYTHIC_ADMIN_PASSWORD="):
-                pw = line.split("=", 1)[1].strip().strip("'\"")
-
     async def _q():
-        client = await mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw)
+        client = await mythic.login(
+            server_ip="127.0.0.1",
+            username="mythic_admin",
+            password=_resolve_mythic_password(),
+        )
         query = ('query Cmds {command(where:{payloadtype:{name:{_eq:"apollo"}}}) {cmd description}}')
         return (await mythic.execute_custom_query(client, query)).get("command", [])
 
@@ -300,13 +313,13 @@ def bloodhound_cypher(query: str, *, timeout: int = 60) -> list:
 def _mythic_login():
     """Log in to local Mythic (shared by the Mythic-side seams). Returns a client."""
     from mythic import mythic  # type: ignore
-    pw = os.environ.get("MYTHIC_ADMIN_PASSWORD")
-    if not pw:
-        env = Path("/home/john/dev/mythic/.env")
-        for line in (env.read_text(encoding="utf-8").splitlines() if env.exists() else []):
-            if line.startswith("MYTHIC_ADMIN_PASSWORD="):
-                pw = line.split("=", 1)[1].strip().strip("'\"")
-    return asyncio.run(mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw))
+    return asyncio.run(
+        mythic.login(
+            server_ip="127.0.0.1",
+            username="mythic_admin",
+            password=_resolve_mythic_password(),
+        )
+    )
 
 
 def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_steps: int = 0):
@@ -370,6 +383,29 @@ def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int =
             timeout=timeout, max_steps=max_steps,
         ))
 
+    return solve
+
+
+def make_native_chat_solver(client: Any, *, timeout: int = 1800, poll_interval: float = 5.0):
+    """Run one autonomous objective through a fresh locked Mythic v4 Sage chat channel."""
+    scripts = Path(__file__).resolve().parents[4] / "skills" / "sage-live-runner" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from native_chat import run_native_chat_turn
+
+    def solve(objective: str) -> str:
+        result = asyncio.run(
+            run_native_chat_turn(
+                client,
+                objective,
+                timeout_seconds=timeout,
+                poll_interval_seconds=poll_interval,
+            )
+        )
+        solve.last_result = result
+        return str(result.get("status") or "completed")
+
+    solve.last_result = None
     return solve
 
 
@@ -885,10 +921,8 @@ def ad_domain_admins_probe_via_reader(reader: Callable[[str], set], domain: str,
 async def _mythic_login_async_safe():
     """Async Mythic login for use inside an already-async probe body."""
     from mythic import mythic  # type: ignore
-    pw = os.environ.get("MYTHIC_ADMIN_PASSWORD")
-    if not pw:
-        env = Path("/home/john/dev/mythic/.env")
-        for line in (env.read_text(encoding="utf-8").splitlines() if env.exists() else []):
-            if line.startswith("MYTHIC_ADMIN_PASSWORD="):
-                pw = line.split("=", 1)[1].strip().strip("'\"")
-    return await mythic.login(server_ip="127.0.0.1", username="mythic_admin", password=pw)
+    return await mythic.login(
+        server_ip="127.0.0.1",
+        username="mythic_admin",
+        password=_resolve_mythic_password(),
+    )

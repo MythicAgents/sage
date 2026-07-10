@@ -15,6 +15,7 @@ is to use ``run_chat_turn`` correctly and never swallow ``CancelledError``.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from mythic_container.ChatBase import Chat, ChatRequest
@@ -33,6 +34,10 @@ class SageChat(Chat):
     name = "sage"
     description = "Sage — AI red-team operator assistant (native Mythic v4.0.0 chat container)."
     semver = "4.0.0"
+    # rc5: the chat container's service icon (light + dark). Only sage.svg exists today, so it serves both
+    # until a dedicated dark variant lands. Path is resolved from this module (…/sage_chat/) up to the sage root.
+    agent_icon_path = str(Path(__file__).resolve().parent.parent / "sage.svg")
+    dark_mode_agent_icon_path = str(Path(__file__).resolve().parent.parent / "sage.svg")
     models = SAGE_MODELS
 
     async def _ensure_bloodhound_connected(self) -> None:

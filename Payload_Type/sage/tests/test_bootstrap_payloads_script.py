@@ -285,7 +285,12 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
         return {"ready": True}
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
@@ -307,7 +312,6 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("import", {"uuid": "payload-uuid", "key": "secret"}),
         ("preflight", 180, 60.0),
     ]
@@ -352,7 +356,12 @@ def test_bootstrap_reset_imports_retained_merlin_without_creating_apollo(
         raise AssertionError("Apollo post-callback preflight must be skipped")
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
@@ -374,7 +383,6 @@ def test_bootstrap_reset_imports_retained_merlin_without_creating_apollo(
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("import", {
             "uuid": "payload-uuid",
             "key": "secret",
@@ -438,7 +446,12 @@ def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_c
         raise AssertionError("Baked Apollo import must be opt-in")
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fake_create_apollo)
@@ -459,7 +472,6 @@ def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_c
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("apollo", None),
         ("download", "/payloads"),
     ]
@@ -728,10 +740,15 @@ def test_callback_readiness_selects_fresh_live_sage_and_castelblack_apollo():
         9: {"alive": True, "reason": "fresh"},
     }
 
-    status = bootstrap_payloads.summarize_callback_readiness(callbacks, liveness)
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
 
     assert status["ready"] is True
-    assert status["selected_sage_cb"] == 7
+    assert status["selected_sage_cb"] is None
+    assert status["selected_chat_container_id"] == 1
     assert status["selected_foothold_cb"] == 9
     assert status["selected_apollo_cb"] == 9
 
@@ -770,11 +787,12 @@ def test_callback_readiness_selects_merlin_when_requested():
         callbacks,
         liveness,
         foothold_payload_type="merlin",
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
     )
 
     assert status["ready"] is True
     assert status["foothold_payload_type"] == "merlin"
-    assert status["selected_sage_cb"] == 1
+    assert status["selected_sage_cb"] is None
     assert status["selected_foothold_cb"] == 2
     assert status["selected_apollo_cb"] is None
 

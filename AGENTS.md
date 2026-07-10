@@ -1,6 +1,6 @@
 # Sage Codex Session Guide
 
-This repo is the Sage Mythic payload: an AI/LangGraph interface that operates Mythic callbacks, BloodHound, and MCP tools. The August 2026 demo target is an autonomous GOAD "Trust Walker" solve: starting from an assumed-breach callback on CASTELBLACK as `north\samwell.tarly`, Sage should reason over BloodHound and execute the path to Domain Admin / cross-forest compromise.
+This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that operates Mythic callbacks, BloodHound, and MCP tools. The August 2026 demo target is an autonomous GOAD "Trust Walker" solve: starting from an assumed-breach callback on CASTELBLACK as `north\samwell.tarly`, Sage should reason over BloodHound and execute the path to Domain Admin / cross-forest compromise.
 
 ## Start Here
 
@@ -22,6 +22,7 @@ Historical markdown that is not part of the current minimal handoff lives under 
 - `Payload_Type/sage/ai/langgraph/engagement_state.py`: STRIPS-like techniques, effects, preconditions, planner candidates, rendered state.
 - `Payload_Type/sage/ai/langgraph/graph_reconciler.py`: BloodHound graph facts projected into engagement predicates.
 - `Payload_Type/sage/ai/langgraph/access_reconciler.py`: Mythic callback/liveness projected into footholds.
+- `Payload_Type/sage/sage_chat/`: native Mythic v4 chat container, request lifecycle, config, streaming, and sessions.
 - `Payload_Type/sage/ai/langgraph/intent_classifier.py`: maps Mythic tool calls to modeled engagement techniques.
 - `Payload_Type/sage/container/agent_functions/query.py`: one-shot Mythic command; auto-connects BloodHound before graph construction.
 - `Payload_Type/sage/container/agent_functions/chat.py`: interactive/sessionful Mythic command; supports `mode=auto|supervised`.
@@ -68,7 +69,8 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
   `SKILL.md`. `Plans/` is for minimal current planning/handoff markdown plus archived historical notes.
 - Preserve user changes; do not reset, checkout, or revert unrelated files.
 - Do not start expensive live GOAD/inference runs without clear user intent. A full autonomous solve can take ~25 minutes and depends on external lab state.
-- Always re-discover live callback IDs after lab resets. Historical IDs in Plans are examples, not truth.
+- Always re-discover live payload callback IDs after lab resets. Sage itself uses a fresh chat channel, not a callback.
+- Prefer single-line shell commands in operator instructions. Avoid backslash-continued commands when one line is practical.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
 - If touching autonomous execution, run focused tests plus the full offline suite.
 - High-risk Sage architecture work must pass the architecture governor before edits. Use
@@ -114,11 +116,10 @@ Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
 
 - Use `skills/sage-goad-reset` for the clean GOAD/Ludus/BloodHound/Sage rehearsal reset and readiness preflight.
 - `$sage-goad-reset full reset` means the complete workflow: archive Sage/Phoenix, reset Mythic, roll back GOAD,
-  wipe BloodHound, restart local Sage, and generate fresh Sage/Apollo payloads. Do not interpret it as Ludus-only.
-- Use `skills/sage-callback-bootstrap` after Mythic reset to import the retained baked-Apollo callback config when
-  available, create a fresh Sage callback, and rediscover live callback IDs. It falls back to a fresh Apollo
-  build/download until the baked callback workflow is configured.
-- Use `skills/sage-live-runner` for guided solves, verbose Sage tasking, monitoring, and inspection.
+  wipe BloodHound, restart local Sage chat, and generate a fresh Apollo payload. Do not interpret it as Ludus-only.
+- Use `skills/sage-callback-bootstrap` after Mythic reset to verify the Sage chat container and establish the
+  Apollo or retained foothold callback.
+- Use `skills/sage-live-runner` for native chat solves, request monitoring, and inspection.
 - Use `skills/sage-focused-capability-tests` for narrow capability/adaptor validation.
 - Use `skills/sage-trace-analysis` for Phoenix/Mythic/log analysis.
 - Use `skills/sage-trajectory-learning` for corpus manifests, transition export, and repair-policy replay.
@@ -127,7 +128,7 @@ Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
 
 Do not store lab passwords in skills or copied helper scripts. Prefer session environment variables, local gitignored
 `.env` files owned by each tool, or an OS keychain/secret manager. Current Mythic-facing reset helpers should resolve
-`MYTHIC_ADMIN_PASSWORD` from the environment first and `/home/john/dev/mythic/.env` second.
+`MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, and the legacy v3 `.env`.
 
 Use this order for clean GOAD/BloodHound/Mythic rehearsal setup. Mythic is Docker-backed, but Sage runs locally
 in tmux throughout current development.
@@ -147,12 +148,10 @@ in tmux throughout current development.
    RAM-backed snapshots can restore guests with clocks days apart.
 4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
    `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp`.
-5. **Create fresh Sage and Apollo payloads.** Run
-   `skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It creates Sage first so Sage
-   receives callback display ID `1` on a clean Mythic database, then builds/downloads a fresh Apollo payload for
-   the clean-baseline workflow. The old baked callback import is legacy-only behind `--use-baked-apollo`.
-6. **Establish callbacks.** The fresh Sage payload establishes its callback immediately. Open an active RDP
-   session as `NORTH\samwell.tarly` on CASTELBLACK, then stage/launch the fresh Apollo payload with
+5. **Verify Sage chat and create Apollo.** Run
+   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It requires
+   a running Sage chat container and builds/downloads a fresh Apollo payload. It does not create Sage payloads.
+6. **Establish the foothold callback.** Open an active RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then stage/launch the fresh Apollo payload with
    `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
    `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged
    bootstrap payload file, which defaults to `C:\Users\Public\apollo.exe`; clean-baseline Defender otherwise
@@ -162,11 +161,10 @@ in tmux throughout current development.
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight`; it
    waits for the live Samwell Apollo callback, synchronizes clocks, purges stale Kerberos tickets, and verifies
    UTC/domain/identity output.
-8. **Only then rediscover callbacks and run Sage.** After DB archival and Sage restart, run
+8. **Only then rediscover Apollo and run Sage.** After DB archival and Sage restart, run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
-   preflight; it must show `ready: true`. Then use `.venv/bin/python skills/sage-live-runner/scripts/sage_task.py callbacks`; identify
-   the live fresh Sage and Apollo callback display IDs; then run
-   `SAGE_CB=<sage_cb> APOLLO_CB=<apollo_cb> .venv/bin/python skills/sage-live-runner/scripts/run_essos_da.py`.
+   preflight; it must show `ready: true`. Then run
+   `.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400`.
 
 The GOAD and BloodHound reset helpers below are still used for lab state, but they do not replace the Mythic
 payload/callback lifecycle above.
@@ -235,7 +233,7 @@ Concrete next sequence:
    boundary.
 2. Add deterministic guards/tests so a capability cannot record achieved effects from off-agent target I/O or
    off-agent compromise primitives.
-3. Run one measured clean one-shot GOAD solve using `skills/sage-live-runner/scripts/run_essos_da.py` only after
+3. Run one measured clean one-shot GOAD solve using `skills/sage-live-runner/scripts/native_chat.py` only after
    the boundary fix is in place. Inspect Phoenix/decoded Mythic output, ledger rows, repeated tool calls, skips,
    failures, and the final proof chain.
 4. Reset GOAD/BloodHound/Mythic to a clean state and repeat until the guided one-shot reliably reaches verified

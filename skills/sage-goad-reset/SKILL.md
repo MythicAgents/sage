@@ -17,8 +17,8 @@ In Codex, use:
 $sage-goad-reset full reset
 ```
 
-Treat `full reset`, `reset everything`, or an equivalent request as the entire workflow below, including fresh
-Sage/Apollo creation and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
+Treat `full reset`, `reset everything`, or an equivalent request as the entire workflow below, including Sage
+chat verification, fresh Apollo creation, and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
 must be requested explicitly as a range-only or GOAD-only reset.
 
 ## Order
@@ -57,15 +57,13 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-   This creates Sage first, then builds/downloads a fresh Apollo payload for the clean-baseline workflow. On a
-   clean Mythic database, Sage is callback `1`.
+   This verifies the running Sage chat container, then builds/downloads a fresh Apollo payload for the
+   clean-baseline workflow. It does not create a Sage payload or callback.
 
    For an intentional retained foothold reuse such as the current Merlin R-C2 flow, replace that command with:
 
 ```bash
-.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset \
-  --use-retained-callback \
-  --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset --use-retained-callback --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
 ```
 
    This imports the exported callback config and stops before target-side payload execution. After the operator
@@ -84,7 +82,8 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 
    This waits for the live Samwell Apollo callback, synchronizes range clocks, purges stale Kerberos tickets, and
    verifies UTC/domain/identity output. Treat any nonzero exit as a reset failure.
-9. Rediscover callback IDs. Never trust historical IDs.
+9. Rediscover the Apollo callback ID. Never trust historical IDs. The Sage solve uses a fresh chat channel, not
+   a callback.
 
 ## GOAD
 

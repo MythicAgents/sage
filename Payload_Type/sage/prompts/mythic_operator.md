@@ -1,6 +1,7 @@
 ---
 name: Mythic_Operator
 color: "#3B82F6"   # sub-agent card color (CSS text: #RRGGBB or named).
+icon: "user-secret"   # sub-agent card icon (Font-Awesome name, rc5).
 description: Drives ALL Mythic C2 operations and in-memory offensive tradecraft; consults the TTP library.
 variables:
   - name: commands_text

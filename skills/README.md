@@ -11,10 +11,10 @@ operational tooling (per `CLAUDE.md` / `AGENTS.md`); do **not** put helper scrip
 | Skill | Purpose | Primary entry |
 |-------|---------|---------------|
 | **sage-goad-reset** | Full GOAD lab reset + readiness: archive Sage/Phoenix runtime DBs, reset Docker-Mythic, reset/verify Ludus GOAD, wipe/check BloodHound, restart local Sage, preflight before a solve. | `scripts/sage_restart.sh`, `scripts/archive_runtime_dbs.py`, `scripts/ludus.py`, `scripts/bh_reset.py` |
-| **sage-callback-bootstrap** | Post-Mythic-reset Sage/foothold callback bootstrap: create fresh Sage/Apollo payloads, import retained foothold configs such as Merlin, run callback readiness, rediscover live callback IDs. | `scripts/bootstrap_payloads.py` |
+| **sage-callback-bootstrap** | Post-Mythic-reset Sage chat/foothold bootstrap: verify native chat, create Apollo or import retained footholds, run readiness, rediscover Apollo. | `scripts/bootstrap_payloads.py` |
 | **sage-mythic-payload-deploy** | Download a built Mythic payload and stage/launch it on a Ludus Windows host over WinRM, including the clean-baseline interactive Samwell Apollo path. | `scripts/deploy_payload_via_ludus.py` |
-| **sage-live-runner** | Live Sage runs/tasking/monitoring: verbose `query`/`chat`/`state`, guided GOAD solve, inspect/monitor/resume a solve, restart the Sage process. | `scripts/run_solve.py`, `scripts/sage_task.py`, `scripts/monitor_solve.py`, `scripts/run_essos_da.py` |
-| **sage-eval-gauge** | Ground-truthed capability gauge + hill-climb / Gate Experiment runner (bare-vs-harness, noise floor / MDE). The "is config A better than B?" instrument. | `scripts/orchestrate.py` (+ `Payload_Type/sage/ai/hillclimb/`) |
+| **sage-live-runner** | Native Mythic v4 Sage chat runs and monitoring with a fresh locked channel per one-shot solve. | `scripts/native_chat.py` |
+| **sage-eval-gauge** | Reset-per-seed, ground-truthed native-chat capability gauge and five-seed one-shot proof. | `scripts/orchestrate.py` (+ `Payload_Type/sage/ai/hillclimb/`) |
 | **sage-focused-capability-tests** | Narrow live/semi-live smoke tests for one capability/adapter (ADCS / DCSync / GPO / LAPS / Kerberos) before burning a full autonomous run. | `scripts/build_capability_smoke.py`, `scripts/run_focused_*.py` |
 | **sage-trace-analysis** | Read-only forensics: mine historical failures, inspect Phoenix spans, backfill task IDs, audit solve steps, diagnose ingestion/file/output behavior. | `scripts/mine_failures.py`, `scripts/step_audit.py` |
 | **sage-trajectory-learning** | Convert retained runs into normalized `state → action → observation → verifier → repair` records; label repeated blocker classes; replay repair-policy decisions. | see `SKILL.md` (module CLI) |

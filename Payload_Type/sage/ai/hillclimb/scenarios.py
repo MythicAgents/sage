@@ -63,12 +63,7 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
         Scenario(
             name="cross-forest-objective",
             engagement_id=engagement_id,
-            # Phrased so engagement_state._objective_target_domains parses the target ("administrative control
-            # of {OBJECTIVE}") — this gives completion-recognition the STRONG target-matched path instead of
-            # the weaker no-next-hop fallback (the "the objective domain X" wrapper did not parse; preflight
-            # flagged it). Mirrors the child-da phrasing that validated objective_clean_stop=true.
-            objective=(f"From the CASTELBLACK foothold, achieve administrative control of {OBJECTIVE} "
-                       f"(cross-forest from {CHILD} via {PARENT})."),
+            objective=f"From the current foothold, achieve administrative control of {OBJECTIVE}.",
             domains=_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=tuple(m for m in Milestone if m != Milestone.CERT_FORGED),

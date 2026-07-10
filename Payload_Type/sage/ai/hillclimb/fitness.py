@@ -107,13 +107,10 @@ class ScoreCard:
     objective_clean_stop: bool = False
 
 
-# Terminal status that means Sage genuinely RECOGNIZED objective completion — set by query.py ONLY when the
-# autonomous solve streamed the objective-completion report (`_objective_completion_report_streamed`), NOT the
-# platform-default "success"/"stopped" that any non-error finish (step-limit, wandered, operator stop) lands
-# on. Gating objective_clean_stop on this — together with the independent out-of-band ground-truth check —
-# is what makes the signal Goodhart-safe: it requires BOTH that the objective is really met (probes) AND that
-# Sage recognized it (this status). A run that reaches the objective but churns/step-limits does NOT qualify.
-_CLEAN_TERMINAL_STATUSES = {"objective-recognized"}
+# Native Mythic v4 chat requests are one-shot: a completed request is terminal. The independent objective
+# probes remain the ground-truth half of this signal, so a completed chat turn that did not achieve the
+# objective still earns no clean-stop credit. Keep the legacy payload status for historical reports.
+_CLEAN_TERMINAL_STATUSES = {"objective-recognized", "complete", "completed"}
 
 
 def _f(record: dict, key: str, default: float = 0.0) -> float:

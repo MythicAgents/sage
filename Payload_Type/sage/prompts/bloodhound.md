@@ -1,6 +1,7 @@
 ---
 name: BloodHound
 color: "#E5484D"   # sub-agent card color (CSS text: #RRGGBB or named). Red for BloodHound.
+icon: "dog"        # sub-agent card icon (Font-Awesome name, rc5).
 description: Dedicated BloodHound agent — owns the BloodHound graph lifecycle (ingest a collection, verify it, then query attack paths) via the BloodHound MCP server.
 # NOTE: the BloodHound MCP server's tools (file_upload, domain_info, data_quality, graph_analysis,
 # cypher_query, user_info, group_info, computer_info, ou_info, gpo_info, adcs_info, custom_nodes,

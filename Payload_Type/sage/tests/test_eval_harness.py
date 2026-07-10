@@ -421,7 +421,7 @@ def test_score_answer_truth_table():
 def test_cases_yaml_loads_and_validates():
     data = harness.load_cases(Path(__file__).resolve().parents[1] / "evals" / "cases.yaml")
 
-    assert data["sage_cb"] == 15
+    assert "sage_cb" not in data
     # apollo_cb is a live callback id that churns as the foothold is re-established
     # (cb17→18→19→20…); assert it's a valid id, not a transient literal.
     assert isinstance(data["apollo_cb"], int) and data["apollo_cb"] > 0
@@ -683,7 +683,6 @@ def test_compare_tolerates_null_pass_fraction(tmp_path):
     report = harness.build_report_v2(
         "a",
         "b",
-        15,
         2,
         [
             {
@@ -739,15 +738,15 @@ def test_variance_aware_compare_reports_noise_significance_and_v1_compat(tmp_pat
     significant_path = tmp_path / "significant.json"
     v1_path = tmp_path / "v1.json"
     within_path.write_text(
-        json.dumps(harness.build_report_v2("a", "b", 15, 2, [within_a])),
+        json.dumps(harness.build_report_v2("a", "b", 2, [within_a])),
         encoding="utf-8",
     )
     within_new_path.write_text(
-        json.dumps(harness.build_report_v2("a", "b", 15, 2, [within_b])),
+        json.dumps(harness.build_report_v2("a", "b", 2, [within_b])),
         encoding="utf-8",
     )
     significant_path.write_text(
-        json.dumps(harness.build_report_v2("a", "b", 15, 2, [significant_b])),
+        json.dumps(harness.build_report_v2("a", "b", 2, [significant_b])),
         encoding="utf-8",
     )
     v1_path.write_text(
@@ -916,9 +915,11 @@ def test_runner_offline_with_mocked_mythic_and_phoenix(tmp_path, monkeypatch):
             "answer_snippet",
             "tool_outputs_chars",
             "tool_outputs_snippet",
-            "trace_ids",
-            "spans",
-        }
+                "trace_ids",
+                "spans",
+                "chat_channel_id",
+                "chat_request_id",
+            }
         assert seed_record["passed"]
         assert seed_record["total_tokens"] == 42
         assert seed_record["answer_full"] == "samwell found"

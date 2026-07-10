@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Bootstrap Sage and foothold callbacks after a Mythic reset.
+"""Verify Sage native chat and bootstrap the foothold after a Mythic reset.
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
 active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
-this helper creates fresh Sage/Apollo payloads before Apollo is launched on CASTELBLACK.
+this helper verifies native Sage chat and creates Apollo before it is launched on CASTELBLACK.
 Retained callback configs can be imported explicitly for any foothold payload type. The
 older baked-Apollo flow remains available behind --use-baked-apollo.
 
@@ -41,7 +41,14 @@ if str(LANGGRAPH_ROOT) not in sys.path:
 from mythic_tools import assess_callback_liveness  # noqa: E402
 
 
-MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
+MYTHIC_ENV_PATH = Path(
+    os.environ.get("MYTHIC_ENV_PATH")
+    or (
+        "/home/john/dev/mythic_v4/.env"
+        if Path("/home/john/dev/mythic_v4/.env").exists()
+        else "/home/john/dev/mythic/.env"
+    )
+)
 SKILL_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
@@ -81,6 +88,22 @@ query ActiveCallbacks {
     user
     active
     payload { payloadtype { name } }
+  }
+}
+"""
+
+CHAT_CONTAINER_QUERY = """
+query SageChatContainers {
+  consuming_container(
+    where: {name: {_eq: "sage"}, type: {_eq: "chat"}, deleted: {_eq: false}}
+    order_by: {id: desc}
+  ) {
+    id
+    name
+    type
+    container_running
+    deleted
+    updated_at
   }
 }
 """
@@ -141,7 +164,7 @@ def resolve_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
     raise RuntimeError(
-        "Set MYTHIC_ADMIN_PASSWORD or provide /home/john/dev/mythic/.env with MYTHIC_ADMIN_PASSWORD."
+        f"Set MYTHIC_ADMIN_PASSWORD or provide {env_path} with MYTHIC_ADMIN_PASSWORD."
     )
 
 
@@ -364,6 +387,7 @@ def summarize_callback_readiness(
     liveness_by_display_id: dict[int, dict[str, Any]],
     *,
     foothold_payload_type: str = "apollo",
+    chat_containers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     foothold_payload_type = str(foothold_payload_type or "").strip().casefold()
     if not foothold_payload_type:
@@ -383,9 +407,10 @@ def summarize_callback_readiness(
             "liveness_reason": live.get("reason"),
         })
 
-    live_sage = [
-        row for row in rows
-        if row["payloadtype"] == "sage" and row["live"]
+    live_chat = [
+        row
+        for row in (chat_containers or [])
+        if row.get("container_running") and not row.get("deleted")
     ]
     live_foothold = [
         row for row in rows
@@ -396,14 +421,16 @@ def summarize_callback_readiness(
     ]
     selected_foothold_cb = max((row["display_id"] for row in live_foothold), default=None)
     return {
-        "ready": bool(live_sage and live_foothold),
+        "ready": bool(live_chat and live_foothold),
         "callbacks": rows,
-        "selected_sage_cb": max((row["display_id"] for row in live_sage), default=None),
+        "selected_sage_cb": None,
+        "chat_containers": live_chat,
+        "selected_chat_container_id": live_chat[0].get("id") if live_chat else None,
         "foothold_payload_type": foothold_payload_type,
         "selected_foothold_cb": selected_foothold_cb,
         "selected_apollo_cb": selected_foothold_cb if foothold_payload_type == "apollo" else None,
         "required": (
-            "fresh live sage callback plus live "
+            "running Sage chat container plus live "
             f"{foothold_payload_type} callback on CASTELBLACK as samwell.tarly"
         ),
     }
@@ -417,7 +444,12 @@ async def login(args: argparse.Namespace):
 async def inspect(client) -> dict[str, Any]:
     schemas = await mythic.execute_custom_query(client, BOOTSTRAP_SCHEMA_QUERY)
     callbacks = await mythic.execute_custom_query(client, CALLBACK_QUERY)
-    return {"schemas": schemas, "callbacks": callbacks.get("callback", [])}
+    chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+    return {
+        "schemas": schemas,
+        "callbacks": callbacks.get("callback", []),
+        "chat_containers": chat.get("consuming_container", []),
+    }
 
 
 async def resolve_agent_callback_id(client, selector: str) -> str:
@@ -481,7 +513,7 @@ async def readiness(
         display_id = callback.get("display_id")
         if not isinstance(display_id, int):
             continue
-        if payload_type_name(callback).lower() not in {"sage", foothold_payload_type}:
+        if payload_type_name(callback).lower() != foothold_payload_type:
             continue
         try:
             liveness_by_display_id[display_id] = await assess_callback_liveness(client, display_id)
@@ -493,13 +525,14 @@ async def readiness(
         observed.get("callbacks", []),
         liveness_by_display_id,
         foothold_payload_type=foothold_payload_type,
+        chat_containers=observed.get("chat_containers", []),
     )
     blockers = []
     if not runtime["ready"]:
         blockers.append("archive stale Sage/Phoenix runtime DBs before restarting Sage")
     if not callbacks["ready"]:
         blockers.append(
-            f"fresh live Sage and {foothold_payload_type} callbacks are not both present"
+            f"running Sage chat container and live {foothold_payload_type} foothold are not both present"
         )
     return {
         "ready": not blockers,
@@ -889,7 +922,18 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
             )
 
     client = await login(args)
-    result: dict[str, Any] = {"sage": await create_sage(client, args)}
+    chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+    running_chat = [
+        row
+        for row in chat.get("consuming_container", [])
+        if row.get("container_running") and not row.get("deleted")
+    ]
+    if not running_chat:
+        raise RuntimeError("Sage chat container is not running; restart Sage before bootstrap-reset")
+    result: dict[str, Any] = {
+        "sage_chat_container": running_chat[0],
+        "sage_payload_created": False,
+    }
     if use_baked_apollo:
         result["apollo_callback_import"] = await import_callback_config(
             client,
@@ -1006,7 +1050,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = sub.add_parser("inspect", help="Print Sage/Apollo payload schemas and current callbacks.")
+    inspect_parser = sub.add_parser("inspect", help="Print Sage chat, payload schemas, and current callbacks.")
     add_common(inspect_parser)
     inspect_parser.set_defaults(func=command_inspect)
 
@@ -1077,7 +1121,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset_parser = sub.add_parser(
         "bootstrap-reset",
-        help="Create fresh Sage/Apollo payloads or explicitly import a retained foothold callback config.",
+        help="Verify Sage chat and create Apollo, or import a retained foothold callback config.",
     )
     add_common(reset_parser)
     add_sage_args(reset_parser)

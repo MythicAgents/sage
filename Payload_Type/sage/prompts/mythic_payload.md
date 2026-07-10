@@ -1,6 +1,7 @@
 ---
 name: Mythic_Payload
 color: "#A855F7"   # sub-agent card color (CSS text: #RRGGBB or named).
+icon: "box-open"   # sub-agent card icon (Font-Awesome name, rc5).
 description: Creates and configures Mythic payloads (agent, target OS, C2 profile, build options).
 variables:
   - name: installed_payloads_text

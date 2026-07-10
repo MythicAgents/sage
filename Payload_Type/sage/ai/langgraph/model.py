@@ -1958,14 +1958,23 @@ class Model:
 
     @staticmethod
     def _delegation_icon(agent_name: str) -> str:
-        icons = {
-            "BloodHound": "BH",
-            "Mythic_Operator": "MO",
-            "Mythic_Payload": "MP",
-            "Generalist": "GN",
-            "MCP_Manager": "MM",
+        """Sub-agent card icon. rc5 lets this be a Font-Awesome icon NAME (rendered as the glyph);
+        operator-editable via the prompt frontmatter ``icon:`` (like ``color:``), with a per-agent fa
+        default, then a 2-letter code for an unknown agent."""
+        fallback = {
+            "BloodHound": "dog",            # bloodhound = the dog
+            "Mythic_Operator": "user-secret",
+            "Mythic_Payload": "box-open",
+            "Generalist": "robot",
+            "MCP_Manager": "plug",
         }
-        return icons.get(agent_name, agent_name[:2].upper())
+        try:
+            icon = load_prompt_meta(agent_name.lower()).get("icon")
+            if isinstance(icon, str) and icon.strip():
+                return icon.strip()
+        except Exception as e:
+            logger.debug(f"_delegation_icon frontmatter read failed for {agent_name} (non-fatal): {e}")
+        return fallback.get(agent_name, agent_name[:2].upper())
 
     @staticmethod
     def _delegation_color(agent_name: str) -> str:

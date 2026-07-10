@@ -28,9 +28,20 @@ SAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = SAGE_ROOT / "evals" / "cases.yaml"
 DEFAULT_RESULTS = SAGE_ROOT / "evals" / "results"
 DEFAULT_DB = SAGE_ROOT / ".phoenix" / "phoenix.db"
-MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
+MYTHIC_ENV_PATH = Path(
+    os.environ.get("MYTHIC_ENV_PATH")
+    or (
+        "/home/john/dev/mythic_v4/.env"
+        if Path("/home/john/dev/mythic_v4/.env").exists()
+        else "/home/john/dev/mythic/.env"
+    )
+)
 MYTHIC_SERVER = "127.0.0.1"
 MYTHIC_USER = "mythic_admin"
+NATIVE_CHAT_SCRIPTS = REPO_ROOT / "skills" / "sage-live-runner" / "scripts"
+if str(NATIVE_CHAT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CHAT_SCRIPTS))
+from native_chat import run_native_chat_turn  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -61,7 +72,7 @@ def load_cases(path: str | Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("cases file must contain a mapping")
 
-    for key in ("sage_cb", "apollo_cb", "default_timeout", "forbid", "cases"):
+    for key in ("apollo_cb", "default_timeout", "forbid", "cases"):
         if key not in data:
             raise ValueError(f"cases file missing required key: {key}")
     if not isinstance(data["forbid"], list) or not data["forbid"]:
@@ -113,7 +124,7 @@ def resolve_password(env_path: str | Path = MYTHIC_ENV_PATH) -> str:
                 return value.strip().strip("'\"")
 
     raise RuntimeError(
-        "MYTHIC_ADMIN_PASSWORD is not set and no MYTHIC_ADMIN_PASSWORD entry was found in /home/john/dev/mythic/.env"
+        f"MYTHIC_ADMIN_PASSWORD is not set and no entry was found in {path}"
     )
 
 
@@ -324,7 +335,7 @@ async def run_case(
     *,
     seed: int = 0,
     db_path: str | Path,
-    sage_cb: int,
+    sage_cb: int | None = None,
     timeout_seconds: int,
     poll_interval_seconds: float,
     forbid: Sequence[str],
@@ -357,6 +368,8 @@ async def run_case(
         "tool_outputs_snippet": "",
         "trace_ids": [],
         "spans": [],
+        "chat_channel_id": None,
+        "chat_request_id": None,
     }
 
     try:
@@ -385,7 +398,9 @@ async def run_case(
                 base["errors"] = [f"incomplete: {status}"]
                 base["wall_seconds"] = round(time.monotonic() - start, 3)
                 return base
-        else:
+        elif os.environ.get("SAGE_EVAL_LEGACY_PAYLOAD") or sage_cb is not None:
+            if sage_cb is None:
+                raise RuntimeError("SAGE_EVAL_LEGACY_PAYLOAD requires a Sage callback ID")
             task = await issue_chat_task(client, case["prompt"], sage_cb)
             display_id = _extract_task_display_id(task)
             try:
@@ -398,6 +413,24 @@ async def run_case(
                 except TimeoutError:
                     print(f"WARN case still running after grace wait; display_id={display_id}", flush=True)
                 base["wall_seconds"] = round(time.monotonic() - start, 3)
+                return base
+        else:
+            chat_result = await run_native_chat_turn(
+                client,
+                case["prompt"],
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                metadata={"eval_case": case["id"], "seed": seed},
+            )
+            base["chat_channel_id"] = chat_result.get("chat_channel_id")
+            base["chat_request_id"] = chat_result.get("chat_request_id")
+            status = str(chat_result.get("status") or "").casefold()
+            if status not in {"complete", "completed"}:
+                base["status"] = "incomplete"
+                base["errors"] = [
+                    f"incomplete: chat request status={chat_result.get('status')!r} "
+                    f"error={chat_result.get('error')!r}"
+                ]
                 return base
 
         summaries = await wait_for_settled_traces(db_path, pre_rowid, timeout_seconds, poll_interval_seconds)
@@ -462,7 +495,12 @@ async def run_eval(
 
     config = load_cases(cases_path)
     selected = select_cases(config["cases"], only)
-    resolved_sage_cb = int(sage_cb if sage_cb is not None else config["sage_cb"])
+    configured_sage_cb = config.get("sage_cb")
+    resolved_sage_cb = (
+        int(sage_cb if sage_cb is not None else configured_sage_cb)
+        if sage_cb is not None or configured_sage_cb is not None
+        else None
+    )
     resolved_apollo_cb = int(config["apollo_cb"])
     resolved_timeout = int(timeout_seconds if timeout_seconds is not None else config["default_timeout"])
     resolved_db = Path(db_path or os.environ.get("PHOENIX_DB", DEFAULT_DB))
@@ -496,7 +534,7 @@ async def run_eval(
             print(f"{status} {case['id']} seed={seed} score={record['score']} tokens={record['total_tokens']}", flush=True)
         records.append(aggregate_case_runs(case, seed_records))
 
-    report = build_report_v2(started, utc_timestamp(), resolved_sage_cb, seeds, records)
+    report = build_report_v2(started, utc_timestamp(), seeds, records)
     write_reports(report, out_dir)
     return report
 
@@ -558,7 +596,6 @@ def aggregate_case_runs(case: dict[str, Any], seed_records: list[dict[str, Any]]
 def build_report_v2(
     started: str,
     finished: str,
-    sage_cb: int,
     seeds: int,
     cases: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -570,7 +607,7 @@ def build_report_v2(
     return {
         "started": started,
         "finished": finished,
-        "sage_cb": sage_cb,
+        "execution_surface": "mythic-v4-chat",
         "schema_version": 2,
         "seeds": seeds,
         "pass_rate": statistics.mean(scorable_pass_fractions) if scorable_pass_fractions else 0.0,
@@ -632,7 +669,7 @@ def render_markdown_v2(report: dict[str, Any]) -> str:
         "",
         f"- Started: {report['started']}",
         f"- Finished: {report['finished']}",
-        f"- Sage callback: {report['sage_cb']}",
+        f"- Execution surface: {report.get('execution_surface', 'mythic-v4-chat')}",
         f"- Schema version: {report['schema_version']}",
         f"- Seeds: {report['seeds']}",
         f"- Pass rate: {pass_rate_cell}",

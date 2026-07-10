@@ -39,7 +39,7 @@ RESET_STEPS = [
                           "SAGE_ENGAGEMENT_GATE=1", f"SAGE_BLOODHOUND_MCP_DIR={BH}"], ROOT, 240),
     ("wipe bloodhound",  ["uv", "--directory", BH, "run", "python",
                           str(ROOT / "skills/sage-goad-reset/scripts/bh_reset.py"), "wipe", "--yes"], ROOT, 180),
-    ("bootstrap callbacks", [PY, "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py", "bootstrap-reset"], ROOT, 900),
+    ("bootstrap foothold", [PY, "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py", "bootstrap-reset"], ROOT, 900),
 ]
 LUDUS_STATUS = [PY, "skills/sage-goad-reset/scripts/ludus.py", "status"]
 READINESS = [PY, "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py", "readiness", "--runtime-dbs-archived"]
@@ -75,17 +75,16 @@ def _readiness_ok(out: str) -> bool:
         return False
 
 
-def discover_callbacks() -> tuple[int, int]:
+def discover_callbacks() -> int:
     out = subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True).stdout
-    sage = [int(m) for m in re.findall(r"id=(\d+)\s+payloadtype=sage", out)]
     apollo = [int(m) for m in re.findall(r"id=(\d+)\s+payloadtype=apollo", out)]
-    if not sage or not apollo:
-        raise SystemExit(f"ABORT: missing callbacks (sage={sage} apollo={apollo}).\n{out}")
-    return sage[-1], apollo[-1]   # newest of each
+    if not apollo:
+        raise SystemExit(f"ABORT: missing Apollo foothold callback.\n{out}")
+    return apollo[-1]
 
 
-def full_reset_and_ready(restart_env: dict | None = None) -> tuple[int, int]:
-    """Full clean reset -> readiness -> callback discovery; returns (sage_cb, apollo_cb).
+def full_reset_and_ready(restart_env: dict | None = None) -> tuple[None, int]:
+    """Full clean reset -> readiness -> callback discovery; returns (None, apollo_cb).
 
     `restart_env` (e.g. {"SAGE_ENGAGEMENT_ID": <run token>, "SAGE_MODEL": <tier>}) is appended as positional
     KEY=VAL overrides to the `restart sage` step, so the relaunched Sage runs under that engagement id and
@@ -101,9 +100,9 @@ def full_reset_and_ready(restart_env: dict | None = None) -> tuple[int, int]:
             step_argv = list(argv) + [f"{k}={v}" for k, v in restart_env.items()]
         _run(name, step_argv, cwd, timeout)
     _poll("ludus guests up", LUDUS_STATUS, ROOT, lambda o: "10.4.10.10" in o, timeout=1800)
-    # Apollo must reconnect from the baked snapshot or be deployed from the fallback build.
-    _poll("sage+apollo ready", READINESS, ROOT, _readiness_ok, timeout=1200)
-    return discover_callbacks()
+    # Apollo must reconnect from a retained snapshot or be deployed from the fresh build.
+    _poll("sage chat + apollo ready", READINESS, ROOT, _readiness_ok, timeout=1200)
+    return None, discover_callbacks()
 
 
 # Seconds the per-run gauge SUBPROCESS may take ON TOP OF the solve itself — covers reset-independent
@@ -136,10 +135,9 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, controll
                 '"ESSOS":"essos.local"}'
             ),
         }
-    sage_cb, apollo_cb = full_reset_and_ready(restart_env=restart_env)
+    _sage_cb, apollo_cb = full_reset_and_ready(restart_env=restart_env)
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
-            "--sage-cb", str(sage_cb), "--apollo-cb", str(apollo_cb),
-            "--solve-timeout", str(solve_timeout)]
+            "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout)]
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -165,11 +163,11 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout):
             print(f"  (cd {ROOT}) {' '.join(LUDUS_STATUS)}     # poll until guests up")
             print(
                 f"  (cd {ROOT}) {' '.join(READINESS)}        "
-                "# poll until baked Apollo reconnects or fallback Apollo is deployed"
+                "# poll until Sage chat and Apollo are ready"
             )
-            print(f"  (cd {ROOT}) {' '.join(CALLBACKS)}        # parse sage_cb + apollo_cb")
+            print(f"  (cd {ROOT}) {' '.join(CALLBACKS)}        # parse apollo_cb")
             print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py run --go --side {sd} "
-                  f"--scenario {scenario} --sage-cb <sage> --apollo-cb <apollo> --solve-timeout {solve_timeout}")
+                  f"--scenario {scenario} --apollo-cb <apollo> --solve-timeout {solve_timeout}")
     print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
     print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
