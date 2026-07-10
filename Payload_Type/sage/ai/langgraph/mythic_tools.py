@@ -1113,6 +1113,8 @@ class MythicTools:
         # Prevents repeated make_token calls for the same EA/DA context when ticket_store_list/proof should
         # be used first.
         self._kerberos_logon_context_keys: set[tuple] = set()
+        self._kerberos_logon_context_callbacks: set[int] = set()
+        self._kerberos_logon_account_context_keys: set[tuple] = set()
         self._kerberos_account_context_keys: set[tuple] = set()
         # Per-callback Kerberos context epoch. Service-access probes depend on the current logon/session
         # ticket state, so an Access Denied before make_token/ticket import must not poison the identical
@@ -2512,16 +2514,34 @@ class MythicTools:
                 self._kerberos_logon_context_keys = {
                     key for key in self._kerberos_logon_context_keys if key[0] != int(callback_display_id)
                 }
+                self._kerberos_logon_context_callbacks.discard(int(callback_display_id))
+                self._kerberos_logon_account_context_keys = {
+                    key for key in self._kerberos_logon_account_context_keys
+                    if key[0] != str(callback_display_id)
+                }
                 self._bump_kerberos_context_epoch(callback_display_id)
                 return
             key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
-            if not key:
+            if normalized != "make_token":
                 return
             low = str(output or "").casefold()
-            if "successfully impersonated" in low or "new claims" in low:
+            if (
+                "successfully set primary identity" in low
+                or "successfully impersonated" in low
+                or "new claims" in low
+            ):
                 self._authentication_contexts.pop(str(callback_display_id), None)
-                if key not in self._kerberos_logon_context_keys:
+                callback_key = int(callback_display_id)
+                context_changed = callback_key not in self._kerberos_logon_context_callbacks
+                self._kerberos_logon_context_callbacks.add(callback_key)
+                self._kerberos_logon_account_context_keys = {
+                    account_key for account_key in self._kerberos_logon_account_context_keys
+                    if account_key[0] != str(callback_display_id)
+                }
+                if key and key not in self._kerberos_logon_context_keys:
                     self._kerberos_logon_context_keys.add(key)
+                    context_changed = True
+                if context_changed:
                     self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
@@ -4888,6 +4908,25 @@ class MythicTools:
                 return
             capability = self._capability_text(context.get("capability")).casefold()
             expected_probe = self._capability_text(context.get("expected_probe")).casefold()
+            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_logon_context_probe":
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
+                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
+                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                low = self._capability_text(output).casefold()
+                if (
+                    account
+                    and domain
+                    and (
+                        "successfully set primary identity" in low
+                        or "successfully impersonated" in low
+                        or "new claims" in low
+                    )
+                ):
+                    self._kerberos_logon_account_context_keys.add(
+                        self._kerberos_account_context_key(callback_display_id, account, domain)
+                    )
+                return
             if capability == "ensure-account-kerberos-context" and expected_probe == "extract_account_ticket_cache_probe":
                 action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
                 intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
@@ -5367,6 +5406,15 @@ class MythicTools:
                     account,
                     domain,
                 ) in getattr(self, "_kerberos_account_context_keys", set())
+                probe["logon_context_proven"] = self._kerberos_account_context_key(
+                    callback_display_id,
+                    account,
+                    domain,
+                ) in getattr(
+                    self,
+                    "_kerberos_logon_account_context_keys",
+                    set(),
+                )
             verification = capabilities.verify_capability(capability, probe)
             if verification.verdict != "achieved":
                 return
@@ -8094,6 +8142,18 @@ class MythicTools:
                     self._log_dcsync_proof_fire(target_domain, len(self._capability_text(output)))
                 verification = capabilities_mod.verify_capability(capability, probe)
                 return probe, verification
+            if expected_probe == "extract_logon_context_probe":
+                low = self._capability_text(output).casefold()
+                probe = {
+                    "callback_id": self._capability_text(callback_id),
+                    "logon_context_proven": (
+                        "successfully set primary identity" in low
+                        or "successfully impersonated" in low
+                        or "new claims" in low
+                    ),
+                }
+                verification = capabilities_mod.verify_capability(capability, probe)
+                return probe, verification
             if expected_probe not in {
                 "extract_ticket_probe",
                 "extract_account_ticket_probe",
@@ -10107,6 +10167,13 @@ class MythicTools:
                     inputs["key_type"] = credential["key_type"]
                     inputs["credential_id"] = credential.get("id")
                     inputs["credential_source"] = "mythic_credential_store"
+            context_password = self._capability_text(
+                inputs.get("context_password") or inputs.get("logon_password") or "SageNetOnlyContext1!"
+            )
+            logon_credential = await self._ensure_netonly_plaintext_credential(domain, context_password)
+            if logon_credential:
+                inputs["logon_credential_id"] = logon_credential.get("id")
+                inputs["logon_credential_source"] = logon_credential.get("status")
             self._sanitize_account_context_proof_target(action, inputs)
             self._normalize_capability_service_proof_target(action, inputs, default_share="SYSVOL")
             await self._augment_capability_account_ticket_proof_target(inputs, domain)
@@ -10580,6 +10647,42 @@ class MythicTools:
             return recovered if recovered else {}
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
+
+    async def _ensure_netonly_plaintext_credential(self, domain: str, password: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        password_text = self._capability_text(password)
+        if not domain_cf or not password_text or self.client is None:
+            return {}
+        account = "sage.netonly"
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        for cred in creds or []:
+            if self._canonical_credential_account(cred.get("account")) != account:
+                continue
+            if self._capability_text(cred.get("realm")).casefold() != domain_cf:
+                continue
+            if self._capability_text(cred.get("type")).casefold() != "plaintext":
+                continue
+            if self._capability_text(cred.get("credential_text")) != password_text:
+                continue
+            if cred.get("id") is not None:
+                return {"id": cred.get("id"), "status": "existing"}
+        try:
+            result = await mythic.create_credential(
+                self.client,
+                credential=password_text,
+                account=account,
+                realm=domain_cf,
+                comment="Sage sacrificial NetOnly context; not a valid account password",
+                credential_type="plaintext",
+            )
+        except Exception:
+            return {}
+        credential_id = result.get("id") if isinstance(result, dict) else None
+        if credential_id is None:
+            return {}
+        self._cred_cache = None
+        self._cred_cache_ts = None
+        return {"id": credential_id, "status": "created"}
 
     async def _recover_account_credential_from_recorded_task(self, domain: str, account: str) -> dict:
         domain_cf = self._capability_text(domain).casefold()

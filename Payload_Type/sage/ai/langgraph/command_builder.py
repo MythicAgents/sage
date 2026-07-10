@@ -37,6 +37,7 @@ _CONSTRUCTION_SIGNATURES = (
     "not registered",
     "ensure_tool_uploaded",
     "null uuid",
+    "credential material is not a plaintext password",
 )
 
 _GENUINE_SIGNATURES = (

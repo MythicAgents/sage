@@ -674,10 +674,17 @@ def verify_account_kerberos_context(probe_result: dict[str, Any]) -> CapabilityV
         ("account_ticket_present", "ticket_client_matches_account", "expected_account_ticket_present"),
     )
     access_proof = _any_true(probe_result, ("ticket_valid", "service_access_proven", "ldap_access_proven"))
-    if access_proof and callback_id and account and domain and account_ticket:
+    context_proof = _any_true(probe_result, ("logon_context_proven", "account_context_proven"))
+    if access_proof and callback_id and account and domain and account_ticket and context_proof:
         return CapabilityVerification(
             "achieved",
             "account Kerberos context proved usable on callback",
+            _selected_probe(probe_result),
+        )
+    if access_proof and callback_id and account_ticket:
+        return CapabilityVerification(
+            "partial",
+            "account ticket and service access were observed, but the active logon context was not proven",
             _selected_probe(probe_result),
         )
     if access_proof and callback_id:
@@ -1331,7 +1338,14 @@ def _probe_proves_callback_kerberos_context(action: CapabilityAction, probe_resu
         # callback context. Schannel LDAP also proves certificate auth without creating a Kerberos context.
         return bool(service_access and staged_ticket)
     if capability == "ensure-account-kerberos-context":
-        return bool(service_access and _any_true(probe_result, ("account_ticket_present", "ticket_client_matches_account", "expected_account_ticket_present")))
+        return bool(
+            service_access
+            and _any_true(
+                probe_result,
+                ("account_ticket_present", "ticket_client_matches_account", "expected_account_ticket_present"),
+            )
+            and _any_true(probe_result, ("logon_context_proven", "account_context_proven"))
+        )
     if capability in {"ensure-kerberos-context", "forge-golden-ticket"}:
         return bool(service_access)
     return False
@@ -3440,7 +3454,12 @@ def _build_ensure_account_kerberos_context_execution_plan(
     dc = _input_text(inputs, "dc", "domain_controller")
     context_password = _input_text(inputs, "context_password", "logon_password") or "SageNetOnlyContext1!"
     context_process = _input_text(inputs, "context_process", "sacrificial_process", "run")
-    credential_id = _input_text(inputs, "credential_id", "mythic_credential_id")
+    logon_credential_id = _input_text(
+        inputs,
+        "logon_credential_id",
+        "netonly_credential_id",
+        "sacrificial_credential_id",
+    )
 
     steps: list[CapabilityExecutionStep] = []
     if _input_bool(inputs, "preflight_existing_context", default=True):
@@ -3502,7 +3521,7 @@ def _build_ensure_account_kerberos_context_execution_plan(
                 "user": account,
                 "password": context_password,
                 "netonly": True,
-                **({"credential_id": credential_id} if credential_id else {}),
+                **({"logon_credential_id": logon_credential_id} if logon_credential_id else {}),
                 **({"process": context_process} if context_process else {}),
             },
             capability=action.name,
@@ -4820,7 +4839,12 @@ def _ensure_account_kerberos_context_action(domain: str, account: str, callback_
             ],
         },
         verifier={
-            "achieved_all": ["account_ticket_present", "service_access_proven", "callback_id"],
+            "achieved_all": [
+                "logon_context_proven",
+                "account_ticket_present",
+                "service_access_proven",
+                "callback_id",
+            ],
             "partial_any": ["tgt_present", "ticket_imported", "ticket_context_created"],
             "blockers": [
                 "bad_key",

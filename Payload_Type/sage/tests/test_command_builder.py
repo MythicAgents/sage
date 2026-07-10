@@ -351,5 +351,11 @@ def test_classify_normal_task_output_as_success():
     assert classify_result("whoami", output) == ResultClass.SUCCESS
 
 
+def test_classify_make_token_hash_rejection_as_construction_failure():
+    output = "Credential material is not a plaintext password."
+
+    assert classify_result("make_token", output) == ResultClass.CONSTRUCTION
+
+
 def test_genuine_breaker_decision_stops_without_retry():
     assert breaker_decision(ResultClass.GENUINE, 0) == "stop"

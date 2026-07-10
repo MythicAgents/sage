@@ -2715,7 +2715,7 @@ def test_build_capability_commands_selects_account_key_for_account_context():
     assert plan["commands"][-1]["parameters"] == "dir \\\\dc01.lab.local\\SYSVOL"
 
 
-def test_deterministic_account_context_records_only_after_account_ticket_and_service_proof():
+def test_deterministic_account_context_records_only_after_logon_ticket_and_service_proof():
     mt = _make_tools()
 
     async def no_schema(command, callback_display_id):
@@ -2737,6 +2737,7 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
         },
     )
     action_dict = asdict(action)
+    logon_params = {"credential": "@cred:88", "netOnly": True}
     list_params = {"luid": ""}
     proof_params = "dir \\\\dc01.lab.local\\SYSVOL"
     base_context = {
@@ -2747,6 +2748,12 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
         "action": action_dict,
         "produces": [],
         "consumes": [],
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("make_token", logon_params)
+    ] = {
+        **base_context,
+        "expected_probe": "extract_logon_context_probe",
     }
     mt._deterministic_capability_command_contexts[
         mythic_tools._capability_command_key("ticket_store_list", list_params)
@@ -2766,6 +2773,11 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
     ticket_list = "Cached Tickets\nClient: alice @ LAB.LOCAL\nServer: krbtgt/LAB.LOCAL"
     proof_output = " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully."
 
+    with _split_issue(
+        "Successfully set Primary Identity for local access and Impersonation Identity for remote access.",
+        display_id=7000,
+    ):
+        asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", logon_params, 13, timeout=5))
     with _split_issue(ticket_list, display_id=7001):
         asyncio.run(mt.issue_task_and_waitfor_task_output("ticket_store_list", list_params, 13, timeout=5))
     with _split_issue(proof_output, display_id=7002):
@@ -2815,7 +2827,7 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
     ticket = base64.b64encode(b"A" * 80).decode()
     outputs = iter([
-        "No tickets in current context.",
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
         " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
         f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
         "Successfully impersonated local\\user for local access and lab.local\\alice for remote access.",
@@ -2851,6 +2863,96 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     final_probe = mt._engagement_hops[-1].evidence["probe"]
     assert final_probe["account_ticket_present"] is True
     assert final_probe["service_access_proven"] is True
+
+
+def test_netonly_plaintext_credential_is_created_separately_from_account_key(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+        }]
+
+    created = []
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        created.append({
+            "credential": credential,
+            "account": account,
+            "realm": realm,
+            "comment": comment,
+            "credential_type": credential_type,
+        })
+        return {"status": "success", "id": 88}
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+
+    result = asyncio.run(mt._ensure_netonly_plaintext_credential("lab.local", "SageNetOnlyContext1!"))
+
+    assert result == {"id": 88, "status": "created"}
+    assert created == [{
+        "credential": "SageNetOnlyContext1!",
+        "account": "sage.netonly",
+        "realm": "lab.local",
+        "comment": "Sage sacrificial NetOnly context; not a valid account password",
+        "credential_type": "plaintext",
+    }]
+
+
+def test_execute_account_context_stops_after_make_token_rejects_hash(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+            "comment": "aes256",
+        }]
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        return {"status": "success", "id": 88}
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+    ticket = base64.b64encode(b"A" * 80).decode()
+    outputs = iter([
+        "No tickets in current context.",
+        "Access is denied.",
+        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
+        "Credential material is not a plaintext password.",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7200):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "ensure-account-kerberos-context",
+                "domain": "lab.local",
+                "account": "alice",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "failed"
+    assert "plaintext password" in result["reason"]
+    issued_commands = [call["command_name"] for call in calls["issued"]]
+    assert issued_commands[-1] == "make_token"
+    assert "ticket_store_add" not in issued_commands
+    make_token = calls["issued"][-1]
+    assert make_token["parameters"]["credential"] == "@cred:88"
 
 
 def test_build_capability_commands_supports_managed_secret_read():

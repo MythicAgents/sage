@@ -2129,6 +2129,7 @@ def test_verify_account_kerberos_context_requires_account_ticket_and_access():
         "callback_id": "13",
         "account": "alice",
         "domain": "lab.local",
+        "logon_context_proven": True,
         "account_ticket_present": True,
         "service_access_proven": True,
     })
@@ -2136,11 +2137,20 @@ def test_verify_account_kerberos_context_requires_account_ticket_and_access():
         "callback_id": "13",
         "account": "alice",
         "domain": "lab.local",
+        "logon_context_proven": True,
+        "service_access_proven": True,
+    })
+    wrong_context = capabilities.verify_capability("ensure-account-kerberos-context", {
+        "callback_id": "13",
+        "account": "alice",
+        "domain": "lab.local",
+        "account_ticket_present": True,
         "service_access_proven": True,
     })
 
     assert achieved.verdict == "achieved"
     assert partial.verdict == "partial"
+    assert wrong_context.verdict == "partial"
 
 
 def test_build_forge_golden_ticket_execution_plan_is_kerberos_primitive():

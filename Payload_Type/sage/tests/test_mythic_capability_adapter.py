@@ -1112,7 +1112,37 @@ def test_adapter_translates_account_context_to_managed_asktgt_sequence_without_p
     assert mythic_plan.commands[6].consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
 
 
-def test_adapter_uses_mythic_credential_reference_for_account_context_make_token():
+def test_adapter_uses_distinct_plaintext_credential_reference_for_account_context_make_token():
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=lab.local;account=alice;callback=13",
+        preconditions=["creds:alice@lab.local", "live-callback:13"],
+        effects=["kerberos-account-context:alice@lab.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "lab.local",
+            "account": "alice",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "aes256": "d" * 64,
+        "credential_id": 77,
+        "logon_credential_id": 88,
+        "proof_host": "dc01.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    make_token = mythic_plan.commands[3]
+    assert make_token.command == "make_token"
+    assert make_token.parameters == {
+        "credential": "@cred:88",
+        "netOnly": True,
+    }
+
+
+def test_adapter_never_uses_ticket_key_credential_reference_for_make_token():
     action = capabilities.CapabilityAction(
         name="ensure-account-kerberos-context",
         target="domain=lab.local;account=alice;callback=13",
@@ -1134,11 +1164,8 @@ def test_adapter_uses_mythic_credential_reference_for_account_context_make_token
     mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
 
     make_token = mythic_plan.commands[3]
-    assert make_token.command == "make_token"
-    assert make_token.parameters == {
-        "credential": "@cred:77",
-        "netOnly": True,
-    }
+    assert make_token.parameters["credential"] != "@cred:77"
+    assert make_token.parameters["credential"]["type"] == "plaintext"
 
 
 def test_merlin_adapter_translates_account_context_through_applied_token_session():
