@@ -1380,6 +1380,45 @@ def test_hitl_respond_select_steer_deny_and_carry_text():
 # Phase 2 header chips — live channel metadata
 # --------------------------------------------------------------------------------------
 
+def test_mythic_tools_preauth_client_adopts_without_mint():
+    """Headless/eval auth (Option A): a preauth_client is adopted by login() directly — no channel/task
+    context, no token mint — so the in-process gauge solve authenticates from the harness's admin client."""
+    from ai.langgraph.mythic_tools import MythicTools
+
+    sentinel = object()
+    mt = MythicTools(preauth_client=sentinel)   # no channel_id, no agent_task_id
+    _run(mt.login())
+    assert mt.client is sentinel                # adopted as-is; the mint branches were skipped
+
+
+def test_headless_solver_imports_and_wraps():
+    """The in-process solve seam imports and exposes the harness-facing entry points."""
+    from ai.hillclimb import headless_solver
+    assert callable(headless_solver.run_headless_solve)
+    assert callable(headless_solver.solve_headless)
+
+
+def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
+    """The alongside headless harness builder returns the same solve(objective)->status contract and
+    routes into run_headless_solve with the injected client + pinned engagement id."""
+    from ai.hillclimb import live_seams, headless_solver
+
+    calls = {}
+
+    async def _fake_run(objective, **kw):
+        calls.update(objective=objective, **kw)
+        return "completed"
+
+    monkeypatch.setattr(headless_solver, "run_headless_solve", _fake_run)
+    solve = live_seams.make_headless_solver("CLIENT", engagement_id="Operation_Chimera_1",
+                                            operation_id=7, timeout=99, max_steps=0)
+    assert solve("compromise CORP") == "completed"
+    assert calls["objective"] == "compromise CORP"
+    assert calls["client"] == "CLIENT"
+    assert calls["engagement_id"] == "Operation_Chimera_1"
+    assert calls["operation_id"] == 7
+
+
 def test_build_channel_metadata_live_counts(monkeypatch):
     """The live header chips reflect MCP tool/server counts, session rounds, and BloodHound state."""
     from sage_chat.metadata import build_channel_metadata

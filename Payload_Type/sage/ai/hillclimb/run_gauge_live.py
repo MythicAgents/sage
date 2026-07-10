@@ -18,6 +18,7 @@ Operator loop per scenario:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -180,7 +181,17 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
                           settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
 
     if side == "harness":
-        solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
+        if os.environ.get("SAGE_EVAL_HEADLESS"):
+            # Option A (Phase-4 migration): run the solve IN-PROCESS via the chat Model instead of tasking
+            # the PayloadType `query` on the virtual callback. Alongside path — selected only when the flag
+            # is set — so a migration run can compare in-process vs task-based on the same reset. Ledger key
+            # comes from SAGE_ENGAGEMENT_ID (the run token the reset sets) or the operation name.
+            _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or cfg.engagement_op
+            print(f"[harness/{scenario_name}] SAGE_EVAL_HEADLESS=1 → in-process solve (engagement={_eng})", flush=True)
+            solve = live_seams.make_headless_solver(client, engagement_id=_eng,
+                                                    timeout=cfg.solve_timeout, max_steps=0)
+        else:
+            solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
         _start = time.time()
         _deadline = _start + cfg.solve_timeout
         print(f"[harness/{scenario_name}] started {time.strftime('%H:%M:%S', time.localtime(_start))} · "

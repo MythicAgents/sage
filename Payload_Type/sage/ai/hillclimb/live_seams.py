@@ -355,6 +355,24 @@ def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_s
     return solve
 
 
+def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int = 0,
+                         timeout: int = 1800, max_steps: int = 0):
+    """Option-A counterpart to make_harness_solver: run a full autonomous Sage solve IN-PROCESS via the
+    chat Model (no PayloadType `query` task, no virtual callback). Same ``solve(objective) -> status_str``
+    contract, so it's a drop-in behind the ``SAGE_EVAL_HEADLESS`` flag in run_gauge_live. ``client`` is this
+    harness's authenticated mythic client (adopted directly by the Model's tools); ``engagement_id`` pins
+    the durable ledger key so scoring reads this run's ledger. Returns "completed"/"timeout"/"error: …"."""
+    from .headless_solver import run_headless_solve
+
+    def solve(objective: str) -> str:
+        return asyncio.run(run_headless_solve(
+            objective, client=client, operation_id=operation_id, engagement_id=engagement_id,
+            timeout=timeout, max_steps=max_steps,
+        ))
+
+    return solve
+
+
 def _canonical_credential_account(name: str) -> str:
     """Mirror MythicTools' light account canonicalizer without importing its heavy module."""
     account = str(name or "").strip().casefold()

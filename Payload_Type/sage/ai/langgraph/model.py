@@ -1520,7 +1520,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -1545,6 +1545,7 @@ class Model:
         # ChatAPITokenProvider instead of the task's AgentTaskID. None/0 on the legacy task path.
         self.channel_id = channel_id
         self.apitoken_id = apitoken_id
+        self._mythic_preauth_client = mythic_preauth_client  # headless/eval: pre-authenticated mythic client
         # Chat-path checkpointer thread key (Section 7 / 8A-P1). The legacy task path derives the
         # LangGraph thread_id from f"{agent_task_id}-{task_id}", but a chat channel has no task and must
         # persist multi-turn state under a channel-stable key (str(ChannelID)). sage_chat sets this so
@@ -2405,6 +2406,7 @@ class Model:
             operation_id=self.operation_id,
             channel_id=self.channel_id,
             apitoken_id=self.apitoken_id,
+            preauth_client=self._mythic_preauth_client,
         )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
         self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)

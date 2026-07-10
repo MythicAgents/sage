@@ -125,6 +125,37 @@ async def login_to_mythic(password: str) -> Any:
     return await mythic.login(server_ip=MYTHIC_SERVER, username=MYTHIC_USER, password=password)
 
 
+_phoenix_ready = False
+
+
+def ensure_phoenix_instrumentation(db_path: str | Path) -> None:
+    """Instrument LangChain → Phoenix in THIS process so an in-process (headless) solve emits the traces
+    the scorer reads from ``db_path`` — ``main.py`` does exactly this for the container, but a headless
+    eval runs the Model here, not there. Idempotent; points ``PHOENIX_WORKING_DIR`` at ``db_path``'s parent
+    so the traces land where ``phoenix_reader`` reads them.
+
+    NOTE [DEFERRED-VERIFY]: the working-dir ↔ phoenix.db ↔ OTLP-collector alignment can't be checked
+    offline — it MUST be confirmed on the first headless eval run (if traces don't land, every case reads
+    empty and scores 0). This is the one piece of the evals headless path that needs a live look.
+    """
+    global _phoenix_ready
+    if _phoenix_ready:
+        return
+    os.environ.setdefault("PHOENIX_WORKING_DIR", str(Path(db_path).resolve().parent))
+    os.environ.setdefault("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "131072")
+    import phoenix as px
+    from phoenix.otel import register
+    from openinference.instrumentation.langchain import LangChainInstrumentor
+
+    try:
+        px.launch_app(use_temp_dir=False)  # standalone collector+db when no container is running
+    except Exception as exc:  # a container's app may already own the port — instrumentation still works
+        print(f"[headless-eval] phoenix launch_app skipped ({exc}); relying on an existing collector", flush=True)
+    tracer_provider = register(project_name="Sage", auto_instrument=False, batch=False)
+    LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+    _phoenix_ready = True
+
+
 async def issue_chat_task(client: Any, prompt: str, sage_cb: int) -> Any:
     """Issue Sage's one-shot `query` command (NOT interactive `chat`).
 
@@ -336,19 +367,38 @@ async def run_case(
                 return base
 
         pre_rowid = phoenix_reader.max_trace_rowid(db_path)
-        task = await issue_chat_task(client, case["prompt"], sage_cb)
-        display_id = _extract_task_display_id(task)
-        try:
-            await wait_for_task_complete(client, display_id, timeout_seconds, poll_interval_seconds)
-        except TimeoutError as exc:
-            base["status"] = "incomplete"
-            base["errors"] = [f"incomplete: {exc}"]
+        if os.environ.get("SAGE_EVAL_HEADLESS"):
+            # Option A (Phase-4 migration): run the solve IN-PROCESS via the chat Model instead of tasking
+            # the PayloadType `query`. The scorer reads Phoenix traces, so instrument THIS process first
+            # (see the [DEFERRED-VERIFY] note on ensure_phoenix_instrumentation). Ledger key from
+            # SAGE_ENGAGEMENT_ID or the eval operation name.
+            ensure_phoenix_instrumentation(db_path)
+            from ai.hillclimb.headless_solver import run_headless_solve
+
+            _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or "Operation_Chimera_1"
+            status = await run_headless_solve(
+                case["prompt"], client=client, operation_id=0, engagement_id=_eng,
+                timeout=timeout_seconds,
+            )
+            if str(status).startswith("timeout"):
+                base["status"] = "incomplete"
+                base["errors"] = [f"incomplete: {status}"]
+                base["wall_seconds"] = round(time.monotonic() - start, 3)
+                return base
+        else:
+            task = await issue_chat_task(client, case["prompt"], sage_cb)
+            display_id = _extract_task_display_id(task)
             try:
-                await wait_for_task_complete(client, display_id, max(1, timeout_seconds // 2), poll_interval_seconds)
-            except TimeoutError:
-                print(f"WARN case still running after grace wait; display_id={display_id}", flush=True)
-            base["wall_seconds"] = round(time.monotonic() - start, 3)
-            return base
+                await wait_for_task_complete(client, display_id, timeout_seconds, poll_interval_seconds)
+            except TimeoutError as exc:
+                base["status"] = "incomplete"
+                base["errors"] = [f"incomplete: {exc}"]
+                try:
+                    await wait_for_task_complete(client, display_id, max(1, timeout_seconds // 2), poll_interval_seconds)
+                except TimeoutError:
+                    print(f"WARN case still running after grace wait; display_id={display_id}", flush=True)
+                base["wall_seconds"] = round(time.monotonic() - start, 3)
+                return base
 
         summaries = await wait_for_settled_traces(db_path, pre_rowid, timeout_seconds, poll_interval_seconds)
         trace_rowids = [summary.rowid for summary in summaries]

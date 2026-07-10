@@ -236,7 +236,7 @@ from datetime import datetime, timezone
 import hashlib
 import inspect
 import re
-from typing import Annotated, List, Dict, TypedDict
+from typing import Annotated, Any, List, Dict, TypedDict
 import aiohttp
 from mythic import mythic, mythic_classes
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
@@ -1013,20 +1013,26 @@ class MythicTools:
     agent_task_id: str
 
     def __init__(self, agent_task_id: str = "", *, operation_id: int | None = None,
-                 channel_id: int | None = None, apitoken_id: int = 0):
+                 channel_id: int | None = None, apitoken_id: int = 0, preauth_client: Any = None):
         """Initialize the MythicTools auth context. Call login() to establish the connection.
 
-        Two auth modes (Section 8A P0):
+        Three auth modes:
         - **Task path (PayloadType):** pass ``agent_task_id``; ``login()`` mints via that AgentTaskID.
         - **Chat path (chat container):** pass ``channel_id`` (+ ``operation_id``/``apitoken_id``);
           ``login()`` mints a channel-scoped bot token via ``ChatAPITokenProvider``. ``channel_id`` is
           the selector — when it's set the chat branch runs regardless of ``agent_task_id``.
+        - **Headless/eval path:** pass ``preauth_client`` — an already-authenticated ``mythic`` client
+          (e.g. the gauge harness's admin login). ``login()`` adopts it directly (no token mint), so the
+          Model can run a full solve in-process with no PayloadType task or chat channel. See
+          ``ai/hillclimb/headless_solver.py``. Pin the engagement key (``SAGE_ENGAGEMENT_ID``) when using
+          an admin client, since it can see many operations.
         """
         logger.debug(f"Initializing MythicAPIClient (task_id={agent_task_id!r} channel_id={channel_id})")
         self.agent_task_id = agent_task_id
         self.operation_id = operation_id
         self.channel_id = channel_id
         self.apitoken_id = apitoken_id
+        self._preauth_client = preauth_client
         self.client = None
         # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
@@ -1362,6 +1368,11 @@ class MythicTools:
         leave ``self.client`` None so guarded tools fail closed via their "not initialized" guard and
         ``_fetch_dynamic_data`` falls back to defaults, instead of crashing ``Model.initialize()``.
         """
+        if self._preauth_client is not None:
+            # Headless/eval path: adopt the caller's already-authenticated client directly — no token mint,
+            # no channel/task context needed. Lets the gauge harness run a full solve in-process.
+            self.client = self._preauth_client
+            return
         api_key = None
         if self.channel_id is not None:
             # Chat bot-token path — the primary consumer of ChatAPITokenProvider (corrects the earlier
