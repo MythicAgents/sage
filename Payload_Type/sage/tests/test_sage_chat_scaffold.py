@@ -1263,6 +1263,32 @@ def test_capability_command_observer_surfaces_real_callback_command_name():
     assert emitter.tool_use_calls[1]["result_preview"] == "Ticket cache purged."
 
 
+def test_capability_wait_observer_emits_operator_progress_messages():
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {})
+
+    base = {
+        "trace_id": "capability_command:1",
+        "command": "wait_for_seconds",
+        "parameters": {
+            "seconds": 300,
+            "reason": "wait for Group Policy refresh after GPO task write",
+        },
+    }
+    _run(m._emit_capability_command_card({**base, "status": "started"}))
+    _run(m._emit_capability_command_card({
+        **base,
+        "status": "progress",
+        "result_preview": "waited 150 seconds; 150 seconds remaining",
+    }))
+    _run(m._emit_capability_command_card({**base, "status": "completed"}))
+
+    assert "Waiting for propagation" in emitter.text_sends[0]
+    assert "150 seconds remaining" in emitter.text_sends[1]
+    assert "Propagation wait complete" in emitter.text_sends[2]
+    assert emitter.tool_use_calls == []
+
+
 def test_tool_result_is_error_ignores_nested_errors_in_a_listing():
     """A data-listing result (e.g. get_task_history_for_callback) whose records include a historical
     'error' status must NOT tag the call Failed — only the TOP-LEVEL shape signals tool failure."""

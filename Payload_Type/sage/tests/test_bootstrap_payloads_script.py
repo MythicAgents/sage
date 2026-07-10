@@ -265,6 +265,7 @@ def test_import_callback_config_passes_jsonb_object(monkeypatch):
 
 def test_import_callback_config_hides_retained_callback_without_mutating_source(monkeypatch):
     observed = {}
+    updates = []
     source = {
         "callback": {
             "agent_callback_id": "callback-uuid",
@@ -274,6 +275,13 @@ def test_import_callback_config_hides_retained_callback_without_mutating_source(
     }
 
     async def fake_query(client, query, variables=None):
+        if "importCallbackConfig" not in query:
+            return {
+                "callback": [{
+                    "display_id": 7,
+                    "agent_callback_id": "callback-uuid",
+                }]
+            }
         observed["variables"] = variables
         return {
             "importCallbackConfig": {
@@ -282,12 +290,19 @@ def test_import_callback_config_hides_retained_callback_without_mutating_source(
             }
         }
 
-    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    async def fake_update(client, callback_display_id, active=None, **kwargs):
+        updates.append((callback_display_id, active))
+        return {"status": "success", "error": None}
 
-    asyncio.run(bootstrap_payloads.import_callback_config(object(), source))
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "update_callback", fake_update)
+
+    result = asyncio.run(bootstrap_payloads.import_callback_config(object(), source))
 
     assert observed["variables"]["config"]["callback"]["active"] is False
     assert source["callback"]["active"] is True
+    assert result["callback_hidden"] is True
+    assert updates == [(7, False)]
 
 
 def test_callback_config_payload_type_reads_exported_payload_type():

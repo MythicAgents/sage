@@ -503,15 +503,37 @@ async def export_callback_config(client, selector: str) -> dict[str, Any]:
 
 
 async def import_callback_config(client, config: Any) -> dict[str, Any]:
+    prepared = prepare_callback_config_for_import(config)
     result = await mythic.execute_custom_query(
         client,
         IMPORT_CALLBACK_CONFIG_MUTATION,
-        variables={"config": prepare_callback_config_for_import(config)},
+        variables={"config": prepared},
     )
-    return _require_success(
+    imported = _require_success(
         "callback config import",
         result.get("importCallbackConfig") or {},
     )
+    callback = prepared.get("callback") if isinstance(prepared, dict) else None
+    selector = ""
+    if isinstance(callback, dict):
+        selector = str(callback.get("agent_callback_id") or callback.get("display_id") or "").strip()
+    if not selector:
+        return imported
+    identity = await resolve_callback_identity(client, selector)
+    hidden = _require_success(
+        "imported callback hide",
+        await mythic.update_callback(
+            client,
+            callback_display_id=int(identity["display_id"]),
+            active=False,
+        ),
+    )
+    return {
+        **imported,
+        "callback_hidden": True,
+        "callback_display_id": int(identity["display_id"]),
+        "callback_hide": hidden,
+    }
 
 
 def load_native_chat_module():

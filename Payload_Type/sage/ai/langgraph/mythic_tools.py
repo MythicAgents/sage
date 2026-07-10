@@ -1488,20 +1488,32 @@ class MythicTools:
                     ))
         return tools
 
+    async def _bounded_wait_for_seconds(self, seconds: int, reason: str = "", heartbeat=None) -> str:
+        try:
+            wait_seconds = int(seconds)
+        except (TypeError, ValueError):
+            wait_seconds = 1
+        wait_seconds = max(1, min(wait_seconds, 600))
+        if heartbeat is None or wait_seconds < 2:
+            await asyncio.sleep(wait_seconds)
+        else:
+            elapsed = wait_seconds // 2
+            await asyncio.sleep(elapsed)
+            remaining = wait_seconds - elapsed
+            observed = heartbeat(elapsed, remaining)
+            if inspect.isawaitable(observed):
+                await observed
+            await asyncio.sleep(remaining)
+        suffix = f" reason={reason}" if reason else ""
+        return f"waited {wait_seconds} seconds{suffix}"
+
     async def wait_for_seconds(self, seconds: int, reason: str = "") -> str:
         """
         Pause Sage-side LLM execution for a bounded number of seconds, without tasking or changing any Mythic
         callback sleep interval. Use this when an external effect needs propagation time before a verifier can
         be meaningful, such as waiting for a Group Policy refresh before polling domain group membership.
         """
-        try:
-            wait_seconds = int(seconds)
-        except (TypeError, ValueError):
-            wait_seconds = 1
-        wait_seconds = max(1, min(wait_seconds, 600))
-        await asyncio.sleep(wait_seconds)
-        suffix = f" reason={reason}" if reason else ""
-        return f"waited {wait_seconds} seconds{suffix}"
+        return await self._bounded_wait_for_seconds(seconds, reason)
 
     async def get_all_active_callbacks(self) -> str:
 
@@ -7389,9 +7401,32 @@ class MythicTools:
                 except (TypeError, ValueError):
                     seconds = 0
                 reason = self._capability_text(parameters.get("reason"))
-            output = await self.wait_for_seconds(seconds or 300, reason=reason)
+            seconds = max(1, min(seconds or 300, 600))
+            trace_id = self._next_capability_command_trace_id()
+            await self._notify_capability_command_observer(
+                trace_id=trace_id,
+                status="started",
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+            )
+
+            async def heartbeat(elapsed: int, remaining: int) -> None:
+                await self._notify_capability_command_observer(
+                    trace_id=trace_id,
+                    status="progress",
+                    command_obj=command_obj,
+                    command_name=command_name,
+                    parameters=parameters,
+                    callback_id=callback_id,
+                    capability_name=capability_name,
+                    result_preview=f"waited {elapsed} seconds; {remaining} seconds remaining",
+                )
+
+            output = await self._bounded_wait_for_seconds(seconds, reason=reason, heartbeat=heartbeat)
             task_id = None
-            trace_id = ""
         else:
             if self._capability_executor_allows_repeated_probe(command_obj):
                 try:

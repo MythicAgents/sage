@@ -77,3 +77,38 @@ def test_post_callback_preflight_requires_purge_and_probe(monkeypatch) -> None:
     assert result["identity_probe"]["domain"] == "north.local"
     assert calls[0] == (2, "shell", "klist purge")
     assert "GetCurrentDomain" in calls[1][2]
+
+
+def test_import_callback_config_explicitly_hides_imported_callback(monkeypatch) -> None:
+    queries = []
+    updates = []
+
+    async def fake_query(client, query, variables=None):
+        queries.append((query, variables))
+        if "importCallbackConfig" in query:
+            assert variables["config"]["callback"]["active"] is False
+            return {"importCallbackConfig": {"status": "success", "error": ""}}
+        return {
+            "callback": [{
+                "display_id": 7,
+                "agent_callback_id": "callback-uuid",
+            }]
+        }
+
+    async def fake_update(client, callback_display_id, active=None, **kwargs):
+        updates.append((callback_display_id, active))
+        return {"status": "success", "error": ""}
+
+    monkeypatch.setattr(bootstrap.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap.mythic, "update_callback", fake_update)
+
+    result = asyncio.run(bootstrap.import_callback_config(object(), {
+        "callback": {
+            "agent_callback_id": "callback-uuid",
+            "active": True,
+        }
+    }))
+
+    assert result["callback_hidden"] is True
+    assert result["callback_display_id"] == 7
+    assert updates == [(7, False)]

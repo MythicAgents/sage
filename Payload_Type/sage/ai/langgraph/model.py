@@ -1877,6 +1877,30 @@ class Model:
         trace_id = str(event.get("trace_id") or "").strip()
         if not command_name or not trace_id:
             return
+        if command_name == "wait_for_seconds":
+            parameters = event.get("parameters") if isinstance(event.get("parameters"), dict) else {}
+            seconds = int(parameters.get("seconds") or 300)
+            reason = str(parameters.get("reason") or "wait for propagation").strip()
+            status = str(event.get("status") or "").strip().casefold()
+            if status == "started":
+                message = (
+                    "**Waiting for propagation**\n"
+                    f"Sage is waiting up to {seconds} seconds before validating the external effect.\n"
+                    f"Reason: {reason}\n"
+                )
+            elif status == "progress":
+                preview = str(event.get("result_preview") or "").strip()
+                message = (
+                    "**Propagation wait in progress**\n"
+                    f"Sage is still waiting before validation{f': {preview}' if preview else '.'}\n"
+                )
+            else:
+                message = (
+                    "**Propagation wait complete**\n"
+                    "Sage finished the bounded wait and is continuing with effect validation.\n"
+                )
+            await self._stream_message_to_mythic(message)
+            return
         arguments: dict[str, Any] = {
             "callback_id": event.get("callback_id"),
             "parameters": event.get("parameters"),

@@ -6893,6 +6893,44 @@ def test_wait_for_seconds_is_bounded(monkeypatch):
     assert "gp refresh" in out
 
 
+def test_capability_wait_emits_started_midpoint_and_completed(monkeypatch):
+    mt = _make_tools()
+    waits = []
+    events = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    async def observer(event):
+        events.append(event)
+
+    async def binding(command_obj, _callback_id):
+        return {
+            "ok": True,
+            "command": command_obj["command"],
+            "parameters": command_obj["parameters"],
+        }
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    mt.set_capability_command_observer(observer)
+    mt._prepare_capability_command_binding = binding
+
+    item = asyncio.run(mt._execute_capability_command(
+        {
+            "command": "wait_for_seconds",
+            "parameters": {"seconds": 300, "reason": "wait for Group Policy refresh"},
+        },
+        2,
+        timeout=5,
+        capability_name="abuse-gpo",
+    ))
+
+    assert waits == [150, 150]
+    assert [event["status"] for event in events] == ["started", "progress", "completed"]
+    assert len({event["trace_id"] for event in events}) == 1
+    assert item["command"] == "wait_for_seconds"
+
+
 def test_rewrite_shell_like_run_handles_json_command():
     mt = _make_tools()
     command, params = mt._rewrite_shell_like_run(
