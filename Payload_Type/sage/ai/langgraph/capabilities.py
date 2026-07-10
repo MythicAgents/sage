@@ -3440,6 +3440,7 @@ def _build_ensure_account_kerberos_context_execution_plan(
     dc = _input_text(inputs, "dc", "domain_controller")
     context_password = _input_text(inputs, "context_password", "logon_password") or "SageNetOnlyContext1!"
     context_process = _input_text(inputs, "context_process", "sacrificial_process", "run")
+    credential_id = _input_text(inputs, "credential_id", "mythic_credential_id")
 
     steps: list[CapabilityExecutionStep] = []
     if _input_bool(inputs, "preflight_existing_context", default=True):
@@ -3501,6 +3502,7 @@ def _build_ensure_account_kerberos_context_execution_plan(
                 "user": account,
                 "password": context_password,
                 "netonly": True,
+                **({"credential_id": credential_id} if credential_id else {}),
                 **({"process": context_process} if context_process else {}),
             },
             capability=action.name,

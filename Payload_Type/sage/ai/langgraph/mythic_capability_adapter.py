@@ -1006,6 +1006,7 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
     username = f"{domain}\\{user}" if domain and "\\" not in user and "@" not in user else user
     netonly_param = _adapter_text(config, "logon_netonly_param", "netOnly")
     credential_param = _adapter_text(config, "logon_credential_param", "credential")
+    credential_id = _text(parameters.get("credential_id") or parameters.get("mythic_credential_id"))
     mode = _normalize(config.get("logon_session_mode") or config.get("logon_strategy") or "credential-store")
     mythic_parameters: dict[str, Any] = {}
     if mode in {"direct", "username-password", "newcredentials"} or not credential_param:
@@ -1016,12 +1017,16 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
-        mythic_parameters[credential_param] = {
-            "account": user,
-            "realm": domain,
-            "credential": password,
-            "type": "plaintext",
-        }
+        mythic_parameters[credential_param] = (
+            f"@cred:{credential_id}"
+            if credential_id
+            else {
+                "account": user,
+                "realm": domain,
+                "credential": password,
+                "type": "plaintext",
+            }
+        )
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     process_param = _adapter_text(config, "logon_process_param", "")
