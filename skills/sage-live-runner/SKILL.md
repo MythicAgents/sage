@@ -42,7 +42,8 @@ intermediate goals to the objective.
 The proof path requires:
 
 - a running `sage` consuming container of type `chat`
-- an active Mythic API token with wildcard scope or `apitoken.write` and `chat-ai.write`
+- an active Mythic API token with wildcard scope; Mythic's chat token delegation inherits the backing token's
+  scopes, so the UI-minimum `apitoken.write` and `chat-ai.write` pair cannot drive autonomous operator tools
 - a live Apollo callback on CASTELBLACK as Samwell
 - archived Sage/Phoenix runtime databases followed by a clean Sage restart
 - a clean BloodHound database and reset GOAD range

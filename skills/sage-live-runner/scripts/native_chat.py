@@ -29,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SAGE_ENV_PATH = REPO_ROOT / "Payload_Type" / "sage" / ".env"
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
+AUTONOMOUS_TOKEN_SCOPES = {"*"}
 
 READINESS_QUERY = """
 query SageChatReadiness {
@@ -303,12 +304,11 @@ def select_chat_resources(
     usable = [
         row
         for row in tokens
-        if "*" in _scopes(row) or REQUIRED_TOKEN_SCOPES.issubset(_scopes(row))
+        if AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
     ]
     if not usable:
         raise RuntimeError(
-            "No active Mythic API token has required scopes: "
-            + ", ".join(sorted(REQUIRED_TOKEN_SCOPES))
+            "No active Mythic API token has the wildcard scope required for autonomous Sage operations."
         )
     return containers[0], usable[0]
 
@@ -335,14 +335,14 @@ async def ensure_api_token(client: Any, *, name: str = "Sage native chat") -> di
     usable = [
         row
         for row in observed.get("apitokens", [])
-        if "*" in _scopes(row) or REQUIRED_TOKEN_SCOPES.issubset(_scopes(row))
+        if AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
     ]
     if usable:
         return {"created": False, "api_token": usable[0]}
     result = await mythic.execute_custom_query(
         client,
         CREATE_TOKEN_MUTATION,
-        variables={"name": name, "scopes": sorted(REQUIRED_TOKEN_SCOPES)},
+        variables={"name": name, "scopes": sorted(AUTONOMOUS_TOKEN_SCOPES)},
     )
     token = _require_success("API token creation", result.get("createAPIToken") or {})
     return {"created": True, "api_token": token}

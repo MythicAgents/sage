@@ -27,7 +27,7 @@ Verify the Sage chat container and create a fresh Apollo payload:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-`bootstrap-reset` must report a running `sage_chat_container`, an empty locked prepared channel named
+`bootstrap-reset` must report a running `sage_chat_container`, a wildcard-scoped autonomous API token, an empty locked prepared channel named
 `Sage GOAD Ready`, and `sage_payload_created: false`.
 
 After Apollo is launched as `NORTH\samwell.tarly` on CASTELBLACK, run:

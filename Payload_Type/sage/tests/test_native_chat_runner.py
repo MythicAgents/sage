@@ -29,17 +29,57 @@ def test_select_chat_resources_accepts_wildcard_token():
 
 
 def test_select_chat_resources_fails_without_required_scope():
-    with pytest.raises(RuntimeError, match="required scopes"):
+    with pytest.raises(RuntimeError, match="wildcard scope"):
         native_chat.select_chat_resources(
             {
                 "consuming_container": [
                     {"id": 1, "container_running": True, "deleted": False}
                 ],
                 "apitokens": [
-                    {"id": 2, "active": True, "deleted": False, "scopes": ["auth.read"]}
+                    {
+                        "id": 2,
+                        "active": True,
+                        "deleted": False,
+                        "scopes": ["apitoken.write", "chat-ai.write"],
+                    }
                 ],
             }
         )
+
+
+def test_ensure_api_token_creates_wildcard_for_autonomous_operations(monkeypatch):
+    calls = []
+
+    async def fake_query(client, query, variables=None):
+        calls.append(variables)
+        if variables is None:
+            return {
+                "consuming_container": [],
+                "apitokens": [
+                    {
+                        "id": 2,
+                        "active": True,
+                        "deleted": False,
+                        "scopes": ["apitoken.write", "chat-ai.write"],
+                    }
+                ],
+            }
+        return {
+            "createAPIToken": {
+                "id": 3,
+                "name": "Sage native chat",
+                "scopes": ["*"],
+                "status": "success",
+                "error": "",
+            }
+        }
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(native_chat.ensure_api_token(object()))
+
+    assert result["created"] is True
+    assert calls[-1]["scopes"] == ["*"]
 
 
 def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
