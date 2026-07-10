@@ -1022,7 +1022,13 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
         mythic_parameters[credential_param] = (
-            f"@cred:{logon_credential_id}"
+            {
+                "id": logon_credential_id,
+                "account": user,
+                "realm": domain,
+                "credential": password,
+                "type": "plaintext",
+            }
             if logon_credential_id
             else {
                 "account": user,
@@ -1546,6 +1552,11 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
     username = f"{realm}\\{local_account}" if realm and "\\" not in local_account and "@" not in local_account else local_account
     netonly_param = _adapter_text(config, "logon_netonly_param", "netOnly")
     credential_param = _adapter_text(config, "logon_credential_param", "credential")
+    credential_id = _text(
+        parameters.get("local_admin_credential_id")
+        or parameters.get("managed_local_admin_credential_id")
+        or parameters.get("credential_id")
+    )
     mode = _normalize(config.get("logon_session_mode") or config.get("local_admin_logon_mode") or "credential-store")
     mythic_parameters: dict[str, Any]
     if mode in {"direct", "username-password", "newcredentials"} or not credential_param:
@@ -1557,12 +1568,22 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
         mythic_parameters = {
-            credential_param: {
-                "account": local_account,
-                "realm": realm,
-                "credential": password,
-                "type": "plaintext",
-            },
+            credential_param: (
+                {
+                    "id": credential_id,
+                    "account": local_account,
+                    "realm": realm,
+                    "credential": password,
+                    "type": "plaintext",
+                }
+                if credential_id
+                else {
+                    "account": local_account,
+                    "realm": realm,
+                    "credential": password,
+                    "type": "plaintext",
+                }
+            ),
         }
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))

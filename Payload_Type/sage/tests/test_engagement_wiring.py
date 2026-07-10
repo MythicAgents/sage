@@ -2810,6 +2810,17 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     mt = _make_tools()
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    record_command_result = mt._record_deterministic_capability_command_result
+
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output):
+        if command != "make_token":
+            record_command_result(command, parameters, callback_display_id, output)
+
+    monkeypatch.setattr(
+        mt,
+        "_record_deterministic_capability_command_result",
+        record_with_mythic_make_token_parameter_rewrite,
+    )
 
     async def fake_fetch_credentials(now):
         return [
@@ -2852,7 +2863,7 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
             },
         )))
 
-    assert result["ok"] is True, result
+    assert result["ok"] is True, json.dumps(result, indent=2)
     assert result["verdict"] == "achieved"
     assert calls["issue"] == 7
     issued_params = [str(call["parameters"]) for call in calls["issued"]]
@@ -2909,7 +2920,10 @@ def test_netonly_plaintext_credential_is_created_separately_from_account_key(mon
 
 def test_execute_account_context_stops_after_make_token_rejects_hash(monkeypatch):
     mt = _make_tools()
-    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema() if command == "make_token" else [],
+    )
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
     async def fake_fetch_credentials(now):
@@ -2934,6 +2948,7 @@ def test_execute_account_context_stops_after_make_token_rejects_hash(monkeypatch
         "Access is denied.",
         f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
         "Credential material is not a plaintext password.",
+        "Credential material is not a plaintext password.",
     ])
     calls = {"issue": 0}
 
@@ -2955,7 +2970,7 @@ def test_execute_account_context_stops_after_make_token_rejects_hash(monkeypatch
     assert issued_commands[-1] == "make_token"
     assert "ticket_store_add" not in issued_commands
     make_token = calls["issued"][-1]
-    assert make_token["parameters"]["credential"] == "@cred:88"
+    assert make_token["parameters"]["Credential"] == "@cred:88"
 
 
 def test_build_capability_commands_supports_managed_secret_read():
@@ -3152,26 +3167,61 @@ def test_execute_capability_managed_secret_read_refreshes_stale_account_context(
 
 def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_context(monkeypatch):
     mt = _make_tools()
-    mt._engagement_hops = [_proof_hop(
-        "kerberos-account-context:alice@lab.local@callback:13",
-        7000,
-        callback_id="13",
-        technique="capability:ensure-account-kerberos-context",
-        target="domain=lab.local;account=alice;callback=13",
-    )]
-    context_key = mt._kerberos_account_context_key(13, "alice", "lab.local")
-    mt._kerberos_logon_account_context_keys.add(context_key)
-    mt._kerberos_account_context_keys.add(context_key)
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
-    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.child.lab.local")
+    record_command_result = mt._record_deterministic_capability_command_result
+
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output):
+        if command != "make_token":
+            record_command_result(command, parameters, callback_display_id, output)
+
+    monkeypatch.setattr(
+        mt,
+        "_record_deterministic_capability_command_result",
+        record_with_mythic_make_token_parameter_rewrite,
+    )
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(
+        0,
+        result="dc01.child.lab.local" if domain == "child.lab.local" else "dc01.lab.local",
+    )
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+            "comment": "aes256",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    ticket = base64.b64encode(b"A" * 80).decode()
     calls = {"issue": 0}
-    output = "\n".join([
+    outputs = iter([
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
+        " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
+        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
+        "Successfully impersonated local\\user for local access and lab.local\\alice for remote access.",
+        "Added Ticket to Ticket Store",
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
+        " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
+        "\n".join([
         "distinguishedname=CN=WS01,DC=child,DC=lab,DC=local",
         "ms-mcs-admpwd=CorrectHorseBatteryStaple!",
+        ]),
     ])
 
-    with _split_issue(output, calls, display_id=7200):
+    with _split_issue(lambda: next(outputs), calls, display_id=7200):
+        context_result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "ensure-account-kerberos-context",
+                "domain": "lab.local",
+                "account": "alice",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
         result = json.loads(asyncio.run(mt.execute_capability(
             {
                 "capability": "read-managed-local-admin-secret",
@@ -3184,9 +3234,10 @@ def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_co
             {"timeout": 5},
         )))
 
-    assert result["ok"] is True, result
+    assert context_result["ok"] is True, context_result
+    assert result["ok"] is True, json.dumps(result, indent=2)
     assert result["verdict"] == "achieved"
-    assert calls["issue"] == 1
+    assert calls["issue"] == 8
     assert [item["command"] for item in result["issued"]] == ["powerpick"]
     assert result["recorded_effects"] == ["managed-local-admin-secret:ws01@child.lab.local"]
 
@@ -3629,12 +3680,73 @@ def test_build_capability_commands_supports_local_admin_secret_use_from_credenti
     ]
     assert [command["command"] for command in plan["commands"]] == ["make_token", "ls"]
     assert plan["commands"][0]["parameters"]["credential"] == {
+        "id": "91",
         "account": "Administrator",
         "realm": "ws01",
         "credential": "CorrectHorseBatteryStaple!",
         "type": "plaintext",
     }
     assert plan["commands"][1]["parameters"] == {"path": r"\\ws01.child.lab.local\C$"}
+
+
+def test_execute_local_admin_secret_use_tasks_mythic_credential_reference(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop(
+            "managed-local-admin-secret:ws01@child.lab.local",
+            7200,
+            callback_id="13",
+            technique="capability:read-managed-local-admin-secret",
+        )
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema() if command == "make_token" else [],
+    )
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 91,
+            "account": "Administrator",
+            "realm": "ws01",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+            "comment": "managed local admin password for ws01",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    calls = {"issue": 0}
+    outputs = iter([
+        "Successfully impersonated ws01\\Administrator for remote access.",
+        "\n".join([
+            r" Volume in drive \\ws01.child.lab.local\C$ has no label.",
+            r" Directory of \\ws01.child.lab.local\C$",
+            "06/10/2026  12:00 PM    <DIR>          Windows",
+        ]),
+    ])
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7201):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "use-managed-local-admin-secret",
+                "target_host": "ws01",
+                "target_domain": "child.lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, json.dumps(result, indent=2)
+    assert result["verdict"] == "achieved"
+    assert calls["issued"][0]["command_name"] == "make_token"
+    assert calls["issued"][0]["parameters"]["Credential"] == "@cred:91"
+    assert calls["issued"][1]["command_name"] == "ls"
+    assert set(result["recorded_effects"]) == {
+        "local-admin:ws01@child.lab.local",
+        "admin:ws01",
+        "system-or-admin:ws01",
+    }
 
 
 def test_deterministic_local_admin_secret_use_records_admin_effects_without_secret():
@@ -7137,6 +7249,230 @@ def _merlin_shell_schema():
             "default_value": None,
         },
     ]
+
+
+def _apollo_make_token_schema():
+    return [
+        {
+            "name": "credential",
+            "cli_name": "Credential",
+            "type": "CredentialJson",
+            "parameter_group_name": "credential_store",
+            "required": True,
+            "choices": [],
+            "default_value": None,
+        },
+        {
+            "name": "netOnly",
+            "cli_name": "netOnly",
+            "type": "Boolean",
+            "parameter_group_name": "credential_store",
+            "required": False,
+            "choices": [],
+            "default_value": True,
+        },
+    ]
+
+
+def test_credential_binder_converts_only_live_credential_parameters():
+    mt = _make_tools()
+    parameters = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        13,
+        param_schema=_apollo_make_token_schema(),
+    ))
+
+    assert bound == {"credential": "@cred:91", "netOnly": True}
+    assert parameters["credential"]["id"] == "91"
+
+
+def test_credential_binder_leaves_merlin_direct_user_pass_unchanged():
+    mt = _make_tools()
+    parameters = {
+        "user": "Administrator",
+        "pass": "CorrectHorseBatteryStaple!",
+        "domain": "ws01",
+    }
+    schema = [
+        _string_param("user"),
+        _string_param("pass"),
+        _string_param("domain"),
+    ]
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        2,
+        param_schema=schema,
+    ))
+
+    assert bound == parameters
+
+
+def test_credential_binder_resolves_matching_store_credential_without_id():
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 91,
+            "account": "Administrator",
+            "realm": "ws01",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    parameters = {
+        "credential": {
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        13,
+        param_schema=_apollo_make_token_schema(),
+    ))
+
+    assert bound["credential"] == "@cred:91"
+
+
+def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypatch):
+    mt = _make_tools()
+    calls = {"issue": 0}
+
+    async def make_token_schema(command, callback_display_id):
+        assert command == "make_token"
+        return _apollo_make_token_schema()
+
+    async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+        calls["issue"] += 1
+        calls.setdefault("parameters", []).append(parameters)
+        if calls["issue"] == 1:
+            raise Exception("Failed to process task references: cred parameters require @cred task references")
+        return {"display_id": 7300}
+
+    async def fake_waitfor(mythic, task_display_id, timeout=None):
+        return "Successfully impersonated ws01\\Administrator for remote access."
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    monkeypatch.setattr(mythic_tools.mythic, "issue_task", fake_issue_task)
+    monkeypatch.setattr(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor)
+    original_bind = mt._bind_mythic_credential_parameters
+    bind_calls = {"count": 0}
+
+    async def delayed_bind(*args, **kwargs):
+        bind_calls["count"] += 1
+        if bind_calls["count"] == 1:
+            return args[1]
+        return await original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(mt, "_bind_mythic_credential_parameters", delayed_bind)
+    parameters = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    output = asyncio.run(mt.issue_task_and_waitfor_task_output(
+        "make_token",
+        parameters,
+        13,
+        timeout=5,
+    ))
+
+    assert "Successfully impersonated" in output
+    assert calls["issue"] == 2
+    assert isinstance(calls["parameters"][0]["Credential"], dict)
+    assert calls["parameters"][1]["Credential"] == "@cred:91"
+
+
+def test_bound_credential_contexts_keep_distinct_make_token_identities(monkeypatch):
+    mt = _make_tools()
+    calls = {"issue": 0}
+
+    async def make_token_schema(command, callback_display_id):
+        return _apollo_make_token_schema()
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    cersei = {
+        "credential": {
+            "id": "88",
+            "account": "cersei.lannister",
+            "realm": "sevenkingdoms.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    braavos = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "braavos",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    essos = {
+        "credential": {
+            "id": "92",
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    with _split_issue("Successfully impersonated remote identity.", calls):
+        first = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", cersei, 1, timeout=5))
+        second = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", braavos, 1, timeout=5))
+        third = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", essos, 1, timeout=5))
+        duplicate = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", essos, 1, timeout=5))
+
+    assert "Successfully impersonated" in first
+    assert "Successfully impersonated" in second
+    assert "Successfully impersonated" in third
+    assert calls["issue"] == 3
+    assert calls["issued"][0]["parameters"]["Credential"] == "@cred:88"
+    assert calls["issued"][1]["parameters"]["Credential"] == "@cred:91"
+    assert calls["issued"][2]["parameters"]["Credential"] == "@cred:92"
+    assert "matching NetOnly Kerberos logon context" in duplicate
+    assert "administrator@essos.local" in duplicate.casefold()
+
+
+def test_bound_credential_reference_without_identity_does_not_create_empty_duplicate_key():
+    mt = _make_tools()
+
+    assert mt._kerberos_logon_context_key(
+        "make_token",
+        1,
+        {"Credential": "@cred:91", "netOnly": True},
+    ) is None
 
 
 def test_issue_path_wraps_merlin_shell_command_line_from_live_schema(monkeypatch):

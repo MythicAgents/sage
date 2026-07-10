@@ -3741,6 +3741,12 @@ def _build_use_managed_local_admin_secret_execution_plan(
         "credential",
         "credential_text",
     ) or action.intent.get("password")
+    credential_id = _input_text(
+        inputs,
+        "local_admin_credential_id",
+        "managed_local_admin_credential_id",
+        "credential_id",
+    )
     missing = []
     if not target_host:
         missing.append("target_host")
@@ -3774,6 +3780,7 @@ def _build_use_managed_local_admin_secret_execution_plan(
                     "password": password,
                     "callback_id": callback_id,
                     "netonly": True,
+                    **({"credential_id": credential_id} if credential_id else {}),
                     **({"process": process} if process else {}),
                 },
                 capability=action.name,

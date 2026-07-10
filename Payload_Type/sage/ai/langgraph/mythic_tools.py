@@ -1113,6 +1113,7 @@ class MythicTools:
         # Prevents repeated make_token calls for the same EA/DA context when ticket_store_list/proof should
         # be used first.
         self._kerberos_logon_context_keys: set[tuple] = set()
+        self._bound_credential_contexts: dict[str, tuple[str, str]] = {}
         self._kerberos_logon_context_callbacks: set[int] = set()
         self._kerberos_logon_account_context_keys: set[tuple] = set()
         self._kerberos_account_context_keys: set[tuple] = set()
@@ -2496,10 +2497,18 @@ class MythicTools:
             credential_realm = credential.get("realm") if isinstance(credential, dict) else ""
             username = self._capability_text(parameters.get("username") or parameters.get("user") or credential_account)
             realm = self._capability_text(parameters.get("domain") or parameters.get("realm") or credential_realm)
+            if not username and not realm and isinstance(credential, str):
+                bound_context = self._bound_credential_contexts.get(
+                    _capability_command_key(command, parameters)
+                )
+                if bound_context:
+                    username, realm = bound_context
             if "\\" in username and not realm:
                 realm, _, username = username.partition("\\")
             if "@" in username and not realm:
                 username, _, realm = username.partition("@")
+            if not username and not realm:
+                return None
             netonly = parameters.get("netOnly", parameters.get("netonly", True))
             return (
                 int(callback_display_id),
@@ -2955,6 +2964,12 @@ class MythicTools:
                     resolved = command_builder.resolve_params(param_schema, parameters, command=command)
                     if resolved.ok:
                         parameters = resolved.params
+                        parameters = await self._bind_mythic_credential_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            param_schema=param_schema,
+                        )
                         if parameters != original_parameters:
                             logger.debug(
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
@@ -3054,10 +3069,28 @@ class MythicTools:
                 self._last_issued_task_display_id = None
 
                 async def _issue_and_wait():
-                    task = await mythic.issue_task(
-                        mythic=self.client, command_name=command, parameters=parameters,
-                        callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
-                    )  # token_id=token_id
+                    nonlocal parameters
+                    try:
+                        task = await mythic.issue_task(
+                            mythic=self.client, command_name=command, parameters=parameters,
+                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        )  # token_id=token_id
+                    except Exception as exc:
+                        if not self._is_mythic_credential_reference_rejection(exc):
+                            raise
+                        repaired = await self._bind_mythic_credential_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            force_refresh=True,
+                        )
+                        if repaired == parameters:
+                            raise
+                        parameters = repaired
+                        task = await mythic.issue_task(
+                            mythic=self.client, command_name=command, parameters=parameters,
+                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
                     if tdid is None:
                         raise Exception("Failed to create task")
@@ -3068,6 +3101,7 @@ class MythicTools:
                     )
 
                 results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
+                fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
                 timeout_result = (
                     f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
@@ -6149,17 +6183,11 @@ class MythicTools:
                     self._capability_transaction_update_verification(transaction, command_obj, verification)
                     final_probe = self._capability_executor_is_final_probe(command_obj)
                     if verification.verdict == "achieved" and final_probe:
-                        if self._capability_text(getattr(action_obj, "name", "")).casefold() == "ensure-account-kerberos-context":
-                            account = self._capability_account(action_obj, input_values)
-                            account_domain = self._capability_account_domain(action_obj, input_values)
-                            if account and account_domain:
-                                context_key = self._kerberos_account_context_key(
-                                    callback_id,
-                                    account,
-                                    account_domain,
-                                )
-                                self._kerberos_logon_account_context_keys.add(context_key)
-                                self._kerberos_account_context_keys.add(context_key)
+                        self._record_verified_account_kerberos_context(
+                            action_obj,
+                            input_values,
+                            callback_id,
+                        )
                         credential_refs = await self._import_capability_credential_material(
                             action_obj,
                             input_values,
@@ -6262,6 +6290,11 @@ class MythicTools:
                             probe = retry_probe
                             verification = retry_verification
                             if retry_verification.verdict == "achieved":
+                                self._record_verified_account_kerberos_context(
+                                    action_obj,
+                                    input_values,
+                                    callback_id,
+                                )
                                 credential_refs = await self._import_capability_credential_material(
                                     action_obj,
                                     input_values,
@@ -7333,6 +7366,11 @@ class MythicTools:
                         self._capability_executor_is_current_context_service_proof(command_obj)
                         and verification.verdict == "achieved"
                     ):
+                        self._record_verified_account_kerberos_context(
+                            action,
+                            preflight_inputs,
+                            callback_id,
+                        )
                         if not self._capability_action_effects_achieved(action):
                             self.record_capability_result(
                                 action,
@@ -11771,6 +11809,18 @@ class MythicTools:
             self._capability_text(domain).casefold(),
         )
 
+    def _record_verified_account_kerberos_context(self, action, inputs: dict, callback_display_id) -> tuple | None:
+        if self._capability_text(getattr(action, "name", "")).casefold() != "ensure-account-kerberos-context":
+            return None
+        account = self._capability_account(action, inputs)
+        account_domain = self._capability_account_domain(action, inputs) or self._capability_domain(action, inputs)
+        if not account or not account_domain:
+            return None
+        context_key = self._kerberos_account_context_key(callback_display_id, account, account_domain)
+        self._kerberos_logon_account_context_keys.add(context_key)
+        self._kerberos_account_context_keys.add(context_key)
+        return context_key
+
     def _ticket_cache_output_has_account(self, output: str, account: str, domain: str) -> bool:
         text = self._capability_text(output).casefold()
         account_cf = self._capability_text(account).casefold()
@@ -12874,6 +12924,153 @@ class MythicTools:
             f"payload '{payload}' for callback {callback_display_id}; do not issue a command from another "
             "payload schema."
         )
+
+    @staticmethod
+    def _credential_schema_parameter_names(param_schema) -> set[str]:
+        names: set[str] = set()
+        for param in param_schema or []:
+            if not isinstance(param, dict):
+                continue
+            if str(param.get("type") or "").casefold() not in {"credential", "credentialjson"}:
+                continue
+            for key in ("name", "cli_name"):
+                value = str(param.get(key) or "").strip()
+                if value:
+                    names.add(value)
+        return names
+
+    async def _resolve_mythic_credential_reference(self, value, *, force_refresh: bool = False) -> str:
+        text = self._capability_text(value).strip() if not isinstance(value, dict) else ""
+        if text:
+            match = re.fullmatch(r"@cred(?::|\()?(\d+)\)?", text, flags=re.I)
+            if match:
+                return f"@cred:{match.group(1)}"
+            if text.isdigit():
+                return f"@cred:{text}"
+            return ""
+        if not isinstance(value, dict):
+            return ""
+
+        credential_id = self._capability_text(
+            value.get("id")
+            or value.get("credential_id")
+            or value.get("mythic_credential_id")
+        ).strip()
+        if credential_id.isdigit():
+            return f"@cred:{credential_id}"
+
+        account = self._capability_text(value.get("account") or value.get("username") or value.get("user")).strip()
+        realm = self._capability_text(value.get("realm") or value.get("domain")).strip()
+        credential = self._capability_text(
+            value.get("credential") or value.get("credential_text") or value.get("secret")
+        ).strip()
+        credential_type = self._capability_text(value.get("type") or value.get("credential_type") or "plaintext").strip()
+        if not account or not realm or not credential:
+            return ""
+
+        if force_refresh:
+            self._cred_cache = None
+            self._cred_cache_ts = None
+        rows = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        for row in rows or []:
+            if self._canonical_credential_account(row.get("account")) != self._canonical_credential_account(account):
+                continue
+            if self._capability_text(row.get("realm")).casefold() != realm.casefold():
+                continue
+            if self._capability_text(row.get("credential_text")) != credential:
+                continue
+            row_id = row.get("id")
+            if row_id is not None:
+                return f"@cred:{row_id}"
+
+        if self.client is None:
+            return ""
+        try:
+            created = await mythic.create_credential(
+                self.client,
+                credential=credential,
+                account=account,
+                realm=realm,
+                comment="Sage schema-bound credential reference",
+                credential_type=credential_type or "plaintext",
+            )
+        except Exception:
+            created = {}
+        created_id = created.get("id") if isinstance(created, dict) else None
+        if created_id is None:
+            return ""
+        self._cred_cache = None
+        self._cred_cache_ts = None
+        return f"@cred:{created_id}"
+
+    def _register_bound_command_parameters(self, command: str, original, bound) -> None:
+        if original == bound:
+            return
+        original_key = _capability_command_key(command, original)
+        bound_key = _capability_command_key(command, bound)
+        context = self._deterministic_capability_command_contexts.get(original_key)
+        if isinstance(context, dict):
+            self._deterministic_capability_command_contexts[bound_key] = context
+        if _normalize_command_name(command) != "make_token":
+            return
+        for key in ("Credential", "credential"):
+            credential = original.get(key) if isinstance(original, dict) else None
+            if not isinstance(credential, dict):
+                continue
+            account = self._capability_text(
+                credential.get("account") or credential.get("username") or credential.get("user")
+            ).strip()
+            realm = self._capability_text(
+                credential.get("realm") or credential.get("domain")
+            ).strip()
+            if account or realm:
+                self._bound_credential_contexts[bound_key] = (account, realm)
+            break
+
+    async def _bind_mythic_credential_parameters(
+        self,
+        command: str,
+        parameters,
+        callback_display_id,
+        *,
+        param_schema=None,
+        force_refresh: bool = False,
+    ):
+        if not isinstance(parameters, dict) or not parameters:
+            return parameters
+        schema = param_schema
+        if schema is None:
+            schema = await self._fetch_command_schema(command, callback_display_id)
+        credential_names = self._credential_schema_parameter_names(schema)
+        if not credential_names:
+            return parameters
+
+        bound = dict(parameters)
+        changed = False
+        for key in list(bound):
+            if key not in credential_names:
+                continue
+            reference = await self._resolve_mythic_credential_reference(
+                bound[key],
+                force_refresh=force_refresh,
+            )
+            if reference and reference != bound[key]:
+                bound[key] = reference
+                changed = True
+        if changed:
+            self._register_bound_command_parameters(command, parameters, bound)
+            logger.info(
+                "🔐 credential-bind command=%s callback=%s fields=%s",
+                command,
+                callback_display_id,
+                sorted(key for key in bound if key in credential_names),
+            )
+        return bound
+
+    @staticmethod
+    def _is_mythic_credential_reference_rejection(value) -> bool:
+        text = str(value or "").casefold()
+        return "cred parameters require @cred task references" in text
 
     async def _fetch_command_schema(self, command, callback_display_id):
         """Resolve the parameter-group schema for `command` on the callback's payload type.

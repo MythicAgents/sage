@@ -1137,7 +1137,13 @@ def test_adapter_uses_distinct_plaintext_credential_reference_for_account_contex
     make_token = mythic_plan.commands[3]
     assert make_token.command == "make_token"
     assert make_token.parameters == {
-        "credential": "@cred:88",
+        "credential": {
+            "id": "88",
+            "account": "alice",
+            "realm": "lab.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
         "netOnly": True,
     }
 
@@ -1415,6 +1421,36 @@ def test_adapter_translates_local_admin_use_to_make_token_and_admin_share_proof(
     assert proof.consumes == ["local_admin_logon_context"]
     assert proof.produces == ["local_admin_access_probe"]
     assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$"}
+
+
+def test_adapter_uses_managed_local_admin_credential_reference_when_available():
+    action = capabilities.CapabilityAction(
+        name="use-managed-local-admin-secret",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["managed-local-admin-secret:ws01@child.lab.local", "live-callback:13"],
+        effects=["local-admin:ws01@child.lab.local", "admin:ws01", "system-or-admin:ws01"],
+        intent={
+            "capability": "use-managed-local-admin-secret",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "credential_id": 91,
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    assert mythic_plan.commands[0].parameters["credential"] == {
+        "id": "91",
+        "account": "Administrator",
+        "realm": "ws01",
+        "credential": "CorrectHorseBatteryStaple!",
+        "type": "plaintext",
+    }
 
 
 def test_adapter_translates_remote_execution_to_wmiexecute_and_cat():
