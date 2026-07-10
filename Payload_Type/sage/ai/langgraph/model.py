@@ -87,6 +87,113 @@ def _controller_hitl_flag_enabled() -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
+# Minimal non-empty fallback for a top-level system prompt. Anthropic-on-Bedrock rejects an empty/blank
+# `system` content block with `ValidationException: system: text content blocks must be non-empty`, and the
+# system field is optional — so a blank must be normalized (or omitted) before it reaches the provider. This
+# is the construction-site guard; _sanitize_messages is the belt-and-suspenders drop at the invoke boundary.
+_DEFAULT_SYSTEM_PROMPT = "You are Sage, an autonomous offensive security operator."
+
+
+def _nonempty_system(text: Any) -> str:
+    """Return a non-blank system prompt: the given text if it carries content, else a minimal default.
+
+    Only a real string counts as content — a non-str (e.g. a list of content blocks passed by mistake) would
+    otherwise str()-ify to non-empty garbage, so it falls back to the default instead."""
+    t = (text if isinstance(text, str) else "").strip()
+    return t if t else _DEFAULT_SYSTEM_PROMPT
+
+
+def _coerce_prompt_text(prompt: Any) -> str:
+    """Normalize a chat turn to plain text for the deterministic objective gate.
+
+    A prompt is usually a str, but LangChain content can be a list of blocks ([{'type':'text','text':...}]).
+    The objective detector is a regex over text, so join the text parts and ignore non-text blocks rather
+    than str()-ing a list (which would smuggle '[{...}]' into the match)."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        parts = []
+        for b in prompt:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text", "")))
+            elif isinstance(b, str):
+                parts.append(b)
+        return " ".join(parts)
+    return str(prompt or "")
+
+
+def _content_has_text(content: Any) -> bool:
+    """True if a message's content carries at least one non-blank piece of text or a non-text block.
+
+    Used to decide whether a SystemMessage is 'real' or an empty block that would trip Bedrock's
+    'text content blocks must be non-empty' validation."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict):
+                # A dict block with non-blank text counts regardless of an explicit "type" (keeps this in
+                # agreement with _strip_blank_text_blocks, which only drops type=="text" blank blocks).
+                if str(b.get("text", "")).strip():
+                    return True
+                if b.get("type") and b.get("type") != "text":
+                    return True  # tool_use / image / etc. count as content
+            elif isinstance(b, str) and b.strip():
+                return True
+        return False
+    return content is not None
+
+
+def _strip_blank_text_blocks(content: Any) -> Any:
+    """Drop empty/whitespace-only text blocks from list content, preserving non-text blocks.
+
+    Returns the original content unchanged if it is not a list, or if stripping would remove every block
+    (the caller decides what to do with a now-empty message). Mirrors _fix_payload_empty_content's list
+    handling so the langchain-aws provider path — which never touches the langchain_openai patch — is also
+    protected against blank text blocks."""
+    if not isinstance(content, list):
+        return content
+    kept = [
+        b for b in content
+        if not (isinstance(b, dict) and b.get("type") == "text" and not str(b.get("text", "")).strip())
+    ]
+    return kept if kept else content
+
+
+def _sanitize_model_messages(msgs: list) -> tuple[list, bool]:
+    """Normalize a message list so NO empty/blank content block reaches any provider. Returns (messages, changed).
+
+    Scope is the empty-block class ONLY — drop empty SystemMessages, strip blank text blocks from list content,
+    and backfill an AIMessage left with no textual content (empty string, or an assistant turn carrying only a
+    tool_use block would still be valid, but an empty text block alongside it is not). It deliberately does NOT
+    reorder or drop tool_use/tool_result pairs — that is `_sanitize_messages`' job on the channel path. This is
+    the provider-agnostic core shared by `_MessageSanitizerMiddleware`, which reaches create_agent's internal
+    react loop where `_sanitize_messages` and the langchain_openai monkeypatch cannot."""
+    out: list = []
+    changed = False
+    for m in msgs:
+        content = getattr(m, "content", None)
+        # Drop an empty/blank top-level system block (Bedrock: "system: text content blocks must be non-empty";
+        # system is optional so dropping is valid).
+        if isinstance(m, SystemMessage) and not _content_has_text(content):
+            changed = True
+            continue
+        # Strip blank text blocks from any list content, preserving non-text (tool_use / image / …) blocks.
+        if isinstance(content, list):
+            stripped = _strip_blank_text_blocks(content)
+            if stripped != content:
+                m = m.model_copy(update={"content": stripped})
+                content = stripped
+                changed = True
+        # An assistant turn must not carry empty content (empty string, or a now-empty block set). A tool_use
+        # block counts as content (_content_has_text handles that), so this only fires on genuinely empty ones.
+        if isinstance(m, AIMessage) and not _content_has_text(content):
+            m = m.model_copy(update={"content": "."})
+            changed = True
+        out.append(m)
+    return out, changed
+
+
 _AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT = _env_positive_int(
     "SAGE_AUTONOMOUS_UNBOUNDED_GRAPH_RECURSION_LIMIT",
     100000,
@@ -467,7 +574,15 @@ def _apply_bedrock_patch():
 
 
 def _patch_model_for_bedrock(model: BaseChatModel) -> BaseChatModel:
-    """Apply the Bedrock fix and return the model unchanged."""
+    """Apply the langchain_openai empty-content monkeypatch and return the model unchanged.
+
+    IMPORTANT — scope: `_apply_bedrock_patch` only patches `langchain_openai.chat_models.base.
+    _convert_message_to_dict`, so it takes effect ONLY when the live model is `ChatOpenAI` (provider
+    "openai" or an OpenAI-compatible / LiteLLM proxy that fronts Bedrock). For the NATIVE Bedrock provider —
+    `init_chat_model(model_provider="bedrock")` → langchain-aws `ChatBedrock`/`ChatBedrockConverse` — this
+    patch is a NO-OP (that path never imports langchain_openai). The authoritative, provider-agnostic
+    empty-`system`/blank-block guard for the native path is `_sanitize_messages` plus the `_nonempty_system`
+    construction-site default; do not rely on this monkeypatch for the langchain-aws provider."""
     _apply_bedrock_patch()
     return model
 
@@ -682,6 +797,49 @@ class _EngagementStateMiddleware(AgentMiddleware):
             return await handler(augmented)
         except Exception:
             return await handler(request)  # fail-open: a bad injection must never abort the turn
+
+
+class _MessageSanitizerMiddleware(AgentMiddleware):
+    """Provider-agnostic empty/blank content-block guard on EVERY model call inside create_agent's react loop.
+
+    WHY THIS EXISTS (2026-07-10): the reported `ValidationException: system: text content blocks must be
+    non-empty` fired on a native `ChatBedrock` (InvokeModel) call under the Supervisor. Two prior defenses do
+    NOT cover that path: (1) `_sanitize_messages` only cleans the channel lists the graph passes in — it never
+    sees the messages create_agent assembles internally across a multi-step react loop; (2) the
+    `langchain_openai._convert_message_to_dict` monkeypatch only affects the ChatOpenAI/LiteLLM-proxy provider,
+    so it is a NO-OP for langchain-aws (`ChatBedrock`/`ChatBedrockConverse`) and for every other native provider
+    (ollama, anthropic, google_genai, …). This middleware fires at `wrap_model_call`, which wraps the actual
+    model invocation for ALL providers regardless of class, and normalizes the OUTGOING request so no empty
+    `system` prompt, blank text block, or empty assistant turn reaches the provider. Appended INNERMOST so it
+    sees the final request after all other middleware (engagement-state injection, summarization). Fail-open: a
+    sanitizer error must never abort a model call."""
+    def __init__(self, model: "Model"):
+        super().__init__()
+        self._model = model
+
+    def _sanitize(self, request):
+        try:
+            overrides: dict[str, Any] = {}
+            # A blank top-level system prompt (create_agent's `system_prompt=`) → minimal non-empty default.
+            sysp = getattr(request, "system_prompt", None)
+            if isinstance(sysp, str) and not sysp.strip():
+                overrides["system_prompt"] = _DEFAULT_SYSTEM_PROMPT
+            msgs = getattr(request, "messages", None)
+            if isinstance(msgs, list):
+                cleaned, mchanged = _sanitize_model_messages(msgs)
+                if mchanged:
+                    overrides["messages"] = cleaned
+            if not overrides:
+                return request
+            return request.override(**overrides)
+        except Exception:
+            return request  # fail-open: never break a model call over sanitization
+
+    def wrap_model_call(self, request, handler):
+        return handler(self._sanitize(request))
+
+    async def awrap_model_call(self, request, handler):
+        return await handler(self._sanitize(request))
 
 
 def _tool_name_from_request(request: Any) -> str:
@@ -1600,7 +1758,11 @@ class Model:
         self.tool_cache = ToolCache(db_path)
         conn = aiosqlite.connect(db_path, check_same_thread=False)
         self.memory = AsyncSqliteSaver(conn)
-        self.system_message = SystemMessage(content=system_prompt)
+        # Guard against an empty top-level system prompt. In chat mode `system_prompt` defaults to "" and this
+        # SystemMessage is seeded as the FIRST message of the supervisor channel (below); an empty system block
+        # makes Bedrock raise `ValidationException: system: text content blocks must be non-empty`. Normalize a
+        # blank to a minimal real default so messages[0] stays a valid, non-empty SystemMessage (no index shift).
+        self.system_message = SystemMessage(content=_nonempty_system(system_prompt))
         _tag_msg(self.system_message, 0)  # System message gets sequence 0
         self.state = {
             "messages": self.messages,          # legacy combined channel
@@ -1704,9 +1866,11 @@ class Model:
             logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and no api_key")
             llm = init_chat_model(model_provider=self.provider, model=self.model)
 
-        # Patch model to strip empty text blocks before every LLM call.
-        # This catches blank content blocks inside LangChain's internal react loop
-        # where our _sanitize_messages can't reach.
+        # Legacy: monkeypatch langchain_openai's message conversion to strip blank text blocks. NOTE this only
+        # affects the ChatOpenAI / LiteLLM-proxy provider path — it is a NO-OP for native langchain-aws
+        # (ChatBedrock/ChatBedrockConverse) and every other native provider. The provider-agnostic guard that
+        # actually reaches create_agent's internal react loop for ALL providers is `_MessageSanitizerMiddleware`
+        # (added in `_context_middleware`); this patch is retained only as belt-and-suspenders for the proxy path.
         if llm is not None:
             llm = _patch_model_for_bedrock(llm)
         return llm
@@ -3425,6 +3589,12 @@ class Model:
             "",
             text,
         )
+        # Leading prohibition: an instruction that OPENS with a hard negation is a prohibition regardless of how
+        # much filler pads it before the objective verb. This closes the bounded-window bypass of the proximity
+        # check above (e.g. "please do not, and I mean under no circumstances, compromise the domain") — for a
+        # default-deny safety gate, over-declining a negated instruction is the safe direction.
+        if re.match(r"^(?:do not|don'?t|never|no)\b", candidate):
+            return False
         if not re.search(
             r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue)\b",
             candidate,
@@ -3469,12 +3639,22 @@ class Model:
             or getattr(self, "_supervised_objective_active", False)
         )
 
-    def _should_use_controller(self, is_interactive: bool) -> bool:
+    def _should_use_controller(self, is_interactive: bool, prompt: Any = "") -> bool:
         """Whether the deterministic controller should handle this solve.
 
         Existing autonomous solves keep their first-turn behavior. A supervised chat objective turn is the
         exception: it may begin on an already-open chat session because `is_interactive` there means "reused
         channel", not "approval response". Pending approvals are routed before this method is reached.
+
+        AUTO-MODE INITIATION GATE (default-deny): the deterministic controller drives offensive execution off
+        the observed range state (`capabilities.actions_from_state`), so ceding control to it on a turn that is
+        NOT an explicit objective means the ENVIRONMENT — not an authorized operator objective — starts the
+        attack. A greeting ("hello") on a pre-collected range would otherwise begin executing. We therefore
+        require the same conservative, deterministic objective detector the supervised path already uses before
+        initiating in auto mode. A non-objective first turn falls through to normal conversational handling; the
+        operator can restate. The gate is deliberately deterministic (not an LLM classifier on the hot path):
+        an LLM guard is itself prompt-injectable/DoS-able, and a false negative here costs only a clarifying
+        turn while a false positive fires offensive actions.
         """
         if not self._controller_owned_solve() or not _controller_flag_enabled():
             return False
@@ -3482,10 +3662,18 @@ class Model:
             return self._controller_hitl_enabled()
         if is_interactive:
             return False
-        return bool(
-            getattr(self, "mode", "auto") == "auto"
-            or self._controller_hitl_enabled()
-        )
+        if getattr(self, "mode", "auto") == "auto":
+            if self._looks_like_explicit_objective_prompt(_coerce_prompt_text(prompt)):
+                return True
+            # Observable decline (not a silent fallthrough): the turn is not an explicit objective, so the
+            # deterministic controller does NOT initiate; the normal supervisor graph handles it conversationally
+            # and can still ask the operator to restate the objective.
+            logger.info(
+                "Auto-mode initiation gate DECLINED: first turn is not an explicit engagement objective; "
+                "handling via the supervisor graph instead of the deterministic controller."
+            )
+            return False
+        return bool(self._controller_hitl_enabled())
 
     def _controller_hitl_enabled(self) -> bool:
         """Whether supervised controller-owned chat should pause moves for operator approval."""
@@ -4727,6 +4915,11 @@ class Model:
         # context-editing/summarization middleware run, so it is never trimmed before reaching the model.
         if inject_engagement_state:
             mw.append(_EngagementStateMiddleware(self))
+        # Provider-agnostic empty/blank-block guard — appended LAST so it is the INNERMOST wrapper and sees the
+        # final request (after engagement-state injection) on every model call inside create_agent's react loop,
+        # for ALL providers. This is the create_agent-internal-loop counterpart to the channel-path
+        # `_sanitize_messages`; together they close the empty-`system`/blank-block class on every code path.
+        mw.append(_MessageSanitizerMiddleware(self))
         return mw
     
     # Agent definitions
@@ -5037,7 +5230,11 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            system_prompt=prompt,
+            # Guard the ONE system-block site the message-boundary sanitizer can't reach: create_agent prepends
+            # this as a system block inside its own react loop, downstream of _wrap_create_agent's
+            # _sanitize_messages. supervisor.md is non-empty today, but a blank render would otherwise send an
+            # empty `system` block to Bedrock (bug 2). Normalize here too, consistently with __init__.
+            system_prompt=_nonempty_system(prompt),
             middleware=self._context_middleware(),
         )
         return self._wrap_create_agent(agent, "supervisor_messages", name)
@@ -5134,8 +5331,15 @@ class Model:
             """
             Sanitize message list for LLM invocation:
             1. Remove orphan ToolMessages whose tool_call_id was never introduced by a preceding AIMessage
-            2. Keep only the FIRST SystemMessage, remove all others (prevents "multiple non-consecutive system messages" error)
-            Note: Bedrock blank text field fix is handled at the payload level by _patch_model_for_bedrock.
+            2. Keep only the FIRST NON-EMPTY SystemMessage; drop empty/blank ones and all later ones (prevents
+               both "multiple non-consecutive system messages" AND the Bedrock
+               "system: text content blocks must be non-empty" ValidationException — an empty first system
+               block was previously kept and forwarded verbatim). Bedrock treats `system` as optional, so
+               dropping a blank system message entirely is valid.
+            Note: this is the provider-agnostic empty-block guard on the live invoke path. The legacy
+            `_patch_model_for_bedrock` / `_apply_bedrock_patch` monkeypatch ONLY affects the
+            langchain_openai (OpenAI-compatible / LiteLLM proxy) path and is a no-op for the native
+            `init_chat_model(model_provider="bedrock")` (langchain-aws) provider — so it cannot be relied on here.
             """
             seen_tool_use_ids = set()
             seen_system_message = False
@@ -5153,11 +5357,14 @@ class Model:
                         cleaned.append(m)
                     # else drop orphan
                 elif isinstance(m, SystemMessage):
-                    # Only keep the first SystemMessage
-                    if not seen_system_message:
-                        cleaned.append(m)
+                    # Keep only the FIRST NON-EMPTY SystemMessage; drop blank ones (an empty `system` block is
+                    # rejected by Bedrock) and drop all later ones (provider "single system" rule). Strip any
+                    # blank text blocks from a kept list-form system message so no empty block slips through.
+                    if not seen_system_message and _content_has_text(m.content):
+                        cleaned.append(m.model_copy(update={"content": _strip_blank_text_blocks(m.content)})
+                                       if isinstance(m.content, list) else m)
                         seen_system_message = True
-                    # else drop additional system messages
+                    # else drop empty / duplicate system messages
                 elif isinstance(m, HumanMessage):
                     cleaned.append(m)
                 # ignore other types silently
@@ -5709,7 +5916,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # any capability or collection move; query remains one-shot and falls through to the legacy graph HITL
         # path because it has no interactive approve/deny transport. Interactive approval replies are handled
         # above before a fresh solve is seeded.
-        if self._should_use_controller(is_interactive):
+        if self._should_use_controller(is_interactive, prompt):
             try:
                 return await self._run_autonomous_controller(prompt)
             except asyncio.CancelledError:

@@ -212,12 +212,16 @@ def test_gate_defaults_on_for_auto_and_supervised_chat_but_not_query_or_interact
         assert m._should_use_controller(is_interactive=False) is False
         # auto mode but interactive follow-up -> fall through to normal path
         m.mode = "auto"
-        assert m._should_use_controller(is_interactive=True) is False
-        # auto + non-interactive -> run the controller by default
-        assert m._should_use_controller(is_interactive=False) is True
+        assert m._should_use_controller(is_interactive=True, prompt="compromise the corp domain") is False
+        # auto + non-interactive + an EXPLICIT OBJECTIVE -> run the controller
+        assert m._should_use_controller(is_interactive=False, prompt="compromise the corp domain") is True
+        # auto + non-interactive + a GREETING/non-objective -> DEFAULT-DENY, do NOT initiate.
+        # (bug-1 fix: a bare "hello" must not launch the deterministic offensive controller.)
+        assert m._should_use_controller(is_interactive=False, prompt="hello") is False
+        assert m._should_use_controller(is_interactive=False, prompt="what callbacks are active?") is False
         # not an autonomous solve -> never
         m._autonomous_solve = False
-        assert m._should_use_controller(is_interactive=False) is False
+        assert m._should_use_controller(is_interactive=False, prompt="compromise the corp domain") is False
         # flag off -> never
         m._autonomous_solve = True
         os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = "0"
