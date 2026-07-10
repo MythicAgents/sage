@@ -2863,6 +2863,9 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     final_probe = mt._engagement_hops[-1].evidence["probe"]
     assert final_probe["account_ticket_present"] is True
     assert final_probe["service_access_proven"] is True
+    context_key = mt._kerberos_account_context_key(13, "alice", "lab.local")
+    assert context_key in mt._kerberos_logon_account_context_keys
+    assert context_key in mt._kerberos_account_context_keys
 
 
 def test_netonly_plaintext_credential_is_created_separately_from_account_key(monkeypatch):
@@ -3145,6 +3148,47 @@ def test_execute_capability_managed_secret_read_refreshes_stale_account_context(
     ]
     assert result["recorded_effects"] == ["managed-local-admin-secret:ws01@child.lab.local"]
     assert "CorrectHorseBatteryStaple" not in json.dumps(mt._engagement_hops[-1].evidence)
+
+
+def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_context(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [_proof_hop(
+        "kerberos-account-context:alice@lab.local@callback:13",
+        7000,
+        callback_id="13",
+        technique="capability:ensure-account-kerberos-context",
+        target="domain=lab.local;account=alice;callback=13",
+    )]
+    context_key = mt._kerberos_account_context_key(13, "alice", "lab.local")
+    mt._kerberos_logon_account_context_keys.add(context_key)
+    mt._kerberos_account_context_keys.add(context_key)
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.child.lab.local")
+    calls = {"issue": 0}
+    output = "\n".join([
+        "distinguishedname=CN=WS01,DC=child,DC=lab,DC=local",
+        "ms-mcs-admpwd=CorrectHorseBatteryStaple!",
+    ])
+
+    with _split_issue(output, calls, display_id=7200):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "read-managed-local-admin-secret",
+                "account": "alice",
+                "account_domain": "lab.local",
+                "target_host": "ws01",
+                "target_domain": "child.lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 1
+    assert [item["command"] for item in result["issued"]] == ["powerpick"]
+    assert result["recorded_effects"] == ["managed-local-admin-secret:ws01@child.lab.local"]
 
 
 def test_read_managed_secret_imports_plaintext_credential(monkeypatch):

@@ -6149,6 +6149,17 @@ class MythicTools:
                     self._capability_transaction_update_verification(transaction, command_obj, verification)
                     final_probe = self._capability_executor_is_final_probe(command_obj)
                     if verification.verdict == "achieved" and final_probe:
+                        if self._capability_text(getattr(action_obj, "name", "")).casefold() == "ensure-account-kerberos-context":
+                            account = self._capability_account(action_obj, input_values)
+                            account_domain = self._capability_account_domain(action_obj, input_values)
+                            if account and account_domain:
+                                context_key = self._kerberos_account_context_key(
+                                    callback_id,
+                                    account,
+                                    account_domain,
+                                )
+                                self._kerberos_logon_account_context_keys.add(context_key)
+                                self._kerberos_account_context_keys.add(context_key)
                         credential_refs = await self._import_capability_credential_material(
                             action_obj,
                             input_values,
@@ -7148,6 +7159,17 @@ class MythicTools:
         account_domain = self._capability_account_domain(action, inputs)
         if not account or not account_domain:
             return {"status": "skipped", "issued": []}
+
+        context_key = self._kerberos_account_context_key(callback_id, account, account_domain)
+        if (
+            context_key in getattr(self, "_kerberos_logon_account_context_keys", set())
+            and context_key in getattr(self, "_kerberos_account_context_keys", set())
+        ):
+            return {
+                "status": "achieved",
+                "issued": [],
+                "reason": "exact account Kerberos context is already proven in the current callback runtime",
+            }
 
         context_action = capabilities_mod.CapabilityAction(
             name="ensure-account-kerberos-context",
