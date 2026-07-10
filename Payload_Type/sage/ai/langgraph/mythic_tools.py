@@ -1499,12 +1499,16 @@ class MythicTools:
         if heartbeat is None or wait_seconds < 2:
             await asyncio.sleep(wait_seconds)
         else:
-            elapsed = wait_seconds // 2
-            await asyncio.sleep(elapsed)
-            remaining = wait_seconds - elapsed
-            observed = heartbeat(elapsed, remaining)
-            if inspect.isawaitable(observed):
-                await observed
+            elapsed = 0
+            remaining = wait_seconds
+            heartbeat_interval = 60
+            while remaining > heartbeat_interval:
+                await asyncio.sleep(heartbeat_interval)
+                elapsed += heartbeat_interval
+                remaining -= heartbeat_interval
+                observed = heartbeat(elapsed, remaining)
+                if inspect.isawaitable(observed):
+                    await observed
             await asyncio.sleep(remaining)
         suffix = f" reason={reason}" if reason else ""
         return f"waited {wait_seconds} seconds{suffix}"
@@ -7462,6 +7466,12 @@ class MythicTools:
             )
 
             async def heartbeat(elapsed: int, remaining: int) -> None:
+                def display_duration(value: int) -> str:
+                    if value >= 60 and value % 60 == 0:
+                        minutes = value // 60
+                        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+                    return f"{value} seconds"
+
                 await self._notify_capability_command_observer(
                     trace_id=trace_id,
                     status="progress",
@@ -7470,7 +7480,10 @@ class MythicTools:
                     parameters=parameters,
                     callback_id=callback_id,
                     capability_name=capability_name,
-                    result_preview=f"waited {elapsed} seconds; {remaining} seconds remaining",
+                    result_preview=(
+                        f"{display_duration(elapsed)} elapsed; "
+                        f"{display_duration(remaining)} remaining"
+                    ),
                 )
 
             output = await self._bounded_wait_for_seconds(seconds, reason=reason, heartbeat=heartbeat)

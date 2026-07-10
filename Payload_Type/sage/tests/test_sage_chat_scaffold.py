@@ -1279,12 +1279,15 @@ def test_capability_wait_observer_emits_operator_progress_messages():
     _run(m._emit_capability_command_card({
         **base,
         "status": "progress",
-        "result_preview": "waited 150 seconds; 150 seconds remaining",
+        "result_preview": "1 minute elapsed; 4 minutes remaining",
     }))
     _run(m._emit_capability_command_card({**base, "status": "completed"}))
 
     assert "Waiting for propagation" in emitter.text_sends[0]
-    assert "150 seconds remaining" in emitter.text_sends[1]
+    assert "sleeping for 5 minutes" in emitter.text_sends[0]
+    assert "No operator action is required" in emitter.text_sends[0]
+    assert "4 minutes remaining" in emitter.text_sends[1]
+    assert "No operator action is required" in emitter.text_sends[1]
     assert "Propagation wait complete" in emitter.text_sends[2]
     assert emitter.tool_use_calls == []
 

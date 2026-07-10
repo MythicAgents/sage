@@ -6995,7 +6995,7 @@ def test_wait_for_seconds_is_bounded(monkeypatch):
     assert "gp refresh" in out
 
 
-def test_capability_wait_emits_started_midpoint_and_completed(monkeypatch):
+def test_capability_wait_emits_started_minute_progress_and_completed(monkeypatch):
     mt = _make_tools()
     waits = []
     events = []
@@ -7027,8 +7027,21 @@ def test_capability_wait_emits_started_midpoint_and_completed(monkeypatch):
         capability_name="abuse-gpo",
     ))
 
-    assert waits == [150, 150]
-    assert [event["status"] for event in events] == ["started", "progress", "completed"]
+    assert waits == [60, 60, 60, 60, 60]
+    assert [event["status"] for event in events] == [
+        "started",
+        "progress",
+        "progress",
+        "progress",
+        "progress",
+        "completed",
+    ]
+    assert [event.get("result_preview") for event in events[1:-1]] == [
+        "1 minute elapsed; 4 minutes remaining",
+        "2 minutes elapsed; 3 minutes remaining",
+        "3 minutes elapsed; 2 minutes remaining",
+        "4 minutes elapsed; 1 minute remaining",
+    ]
     assert len({event["trace_id"] for event in events}) == 1
     assert item["command"] == "wait_for_seconds"
 

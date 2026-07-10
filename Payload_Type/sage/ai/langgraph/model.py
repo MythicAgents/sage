@@ -1882,17 +1882,24 @@ class Model:
             seconds = int(parameters.get("seconds") or 300)
             reason = str(parameters.get("reason") or "wait for propagation").strip()
             status = str(event.get("status") or "").strip().casefold()
+            duration = (
+                f"{seconds // 60} minute{'s' if seconds // 60 != 1 else ''}"
+                if seconds >= 60 and seconds % 60 == 0
+                else f"{seconds} seconds"
+            )
             if status == "started":
                 message = (
                     "**Waiting for propagation**\n"
-                    f"Sage is waiting up to {seconds} seconds before validating the external effect.\n"
+                    f"Sage is sleeping for {duration} while the external effect propagates, then it will resume verification.\n"
                     f"Reason: {reason}\n"
+                    "No operator action is required.\n"
                 )
             elif status == "progress":
                 preview = str(event.get("result_preview") or "").strip()
                 message = (
                     "**Propagation wait in progress**\n"
-                    f"Sage is still waiting before validation{f': {preview}' if preview else '.'}\n"
+                    f"Sage is still sleeping before verification{f': {preview}' if preview else '.'}\n"
+                    "No operator action is required.\n"
                 )
             else:
                 message = (
