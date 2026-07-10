@@ -1106,6 +1106,7 @@ class MythicTools:
         self._deterministic_ticket_command_keys: set[str] = set()
         self._deterministic_ticket_command_contexts: dict[str, dict] = {}
         self._deterministic_capability_command_contexts: dict[str, dict] = {}
+        self._bound_failure_parameter_signatures: dict[str, str] = {}
         # Runtime artifacts from deterministic Kerberos capability plans. The model should not have to copy
         # long Rubeus ticket blobs between tools; cache them once and bind them into ticket_store_add.
         self._capability_artifacts: dict[str, str] = {}
@@ -1161,6 +1162,8 @@ class MythicTools:
         # neither path re-queries Mythic repeatedly.
         self._cred_cache: list | None = None
         self._cred_cache_ts: str | None = None
+        self._credential_reference_bindings: dict[tuple[str, str, str, str], str] = {}
+        self._credential_reference_lock = asyncio.Lock()
         self._domain_sid_cache: dict[str, str] = {}
         # Idempotency for collection ingest: sha256(content) -> bloodhound job id of a VERIFIED ingest. Prevents
         # re-uploading + re-ingesting the identical SharpHound zip (observed 4x in one window) even when
@@ -2661,10 +2664,13 @@ class MythicTools:
 
     def _task_failure_key(self, command: str, callback_display_id: int, parameters) -> tuple:
         try:
-            serialized = (
-                json.dumps(parameters, sort_keys=True)
-                if isinstance(parameters, (dict, list))
-                else str(parameters)
+            serialized = self._bound_failure_parameter_signatures.get(
+                _capability_command_key(command, parameters),
+                (
+                    json.dumps(parameters, sort_keys=True)
+                    if isinstance(parameters, (dict, list))
+                    else str(parameters)
+                ),
             )
         except Exception:
             serialized = str(parameters)
@@ -4946,11 +4952,26 @@ class MythicTools:
                 return
             capability = self._capability_text(context.get("capability")).casefold()
             expected_probe = self._capability_text(context.get("expected_probe")).casefold()
-            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_logon_context_probe":
+            account_context_action = None
+            if capability == "ensure-account-kerberos-context":
+                try:
+                    from . import capabilities as account_context_capabilities
+                except ImportError:
+                    import capabilities as account_context_capabilities
                 action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
-                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
-                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                account_context_action = account_context_capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_logon_context_probe":
+                account = self._capability_account(account_context_action, {})
+                domain = self._capability_account_context_domain(account_context_action, {})
                 low = self._capability_text(output).casefold()
                 if (
                     account
@@ -4966,10 +4987,8 @@ class MythicTools:
                     )
                 return
             if capability == "ensure-account-kerberos-context" and expected_probe == "extract_account_ticket_cache_probe":
-                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
-                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
-                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                account = self._capability_account(account_context_action, {})
+                domain = self._capability_account_context_domain(account_context_action, {})
                 if account and domain and self._ticket_cache_output_has_account(output, account, domain):
                     self._kerberos_account_context_keys.add(
                         self._kerberos_account_context_key(callback_display_id, account, domain)
@@ -5428,13 +5447,24 @@ class MythicTools:
             except ImportError:
                 import capabilities
                 import credential_artifacts
+            action = account_context_action
+            if action is None:
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
             probe = dict(credential_artifacts.extract_ticket_probe(output))
             probe["callback_id"] = self._capability_text(callback_display_id)
             if capability == "ensure-account-kerberos-context":
-                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
-                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
-                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                account = self._capability_account(action, {})
+                domain = self._capability_account_context_domain(action, {})
                 if account:
                     probe["account"] = account
                 if domain:
@@ -5456,17 +5486,6 @@ class MythicTools:
             verification = capabilities.verify_capability(capability, probe)
             if verification.verdict != "achieved":
                 return
-            action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-            action = capabilities.CapabilityAction(
-                name=self._capability_text(action_data.get("name") or capability),
-                target=self._capability_text(action_data.get("target") or context.get("target")),
-                preconditions=self._capability_list(action_data.get("preconditions")),
-                effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
-                intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
-                verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
-                reason=self._capability_text(action_data.get("reason")),
-                source_facts=self._capability_list(action_data.get("source_facts")),
-            )
             self.record_capability_result(
                 action,
                 probe,
@@ -7189,7 +7208,7 @@ class MythicTools:
             return {"status": "skipped", "issued": []}
 
         account = self._capability_account(action, inputs)
-        account_domain = self._capability_account_domain(action, inputs)
+        account_domain = self._capability_account_context_domain(action, inputs)
         if not account or not account_domain:
             return {"status": "skipped", "issued": []}
 
@@ -11624,6 +11643,10 @@ class MythicTools:
             return account.rsplit("@", 1)[1].casefold()
         return ""
 
+    def _capability_account_context_domain(self, action, inputs: dict) -> str:
+        """Resolve the account's home realm consistently across record, probe, and reuse paths."""
+        return self._capability_account_domain(action, inputs) or self._capability_domain(action, inputs)
+
     def _capability_local_account(self, action, inputs: dict) -> str:
         intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
         target_fields = {}
@@ -11813,7 +11836,7 @@ class MythicTools:
         if self._capability_text(getattr(action, "name", "")).casefold() != "ensure-account-kerberos-context":
             return None
         account = self._capability_account(action, inputs)
-        account_domain = self._capability_account_domain(action, inputs) or self._capability_domain(action, inputs)
+        account_domain = self._capability_account_context_domain(action, inputs)
         if not account or not account_domain:
             return None
         context_key = self._kerberos_account_context_key(callback_display_id, account, account_domain)
@@ -12956,9 +12979,6 @@ class MythicTools:
             or value.get("credential_id")
             or value.get("mythic_credential_id")
         ).strip()
-        if credential_id.isdigit():
-            return f"@cred:{credential_id}"
-
         account = self._capability_text(value.get("account") or value.get("username") or value.get("user")).strip()
         realm = self._capability_text(value.get("realm") or value.get("domain")).strip()
         credential = self._capability_text(
@@ -12966,48 +12986,101 @@ class MythicTools:
         ).strip()
         credential_type = self._capability_text(value.get("type") or value.get("credential_type") or "plaintext").strip()
         if not account or not realm or not credential:
-            return ""
+            return f"@cred:{credential_id}" if credential_id.isdigit() else ""
 
-        if force_refresh:
-            self._cred_cache = None
-            self._cred_cache_ts = None
-        rows = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
-        for row in rows or []:
-            if self._canonical_credential_account(row.get("account")) != self._canonical_credential_account(account):
-                continue
-            if self._capability_text(row.get("realm")).casefold() != realm.casefold():
-                continue
-            if self._capability_text(row.get("credential_text")) != credential:
-                continue
-            row_id = row.get("id")
-            if row_id is not None:
-                return f"@cred:{row_id}"
+        identity = (
+            self._canonical_credential_account(account),
+            realm.casefold(),
+            credential,
+            (credential_type or "plaintext").casefold(),
+        )
+        async with self._credential_reference_lock:
+            existing = self._credential_reference_bindings.get(identity)
+            if existing and not force_refresh:
+                return existing
 
-        if self.client is None:
-            return ""
-        try:
-            created = await mythic.create_credential(
-                self.client,
-                credential=credential,
-                account=account,
-                realm=realm,
-                comment="Sage schema-bound credential reference",
-                credential_type=credential_type or "plaintext",
-            )
-        except Exception:
-            created = {}
-        created_id = created.get("id") if isinstance(created, dict) else None
-        if created_id is None:
-            return ""
-        self._cred_cache = None
-        self._cred_cache_ts = None
-        return f"@cred:{created_id}"
+            if force_refresh:
+                self._cred_cache = None
+                self._cred_cache_ts = None
+            rows = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+
+            def row_matches(row: dict) -> bool:
+                if self._canonical_credential_account(row.get("account")) != identity[0]:
+                    return False
+                if self._capability_text(row.get("realm")).casefold() != identity[1]:
+                    return False
+                if self._capability_text(row.get("credential_text")) != identity[2]:
+                    return False
+                row_type = self._capability_text(row.get("type")).casefold()
+                return not row_type or row_type == identity[3]
+
+            if credential_id.isdigit():
+                for row in rows or []:
+                    if self._capability_text(row.get("id")).strip() != credential_id:
+                        continue
+                    if row_matches(row):
+                        reference = f"@cred:{credential_id}"
+                        self._credential_reference_bindings[identity] = reference
+                        return reference
+                    break
+
+            for row in rows or []:
+                if not row_matches(row):
+                    continue
+                row_id = row.get("id")
+                if row_id is not None:
+                    reference = f"@cred:{row_id}"
+                    self._credential_reference_bindings[identity] = reference
+                    return reference
+
+            # A just-created credential can be taskable before it appears in a subsequent store query.
+            # Preserve that known binding rather than creating a duplicate during repair.
+            if existing:
+                return existing
+
+            if self.client is None:
+                return ""
+            try:
+                created = await mythic.create_credential(
+                    self.client,
+                    credential=credential,
+                    account=account,
+                    realm=realm,
+                    comment="Sage schema-bound credential reference",
+                    credential_type=credential_type or "plaintext",
+                )
+            except Exception:
+                created = {}
+            created_id = created.get("id") if isinstance(created, dict) else None
+            if created_id is None:
+                return ""
+            reference = f"@cred:{created_id}"
+            self._credential_reference_bindings[identity] = reference
+            if self._cred_cache is not None:
+                self._cred_cache.insert(0, {
+                    "id": created_id,
+                    "account": account,
+                    "realm": realm,
+                    "type": credential_type or "plaintext",
+                    "credential_text": credential,
+                    "comment": "Sage schema-bound credential reference",
+                })
+                self._cred_cache_ts = datetime.now(timezone.utc).isoformat()
+            return reference
 
     def _register_bound_command_parameters(self, command: str, original, bound) -> None:
         if original == bound:
             return
         original_key = _capability_command_key(command, original)
         bound_key = _capability_command_key(command, bound)
+        try:
+            self._bound_failure_parameter_signatures[bound_key] = (
+                json.dumps(original, sort_keys=True)
+                if isinstance(original, (dict, list))
+                else str(original)
+            )
+        except Exception:
+            self._bound_failure_parameter_signatures[bound_key] = str(original)
         context = self._deterministic_capability_command_contexts.get(original_key)
         if isinstance(context, dict):
             self._deterministic_capability_command_contexts[bound_key] = context

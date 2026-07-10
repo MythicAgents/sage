@@ -2879,6 +2879,84 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     assert context_key in mt._kerberos_account_context_keys
 
 
+def test_verified_account_kerberos_context_does_not_borrow_target_domain():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=essos.local;account=administrator;callback=13",
+        preconditions=[],
+        effects=["kerberos-account-context:administrator@sevenkingdoms.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "essos.local",
+            "account_domain": "sevenkingdoms.local",
+            "account": "administrator",
+            "callback_id": "13",
+        },
+    )
+
+    assert mt._capability_account_context_domain(action, {}) == "sevenkingdoms.local"
+    key = mt._record_verified_account_kerberos_context(action, {}, 13)
+
+    assert key == mt._kerberos_account_context_key(13, "administrator", "sevenkingdoms.local")
+    assert mt._kerberos_account_context_key(13, "administrator", "essos.local") not in mt._kerberos_account_context_keys
+
+
+def test_deterministic_account_context_bookkeeping_uses_account_home_realm():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=essos.local;account=administrator;callback=13",
+        preconditions=[],
+        effects=["kerberos-account-context:administrator@sevenkingdoms.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "essos.local",
+            "account_domain": "sevenkingdoms.local",
+            "account": "administrator",
+            "callback_id": "13",
+        },
+    )
+    logon_params = {"Credential": "@cred:91", "netOnly": True}
+    ticket_params = ""
+    common = {
+        "capability": action.name,
+        "target": action.target,
+        "effects": list(action.effects),
+        "action": asdict(action),
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("make_token", logon_params)
+    ] = {**common, "expected_probe": "extract_logon_context_probe"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("ticket_store_list", ticket_params)
+    ] = {**common, "expected_probe": "extract_account_ticket_cache_probe"}
+
+    mt._record_deterministic_capability_command_result(
+        "make_token",
+        logon_params,
+        13,
+        "Successfully impersonated remote identity.",
+    )
+    mt._record_deterministic_capability_command_result(
+        "ticket_store_list",
+        ticket_params,
+        13,
+        (
+            "Cached Tickets\r\n"
+            "Client: administrator @ SEVENKINGDOMS.LOCAL\r\n"
+            "Server: krbtgt/sevenkingdoms.local @ SEVENKINGDOMS.LOCAL\r\n"
+        ),
+    )
+
+    home_key = mt._kerberos_account_context_key(13, "administrator", "sevenkingdoms.local")
+    target_key = mt._kerberos_account_context_key(13, "administrator", "essos.local")
+    assert home_key in mt._kerberos_logon_account_context_keys
+    assert home_key in mt._kerberos_account_context_keys
+    assert target_key not in mt._kerberos_logon_account_context_keys
+    assert target_key not in mt._kerberos_account_context_keys
+
+
 def test_netonly_plaintext_credential_is_created_separately_from_account_key(monkeypatch):
     mt = _make_tools()
 
@@ -4242,6 +4320,49 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
     assert Path(hop.evidence["pfx_artifact_path"]).is_file()
     assert hop.evidence["probe"]["pfx_artifact_sha256"] == pfx_sha256
     assert '"pfx_base64":' not in json.dumps(hop.evidence).casefold()
+
+
+def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("adcs-ca-key-export-blocked:ca01@lab.local", 7401, callback_id="13"),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    pfx = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
+    output = "\n".join([
+        "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+        "CERT_ENROLL_STATUS=OK",
+        "CERT_ENROLL_TEMPLATE=VulnerableUser",
+        r"CERT_ENROLL_CA=ca01.lab.local\LAB-CA",
+        r"CERT_PFX_PATH=C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
+        f"PFX_BASE64={pfx}",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(output, calls, display_id=7402):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "adcs-esc-certificate-enroll",
+                "domain": "lab.local",
+                "account": "administrator",
+                "ca_host": "ca01",
+                "callback_id": "13",
+            },
+            {
+                "ca_name": r"ca01.lab.local\LAB-CA",
+                "template": "VulnerableUser",
+                "timeout": 5,
+            },
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 1
+    assert result["recorded_effects"] == [
+        "adcs-enrolled-certificate:administrator@lab.local",
+    ]
+    assert result["issued"][0]["verify_verdict"] == "achieved"
 
 
 def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(monkeypatch):
@@ -7276,6 +7397,13 @@ def _apollo_make_token_schema():
 
 def test_credential_binder_converts_only_live_credential_parameters():
     mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[{
+        "id": 91,
+        "account": "Administrator",
+        "realm": "ws01",
+        "type": "plaintext",
+        "credential_text": "CorrectHorseBatteryStaple!",
+    }])
     parameters = {
         "credential": {
             "id": "91",
@@ -7296,6 +7424,61 @@ def test_credential_binder_converts_only_live_credential_parameters():
 
     assert bound == {"credential": "@cred:91", "netOnly": True}
     assert parameters["credential"]["id"] == "91"
+
+
+def test_credential_id_binding_requires_account_realm_consistency():
+    mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[
+        {
+            "id": 91,
+            "account": "Administrator",
+            "realm": "braavos",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        },
+        {
+            "id": 92,
+            "account": "Administrator",
+            "realm": "essos.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+    ])
+
+    reference = asyncio.run(mt._resolve_mythic_credential_reference({
+        "id": "91",
+        "account": "Administrator",
+        "realm": "essos.local",
+        "credential": "SageNetOnlyContext1!",
+        "type": "plaintext",
+    }))
+
+    assert reference == "@cred:92"
+
+
+def test_force_refresh_credential_binding_is_idempotent_during_store_delay(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[])
+    created = []
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        created.append((account, realm, credential, credential_type))
+        return {"id": 100 + len(created)}
+
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+    value = {
+        "account": "Administrator",
+        "realm": "essos.local",
+        "credential": "SageNetOnlyContext1!",
+        "type": "plaintext",
+    }
+
+    first = asyncio.run(mt._resolve_mythic_credential_reference(value))
+    second = asyncio.run(mt._resolve_mythic_credential_reference(value, force_refresh=True))
+
+    assert first == "@cred:101"
+    assert second == first
+    assert created == [("Administrator", "essos.local", "SageNetOnlyContext1!", "plaintext")]
 
 
 def test_credential_binder_leaves_merlin_direct_user_pass_unchanged():
@@ -7373,6 +7556,13 @@ def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypat
         return "Successfully impersonated ws01\\Administrator for remote access."
 
     monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[{
+        "id": 91,
+        "account": "Administrator",
+        "realm": "ws01",
+        "type": "plaintext",
+        "credential_text": "CorrectHorseBatteryStaple!",
+    }])
     monkeypatch.setattr(mythic_tools.mythic, "issue_task", fake_issue_task)
     monkeypatch.setattr(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor)
     original_bind = mt._bind_mythic_credential_parameters
@@ -7417,6 +7607,29 @@ def test_bound_credential_contexts_keep_distinct_make_token_identities(monkeypat
         return _apollo_make_token_schema()
 
     monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[
+        {
+            "id": 88,
+            "account": "cersei.lannister",
+            "realm": "sevenkingdoms.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+        {
+            "id": 91,
+            "account": "Administrator",
+            "realm": "braavos",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        },
+        {
+            "id": 92,
+            "account": "Administrator",
+            "realm": "essos.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+    ])
     cersei = {
         "credential": {
             "id": "88",
@@ -7473,6 +7686,69 @@ def test_bound_credential_reference_without_identity_does_not_create_empty_dupli
         1,
         {"Credential": "@cred:91", "netOnly": True},
     ) is None
+
+
+def test_failure_breaker_survives_credential_rebinding():
+    mt = _make_tools()
+    original = {
+        "Credential": {
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    first_bound = {"Credential": "@cred:91", "netOnly": True}
+    second_bound = {"Credential": "@cred:92", "netOnly": True}
+
+    mt._register_bound_command_parameters("make_token", original, first_bound)
+    mt._register_bound_command_parameters("make_token", original, second_bound)
+
+    first_key = mt._task_failure_key("make_token", 13, first_bound)
+    second_key = mt._task_failure_key("make_token", 13, second_bound)
+    mt._task_failure_counts[first_key] = 2
+
+    assert second_key == first_key
+    assert mt._task_failure_counts[second_key] == 2
+
+
+def test_issue_failure_breaker_stops_after_credential_reference_changes(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema(),
+    )
+    bind_calls = {"count": 0}
+
+    async def changing_bind(command, parameters, callback_display_id, **kwargs):
+        bind_calls["count"] += 1
+        bound = dict(parameters)
+        bound["Credential"] = f"@cred:{90 + bind_calls['count']}"
+        mt._register_bound_command_parameters(command, parameters, bound)
+        return bound
+
+    monkeypatch.setattr(mt, "_bind_mythic_credential_parameters", changing_bind)
+    parameters = {
+        "credential": {
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    calls = {"issue": 0}
+
+    with _split_issue("temporary error", calls):
+        first = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+        second = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+        third = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+
+    assert first == "temporary error"
+    assert second == "temporary error"
+    assert calls["issue"] == 2
+    assert "already failed 2 times" in third
 
 
 def test_issue_path_wraps_merlin_shell_command_line_from_live_schema(monkeypatch):
