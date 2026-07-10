@@ -42,8 +42,11 @@ MODEL_PY = SAGE_ROOT / "ai" / "langgraph" / "model.py"
 MODEL_SOURCE = MODEL_PY.read_text()
 MODEL_AST = ast.parse(MODEL_SOURCE)
 
-CHAT_PY = SAGE_ROOT / "container" / "agent_functions" / "chat.py"
+# Phase 4: the PayloadType chat.py command was removed; its chat-turn successor is sage_chat/service.py.
+CHAT_PY = SAGE_ROOT / "sage_chat" / "service.py"
 CHAT_SOURCE = CHAT_PY.read_text()
+# Phase 4: chat-turn session persistence moved to the channel-keyed adapter sage_chat/session.py.
+SESSION_SOURCE = (SAGE_ROOT / "sage_chat" / "session.py").read_text()
 
 
 # ============================================================================
@@ -269,15 +272,6 @@ class TestChatIntegration:
             "chat.py must pass is_interactive=taskData.Task.IsInteractiveTask to invoke()"
         )
 
-    def test_isc14_chat_appends_prompt_indicator(self):
-        """ISC-14: chat.py appends user-prompt-emoji prompt indicator after invoke() returns."""
-        assert "👤>" in CHAT_SOURCE, (
-            "chat.py must add prompt indicator after invoke()"
-        )
-        # Verify it's sent via RPC after invoke
-        assert "SendMythicRPCResponseCreate" in CHAT_SOURCE, (
-            "chat.py must send prompt indicator via RPC"
-        )
 
     def test_isc15_error_handling_streams_then_raises(self):
         """ISC-15: Error handling streams error message then raises exception."""
@@ -551,9 +545,9 @@ class TestAntiCriteria:
     def test_isca2_session_management_preserved(self):
         """ISC-A-2: Anti: Existing multi-turn conversation persistence not broken."""
         # Verify session management functions still exist and are used
-        assert "add_session" in CHAT_SOURCE, "chat.py must use add_session"
-        assert "get_session" in CHAT_SOURCE, "chat.py must use get_session"
-        assert "remove_session" in CHAT_SOURCE, "chat.py must use remove_session"
+        assert "add_session" in SESSION_SOURCE, "sage_chat/session.py must use add_session"
+        assert "get_session" in SESSION_SOURCE, "sage_chat/session.py must use get_session"
+        assert "remove_session" in SESSION_SOURCE, "sage_chat/session.py must use remove_session"
 
         # Verify model.py still exports session management
         assert "add_session" in MODEL_SOURCE, "model.py must define add_session"

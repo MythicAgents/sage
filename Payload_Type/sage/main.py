@@ -1,8 +1,7 @@
 import mythic_container
 from mythic_container.logging import logger
-import container # DO NOT REMOVE THIS IMPORT - This is needed to register the Payload Type with Mythic
-import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__(). Co-registered with
-                 # the PayloadType during the Phase 1-3 transition; the `container` import above is removed in Phase 4.
+import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__().
+                 # Phase 4 complete: the PayloadType (`container`) has been removed — Sage is chat-only.
 import os
 import phoenix as px
 from phoenix.otel import register

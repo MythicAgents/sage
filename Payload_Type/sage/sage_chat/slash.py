@@ -12,6 +12,7 @@ to be useful without porting the full task-bound implementations. They grow late
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from mythic_container.ChatBase import ChatRequest, ChatSlashCommandDefinition
@@ -24,7 +25,7 @@ except Exception:  # pragma: no cover
 
 # Declared to Mythic via model metadata. Names have no leading slash.
 SLASH_COMMANDS = [
-    ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state remove|set|objective|wipe."),
+    ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(Name="mode", Description="Show or set the agent mode: /mode [supervised|auto]."),
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
@@ -54,8 +55,8 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     the autonomous solve. Re-homed from the PayloadType `state` command; `ai.langgraph.engagement_ledger`
     is the single source of truth (the running model publishes its active engagement id there).
 
-    Usage: `/state` (show) · `/state remove <row|id[,…]>` · `/state set <row|id> <status>` ·
-    `/state objective <text>` · `/state wipe`.
+    Usage: `/state` (show) · `/state reconcile [task_id] [apply]` · `/state remove <row|id[,…]>` ·
+    `/state set <row|id> <status>` · `/state objective <text>` · `/state wipe`.
     """
     try:
         from ai.langgraph import engagement_ledger
@@ -104,9 +105,33 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
         data, changed = engagement_ledger.set_hop_status(data, selector, status)
         engagement_ledger.save(data, engagement_id)
         return _render_ledger_markdown(data, engagement_id, model, request, notice=f"✏️ Set status on {changed} hop(s) → `{status}`.")
+    if sub == "reconcile":
+        # Re-homed operator action: inspect completed Mythic task history, record achieved effects into
+        # the ledger, and import discovered credential material. DRY-RUN unless `apply` is given (task
+        # output is attacker-influenceable). `/state reconcile [task_id] [apply]`.
+        tools = getattr(model, "mythic_client", None)
+        client = getattr(tools, "client", None) if tools is not None else None
+        if client is None:
+            return ("`/state reconcile` needs an active Mythic session — send one message on this channel "
+                    "first, then retry `/state reconcile [task_id] [apply]`.")
+        try:
+            from ai.langgraph import state_reconcile
+        except ImportError:  # pragma: no cover
+            from ..ai.langgraph import state_reconcile  # type: ignore
+        tokens = rest.split()
+        apply = any(t.lower() == "apply" for t in tokens)
+        task_id = next((t for t in tokens if t.isdigit()), "")
+        data = engagement_ledger.load(engagement_id)
+        now = datetime.now(timezone.utc).isoformat()
+        data, notes = await state_reconcile.reconcile_task_history(
+            client, data, task_id, "", 25, now, apply=apply,
+        )
+        engagement_ledger.save(data, engagement_id)
+        return _render_ledger_markdown(data, engagement_id, model, request, notice="\n".join(notes))
     if sub and sub != "show":
         return ("Unknown `/state` subcommand. Usage:\n"
                 "- `/state` — show the engagement ledger\n"
+                "- `/state reconcile [task_id] [apply]` — import verified effects/creds from task history (dry-run unless `apply`)\n"
                 "- `/state remove <row|id[,…]>`\n"
                 "- `/state set <row|id> <status>`\n"
                 "- `/state objective <text>`\n"
