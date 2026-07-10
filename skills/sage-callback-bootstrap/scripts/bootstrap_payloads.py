@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -54,6 +55,7 @@ DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
 DEFAULT_CALLBACK_CONFIG_PATH = Path(__file__).resolve().parents[1] / "apollo_callback_config.json"
 SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py"
+NATIVE_CHAT_PATH = REPO_ROOT / "skills" / "sage-live-runner" / "scripts" / "native_chat.py"
 DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
 REQUIRED_RUNTIME_DBS = (
@@ -117,12 +119,20 @@ query CallbackIdentity($displayId: Int!) {
 }
 """
 
+CALLBACK_UUID_QUERY = """
+query CallbackIdentityByUUID($agentCallbackId: String!) {
+  callback(where: {agent_callback_id: {_eq: $agentCallbackId}}, limit: 1) {
+    display_id
+    agent_callback_id
+  }
+}
+"""
+
 EXPORT_CALLBACK_CONFIG_QUERY = """
-query ExportCallbackConfig($agentCallbackId: String!) {
-  exportCallbackConfig(agent_callback_id: $agentCallbackId) {
+query ExportCallbackConfig($callbackDisplayId: Int!) {
+  exportCallbackConfig(callback_display_id: $callbackDisplayId) {
     status
     error
-    agent_callback_id
     config
   }
 }
@@ -222,6 +232,15 @@ def normalize_callback_config(value: Any) -> Any:
     if not isinstance(value, (dict, list)):
         raise ValueError("Callback config must be a JSON object or array.")
     return value
+
+
+def prepare_callback_config_for_import(config: Any) -> Any:
+    prepared = copy.deepcopy(normalize_callback_config(config))
+    if isinstance(prepared, dict):
+        callback = prepared.get("callback")
+        if isinstance(callback, dict):
+            callback["active"] = False
+    return prepared
 
 
 def build_callback_config_document(exported: dict[str, Any]) -> dict[str, Any]:
@@ -452,46 +471,69 @@ async def inspect(client) -> dict[str, Any]:
     }
 
 
-async def resolve_agent_callback_id(client, selector: str) -> str:
+async def resolve_callback_identity(client, selector: str) -> dict[str, Any]:
     selector = str(selector).strip()
     if not selector:
         raise ValueError("Callback selector cannot be empty.")
-    if not selector.isdigit():
-        return selector
-    result = await mythic.execute_custom_query(
-        client,
-        CALLBACK_ID_QUERY,
-        variables={"displayId": int(selector)},
-    )
+    if selector.isdigit():
+        query = CALLBACK_ID_QUERY
+        variables = {"displayId": int(selector)}
+    else:
+        query = CALLBACK_UUID_QUERY
+        variables = {"agentCallbackId": selector}
+    result = await mythic.execute_custom_query(client, query, variables=variables)
     callbacks = result.get("callback") or []
-    if not callbacks or not callbacks[0].get("agent_callback_id"):
-        raise RuntimeError(f"No callback found for display ID {selector}.")
-    return str(callbacks[0]["agent_callback_id"])
+    if not callbacks:
+        raise RuntimeError(f"No callback found for selector {selector!r}.")
+    return callbacks[0]
 
 
 async def export_callback_config(client, selector: str) -> dict[str, Any]:
-    agent_callback_id = await resolve_agent_callback_id(client, selector)
+    identity = await resolve_callback_identity(client, selector)
     result = await mythic.execute_custom_query(
         client,
         EXPORT_CALLBACK_CONFIG_QUERY,
-        variables={"agentCallbackId": agent_callback_id},
+        variables={"callbackDisplayId": int(identity["display_id"])},
     )
-    return _require_success(
+    exported = _require_success(
         "callback config export",
         result.get("exportCallbackConfig") or {},
     )
+    return {**exported, "agent_callback_id": identity.get("agent_callback_id")}
 
 
 async def import_callback_config(client, config: Any) -> dict[str, Any]:
     result = await mythic.execute_custom_query(
         client,
         IMPORT_CALLBACK_CONFIG_MUTATION,
-        variables={"config": normalize_callback_config(config)},
+        variables={"config": prepare_callback_config_for_import(config)},
     )
     return _require_success(
         "callback config import",
         result.get("importCallbackConfig") or {},
     )
+
+
+def load_native_chat_module():
+    spec = importlib.util.spec_from_file_location("sage_native_chat", NATIVE_CHAT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load native chat helper from {NATIVE_CHAT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def prepare_sage_chat(client) -> dict[str, Any]:
+    native_chat = load_native_chat_module()
+    token = await native_chat.ensure_api_token(client)
+    channel = await native_chat.prepare_locked_channel(
+        client,
+        api_token_id=int(token["api_token"]["id"]),
+    )
+    return {
+        "api_token": token,
+        "prepared_channel": channel,
+    }
 
 
 async def readiness(
@@ -933,6 +975,7 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
     result: dict[str, Any] = {
         "sage_chat_container": running_chat[0],
         "sage_payload_created": False,
+        "sage_chat": await prepare_sage_chat(client),
     }
     if use_baked_apollo:
         result["apollo_callback_import"] = await import_callback_config(

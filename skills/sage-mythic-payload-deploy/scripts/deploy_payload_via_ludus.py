@@ -30,7 +30,14 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
+MYTHIC_ENV_PATH = Path(
+    os.environ.get("MYTHIC_ENV_PATH")
+    or (
+        "/home/john/dev/mythic_v4/.env"
+        if Path("/home/john/dev/mythic_v4/.env").exists()
+        else "/home/john/dev/mythic/.env"
+    )
+)
 DEFAULT_MYTHIC_SERVER = "127.0.0.1"
 DEFAULT_MYTHIC_USER = "mythic_admin"
 DEFAULT_MCP_PATH = REPO_ROOT / ".mcp.json"
@@ -79,6 +86,7 @@ query DeployCallbacks {
     host
     user
     active
+    last_checkin
     payload {
       uuid
       payloadtype { name }
@@ -132,7 +140,7 @@ def resolve_mythic_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
             key, value = stripped.split("=", 1)
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
-    raise DeployError("Set MYTHIC_ADMIN_PASSWORD or provide /home/john/dev/mythic/.env.")
+    raise DeployError(f"Set MYTHIC_ADMIN_PASSWORD or provide {env_path}.")
 
 
 async def mythic_login(args: argparse.Namespace) -> Any:
@@ -744,6 +752,49 @@ $registered = Get-ScheduledTask -TaskName $taskName
     return parse_json_object(result["stdout"]) or result
 
 
+def launch_existing_scheduled_task_interactive(
+    session: Any,
+    task_name: str,
+    run_as_user: str,
+    *,
+    timeout_seconds: int,
+    poll_interval: float,
+) -> dict[str, Any]:
+    session_info = wait_for_active_interactive_session(
+        session,
+        run_as_user,
+        timeout_seconds=timeout_seconds,
+        poll_interval=poll_interval,
+    )
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$taskName = {ps_quote(task_name)}
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+$expectedUser = {ps_quote(run_as_user)}
+$expectedLeaf = ($expectedUser -split '\\\\')[-1]
+$actualUser = $task.Principal.UserId
+$principalMatches = ($actualUser -eq $expectedUser) -or (($actualUser -notmatch '\\\\') -and ($actualUser -eq $expectedLeaf))
+if (-not $principalMatches) {{
+  throw "Task $taskName runs as $($task.Principal.UserId), expected {run_as_user}"
+}}
+Start-ScheduledTask -TaskName $taskName
+Start-Sleep -Seconds 2
+$info = Get-ScheduledTaskInfo -TaskName $taskName
+$task = Get-ScheduledTask -TaskName $taskName
+[PSCustomObject]@{{
+  Method = 'existing-scheduled-task-interactive'
+  TaskName = $taskName
+  RunAsUser = $task.Principal.UserId
+  State = $task.State.ToString()
+  LastTaskResult = $info.LastTaskResult
+  LastRunTime = $info.LastRunTime
+}} | ConvertTo-Json -Compress
+"""
+    result = parse_json_object(run_ps(session, script)["stdout"]) or {}
+    result["interactive_session"] = session_info
+    return result
+
+
 def disconnect_interactive_session(session: Any, session_id: str) -> dict[str, Any]:
     script = f"""
 $ErrorActionPreference = 'Stop'
@@ -1000,6 +1051,40 @@ async def wait_for_new_callbacks(
     return latest, []
 
 
+async def wait_for_callback_checkin_advance(
+    client: Any,
+    before_checkins: dict[int, Any],
+    *,
+    payload_type: str,
+    host: str,
+    user: str,
+    seconds: int,
+    poll_interval: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    deadline = time.monotonic() + max(0, seconds)
+    latest = await get_callbacks(client)
+    while True:
+        for row in latest:
+            display_id = row.get("display_id")
+            current = row.get("last_checkin")
+            row_payload_type = str(
+                ((row.get("payload") or {}).get("payloadtype") or {}).get("name") or ""
+            )
+            if (
+                isinstance(display_id, int)
+                and current
+                and current != before_checkins.get(display_id)
+                and row_payload_type.casefold() == payload_type.casefold()
+                and str(row.get("host") or "").casefold() == host.casefold()
+                and str(row.get("user") or "").casefold() == user.casefold()
+            ):
+                return latest, row
+        if time.monotonic() >= deadline:
+            return latest, None
+        await asyncio.sleep(max(0.25, poll_interval))
+        latest = await get_callbacks(client)
+
+
 async def command_list_payloads(args: argparse.Namespace) -> None:
     client = await mythic_login(args)
     rows = await list_payloads(client, args.payload_type, args.payload_limit)
@@ -1179,6 +1264,58 @@ async def command_deploy(args: argparse.Namespace) -> None:
             server.server_close()
 
 
+async def command_launch_existing(args: argparse.Namespace) -> None:
+    client = await mythic_login(args)
+    callbacks_before = await get_callbacks(client)
+    before_checkins = {
+        row["display_id"]: row.get("last_checkin")
+        for row in callbacks_before
+        if isinstance(row.get("display_id"), int)
+    }
+    host = select_ludus_host(args)
+    session = winrm_session(
+        host,
+        args.winrm_operation_timeout_seconds,
+        args.winrm_read_timeout_seconds,
+    )
+    launch = launch_existing_scheduled_task_interactive(
+        session,
+        args.task_name,
+        args.run_as_user,
+        timeout_seconds=args.wait_interactive_session_seconds,
+        poll_interval=args.poll_interval,
+    )
+    callbacks_after, callback = await wait_for_callback_checkin_advance(
+        client,
+        before_checkins,
+        payload_type=args.payload_type,
+        host=args.callback_host,
+        user=args.callback_user,
+        seconds=args.wait_callbacks_seconds,
+        poll_interval=args.poll_interval,
+    )
+    disconnect = None
+    if callback and args.disconnect_interactive_session:
+        session_id = str((launch.get("interactive_session") or {}).get("session_id") or "")
+        disconnect = disconnect_interactive_session(session, session_id)
+    result = {
+        "target": {
+            "inventory_hostname": host.get("inventory_hostname"),
+            "ansible_host": host.get("ansible_host"),
+        },
+        "launch": launch,
+        "callback": callback_identity(callback) if callback else None,
+        "interactive_session_disconnect": disconnect,
+        "callbacks_after": [callback_identity(row) for row in callbacks_after],
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not callback:
+        raise DeployError(
+            f"No {args.payload_type} callback check-in advanced on "
+            f"{args.callback_host} as {args.callback_user} within {args.wait_callbacks_seconds}s."
+        )
+
+
 def add_mythic_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", default=DEFAULT_MYTHIC_SERVER)
     parser.add_argument("--user", default=DEFAULT_MYTHIC_USER)
@@ -1282,6 +1419,28 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)
     deploy_parser.add_argument("--winrm-read-timeout-seconds", type=int, default=75)
     deploy_parser.set_defaults(func=command_deploy)
+
+    relaunch_parser = sub.add_parser(
+        "launch-existing",
+        help="Start a staged interactive scheduled task and wait for its retained callback.",
+    )
+    add_mythic_args(relaunch_parser)
+    relaunch_parser.add_argument("--payload-type", default="apollo")
+    relaunch_parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
+    relaunch_parser.add_argument("--ludus-host", default=None)
+    relaunch_parser.add_argument("--target-host", default="CASTELBLACK")
+    relaunch_parser.add_argument("--target-ip", default=None)
+    relaunch_parser.add_argument("--task-name", default="SageApolloBootstrap")
+    relaunch_parser.add_argument("--run-as-user", default=r"NORTH\samwell.tarly")
+    relaunch_parser.add_argument("--callback-host", default="CASTELBLACK")
+    relaunch_parser.add_argument("--callback-user", default="samwell.tarly")
+    relaunch_parser.add_argument("--wait-callbacks-seconds", type=int, default=90)
+    relaunch_parser.add_argument("--wait-interactive-session-seconds", type=int, default=120)
+    relaunch_parser.add_argument("--disconnect-interactive-session", action=argparse.BooleanOptionalAction, default=True)
+    relaunch_parser.add_argument("--poll-interval", type=float, default=3.0)
+    relaunch_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)
+    relaunch_parser.add_argument("--winrm-read-timeout-seconds", type=int, default=75)
+    relaunch_parser.set_defaults(func=command_launch_existing)
 
     return parser
 

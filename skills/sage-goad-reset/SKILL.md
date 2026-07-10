@@ -42,7 +42,14 @@ must be requested explicitly as a range-only or GOAD-only reset.
 /bin/bash skills/sage-goad-reset/scripts/mythic_reset.sh --yes
 ```
 
-4. Reset/verify GOAD and BloodHound.
+4. Reset/verify GOAD, then wipe BloodHound and require zero domains before continuing:
+
+```bash
+uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
+```
+
+   The wipe command includes its own delayed verification and must finish with `available-domains: count=0`.
+   A nonzero exit or any remaining domain blocks the reset.
 5. Restart local Sage in tmux:
 
 ```bash
@@ -57,7 +64,8 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-   This verifies the running Sage chat container, then builds/downloads a fresh Apollo payload for the
+   This verifies the running Sage chat container, ensures the scoped Mythic API token, creates or reuses one
+   empty locked AI channel named `Sage GOAD Ready`, then builds/downloads a fresh Apollo payload for the
    clean-baseline workflow. It does not create a Sage payload or callback.
 
    For an intentional retained foothold reuse such as the current Merlin R-C2 flow, replace that command with:
@@ -133,8 +141,8 @@ uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skil
 uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py status
 ```
 
-The wipe waits 10 seconds before its first verification poll, then polls every 5 seconds until
-`available-domains: count=0`. Do not run a separate immediate status check.
+The wipe is mandatory for every full reset. It waits 10 seconds before its first verification poll, then polls
+every 5 seconds until `available-domains: count=0`. Do not run a separate immediate status check.
 
 After a target-scope collection on a GOAD-style cross-forest range, use the read-only bridge probe before
 blaming Sage for an empty frontier:

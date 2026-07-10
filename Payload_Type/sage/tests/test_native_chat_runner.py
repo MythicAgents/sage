@@ -72,7 +72,11 @@ def test_run_native_chat_turn_returns_channel_and_request(monkeypatch):
             "messages": [{"message": "done"}],
         }
 
+    async def no_prepared_channel(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(native_chat, "create_locked_channel", fake_channel)
+    monkeypatch.setattr(native_chat, "find_prepared_channel", no_prepared_channel)
     monkeypatch.setattr(native_chat, "create_message", fake_message)
     monkeypatch.setattr(native_chat, "wait_for_request", fake_wait)
 
@@ -81,3 +85,56 @@ def test_run_native_chat_turn_returns_channel_and_request(monkeypatch):
     assert result["chat_channel_id"] == 10
     assert result["chat_request_id"] == 30
     assert result["status"] == "complete"
+
+
+def test_prepare_locked_channel_reuses_empty_prepared_channel(monkeypatch):
+    async def fake_find(client):
+        return {
+            "chat_channel_id": 10,
+            "chat_channel_name": "Sage GOAD Ready",
+            "prepared": True,
+            "reused": True,
+        }
+
+    async def fail_create(*args, **kwargs):
+        raise AssertionError("existing prepared channel must be reused")
+
+    monkeypatch.setattr(native_chat, "find_prepared_channel", fake_find)
+    monkeypatch.setattr(native_chat, "create_locked_channel", fail_create)
+
+    result = asyncio.run(native_chat.prepare_locked_channel(object()))
+
+    assert result["chat_channel_id"] == 10
+    assert result["reused"] is True
+
+
+def test_run_native_chat_turn_prefers_prepared_channel(monkeypatch):
+    calls = []
+
+    async def fake_find(client):
+        return {
+            "chat_channel_id": 11,
+            "chat_channel_name": "Sage GOAD Ready",
+            "prepared": True,
+            "reused": True,
+        }
+
+    async def fail_create(*args, **kwargs):
+        raise AssertionError("prepared channel must be used")
+
+    async def fake_message(client, channel_id, prompt):
+        calls.append((channel_id, prompt))
+        return {"chat_message_id": 20, "chat_request_id": 30}
+
+    async def fake_wait(*args, **kwargs):
+        return {"request": {"status": "complete", "error": ""}, "messages": []}
+
+    monkeypatch.setattr(native_chat, "find_prepared_channel", fake_find)
+    monkeypatch.setattr(native_chat, "create_locked_channel", fail_create)
+    monkeypatch.setattr(native_chat, "create_message", fake_message)
+    monkeypatch.setattr(native_chat, "wait_for_request", fake_wait)
+
+    result = asyncio.run(native_chat.run_native_chat_turn(object(), "objective"))
+
+    assert result["chat_channel_id"] == 11
+    assert calls == [(11, "objective")]

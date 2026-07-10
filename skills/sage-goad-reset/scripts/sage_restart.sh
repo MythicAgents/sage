@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SNAP="/tmp/sage_env.snapshot"
 VENV_PY="${SAGE_VENV_PY:-/home/john/dev/sage/.venv/bin/python}"
 DEFAULT_CWD="${SAGE_CWD:-/home/john/dev/sage/Payload_Type/sage}"
-MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-/home/john/dev/mythic/.env}"
+MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-/home/john/dev/mythic_v4/.env}"
 
 snapshot_last_value() {
   local key="$1"

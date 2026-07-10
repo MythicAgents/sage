@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import importlib.util
 from pathlib import Path
 
@@ -111,3 +112,64 @@ def test_maybe_disconnect_interactive_session_keeps_session_when_callback_missin
     )
 
     assert result == {"skipped": True, "reason": "no-new-callback-observed"}
+
+
+def test_wait_for_callback_checkin_advance_accepts_retained_callback(monkeypatch):
+    rows = [{
+        "display_id": 1,
+        "host": "CASTELBLACK",
+        "user": "samwell.tarly",
+        "last_checkin": "new",
+        "payload": {"payloadtype": {"name": "apollo"}},
+    }]
+
+    async def fake_callbacks(client):
+        return rows
+
+    monkeypatch.setattr(deploy, "get_callbacks", fake_callbacks)
+
+    latest, callback = asyncio.run(deploy.wait_for_callback_checkin_advance(
+        object(),
+        {1: "old"},
+        payload_type="apollo",
+        host="CASTELBLACK",
+        user="samwell.tarly",
+        seconds=0,
+        poll_interval=0.1,
+    ))
+
+    assert latest == rows
+    assert callback == rows[0]
+
+
+def test_launch_existing_accepts_windows_normalized_bare_principal(monkeypatch):
+    scripts = []
+
+    monkeypatch.setattr(
+        deploy,
+        "wait_for_active_interactive_session",
+        lambda *args, **kwargs: {"session_id": "4"},
+    )
+
+    def fake_run_ps(session, script):
+        scripts.append(script)
+        return {
+            "stdout": (
+                '{"Method":"existing-scheduled-task-interactive",'
+                '"TaskName":"SageApolloBootstrap","RunAsUser":"samwell.tarly"}'
+            )
+        }
+
+    monkeypatch.setattr(deploy, "run_ps", fake_run_ps)
+
+    result = deploy.launch_existing_scheduled_task_interactive(
+        object(),
+        "SageApolloBootstrap",
+        r"NORTH\samwell.tarly",
+        timeout_seconds=30,
+        poll_interval=1.0,
+    )
+
+    assert result["RunAsUser"] == "samwell.tarly"
+    assert "$actualUser -notmatch '\\\\'" in scripts[0]
+    assert "$actualUser -eq $expectedLeaf" in scripts[0]

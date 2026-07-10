@@ -27,7 +27,8 @@ Verify the Sage chat container and create a fresh Apollo payload:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
 ```
 
-`bootstrap-reset` must report a running `sage_chat_container` and `sage_payload_created: false`.
+`bootstrap-reset` must report a running `sage_chat_container`, an empty locked prepared channel named
+`Sage GOAD Ready`, and `sage_payload_created: false`.
 
 After Apollo is launched as `NORTH\samwell.tarly` on CASTELBLACK, run:
 
@@ -52,6 +53,9 @@ Import after reset:
 ```bash
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset --use-retained-callback --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
 ```
+
+Imported callback rows are forced inactive so they remain historical metadata and cannot be selected for
+tasking. Launching the retained payload creates the active callback row used by Sage.
 
 Then launch the retained payload and run:
 

@@ -27,6 +27,22 @@ assert RUN_ESSOS_SPEC and RUN_ESSOS_SPEC.loader
 RUN_ESSOS_SPEC.loader.exec_module(run_essos_da)
 
 
+@pytest.fixture(autouse=True)
+def stub_prepared_sage_chat(monkeypatch):
+    async def fake_prepare(client):
+        return {
+            "api_token": {"created": False, "api_token": {"id": 4}},
+            "prepared_channel": {
+                "chat_channel_id": 2,
+                "chat_channel_name": "Sage GOAD Ready",
+                "prepared": True,
+                "reused": False,
+            },
+        }
+
+    monkeypatch.setattr(bootstrap_payloads, "prepare_sage_chat", fake_prepare)
+
+
 def test_sage_build_parameters_skip_empty_values():
     args = argparse.Namespace(
         provider="Bedrock",
@@ -215,7 +231,7 @@ def test_export_callback_config_resolves_display_id_and_uses_graphql_variables(m
 
     assert result["agent_callback_id"] == "callback-uuid"
     assert calls[0][1] == {"displayId": 7}
-    assert calls[1][1] == {"agentCallbackId": "callback-uuid"}
+    assert calls[1][1] == {"callbackDisplayId": 7}
 
 
 def test_import_callback_config_passes_jsonb_object(monkeypatch):
@@ -245,6 +261,33 @@ def test_import_callback_config_passes_jsonb_object(monkeypatch):
         "config": {"uuid": "payload-uuid", "key": "secret"}
     }
     assert "$config: jsonb!" in observed["query"]
+
+
+def test_import_callback_config_hides_retained_callback_without_mutating_source(monkeypatch):
+    observed = {}
+    source = {
+        "callback": {
+            "agent_callback_id": "callback-uuid",
+            "active": True,
+        },
+        "payload_type": {"name": "apollo"},
+    }
+
+    async def fake_query(client, query, variables=None):
+        observed["variables"] = variables
+        return {
+            "importCallbackConfig": {
+                "status": "success",
+                "error": None,
+            }
+        }
+
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    asyncio.run(bootstrap_payloads.import_callback_config(object(), source))
+
+    assert observed["variables"]["config"]["callback"]["active"] is False
+    assert source["callback"]["active"] is True
 
 
 def test_callback_config_payload_type_reads_exported_payload_type():
@@ -476,6 +519,7 @@ def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_c
         ("download", "/payloads"),
     ]
     assert output["mode"] == "fresh-interactive-apollo"
+    assert output["sage_chat"]["prepared_channel"]["chat_channel_name"] == "Sage GOAD Ready"
     assert output["apollo"]["uuid"] == "apollo-uuid"
     assert output["apollo_bootstrap"]["method"] == "interactive-rdp-scheduled-task"
     assert output["apollo_bootstrap"]["payload_uuid"] == "apollo-uuid"

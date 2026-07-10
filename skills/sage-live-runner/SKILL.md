@@ -16,14 +16,22 @@ Check the running chat container and reusable API token:
 .venv/bin/python skills/sage-live-runner/scripts/native_chat.py inspect
 ```
 
+Prepare the visible empty channel used by the next run:
+
+```bash
+.venv/bin/python skills/sage-live-runner/scripts/native_chat.py prepare
+```
+
 Run the stock strict one-shot objective through a fresh locked AI channel:
 
 ```bash
 .venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400
 ```
 
-Each invocation creates a new channel and reports `chat_channel_id`, `chat_request_id`, terminal status, and
-messages. The helper configures autonomous mode explicitly. It resolves credentials in this order:
+The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
+Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
+and messages. Use `--new-channel` to bypass a prepared channel. The helper configures autonomous mode explicitly.
+It resolves credentials in this order:
 `MYTHIC_ADMIN_PASSWORD`, `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, then the legacy v3 `.env`.
 
 Do not reuse an old channel for a seeded proof. Do not add route hints, callback IDs, hostnames, credentials, or

@@ -7,7 +7,9 @@ description: Download an existing Mythic payload, stage it onto a Ludus Windows 
 
 ## Overview
 
-Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth comes from `MYTHIC_ADMIN_PASSWORD` or `/home/john/dev/mythic/.env`, Ludus API auth comes from `.mcp.json`, and target run-as credentials come from `--run-as-password`, `SAGE_RUN_AS_PASSWORD`, or Mythic's credential store.
+Use the bundled script for deterministic payload redeploys from Mythic into the Ludus GOAD range. Keep passwords out of scripts: Mythic auth resolves from `MYTHIC_ADMIN_PASSWORD`, `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, then the legacy v3 `.env`; Ludus API auth comes from `.mcp.json`; target run-as credentials come from `--run-as-password`, `SAGE_RUN_AS_PASSWORD`, or Mythic's credential store.
+
+After rolling back the disk-only Apollo-staged snapshot and importing the retained callback config, open an RDP session as Samwell and run `launch-existing`. It starts the preserved `SageApolloBootstrap` task, waits for the retained callback check-in to advance, and disconnects the RDP session.
 
 ## Workflow
 
