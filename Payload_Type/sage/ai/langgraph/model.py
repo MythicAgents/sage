@@ -1738,6 +1738,7 @@ class Model:
             self.policy_mode = "llm"
         self._policy_model_calls = 0
         self._policy_episode_id = ""
+        self._controller_runtime_telemetry: dict[str, Any] = {}
         self.graph = None
         self.verbose = False
         self.is_interactive = False
@@ -4258,6 +4259,13 @@ class Model:
             HumanMessage(content=json.dumps(request, sort_keys=True)),
         ])
 
+    def controller_runtime_telemetry(self) -> dict[str, Any]:
+        """Return the latest observed policy/controller telemetry for this session."""
+        telemetry = dict(getattr(self, "_controller_runtime_telemetry", {}) or {})
+        if telemetry:
+            telemetry["model_calls"] = int(getattr(self, "_policy_model_calls", 0) or 0)
+        return telemetry
+
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the policy-selected AutonomousController execution kernel.
 
@@ -4497,6 +4505,7 @@ class Model:
 
         objective_text = str(prompt or "").strip()
         self._policy_episode_id = _policy.new_episode_id()
+        self._policy_model_calls = 0
         policy_mode = _policy.normalize_policy_mode(
             getattr(self, "policy_mode", _policy.POLICY_SYMBOLIC),
             default=_policy.POLICY_SYMBOLIC,
@@ -4557,6 +4566,19 @@ class Model:
                 provider=getattr(self, "provider", ""),
                 model_id=getattr(self, "model", ""),
             )
+        self._controller_runtime_telemetry = {
+            "episode_id": self._policy_episode_id,
+            "policy_mode": str(getattr(policy_backend, "mode", "") or ""),
+            "model_provider": str(getattr(self, "provider", "") or ""),
+            "model_id": str(getattr(self, "model", "") or ""),
+            "model_calls": 0,
+            "controller_status": "running",
+            "controller_terminal_reason": "",
+            "objective_recognized": False,
+            "semantic_transaction_count": 0,
+            "authorized_transaction_count": 0,
+            "semantic_policy_coverage": 1.0,
+        }
         if resumed_after_approval:
             start_progress = (
                 "**Execution resumed**\n"
@@ -4596,6 +4618,22 @@ class Model:
         except _ControllerHitlPause:
             await self._flush_controller_verbose_events()
             return ""
+        result_data = result.to_dict()
+        self._controller_runtime_telemetry = {
+            "episode_id": result.episode_id,
+            "policy_mode": result.policy_mode,
+            "model_provider": str(getattr(self, "provider", "") or ""),
+            "model_id": str(getattr(self, "model", "") or ""),
+            "model_calls": int(getattr(self, "_policy_model_calls", 0) or 0),
+            "controller_status": result.status,
+            "controller_terminal_reason": result.reason,
+            "objective_recognized": result.status == _ctrl.STATUS_COMPLETE,
+            "semantic_transaction_count": result_data["semantic_transaction_count"],
+            "authorized_transaction_count": result_data["authorized_transaction_count"],
+            "semantic_policy_coverage": result_data["semantic_policy_coverage"],
+            "decisions": result_data["decisions"],
+            "transactions": result_data["transactions"],
+        }
         fire(
             f"DONE status={result.status} cycles={result.cycle_count} "
             f"effects={len(result.achieved_effects)} reason={result.reason}",

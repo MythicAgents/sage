@@ -5,10 +5,51 @@ validated on the range; this pins the wiring that prevents the pollution + wrong
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
 import run_gauge_live as rgl  # noqa: E402
 from range_state import Milestone, PROBEABLE_MILESTONES  # noqa: E402
+
+
+def _telemetry(**overrides):
+    value = {
+        "policy_mode": "llm",
+        "semantic_transaction_count": 2,
+        "authorized_transaction_count": 2,
+        "semantic_policy_coverage": 1.0,
+    }
+    value.update(overrides)
+    return value
+
+
+def test_runtime_telemetry_validation_accepts_complete_provenance():
+    rgl.validate_harness_runtime_telemetry("llm", _telemetry())
+
+
+def test_runtime_telemetry_validation_rejects_policy_mismatch():
+    with pytest.raises(RuntimeError, match="did not match"):
+        rgl.validate_harness_runtime_telemetry(
+            "symbolic",
+            _telemetry(policy_mode="llm"),
+        )
+
+
+def test_runtime_telemetry_validation_rejects_incomplete_coverage():
+    with pytest.raises(RuntimeError, match="1/2"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            _telemetry(
+                authorized_transaction_count=1,
+                semantic_policy_coverage=0.5,
+            ),
+        )
+
+
+def test_runtime_telemetry_validation_rejects_missing_record():
+    with pytest.raises(RuntimeError, match="no observed"):
+        rgl.validate_harness_runtime_telemetry("llm", {})
 
 
 class _Scn:

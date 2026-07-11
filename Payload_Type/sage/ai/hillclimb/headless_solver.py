@@ -45,7 +45,8 @@ async def run_headless_solve(
     max_steps: int = 0,
     config: dict | None = None,
     timeout: int = 1800,
-) -> str:
+    return_details: bool = False,
+) -> str | dict[str, Any]:
     """Run one full autonomous solve in-process; return the terminal status string.
 
     :param objective: the solve objective (the prompt the PayloadType `query` command used to receive).
@@ -87,17 +88,24 @@ async def run_headless_solve(
     )
     await llm.initialize()
 
+    status: str
     try:
         await asyncio.wait_for(llm.invoke(objective), timeout=timeout)
-        return "completed"
+        status = "completed"
     except asyncio.TimeoutError:
         try:
             llm.request_stop()
         except Exception:
             pass
-        return "timeout"
+        status = "timeout"
     except Exception as e:  # a solve error is a terminal status, not a harness crash (mirrors task status)
-        return f"error: {type(e).__name__}: {e}"
+        status = f"error: {type(e).__name__}: {e}"
+    if return_details:
+        return {
+            "status": status,
+            "runtime_telemetry": llm.controller_runtime_telemetry(),
+        }
+    return status
 
 
 def solve_headless(objective: str, **kwargs: Any) -> str:

@@ -379,11 +379,16 @@ def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int =
     from .headless_solver import run_headless_solve
 
     def solve(objective: str) -> str:
-        return asyncio.run(run_headless_solve(
+        result = asyncio.run(run_headless_solve(
             objective, client=client, operation_id=operation_id, engagement_id=engagement_id,
-            timeout=timeout, max_steps=max_steps, policy_mode=policy_mode,
+            timeout=timeout, max_steps=max_steps, policy_mode=policy_mode, return_details=True,
         ))
+        solve.last_result = result
+        if not isinstance(result, dict):
+            return str(result or "completed")
+        return str(result.get("status") or "completed")
 
+    solve.last_result = None
     return solve
 
 

@@ -84,6 +84,10 @@ def test_null_llm_policy_fails_closed_without_execution():
     assert calls == []
     assert result.policy_mode == "llm"
     assert result.decisions[0]["disposition"] == "stop"
+    telemetry = result.to_dict()
+    assert telemetry["semantic_transaction_count"] == 0
+    assert telemetry["authorized_transaction_count"] == 0
+    assert telemetry["semantic_policy_coverage"] == 1.0
 
 
 def test_controller_passes_policy_decision_to_execution():
@@ -109,3 +113,41 @@ def test_controller_passes_policy_decision_to_execution():
     assert result.status == ac.STATUS_COMPLETE
     assert captured[0][1].decision_id == result.cycles[0].decision_id
     assert result.policy_mode == "symbolic"
+    telemetry = result.to_dict()
+    assert telemetry["semantic_transaction_count"] == 1
+    assert telemetry["authorized_transaction_count"] == 1
+    assert telemetry["semantic_policy_coverage"] == 1.0
+
+
+def test_controller_result_reports_incomplete_policy_coverage():
+    result = ac.ControllerResult(
+        status=ac.STATUS_BLOCKED,
+        reason="test",
+        blocker=None,
+        cycle_count=1,
+        cycles=[],
+        achieved_effects=[],
+        episode_id="episode-1",
+        policy_mode="llm",
+        transactions=[
+            {
+                "kind": "capability",
+                "capability": "first",
+                "target": "one",
+                "decision_id": "decision-1",
+                "policy_mode": "llm",
+            },
+            {
+                "kind": "capability",
+                "capability": "second",
+                "target": "two",
+                "decision_id": "",
+                "policy_mode": "",
+            },
+        ],
+    )
+
+    telemetry = result.to_dict()
+    assert telemetry["semantic_transaction_count"] == 2
+    assert telemetry["authorized_transaction_count"] == 1
+    assert telemetry["semantic_policy_coverage"] == 0.5

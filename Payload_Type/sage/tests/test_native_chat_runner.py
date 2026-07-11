@@ -126,6 +126,35 @@ def test_run_native_chat_turn_returns_channel_and_request(monkeypatch):
     assert result["chat_channel_id"] == 10
     assert result["chat_request_id"] == 30
     assert result["status"] == "complete"
+    assert result["runtime_telemetry"] == {}
+
+
+def test_extract_runtime_telemetry_reads_terminal_metadata():
+    telemetry = {
+        "policy_mode": "llm",
+        "semantic_transaction_count": 2,
+        "authorized_transaction_count": 2,
+        "semantic_policy_coverage": 1.0,
+    }
+    messages = [
+        {"metadata": {"tool_use": {"status": "completed"}}},
+        {"metadata": {"runtime_telemetry": telemetry}},
+    ]
+
+    assert native_chat.extract_runtime_telemetry(messages) == telemetry
+
+
+def test_extract_runtime_telemetry_reads_error_wrapped_metadata():
+    telemetry = {"policy_mode": "symbolic"}
+    messages = [{
+        "metadata": {
+            "container_metadata": {
+                "runtime_telemetry": telemetry,
+            }
+        }
+    }]
+
+    assert native_chat.extract_runtime_telemetry(messages) == telemetry
 
 
 def test_prepare_locked_channel_reuses_empty_prepared_channel(monkeypatch):

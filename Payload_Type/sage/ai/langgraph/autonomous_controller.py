@@ -99,8 +99,11 @@ class ControllerResult:
     episode_id: str = ""
     policy_mode: str = ""
     decisions: list[dict[str, Any]] = field(default_factory=list)
+    transactions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        authorized = sum(1 for item in self.transactions if item.get("decision_id"))
+        transaction_count = len(self.transactions)
         return {
             "status": self.status,
             "reason": self.reason,
@@ -110,6 +113,12 @@ class ControllerResult:
             "episode_id": self.episode_id,
             "policy_mode": self.policy_mode,
             "decisions": self.decisions,
+            "transactions": self.transactions,
+            "semantic_transaction_count": transaction_count,
+            "authorized_transaction_count": authorized,
+            "semantic_policy_coverage": (
+                authorized / transaction_count if transaction_count else 1.0
+            ),
             "cycles": [vars(c) for c in self.cycles],
         }
 
@@ -333,6 +342,7 @@ class AutonomousController:
         self._no_effect = 0
         cycles: list[CycleRecord] = []
         decisions: list[Any] = []
+        transactions: list[dict[str, Any]] = []
         blocker: dict | None = None
         achieved: set[str] = set()
 
@@ -345,7 +355,8 @@ class AutonomousController:
                                     decisions=[
                                         d.to_dict() if hasattr(d, "to_dict") else dict(d)
                                         for d in decisions
-                                    ])
+                                    ],
+                                    transactions=list(transactions))
 
         # Budget check BEFORE the first (potentially expensive) observe — fail cheap.
         over = await self._budget_exceeded()
@@ -436,6 +447,13 @@ class AutonomousController:
                             note=f"configured global collection emergency cap exhausted at {self._collections}",
                         ))
                         return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
+                    transactions.append({
+                        "kind": "collection",
+                        "capability": "collect-graph",
+                        "target": request_key,
+                        "decision_id": str(getattr(decision, "decision_id", "") or ""),
+                        "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+                    })
                     cst, cres = await self._collect_seam(state, decision)
                     self._collections += 1
                     self._collection_attempts[request_key] = attempts + 1
@@ -503,6 +521,13 @@ class AutonomousController:
             expected = _action_effects(action)
 
             # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
+            transactions.append({
+                "kind": "capability",
+                "capability": name,
+                "target": target,
+                "decision_id": str(getattr(decision, "decision_id", "") or ""),
+                "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+            })
             est, eres = await self._execute_seam(action, decision)
             result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
 

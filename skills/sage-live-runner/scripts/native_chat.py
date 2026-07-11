@@ -491,6 +491,22 @@ async def wait_for_request(
     )
 
 
+def extract_runtime_telemetry(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return Sage's observed runtime telemetry from the terminal assistant message."""
+    for message in reversed(messages or []):
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        telemetry = metadata.get("runtime_telemetry")
+        if not isinstance(telemetry, dict):
+            container_metadata = metadata.get("container_metadata")
+            if isinstance(container_metadata, dict):
+                telemetry = container_metadata.get("runtime_telemetry")
+        if isinstance(telemetry, dict):
+            return dict(telemetry)
+    return {}
+
+
 async def run_native_chat_turn(
     client: Any,
     prompt: str,
@@ -520,12 +536,14 @@ async def run_native_chat_turn(
         poll_interval_seconds=poll_interval_seconds,
     )
     request = completed["request"]
+    messages = completed["messages"]
     return {
         **channel,
         **message,
         "status": request.get("status"),
         "error": request.get("error"),
-        "messages": completed["messages"],
+        "messages": messages,
+        "runtime_telemetry": extract_runtime_telemetry(messages),
     }
 
 

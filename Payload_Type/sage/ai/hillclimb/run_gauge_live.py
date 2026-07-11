@@ -164,6 +164,38 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
     return checks
 
 
+def validate_harness_runtime_telemetry(
+    configured_policy_mode: str,
+    telemetry: dict,
+) -> None:
+    """Reject mislabeled or incompletely attributed harness runs."""
+    if not isinstance(telemetry, dict) or not telemetry:
+        raise RuntimeError("Sage returned no observed runtime telemetry")
+    observed = str(telemetry.get("policy_mode") or "").strip().casefold()
+    configured = str(configured_policy_mode or "").strip().casefold()
+    if observed != configured:
+        raise RuntimeError(
+            f"configured policy mode {configured!r} did not match observed mode {observed!r}"
+        )
+    total = int(telemetry.get("semantic_transaction_count", 0) or 0)
+    authorized = int(telemetry.get("authorized_transaction_count", 0) or 0)
+    coverage = float(telemetry.get("semantic_policy_coverage", 0.0) or 0.0)
+    if total < 0 or authorized < 0 or authorized > total:
+        raise RuntimeError(
+            f"invalid semantic transaction counts: authorized={authorized}, total={total}"
+        )
+    expected_coverage = authorized / total if total else 1.0
+    if abs(coverage - expected_coverage) > 1e-9:
+        raise RuntimeError(
+            f"semantic policy coverage {coverage} disagrees with counts "
+            f"{authorized}/{total}"
+        )
+    if authorized != total:
+        raise RuntimeError(
+            f"semantic policy provenance incomplete: {authorized}/{total} transactions authorized"
+        )
+
+
 def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     scn = _scenario(cfg, scenario_name)
@@ -210,10 +242,24 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
         _elapsed = int(time.time() - _start)
         print(f"[harness/{scenario_name}] solve returned {time.strftime('%H:%M:%S')} "
               f"(elapsed {_elapsed // 60}m{_elapsed % 60}s, status={solve_status})", flush=True)
+        native_result = getattr(solve, "last_result", None)
+        runtime_telemetry = (
+            dict(native_result.get("runtime_telemetry") or {})
+            if isinstance(native_result, dict)
+            else {}
+        )
+        validate_harness_runtime_telemetry(cfg.policy_mode, runtime_telemetry)
         # Record the REAL terminal status (incl. "timeout") AND the wall-clock cost in the card -> jsonl.
         # wall_seconds is the discriminating signal once capability saturates: a completion-recognized clean
         # stop (status="stopped" well under the budget) vs a churn-to-timeout shows up here, not in capability.
-        card = bare_runner.score_from_probes(scn, probes, status=solve_status, wall_seconds=_elapsed)
+        card = bare_runner.score_from_probes(
+            scn,
+            probes,
+            status=solve_status,
+            wall_seconds=_elapsed,
+            runtime_telemetry=runtime_telemetry,
+            configured_policy_mode=cfg.policy_mode,
+        )
     elif side == "bare":
         bare = build_bare_runner(cfg)            # builds its own stripped-Mythic dispatcher (all callbacks)
         result = bare.run(scn.objective)
@@ -225,17 +271,26 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     # the model from Sage's .env (bare via build_bare_runner -> load_sage_defaults; harness = whatever Sage
     # is running). When a bare-side --model override is added, record THAT for the bare side instead.
     _defs = live_seams.load_sage_defaults()
-    card.policy_mode = cfg.policy_mode if side == "harness" else "llm"
-    card.model_provider = str(_defs.get("provider") or "")
-    card.model_id = str(_defs.get("model") or "")
+    if side == "bare":
+        card.policy_mode = "llm"
+        card.configured_policy_mode = "llm"
+        card.policy_identity_valid = True
+        card.model_provider = str(_defs.get("provider") or "")
+        card.model_id = str(_defs.get("model") or "")
     _now = time.time()
     rec = {"side": side, "scenario": scenario_name,
            "model": _defs.get("model"), "provider": _defs.get("provider"),
            "policy_mode": card.policy_mode,
+           "configured_policy_mode": card.configured_policy_mode,
+           "policy_identity_valid": card.policy_identity_valid,
            "request_completed": card.request_completed,
+           "objective_recognized": card.objective_recognized,
            "objective_proven": card.objective_proven,
            "clean_stop": card.clean_stop,
            "controller_terminal_reason": card.controller_terminal_reason,
+           "semantic_transaction_count": card.semantic_transaction_count,
+           "authorized_transaction_count": card.authorized_transaction_count,
+           "semantic_policy_coverage": card.semantic_policy_coverage,
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),

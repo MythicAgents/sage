@@ -165,6 +165,26 @@ def test_no_assistant_output_uses_nonempty_terminal_fallback():
     }]
 
 
+def test_terminal_message_carries_observed_runtime_telemetry():
+    class _TelemetryModel(_FakeModel):
+        def controller_runtime_telemetry(self):
+            return {
+                "policy_mode": "llm",
+                "model_calls": 2,
+                "semantic_transaction_count": 2,
+                "authorized_transaction_count": 2,
+                "semantic_policy_coverage": 1.0,
+            }
+
+    chat = _DriverChat(_TelemetryModel(stream=("final",)))
+    _run(chat.chat(build_chat_request("objective", channel_id=5, request_id=14)))
+
+    terminal = chat.terminal_emissions[0]
+    assert terminal["response_key"] == "assistant:14:1"
+    assert terminal["metadata"]["runtime_telemetry"]["policy_mode"] == "llm"
+    assert terminal["metadata"]["runtime_telemetry"]["semantic_policy_coverage"] == 1.0
+
+
 def test_emit_tool_use_produces_tool_use_card():
     chat = HeadlessSageChat()
     req = build_chat_request("x")
@@ -1567,6 +1587,7 @@ def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
     assert calls["engagement_id"] == "Operation_Chimera_1"
     assert calls["operation_id"] == 7
     assert calls["policy_mode"] == "symbolic"
+    assert calls["return_details"] is True
 
 
 def test_build_channel_metadata_live_counts(monkeypatch):

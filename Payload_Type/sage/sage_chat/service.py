@@ -201,19 +201,26 @@ class SageChat(Chat):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.
                 return None
+            runtime_telemetry = {}
+            get_runtime_telemetry = getattr(model, "controller_runtime_telemetry", None)
+            if callable(get_runtime_telemetry):
+                runtime_telemetry = dict(get_runtime_telemetry() or {})
+            terminal_metadata = {"channel_id": request.ChannelID}
+            if runtime_telemetry:
+                terminal_metadata["runtime_telemetry"] = runtime_telemetry
             if stream_emitter.last_response_key:
                 # Reuse the final visible block's key so Mythic updates it in place instead of creating
                 # a separate empty timestamp row for the request terminal.
                 await self.send_complete(
                     request,
                     stream_emitter.last_response_key,
-                    metadata=turn._metadata({"channel_id": request.ChannelID}),
+                    metadata=turn._metadata(terminal_metadata),
                     content=stream_emitter.last_content,
                     complete_request=True,
                 )
                 return None
             # No assistant text was emitted. Let run_chat_turn create a visible fallback terminal.
-            return {"channel_id": request.ChannelID}
+            return terminal_metadata
 
         await self.run_chat_turn(
             request,

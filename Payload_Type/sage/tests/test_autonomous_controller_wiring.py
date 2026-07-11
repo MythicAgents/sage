@@ -123,6 +123,14 @@ def test_llm_policy_decision_is_attached_to_capability_inputs():
     assert decision["selected_capability"] == "adcs-ca-private-key-export"
     assert decision["decision_id"].startswith("decision-")
     assert payload["intent"]["policy_decision"]["decision_id"] == decision["decision_id"]
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["policy_mode"] == "llm"
+    assert telemetry["model_provider"] == "test"
+    assert telemetry["model_id"] == "selector"
+    assert telemetry["model_calls"] == 2
+    assert telemetry["semantic_transaction_count"] == 2
+    assert telemetry["authorized_transaction_count"] == 2
+    assert telemetry["semantic_policy_coverage"] == 1.0
 
 
 def test_controller_resume_executes_exact_approved_action_without_second_llm_decision():
