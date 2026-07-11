@@ -1712,6 +1712,7 @@ class Model:
         self._response_emitter = response_emitter
         self._active_delegations: dict[str, dict[str, Any]] = {}
         self._delegation_seq: int = 0
+        self._delegation_scope: str = ""
         self._execution_activity_seq: int = 0
         self._visibility_expected: set[str] = set()
         self._visibility_rendered: set[str] = set()
@@ -2058,11 +2059,12 @@ class Model:
             logger.debug(f"_emit_tool_use_card failed (non-fatal): {e}")
             return False
 
-    def begin_visibility_turn(self) -> None:
+    def begin_visibility_turn(self, delegation_scope: str = "") -> None:
         """Reset request-scoped visibility accounting before execution starts."""
         self._visibility_expected = set()
         self._visibility_rendered = set()
         self._visibility_failed = set()
+        self._delegation_scope = str(delegation_scope or "").strip()
 
     async def _emit_execution_event(self, event: dict[str, Any]) -> None:
         """Render one boundary-owned Mythic or MCP lifecycle event."""
@@ -2362,7 +2364,12 @@ class Model:
             if existing is not None:
                 await self._close_delegation(agent_name)
             self._delegation_seq += 1
-            delegation_id = f"{agent_name.lower()}:{self._delegation_seq}"
+            scope = str(getattr(self, "_delegation_scope", "") or "").strip()
+            delegation_id = (
+                f"{agent_name.lower()}:{scope}:{self._delegation_seq}"
+                if scope
+                else f"{agent_name.lower()}:{self._delegation_seq}"
+            )
             icon = self._delegation_icon(agent_name)
             icon_color = self._delegation_color(agent_name)
             card_title = _normalize_handoff_title(title, instruction, agent_name)
@@ -2417,20 +2424,14 @@ class Model:
             if delegation is None:
                 return
             final_summary = str(delegation.get("final_summary") or "").strip()
-            if not content:
-                content = final_summary or str(delegation.get("last_text") or "")
-            # The handback summary is captured from the control-tool args and, until now, only landed
-            # in the card's close content — it never went through emit_agent_text, so the expanded
-            # sub-agent (Open) view never showed the agent's final message. Echo it into the drill-down
-            # too, so the final message appears in BOTH the card summary and the Open view. Guarded on
-            # final_summary specifically: last_text was already streamed to the drill-down as it happened,
-            # so echoing that instead would duplicate it.
-            if final_summary:
-                await self._emit_agent_text(
-                    content=final_summary,
-                    delegation_id=str(delegation.get("id", "")),
-                    delegation_name=str(delegation.get("name", agent_name)),
-                )
+            explicit_content = str(content or "").strip()
+            last_text = str(delegation.get("last_text") or "").strip()
+            # Mythic automatically persists non-empty terminal card content as a
+            # subagent_final_output drill-down message. Text already emitted through emit_agent_text
+            # must therefore not be repeated as card-close content.
+            content = explicit_content or final_summary
+            if content and last_text and content == last_text:
+                content = ""
             await self._emit_subagent_status(
                 title=str(delegation.get("title", "")),
                 delegation_id=str(delegation.get("id", "")),
@@ -3761,6 +3762,74 @@ class Model:
             and _controller_hitl_flag_enabled()
             and self._looks_like_explicit_objective_prompt(prompt)
         )
+
+    @staticmethod
+    def _looks_like_casual_greeting(prompt: Any) -> bool:
+        """Recognize short greetings that must remain a tool-free conversational turn."""
+        text = re.sub(r"\s+", " ", _coerce_prompt_text(prompt).strip().lower())
+        text = re.sub(r"[!.?]+$", "", text).strip()
+        return bool(re.fullmatch(
+            r"(?:hello|hi|hey|hello there|hi there|hey there|"
+            r"good morning|good afternoon|good evening)(?: sage)?",
+            text,
+        ))
+
+    async def _run_generalist_only_turn(self, prompt: Any) -> str:
+        """Run one tool-free Generalist inference and end the turn.
+
+        This is the provider-independent terminal route for casual greetings. It deliberately bypasses the
+        Supervisor because a provider may otherwise continue routing after the Generalist has already answered.
+        The Generalist callback writes into its trace card, so this route must also emit the final response to
+        the main chat before completing the turn.
+        """
+        generalist = self._generalist_agent()
+        delegated = HumanMessage(
+            content=_coerce_prompt_text(prompt),
+            additional_kwargs={
+                "_delegated_to": "Generalist",
+                "_handoff_title": "Conversation",
+                "_hide_from_stream": True,
+            },
+        )
+        _tag_msg(delegated, self._next_seq())
+        self.state.setdefault("generalist_messages", []).append(delegated)
+        update = await generalist(self.state, self._graph_run_config(self._session_thread_id()))
+        final_message = None
+        if isinstance(update, dict):
+            final_message = next(
+                (
+                    msg
+                    for msg in reversed(update.get("generalist_messages", []))
+                    if isinstance(msg, AIMessage)
+                    and not (getattr(msg, "tool_calls", None) or [])
+                    and _message_content_as_text(msg.content).strip()
+                ),
+                None,
+            )
+            for channel in (
+                "messages",
+                "supervisor_messages",
+                "generalist_messages",
+                "_message_seq",
+            ):
+                if channel not in update:
+                    continue
+                if channel == "_message_seq":
+                    self._message_seq = update[channel]
+                    self.state[channel] = update[channel]
+                else:
+                    self.state.setdefault(channel, []).extend(
+                        msg for msg in update[channel] if not _is_internal_human_message(msg)
+                    )
+        if final_message is None:
+            final_message = AIMessage(
+                content="I’m sorry, but I couldn’t produce a response for that turn.",
+                name="Generalist",
+            )
+        formatted = self._format_message_for_streaming(final_message, agent_name="Generalist")
+        if formatted:
+            await self._stream_message_to_mythic(formatted)
+        return ""
 
     def _controller_owned_solve(self) -> bool:
         """Whether deterministic controller code owns the current solve."""
@@ -6120,6 +6189,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         ):
             return ""
 
+        if self._looks_like_casual_greeting(prompt):
+            logger.info("Casual greeting routed to one tool-free Generalist turn")
+            return await self._run_generalist_only_turn(prompt)
+
         # Deterministic controller. For autonomous auto one-shots, supervised autonomous chat, or an explicit
         # supervised chat objective turn with controller-native HITL, OWN the
         # observe->frontier->select->execute->verify->stop cycle in deterministic code, bypassing the
@@ -6134,7 +6207,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             except asyncio.CancelledError:
                 logger.info("🛑 Autonomous controller cancelled — clean stop")
                 try:
-                    await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+                    await self._stream_message_to_mythic("\n🛑 Session stopped by operator.\n")
                 except Exception:
                     pass
                 raise
@@ -6158,7 +6231,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 if self._stop_requested:
                     logger.info("🛑 Stop requested — terminating graph execution (main loop)")
                     try:
-                        await self._stream_message_to_mythic("\n🛑> Session stopped by operator.\n")
+                        await self._stream_message_to_mythic("\n🛑 Session stopped by operator.\n")
                     except Exception:
                         pass
                     # Any sub-agent card still open would otherwise stay stuck on "running".
@@ -6299,7 +6372,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # request_stop() cancels the active invoke task to interrupt long-running tool awaits
             # immediately. Treat that as an operator stop, not as an invocation failure.
             self._stop_requested = True
-            stop_message = "\n🛑> Session stopped by operator.\n"
+            stop_message = "\n🛑 Session stopped by operator.\n"
             logger.info("🛑 Operator stop cancelled active invoke task — terminating session")
             # Hard cancel: shield the stop notice + card-close so the tearing-down task can't cut
             # the emits off before they reach Mythic (which left the sub-agent card stuck "running").
@@ -6310,7 +6383,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # check). End the session cleanly instead of surfacing it as an error.
             if getattr(self, "_global_step_limit_hit", False):
                 stop_message = (
-                    f"\n🛑> Halted: global step limit ({self._max_steps}) reached; "
+                    f"\n🛑 Halted: global step limit ({self._max_steps}) reached; "
                     "the run may be looping without progress.\n"
                 )
                 logger.info(
@@ -6318,7 +6391,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     f"{self._global_step_count} model steps"
                 )
             else:
-                stop_message = "\n🛑> Session stopped by operator.\n"
+                stop_message = "\n🛑 Session stopped by operator.\n"
                 logger.info("🛑 Operator stop honored inside agent loop — terminating session")
             try:
                 await self._stream_message_to_mythic(stop_message)

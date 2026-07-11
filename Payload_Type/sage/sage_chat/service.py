@@ -150,7 +150,9 @@ class SageChat(Chat):
             model._thread_id_override = thread_id
             begin_visibility = getattr(model, "begin_visibility_turn", None)
             if callable(begin_visibility):
-                begin_visibility()
+                begin_visibility(
+                    f"chat:{request.ChannelID}:request:{request.RequestID}"
+                )
             try:
                 from ai.mcp import MCPManager
             except ImportError:  # pragma: no cover

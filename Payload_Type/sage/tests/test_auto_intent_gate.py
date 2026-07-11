@@ -23,6 +23,8 @@ import os
 import sys
 from pathlib import Path
 
+from langchain_core.messages import AIMessage
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sage
 from ai.langgraph import model as model_mod  # noqa: E402
 from ai.langgraph.model import Model, _coerce_prompt_text  # noqa: E402
@@ -59,6 +61,50 @@ def test_greeting_does_not_initiate_controller_in_auto_mode():
         assert m._should_use_controller(is_interactive=False, prompt="hi there") is False
         assert m._should_use_controller(is_interactive=False, prompt="") is False
     _with_default_flags(_case)
+
+
+def test_casual_greetings_use_terminal_tool_free_route():
+    m = _auto_model()
+    for prompt in ("hello", "Hello!", "hi there", "Hey Sage", "good morning"):
+        assert m._looks_like_casual_greeting(prompt) is True
+    for prompt in ("list callbacks", "hello and run whoami", "compromise the corp domain"):
+        assert m._looks_like_casual_greeting(prompt) is False
+
+
+def test_casual_greeting_emits_generalist_answer_to_main_chat():
+    m = _auto_model()
+    m.channel_id = 3
+    m.state = {
+        "messages": [],
+        "supervisor_messages": [],
+        "generalist_messages": [],
+        "_message_seq": 0,
+    }
+    m._message_seq = 0
+    m.verbose = True
+    streamed = []
+
+    async def _agent(state, config):
+        answer = AIMessage(content="Hello! How can I help?", name="Generalist")
+        return {
+            "messages": [answer],
+            "generalist_messages": [answer],
+            "supervisor_messages": [],
+        }
+
+    async def _stream(message):
+        streamed.append(message)
+        return True
+
+    m._generalist_agent = lambda: _agent
+    m._graph_run_config = lambda thread_id: {}
+    m._session_thread_id = lambda: "3"
+    m._stream_message_to_mythic = _stream
+
+    import asyncio
+    asyncio.run(m._run_generalist_only_turn("hello"))
+
+    assert streamed == ["Hello! How can I help?\n"]
 
 
 def test_questions_and_negatives_do_not_initiate_in_auto_mode():

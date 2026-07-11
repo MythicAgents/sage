@@ -85,7 +85,7 @@ def test_ensure_api_token_creates_wildcard_for_autonomous_operations(monkeypatch
 def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
-        'export provider="openai"\nexport model="test-model"\nexport API_ENDPOINT="http://localhost/v1"\n',
+        'export provider="OpenAI"\nexport model="test-model"\nexport API_ENDPOINT="http://localhost/v1"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(native_chat, "SAGE_ENV_PATH", env_file)
@@ -97,6 +97,7 @@ def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     assert metadata["config"]["autonomous_solve"] is True
     assert metadata["config"]["max_steps"] == 0
     assert metadata["config"]["model"] == "test-model"
+    assert metadata["config"]["provider"] == "openai"
 
 
 def test_run_native_chat_turn_returns_channel_and_request(monkeypatch):

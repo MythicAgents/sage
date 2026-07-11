@@ -229,6 +229,11 @@ def _read_env_defaults(path: Path | None = None) -> dict[str, str]:
     return values
 
 
+def normalize_provider(value: str) -> str:
+    """Return the canonical provider identifier used by Sage's Mythic choice field."""
+    return str(value or "openai").strip().lower()
+
+
 def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     file_env = _read_env_defaults()
 
@@ -236,7 +241,7 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         return os.environ.get(name) or file_env.get(name) or default
 
     config: dict[str, Any] = {
-        "provider": value("provider", "openai"),
+        "provider": normalize_provider(value("provider", "openai")),
         "model": value("model"),
         "mode": "auto",
         "autonomous_solve": True,

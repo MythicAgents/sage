@@ -495,7 +495,7 @@ def test_delegation_safety_close_falls_back_to_last_text():
 
     assert len(emitter.calls) == 1
     finished = emitter.calls[0]
-    assert finished["content"] == "Callback 1 history shows only failed tasks."
+    assert finished["content"] == ""
     assert finished["status"] == "finished"
     assert finished["complete"] is True
     assert finished["tool_count"] == 2
@@ -1175,8 +1175,8 @@ def test_close_all_delegations_marks_open_cards_stopped():
     assert call["icon_color"] == "#3B82F6"                 # color still applied on the stopped card
 
 
-def test_close_delegation_echoes_handback_summary_to_drilldown():
-    """The captured handback summary lands in BOTH the card content and the Open drill-down."""
+def test_close_delegation_persists_handback_summary_once_via_card_close():
+    """Mythic persists terminal card content as the drill-down's final output."""
     emitter = _RecEmitter()
     m = _bare_model_with(emitter, {
         "BloodHound": {"id": "bloodhound:1", "name": "BloodHound", "title": "t", "tool_count": 1,
@@ -1186,10 +1186,8 @@ def test_close_delegation_echoes_handback_summary_to_drilldown():
 
     _run(m._close_delegation("BloodHound"))
 
-    assert emitter.subagent_calls[0]["content"] == "DONE — ingested job 228."   # card summary
-    assert len(emitter.agent_text_calls) == 1                                    # echoed to drill-down
-    assert emitter.agent_text_calls[0]["content"] == "DONE — ingested job 228."
-    assert emitter.agent_text_calls[0]["delegation_id"] == "bloodhound:1"
+    assert emitter.subagent_calls[0]["content"] == "DONE — ingested job 228."
+    assert emitter.agent_text_calls == []
 
 
 def test_close_delegation_does_not_reecho_streamed_last_text():
@@ -1204,8 +1202,44 @@ def test_close_delegation_does_not_reecho_streamed_last_text():
 
     _run(m._close_delegation("Generalist"))
 
-    assert emitter.agent_text_calls == []                                        # no re-echo
-    assert emitter.subagent_calls[0]["content"] == "already streamed"            # still the card content
+    assert emitter.agent_text_calls == []
+    assert emitter.subagent_calls[0]["content"] == ""
+
+
+def test_close_delegation_suppresses_explicit_content_already_streamed():
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "Generalist": {"id": "generalist:1", "name": "Generalist", "title": "t", "tool_count": 0,
+                       "icon": "GN", "icon_color": "#10B981",
+                       "final_summary": "", "last_text": "Hello! How can I help?"},
+    })
+
+    _run(m._close_delegation("Generalist", content="Hello! How can I help?"))
+
+    assert emitter.subagent_calls[0]["content"] == ""
+
+
+def test_request_scope_prevents_delegation_id_reuse_after_restart():
+    from ai.langgraph.model import Model
+
+    emitter = _SubagentStatusRecorder()
+
+    first = Model.__new__(Model)
+    first._active_delegations = {}
+    first._delegation_seq = 0
+    first._response_emitter = emitter
+    first.begin_visibility_turn("chat:3:request:4")
+    _run(first._open_delegation("Generalist", "hello", 1))
+
+    second = Model.__new__(Model)
+    second._active_delegations = {}
+    second._delegation_seq = 0
+    second._response_emitter = emitter
+    second.begin_visibility_turn("chat:3:request:5")
+    _run(second._open_delegation("Generalist", "hello", 1))
+
+    assert emitter.calls[0]["delegation_id"] == "generalist:chat:3:request:4:1"
+    assert emitter.calls[1]["delegation_id"] == "generalist:chat:3:request:5:1"
 
 
 def test_run_operator_stop_shielded_streams_notice_and_stops_cards():
@@ -1217,9 +1251,10 @@ def test_run_operator_stop_shielded_streams_notice_and_stops_cards():
                        "icon": "BH", "icon_color": "#E5484D", "final_summary": "", "last_text": ""},
     })
 
-    _run(m._run_operator_stop_shielded("\n🛑> Session stopped by operator.\n"))
+    _run(m._run_operator_stop_shielded("\n🛑 Session stopped by operator.\n"))
 
     assert any("stopped by operator" in t for t in emitter.text_sends)   # notice reached egress
+    assert all("🛑>" not in t for t in emitter.text_sends)
     assert m._active_delegations == {}                                    # card closed
     assert emitter.subagent_calls[-1]["status"] == "stopped"              # ...as stopped
 
