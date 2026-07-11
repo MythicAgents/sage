@@ -1062,6 +1062,24 @@ def test_autonomous_is_boolean_option_and_verbose_removed():
     assert "verbose" not in opts  # removed — chat container is always full-detail
 
 
+def test_provider_is_choice_dropdown_not_freeform_string():
+    """Restored the Mythic-v3 provider dropdown: `provider` is a Choice, not a freeform String. A freeform box
+    lets a typo'd provider name through to init_chat_model, which then fails at model init. Values must be the
+    ones config.py / _get_base_chat_model actually handle (bedrock special-cased; the rest via init_chat_model)."""
+    opts = {o.Name: o for o in SAGE_MODELS[0].Metadata.ConfigurationOptions}
+    prov = opts["provider"]
+    assert str(prov.Type) == "choice"
+    assert prov.DefaultValue == "openai"
+    values = {c.Value for c in prov.Choices}
+    assert values == {"openai", "bedrock", "anthropic", "ollama"}
+    # "bedrock" must be exactly this string so config.py's `if provider == "bedrock"` AWS-quad branch fires
+    assert "bedrock" in values
+    # round-trips through to_json (what actually syncs to Mythic) with choices intact
+    pj = [o for o in SAGE_MODELS[0].to_json()["metadata"]["configuration_options"] if o["name"] == "provider"][0]
+    assert pj["type"] == "choice"
+    assert {c["value"] for c in pj["choices"]} == {"openai", "bedrock", "anthropic", "ollama"}
+
+
 def test_autonomous_solve_toggle_independent_of_mode():
     # the explicit toggle enables autonomy even when mode stays supervised
     kwargs = build_model_kwargs(build_chat_request("hi", config={"autonomous_solve": "true"}))

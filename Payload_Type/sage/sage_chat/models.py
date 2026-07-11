@@ -44,10 +44,16 @@ _CONFIG_OPTIONS = [
         Name="provider",
         DisplayName="Provider",
         DisplayAsChip=True,
-        Type=OptType.String,
-        Description="The model provider to interact with (e.g. anthropic, bedrock, openai, ollama).",
+        Type=OptType.Choice,
+        Description="The model provider to interact with. Bedrock uses the AWS quad below; the others use API Key / API Endpoint.",
         Required=False,
         DefaultValue="openai",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="OpenAI", Value="openai"),
+            ChatModelConfigurationOptionChoice(Label="AWS Bedrock", Value="bedrock"),
+            ChatModelConfigurationOptionChoice(Label="Anthropic", Value="anthropic"),
+            ChatModelConfigurationOptionChoice(Label="Ollama", Value="ollama"),
+        ],
     ),
     ChatModelConfigurationOption(
         Name="model",
