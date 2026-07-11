@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -45,6 +47,7 @@ async def run_headless_solve(
     max_steps: int = 0,
     config: dict | None = None,
     timeout: int = 1800,
+    null_model: bool = False,
     return_details: bool = False,
 ) -> str | dict[str, Any]:
     """Run one full autonomous solve in-process; return the terminal status string.
@@ -60,7 +63,13 @@ async def run_headless_solve(
         old harness's ``stop`` task).
     :returns: ``"completed"`` | ``"timeout"`` | ``"error: <Type>: <msg>"``.
     """
-    from ai.langgraph.model import Model
+    try:
+        from ai.langgraph.model import Model
+    except ModuleNotFoundError:
+        # run_gauge_live.py is also invoked as a script, which puts ai/hillclimb (not Payload_Type/sage)
+        # on sys.path. Restore the package root so the same headless solver works in both invocation modes.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from ai.langgraph.model import Model
 
     # Pin the ledger key up front so the engagement ledger is keyed to this run's operation regardless of
     # what an admin-scoped client can see (mirrors the PayloadType path's engagement resolution).
@@ -71,7 +80,19 @@ async def run_headless_solve(
     model = (model or _env("model", "")).lower()
     policy_mode = (policy_mode or _env("SAGE_POLICY_MODE", "llm")).lower()
 
-    llm = Model(
+    model_class = Model
+    if null_model:
+        from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+        class NullModel(Model):
+            """Build the controller graph without constructing a provider-backed chat model."""
+
+            def _get_base_chat_model(self):
+                return FakeListChatModel(responses=[""])
+
+        model_class = NullModel
+
+    llm = model_class(
         provider=provider,
         model=model,
         system_prompt=_env("system_prompt", ""),
@@ -87,6 +108,10 @@ async def run_headless_solve(
         mythic_preauth_client=client,
     )
     await llm.initialize()
+    if null_model:
+        # Eval-only ablation: the inert model exists only long enough to build the normal graph shell. Remove
+        # the policy inference seam before the controller starts; symbolic is unaffected, learned policies fail closed.
+        llm.llm = None
 
     status: str
     try:

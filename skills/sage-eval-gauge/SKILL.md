@@ -21,6 +21,10 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - Gate-experiment dry-run (synthetic, safe): `../../.venv/bin/python -m ai.hillclimb gate-experiment --dry-run`
 - Operator replay fixture validation (safe): `../../.venv/bin/python -m ai.hillclimb operator-replay validate`
 - Operator replay dry-run (safe; no model calls): `../../.venv/bin/python -m ai.hillclimb operator-replay run --dry-run`
+- Null-model policy factorial (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb null-model-factorial`
+- Live null-model factorial (OFFENSIVE symbolic baseline; clean reset per policy):
+  `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario cross-forest-objective --side harness --null-model-factorial --seeds 1 --solve-timeout 5400 --go`
 - Live driver dry-run (safe; resolves Sage model, Apollo catalog, BloodHound): `../../.venv/bin/python ai/hillclimb/run_gauge_live.py`
 - **Orchestrated bare-vs-harness (OFFENSIVE — resets the lab per run; run DETACHED, ~1.5–2.5h/seed):**
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario child-da --side harness --seeds N --solve-timeout 5400 --go`

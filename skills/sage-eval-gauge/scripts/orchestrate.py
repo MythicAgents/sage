@@ -259,6 +259,7 @@ _GAUGE_STEP_OVERHEAD_S = 900
 
 def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_mode: str = "llm",
              provider: str | None = None, model: str | None = None,
+             null_model: bool = False,
              route_env: dict[str, str] | None = None,
              snapshot: str = DEFAULT_SNAPSHOT,
              retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG) -> None:
@@ -298,6 +299,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         argv.extend(["--provider", provider])
     if model:
         argv.extend(["--model", model])
+    if null_model:
+        argv.append("--null-model")
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -315,6 +318,7 @@ def compare(scenario: str) -> None:
 
 
 def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=None, model=None,
+                  null_model=False,
                   snapshot=DEFAULT_SNAPSHOT,
                   retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG):
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
@@ -347,7 +351,8 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   f"--scenario {scenario} --apollo-cb <apollo> --solve-timeout {solve_timeout} "
                   f"--policy-mode {policy_mode}"
                   f"{f' --provider {provider}' if provider else ''}"
-                  f"{f' --model {model}' if model else ''}")
+                  f"{f' --model {model}' if model else ''}"
+                  f"{' --null-model' if null_model else ''}")
     print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
     print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
@@ -368,6 +373,10 @@ def main(argv=None) -> int:
                     help="explicit harness model provider for a controlled model treatment")
     ap.add_argument("--model", default=None,
                     help="explicit harness model ID for a controlled model treatment")
+    ap.add_argument("--null-model", action="store_true",
+                    help="disable the headless harness policy model for one selected policy")
+    ap.add_argument("--null-model-factorial", action="store_true",
+                    help="run clean-reset null-model harness treatments for symbolic, llm, and hybrid")
     ap.add_argument("--treatment", choices=["sonnet", "haiku"], default=None,
                     help="load a named LiteLLM-backed treatment from --route-env")
     ap.add_argument("--route-env", type=Path, default=DEFAULT_ROUTE_ENV,
@@ -384,6 +393,12 @@ def main(argv=None) -> int:
                     help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     policy_mode = "symbolic" if args.controller else args.policy_mode
+    if args.null_model_factorial and args.side not in (None, "harness"):
+        ap.error("--null-model-factorial only supports the harness side")
+    if args.null_model_factorial and args.treatment:
+        ap.error("--null-model-factorial cannot be combined with a paid model treatment")
+    policy_modes = ["symbolic", "llm", "hybrid"] if args.null_model_factorial else [policy_mode]
+    null_model = bool(args.null_model or args.null_model_factorial)
     route_env = None
     if args.treatment:
         route = load_treatment_route(args.route_env, args.treatment)
@@ -395,20 +410,27 @@ def main(argv=None) -> int:
         }
 
     if not args.go:
-        _dry_run_plan(args.scenario, args.side, args.seeds, args.solve_timeout, policy_mode,
-                      args.provider, args.model, args.snapshot, args.retained_callback_config)
-        print(f"\n  NOTE: Sage policy mode -> {policy_mode}.")
+        for selected_mode in policy_modes:
+            _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
+                          args.seeds, args.solve_timeout, selected_mode,
+                          args.provider, args.model, null_model,
+                          args.snapshot, args.retained_callback_config)
+            print(f"\n  NOTE: Sage policy mode -> {selected_mode}; null_model={null_model}.")
         return 0
 
     validate_reset_inputs(args.snapshot, args.retained_callback_config)
-    for _ in range(args.seeds):
-        for side in ([args.side] if args.side else ["harness", "bare"]):
-            run_side(args.scenario, side, go=True, solve_timeout=args.solve_timeout,
-                     policy_mode=policy_mode, provider=args.provider, model=args.model,
-                     route_env=route_env,
-                     snapshot=args.snapshot,
-                     retained_callback_config=args.retained_callback_config)
-    if not args.side:
+    for selected_mode in policy_modes:
+        for _ in range(args.seeds):
+            sides = ["harness"] if args.null_model_factorial else (
+                [args.side] if args.side else ["harness", "bare"]
+            )
+            for side in sides:
+                run_side(args.scenario, side, go=True, solve_timeout=args.solve_timeout,
+                         policy_mode=selected_mode, provider=args.provider, model=args.model,
+                         null_model=null_model, route_env=route_env,
+                         snapshot=args.snapshot,
+                         retained_callback_config=args.retained_callback_config)
+    if not args.side and not args.null_model_factorial:
         compare(args.scenario)
     return 0
 

@@ -54,6 +54,7 @@ class Config:
     model_id: str | None = None
     model_api_endpoint: str | None = None
     model_api_key: str | None = None
+    null_model: bool = False
 
     @property
     def results_path(self) -> Path:
@@ -246,18 +247,23 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
                           settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
 
     if side == "harness":
-        if os.environ.get("SAGE_EVAL_HEADLESS"):
+        if cfg.null_model or os.environ.get("SAGE_EVAL_HEADLESS"):
             # Option A (Phase-4 migration): run the solve IN-PROCESS via the chat Model instead of tasking
             # the PayloadType `query` on the virtual callback. Alongside path — selected only when the flag
             # is set — so a migration run can compare in-process vs task-based on the same reset. Ledger key
             # comes from SAGE_ENGAGEMENT_ID (the run token the reset sets) or the operation name.
             _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or cfg.engagement_op
-            print(f"[harness/{scenario_name}] SAGE_EVAL_HEADLESS=1 → in-process solve (engagement={_eng})", flush=True)
+            treatment = "null-model" if cfg.null_model else "headless"
+            print(
+                f"[harness/{scenario_name}] {treatment} in-process solve (engagement={_eng})",
+                flush=True,
+            )
             solve = live_seams.make_headless_solver(client, engagement_id=_eng,
                                                     timeout=cfg.solve_timeout, max_steps=0,
                                                     policy_mode=cfg.policy_mode,
                                                     provider=cfg.model_provider,
-                                                    model=cfg.model_id)
+                                                    model=cfg.model_id,
+                                                    null_model=cfg.null_model)
         else:
             solve = live_seams.make_native_chat_solver(
                 client,
@@ -430,6 +436,8 @@ def main(argv=None) -> int:
                    help="explicit harness model provider; required for controlled multi-model runs")
     r.add_argument("--model", default=None,
                    help="explicit harness model ID; required for controlled multi-model runs")
+    r.add_argument("--null-model", action="store_true",
+                   help="headless ablation: disable the policy model after Model initialization")
     r.add_argument("--da-settle-timeout", type=int, default=None,
                    help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
@@ -479,6 +487,8 @@ def main(argv=None) -> int:
         cfg.model_provider = args.provider
     if getattr(args, "model", None):
         cfg.model_id = args.model
+    if getattr(args, "null_model", False):
+        cfg.null_model = True
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
@@ -492,6 +502,8 @@ def main(argv=None) -> int:
         print(f"  probes (all collection-independent): KRBTGT_DUMPED (Mythic loot), "
               f"DA_CHILD/OBJECTIVE (AD-direct: live DC Domain Admins vs post-reset baseline)")
         print(f"  objective: {_scenario(cfg, args.scenario).objective}")
+        if cfg.null_model:
+            print("  treatment: null policy model (headless; no policy inference calls)")
         return 0
 
     try:

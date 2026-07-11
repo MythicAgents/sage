@@ -371,7 +371,8 @@ def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_s
 
 def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int = 0,
                          timeout: int = 1800, max_steps: int = 0, policy_mode: str = "llm",
-                         provider: str | None = None, model: str | None = None):
+                         provider: str | None = None, model: str | None = None,
+                         null_model: bool = False):
     """Option-A counterpart to make_harness_solver: run a full autonomous Sage solve IN-PROCESS via the
     chat Model (no PayloadType `query` task, no virtual callback). Same ``solve(objective) -> status_str``
     contract, so it's a drop-in behind the ``SAGE_EVAL_HEADLESS`` flag in run_gauge_live. ``client`` is this
@@ -386,7 +387,7 @@ def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int =
         result = asyncio.run(run_headless_solve(
             objective, client=client, operation_id=operation_id, engagement_id=engagement_id,
             timeout=timeout, max_steps=max_steps, policy_mode=policy_mode,
-            provider=provider, model=model, return_details=True,
+            provider=provider, model=model, null_model=null_model, return_details=True,
         ))
         solve.last_result = result
         if not isinstance(result, dict):
