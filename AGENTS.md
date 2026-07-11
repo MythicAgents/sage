@@ -5,10 +5,11 @@ This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that o
 ## Start Here
 
 1. Read `Plans/RESUME.md` first. It is the fastest-changing operational state and usually names the live frontier.
-2. Read `Plans/TRAJECTORY_LEARNING_RUNTIME.md` for the current data-backed autonomy build direction.
-3. Read `Plans/SESSION_HANDOFF.md` when preparing a live GOAD/Mythic/BloodHound run.
-4. Read `CLAUDE.md` for lab gotchas, Phoenix usage, and historical debugging notes.
-5. Treat `README.md` as useful setup documentation, but verify safety/control claims against code. It has been stale before.
+2. Read `Plans/CURRENT_WORK.md` for active priorities and archived source links.
+3. Read `Plans/TRAJECTORY_LEARNING_RUNTIME.md` for the current data-backed autonomy build direction.
+4. Read `Plans/SESSION_HANDOFF.md` when preparing a live GOAD/Mythic/BloodHound run.
+5. Read `CLAUDE.md` for lab gotchas, Phoenix usage, and historical debugging notes.
+6. Treat `README.md` as useful setup documentation, but verify safety/control claims against code. It has been stale before.
 
 Plans and Notes are mostly private/gitignored working context. Do not assume they are committed history. Verify important claims against source.
 Historical markdown that is not part of the current minimal handoff lives under `Plans/Archived/`.
@@ -24,9 +25,10 @@ Historical markdown that is not part of the current minimal handoff lives under 
 - `Payload_Type/sage/ai/langgraph/access_reconciler.py`: Mythic callback/liveness projected into footholds.
 - `Payload_Type/sage/sage_chat/`: native Mythic v4 chat container, request lifecycle, config, streaming, and sessions.
 - `Payload_Type/sage/ai/langgraph/intent_classifier.py`: maps Mythic tool calls to modeled engagement techniques.
-- `Payload_Type/sage/container/agent_functions/query.py`: one-shot Mythic command; auto-connects BloodHound before graph construction.
-- `Payload_Type/sage/container/agent_functions/chat.py`: interactive/sessionful Mythic command; supports `mode=auto|supervised`.
-- `Payload_Type/sage/container/agent_functions/state.py`: operator-facing durable engagement ledger viewer/editor.
+- `Payload_Type/sage/sage_chat/service.py`: native Mythic request lifecycle, session reuse, HITL resume, visibility
+  reconciliation, and channel metadata.
+- `Payload_Type/sage/sage_chat/slash.py`: `/state`, `/list`, `/mode`, `/stop`, MCP, and BloodHound chat commands.
+- `Payload_Type/sage/sage_chat/headless.py`: non-UI chat entrypoint for tests, evals, and trajectory tooling.
 - `Payload_Type/sage/prompts/`: externalized agent prompts.
 - `Payload_Type/sage/ttps/`: TTP/tradecraft corpus and pinned tool metadata.
 - `Payload_Type/sage/evals/`: Phoenix-backed GOAD eval harness.
@@ -42,7 +44,7 @@ Run this from repo root before and after code changes:
 .venv/bin/python -m pytest Payload_Type/sage/tests -q
 ```
 
-Latest observed baseline from the guided cb3 ESSOS completion work: `804 passed, 1 warning`.
+Latest observed baseline: `1550 passed, 4 warnings` on July 11, 2026.
 
 For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do not trust the Mythic task poller for long Sage runs; it can hang. Read results from `Payload_Type/sage/.phoenix/phoenix.db` or decoded Mythic task output.
 
@@ -248,7 +250,9 @@ This is higher value than another prompt iteration or another full autonomous ru
 A ground-truthed measurement instrument lives at `Payload_Type/sage/ai/hillclimb/` — the eval **gauge**: "is config A better than B?", bare-model-vs-harness, the Gate Experiment (Spearman ρ of eval-vs-ground-truth), and the noise floor. It exists because substring-match eval scores are gameable; a hill-climber optimizes whatever the metric measures, so the gauge must track real range state, not trace text.
 
 - **Entry point:** the `sage-eval-gauge` skill (run commands, helpers, gotchas).
-- **Why (canonical):** `Plans/SAGE_HILL_CLIMBING_DESIGN.md` + `SPEC.md`. **Build spec/ISA:** `Plans/SAGE_EVAL_GAUGE_PHASE0_ISA.md`.
+- **Why (canonical):** `Plans/Archived/SAGE_HILL_CLIMBING_DESIGN.md` +
+  `Plans/Archived/SAGE_HILL_CLIMBING_SPEC.md`. **Build spec/ISA:**
+  `Plans/Archived/SAGE_EVAL_GAUGE_PHASE0_ISA.md`.
 - **Additive + read-only to Sage:** the running Sage process never imports it; **no Sage restart** is needed for gauge changes.
 - **Offline tests:** `tests/test_hillclimb_*.py` (hermetic). **Live driver** `ai/hillclimb/run_gauge_live.py --go` runs OFFENSIVE solves and is operator-gated.
 - The bare model uses Sage's own model from `skills/sage-callback-bootstrap/.env` (no `--model`); BloodHound ground truth is read-only via the CE REST API.
