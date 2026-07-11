@@ -19,6 +19,7 @@ import os
 from typing import Any
 
 from mythic_container.ChatBase import ChatConfigView, ChatRequest, ChatSecretView
+from ai.langgraph.policy import normalize_policy_mode
 
 
 def _resolve(
@@ -95,15 +96,13 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     autonomous_solve = mode == "auto" or _resolve_bool(
         config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False
     )
-    policy_mode = _resolve(
+    policy_mode = normalize_policy_mode(_resolve(
         config,
         secrets,
         "policy_mode",
         env_key="SAGE_POLICY_MODE",
         default="llm",
-    ).lower()
-    if policy_mode not in ("llm", "symbolic"):
-        policy_mode = "llm"
+    ))
 
     max_steps_raw = _resolve(config, secrets, "max_steps", env_key="max_steps", default="")
     try:

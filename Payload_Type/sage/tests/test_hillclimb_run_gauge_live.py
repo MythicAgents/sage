@@ -16,6 +16,9 @@ from range_state import Milestone, PROBEABLE_MILESTONES  # noqa: E402
 def _telemetry(**overrides):
     value = {
         "policy_mode": "llm",
+        "configured_policy_mode": "llm",
+        "policy_identity_valid": True,
+        "policy_switches": [],
         "semantic_transaction_count": 2,
         "authorized_transaction_count": 2,
         "semantic_policy_coverage": 1.0,
@@ -52,6 +55,27 @@ def test_runtime_telemetry_validation_rejects_policy_mismatch():
             "symbolic",
             _telemetry(policy_mode="llm"),
         )
+
+
+def test_runtime_telemetry_validation_rejects_recorded_policy_switch():
+    with pytest.raises(RuntimeError, match="policy identity invalid"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            _telemetry(
+                policy_identity_valid=False,
+                policy_switches=[{
+                    "configured_policy_mode": "llm",
+                    "observed_policy_mode": "symbolic",
+                }],
+            ),
+        )
+
+
+def test_runtime_telemetry_validation_rejects_missing_switch_records():
+    telemetry = _telemetry()
+    telemetry.pop("policy_switches")
+    with pytest.raises(RuntimeError, match="omitted policy switch"):
+        rgl.validate_harness_runtime_telemetry("llm", telemetry)
 
 
 def test_runtime_telemetry_validation_rejects_incomplete_coverage():

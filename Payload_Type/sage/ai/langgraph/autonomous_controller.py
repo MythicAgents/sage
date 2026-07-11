@@ -102,7 +102,22 @@ class ControllerResult:
     transactions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        authorized = sum(1 for item in self.transactions if item.get("decision_id"))
+        policy_switches = []
+        for source, items in (("decision", self.decisions), ("transaction", self.transactions)):
+            for index, item in enumerate(items):
+                observed = str(item.get("policy_mode") or "")
+                if observed != self.policy_mode:
+                    policy_switches.append({
+                        "source": source,
+                        "index": index,
+                        "configured_policy_mode": self.policy_mode,
+                        "observed_policy_mode": observed,
+                    })
+        authorized = sum(
+            1
+            for item in self.transactions
+            if item.get("decision_id") and str(item.get("policy_mode") or "") == self.policy_mode
+        )
         transaction_count = len(self.transactions)
         return {
             "status": self.status,
@@ -112,6 +127,8 @@ class ControllerResult:
             "achieved_effects": self.achieved_effects,
             "episode_id": self.episode_id,
             "policy_mode": self.policy_mode,
+            "policy_identity_valid": not policy_switches,
+            "policy_switches": policy_switches,
             "decisions": self.decisions,
             "transactions": self.transactions,
             "semantic_transaction_count": transaction_count,
@@ -254,16 +271,24 @@ class AutonomousController:
         )
         if status != "ok" or decision is None:
             return None, None
+        if not str(getattr(decision, "decision_id", "") or ""):
+            return None, decision
+        if (
+            self._episode_id
+            and str(getattr(decision, "episode_id", "") or "") != self._episode_id
+        ):
+            return None, decision
+        if str(getattr(decision, "policy_mode", "") or "") != str(getattr(self._policy, "mode", "") or ""):
+            return None, decision
         if str(getattr(decision, "disposition", "")) != "select":
             return None, decision
         index = getattr(decision, "selected_index", None)
         if not isinstance(index, int) or index < 0 or index >= len(candidates):
             return None, decision
         selected = candidates[index]
-        if (
-            str(getattr(decision, "selected_capability", "") or "")
-            and str(getattr(decision, "selected_capability", "")) != str(getattr(selected, "name", ""))
-        ):
+        if str(getattr(decision, "selected_capability", "") or "") != str(getattr(selected, "name", "")):
+            return None, decision
+        if str(getattr(decision, "selected_target", "") or "") != str(getattr(selected, "target", "")):
             return None, decision
         return selected, decision
 
@@ -477,6 +502,20 @@ class AutonomousController:
             frontier = list(self._frontier_fn(state) or [])
             decision = None
             if not frontier:
+                if self._policy is not None:
+                    blocker = {
+                        "reason": "no admissible capability action from observed state",
+                        "policy_mode": str(getattr(self._policy, "mode", "") or ""),
+                        "achieved": sorted(achieved),
+                    }
+                    cycles.append(CycleRecord(
+                        cycle,
+                        "policy",
+                        ok=False,
+                        note="empty frontier; explicit policy cannot use legacy route discovery",
+                        policy_mode=str(getattr(self._policy, "mode", "") or ""),
+                    ))
+                    return done(STATUS_NO_ACTION, "empty frontier under explicit policy")
                 # 5) empty frontier -> bounded LLM route discovery (precondition-checked), else clean halt.
                 candidate = None
                 if self._route_discovery is not None:

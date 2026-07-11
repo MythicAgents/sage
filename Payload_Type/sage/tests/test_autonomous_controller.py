@@ -262,6 +262,42 @@ def test_route_discovery_candidate_must_pass_preconditions():
     assert executed == []
 
 
+def test_explicit_policy_cannot_fall_back_to_route_discovery():
+    w = World({"da:north", "krbtgt-hash:north"})
+    executed = []
+    discovered = []
+
+    class ExplicitPolicy:
+        mode = "llm"
+
+        async def select(self, **_kwargs):
+            raise AssertionError("empty frontier should halt before policy selection")
+
+    def route_admissible(_state):
+        discovered.append(True)
+        return FakeAction(
+            "forge-golden-ticket",
+            "x",
+            effects=["da:sevenkingdoms.local"],
+            preconditions=["krbtgt-hash:north"],
+        )
+
+    controller = ac.AutonomousController(
+        observe=w.observe,
+        execute=lambda action: executed.append(action) or {"ok": True},
+        frontier_fn=lambda _state: [],
+        route_discovery=route_admissible,
+        policy_backend=ExplicitPolicy(),
+    )
+
+    result = run(controller)
+
+    assert result.status == ac.STATUS_NO_ACTION, result.to_dict()
+    assert discovered == []
+    assert executed == []
+    assert result.reason == "empty frontier under explicit policy"
+
+
 def test_execute_exception_is_clean_blocker_not_crash():
     """Forge #5: a throwing live seam becomes a diagnostic halt, never a traceback escaping run()."""
     w = World({"remote-exec:braavos@essos.local"})

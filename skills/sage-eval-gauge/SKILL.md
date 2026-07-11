@@ -25,8 +25,9 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - **Orchestrated bare-vs-harness (OFFENSIVE — resets the lab per run; run DETACHED, ~1.5–2.5h/seed):**
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario child-da --side harness --seeds N --solve-timeout 5400 --go`
   (omit `--go` for a dry-run plan; the step cap auto-scales to `--solve-timeout`).
-  The default harness policy is `llm`. Add `--policy-mode symbolic` for the labeled deterministic selection
-  baseline. Both modes use the same bounded execution kernel and verifiers.
+  The default harness policy is `llm`. Use `--policy-mode hybrid` for model selection over the deterministic
+  admissible frontier, or `--policy-mode symbolic` for the labeled deterministic baseline. All modes use the
+  same bounded execution kernel and verifiers.
 - **Stock GOAD one-shot proof (five independent clean seeds):**
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario cross-forest-objective --side harness --seeds 5 --solve-timeout 5400 --go`
   Each seed resets GOAD/Mythic/BloodHound/Sage state, creates a fresh locked chat channel, sends only

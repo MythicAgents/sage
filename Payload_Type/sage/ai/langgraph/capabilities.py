@@ -94,6 +94,33 @@ class CapabilityTransaction:
     proof_obligations: list[str] = field(default_factory=list)
 
 
+_CAPABILITY_CATALOG = (
+    ("collect-graph", "Collect and ingest directory graph observations from an authorized foothold."),
+    ("gpo-controlled-system-exec", "Use a controlled GPO to obtain verified SYSTEM execution."),
+    ("grant-directory-rights", "Use verified SYSTEM execution to grant directory replication rights."),
+    ("dcsync-krbtgt", "Retrieve krbtgt credential material using verified replication authority."),
+    ("dcsync-account", "Retrieve required account credential material using verified replication authority."),
+    ("forge-golden-ticket", "Create and apply a Kerberos ticket from verified domain key material."),
+    ("ensure-kerberos-context", "Establish or refresh a callback-scoped Kerberos context for a domain."),
+    ("ensure-account-kerberos-context", "Establish a callback-scoped Kerberos context for an account."),
+    ("read-managed-local-admin-secret", "Read a graph-proven managed local administrator secret."),
+    ("use-managed-local-admin-secret", "Use a managed local administrator secret on its authorized host."),
+    ("execute-as-local-admin", "Turn verified local administrator access into a live execution context."),
+    ("endpoint-protection-adjustment", "Apply a bounded endpoint protection change required by execution."),
+    ("adcs-ca-private-key-export", "Export a CA private key from a verified administrative execution context."),
+    ("adcs-esc-certificate-enroll", "Enroll a certificate through a graph-proven ADCS escalation path."),
+    ("adcs-certificate-auth", "Authenticate with verified certificate material to obtain domain control."),
+)
+
+
+def capability_catalog() -> list[dict[str, str]]:
+    """Return the semantic capability catalog without current-state admissibility."""
+    return [
+        {"name": name, "description": description}
+        for name, description in _CAPABILITY_CATALOG
+    ]
+
+
 def actions_from_state(state: Any) -> list[CapabilityAction]:
     """Return generic capability actions available from the observed state."""
     actions: list[CapabilityAction] = []

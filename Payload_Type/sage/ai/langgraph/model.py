@@ -1733,9 +1733,11 @@ class Model:
         self.model = model
         self.mode = mode if mode in ("auto", "supervised") else "supervised"
         self._autonomous_solve = bool(autonomous_solve)
-        self.policy_mode = str(policy_mode or "llm").strip().casefold()
-        if self.policy_mode not in ("llm", "symbolic"):
-            self.policy_mode = "llm"
+        try:
+            from .policy import normalize_policy_mode
+        except ImportError:
+            from policy import normalize_policy_mode
+        self.policy_mode = normalize_policy_mode(policy_mode)
         self._policy_model_calls = 0
         self._policy_episode_id = ""
         self._controller_runtime_telemetry: dict[str, Any] = {}
@@ -4250,12 +4252,21 @@ class Model:
         if self.llm is None:
             raise RuntimeError("configured LLM is unavailable")
         self._policy_model_calls = int(getattr(self, "_policy_model_calls", 0) or 0) + 1
+        if str(request.get("selection_contract") or "") == "admissible_frontier":
+            instruction = (
+                "Rank the supplied deterministic admissible frontier for the stated objective. Return JSON only. "
+                "Use disposition=select with candidate_index, or stop/ask. Do not invent candidates, commands, "
+                "or additional steps."
+            )
+        else:
+            instruction = (
+                "Choose the next semantic capability and target for the stated objective using the normalized "
+                "state and capability catalog. Return JSON only. Use disposition=select with capability and "
+                "target, or stop/ask. Deterministic code will reject proposals that are not currently admissible. "
+                "Do not emit commands or additional steps."
+            )
         return await self.llm.ainvoke([
-            SystemMessage(content=(
-                "Select the next semantic capability for the stated objective from the supplied admissible "
-                "candidates. Return JSON only. Use disposition=select with candidate_index, or stop/ask. "
-                "Do not invent candidates, commands, or additional steps."
-            )),
+            SystemMessage(content=instruction),
             HumanMessage(content=json.dumps(request, sort_keys=True)),
         ])
 
@@ -4526,6 +4537,17 @@ class Model:
                     match_index = None
                     if kind == "capability":
                         approved = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+                        if policy_mode == _policy.POLICY_LLM:
+                            candidates = [
+                                {
+                                    "index": index,
+                                    "name": str(getattr(candidate, "name", "") or ""),
+                                    "target": str(getattr(candidate, "target", "") or ""),
+                                    "preconditions": list(getattr(candidate, "preconditions", None) or []),
+                                    "effects": list(getattr(candidate, "effects", None) or []),
+                                }
+                                for index, candidate in enumerate(_cap.actions_from_state(snap.get("state")))
+                            ]
                         for candidate in candidates:
                             if not isinstance(candidate, dict):
                                 continue
@@ -4539,6 +4561,15 @@ class Model:
                                 break
                     elif kind == "collection":
                         collection_key = str(args.get("collection_key") or "")
+                        if policy_mode == _policy.POLICY_LLM:
+                            return {
+                                "disposition": "select",
+                                "capability": "collect-graph",
+                                "target": collection_key,
+                                "rationale": "resume the exact operator-approved collection after revalidation",
+                                "confidence": 1.0,
+                                "expected_evidence": "verified graph collection and ingest",
+                            }
                         for candidate in candidates:
                             if (
                                 isinstance(candidate, dict)
@@ -4548,6 +4579,16 @@ class Model:
                                 match_index = candidate.get("index")
                                 break
                     if isinstance(match_index, int):
+                        if policy_mode == _policy.POLICY_LLM:
+                            matched = candidates[match_index]
+                            return {
+                                "disposition": "select",
+                                "capability": str(matched.get("name") or ""),
+                                "target": str(matched.get("target") or ""),
+                                "rationale": "resume the exact operator-approved action after deterministic revalidation",
+                                "confidence": 1.0,
+                                "expected_evidence": "the approved capability's declared effects",
+                            }
                         return {
                             "disposition": "select",
                             "candidate_index": match_index,
@@ -4561,14 +4602,23 @@ class Model:
                     }
                 return await self._controller_llm_policy_decide(request)
 
-            policy_backend = _policy.LLMPolicy(
+            policy_class = (
+                _policy.HybridPolicy
+                if policy_mode == _policy.POLICY_HYBRID
+                else _policy.LLMPolicy
+            )
+            policy_backend = policy_class(
                 policy_decide if getattr(self, "llm", None) is not None else None,
                 provider=getattr(self, "provider", ""),
                 model_id=getattr(self, "model", ""),
+                catalog=_cap.capability_catalog() if policy_mode == _policy.POLICY_LLM else None,
             )
         self._controller_runtime_telemetry = {
             "episode_id": self._policy_episode_id,
             "policy_mode": str(getattr(policy_backend, "mode", "") or ""),
+            "configured_policy_mode": policy_mode,
+            "policy_identity_valid": True,
+            "policy_switches": [],
             "model_provider": str(getattr(self, "provider", "") or ""),
             "model_id": str(getattr(self, "model", "") or ""),
             "model_calls": 0,
@@ -4622,6 +4672,9 @@ class Model:
         self._controller_runtime_telemetry = {
             "episode_id": result.episode_id,
             "policy_mode": result.policy_mode,
+            "configured_policy_mode": policy_mode,
+            "policy_identity_valid": result_data["policy_identity_valid"],
+            "policy_switches": result_data["policy_switches"],
             "model_provider": str(getattr(self, "provider", "") or ""),
             "model_id": str(getattr(self, "model", "") or ""),
             "model_calls": int(getattr(self, "_policy_model_calls", 0) or 0),

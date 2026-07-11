@@ -120,7 +120,11 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     mode = str(getattr(model, "mode", "") or "supervised")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
     policy_mode = str(getattr(model, "policy_mode", "") or "llm")
-    policy_color = "success" if policy_mode == "llm" else "warning"
+    policy_color = {
+        "llm": "success",
+        "hybrid": "info",
+        "symbolic": "warning",
+    }.get(policy_mode, "neutral")
     mode_color = "info" if mode == "supervised" else "warning"
     autonomous_color = "warning" if autonomous else "neutral"
 

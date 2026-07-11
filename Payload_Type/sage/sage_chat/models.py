@@ -96,13 +96,14 @@ _CONFIG_OPTIONS = [
         DisplayName="Policy",
         Type=OptType.Choice,
         Description=(
-            "LLM makes each semantic capability decision. Symbolic preserves the deterministic priority "
-            "baseline and is labeled separately in traces and evaluations."
+            "LLM makes each semantic capability decision. Hybrid has the model select from the deterministic "
+            "admissible frontier. Symbolic preserves the deterministic priority baseline."
         ),
         Required=False,
         DefaultValue="llm",
         Choices=[
             ChatModelConfigurationOptionChoice(Label="LLM", Value="llm"),
+            ChatModelConfigurationOptionChoice(Label="Hybrid", Value="hybrid"),
             ChatModelConfigurationOptionChoice(Label="Symbolic Baseline", Value="symbolic"),
         ],
     ),

@@ -1169,10 +1169,27 @@ def test_autonomous_solve_toggle_independent_of_mode():
     assert kwargs["mode"] == "supervised" and kwargs["autonomous_solve"] is True
 
 
-def test_policy_mode_defaults_llm_and_accepts_symbolic():
+def test_policy_mode_defaults_llm_and_accepts_hybrid_and_symbolic():
     assert build_model_kwargs(build_chat_request("hi"))["policy_mode"] == "llm"
+    kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "hybrid"}))
+    assert kwargs["policy_mode"] == "hybrid"
     kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "symbolic"}))
     assert kwargs["policy_mode"] == "symbolic"
+
+
+def test_invalid_explicit_policy_mode_is_rejected():
+    with pytest.raises(ValueError, match="unsupported policy mode"):
+        build_model_kwargs(build_chat_request("hi", config={"policy_mode": "automatic"}))
+
+
+def test_policy_configuration_exposes_all_three_policy_backends():
+    option = next(
+        item
+        for item in SAGE_MODELS[0].Metadata.ConfigurationOptions
+        if item.Name == "policy_mode"
+    )
+
+    assert {choice.Value for choice in option.Choices} == {"llm", "hybrid", "symbolic"}
 
 
 def test_api_key_and_endpoint_resolve_from_config(monkeypatch):
@@ -1754,6 +1771,23 @@ def test_channel_metadata_default_control_colors_are_distinct(monkeypatch):
     ]
     assert colors == ["success", "info", "neutral"]
     assert len(set(colors)) == 3
+
+
+def test_channel_metadata_labels_hybrid_policy_distinctly(monkeypatch):
+    from sage_chat.metadata import build_channel_metadata
+    from ai import mcp
+
+    monkeypatch.setattr(mcp.MCPManager, "get_tools_summary", lambda: {}, raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", lambda: [], raising=False)
+
+    class _M:
+        mode = "supervised"
+        _autonomous_solve = False
+        policy_mode = "hybrid"
+
+    items = {item["key"]: item for item in build_channel_metadata(_M())["items"]}
+    assert items["cfg_policy"]["value"] == "hybrid"
+    assert items["cfg_policy"]["color"] == "info"
 
 
 def test_scope_usable_mythic_tools_reflects_disabled():

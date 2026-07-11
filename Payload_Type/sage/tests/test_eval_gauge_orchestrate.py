@@ -38,6 +38,28 @@ def test_dry_run_uses_staged_snapshot_retained_config_and_existing_apollo():
     assert "fresh-interactive-apollo" not in output
 
 
+def test_dry_run_accepts_hybrid_policy_treatment():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "essos-da",
+            "--side",
+            "harness",
+            "--policy-mode",
+            "hybrid",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "--policy-mode hybrid" in result.stdout
+    assert "Sage policy mode -> hybrid" in result.stdout
+
+
 def test_treatment_route_rejects_loopback_proxy(tmp_path):
     route = tmp_path / ".env.local"
     route.write_text(

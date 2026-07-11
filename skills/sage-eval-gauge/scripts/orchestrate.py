@@ -362,7 +362,7 @@ def main(argv=None) -> int:
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
                          "to cover this + post-solve scoring overhead, so long solves are not killed early.")
     ap.add_argument("--go", action="store_true", help="actually reset the lab + run offensive tooling")
-    ap.add_argument("--policy-mode", choices=["llm", "symbolic"], default="llm",
+    ap.add_argument("--policy-mode", choices=["llm", "hybrid", "symbolic"], default="llm",
                     help="semantic capability policy for the Sage harness (default: llm)")
     ap.add_argument("--provider", default=None,
                     help="explicit harness model provider for a controlled model treatment")

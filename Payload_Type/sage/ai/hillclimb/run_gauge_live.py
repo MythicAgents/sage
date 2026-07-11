@@ -191,6 +191,13 @@ def validate_harness_runtime_telemetry(
         raise RuntimeError(
             f"configured policy mode {configured!r} did not match observed mode {observed!r}"
         )
+    if str(telemetry.get("configured_policy_mode") or "").strip().casefold() != configured:
+        raise RuntimeError("runtime telemetry did not preserve the configured policy mode")
+    switches = telemetry.get("policy_switches")
+    if not isinstance(switches, list):
+        raise RuntimeError("runtime telemetry omitted policy switch records")
+    if switches or telemetry.get("policy_identity_valid") is not True:
+        raise RuntimeError(f"runtime policy identity invalid; switches={switches!r}")
     for label, expected, key in (
         ("provider", configured_provider, "model_provider"),
         ("model", configured_model, "model_id"),
@@ -417,7 +424,7 @@ def main(argv=None) -> int:
     r.add_argument("--apollo-cb", type=int, default=None)
     r.add_argument("--solve-timeout", type=int, default=None,
                    help="seconds to wait for the harness solve (default 1800=30min); raise for full solves")
-    r.add_argument("--policy-mode", choices=["llm", "symbolic"], default="llm",
+    r.add_argument("--policy-mode", choices=["llm", "hybrid", "symbolic"], default="llm",
                    help="policy identity of the running Sage harness")
     r.add_argument("--provider", default=None,
                    help="explicit harness model provider; required for controlled multi-model runs")

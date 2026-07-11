@@ -12,12 +12,17 @@ from uuid import uuid4
 
 POLICY_LLM = "llm"
 POLICY_SYMBOLIC = "symbolic"
-POLICY_MODES = frozenset((POLICY_LLM, POLICY_SYMBOLIC))
+POLICY_HYBRID = "hybrid"
+POLICY_MODES = frozenset((POLICY_LLM, POLICY_SYMBOLIC, POLICY_HYBRID))
 
 
 def normalize_policy_mode(value: Any, default: str = POLICY_LLM) -> str:
     mode = str(value or "").strip().casefold()
-    return mode if mode in POLICY_MODES else default
+    if not mode:
+        mode = str(default or "").strip().casefold()
+    if mode not in POLICY_MODES:
+        raise ValueError(f"unsupported policy mode: {mode or value!r}")
+    return mode
 
 
 def new_episode_id() -> str:
@@ -41,6 +46,62 @@ def candidate_hash(candidates: list[Any]) -> str:
         separators=(",", ":"),
     )
     return f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _normalized_state_payload(state: Any) -> dict[str, Any]:
+    def values(name: str) -> list[Any]:
+        return list(getattr(state, name, None) or [])
+
+    achieved = []
+    try:
+        achieved = sorted(str(v) for v in (state.achieved_effects() or []))
+    except Exception:
+        pass
+    return {
+        "achieved_effects": achieved,
+        "footholds": [
+            {
+                "callback_id": str(getattr(item, "callback_id", "") or ""),
+                "agent": str(getattr(item, "agent", "") or ""),
+                "host": str(getattr(item, "host", "") or ""),
+                "forest": str(getattr(item, "forest", "") or ""),
+                "identity": str(getattr(item, "identity", "") or ""),
+                "integrity": str(getattr(item, "integrity", "") or ""),
+                "alive": bool(getattr(item, "alive", False)),
+            }
+            for item in values("footholds")
+        ],
+        "graph_facts": sorted(
+            str(getattr(item, "predicate", item) or "")
+            for item in values("graph_facts")
+            if str(getattr(item, "predicate", item) or "")
+        ),
+        "recent_outcomes": [
+            {
+                "capability": str(getattr(item, "technique", "") or ""),
+                "target": str(getattr(item, "target", "") or ""),
+                "effect": str(getattr(item, "effect", "") or ""),
+                "status": str(getattr(item, "status", "") or ""),
+            }
+            for item in values("hops")[-12:]
+        ],
+    }
+
+
+def _prior_decisions_payload(history: list["PolicyDecision"]) -> list[dict[str, Any]]:
+    return [
+        {
+            "decision_id": item.decision_id,
+            "disposition": item.disposition,
+            "capability": item.selected_capability,
+            "target": item.selected_target,
+        }
+        for item in history[-8:]
+    ]
+
+
+def _selection_key(value: Any) -> str:
+    return str(value or "").strip().casefold()
 
 
 @dataclass(frozen=True)
@@ -105,44 +166,33 @@ class LLMPolicy:
         *,
         provider: str = "",
         model_id: str = "",
+        catalog: list[dict[str, Any]] | None = None,
     ):
         self._decide = decide
         self.provider = str(provider or "")
         self.model_id = str(model_id or "")
+        self.catalog = [dict(item) for item in (catalog or []) if isinstance(item, dict)]
 
-    @staticmethod
     def request_payload(
+        self,
         objective: str,
         state: Any,
         candidates: list[Any],
         history: list[PolicyDecision],
         budgets: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        achieved = []
-        try:
-            achieved = sorted(str(v) for v in (state.achieved_effects() or []))
-        except Exception:
-            pass
+        del candidates
         return {
             "objective": str(objective or ""),
-            "achieved_effects": achieved,
-            "candidates": [
-                {"index": index, **_candidate_payload(candidate)}
-                for index, candidate in enumerate(candidates)
-            ],
-            "prior_decisions": [
-                {
-                    "decision_id": item.decision_id,
-                    "disposition": item.disposition,
-                    "capability": item.selected_capability,
-                    "target": item.selected_target,
-                }
-                for item in history[-8:]
-            ],
+            "normalized_state": _normalized_state_payload(state),
+            "capability_catalog": [dict(item) for item in self.catalog],
+            "prior_decisions": _prior_decisions_payload(history),
             "budgets": dict(budgets or {}),
+            "selection_contract": "semantic_catalog",
             "response_schema": {
                 "disposition": "select|stop|ask",
-                "candidate_index": "integer required for select",
+                "capability": "catalog capability name required for select",
+                "target": "semantic target; omit only when capability identifies one admissible action",
                 "rationale": "short string",
                 "confidence": "number 0..1",
                 "expected_evidence": "short string",
@@ -192,7 +242,9 @@ class LLMPolicy:
         if not candidates:
             return self._stop(episode_id, c_hash, "no admissible candidates")
         if self._decide is None:
-            return self._stop(episode_id, c_hash, "LLM policy has no model decision seam")
+            return self._stop(episode_id, c_hash, f"{self.mode} policy has no model decision seam")
+        if self.mode == POLICY_LLM and not self.catalog:
+            return self._stop(episode_id, c_hash, "LLM policy has no capability catalog")
 
         request = self.request_payload(objective, state, candidates, history, budgets)
         try:
@@ -200,7 +252,7 @@ class LLMPolicy:
             if inspect.isawaitable(response):
                 response = await response
         except Exception as exc:
-            return self._stop(episode_id, c_hash, f"LLM policy call failed: {type(exc).__name__}: {exc}")
+            return self._stop(episode_id, c_hash, f"{self.mode} policy call failed: {type(exc).__name__}: {exc}")
 
         parsed = self._response_dict(response)
         disposition = str(parsed.get("disposition") or "").strip().casefold()
@@ -216,12 +268,11 @@ class LLMPolicy:
                 model_provider=self.provider,
                 model_id=self.model_id,
             )
-        try:
-            index = int(parsed.get("candidate_index"))
-        except (TypeError, ValueError):
-            return self._stop(episode_id, c_hash, "LLM policy returned no valid candidate index")
-        if disposition != "select" or index < 0 or index >= len(candidates):
-            return self._stop(episode_id, c_hash, "LLM policy returned an invalid selection")
+        if disposition != "select":
+            return self._stop(episode_id, c_hash, f"{self.mode} policy returned an invalid selection")
+        index, error = self._resolve_selection(parsed, candidates)
+        if index is None:
+            return self._stop(episode_id, c_hash, error)
 
         selected = candidates[index]
         confidence = parsed.get("confidence")
@@ -245,6 +296,34 @@ class LLMPolicy:
             model_id=self.model_id,
         )
 
+    def _resolve_selection(
+        self,
+        parsed: dict[str, Any],
+        candidates: list[Any],
+    ) -> tuple[int | None, str]:
+        capability = _selection_key(parsed.get("capability"))
+        target = _selection_key(parsed.get("target"))
+        if not capability:
+            return None, "LLM policy returned no semantic capability"
+        catalog_names = {
+            _selection_key(item.get("name"))
+            for item in self.catalog
+            if _selection_key(item.get("name"))
+        }
+        if capability not in catalog_names:
+            return None, "LLM policy proposed a capability outside the catalog"
+        matches = [
+            index
+            for index, candidate in enumerate(candidates)
+            if _selection_key(getattr(candidate, "name", "")) == capability
+            and (not target or _selection_key(getattr(candidate, "target", "")) == target)
+        ]
+        if len(matches) == 1:
+            return matches[0], ""
+        if not matches:
+            return None, "LLM policy proposed a capability that is not currently admissible"
+        return None, "LLM policy proposal is ambiguous without an exact target"
+
     def _stop(self, episode_id: str, c_hash: str, rationale: str) -> PolicyDecision:
         return PolicyDecision(
             episode_id=episode_id,
@@ -256,3 +335,53 @@ class LLMPolicy:
             model_provider=self.provider,
             model_id=self.model_id,
         )
+
+
+class HybridPolicy(LLMPolicy):
+    """Model-mediated selection over the deterministic admissible frontier.
+
+    The deterministic layer generates and constrains candidates. The model must still select the semantic
+    capability; missing, failed, or invalid model output stops instead of falling back to symbolic priority.
+    """
+
+    mode = POLICY_HYBRID
+
+    def request_payload(
+        self,
+        objective: str,
+        state: Any,
+        candidates: list[Any],
+        history: list[PolicyDecision],
+        budgets: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "objective": str(objective or ""),
+            "normalized_state": _normalized_state_payload(state),
+            "candidates": [
+                {"index": index, **_candidate_payload(candidate)}
+                for index, candidate in enumerate(candidates)
+            ],
+            "prior_decisions": _prior_decisions_payload(history),
+            "budgets": dict(budgets or {}),
+            "selection_contract": "admissible_frontier",
+            "response_schema": {
+                "disposition": "select|stop|ask",
+                "candidate_index": "integer required for select",
+                "rationale": "short string",
+                "confidence": "number 0..1",
+                "expected_evidence": "short string",
+            },
+        }
+
+    def _resolve_selection(
+        self,
+        parsed: dict[str, Any],
+        candidates: list[Any],
+    ) -> tuple[int | None, str]:
+        try:
+            index = int(parsed.get("candidate_index"))
+        except (TypeError, ValueError):
+            return None, "hybrid policy returned no valid candidate index"
+        if index < 0 or index >= len(candidates):
+            return None, "hybrid policy returned an invalid frontier selection"
+        return index, ""

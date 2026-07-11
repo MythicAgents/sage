@@ -14,6 +14,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 
 async def _nosleep(*_a, **_k):
     return None
@@ -105,12 +107,15 @@ def test_llm_policy_decision_is_attached_to_capability_inputs():
     m.model = "selector"
 
     class FakeLLM:
-        async def ainvoke(self, _messages):
+        async def ainvoke(self, messages):
+            request = json.loads(messages[-1].content)
+            assert request["selection_contract"] == "semantic_catalog"
+            assert "candidates" not in request
             return type("Response", (), {
                 "content": json.dumps({
                     "disposition": "select",
-                    "candidate_index": 0,
-                    "rationale": "selected from the admissible frontier",
+                    "capability": "adcs-ca-private-key-export",
+                    "rationale": "selected from normalized state and the capability catalog",
                 })
             })()
 
@@ -133,7 +138,8 @@ def test_llm_policy_decision_is_attached_to_capability_inputs():
     assert telemetry["semantic_policy_coverage"] == 1.0
 
 
-def test_controller_resume_executes_exact_approved_action_without_second_llm_decision():
+@pytest.mark.parametrize("policy_mode", ["llm", "hybrid"])
+def test_controller_resume_executes_exact_approved_action_without_second_model_decision(policy_mode):
     calls = []
     events = []
     state = _state_with_remote_exec()
@@ -150,7 +156,7 @@ def test_controller_resume_executes_exact_approved_action_without_second_llm_dec
     m.mode = "supervised"
     m.command_name = "chat"
     m._autonomous_solve = True
-    m.policy_mode = "llm"
+    m.policy_mode = policy_mode
     m.provider = "test"
     m.model = "selector"
     m._controller_hitl_pending = None
@@ -191,6 +197,11 @@ def test_controller_resume_executes_exact_approved_action_without_second_llm_dec
     assert calls[0][0]["target"] == action.target
     assert events == ["execute", "llm"]
     assert "halted_no_action" in report
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["policy_mode"] == policy_mode
+    assert telemetry["configured_policy_mode"] == policy_mode
+    assert telemetry["policy_identity_valid"] is True
+    assert telemetry["policy_switches"] == []
 
 
 def test_verbose_controller_streams_progress_before_terminal_report():
