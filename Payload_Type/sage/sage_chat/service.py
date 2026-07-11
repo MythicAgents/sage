@@ -16,6 +16,7 @@ job is to use ``run_chat_turn`` correctly and never swallow ``CancelledError``.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ from .models import SAGE_MODELS
 from .session import channel_session_key, get_channel_session, put_channel_session
 from .slash import handle_slash
 from .streaming import ChatStreamEmitter
+
+
+_CHANNEL_METADATA_HEARTBEAT_SECONDS = 2.0
 
 
 class SageChat(Chat):
@@ -150,6 +154,24 @@ class SageChat(Chat):
             )
             model._hitl_card_pending = False
             model._thread_id_override = thread_id
+            last_channel_metadata: dict[str, Any] | None = None
+
+            async def publish_channel_metadata(*, force: bool = False) -> None:
+                nonlocal last_channel_metadata
+                channel_metadata = build_channel_metadata(model)
+                if not force and channel_metadata == last_channel_metadata:
+                    return
+                try:
+                    await turn.update_channel_metadata(channel_metadata)
+                    last_channel_metadata = channel_metadata
+                except Exception:
+                    logger.debug("channel metadata update failed (non-fatal)", exc_info=True)
+
+            async def metadata_heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(_CHANNEL_METADATA_HEARTBEAT_SECONDS)
+                    await publish_channel_metadata()
+
             begin_visibility = getattr(model, "begin_visibility_turn", None)
             if callable(begin_visibility):
                 begin_visibility(
@@ -161,6 +183,8 @@ class SageChat(Chat):
                 from ..ai.mcp import MCPManager  # type: ignore
             execution_observer = getattr(model, "_emit_execution_event", None)
             observer_token = MCPManager.set_execution_observer(execution_observer)
+            await publish_channel_metadata(force=True)
+            metadata_task = asyncio.create_task(metadata_heartbeat())
             try:
                 if isinstance(getattr(model, "_controller_hitl_pending", None), dict):
                     # Controller-native HITL is not a LangGraph checkpoint interrupt, so it has its own pending
@@ -187,16 +211,16 @@ class SageChat(Chat):
                     logger.warning("request_stop() failed during cancel handling", exc_info=True)
                 raise
             finally:
+                metadata_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await metadata_task
                 MCPManager.reset_execution_observer(observer_token)
             finalize_visibility = getattr(model, "finalize_visibility_turn", None)
             if callable(finalize_visibility):
                 await finalize_visibility()
             # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
-            # turn's work is done. Fire-and-forget: a header update must never fail a chat turn.
-            try:
-                await turn.update_channel_metadata(build_channel_metadata(model))
-            except Exception:
-                logger.debug("channel metadata update failed (non-fatal)", exc_info=True)
+            # turn's work is done. The publisher de-duplicates unchanged payloads.
+            await publish_channel_metadata()
             if getattr(model, "_hitl_card_pending", False):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.

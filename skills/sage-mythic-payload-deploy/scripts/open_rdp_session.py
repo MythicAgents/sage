@@ -7,8 +7,8 @@ provides via `tty:true` but Claude Code's Bash tool (and cron/CI) do not. This w
 works for Codex, Claude Code, and unattended runs.
 
 It also resolves the run-as password from a DURABLE source (arg -> SAGE_RUN_AS_PASSWORD env ->
-a config file -> the mythic .env) instead of assuming an exported shell var, so a per-call shell
-that carries no env still authenticates.
+a config file -> Sage .env -> the mythic .env) instead of assuming an exported shell var, so a
+per-call shell that carries no env still authenticates.
 
 Kerberos is forced OFF (`/auth-pkg-list:!kerberos`) so NLA goes straight to NTLM — the operator
 host has no KDC route to the GOAD realms, and the Kerberos attempt otherwise stalls/logs off.
@@ -33,10 +33,11 @@ def _resolve_password(explicit: str | None, env_path: str | None) -> str:
     env = os.environ.get("SAGE_RUN_AS_PASSWORD")
     if env:
         return env
-    # durable fallbacks: a dedicated secrets file, then the mythic .env
+    # durable fallbacks: a dedicated secrets file, Sage's runtime env, then the Mythic env
     candidates = [
         os.environ.get("SAGE_RUNAS_FILE"),
         str(Path.home() / ".config" / "sage" / "runas.env"),
+        str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage" / ".env"),
         env_path or os.environ.get("MYTHIC_ENV_PATH") or str(Path.home() / "dev" / "mythic_v4" / ".env"),
     ]
     for path in candidates:

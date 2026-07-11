@@ -34,6 +34,65 @@ def test_find_active_interactive_session_matches_only_active_named_user():
     }
 
 
+def test_find_user_sessions_matches_named_user_in_any_state():
+    output = (
+        " USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME\r\n"
+        " localuser             console             1  Active      none   7/11/2026 9:00 AM\r\n"
+        " localuser                                 2  Disc           10  7/11/2026 8:00 AM\r\n"
+        " samwell.tarly         rdp-tcp#4           4  Active          .  7/11/2026 9:05 AM\r\n"
+    )
+
+    assert deploy.find_user_sessions(output, "localuser") == [
+        {
+            "user": "localuser",
+            "session_id": "1",
+            "state": "Active",
+            "line": "localuser             console             1  Active      none   7/11/2026 9:00 AM",
+        },
+        {
+            "user": "localuser",
+            "session_id": "2",
+            "state": "Disc",
+            "line": "localuser                                 2  Disc           10  7/11/2026 8:00 AM",
+        },
+    ]
+
+
+def test_logoff_user_sessions_only_logs_off_named_user(monkeypatch):
+    outputs = iter([
+        (
+            " localuser             console             1  Active      none   now\r\n"
+            " samwell.tarly         rdp-tcp#4           4  Active          .  now\r\n"
+        ),
+        " samwell.tarly         rdp-tcp#4           4  Active          .  now\r\n",
+    ])
+    scripts = []
+
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": next(outputs), "status_code": 0},
+    )
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script) or {
+            "status_code": 0,
+            "stdout": "",
+            "stderr": "",
+        },
+    )
+
+    result = deploy.logoff_user_sessions(object(), "localuser")
+
+    assert [row["session_id"] for row in result["logged_off"]] == ["1"]
+    assert result["remaining"] == []
+    assert len(scripts) == 1
+    assert "logoff.exe" in scripts[0]
+    assert "'1'" in scripts[0]
+    assert "4" not in scripts[0]
+
+
 def test_default_remote_filename_preserves_interactive_payload_name():
     assert deploy.default_remote_filename("apollo.exe", "scheduled-task-interactive") == "apollo.exe"
 

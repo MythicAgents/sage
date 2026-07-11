@@ -17,18 +17,28 @@ if [[ -z "$PID" ]]; then
 fi
 
 tmux send-keys -t "$SESSION" C-c
-for _ in $(seq 1 25); do
-  kill -0 "$PID" 2>/dev/null || {
-    echo "Stopped local Sage pid $PID in tmux '$SESSION'."
-    exit 0
-  }
-  sleep 1
-done
+wait_for_exit() {
+  local seconds="$1"
+  local state
+  for _ in $(seq 1 "$seconds"); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+      return 0
+    fi
+    state="$(ps -o stat= -p "$PID" 2>/dev/null || true)"
+    [[ "$state" == Z* ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+if wait_for_exit 60; then
+  echo "Stopped local Sage pid $PID in tmux '$SESSION'."
+  exit 0
+fi
 
 tmux send-keys -t "$SESSION" C-c
-sleep 3
-kill -0 "$PID" 2>/dev/null && {
+if ! wait_for_exit 20; then
   echo "ERR: local Sage pid $PID is still running" >&2
   exit 1
-}
+fi
 echo "Stopped local Sage pid $PID in tmux '$SESSION'."

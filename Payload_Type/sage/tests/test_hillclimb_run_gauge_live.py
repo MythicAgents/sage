@@ -25,7 +25,25 @@ def _telemetry(**overrides):
 
 
 def test_runtime_telemetry_validation_accepts_complete_provenance():
-    rgl.validate_harness_runtime_telemetry("llm", _telemetry())
+    rgl.validate_harness_runtime_telemetry(
+        "llm",
+        _telemetry(
+            model_provider="openai",
+            model_id="bedrock-claude-4-6-sonnet",
+        ),
+        configured_provider="openai",
+        configured_model="bedrock-claude-4-6-sonnet",
+    )
+
+
+def test_runtime_telemetry_validation_rejects_mislabeled_model():
+    with pytest.raises(RuntimeError, match="did not match observed model"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            _telemetry(model_provider="openai", model_id="gpt-5.4-mini"),
+            configured_provider="openai",
+            configured_model="bedrock-claude-4-6-sonnet",
+        )
 
 
 def test_runtime_telemetry_validation_rejects_policy_mismatch():
@@ -74,6 +92,22 @@ def test_build_probes_includes_objective_only_when_scored():
     probes = rgl.build_probes(reader, {}, scn)
     assert Milestone.OBJECTIVE in probes
     assert Milestone.DA_CHILD not in probes
+
+
+def test_objective_probe_accepts_certificate_admin_control_without_ldap_wait(monkeypatch):
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "certificate_admin_control_probe",
+        lambda *args, **kwargs: (lambda: True),
+    )
+
+    def unexpected_reader(_domain):
+        raise AssertionError("LDAP membership path should short-circuit after certificate proof")
+
+    scn = _Scn((Milestone.OBJECTIVE,))
+    probes = rgl.build_probes(unexpected_reader, {}, scn, settle_timeout=300)
+
+    assert probes[Milestone.OBJECTIVE]() is True
 
 
 def test_build_probes_da_reads_via_reader_not_callback():

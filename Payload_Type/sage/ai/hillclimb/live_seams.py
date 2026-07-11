@@ -370,18 +370,23 @@ def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_s
 
 
 def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int = 0,
-                         timeout: int = 1800, max_steps: int = 0, policy_mode: str = "llm"):
+                         timeout: int = 1800, max_steps: int = 0, policy_mode: str = "llm",
+                         provider: str | None = None, model: str | None = None):
     """Option-A counterpart to make_harness_solver: run a full autonomous Sage solve IN-PROCESS via the
     chat Model (no PayloadType `query` task, no virtual callback). Same ``solve(objective) -> status_str``
     contract, so it's a drop-in behind the ``SAGE_EVAL_HEADLESS`` flag in run_gauge_live. ``client`` is this
     harness's authenticated mythic client (adopted directly by the Model's tools); ``engagement_id`` pins
     the durable ledger key so scoring reads this run's ledger. Returns "completed"/"timeout"/"error: …"."""
-    from .headless_solver import run_headless_solve
+    try:
+        from .headless_solver import run_headless_solve
+    except ImportError:
+        from headless_solver import run_headless_solve  # type: ignore
 
     def solve(objective: str) -> str:
         result = asyncio.run(run_headless_solve(
             objective, client=client, operation_id=operation_id, engagement_id=engagement_id,
-            timeout=timeout, max_steps=max_steps, policy_mode=policy_mode, return_details=True,
+            timeout=timeout, max_steps=max_steps, policy_mode=policy_mode,
+            provider=provider, model=model, return_details=True,
         ))
         solve.last_result = result
         if not isinstance(result, dict):
@@ -392,20 +397,46 @@ def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int =
     return solve
 
 
-def make_native_chat_solver(client: Any, *, timeout: int = 1800, poll_interval: float = 5.0):
+def make_native_chat_solver(
+    client: Any,
+    *,
+    timeout: int = 1800,
+    poll_interval: float = 5.0,
+    provider: str | None = None,
+    model: str | None = None,
+    api_endpoint: str | None = None,
+    api_key: str | None = None,
+):
     """Run one autonomous objective through a fresh locked Mythic v4 Sage chat channel."""
     scripts = Path(__file__).resolve().parents[4] / "skills" / "sage-live-runner" / "scripts"
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
-    from native_chat import run_native_chat_turn
+    import native_chat
+
+    treatment_metadata = None
+    use_prepared_channel = True
+    if provider or model:
+        treatment_metadata = native_chat.default_ai_metadata()
+        treatment_config = treatment_metadata.setdefault("config", {})
+        if provider:
+            treatment_config["provider"] = str(provider).strip().lower()
+        if model:
+            treatment_config["model"] = str(model).strip()
+        if api_endpoint:
+            treatment_config["API_ENDPOINT"] = str(api_endpoint).strip()
+        if api_key:
+            treatment_config["API_KEY"] = str(api_key).strip()
+        use_prepared_channel = False
 
     def solve(objective: str) -> str:
         result = asyncio.run(
-            run_native_chat_turn(
+            native_chat.run_native_chat_turn(
                 client,
                 objective,
                 timeout_seconds=timeout,
                 poll_interval_seconds=poll_interval,
+                metadata=treatment_metadata,
+                use_prepared_channel=use_prepared_channel,
             )
         )
         solve.last_result = result
@@ -476,6 +507,18 @@ _KRBTGT_DCSYNC_TASK_QUERY = """
           }
         }
         """
+_CERTIFICATE_AUTH_TASK_QUERY = """
+        query CertificateAuthTasks($limit: Int!) {
+          task(where: {completed: {_eq: true}}, order_by: {display_id: desc}, limit: $limit) {
+            display_id
+            command_name
+            display_params
+            original_params
+            callback { display_id }
+            responses { response_text }
+          }
+        }
+        """
 
 
 def _fetch_credentials_for_probe(*, timeout: int = 60) -> list[dict]:
@@ -508,10 +551,12 @@ def mythic_queries_valid(*, timeout: int = 30) -> tuple[bool, str]:
             mythic.execute_custom_query(client, _CREDENTIAL_QUERY, variables={}), timeout=timeout)
         await asyncio.wait_for(
             mythic.execute_custom_query(client, _KRBTGT_DCSYNC_TASK_QUERY, variables={"limit": 1}), timeout=timeout)
+        await asyncio.wait_for(
+            mythic.execute_custom_query(client, _CERTIFICATE_AUTH_TASK_QUERY, variables={"limit": 1}), timeout=timeout)
 
     try:
         asyncio.run(_run())
-        return True, "mythic credential + krbtgt-dcsync queries validate against the live schema"
+        return True, "mythic credential + task-proof queries validate against the live schema"
     except Exception as e:
         return False, f"mythic query failed against the live schema (fix before a live run): {e}"
 
@@ -543,6 +588,122 @@ def mythic_credential_probe(account: str, *, realm: str | None = None, timeout: 
         except Exception:
             # Fail-open like the original async wrapper: probe errors score unmet rather than aborting runs.
             return False
+
+    return probe
+
+
+def _probe_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().casefold()).strip("_")
+
+
+def _certificate_auth_anchor_matches(output: str, account: str, realm: str) -> bool:
+    """True when task output explicitly identifies the requested certificate-auth principal."""
+    account_slug = _probe_slug(_canonical_credential_account(account))
+    realm_slug = _probe_slug(realm)
+    marker = f"sage_cert_auth_proof_{account_slug}_{realm_slug}_"
+    low = str(output or "").casefold()
+    if marker in low:
+        return True
+
+    domain_match = re.search(r"(?im)^\s*CERT_AUTH_DOMAIN\s*[:=]\s*(\S+)\s*$", output or "")
+    account_match = re.search(r"(?im)^\s*CERT_AUTH_ACCOUNT\s*[:=]\s*(\S+)\s*$", output or "")
+    return bool(
+        domain_match
+        and account_match
+        and _realms_match(domain_match.group(1), realm)
+        and _canonical_credential_account(account_match.group(1))
+        == _canonical_credential_account(account)
+    )
+
+
+def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
+    """Read completed Mythic task outputs used by the independent certificate-auth referee."""
+    from mythic import mythic  # type: ignore
+
+    async def _q():
+        client = await _mythic_login_async_safe()
+        result = await asyncio.wait_for(
+            mythic.execute_custom_query(
+                client,
+                _CERTIFICATE_AUTH_TASK_QUERY,
+                variables={"limit": int(limit)},
+            ),
+            timeout=timeout,
+        )
+        return result.get("task", []) or []
+
+    try:
+        rows = asyncio.run(_q())
+    except Exception:
+        return []
+    return [
+        {
+            **row,
+            "output": _decode_mythic_response_rows(row.get("responses")),
+            "callback_display_id": (row.get("callback") or {}).get("display_id"),
+        }
+        for row in rows
+    ]
+
+
+def certificate_admin_control_probe(
+    account: str,
+    *,
+    realm: str,
+    timeout: int = 60,
+    task_window: int = 12,
+) -> DirectProbe:
+    """True iff completed Mythic tasks independently prove certificate-authenticated admin access.
+
+    Certificate authentication can establish Administrator control without changing Domain Admins group
+    membership. The capability is multi-command, so locate its principal-specific proof marker and replay
+    the verifier over that task plus the immediately preceding tasks on the same callback.
+    """
+    wanted_account = _canonical_credential_account(account)
+
+    def probe() -> bool:
+        try:
+            try:
+                from ..langgraph import capabilities
+            except Exception:
+                from ai.langgraph import capabilities  # type: ignore
+
+            rows = _fetch_certificate_auth_task_outputs(timeout=timeout)
+            for anchor in rows:
+                output = str(anchor.get("output") or "")
+                if not _certificate_auth_anchor_matches(output, wanted_account, realm):
+                    continue
+                anchor_id = int(anchor.get("display_id") or 0)
+                callback_id = anchor.get("callback_display_id")
+                related = [
+                    str(row.get("output") or "")
+                    for row in rows
+                    if row.get("callback_display_id") == callback_id
+                    and anchor_id - max(0, int(task_window)) <= int(row.get("display_id") or 0) <= anchor_id
+                ]
+                combined = "\n".join(reversed(related))
+                structured = capabilities.extract_adcs_certificate_auth_probe(
+                    combined,
+                    wanted_account,
+                    realm,
+                )
+                structured["callback_id"] = str(callback_id or "")
+                if capabilities.verify_capability(
+                    "adcs-certificate-auth",
+                    structured,
+                ).verdict == "achieved":
+                    return True
+        except Exception:
+            return False
+        return False
+
+    return probe
+
+
+def any_probe(*probes: DirectProbe) -> DirectProbe:
+    """Return a short-circuiting OR over independent proof paths."""
+    def probe() -> bool:
+        return any(candidate() for candidate in probes)
 
     return probe
 

@@ -49,7 +49,12 @@ Use Mythic's credential store instead of an environment variable when the creden
 ```
 
 For the clean-baseline CASTELBLACK foothold, use the interactive launch path instead of `auto`. Open an RDP
-session as `NORTH\samwell.tarly`, then launch the staged payload through that active desktop session:
+session as `NORTH\samwell.tarly`, then launch the staged payload through that active desktop session.
+First log off the snapshot's `localuser` console session:
+
+```bash
+.venv/bin/python skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py logoff-user --username localuser
+```
 
 ```bash
 printf '%s\n' "$SAGE_RUN_AS_PASSWORD" | xfreerdp3 \
@@ -74,9 +79,10 @@ The manual `xfreerdp3` line above assumes an interactive terminal — Codex supp
 Claude Code's Bash tool and cron do **not**, and without a controlling terminal `xfreerdp3`'s NLA/NTLM path
 dies pre-auth (exit 144, no output). `scripts/open_rdp_session.py` wraps `xfreerdp3` in `pty.fork()` so it
 gets its own controlling terminal regardless of the caller, forces NTLM (`/auth-pkg-list:!kerberos` — the
-operator host has no KDC route to the GOAD realms), and pins the workflow Xvfb (`SAGE_RDP_DISPLAY`, default
-`:99`). It resolves the run-as password durably (`SAGE_RUN_AS_PASSWORD` → `~/.config/sage/runas.env` →
-mythic `.env`) so a fresh, env-less shell still authenticates.
+operator host has no KDC route to the GOAD realms). The one-command launcher selects a live Xwayland `:0`
+or Xvfb `:99` display instead of assuming one exists. It resolves the run-as password durably
+(`SAGE_RUN_AS_PASSWORD` → `~/.config/sage/runas.env` → Sage `.env` → Mythic `.env`) so a fresh,
+env-less shell still authenticates. It also logs off only `localuser` before opening Samwell's session.
 
 One command opens the session and starts the pre-staged Apollo — works for Codex *and* headless agents:
 

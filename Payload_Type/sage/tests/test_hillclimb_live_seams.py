@@ -170,6 +170,47 @@ def test_krbtgt_dumped_probe_callable_no_live_range_no_hang(monkeypatch):
     assert time.monotonic() - start < 1.0
 
 
+def test_certificate_admin_control_probe_replays_multi_task_proof(monkeypatch):
+    ticket = base64.b64encode(b"A" * 80).decode("ascii")
+    rows = [
+        {
+            "display_id": 52,
+            "callback_display_id": 2,
+            "output": (
+                "SAGE_CERT_AUTH_PROOF_administrator_essos_local_2\n"
+                " Directory of \\\\braavos.essos.local\\C$\nWindows"
+            ),
+        },
+        {
+            "display_id": 51,
+            "callback_display_id": 2,
+            "output": f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}",
+        },
+    ]
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: rows)
+
+    assert ls.certificate_admin_control_probe(
+        "administrator",
+        realm="essos.local",
+    )() is True
+
+
+def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: [{
+        "display_id": 52,
+        "callback_display_id": 2,
+        "output": (
+            "SAGE_CERT_AUTH_PROOF_administrator_north_sevenkingdoms_local_2\n"
+            "CERT_AUTH_STATUS=OK"
+        ),
+    }])
+
+    assert ls.certificate_admin_control_probe(
+        "administrator",
+        realm="essos.local",
+    )() is False
+
+
 def test_decode_mythic_response_rows_base64_with_raw_fallback():
     encoded = base64.b64encode(b"decoded output").decode("ascii")
     assert ls._decode_mythic_response_rows([{"response_text": encoded}]) == "decoded output"

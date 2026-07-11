@@ -16,12 +16,18 @@ MYTHIC_CLI="${MYTHIC_CLI:-/home/john/dev/mythic_v4/mythic-cli}"
 MYTHIC_DIR="$(cd "$(dirname "$MYTHIC_CLI")" && pwd)"
 cd "$MYTHIC_DIR"
 
-"$MYTHIC_CLI" stop
+# Sage's .env uses Docker service hostnames that are valid inside the chat container but poison
+# mythic-cli when inherited by this host-side reset script.
+mythic_cli() {
+  env -u RABBITMQ_HOST -u MYTHIC_SERVER_HOST -u NGINX_HOST "$MYTHIC_CLI" "$@"
+}
+
+mythic_cli stop
 if [[ -d "$MYTHIC_DIR/postgres-docker/database" ]]; then
   docker run --rm \
     -v "$MYTHIC_DIR/postgres-docker/database:/db" \
     alpine sh -c 'rm -rf /db/* /db/.[!.]* /db/..?*'
 else
-  "$MYTHIC_CLI" database reset -f
+  mythic_cli database reset -f
 fi
-"$MYTHIC_CLI" start
+mythic_cli start

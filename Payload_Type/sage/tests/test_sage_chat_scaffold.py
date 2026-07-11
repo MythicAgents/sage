@@ -105,6 +105,44 @@ def test_native_chat_marks_model_command_name_chat():
     assert model.command_name == "chat"
 
 
+def test_channel_metadata_publishes_before_model_invoke():
+    class _MetadataAwareModel(_FakeModel):
+        async def invoke(self, prompt, is_interactive=False):
+            assert chat.channel_metadata_updates
+            return await super().invoke(prompt, is_interactive=is_interactive)
+
+    model = _MetadataAwareModel()
+    chat = _DriverChat(model)
+    _run(chat.chat(build_chat_request("first turn", channel_id=5, request_id=10)))
+
+
+def test_channel_metadata_heartbeat_publishes_changed_rounds(monkeypatch):
+    import sage_chat.service as service
+
+    class _LongModel(_FakeModel):
+        _global_step_count = 0
+        _policy_model_calls = 0
+
+        async def invoke(self, prompt, is_interactive=False):
+            self._policy_model_calls = 1
+            await asyncio.sleep(0.03)
+            self._policy_model_calls = 2
+            await asyncio.sleep(0.03)
+            return "done"
+
+    monkeypatch.setattr(service, "_CHANNEL_METADATA_HEARTBEAT_SECONDS", 0.01)
+    chat = _DriverChat(_LongModel())
+    _run(chat.chat(build_chat_request("long turn", channel_id=5, request_id=10)))
+
+    rounds = [
+        next(item["value"] for item in update["items"] if item["key"] == "rounds")
+        for update in chat.channel_metadata_updates
+    ]
+    assert rounds[0] == 0
+    assert 1 in rounds
+    assert rounds[-1] == 2
+
+
 # --------------------------------------------------------------------------------------
 # Cancel + error paths
 # --------------------------------------------------------------------------------------
@@ -1115,6 +1153,16 @@ def test_provider_is_choice_dropdown_not_freeform_string():
     assert {c["value"] for c in pj["choices"]} == {"openai", "bedrock", "anthropic", "ollama"}
 
 
+def test_provider_and_model_are_adjacent_static_header_chips():
+    opts = SAGE_MODELS[0].Metadata.ConfigurationOptions
+    provider_index = next(i for i, option in enumerate(opts) if option.Name == "provider")
+    model_index = next(i for i, option in enumerate(opts) if option.Name == "model")
+
+    assert model_index == provider_index + 1
+    assert opts[provider_index].DisplayAsChip is True
+    assert opts[model_index].DisplayAsChip is True
+
+
 def test_autonomous_solve_toggle_independent_of_mode():
     # the explicit toggle enables autonomy even when mode stays supervised
     kwargs = build_model_kwargs(build_chat_request("hi", config={"autonomous_solve": "true"}))
@@ -1580,14 +1628,56 @@ def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
 
     monkeypatch.setattr(headless_solver, "run_headless_solve", _fake_run)
     solve = live_seams.make_headless_solver("CLIENT", engagement_id="Operation_Chimera_1",
-                                            operation_id=7, timeout=99, max_steps=0, policy_mode="symbolic")
+                                            operation_id=7, timeout=99, max_steps=0, policy_mode="symbolic",
+                                            provider="openai", model="test-model")
     assert solve("compromise CORP") == "completed"
     assert calls["objective"] == "compromise CORP"
     assert calls["client"] == "CLIENT"
     assert calls["engagement_id"] == "Operation_Chimera_1"
     assert calls["operation_id"] == 7
     assert calls["policy_mode"] == "symbolic"
+    assert calls["provider"] == "openai"
+    assert calls["model"] == "test-model"
     assert calls["return_details"] is True
+
+
+def test_make_native_chat_solver_creates_treatment_channel(monkeypatch):
+    """Explicit model treatments must bypass the default prepared channel and travel in channel metadata."""
+    import sys
+    import types
+
+    from ai.hillclimb import live_seams
+
+    calls = {}
+
+    async def _fake_run(client, objective, **kwargs):
+        calls.update(client=client, objective=objective, **kwargs)
+        return {"status": "completed"}
+
+    fake_native_chat = types.SimpleNamespace(
+        default_ai_metadata=lambda: {
+            "config": {
+                "provider": "openai",
+                "model": "default-model",
+                "API_ENDPOINT": "http://proxy/v1",
+                "API_KEY": "secret",
+            },
+        },
+        run_native_chat_turn=_fake_run,
+    )
+    monkeypatch.setitem(sys.modules, "native_chat", fake_native_chat)
+
+    solve = live_seams.make_native_chat_solver(
+        "CLIENT",
+        provider="openai",
+        model="bedrock-claude-4-6-sonnet",
+    )
+
+    assert solve("objective") == "completed"
+    assert calls["use_prepared_channel"] is False
+    assert calls["metadata"]["config"]["provider"] == "openai"
+    assert calls["metadata"]["config"]["model"] == "bedrock-claude-4-6-sonnet"
+    assert calls["metadata"]["config"]["API_ENDPOINT"] == "http://proxy/v1"
 
 
 def test_build_channel_metadata_live_counts(monkeypatch):
@@ -1614,11 +1704,33 @@ def test_build_channel_metadata_live_counts(monkeypatch):
     assert items["bloodhound"]["display_value"] == "connected"
     assert "mythic_tools" in items                       # scope-usable Mythic tool count present
     # Policy leads the operational controls; state-aware colors make the three controls distinguishable.
-    assert items["cfg_model"]["value"] == "claude-sonnet-5" and items["cfg_model"]["color"] == "info"
+    assert "cfg_model" not in items
     assert items["cfg_policy"]["value"] == "llm" and items["cfg_policy"]["color"] == "success"
     assert items["cfg_policy"]["order"] < items["cfg_mode"]["order"] < items["cfg_autonomous"]["order"]
     assert items["cfg_mode"]["value"] == "auto" and items["cfg_mode"]["color"] == "warning"
     assert items["cfg_autonomous"]["display_value"] == "on" and items["cfg_autonomous"]["color"] == "warning"
+
+
+def test_build_channel_metadata_rounds_accumulate_across_controller_resets(monkeypatch):
+    from sage_chat.metadata import build_channel_metadata
+    from ai import mcp
+
+    monkeypatch.setattr(mcp.MCPManager, "get_tools_summary", lambda: {}, raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", lambda: [], raising=False)
+
+    class _M:
+        _global_step_count = 2
+        _policy_model_calls = 3
+
+    model = _M()
+    items = {item["key"]: item for item in build_channel_metadata(model)["items"]}
+    assert items["rounds"]["value"] == 5
+
+    model._policy_model_calls = 0
+    build_channel_metadata(model)
+    model._policy_model_calls = 2
+    items = {item["key"]: item for item in build_channel_metadata(model)["items"]}
+    assert items["rounds"]["value"] == 7
 
 
 def test_channel_metadata_default_control_colors_are_distinct(monkeypatch):

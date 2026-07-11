@@ -18,6 +18,7 @@ skills/sage-callback-bootstrap/merlin_callback_config.json
 .evals/
 .mcp.json
 .envrc
+skills/sage-eval-gauge/.env.local
 
 # Phoenix observability directory - ignore contents but keep structure
 Payload_Type/sage/.phoenix/*

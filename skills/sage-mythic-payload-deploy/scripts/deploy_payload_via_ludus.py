@@ -684,10 +684,63 @@ def find_active_interactive_session(output: str, run_as_user: str) -> dict[str, 
     return None
 
 
+def find_user_sessions(output: str, username: str) -> list[dict[str, str]]:
+    """Return quser rows for an exact username, regardless of session state."""
+    short_user = run_as_short_user(username).casefold()
+    matches: list[dict[str, str]] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.lstrip(">").strip()
+        if not line or line.casefold().startswith("username"):
+            continue
+        tokens = line.split()
+        if not tokens or tokens[0].casefold() != short_user:
+            continue
+        for index, token in enumerate(tokens[1:], start=1):
+            if not token.isdigit() or index + 1 >= len(tokens):
+                continue
+            state = tokens[index + 1]
+            if state.casefold() not in {"active", "disc", "listen", "idle"}:
+                continue
+            matches.append({
+                "user": tokens[0],
+                "session_id": token,
+                "state": state,
+                "line": line,
+            })
+            break
+    return matches
+
+
 def query_user_sessions(session: Any) -> dict[str, Any]:
     result = run_ps(session, "quser 2>&1 | Out-String", check=False)
     output = result.get("stdout") or result.get("stderr") or ""
     return {"output": output, "status_code": result.get("status_code")}
+
+
+def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
+    """Log off only sessions owned by username and report the before/after rows."""
+    before = query_user_sessions(session)
+    matches = find_user_sessions(before.get("output", ""), username)
+    logged_off: list[dict[str, str]] = []
+    for match in matches:
+        session_id = match["session_id"]
+        run_ps(
+            session,
+            f"& \"$env:SystemRoot\\System32\\logoff.exe\" {ps_quote(session_id)}",
+        )
+        logged_off.append(match)
+    after = query_user_sessions(session)
+    remaining = find_user_sessions(after.get("output", ""), username)
+    if remaining:
+        raise DeployError(
+            f"Sessions for {username!r} remain after logoff: "
+            f"{[row['session_id'] for row in remaining]}"
+        )
+    return {
+        "username": username,
+        "logged_off": logged_off,
+        "remaining": remaining,
+    }
 
 
 def wait_for_active_interactive_session(
@@ -1316,6 +1369,21 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         )
 
 
+async def command_logoff_user(args: argparse.Namespace) -> None:
+    host = select_ludus_host(args)
+    session = winrm_session(
+        host,
+        args.winrm_operation_timeout_seconds,
+        args.winrm_read_timeout_seconds,
+    )
+    result = logoff_user_sessions(session, args.username)
+    result["target"] = {
+        "inventory_hostname": host.get("inventory_hostname"),
+        "ansible_host": host.get("ansible_host"),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def add_mythic_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", default=DEFAULT_MYTHIC_SERVER)
     parser.add_argument("--user", default=DEFAULT_MYTHIC_USER)
@@ -1441,6 +1509,19 @@ def build_parser() -> argparse.ArgumentParser:
     relaunch_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)
     relaunch_parser.add_argument("--winrm-read-timeout-seconds", type=int, default=75)
     relaunch_parser.set_defaults(func=command_launch_existing)
+
+    logoff_parser = sub.add_parser(
+        "logoff-user",
+        help="Log off only the named user's Windows sessions before opening the foothold RDP session.",
+    )
+    logoff_parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
+    logoff_parser.add_argument("--ludus-host", default=None)
+    logoff_parser.add_argument("--target-host", default="CASTELBLACK")
+    logoff_parser.add_argument("--target-ip", default=None)
+    logoff_parser.add_argument("--username", default="localuser")
+    logoff_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)
+    logoff_parser.add_argument("--winrm-read-timeout-seconds", type=int, default=75)
+    logoff_parser.set_defaults(func=command_logoff_user)
 
     return parser
 
