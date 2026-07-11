@@ -60,6 +60,38 @@ def test_dry_run_accepts_hybrid_policy_treatment():
     assert "Sage policy mode -> hybrid" in result.stdout
 
 
+def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config):
+        del snapshot, retained_callback_config
+        seen[restart_env["SAGE_POLICY_MODE"]] = dict(restart_env)
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    for policy_mode in ("symbolic", "llm", "hybrid"):
+        orchestrate.run_side(
+            "cross-forest-objective",
+            "harness",
+            go=False,
+            solve_timeout=1,
+            policy_mode=policy_mode,
+        )
+
+    assert set(seen) == {"symbolic", "llm", "hybrid"}
+    assert {
+        values["SAGE_ENGAGEMENT_NETBIOS_MAP"]
+        for values in seen.values()
+    } == {orchestrate.DEFAULT_ENGAGEMENT_NETBIOS_MAP}
+    assert {
+        values["SAGE_AUTONOMOUS_CONTROLLER"]
+        for values in seen.values()
+    } == {"1"}
+
+
 def test_treatment_route_rejects_loopback_proxy(tmp_path):
     route = tmp_path / ".env.local"
     route.write_text(

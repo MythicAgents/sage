@@ -35,6 +35,11 @@ DEFAULT_RETAINED_CALLBACK_CONFIG = (
     ROOT / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
 )
 DEFAULT_ROUTE_ENV = ROOT / "skills" / "sage-eval-gauge" / ".env.local"
+DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
+    '{"NORTH":"north.sevenkingdoms.local",'
+    '"SEVENKINGDOMS":"sevenkingdoms.local",'
+    '"ESSOS":"essos.local"}'
+)
 LAUNCH_FOOTHOLD = [
     "/bin/bash",
     "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh",
@@ -278,15 +283,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     restart_env = {
         "SAGE_AUTONOMOUS_CONTROLLER": "1",
         "SAGE_POLICY_MODE": policy_mode,
+        "SAGE_ENGAGEMENT_NETBIOS_MAP": DEFAULT_ENGAGEMENT_NETBIOS_MAP,
     }
-    if policy_mode == "symbolic":
-        restart_env.update({
-            "SAGE_ENGAGEMENT_NETBIOS_MAP": (
-                '{"NORTH":"north.sevenkingdoms.local",'
-                '"SEVENKINGDOMS":"sevenkingdoms.local",'
-                '"ESSOS":"essos.local"}'
-            ),
-        })
     _sage_cb, apollo_cb = full_reset_and_ready(
         restart_env=restart_env,
         snapshot=snapshot,
