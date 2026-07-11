@@ -1,4 +1,4 @@
-"""Deterministic autonomous controller (control-state reprioritization, P0).
+"""Deterministic execution kernel for policy-selected capability transactions.
 
 THE PROBLEM (Plans/SAGE_AUTONOMOUS_CONTROLLER_DESIGN_2026-06-22.md): autonomous control is diffuse —
 selection / sequencing / polling / termination are owned by the Supervisor+worker LLMs negotiating in text.
@@ -7,14 +7,13 @@ canary's poll/ingest/recon wander). The execution substrate is deterministic and
 precondition/effect model is already declared (`capabilities.actions_from_state` returns a priority-ordered
 admissible frontier — Spike 0 confirmed it reproduces a full proven attack chain's critical path at rank 0).
 
-THE FIX: a deterministic controller OWNS the cycle
+The kernel owns the bounded transaction cycle
 
     observe -> collect-once-if-needed -> compute frontier -> select one admissible action
             -> execute -> verify -> update state -> decide(continue|route|stop)
 
-and demotes the LLM to a BOUNDED advisor: it ranks among already-admissible, precondition-checked actions on a
-priority tie, and proposes a candidate only when the deterministic frontier is EMPTY (route discovery). The LLM
-never owns scheduling, polling, repeat-policy, or termination.
+while an explicit policy backend owns semantic capability selection. Deterministic code retains observation,
+admissibility, polling, verification, repeat-policy, and termination.
 
 WHY THE `1116` LOOP BECOMES STRUCTURALLY IMPOSSIBLE: the controller selects ONLY from the precondition-checked
 frontier, so it cannot select `adcs-certificate-auth` before `adcs-ca-private-key` exists — it picks the
@@ -85,6 +84,8 @@ class CycleRecord:
     ok: bool = False
     new_effects: list[str] = field(default_factory=list)
     note: str = ""
+    decision_id: str = ""
+    policy_mode: str = ""
 
 
 @dataclass
@@ -95,6 +96,9 @@ class ControllerResult:
     cycle_count: int
     cycles: list[CycleRecord]
     achieved_effects: list[str]
+    episode_id: str = ""
+    policy_mode: str = ""
+    decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -103,8 +107,20 @@ class ControllerResult:
             "blocker": self.blocker,
             "cycle_count": self.cycle_count,
             "achieved_effects": self.achieved_effects,
+            "episode_id": self.episode_id,
+            "policy_mode": self.policy_mode,
+            "decisions": self.decisions,
             "cycles": [vars(c) for c in self.cycles],
         }
+
+
+@dataclass(frozen=True)
+class _CollectionCandidate:
+    name: str = "collect-graph"
+    target: str = ""
+    preconditions: list[str] = field(default_factory=list)
+    effects: list[str] = field(default_factory=lambda: ["graph-collected"])
+    reason: str = "refresh graph observations required by the current state"
 
 
 def _parse_result(value: Any) -> dict:
@@ -178,6 +194,9 @@ class AutonomousController:
                  clock: Callable[[], float] | None = None,
                  should_abort: Callable[[], bool] | None = None,
                  frontier_fn: Callable[[Any], list[Any]] | None = None,
+                 policy_backend: Any | None = None,
+                 objective: str = "",
+                 episode_id: str = "",
                  config: ControllerConfig | None = None,
                  logger: Callable[[str], None] | None = None):
         self._observe = observe
@@ -191,12 +210,53 @@ class AutonomousController:
         self._clock = clock
         self._should_abort = should_abort
         self._frontier_fn = frontier_fn or cap.actions_from_state
+        self._policy = policy_backend
+        self._objective = str(objective or "")
+        self._episode_id = str(episode_id or "")
         self.config = config or ControllerConfig()
         self._log = logger or (lambda _m: None)
         self._loop = wo.LoopBreakerState()
         self._collections = 0
         self._collection_attempts: dict[str, int] = {}
         self._no_effect = 0
+
+    async def _policy_select(
+        self,
+        state: Any,
+        candidates: list[Any],
+        history: list[Any],
+    ) -> tuple[Any | None, Any | None]:
+        if self._policy is None:
+            return await self._select(candidates), None
+        status, decision = await self._seam(
+            lambda: self._policy.select(
+                episode_id=self._episode_id,
+                objective=self._objective,
+                state=state,
+                candidates=list(candidates),
+                history=list(history),
+                budgets={
+                    "max_cycles": self.config.max_cycles,
+                    "wall_clock_budget_s": self.config.wall_clock_budget_s,
+                    "token_budget": self.config.token_budget,
+                },
+            ),
+            "policy_select",
+        )
+        if status != "ok" or decision is None:
+            return None, None
+        if str(getattr(decision, "disposition", "")) != "select":
+            return None, decision
+        index = getattr(decision, "selected_index", None)
+        if not isinstance(index, int) or index < 0 or index >= len(candidates):
+            return None, decision
+        selected = candidates[index]
+        if (
+            str(getattr(decision, "selected_capability", "") or "")
+            and str(getattr(decision, "selected_capability", "")) != str(getattr(selected, "name", ""))
+        ):
+            return None, decision
+        return selected, decision
 
     def _achieved(self, state: Any) -> set[str]:
         """Canonical achieved-effect set, normalized with the SAME fn the frontier uses (cap._canonical_effect)
@@ -272,13 +332,20 @@ class AutonomousController:
         self._collection_attempts = {}
         self._no_effect = 0
         cycles: list[CycleRecord] = []
+        decisions: list[Any] = []
         blocker: dict | None = None
         achieved: set[str] = set()
 
         def done(status: str, reason: str) -> ControllerResult:
             return ControllerResult(status=status, reason=reason, blocker=blocker,
                                     cycle_count=len(cycles), cycles=cycles,
-                                    achieved_effects=sorted(achieved))
+                                    achieved_effects=sorted(achieved),
+                                    episode_id=self._episode_id,
+                                    policy_mode=str(getattr(self._policy, "mode", "") or ""),
+                                    decisions=[
+                                        d.to_dict() if hasattr(d, "to_dict") else dict(d)
+                                        for d in decisions
+                                    ])
 
         # Budget check BEFORE the first (potentially expensive) observe — fail cheap.
         over = await self._budget_exceeded()
@@ -314,6 +381,29 @@ class AutonomousController:
             if self._needs_collection is not None and self._collect is not None:
                 st, need = await self._seam(lambda: self._needs_collection(state), "needs_collection")
                 if st == "ok" and bool(need):
+                    collect_candidate = _CollectionCandidate(
+                        target=_collection_request_key(need),
+                    )
+                    selected, decision = await self._policy_select(
+                        state,
+                        [collect_candidate],
+                        decisions,
+                    )
+                    if decision is not None:
+                        decisions.append(decision)
+                    if selected is None:
+                        rationale = str(getattr(decision, "rationale", "") or "policy did not authorize collection")
+                        blocker = {"reason": rationale, "policy_mode": str(getattr(decision, "policy_mode", "") or "")}
+                        cycles.append(CycleRecord(
+                            cycle,
+                            "collect",
+                            action="collect-graph",
+                            ok=False,
+                            note=rationale,
+                            decision_id=str(getattr(decision, "decision_id", "") or ""),
+                            policy_mode=str(getattr(decision, "policy_mode", "") or ""),
+                        ))
+                        return done(STATUS_NO_ACTION, "policy declined graph collection")
                     request_key = _collection_request_key(need) or "__anonymous_collection_request__"
                     attempts = self._collection_attempts.get(request_key, 0)
                     if attempts >= self.config.max_collection_attempts_per_request:
@@ -346,7 +436,7 @@ class AutonomousController:
                             note=f"configured global collection emergency cap exhausted at {self._collections}",
                         ))
                         return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
-                    cst, cres = await self._seam(lambda: self._collect(state), "collect")
+                    cst, cres = await self._collect_seam(state, decision)
                     self._collections += 1
                     self._collection_attempts[request_key] = attempts + 1
                     res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
@@ -355,7 +445,9 @@ class AutonomousController:
                     if collection_reason:
                         note = f"{collection_reason}: {note}" if note else collection_reason
                     cycles.append(CycleRecord(cycle, "collect", action="collect_graph",
-                                              ok=bool(res.get("ok", True)), note=note))
+                                              ok=bool(res.get("ok", True)), note=note,
+                                              decision_id=str(getattr(decision, "decision_id", "") or ""),
+                                              policy_mode=str(getattr(decision, "policy_mode", "") or "")))
                     ost, state = await self._seam(lambda: self._observe(), "observe")
                     if ost != "ok" or state is None:
                         blocker = {"reason": f"observe unavailable after collect: {state}"}
@@ -365,6 +457,7 @@ class AutonomousController:
 
             # 4) frontier
             frontier = list(self._frontier_fn(state) or [])
+            decision = None
             if not frontier:
                 # 5) empty frontier -> bounded LLM route discovery (precondition-checked), else clean halt.
                 candidate = None
@@ -383,7 +476,26 @@ class AutonomousController:
                 action = candidate
                 phase = "route_discovery"
             else:
-                action = await self._select(frontier)
+                action, decision = await self._policy_select(state, frontier, decisions)
+                if decision is not None:
+                    decisions.append(decision)
+                if action is None:
+                    rationale = str(getattr(decision, "rationale", "") or "policy produced no executable selection")
+                    blocker = {
+                        "reason": rationale,
+                        "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+                        "decision_id": str(getattr(decision, "decision_id", "") or ""),
+                        "achieved": sorted(achieved),
+                    }
+                    cycles.append(CycleRecord(
+                        cycle,
+                        "policy",
+                        ok=False,
+                        note=rationale,
+                        decision_id=str(getattr(decision, "decision_id", "") or ""),
+                        policy_mode=str(getattr(decision, "policy_mode", "") or ""),
+                    ))
+                    return done(STATUS_NO_ACTION, "policy selected no offensive capability")
                 phase = "execute"
 
             name = cap._normalize(getattr(action, "name", ""))
@@ -391,7 +503,7 @@ class AutonomousController:
             expected = _action_effects(action)
 
             # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
-            est, eres = await self._execute_seam(action)
+            est, eres = await self._execute_seam(action, decision)
             result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
 
             # 7) verify — re-observe and diff achieved effects; PROGRESS is attributed to THIS action's expected
@@ -411,7 +523,9 @@ class AutonomousController:
 
             cycles.append(CycleRecord(cycle, phase, action=name, target=target,
                                       ok=bool(result.get("ok", True)), new_effects=new_effects,
-                                      note=str(result.get("reason", ""))[:160]))
+                                      note=str(result.get("reason", ""))[:160],
+                                      decision_id=str(getattr(decision, "decision_id", "") or ""),
+                                      policy_mode=str(getattr(decision, "policy_mode", "") or "")))
             self._log(f"cycle {cycle}: {phase} {name}->{target} ok={result.get('ok')} "
                       f"progressed={progressed} new_effects={new_effects}")
 
@@ -443,5 +557,34 @@ class AutonomousController:
 
         return done(STATUS_MAX_CYCLES, f"reached max_cycles={self.config.max_cycles}")
 
-    async def _execute_seam(self, action: Any) -> tuple[str, Any]:
+    async def _execute_seam(self, action: Any, decision: Any | None = None) -> tuple[str, Any]:
+        try:
+            signature = inspect.signature(self._execute)
+            accepts_decision = any(
+                parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            ) or len([
+                parameter for parameter in signature.parameters.values()
+                if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]) >= 2
+        except (TypeError, ValueError):
+            accepts_decision = False
+        if accepts_decision:
+            return await self._seam(lambda: self._execute(action, decision), "execute")
         return await self._seam(lambda: self._execute(action), "execute")
+
+    async def _collect_seam(self, state: Any, decision: Any | None = None) -> tuple[str, Any]:
+        try:
+            signature = inspect.signature(self._collect)
+            accepts_decision = any(
+                parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            ) or len([
+                parameter for parameter in signature.parameters.values()
+                if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]) >= 2
+        except (TypeError, ValueError):
+            accepts_decision = False
+        if accepts_decision:
+            return await self._seam(lambda: self._collect(state, decision), "collect")
+        return await self._seam(lambda: self._collect(state), "collect")

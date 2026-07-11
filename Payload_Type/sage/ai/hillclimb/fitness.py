@@ -105,6 +105,13 @@ class ScoreCard:
     # budget/step-limit termination, after which _CLEAN_TERMINAL_STATUSES is narrowed to that status. Use as a
     # diagnostic for now, not as the optimization target.
     objective_clean_stop: bool = False
+    request_completed: bool = False
+    objective_proven: bool = False
+    clean_stop: bool = False
+    controller_terminal_reason: str = ""
+    policy_mode: str = "unknown"
+    model_provider: str = ""
+    model_id: str = ""
 
 
 # Native Mythic v4 chat requests are one-shot: a completed request is terminal. The independent objective
@@ -181,6 +188,13 @@ def score(
         probe_disagreements=[m.name if isinstance(m, Milestone) else str(m)
                              for m in (ground_truth.probe_disagreements or [])],
         objective_clean_stop=objective_clean_stop,
+        request_completed=_clean_status,
+        objective_proven=bool(_objective_reached),
+        clean_stop=_clean_status,
+        controller_terminal_reason=str(r.get("controller_terminal_reason", "") or ""),
+        policy_mode=str(r.get("policy_mode", "unknown") or "unknown"),
+        model_provider=str(r.get("model_provider", "") or ""),
+        model_id=str(r.get("model_id", "") or ""),
     )
 
 

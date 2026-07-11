@@ -111,33 +111,35 @@ def full_reset_and_ready(restart_env: dict | None = None) -> tuple[None, int]:
 _GAUGE_STEP_OVERHEAD_S = 900
 
 
-def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, controller: bool = False) -> None:
+def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_mode: str = "llm") -> None:
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
     # (via _run's non-zero SystemExit) on a dropped/opaque/unparseable objective.
     _run(f"preflight {scenario}", [PY, "ai/hillclimb/run_gauge_live.py", "preflight", "--scenario", scenario], PAYLOAD, 120)
-    # --controller: restart Sage with SAGE_AUTONOMOUS_CONTROLLER=1 so the harness `query` (mode=auto,
-    # autonomous_solve=True) runs the deterministic autonomous controller instead of the Supervisor/worker
-    # astream path. Opt-in + off by default so this is a clean A/B against the existing autonomous path.
+    # Sage always uses the bounded execution kernel for autonomous solves. Policy mode identifies who selects
+    # each semantic capability: the product LLM policy or the preserved symbolic regression baseline.
     # SAGE_ENGAGEMENT_NETBIOS_MAP is the per-engagement NetBIOS->FQDN map (range-agnostic mechanism; the GOAD
     # values live HERE in the eval harness, not in Sage code). The controller's deterministic frontier needs
     # FQDN-form principal UPNs to match BloodHound's graph (a short forest like 'north' yields
     # samwell.tarly@north, which the graph cypher can't match vs samwell.tarly@north.sevenkingdoms.local) —
     # without it the controller halts at GRAPH_COLLECTED with an empty frontier.
-    restart_env = None
-    if controller:
-        restart_env = {
-            "SAGE_AUTONOMOUS_CONTROLLER": "1",
+    restart_env = {
+        "SAGE_AUTONOMOUS_CONTROLLER": "1",
+        "SAGE_POLICY_MODE": policy_mode,
+    }
+    if policy_mode == "symbolic":
+        restart_env.update({
             "SAGE_ENGAGEMENT_NETBIOS_MAP": (
                 '{"NORTH":"north.sevenkingdoms.local",'
                 '"SEVENKINGDOMS":"sevenkingdoms.local",'
                 '"ESSOS":"essos.local"}'
             ),
-        }
+        })
     _sage_cb, apollo_cb = full_reset_and_ready(restart_env=restart_env)
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
-            "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout)]
+            "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout),
+            "--policy-mode", policy_mode]
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -151,7 +153,7 @@ def compare(scenario: str) -> None:
     _run(f"compare {scenario}", [PY, "ai/hillclimb/run_gauge_live.py", "compare", "--scenario", scenario], PAYLOAD, 120)
 
 
-def _dry_run_plan(scenario, side, seeds, solve_timeout):
+def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode):
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
@@ -167,7 +169,8 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout):
             )
             print(f"  (cd {ROOT}) {' '.join(CALLBACKS)}        # parse apollo_cb")
             print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py run --go --side {sd} "
-                  f"--scenario {scenario} --apollo-cb <apollo> --solve-timeout {solve_timeout}")
+                  f"--scenario {scenario} --apollo-cb <apollo> --solve-timeout {solve_timeout} "
+                  f"--policy-mode {policy_mode}")
     print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
     print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
@@ -182,21 +185,21 @@ def main(argv=None) -> int:
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
                          "to cover this + post-solve scoring overhead, so long solves are not killed early.")
     ap.add_argument("--go", action="store_true", help="actually reset the lab + run offensive tooling")
+    ap.add_argument("--policy-mode", choices=["llm", "symbolic"], default="llm",
+                    help="semantic capability policy for the Sage harness (default: llm)")
     ap.add_argument("--controller", action="store_true",
-                    help="restart Sage with SAGE_AUTONOMOUS_CONTROLLER=1 so the harness solve runs the "
-                         "deterministic autonomous controller (A/B vs the default Supervisor/worker path)")
+                    help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    policy_mode = "symbolic" if args.controller else args.policy_mode
 
     if not args.go:
-        _dry_run_plan(args.scenario, args.side, args.seeds, args.solve_timeout)
-        if args.controller:
-            print("\n  NOTE: --controller -> Sage restarted with SAGE_AUTONOMOUS_CONTROLLER=1 "
-                  "(deterministic autonomous controller path).")
+        _dry_run_plan(args.scenario, args.side, args.seeds, args.solve_timeout, policy_mode)
+        print(f"\n  NOTE: Sage policy mode -> {policy_mode}.")
         return 0
 
     for _ in range(args.seeds):
         for side in ([args.side] if args.side else ["harness", "bare"]):
-            run_side(args.scenario, side, go=True, solve_timeout=args.solve_timeout, controller=args.controller)
+            run_side(args.scenario, side, go=True, solve_timeout=args.solve_timeout, policy_mode=policy_mode)
     if not args.side:
         compare(args.scenario)
     return 0

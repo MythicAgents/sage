@@ -664,6 +664,7 @@ _HOP_STATUSES = {"achieved", "failed", "blocked", "pending"}
 
 
 _OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
+_OBJECTIVE_ACCOUNT_RE = r"[a-z0-9._-]+"
 
 
 def _objective_target_domains(objective) -> set:
@@ -680,6 +681,54 @@ def _objective_target_domains(objective) -> set:
     for m in re.finditer(r"(" + _OBJECTIVE_DOMAIN_RE + r")\s+forest", o):
         targets.add(m.group(1).strip(" .'\""))
     return targets
+
+
+def _objective_credential_targets(objective: Any) -> set[tuple[str, str]]:
+    """Return explicit account@domain credential-material targets from objective prose."""
+    text = str(objective or "").casefold()
+    if not re.search(r"\b(?:credential|credentials|creds|dcsync)\b", text):
+        return set()
+    targets: set[tuple[str, str]] = set()
+    for match in re.finditer(
+        r"\b(" + _OBJECTIVE_ACCOUNT_RE + r")@(" + _OBJECTIVE_DOMAIN_RE + r")\b",
+        text,
+    ):
+        account = match.group(1).strip(" .'\"")
+        domain = match.group(2).strip(" .'\"")
+        if account and domain:
+            targets.add((account, domain))
+    return targets
+
+
+def _credential_effect_satisfied(account: str, domain: str, achieved: set[str]) -> bool:
+    account = _normalize_key(account).split("\\")[-1]
+    domain = _normalize_key(domain)
+    for effect in achieved:
+        if not effect.startswith("creds:"):
+            continue
+        material = effect.split(":", 1)[1].strip()
+        principal, sep, effect_domain = material.rpartition("@")
+        if not sep:
+            continue
+        effect_account = _normalize_key(principal).split("\\")[-1]
+        if effect_account == account and _domains_equivalent(effect_domain, domain):
+            return True
+    return False
+
+
+def objective_effects_complete(state: "EngagementState") -> bool:
+    """Whether an explicit non-admin objective is satisfied by recorded effects."""
+    targets = _objective_credential_targets(getattr(state, "objective", ""))
+    if not targets:
+        return False
+    try:
+        achieved = set(state.achieved_effects())
+    except Exception:
+        return False
+    return all(
+        _credential_effect_satisfied(account, domain, achieved)
+        for account, domain in targets
+    )
 
 
 def _objective_required_effects(objective, domain) -> set[str]:
@@ -721,6 +770,8 @@ def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
     'no further grounded hop advances' only for real human-readable objectives. Opaque ledger IDs are not
     objectives, so they must not turn "no modeled next hop" into mission completion. A proven INTERMEDIATE
     domain with a further hop available is a MILESTONE, not completion — so the climb continues."""
+    if objective_effects_complete(state):
+        return True
     candidates = objective_completion_candidates(state)
     if not candidates:
         return False
@@ -770,7 +821,7 @@ def engagement_phase(state: "EngagementState") -> str:
         # further hop available is a MILESTONE — keep climbing (EXPLOITATION) instead of halting on the first
         # domain reached.
         if _objective_is_complete(state, has_next):
-            return "COMPLETE-CANDIDATE — administrative-control proof for the objective's target is recorded; report the proof chain before executing a new action"
+            return "COMPLETE-CANDIDATE — proof for the objective's target is recorded; report the proof chain before executing a new action"
         if has_next:
             return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
         if current_access_collection_missing(state):

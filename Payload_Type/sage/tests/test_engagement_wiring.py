@@ -229,6 +229,33 @@ def test_accepted_mythic_task_emits_boundary_lifecycle_events():
     assert events[1]["output"] == "NORTH\\arya"
 
 
+def test_mythic_task_event_inherits_policy_decision_provenance():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+    policy_decision = {
+        "episode_id": "episode-1",
+        "decision_id": "decision-1",
+        "policy_mode": "llm",
+    }
+
+    with _split_issue("NORTH\\arya", display_id=4242):
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "whoami",
+            "",
+            11,
+            visibility_context={
+                "capability": "prove-access",
+                "purpose": "verify identity",
+                "policy_decision": policy_decision,
+            },
+        ))
+
+    assert events[0]["episode_id"] == "episode-1"
+    assert events[0]["decision_id"] == "decision-1"
+    assert events[0]["policy_mode"] == "llm"
+
+
 def test_issue_task_refuses_dead_callback_before_mythic_tasking():
     calls = {"issue": 0}
     mt = _make_tools()

@@ -779,6 +779,23 @@ def test_objective_target_domains_parses_goal_not_intermediate():
     assert "essos.local" in t and "north.sevenkingdoms.local" not in t  # intermediate is not a goal-target
 
 
+def test_credential_material_objective_completes_only_for_matching_effect():
+    objective = "Engagement objective: obtain verified credential material for alice@lab.local."
+    state = engagement_state.EngagementState(
+        objective=objective,
+        hops=[_hop("dcsync-account", "alice", "creds:alice@lab.local")],
+    )
+    wrong = engagement_state.EngagementState(
+        objective=objective,
+        hops=[_hop("dcsync-account", "bob", "creds:bob@lab.local")],
+    )
+
+    assert engagement_state._objective_credential_targets(objective) == {("alice", "lab.local")}
+    assert engagement_state.objective_effects_complete(state) is True
+    assert engagement_state._objective_is_complete(state, has_next=True) is True
+    assert engagement_state.objective_effects_complete(wrong) is False
+
+
 def test_objective_is_complete_intermediate_domain_is_milestone(monkeypatch):
     es = engagement_state
     st = es.EngagementState(objective="reach Domain Admin on essos.local")

@@ -41,6 +41,7 @@ async def run_headless_solve(
     model: str | None = None,
     mode: str = "auto",
     autonomous_solve: bool = True,
+    policy_mode: str | None = None,
     max_steps: int = 0,
     config: dict | None = None,
     timeout: int = 1800,
@@ -67,6 +68,7 @@ async def run_headless_solve(
 
     provider = (provider or _env("provider", "openai")).lower()
     model = (model or _env("model", "")).lower()
+    policy_mode = (policy_mode or _env("SAGE_POLICY_MODE", "llm")).lower()
 
     llm = Model(
         provider=provider,
@@ -77,6 +79,7 @@ async def run_headless_solve(
         agent_task_id="",
         mode=mode,
         autonomous_solve=autonomous_solve,
+        policy_mode=policy_mode,
         max_steps=max_steps,
         response_emitter=_noop_emitter,
         operation_id=operation_id,

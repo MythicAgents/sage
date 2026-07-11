@@ -7,8 +7,8 @@ Mythic response block with its own ``response_key`` — satisfying the response_
 (one key per assistant block) without pretending to token-stream. True token streaming is a
 follow-up that adds an ``on_llm_new_token`` hook feeding ``send_delta`` on a stable key.
 
-The turn's single terminal status (``send_complete(complete_request=True)``) is owned by the
-service's ``run_chat_turn`` wrapper, not this emitter — so exactly one terminal is emitted.
+The service finalizes the last visible assistant block with the turn's single terminal status,
+avoiding a separate empty completion row in the Mythic UI.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ class ChatStreamEmitter:
         self._request = request
         self._block = 0
         self._agent_text_block = 0
+        self.last_response_key = ""
+        self.last_content = ""
 
     async def __call__(self, formatted_message: str) -> bool:
         # Mirror the RPC path's empty-guard: a blank block would create an empty UI part.
@@ -39,6 +41,8 @@ class ChatStreamEmitter:
         response_key = f"assistant:{self._request.RequestID}:{self._block}"
         try:
             await self._chat.send_text(self._request, response_key, content=formatted_message)
+            self.last_response_key = response_key
+            self.last_content = formatted_message
             return True
         except Exception:
             # The single-egress caller (_stream_message_to_mythic) already logs; return False so it

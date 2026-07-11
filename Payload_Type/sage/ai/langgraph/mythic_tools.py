@@ -3144,6 +3144,11 @@ class MythicTools:
                         if isinstance(visibility_context, dict)
                         else (_task_visibility_context.get() or {})
                     )
+                    policy_decision = (
+                        context.get("policy_decision")
+                        if isinstance(context.get("policy_decision"), dict)
+                        else {}
+                    )
                     base_event = {
                         "event_id": event_id,
                         "source": "mythic",
@@ -3153,6 +3158,9 @@ class MythicTools:
                         "parameters": parameters,
                         "capability": self._capability_text(context.get("capability")),
                         "purpose": self._capability_text(context.get("purpose")),
+                        "episode_id": self._capability_text(policy_decision.get("episode_id")),
+                        "decision_id": self._capability_text(policy_decision.get("decision_id")),
+                        "policy_mode": self._capability_text(policy_decision.get("policy_mode")),
                     }
                     await self._notify_execution_observer({**base_event, "status": "started"})
                     try:
@@ -4993,6 +5001,14 @@ class MythicTools:
                 hops=list(getattr(self, "_engagement_hops", []) or []),
                 graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
             )
+            evidence = dict(evidence or {})
+            action_intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+            policy_decision = action_intent.get("policy_decision")
+            if isinstance(policy_decision, dict):
+                evidence.setdefault("episode_id", self._capability_text(policy_decision.get("episode_id")))
+                evidence.setdefault("decision_id", self._capability_text(policy_decision.get("decision_id")))
+                evidence.setdefault("policy_mode", self._capability_text(policy_decision.get("policy_mode")))
+                evidence.setdefault("candidate_hash", self._capability_text(policy_decision.get("candidate_hash")))
             updated, verification = capabilities.record_capability_result(
                 state,
                 action,
@@ -5699,6 +5715,11 @@ class MythicTools:
                     "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
                     "produces": list(getattr(command_obj, "produces", []) or []),
                     "consumes": list(getattr(command_obj, "consumes", []) or []),
+                    "policy_decision": (
+                        dict(input_values.get("policy_decision"))
+                        if isinstance(input_values.get("policy_decision"), dict)
+                        else dict((getattr(action_obj, "intent", {}) or {}).get("policy_decision") or {})
+                    ),
                 }
                 self._deterministic_capability_command_contexts[
                     _capability_command_key(command_name, command_params)
@@ -7310,6 +7331,7 @@ class MythicTools:
                 "domain": account_domain,
                 "account": account,
                 "callback_id": str(callback_id),
+                "policy_decision": dict(inputs.get("policy_decision") or {}),
             },
             verifier={},
             reason="refresh current callback token before account-scoped capability execution",
@@ -7317,6 +7339,7 @@ class MythicTools:
         )
         context_inputs = {
             "domain": account_domain,
+            "policy_decision": dict(inputs.get("policy_decision") or {}),
             "account": account,
             "callback_id": str(callback_id),
             "force_revalidate": True,
@@ -7523,9 +7546,11 @@ class MythicTools:
             capability_name=capability_name,
         )
         try:
+            command_context = self._deterministic_capability_command_context(command_name, parameters)
             visibility_token = _task_visibility_context.set({
                 "capability": capability_name,
                 "purpose": command_obj.get("purpose"),
+                "policy_decision": dict(command_context.get("policy_decision") or {}),
             })
             try:
                 output = await self.issue_task_and_waitfor_task_output(

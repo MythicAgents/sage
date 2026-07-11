@@ -30,6 +30,7 @@ def _bare_model(mode: str) -> Model:
     m.verbose = False
     m._controller_hitl_pending = None
     m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
     m._controller_hitl_objective = ""
     m.llm = None
     m._get_base_chat_model = lambda: None
@@ -342,3 +343,33 @@ def test_controller_hitl_stale_approval_never_authorizes_different_action():
 
     assert m._controller_hitl_pending["key"] == second["key"]
     assert m._controller_hitl_approved_key == ""
+
+
+def test_controller_hitl_key_ignores_policy_provenance_but_binds_action():
+    m = _controller_hitl_model()
+    payload = {
+        "name": "dcsync-account",
+        "target": "domain=lab.local;account=alice",
+        "preconditions": ["ds-replication-rights:lab.local"],
+        "effects": ["creds:alice@lab.local"],
+        "intent": {"policy_decision": {"episode_id": "one", "decision_id": "first"}},
+    }
+    first = m._controller_hitl_capability_request(
+        payload,
+        {"callback_id": "3", "policy_decision": {"timestamp": "one"}},
+        "obtain credentials for alice@lab.local",
+    )
+    payload["intent"]["policy_decision"] = {"episode_id": "two", "decision_id": "second"}
+    second = m._controller_hitl_capability_request(
+        payload,
+        {"callback_id": "3", "policy_decision": {"timestamp": "two"}},
+        "obtain credentials for alice@lab.local",
+    )
+    changed = m._controller_hitl_capability_request(
+        {**payload, "target": "domain=lab.local;account=bob"},
+        {"callback_id": "3", "policy_decision": {"timestamp": "two"}},
+        "obtain credentials for alice@lab.local",
+    )
+
+    assert first["key"] == second["key"]
+    assert first["key"] != changed["key"]

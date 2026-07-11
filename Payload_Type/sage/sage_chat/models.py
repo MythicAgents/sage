@@ -68,7 +68,8 @@ _CONFIG_OPTIONS = [
         Type=OptType.Choice,
         Description=(
             "Supervised keeps scoped questions on the multi-agent supervisor and runs explicit objectives "
-            "through the deterministic solver with approvals. Autonomous runs the same solver unattended."
+            "through the policy-selected execution kernel with approvals. Autonomous runs the same kernel "
+            "unattended."
         ),
         Required=False,
         DefaultValue="supervised",
@@ -88,6 +89,21 @@ _CONFIG_OPTIONS = [
         ),
         Required=False,
         DefaultValue=False,
+    ),
+    ChatModelConfigurationOption(
+        Name="policy_mode",
+        DisplayName="Policy",
+        Type=OptType.Choice,
+        Description=(
+            "LLM makes each semantic capability decision. Symbolic preserves the deterministic priority "
+            "baseline and is labeled separately in traces and evaluations."
+        ),
+        Required=False,
+        DefaultValue="llm",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="LLM", Value="llm"),
+            ChatModelConfigurationOptionChoice(Label="Symbolic Baseline", Value="symbolic"),
+        ],
     ),
     ChatModelConfigurationOption(
         Name="max_steps",

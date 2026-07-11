@@ -5714,6 +5714,18 @@ def _credential_target_accounts(
         if _dcsync_account_target_allowed(account, domain, achieved):
             explicit_objective_targets.add((domain, account))
             targets.setdefault((domain, account), f"objective:{match.group(0)}")
+    try:
+        try:
+            from . import engagement_state as _es
+        except ImportError:
+            import engagement_state as _es
+        natural_targets = _es._objective_credential_targets(objective)
+    except Exception:
+        natural_targets = set()
+    for account, domain in sorted(natural_targets):
+        if _dcsync_account_target_allowed(account, domain, achieved):
+            explicit_objective_targets.add((domain, account))
+            targets.setdefault((domain, account), f"objective:credential-material-for:{account}@{domain}")
     if downstream_targets:
         targets = {
             key: source

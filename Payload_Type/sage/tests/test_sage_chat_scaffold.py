@@ -86,7 +86,8 @@ def test_response_key_discipline():
     texts = [e for e in chat.emissions if e["kind"] == "text"]
     assert [t["response_key"] for t in texts] == ["assistant:9:1", "assistant:9:2"]
     complete = [e for e in chat.emissions if e["kind"] == "complete"][0]
-    assert complete["response_key"] == "assistant:9:turn"
+    assert complete["response_key"] == "assistant:9:2"
+    assert complete["content"] == "block-b"
     assert complete["complete_request"] is True
 
 
@@ -147,6 +148,21 @@ def test_emitter_skips_empty_and_increments_blocks():
     assert _run(emitter("a")) is True
     assert _run(emitter("b")) is True
     assert sent == [("assistant:3:1", "a"), ("assistant:3:2", "b")]
+    assert emitter.last_response_key == "assistant:3:2"
+    assert emitter.last_content == "b"
+
+
+def test_no_assistant_output_uses_nonempty_terminal_fallback():
+    chat = _DriverChat(_FakeModel(stream=()))
+    _run(chat.chat(build_chat_request("quiet turn", channel_id=5, request_id=13)))
+
+    assert chat.terminal_emissions == [{
+        "kind": "complete",
+        "response_key": "assistant:13:turn",
+        "content": "Completed.",
+        "metadata": {"channel_id": 5},
+        "complete_request": True,
+    }]
 
 
 def test_emit_tool_use_produces_tool_use_card():
@@ -1024,8 +1040,7 @@ def test_refresh_auth_context_relogins_only_on_token_change():
 
 
 # --------------------------------------------------------------------------------------
-# Full legacy config-option parity (restored: verbose, autonomous_solve, API_KEY,
-# API_ENDPOINT, AWS quad) — see sage_chat/models.py
+# Full config-option parity (restored legacy controls plus explicit policy identity).
 # --------------------------------------------------------------------------------------
 
 # The complete set the operator saw when "creating Sage" as an agent, minus the per-turn `prompt`
@@ -1033,7 +1048,7 @@ def test_refresh_auth_context_relogins_only_on_token_change():
 # `verbose` is deliberately NOT here — the chat container always runs full-detail (cards ARE the
 # verbose view), so there is no operator verbose toggle.
 _EXPECTED_CONFIG_OPTIONS = {
-    "provider", "model", "mode", "autonomous_solve", "max_steps",
+    "provider", "model", "mode", "autonomous_solve", "policy_mode", "max_steps",
     "system_prompt", "API_ENDPOINT", "API_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
 }
@@ -1084,6 +1099,12 @@ def test_autonomous_solve_toggle_independent_of_mode():
     # the explicit toggle enables autonomy even when mode stays supervised
     kwargs = build_model_kwargs(build_chat_request("hi", config={"autonomous_solve": "true"}))
     assert kwargs["mode"] == "supervised" and kwargs["autonomous_solve"] is True
+
+
+def test_policy_mode_defaults_llm_and_accepts_symbolic():
+    assert build_model_kwargs(build_chat_request("hi"))["policy_mode"] == "llm"
+    kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "symbolic"}))
+    assert kwargs["policy_mode"] == "symbolic"
 
 
 def test_api_key_and_endpoint_resolve_from_config(monkeypatch):
@@ -1539,12 +1560,13 @@ def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
 
     monkeypatch.setattr(headless_solver, "run_headless_solve", _fake_run)
     solve = live_seams.make_headless_solver("CLIENT", engagement_id="Operation_Chimera_1",
-                                            operation_id=7, timeout=99, max_steps=0)
+                                            operation_id=7, timeout=99, max_steps=0, policy_mode="symbolic")
     assert solve("compromise CORP") == "completed"
     assert calls["objective"] == "compromise CORP"
     assert calls["client"] == "CLIENT"
     assert calls["engagement_id"] == "Operation_Chimera_1"
     assert calls["operation_id"] == 7
+    assert calls["policy_mode"] == "symbolic"
 
 
 def test_build_channel_metadata_live_counts(monkeypatch):
@@ -1561,6 +1583,7 @@ def test_build_channel_metadata_live_counts(monkeypatch):
         model = "claude-sonnet-5"
         mode = "auto"
         _autonomous_solve = True
+        policy_mode = "llm"
 
     items = {i["key"]: i for i in build_channel_metadata(_M())["items"]}
     assert items["mcp_tools"]["value"] == 13
@@ -1569,10 +1592,35 @@ def test_build_channel_metadata_live_counts(monkeypatch):
     assert items["bloodhound"]["value"] is True
     assert items["bloodhound"]["display_value"] == "connected"
     assert "mythic_tools" in items                       # scope-usable Mythic tool count present
-    # Model / Mode / Autonomous render as accented ("info") chips so they stand out from the neutral ones.
+    # Policy leads the operational controls; state-aware colors make the three controls distinguishable.
     assert items["cfg_model"]["value"] == "claude-sonnet-5" and items["cfg_model"]["color"] == "info"
-    assert items["cfg_mode"]["value"] == "auto" and items["cfg_mode"]["color"] == "info"
-    assert items["cfg_autonomous"]["display_value"] == "on" and items["cfg_autonomous"]["color"] == "info"
+    assert items["cfg_policy"]["value"] == "llm" and items["cfg_policy"]["color"] == "success"
+    assert items["cfg_policy"]["order"] < items["cfg_mode"]["order"] < items["cfg_autonomous"]["order"]
+    assert items["cfg_mode"]["value"] == "auto" and items["cfg_mode"]["color"] == "warning"
+    assert items["cfg_autonomous"]["display_value"] == "on" and items["cfg_autonomous"]["color"] == "warning"
+
+
+def test_channel_metadata_default_control_colors_are_distinct(monkeypatch):
+    from sage_chat.metadata import build_channel_metadata
+    from ai import mcp
+
+    monkeypatch.setattr(mcp.MCPManager, "get_tools_summary", lambda: {}, raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", lambda: [], raising=False)
+
+    class _M:
+        model = "test"
+        mode = "supervised"
+        _autonomous_solve = False
+        policy_mode = "llm"
+
+    items = {item["key"]: item for item in build_channel_metadata(_M())["items"]}
+    colors = [
+        items["cfg_policy"]["color"],
+        items["cfg_mode"]["color"],
+        items["cfg_autonomous"]["color"],
+    ]
+    assert colors == ["success", "info", "neutral"]
+    assert len(set(colors)) == 3
 
 
 def test_scope_usable_mythic_tools_reflects_disabled():

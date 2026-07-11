@@ -1693,7 +1693,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, policy_mode: str = "llm", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -1733,6 +1733,11 @@ class Model:
         self.model = model
         self.mode = mode if mode in ("auto", "supervised") else "supervised"
         self._autonomous_solve = bool(autonomous_solve)
+        self.policy_mode = str(policy_mode or "llm").strip().casefold()
+        if self.policy_mode not in ("llm", "symbolic"):
+            self.policy_mode = "llm"
+        self._policy_model_calls = 0
+        self._policy_episode_id = ""
         self.graph = None
         self.verbose = False
         self.is_interactive = False
@@ -1756,8 +1761,9 @@ class Model:
         self._objective_completion_report_streamed = False
         self._controller_hitl_pending = None
         self._controller_hitl_approved_key = ""
+        self._controller_hitl_approved_pending = None
         self._controller_hitl_objective = ""
-        # A supervised chat turn can opt into the deterministic controller without globally enabling
+        # A supervised chat turn can opt into the policy-selected execution kernel without globally enabling
         # autonomous_solve. This flag stays true across controller-native approval pauses, then is reset
         # before the next fresh operator turn.
         self._supervised_objective_active = False
@@ -1849,11 +1855,10 @@ class Model:
         if not self.config:
             logger.error("Model configuration is missing a config.")
             return None
-        elif not self.config.get("configurable"):
+        cfg = self.config.get("configurable")
+        if cfg is None:
             logger.error("Model configuration is missing 'configurable' settings.")
             return None
-        else:
-            cfg = self.config.get("configurable")
 
         llm = None
         if self.provider.lower() == "bedrock" and cfg is not None:
@@ -1875,16 +1880,22 @@ class Model:
                 return None
             logger.debug(f"Initializing Bedrock model with provider={self.provider}, model={self.model}, aws_region={region}")
             llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
-        elif cfg is not None and cfg.get("api_key"):
-            if cfg.get("base_url"):
-                logger.debug(f"Initializing model with provider={self.provider}, model={self.model}, base_url={cfg.get('base_url')}")
-                llm = init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"), base_url=cfg.get("base_url"))
-            else:
-                logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and api_key")
-                llm = init_chat_model(model_provider=self.provider, model=self.model, api_key=cfg.get("api_key"))
         else:
-            logger.debug(f"Initializing model with provider={self.provider}, model={self.model} and no api_key")
-            llm = init_chat_model(model_provider=self.provider, model=self.model)
+            model_kwargs: dict[str, Any] = {}
+            if cfg.get("api_key"):
+                model_kwargs["api_key"] = cfg["api_key"]
+            if cfg.get("base_url"):
+                model_kwargs["base_url"] = cfg["base_url"]
+            logger.debug(
+                f"Initializing model with provider={self.provider}, model={self.model}, "
+                f"api_key={'configured' if 'api_key' in model_kwargs else 'provider default'}, "
+                f"base_url={model_kwargs.get('base_url', 'provider default')}"
+            )
+            llm = init_chat_model(
+                model_provider=self.provider,
+                model=self.model,
+                **model_kwargs,
+            )
 
         # Legacy: monkeypatch langchain_openai's message conversion to strip blank text blocks. NOTE this only
         # affects the ChatOpenAI / LiteLLM-proxy provider path — it is a NO-OP for native langchain-aws
@@ -3647,10 +3658,30 @@ class Model:
         try:
             if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
                 return None
+            objective = str(getattr(state, "objective", "") or "").strip()
+            credential_targets = _es._objective_credential_targets(objective)
+            if credential_targets and _es.objective_effects_complete(state):
+                achieved = set(state.achieved_effects())
+                evidence = []
+                for account, domain in sorted(credential_targets):
+                    for effect in sorted(achieved):
+                        if _es._credential_effect_satisfied(account, domain, {effect}):
+                            evidence.append(effect)
+                            break
+                lines = ["Objective complete: verified credential material is recorded."]
+                if objective:
+                    lines.append(f"Objective: {objective}")
+                if evidence:
+                    lines.append("Proof:")
+                    lines.extend(f"- `{effect}`" for effect in evidence)
+                lines.append(
+                    "Sage is stopping because the target objective is satisfied; "
+                    "no further capability will be executed."
+                )
+                return "\n".join(lines)
             candidates = _es.objective_completion_candidates(state)
             if not candidates:
                 return None
-            objective = str(getattr(state, "objective", "") or "").strip()
             targets = {str(t).casefold() for t in _es._objective_target_domains(objective)}
             if targets:
                 candidates = [
@@ -3832,20 +3863,20 @@ class Model:
         return ""
 
     def _controller_owned_solve(self) -> bool:
-        """Whether deterministic controller code owns the current solve."""
+        """Whether the bounded execution kernel owns the current solve."""
         return bool(
             getattr(self, "_autonomous_solve", False)
             or getattr(self, "_supervised_objective_active", False)
         )
 
     def _should_use_controller(self, is_interactive: bool, prompt: Any = "") -> bool:
-        """Whether the deterministic controller should handle this solve.
+        """Whether the policy-selected execution kernel should handle this solve.
 
         Existing autonomous solves keep their first-turn behavior. A supervised chat objective turn is the
         exception: it may begin on an already-open chat session because `is_interactive` there means "reused
         channel", not "approval response". Pending approvals are routed before this method is reached.
 
-        AUTO-MODE INITIATION GATE (default-deny): the deterministic controller drives offensive execution off
+        AUTO-MODE INITIATION GATE (default-deny): the execution kernel drives offensive execution off
         the observed range state (`capabilities.actions_from_state`), so ceding control to it on a turn that is
         NOT an explicit objective means the ENVIRONMENT — not an authorized operator objective — starts the
         attack. A greeting ("hello") on a pre-collected range would otherwise begin executing. We therefore
@@ -3865,11 +3896,11 @@ class Model:
             if self._looks_like_explicit_objective_prompt(_coerce_prompt_text(prompt)):
                 return True
             # Observable decline (not a silent fallthrough): the turn is not an explicit objective, so the
-            # deterministic controller does NOT initiate; the normal supervisor graph handles it conversationally
+            # execution kernel does NOT initiate; the normal supervisor graph handles it conversationally
             # and can still ask the operator to restate the objective.
             logger.info(
                 "Auto-mode initiation gate DECLINED: first turn is not an explicit engagement objective; "
-                "handling via the supervisor graph instead of the deterministic controller."
+                "handling via the supervisor graph instead of the execution kernel."
             )
             return False
         return bool(self._controller_hitl_enabled())
@@ -3884,9 +3915,26 @@ class Model:
         )
 
     def _controller_hitl_key(self, kind: str, args: dict[str, Any]) -> str:
-        """Stable fingerprint for the exact controller move shown to the operator."""
+        """Stable fingerprint for the exact controller move shown to the operator.
+
+        Policy provenance is intentionally excluded: a resumed controller rebuilds its
+        episode/decision IDs, but those audit fields do not change the capability the
+        operator approved. Concrete target, preconditions, effects, callback, and inputs
+        remain bound into the fingerprint.
+        """
+        def approval_identity(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    str(key): approval_identity(item)
+                    for key, item in value.items()
+                    if str(key) != "policy_decision"
+                }
+            if isinstance(value, (list, tuple, set)):
+                return [approval_identity(item) for item in value]
+            return _jsonable_value(value)
+
         return json.dumps(
-            {"kind": str(kind or ""), "args": _jsonable_value(args or {})},
+            {"kind": str(kind or ""), "args": approval_identity(args or {})},
             sort_keys=True,
             separators=(",", ":"),
             default=str,
@@ -3990,12 +4038,14 @@ class Model:
         key = str(pending.get("key") or "")
         if key and getattr(self, "_controller_hitl_approved_key", "") == key:
             self._controller_hitl_approved_key = ""
+            self._controller_hitl_approved_pending = None
             self._controller_hitl_pending = None
             logger.info(f"HITL controller approval consumed for {pending.get('tool', 'unknown')}")
             return
 
         # A stale approval must never authorize a different freshly-selected action.
         self._controller_hitl_approved_key = ""
+        self._controller_hitl_approved_pending = None
         self._controller_hitl_pending = pending
         await self._flush_controller_verbose_events()
         await self._surface_controller_hitl_request(pending)
@@ -4020,6 +4070,7 @@ class Model:
 
         if not approved:
             self._controller_hitl_approved_key = ""
+            self._controller_hitl_approved_pending = None
             self._controller_hitl_objective = ""
             self._supervised_objective_active = False
             msg = (
@@ -4034,6 +4085,7 @@ class Model:
             return ""
 
         self._controller_hitl_approved_key = key
+        self._controller_hitl_approved_pending = pending
         self._controller_hitl_objective = objective
         self._seed_autonomous_objective(objective)
         logger.info(f"HITL controller resume: approve for {tool}")
@@ -4192,13 +4244,25 @@ class Model:
             if getattr(self, "_controller_verbose_stream_tail", None) is tail:
                 self._controller_verbose_stream_tail = None
 
-    async def _run_autonomous_controller(self, prompt: str) -> str:
-        """Run the deterministic AutonomousController for a feature-flagged autonomous solve.
+    async def _controller_llm_policy_decide(self, request: dict[str, Any]) -> Any:
+        """Ask the configured model for exactly one semantic capability decision."""
+        if self.llm is None:
+            raise RuntimeError("configured LLM is unavailable")
+        self._policy_model_calls = int(getattr(self, "_policy_model_calls", 0) or 0) + 1
+        return await self.llm.ainvoke([
+            SystemMessage(content=(
+                "Select the next semantic capability for the stated objective from the supplied admissible "
+                "candidates. Return JSON only. Use disposition=select with candidate_index, or stop/ask. "
+                "Do not invent candidates, commands, or additional steps."
+            )),
+            HumanMessage(content=json.dumps(request, sort_keys=True)),
+        ])
 
-        OWNS the observe -> frontier -> select -> execute -> verify -> stop cycle in deterministic code; the LLM
-        is NOT in the control loop. Returns a terminal report (also streamed to Mythic). Each seam emits a
-        runtime FIRE-LOG so we can PROVE the real boundary fired (the C2 'green tests, dead seam' lesson — the
-        controller's unit tests use fakes; this proves execute_capability's STRING return actually flows here).
+    async def _run_autonomous_controller(self, prompt: str) -> str:
+        """Run the policy-selected AutonomousController execution kernel.
+
+        The selected policy owns semantic capability choice. Deterministic code owns observe, execute, verify,
+        budgets, retries, and stop handling. Returns a terminal report (also streamed to Mythic).
 
         Collection is deterministic too: initial current-forest collection runs when no verified graph exists for
         that domain, then later collection is allowed only when the real capability frontier is empty and there is
@@ -4209,15 +4273,22 @@ class Model:
             from . import autonomous_controller as _ctrl
             from . import capabilities as _cap
             from . import engagement_state as _es
+            from . import policy as _policy
         except ImportError:
             import autonomous_controller as _ctrl
             import capabilities as _cap
             import engagement_state as _es
+            import policy as _policy
 
         if self._controller_hitl_enabled():
             self._controller_hitl_objective = str(prompt or "")
         self._controller_verbose_stream_tail = None
         resumed_after_approval = bool(getattr(self, "_controller_hitl_approved_key", ""))
+        approved_pending = (
+            dict(getattr(self, "_controller_hitl_approved_pending", {}) or {})
+            if resumed_after_approval
+            else {}
+        )
 
         def fire(msg: str, *, operator_message: str | None = None) -> None:
             logger.info(f"[autonomous-controller] {msg}")
@@ -4251,9 +4322,18 @@ class Model:
             )
             return state
 
-        async def execute(action):
+        async def execute(action, decision=None):
             payload = _capability_action_payload(action)
             inputs = _autonomous_capability_inputs(action, snap["state"])
+            decision_context = (
+                decision.to_dict() if hasattr(decision, "to_dict")
+                else dict(decision) if isinstance(decision, dict)
+                else {}
+            )
+            if decision_context:
+                payload["intent"] = dict(payload.get("intent") or {})
+                payload["intent"]["policy_decision"] = decision_context
+                inputs["policy_decision"] = decision_context
             pending = self._controller_hitl_capability_request(payload, inputs, prompt)
             if (
                 not self._controller_hitl_enabled()
@@ -4331,7 +4411,7 @@ class Model:
                 snap["collection_request"] = None
                 return False
 
-        async def collect(state):
+        async def collect(state, decision=None):
             request = snap.get("collection_request")
             snap["collection_request"] = None
             pending = self._controller_hitl_collection_request(request, prompt)
@@ -4352,13 +4432,31 @@ class Model:
             activity_token = MCPManager.set_execution_activity(activity) if activity is not None else None
             result = None
             activity_status = "finished"
+            visibility_token = None
             try:
+                decision_context = (
+                    decision.to_dict() if hasattr(decision, "to_dict")
+                    else dict(decision) if isinstance(decision, dict)
+                    else {}
+                )
+                if decision_context:
+                    try:
+                        from . import mythic_tools as _mt
+                    except ImportError:
+                        import mythic_tools as _mt
+                    visibility_token = _mt._task_visibility_context.set({
+                        "capability": "collect-graph",
+                        "purpose": str(getattr(request, "reason", "") or ""),
+                        "policy_decision": decision_context,
+                    })
                 result = await self._controller_collect(state, request=request)
                 return result
             except BaseException:
                 activity_status = "error"
                 raise
             finally:
+                if visibility_token is not None:
+                    _mt._task_visibility_context.reset(visibility_token)
                 await self._flush_controller_verbose_events()
                 if activity_token is not None:
                     MCPManager.reset_execution_activity(activity_token)
@@ -4370,6 +4468,8 @@ class Model:
 
         def objective_met(state):
             try:
+                if _es.objective_effects_complete(state):
+                    return True
                 if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
                     return False
                 cands = _es.objective_completion_candidates(state)
@@ -4396,6 +4496,67 @@ class Model:
         )
 
         objective_text = str(prompt or "").strip()
+        self._policy_episode_id = _policy.new_episode_id()
+        policy_mode = _policy.normalize_policy_mode(
+            getattr(self, "policy_mode", _policy.POLICY_SYMBOLIC),
+            default=_policy.POLICY_SYMBOLIC,
+        )
+        self.policy_mode = policy_mode
+        if policy_mode == _policy.POLICY_SYMBOLIC:
+            policy_backend = _policy.SymbolicPolicy()
+        else:
+            approved_selection_consumed = False
+
+            async def policy_decide(request: dict[str, Any]) -> Any:
+                nonlocal approved_selection_consumed
+                if approved_pending and not approved_selection_consumed:
+                    approved_selection_consumed = True
+                    candidates = request.get("candidates") if isinstance(request.get("candidates"), list) else []
+                    kind = str(approved_pending.get("kind") or "")
+                    args = approved_pending.get("args") if isinstance(approved_pending.get("args"), dict) else {}
+                    match_index = None
+                    if kind == "capability":
+                        approved = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+                        for candidate in candidates:
+                            if not isinstance(candidate, dict):
+                                continue
+                            if (
+                                str(candidate.get("name") or "") == str(approved.get("name") or "")
+                                and str(candidate.get("target") or "") == str(approved.get("target") or "")
+                                and list(candidate.get("preconditions") or []) == list(approved.get("preconditions") or [])
+                                and list(candidate.get("effects") or []) == list(approved.get("effects") or [])
+                            ):
+                                match_index = candidate.get("index")
+                                break
+                    elif kind == "collection":
+                        collection_key = str(args.get("collection_key") or "")
+                        for candidate in candidates:
+                            if (
+                                isinstance(candidate, dict)
+                                and str(candidate.get("name") or "") == "collect-graph"
+                                and str(candidate.get("target") or "") == collection_key
+                            ):
+                                match_index = candidate.get("index")
+                                break
+                    if isinstance(match_index, int):
+                        return {
+                            "disposition": "select",
+                            "candidate_index": match_index,
+                            "rationale": "resume the exact operator-approved action after deterministic revalidation",
+                            "confidence": 1.0,
+                            "expected_evidence": "the approved capability's declared effects",
+                        }
+                    return {
+                        "disposition": "stop",
+                        "rationale": "the operator-approved action is no longer admissible in the observed state",
+                    }
+                return await self._controller_llm_policy_decide(request)
+
+            policy_backend = _policy.LLMPolicy(
+                policy_decide if getattr(self, "llm", None) is not None else None,
+                provider=getattr(self, "provider", ""),
+                model_id=getattr(self, "model", ""),
+            )
         if resumed_after_approval:
             start_progress = (
                 "**Execution resumed**\n"
@@ -4407,7 +4568,8 @@ class Model:
             )
             start_progress = (
                 "**Execution started**\n"
-                f"Sage is pursuing `{objective_text}` using deterministic execution {approval_policy}."
+                f"Sage is pursuing `{objective_text}` using `{self.policy_mode}` policy selection and "
+                f"deterministic execution {approval_policy}."
             )
         fire(
             f"START (flagged) objective_seed='{(prompt or '')[:80]}' "
@@ -4421,6 +4583,9 @@ class Model:
             needs_collection=needs_collection,
             collect=collect,
             frontier_fn=_cap.actions_from_state,
+            policy_backend=policy_backend,
+            objective=objective_text,
+            episode_id=self._policy_episode_id,
             clock=clock,
             should_abort=lambda: bool(getattr(self, "_stop_requested", False)),  # operator kill switch between cycles
             config=cfg,
@@ -4465,6 +4630,7 @@ class Model:
         if self._controller_hitl_enabled():
             self._controller_hitl_pending = None
             self._controller_hitl_approved_key = ""
+            self._controller_hitl_approved_pending = None
             self._controller_hitl_objective = ""
             self._supervised_objective_active = False
         return report
@@ -6104,7 +6270,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.info(f"HITL interrupt pending on thread {thread_id} — routing operator reply to approve/deny resume")
             return await self.handle_hitl_resume(prompt, thread_id)
 
-        # Fresh turn only: supervised chat objective prompts borrow the deterministic controller while scoped
+        # Fresh turn only: supervised chat objective prompts use the bounded execution kernel while scoped
         # questions remain on the normal supervisor graph. Leave the flag alive across a controller-native HITL
         # pause so the next approval can resume the exact pending move.
         self._supervised_objective_active = self._supervised_objective_controller_enabled_for_prompt(prompt)
@@ -6193,9 +6359,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.info("Casual greeting routed to one tool-free Generalist turn")
             return await self._run_generalist_only_turn(prompt)
 
-        # Deterministic controller. For autonomous auto one-shots, supervised autonomous chat, or an explicit
+        # Policy-selected execution kernel. For autonomous auto one-shots, supervised autonomous chat, or an explicit
         # supervised chat objective turn with controller-native HITL, OWN the
-        # observe->frontier->select->execute->verify->stop cycle in deterministic code, bypassing the
+        # observe->policy-select->execute->verify->stop cycle in bounded code, bypassing the
         # Supervisor/worker astream negotiation entirely. SAGE_AUTONOMOUS_CONTROLLER=0 is the rollback path.
         # SAFETY GATE: supervised controller execution is chat-only and pauses inside the controller seams before
         # any capability or collection move; query remains one-shot and falls through to the legacy graph HITL

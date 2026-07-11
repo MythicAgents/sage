@@ -850,6 +850,21 @@ def test_credential_target_fact_unlocks_dcsync_account_with_replication_rights()
     assert "credential-target:alice@lab.local" in action.source_facts
 
 
+def test_natural_credential_objective_unlocks_matching_dcsync_account():
+    state = es.EngagementState(
+        objective="Engagement objective: obtain verified credential material for alice@lab.local.",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[_hop("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name == "dcsync-account"]
+
+    assert len(dcsync) == 1
+    assert dcsync[0].target == "domain=lab.local;account=alice"
+    assert dcsync[0].effects == ["creds:alice@lab.local"]
+
+
 def test_da_with_live_context_unlocks_dcsync_account_target():
     state = es.EngagementState(
         objective="credential-target:alice@root.local",

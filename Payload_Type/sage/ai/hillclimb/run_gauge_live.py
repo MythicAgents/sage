@@ -49,6 +49,7 @@ class Config:
     # membership changes have time to propagate before scoring — returns True the instant they appear.
     da_settle_timeout: int = 300
     da_settle_interval: int = 20
+    policy_mode: str = "llm"
 
     @property
     def results_path(self) -> Path:
@@ -189,7 +190,8 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
             _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or cfg.engagement_op
             print(f"[harness/{scenario_name}] SAGE_EVAL_HEADLESS=1 → in-process solve (engagement={_eng})", flush=True)
             solve = live_seams.make_headless_solver(client, engagement_id=_eng,
-                                                    timeout=cfg.solve_timeout, max_steps=0)
+                                                    timeout=cfg.solve_timeout, max_steps=0,
+                                                    policy_mode=cfg.policy_mode)
         else:
             solve = live_seams.make_native_chat_solver(client, timeout=cfg.solve_timeout)
         _start = time.time()
@@ -223,9 +225,17 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     # the model from Sage's .env (bare via build_bare_runner -> load_sage_defaults; harness = whatever Sage
     # is running). When a bare-side --model override is added, record THAT for the bare side instead.
     _defs = live_seams.load_sage_defaults()
+    card.policy_mode = cfg.policy_mode if side == "harness" else "llm"
+    card.model_provider = str(_defs.get("provider") or "")
+    card.model_id = str(_defs.get("model") or "")
     _now = time.time()
     rec = {"side": side, "scenario": scenario_name,
            "model": _defs.get("model"), "provider": _defs.get("provider"),
+           "policy_mode": card.policy_mode,
+           "request_completed": card.request_completed,
+           "objective_proven": card.objective_proven,
+           "clean_stop": card.clean_stop,
+           "controller_terminal_reason": card.controller_terminal_reason,
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
@@ -309,6 +319,8 @@ def main(argv=None) -> int:
     r.add_argument("--apollo-cb", type=int, default=None)
     r.add_argument("--solve-timeout", type=int, default=None,
                    help="seconds to wait for the harness solve (default 1800=30min); raise for full solves")
+    r.add_argument("--policy-mode", choices=["llm", "symbolic"], default="llm",
+                   help="policy identity of the running Sage harness")
     r.add_argument("--da-settle-timeout", type=int, default=None,
                    help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
@@ -350,6 +362,8 @@ def main(argv=None) -> int:
         cfg.solve_timeout = args.solve_timeout
     if getattr(args, "da_settle_timeout", None) is not None:
         cfg.da_settle_timeout = args.da_settle_timeout
+    if getattr(args, "policy_mode", None):
+        cfg.policy_mode = args.policy_mode
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)

@@ -6,10 +6,11 @@ exactly one terminal status.
 
 Always-terminal (the safety-critical invariant, Section 6): every request path ends with a
 terminal status so the channel never wedges. This is guaranteed in layers —
-``run_chat_turn`` sends ``complete(complete_request=True)`` when the handler returns non-None and
-``send_error(complete_request=True)`` on a handler exception, and the SDK's ``ChatRequestHandler``
-emits ``cancelled`` on ``CancelledError`` and ``error`` on any unhandled exception. This code's job
-is to use ``run_chat_turn`` correctly and never swallow ``CancelledError``.
+the handler finalizes the last visible assistant block with ``complete(complete_request=True)``;
+``run_chat_turn`` provides a non-empty fallback when no assistant block was emitted and sends
+``send_error(complete_request=True)`` on a handler exception. The SDK's ``ChatRequestHandler``
+emits ``cancelled`` on ``CancelledError`` and ``error`` on any unhandled exception. This code's
+job is to use ``run_chat_turn`` correctly and never swallow ``CancelledError``.
 """
 
 from __future__ import annotations
@@ -140,7 +141,8 @@ class SageChat(Chat):
             # stable channel id. Never cache emitters across turns (Section 7 / Cody c). _hitl_card_pending
             # is reset each turn; the interrupt surface sets it True when it emits a channel-release card,
             # so we then return None and let run_chat_turn skip its own terminal completion.
-            model._response_emitter = ChatStreamEmitter(self, request)
+            stream_emitter = ChatStreamEmitter(self, request)
+            model._response_emitter = stream_emitter
             model._hitl_card_emitter = make_card_emitter(
                 self,
                 request,
@@ -199,7 +201,18 @@ class SageChat(Chat):
                 # A confirmation card already released this request (complete_request=False). Returning None
                 # tells run_chat_turn to send no terminal while the graph waits on disk.
                 return None
-            # Non-None → run_chat_turn auto-sends complete(complete_request=True): the terminal status.
+            if stream_emitter.last_response_key:
+                # Reuse the final visible block's key so Mythic updates it in place instead of creating
+                # a separate empty timestamp row for the request terminal.
+                await self.send_complete(
+                    request,
+                    stream_emitter.last_response_key,
+                    metadata=turn._metadata({"channel_id": request.ChannelID}),
+                    content=stream_emitter.last_content,
+                    complete_request=True,
+                )
+                return None
+            # No assistant text was emitted. Let run_chat_turn create a visible fallback terminal.
             return {"channel_id": request.ChannelID}
 
         await self.run_chat_turn(
@@ -207,4 +220,5 @@ class SageChat(Chat):
             _handler,
             response_key=f"assistant:{request.RequestID}:turn",
             model=request.Model,
+            complete_content="Completed.",
         )

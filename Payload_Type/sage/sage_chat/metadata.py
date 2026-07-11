@@ -87,15 +87,21 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     mode = str(getattr(model, "mode", "") or "supervised")
     model_name = str(getattr(model, "model", "") or "?")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
+    policy_mode = str(getattr(model, "policy_mode", "") or "llm")
+    policy_color = "success" if policy_mode == "llm" else "warning"
+    mode_color = "info" if mode == "supervised" else "warning"
+    autonomous_color = "warning" if autonomous else "neutral"
 
     items = [
         {"key": "cfg_model", "label": "Model", "value": model_name, "color": "info", "order": 1,
          "tooltip": "Configured inference model"},
-        {"key": "cfg_mode", "label": "Mode", "value": mode, "color": "info", "order": 2,
+        {"key": "cfg_policy", "label": "Policy", "value": policy_mode, "color": policy_color, "order": 2,
+         "tooltip": "Semantic capability selection backend"},
+        {"key": "cfg_mode", "label": "Mode", "value": mode, "color": mode_color, "order": 3,
          "click": "/mode", "click_confirmation_text": "Run /mode to show or change Sage's mode?",
          "tooltip": "Supervised or autonomous — click to run /mode"},
         {"key": "cfg_autonomous", "label": "Autonomous", "value": autonomous,
-         "display_value": "on" if autonomous else "off", "color": "info", "order": 3,
+         "display_value": "on" if autonomous else "off", "color": autonomous_color, "order": 4,
          "tooltip": "Autonomous solve forced this session"},
         {"key": "mythic_tools", "label": "Mythic Tools", "value": scope_usable_mythic_tools(model),
          "order": 5, "tooltip": "Mythic tools the current bot token can invoke (scope-gated)"},

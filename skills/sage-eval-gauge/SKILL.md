@@ -25,9 +25,8 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - **Orchestrated bare-vs-harness (OFFENSIVE — resets the lab per run; run DETACHED, ~1.5–2.5h/seed):**
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario child-da --side harness --seeds N --solve-timeout 5400 --go`
   (omit `--go` for a dry-run plan; the step cap auto-scales to `--solve-timeout`).
-  Add `--controller` to restart Sage with `SAGE_AUTONOMOUS_CONTROLLER=1` so the harness solve runs the
-  deterministic autonomous controller (`ai/langgraph/autonomous_controller.py`) instead of the Supervisor/worker
-  astream path — a clean A/B against the default.
+  The default harness policy is `llm`. Add `--policy-mode symbolic` for the labeled deterministic selection
+  baseline. Both modes use the same bounded execution kernel and verifiers.
 - **Stock GOAD one-shot proof (five independent clean seeds):**
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario cross-forest-objective --side harness --seeds 5 --solve-timeout 5400 --go`
   Each seed resets GOAD/Mythic/BloodHound/Sage state, creates a fresh locked chat channel, sends only

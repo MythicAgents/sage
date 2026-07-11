@@ -95,6 +95,15 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     autonomous_solve = mode == "auto" or _resolve_bool(
         config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False
     )
+    policy_mode = _resolve(
+        config,
+        secrets,
+        "policy_mode",
+        env_key="SAGE_POLICY_MODE",
+        default="llm",
+    ).lower()
+    if policy_mode not in ("llm", "symbolic"):
+        policy_mode = "llm"
 
     max_steps_raw = _resolve(config, secrets, "max_steps", env_key="max_steps", default="")
     try:
@@ -136,6 +145,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
         "agent_task_id": "",
         "mode": mode,
         "autonomous_solve": autonomous_solve,
+        "policy_mode": policy_mode,
         "max_steps": max_steps,
         "operation_id": request.OperationID,
         # Chat auth context (Section 8A P0): MythicTools mints a channel-scoped bot token from these.

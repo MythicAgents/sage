@@ -20,6 +20,7 @@ async def _nosleep(*_a, **_k):
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ai.langgraph import model  # noqa: E402
+from ai.langgraph import capabilities  # noqa: E402
 from ai.langgraph import engagement_state as es  # noqa: E402
 from ai.langgraph import mythic_tools as mt  # noqa: E402
 
@@ -88,6 +89,100 @@ def test_observe_none_halts_cleanly_without_crash():
     report = asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
     assert "halted_no_action" in report, report
     assert calls == []  # never executed anything without a state
+
+
+def test_llm_policy_decision_is_attached_to_capability_inputs():
+    calls = []
+    blocked_string = json.dumps({
+        "ok": False,
+        "verdict": "blocked",
+        "capability": "adcs-ca-private-key-export",
+        "reason": "stop after provenance probe",
+    })
+    m = _bare_model(blocked_string, _state_with_remote_exec(), calls)
+    m.policy_mode = "llm"
+    m.provider = "test"
+    m.model = "selector"
+
+    class FakeLLM:
+        async def ainvoke(self, _messages):
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "select",
+                    "candidate_index": 0,
+                    "rationale": "selected from the admissible frontier",
+                })
+            })()
+
+    m.llm = FakeLLM()
+    asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    payload, inputs = calls[0]
+    decision = inputs["policy_decision"]
+    assert decision["policy_mode"] == "llm"
+    assert decision["selected_capability"] == "adcs-ca-private-key-export"
+    assert decision["decision_id"].startswith("decision-")
+    assert payload["intent"]["policy_decision"]["decision_id"] == decision["decision_id"]
+
+
+def test_controller_resume_executes_exact_approved_action_without_second_llm_decision():
+    calls = []
+    events = []
+    state = _state_with_remote_exec()
+    m = _bare_model(
+        json.dumps({
+            "ok": False,
+            "verdict": "blocked",
+            "capability": "adcs-ca-private-key-export",
+            "reason": "stop after approved replay",
+        }),
+        state,
+        calls,
+    )
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "llm"
+    m.provider = "test"
+    m.model = "selector"
+    m._controller_hitl_pending = None
+    m._controller_hitl_objective = state.objective
+
+    original_execute = m.mythic_client.execute_capability
+
+    async def ordered_execute(payload, inputs):
+        events.append("execute")
+        return await original_execute(payload, inputs)
+
+    m.mythic_client.execute_capability = ordered_execute
+
+    class RecordingLLM:
+        async def ainvoke(self, _messages):
+            events.append("llm")
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "stop",
+                    "rationale": "stop after the approved replay",
+                })
+            })()
+
+    m.llm = RecordingLLM()
+    action = capabilities.actions_from_state(state)[0]
+    payload = model._capability_action_payload(action)
+    inputs = model._autonomous_capability_inputs(action, state)
+    payload["intent"]["policy_decision"] = {"decision_id": "original"}
+    inputs["policy_decision"] = {"decision_id": "original"}
+    pending = m._controller_hitl_capability_request(payload, inputs, state.objective)
+    m._controller_hitl_approved_pending = pending
+    m._controller_hitl_approved_key = pending["key"]
+
+    report = asyncio.run(m._run_autonomous_controller(state.objective))
+
+    assert len(calls) == 1
+    assert calls[0][0]["name"] == action.name
+    assert calls[0][0]["target"] == action.target
+    assert events == ["execute", "llm"]
+    assert "halted_no_action" in report
 
 
 def test_verbose_controller_streams_progress_before_terminal_report():
