@@ -1243,42 +1243,88 @@ def test_execute_capability_tool_card_uses_semantic_capability_header():
     assert "Request: execute_capability(" in call["content"]
 
 
-def test_capability_command_observer_surfaces_real_callback_command_name():
-    from ai.langgraph.mythic_tools import MythicTools
-
+def test_execution_observer_surfaces_real_callback_command_name():
     emitter = _RecEmitter()
     m = _bare_model_with(emitter, {})
     m._classify_tool_source = lambda _tool_name: "mythic"
-    mt = MythicTools(agent_task_id="test")
-    mt.set_capability_command_observer(m._emit_capability_command_card)
+    m.begin_visibility_turn()
+    base_event = {
+        "event_id": "mythic-task:3:42",
+        "source": "mythic",
+        "tool_name": "ticket_cache_purge",
+        "callback_id": 3,
+        "task_id": 42,
+        "parameters": "",
+        "capability": "forge-golden-ticket",
+        "purpose": "clear stale tickets",
+        "activity": {"id": "execution:1", "name": "Execution"},
+    }
+    _run(m._emit_execution_event({**base_event, "status": "started"}))
+    _run(m._emit_execution_event({
+        **base_event,
+        "status": "completed",
+        "result_preview": "Ticket cache purged.",
+    }))
 
-    async def _binding(command_obj, _callback_id):
-        return {
-            "ok": True,
-            "command": command_obj["command"],
-            "parameters": command_obj["parameters"],
-        }
-
-    async def _issue(_command, _parameters, _callback_id, token_id=None, timeout=None):
-        mt._last_issued_task_display_id = 42
-        return "Ticket cache purged."
-
-    mt._prepare_capability_command_binding = _binding
-    mt.issue_task_and_waitfor_task_output = _issue
-
-    item = _run(mt._execute_capability_command(
-        {"command": "ticket_cache_purge", "parameters": "", "purpose": "clear stale tickets"},
-        3,
-        timeout=5,
-        capability_name="forge-golden-ticket",
-    ))
-
-    assert item["command"] == "ticket_cache_purge"
     assert [call["status"] for call in emitter.tool_use_calls] == ["started", "completed"]
     assert [call["tool_name"] for call in emitter.tool_use_calls] == ["ticket_cache_purge", "ticket_cache_purge"]
     assert emitter.tool_use_calls[0]["tool_call_id"] == emitter.tool_use_calls[1]["tool_call_id"]
     assert "forge-golden-ticket" in emitter.tool_use_calls[0]["arguments"]
     assert emitter.tool_use_calls[1]["result_preview"] == "Ticket cache purged."
+    assert emitter.tool_use_calls[0]["delegation_id"] == "execution:1"
+    assert _run(m.finalize_visibility_turn())["failed"] == 0
+
+
+def test_execution_observer_preserves_raw_large_arguments_and_output():
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {})
+    m.begin_visibility_turn()
+    raw_blob = "A" * 6000
+    raw_result = '{"token":"operator-secret","blob":"' + raw_blob + '"}'
+
+    _run(m._emit_execution_event({
+        "event_id": "mcp:BloodHound:file_upload:9",
+        "source": "mcp",
+        "tool_name": "file_upload",
+        "status": "completed",
+        "arguments": {
+            "file_bytes_base64": raw_blob,
+            "api_key": "operator-secret",
+        },
+        "result_preview": raw_result,
+        "output": raw_result,
+    }))
+
+    call = emitter.tool_use_calls[0]
+    assert raw_blob in call["arguments"]
+    assert "operator-secret" in call["arguments"]
+    assert call["result_preview"] == raw_result
+    assert call["output"] == raw_result
+
+
+def test_visibility_reconciliation_surfaces_failed_card_emission():
+    class _FailedCardEmitter(_RecEmitter):
+        async def emit_tool_use(self, **kw):
+            self.tool_use_calls.append(kw)
+            return False
+
+    emitter = _FailedCardEmitter()
+    m = _bare_model_with(emitter, {})
+    m.begin_visibility_turn()
+
+    _run(m._emit_execution_event({
+        "event_id": "mcp:BloodHound:cypher_query:1",
+        "source": "mcp",
+        "tool_name": "cypher_query",
+        "status": "started",
+        "arguments": {"query": "MATCH (n) RETURN n"},
+    }))
+    summary = _run(m.finalize_visibility_turn())
+
+    assert summary["expected"] == 1
+    assert summary["rendered"] == 0
+    assert summary["failed"] == 1
+    assert "Visibility degraded" in emitter.text_sends[0]
 
 
 def test_capability_wait_observer_emits_operator_progress_messages():

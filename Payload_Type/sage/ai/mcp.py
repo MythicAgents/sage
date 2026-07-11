@@ -1,4 +1,7 @@
 import asyncio
+import contextvars
+import inspect
+import json
 import logging
 import traceback
 import warnings
@@ -14,6 +17,26 @@ from langchain_mcp_adapters.sessions import Connection, StdioConnection, SSEConn
 from langchain_core.tools import BaseTool
 
 from mythic_container.logging import logger
+
+
+_execution_observer: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "sage_execution_observer",
+    default=None,
+)
+_execution_activity: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "sage_execution_activity",
+    default=None,
+)
+
+
+def _execution_result_text(value: Any) -> str:
+    """Serialize the complete MCP result for operator-visible execution evidence."""
+    try:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, default=str, ensure_ascii=False)
+    except Exception:
+        return str(value)
 
 
 # Filter to suppress noisy SSE ping messages from MCP libraries
@@ -94,6 +117,94 @@ class MCPServerManager:
         self.tools: Dict[str, List[BaseTool]] = {}
         self.configs: Dict[str, MCPConnectionConfig] = {}
         self._session_contexts: Dict[str, Any] = {}
+        self._execution_seq = 0
+
+    def set_execution_observer(self, observer):
+        """Bind a request-local execution observer and return its reset token."""
+        return _execution_observer.set(observer if callable(observer) else None)
+
+    def reset_execution_observer(self, token) -> None:
+        _execution_observer.reset(token)
+
+    def set_execution_activity(self, activity: dict[str, str] | None):
+        """Bind a request-local grouping activity and return its reset token."""
+        return _execution_activity.set(dict(activity) if isinstance(activity, dict) else None)
+
+    def reset_execution_activity(self, token) -> None:
+        _execution_activity.reset(token)
+
+    def current_execution_activity(self) -> dict[str, str] | None:
+        activity = _execution_activity.get()
+        return dict(activity) if isinstance(activity, dict) else None
+
+    async def _notify_execution_observer(self, event: dict[str, Any]) -> None:
+        observer = _execution_observer.get()
+        if observer is None:
+            return
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"MCP execution observer failed (non-fatal): {exc}")
+
+    def _wrap_tool_for_visibility(self, server_name: str, tool: BaseTool) -> BaseTool:
+        """Clone one MCP tool with fail-open lifecycle observation around its outbound call."""
+        original = getattr(tool, "coroutine", None)
+        if not callable(original):
+            logger.debug(f"MCP tool {server_name}.{tool.name} has no async coroutine; visibility wrapper skipped")
+            return tool
+
+        self._execution_seq += 1
+        wrapper_version = self._execution_seq
+        manager = self
+
+        async def _observed_coroutine(*args, **kwargs):
+            manager._execution_seq += 1
+            call_id = f"mcp:{server_name}:{tool.name}:{manager._execution_seq}"
+            arguments = kwargs if kwargs else {"args": list(args)}
+            base_event = {
+                "event_id": call_id,
+                "source": "mcp",
+                "server": server_name,
+                "tool_name": tool.name,
+                "arguments": arguments,
+                "activity": manager.current_execution_activity(),
+            }
+            await manager._notify_execution_observer({**base_event, "status": "started"})
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException as exc:
+                await manager._notify_execution_observer(
+                    {
+                        **base_event,
+                        "status": "error",
+                        "result_preview": f"{type(exc).__name__}: {exc}",
+                        "output": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                raise
+            result_text = _execution_result_text(result)
+            await manager._notify_execution_observer({
+                **base_event,
+                "status": "completed",
+                "result_preview": result_text,
+                "output": result_text,
+            })
+            return result
+
+        try:
+            wrapped = tool.model_copy(deep=False)
+            object.__setattr__(wrapped, "coroutine", _observed_coroutine)
+            metadata = dict(getattr(wrapped, "metadata", None) or {})
+            metadata["sage_visibility_wrapper"] = wrapper_version
+            object.__setattr__(wrapped, "metadata", metadata)
+            return wrapped
+        except Exception as exc:
+            logger.warning(
+                f"Could not wrap MCP tool {server_name}.{tool.name} for visibility; using original: {exc}"
+            )
+            return tool
     
     async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
@@ -323,8 +434,12 @@ class MCPServerManager:
                     logger.warning(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Use server_name parameter to disambiguate.")
                     conflicts_found += 1
 
-            # Store ALL tools for this server (including ones with conflicting names)
-            self.tools[server_name] = langchain_tools
+            # Store ALL tools for this server (including ones with conflicting names).
+            # Observation is installed here so every Sage caller shares the same outbound boundary.
+            self.tools[server_name] = [
+                self._wrap_tool_for_visibility(server_name, tool)
+                for tool in langchain_tools
+            ]
 
             if conflicts_found > 0:
                 logger.warning(f"Loaded {len(langchain_tools)} tools from server '{server_name}' ({conflicts_found} tools have name conflicts with other servers)")

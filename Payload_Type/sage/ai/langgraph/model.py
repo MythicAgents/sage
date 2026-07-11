@@ -1407,6 +1407,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         stream_func=None,
         format_func=None,
         tool_use_func=None,
+        tool_source_func=None,
         agent_text_func=None,
         handback_summary_func=None,
         delegation_id: str | None = None,
@@ -1421,6 +1422,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         self._stream_func = stream_func  # Function to stream formatted messages to Mythic
         self._format_func = format_func  # Function to format messages for streaming
         self._tool_use_func = tool_use_func  # Function to stream tool-use cards to Mythic chat
+        self._tool_source_func = tool_source_func
         self._agent_text_func = agent_text_func  # Function to stream delegated specialist text to its drill-down
         self._handback_summary_func = handback_summary_func  # Function to retain control-tool handback summaries
         # Track run_ids for SummarizationMiddleware's internal model.invoke calls.
@@ -1549,6 +1551,11 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                             except Exception as e:
                                                 logger.debug(f"handback summary capture failed (non-fatal): {e}")
                                         continue
+                                    if (
+                                        self._tool_source_func is not None
+                                        and self._tool_source_func(tc_name) == "mcp"
+                                    ):
+                                        continue
                                     try:
                                         await self._tool_use_func(
                                             tool_call_id=tc_id,
@@ -1598,7 +1605,15 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                 logger.debug(f"📨 [Callback:{self.agent_name}] Captured ToolMessage: "
                            f"tool={output.name}, tool_call_id={output.tool_call_id}")
 
-                if self._tool_use_func and self.agent_name != "Supervisor" and not _is_control_tool(output.name):
+                if (
+                    self._tool_use_func
+                    and self.agent_name != "Supervisor"
+                    and not _is_control_tool(output.name)
+                    and not (
+                        self._tool_source_func is not None
+                        and self._tool_source_func(output.name) == "mcp"
+                    )
+                ):
                     content_str = output.content if isinstance(output.content, str) else str(output.content)
                     # Structured-first error detection (not a brittle string match):
                     #   1. ToolMessage.status — LangChain's first-class flag, set to "error" when a tool RAISES.
@@ -1697,6 +1712,10 @@ class Model:
         self._response_emitter = response_emitter
         self._active_delegations: dict[str, dict[str, Any]] = {}
         self._delegation_seq: int = 0
+        self._execution_activity_seq: int = 0
+        self._visibility_expected: set[str] = set()
+        self._visibility_rendered: set[str] = set()
+        self._visibility_failed: set[str] = set()
         self.operation_id = operation_id
         # Chat-path Mythic auth context (Section 7 / 8A-P0): the numeric channel id and the per-channel
         # bot API token id, threaded so MythicTools can mint a channel-scoped token via
@@ -1980,7 +1999,9 @@ class Model:
         output: str | None = None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
-    ) -> None:
+        tool_source: str | None = None,
+        preserve_arguments: bool = False,
+    ) -> bool:
         """Bridge a captured tool call/result to the chat emitter as a collapsible card.
 
         The card's `content` (rendered in the UI Details) carries the tool REQUEST — the tool name and
@@ -1989,10 +2010,10 @@ class Model:
         """
         emitter = self._response_emitter
         if emitter is None or not hasattr(emitter, "emit_tool_use"):
-            return
+            return False
         try:
             raw_name = tool_name or "unknown_tool"
-            source = self._classify_tool_source(raw_name)
+            source = tool_source or self._classify_tool_source(raw_name)
             source_label = "MCP" if source == "mcp" else "Mythic"
             capability_name = _capability_name_from_tool_arguments(arguments) if raw_name == "execute_capability" else ""
             name = capability_name or raw_name
@@ -2003,7 +2024,7 @@ class Model:
                     args_str = _json.dumps(arguments, default=str, ensure_ascii=False)
                 except Exception:
                     args_str = str(arguments)
-                if len(args_str) > 4000:
+                if not preserve_arguments and len(args_str) > 4000:
                     args_str = args_str[:4000] + "…"
             request_line = f"Request: {raw_name}({args_str})" if args_str else ""
             if status == "started":
@@ -2014,7 +2035,7 @@ class Model:
                 content = request_line + ("\n\n" if request_line else "") + f"Tool `{name}` failed."
             else:
                 content = request_line or f"Tool `{name}` finished."
-            await emitter.emit_tool_use(
+            emitted = await emitter.emit_tool_use(
                 tool_call_id=tool_call_id or "",
                 tool_name=name,
                 tool_source=source,
@@ -2028,72 +2049,132 @@ class Model:
                 delegation_id=delegation_id,
                 delegation_name=delegation_name,
             )
+            if emitted is False:
+                return False
             if delegation_id is not None and delegation_name is not None and status == "started":
                 await self._bump_delegation_progress(delegation_name)
+            return True
         except Exception as e:
             logger.debug(f"_emit_tool_use_card failed (non-fatal): {e}")
+            return False
+
+    def begin_visibility_turn(self) -> None:
+        """Reset request-scoped visibility accounting before execution starts."""
+        self._visibility_expected = set()
+        self._visibility_rendered = set()
+        self._visibility_failed = set()
+
+    async def _emit_execution_event(self, event: dict[str, Any]) -> None:
+        """Render one boundary-owned Mythic or MCP lifecycle event."""
+        if not isinstance(event, dict):
+            return
+        event_id = str(event.get("event_id") or "").strip()
+        source = str(event.get("source") or "").strip().casefold()
+        tool_name = str(event.get("tool_name") or event.get("command") or "").strip()
+        status = str(event.get("status") or "").strip().casefold()
+        if not event_id or source not in {"mythic", "mcp"} or not tool_name:
+            return
+        if status == "started":
+            self._visibility_expected.add(event_id)
+
+        activity = event.get("activity") if isinstance(event.get("activity"), dict) else {}
+        arguments = event.get("arguments")
+        if source == "mythic":
+            arguments = {
+                "callback_id": event.get("callback_id"),
+                "parameters": event.get("parameters"),
+                "task_id": event.get("task_id"),
+            }
+            capability_name = str(event.get("capability") or "").strip()
+            if capability_name:
+                arguments["capability"] = capability_name
+            purpose = str(event.get("purpose") or "").strip()
+            if purpose:
+                arguments["purpose"] = purpose
+
+        rendered = await self._emit_tool_use_card(
+            tool_call_id=event_id,
+            tool_name=tool_name,
+            status=status or "completed",
+            complete=status != "started",
+            arguments_present=arguments not in (None, "", {}),
+            arguments=arguments,
+            result_preview=str(event.get("result_preview") or "") or None,
+            output=str(event.get("output") or "") or None,
+            delegation_id=str(activity.get("id") or "") or None,
+            delegation_name=str(activity.get("name") or "") or None,
+            tool_source=source,
+            preserve_arguments=True,
+        )
+        if rendered:
+            self._visibility_rendered.add(event_id)
+        else:
+            self._visibility_failed.add(event_id)
+
+    async def finalize_visibility_turn(self) -> dict[str, Any]:
+        """Reconcile boundary events against rendered cards and surface degraded visibility."""
+        expected = set(getattr(self, "_visibility_expected", set()) or set())
+        rendered = set(getattr(self, "_visibility_rendered", set()) or set())
+        failed = set(getattr(self, "_visibility_failed", set()) or set())
+        missing = sorted(expected - rendered)
+        degraded = sorted(set(missing) | failed)
+        summary = {
+            "expected": len(expected),
+            "rendered": len(expected & rendered),
+            "failed": len(degraded),
+            "missing_event_ids": degraded,
+        }
+        if degraded:
+            preview = ", ".join(degraded[:5])
+            suffix = "" if len(degraded) <= 5 else f" (+{len(degraded) - 5} more)"
+            try:
+                await self._stream_message_to_mythic(
+                    "**Visibility degraded**\n"
+                    f"{len(degraded)} execution event(s) could not be rendered: {preview}{suffix}.\n"
+                )
+            except Exception as exc:
+                logger.warning(f"Visibility reconciliation warning failed: {exc}")
+        return summary
 
     async def _emit_capability_command_card(self, event: dict[str, Any]) -> None:
-        """Render one deterministic capability child command through the normal chat tool-card surface."""
+        """Render non-task capability lifecycle prose; accepted tasks use the shared boundary."""
         if not isinstance(event, dict):
             return
         command_name = str(event.get("command") or "").strip()
         trace_id = str(event.get("trace_id") or "").strip()
         if not command_name or not trace_id:
             return
-        if command_name == "wait_for_seconds":
-            parameters = event.get("parameters") if isinstance(event.get("parameters"), dict) else {}
-            seconds = int(parameters.get("seconds") or 300)
-            reason = str(parameters.get("reason") or "wait for propagation").strip()
-            status = str(event.get("status") or "").strip().casefold()
-            duration = (
-                f"{seconds // 60} minute{'s' if seconds // 60 != 1 else ''}"
-                if seconds >= 60 and seconds % 60 == 0
-                else f"{seconds} seconds"
-            )
-            if status == "started":
-                message = (
-                    "**Waiting for propagation**\n"
-                    f"Sage is sleeping for {duration} while the external effect propagates, then it will resume verification.\n"
-                    f"Reason: {reason}\n"
-                    "No operator action is required.\n"
-                )
-            elif status == "progress":
-                preview = str(event.get("result_preview") or "").strip()
-                message = (
-                    "**Propagation wait in progress**\n"
-                    f"Sage is still sleeping before verification{f': {preview}' if preview else '.'}\n"
-                    "No operator action is required.\n"
-                )
-            else:
-                message = (
-                    "**Propagation wait complete**\n"
-                    "Sage finished the bounded wait and is continuing with effect validation.\n"
-                )
-            await self._stream_message_to_mythic(message)
+        if command_name != "wait_for_seconds":
             return
-        arguments: dict[str, Any] = {
-            "callback_id": event.get("callback_id"),
-            "parameters": event.get("parameters"),
-        }
-        capability_name = str(event.get("capability") or "").strip()
-        if capability_name:
-            arguments["capability"] = capability_name
-        purpose = str(event.get("purpose") or "").strip()
-        if purpose:
-            arguments["purpose"] = purpose
-        task_id = event.get("task_id")
-        if task_id not in (None, ""):
-            arguments["task_id"] = task_id
-        await self._emit_tool_use_card(
-            tool_call_id=trace_id,
-            tool_name=command_name,
-            status=str(event.get("status") or "completed"),
-            complete=str(event.get("status") or "") != "started",
-            arguments_present=True,
-            arguments=arguments,
-            result_preview=str(event.get("result_preview") or "") or None,
+        parameters = event.get("parameters") if isinstance(event.get("parameters"), dict) else {}
+        seconds = int(parameters.get("seconds") or 300)
+        reason = str(parameters.get("reason") or "wait for propagation").strip()
+        status = str(event.get("status") or "").strip().casefold()
+        duration = (
+            f"{seconds // 60} minute{'s' if seconds // 60 != 1 else ''}"
+            if seconds >= 60 and seconds % 60 == 0
+            else f"{seconds} seconds"
         )
+        if status == "started":
+            message = (
+                "**Waiting for propagation**\n"
+                f"Sage is sleeping for {duration} while the external effect propagates, then it will resume verification.\n"
+                f"Reason: {reason}\n"
+                "No operator action is required.\n"
+            )
+        elif status == "progress":
+            preview = str(event.get("result_preview") or "").strip()
+            message = (
+                "**Propagation wait in progress**\n"
+                f"Sage is still sleeping before verification{f': {preview}' if preview else '.'}\n"
+                "No operator action is required.\n"
+            )
+        else:
+            message = (
+                "**Propagation wait complete**\n"
+                "Sage finished the bounded wait and is continuing with effect validation.\n"
+            )
+        await self._stream_message_to_mythic(message)
 
     async def _emit_subagent_status(
         self,
@@ -2162,6 +2243,8 @@ class Model:
             "Mythic_Payload": "box-open",
             "Generalist": "robot",
             "MCP_Manager": "plug",
+            "Execution": "gears",
+            "Collection": "database",
         }
         try:
             icon = load_prompt_meta(agent_name.lower()).get("icon")
@@ -2187,6 +2270,8 @@ class Model:
             "Mythic_Payload": "#A855F7",   # purple
             "Generalist": "#10B981",       # green
             "MCP_Manager": "#F59E0B",      # amber
+            "Execution": "#3B82F6",
+            "Collection": "#F59E0B",
         }
         try:
             color = load_prompt_meta(agent_name.lower()).get("color")
@@ -2204,6 +2289,39 @@ class Model:
             return None
         delegation_id = delegation.get("id")
         return delegation_id if isinstance(delegation_id, str) else None
+
+    async def _open_execution_activity(
+        self,
+        activity_name: str,
+        *,
+        title: str,
+        instruction: str,
+    ) -> dict[str, str] | None:
+        """Open a virtual delegation used to group deterministic execution detail."""
+        self._execution_activity_seq = int(getattr(self, "_execution_activity_seq", 0) or 0) + 1
+        await self._open_delegation(
+            activity_name,
+            instruction,
+            self._execution_activity_seq,
+            title=title,
+        )
+        delegation_id = self.current_delegation_id(activity_name)
+        if delegation_id is None:
+            return None
+        return {"id": delegation_id, "name": activity_name}
+
+    async def _close_execution_activity(
+        self,
+        activity: dict[str, str] | None,
+        *,
+        content: str = "",
+        status: str = "finished",
+    ) -> None:
+        if not isinstance(activity, dict):
+            return
+        activity_name = str(activity.get("name") or "")
+        if activity_name:
+            await self._close_delegation(activity_name, content=content, status=status)
 
     def _single_active_delegation(self) -> tuple[str, str] | None:
         try:
@@ -2614,6 +2732,7 @@ class Model:
         )
         self.mythic_client.set_mechanic_repair_resolver(self._resolve_capability_mechanic)
         self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)
+        self.mythic_client.set_execution_observer(self._emit_execution_event)
         await self.mythic_client.login()
         # Scope preflight (Section 8A P1): learn the bot token's granted scopes and disable guarded tools
         # it can't use BEFORE the graph attaches them (get_tools skips disabled ones). No-op on the task
@@ -2864,6 +2983,7 @@ class Model:
                 stream_func=self._stream_message_to_mythic,
                 format_func=self._format_message_for_streaming,
                 tool_use_func=self._emit_tool_use_card,
+                tool_source_func=self._classify_tool_source,
                 agent_text_func=self._emit_agent_text,
                 handback_summary_func=self._capture_delegation_final_summary,
                 delegation_id=delegation_id,
@@ -2907,7 +3027,17 @@ class Model:
                 # (6) drains. Checked before each (re-)invocation: any in-flight call finishes, then we halt.
                 if getattr(self, "_stop_requested", False):
                     break
-                result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
+                activity_token = None
+                if delegation_id is not None:
+                    activity_token = MCPManager.set_execution_activity({
+                        "id": delegation_id,
+                        "name": node_name,
+                    })
+                try:
+                    result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
+                finally:
+                    if activity_token is not None:
+                        MCPManager.reset_execution_activity(activity_token)
                 updated_channel = result.get("messages", channel)
                 if not _autonomous_operator:
                     break
@@ -3954,6 +4084,7 @@ class Model:
 
         formatted = f"{operator_message or self._controller_operator_progress_from_raw(message)}\n"
         previous = getattr(self, "_controller_verbose_stream_tail", None)
+        activity = MCPManager.current_execution_activity()
 
         async def _send_after_previous() -> None:
             if previous is not None:
@@ -3962,7 +4093,14 @@ class Model:
                 except Exception:
                     pass
             try:
-                await self._stream_message_to_mythic(formatted)
+                if isinstance(activity, dict) and activity.get("id") and activity.get("name"):
+                    await self._emit_agent_text(
+                        content=formatted,
+                        delegation_id=str(activity["id"]),
+                        delegation_name=str(activity["name"]),
+                    )
+                else:
+                    await self._stream_message_to_mythic(formatted)
             except Exception as e:
                 logger.debug(f"Autonomous controller verbose stream failed: {e}")
 
@@ -4057,22 +4195,52 @@ class Model:
                     operator_message=self._controller_selected_action_progress(payload, inputs),
                 )
             await self._require_controller_hitl_approval(pending)
-            fire(
-                f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}",
-                operator_message=(
-                    "**Executing action**\n"
-                    f"Sage started `{payload.get('name')}`"
-                    + (f" for `{payload.get('target')}`." if payload.get("target") else ".")
+            capability_name = str(payload.get("name") or "capability")
+            target = str(payload.get("target") or "").strip()
+            activity = await self._open_execution_activity(
+                "Execution",
+                title=f"Execute {capability_name}",
+                instruction=(
+                    f"Execute `{capability_name}`"
+                    + (f" for `{target}`." if target else ".")
                 ),
             )
-            result = await self.mythic_client.execute_capability(payload, inputs)
-            kind = type(result).__name__
-            size = len(result) if isinstance(result, str) else "n/a"
-            fire(
-                f"execute returned {kind} (len={size})",
-                operator_message=self._controller_capability_result_progress(payload, result),
-            )  # PROVE the real string-return boundary fired
-            return result
+            activity_token = MCPManager.set_execution_activity(activity) if activity is not None else None
+            result = None
+            activity_status = "finished"
+            try:
+                fire(
+                    f"execute {payload.get('name')} -> {payload.get('target')} cb={inputs.get('callback_id', '')}",
+                    operator_message=(
+                        "**Executing action**\n"
+                        f"Sage started `{payload.get('name')}`"
+                        + (f" for `{payload.get('target')}`." if payload.get("target") else ".")
+                    ),
+                )
+                result = await self.mythic_client.execute_capability(payload, inputs)
+                kind = type(result).__name__
+                size = len(result) if isinstance(result, str) else "n/a"
+                fire(
+                    f"execute returned {kind} (len={size})",
+                    operator_message=self._controller_capability_result_progress(payload, result),
+                )  # PROVE the real string-return boundary fired
+                return result
+            except BaseException:
+                activity_status = "error"
+                raise
+            finally:
+                await self._flush_controller_verbose_events()
+                if activity_token is not None:
+                    MCPManager.reset_execution_activity(activity_token)
+                await self._close_execution_activity(
+                    activity,
+                    content=(
+                        self._controller_capability_result_progress(payload, result)
+                        if result is not None
+                        else f"`{capability_name}` did not complete."
+                    ),
+                    status=activity_status,
+                )
 
         def needs_collection(state):
             # N2: signal collection ONLY when a SUPPORTED collector-profile foothold actually needs it — aligned with
@@ -4107,7 +4275,29 @@ class Model:
                     operator_message=self._controller_collection_selection_progress(request),
                 )
             await self._require_controller_hitl_approval(pending)
-            return await self._controller_collect(state, request=request)
+            activity = await self._open_execution_activity(
+                "Collection",
+                title="Collect and ingest graph data",
+                instruction="Run the selected collection and ingest its graph data.",
+            )
+            activity_token = MCPManager.set_execution_activity(activity) if activity is not None else None
+            result = None
+            activity_status = "finished"
+            try:
+                result = await self._controller_collect(state, request=request)
+                return result
+            except BaseException:
+                activity_status = "error"
+                raise
+            finally:
+                await self._flush_controller_verbose_events()
+                if activity_token is not None:
+                    MCPManager.reset_execution_activity(activity_token)
+                await self._close_execution_activity(
+                    activity,
+                    content=str(result or "Collection did not complete."),
+                    status=activity_status,
+                )
 
         def objective_met(state):
             try:
@@ -4720,7 +4910,29 @@ class Model:
                 "recorded_effects": [],
             }, sort_keys=True)
         else:
-            result_text = await self.mythic_client.execute_capability(action_payload, inputs_payload)
+            capability_name = str(action_payload.get("name") or "capability")
+            activity = await self._open_execution_activity(
+                "Execution",
+                title=f"Execute {capability_name}",
+                instruction=f"Execute `{capability_name}` through the autonomous executor.",
+            )
+            activity_token = MCPManager.set_execution_activity(activity) if activity is not None else None
+            activity_status = "finished"
+            activity_content = f"`{capability_name}` execution completed."
+            try:
+                result_text = await self.mythic_client.execute_capability(action_payload, inputs_payload)
+            except BaseException:
+                activity_status = "error"
+                activity_content = f"`{capability_name}` execution did not complete."
+                raise
+            finally:
+                if activity_token is not None:
+                    MCPManager.reset_execution_activity(activity_token)
+                await self._close_execution_activity(
+                    activity,
+                    content=activity_content,
+                    status=activity_status,
+                )
 
         tool_msg = ToolMessage(
             content=result_text,

@@ -212,6 +212,23 @@ def test_issue_task_decodes_bytes_output_before_downstream_processing():
     assert not result.startswith("b'")
 
 
+def test_accepted_mythic_task_emits_boundary_lifecycle_events():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+
+    with _split_issue("NORTH\\arya", display_id=4242):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", "", 11))
+
+    assert result == "NORTH\\arya"
+    assert [event["status"] for event in events] == ["started", "completed"]
+    assert {event["event_id"] for event in events} == {"mythic-task:11:4242"}
+    assert events[0]["tool_name"] == "whoami"
+    assert events[0]["task_id"] == 4242
+    assert events[1]["result_preview"] == "NORTH\\arya"
+    assert events[1]["output"] == "NORTH\\arya"
+
+
 def test_issue_task_refuses_dead_callback_before_mythic_tasking():
     calls = {"issue": 0}
     mt = _make_tools()

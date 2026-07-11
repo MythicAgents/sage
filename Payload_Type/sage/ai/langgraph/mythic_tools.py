@@ -1,4 +1,5 @@
 import os
+import contextvars
 import inspect
 from dataclasses import asdict, is_dataclass
 try:
@@ -10,6 +11,10 @@ except ImportError:
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
 SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
 SAGE_ENGAGEMENT_OBJECTIVE = os.environ.get("SAGE_ENGAGEMENT_OBJECTIVE", "").strip()
+_task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_mythic_task_visibility_context",
+    default=None,
+)
 # Durable-hop TTL (hours). A loaded "achieved" hop older than this is dropped at load so a stale belief
 # (e.g. after a GOAD redeploy) cannot suppress a real hop. Default 0 = disabled (no expiry). The gate
 # also refuses to SILENTLY hard-SKIP a durable hop unless live footholds corroborate it — TTL is the
@@ -1034,6 +1039,7 @@ class MythicTools:
         self.apitoken_id = apitoken_id
         self._preauth_client = preauth_client
         self.client = None
+        self._execution_observer = None
         # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
         self.disabled_tools: set[str] = set()
@@ -1211,6 +1217,28 @@ class MythicTools:
     def set_capability_command_observer(self, observer) -> None:
         """Install a fail-soft presentation observer for callback tasks issued inside a capability."""
         self._capability_command_observer = observer if callable(observer) else None
+
+    def set_execution_observer(self, observer) -> None:
+        """Install the request-scoped observer for accepted Mythic callback tasks."""
+        self._execution_observer = observer if callable(observer) else None
+
+    async def _notify_execution_observer(self, event: dict) -> None:
+        observer = getattr(self, "_execution_observer", None)
+        if observer is None:
+            return
+        try:
+            from ai.mcp import MCPManager
+            event = dict(event)
+            event["activity"] = MCPManager.current_execution_activity()
+        except Exception:
+            event = dict(event)
+            event["activity"] = None
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"Mythic execution observer failed (non-fatal): {exc}")
 
     def _next_capability_command_trace_id(self) -> str:
         self._capability_command_trace_seq = int(getattr(self, "_capability_command_trace_seq", 0) or 0) + 1
@@ -2834,7 +2862,15 @@ class MythicTools:
             return repaired, "rebuild_with_payload_schema"
         return None
 
-    async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
+    async def issue_task_and_waitfor_task_output(
+        self,
+        command: str,
+        parameters: str | dict,
+        callback_display_id: int,
+        token_id: int | None = None,
+        timeout: int | None = None,
+        visibility_context: dict | None = None,
+    ) -> str:
         """Issue `command` on the agent at `callback_display_id` and wait for its output.
 
         Caveat: for a parameter of type "File" pass the Mythic file UUID, not a filename. Format
@@ -3102,9 +3138,50 @@ class MythicTools:
                         raise Exception("Failed to create task")
                     self._last_issued_task_display_id = tdid
                     self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
-                    return await mythic.waitfor_for_task_output(
-                        mythic=self.client, task_display_id=tdid, timeout=timeout,
+                    event_id = f"mythic-task:{callback_display_id}:{tdid}"
+                    context = (
+                        visibility_context
+                        if isinstance(visibility_context, dict)
+                        else (_task_visibility_context.get() or {})
                     )
+                    base_event = {
+                        "event_id": event_id,
+                        "source": "mythic",
+                        "tool_name": command,
+                        "callback_id": callback_display_id,
+                        "task_id": tdid,
+                        "parameters": parameters,
+                        "capability": self._capability_text(context.get("capability")),
+                        "purpose": self._capability_text(context.get("purpose")),
+                    }
+                    await self._notify_execution_observer({**base_event, "status": "started"})
+                    try:
+                        result = await mythic.waitfor_for_task_output(
+                            mythic=self.client, task_display_id=tdid, timeout=timeout,
+                        )
+                    except BaseException as exc:
+                        await self._notify_execution_observer(
+                            {
+                                **base_event,
+                                "status": "error",
+                                "result_preview": f"{type(exc).__name__}: {exc}",
+                                "output": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        raise
+                    result_text = _task_output_text(result)
+                    result_class = command_builder.classify_result(command, result_text)
+                    await self._notify_execution_observer({
+                        **base_event,
+                        "status": (
+                            "completed"
+                            if result_class == command_builder.ResultClass.SUCCESS.value
+                            else "error"
+                        ),
+                        "result_preview": result_text,
+                        "output": result_text,
+                    })
+                    return result
 
                 results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
                 fail_key = self._task_failure_key(command, callback_display_id, parameters)
@@ -7446,12 +7523,19 @@ class MythicTools:
             capability_name=capability_name,
         )
         try:
-            output = await self.issue_task_and_waitfor_task_output(
-                command_name,
-                parameters,
-                callback_id,
-                timeout=timeout,
-            )
+            visibility_token = _task_visibility_context.set({
+                "capability": capability_name,
+                "purpose": command_obj.get("purpose"),
+            })
+            try:
+                output = await self.issue_task_and_waitfor_task_output(
+                    command_name,
+                    parameters,
+                    callback_id,
+                    timeout=timeout,
+                )
+            finally:
+                _task_visibility_context.reset(visibility_token)
         except Exception as exc:
             await self._notify_capability_command_observer(
                 trace_id=trace_id,

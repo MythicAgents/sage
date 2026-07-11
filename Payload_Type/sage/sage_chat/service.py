@@ -148,6 +148,15 @@ class SageChat(Chat):
             )
             model._hitl_card_pending = False
             model._thread_id_override = thread_id
+            begin_visibility = getattr(model, "begin_visibility_turn", None)
+            if callable(begin_visibility):
+                begin_visibility()
+            try:
+                from ai.mcp import MCPManager
+            except ImportError:  # pragma: no cover
+                from ..ai.mcp import MCPManager  # type: ignore
+            execution_observer = getattr(model, "_emit_execution_event", None)
+            observer_token = MCPManager.set_execution_observer(execution_observer)
             try:
                 if isinstance(getattr(model, "_controller_hitl_pending", None), dict):
                     # Controller-native HITL is not a LangGraph checkpoint interrupt, so it has its own pending
@@ -173,6 +182,11 @@ class SageChat(Chat):
                 except Exception:
                     logger.warning("request_stop() failed during cancel handling", exc_info=True)
                 raise
+            finally:
+                MCPManager.reset_execution_observer(observer_token)
+            finalize_visibility = getattr(model, "finalize_visibility_turn", None)
+            if callable(finalize_visibility):
+                await finalize_visibility()
             # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
             # turn's work is done. Fire-and-forget: a header update must never fail a chat turn.
             try:
