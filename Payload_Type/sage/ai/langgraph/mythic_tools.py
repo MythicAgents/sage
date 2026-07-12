@@ -6188,7 +6188,8 @@ class MythicTools:
             # tickets on demand unless the caller explicitly requested an asktgs fallback.
             forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
             core_action_issued = False
-            for command_obj in list(build_payload.get("commands") or []):
+            command_objects = list(build_payload.get("commands") or [])
+            for command_index, command_obj in enumerate(command_objects):
                 is_current_context_preflight = self._capability_executor_is_current_context_preflight(command_obj)
                 refresh_current_context = (
                     self._capability_input_bool(input_values, "refresh_current_context")
@@ -6300,6 +6301,14 @@ class MythicTools:
                     self._capability_transaction_update_verification(transaction, command_obj, verification)
                     final_probe = self._capability_executor_is_final_probe(command_obj)
                     if verification.verdict == "achieved" and final_probe:
+                        cleanup_issued = await self._capability_executor_run_trailing_cleanup_commands(
+                            command_objects,
+                            command_index,
+                            int(callback_id),
+                            timeout,
+                            capability_name=self._capability_text(getattr(action_obj, "name", "")),
+                        )
+                        all_issued.extend(cleanup_issued)
                         self._record_verified_account_kerberos_context(
                             action_obj,
                             input_values,
@@ -6407,6 +6416,14 @@ class MythicTools:
                             probe = retry_probe
                             verification = retry_verification
                             if retry_verification.verdict == "achieved":
+                                cleanup_issued = await self._capability_executor_run_trailing_cleanup_commands(
+                                    command_objects,
+                                    command_index,
+                                    int(callback_id),
+                                    timeout,
+                                    capability_name=self._capability_text(getattr(action_obj, "name", "")),
+                                )
+                                all_issued.extend(cleanup_issued)
                                 self._record_verified_account_kerberos_context(
                                     action_obj,
                                     input_values,
@@ -7319,6 +7336,12 @@ class MythicTools:
                 "status": "achieved",
                 "issued": [],
                 "reason": "exact account Kerberos context is already proven in the current callback runtime",
+            }
+        if self._callback_current_identity_matches_account_context(callback_id, account, account_domain):
+            return {
+                "status": "achieved",
+                "issued": [],
+                "reason": "live callback already runs as the requested account context",
             }
 
         context_action = capabilities_mod.CapabilityAction(
@@ -8784,6 +8807,35 @@ class MythicTools:
             or "kerberos_service_access_probe" in produces
         )
 
+    def _capability_executor_is_trailing_cleanup_command(self, command_obj: dict) -> bool:
+        operation = self._capability_text(command_obj.get("operation")).casefold()
+        return operation in {
+            "local-admin-logon-session-revert",
+        }
+
+    async def _capability_executor_run_trailing_cleanup_commands(
+        self,
+        command_objects: list[dict],
+        command_index: int,
+        callback_id: int,
+        timeout: int | None,
+        *,
+        capability_name: str = "",
+    ) -> list[dict]:
+        issued: list[dict] = []
+        for command_obj in list(command_objects[command_index + 1:]):
+            if not self._capability_executor_is_trailing_cleanup_command(command_obj):
+                break
+            item = await self._execute_capability_command(
+                command_obj,
+                callback_id,
+                timeout,
+                capability_name=capability_name,
+            )
+            item["cleanup"] = True
+            issued.append(item)
+        return issued
+
     def _capability_executor_allows_repeated_probe(self, command_obj: dict) -> bool:
         if not self._capability_executor_is_final_probe(command_obj):
             return False
@@ -10199,20 +10251,21 @@ class MythicTools:
                         )
                         if requested_export_command:
                             inputs["adcs_ca_export_command"] = requested_export_command
-                        else:
+                    payload_type = ""
+                    if callback_id:
+                        try:
+                            payload_type = self._capability_text(
+                                await self._resolve_payload_type(int(callback_id))
+                            ).casefold()
+                        except Exception:
                             payload_type = ""
-                            if callback_id:
-                                try:
-                                    payload_type = self._capability_text(
-                                        await self._resolve_payload_type(int(callback_id))
-                                    ).casefold()
-                                except Exception:
-                                    payload_type = ""
-                            # Apollo's one-task PowerShell wrapper is a proven special case for this
-                            # capability. Leave every other payload unset here so its bound profile
-                            # or the generic adapter default owns the command choice.
-                            if payload_type == "apollo":
-                                inputs["adcs_ca_export_command"] = "powerpick"
+                    if payload_type == "apollo" and "local_admin_remote_exec_reuse_token_context" not in inputs:
+                        inputs["local_admin_remote_exec_reuse_token_context"] = self._callback_has_local_admin_logon_context(
+                            callback_id,
+                            target_host,
+                            target_domain,
+                            local_account,
+                        )
                 else:
                     inputs.setdefault("adcs_ca_export_use_current_context", True)
                     inputs.setdefault("current_context_powershell_command", "powerpick")
@@ -10289,6 +10342,13 @@ class MythicTools:
             if payload_type == "apollo":
                 if not self._capability_text(inputs.get("local_admin_remote_exec_command") or inputs.get("remote_exec_command")):
                     inputs["local_admin_remote_exec_command"] = "wmiexecute"
+                if "local_admin_remote_exec_reuse_token_context" not in inputs:
+                    inputs["local_admin_remote_exec_reuse_token_context"] = self._callback_has_local_admin_logon_context(
+                        callback_id,
+                        target_host,
+                        target_domain,
+                        local_account,
+                    )
             return
         if capability == "use-managed-local-admin-secret":
             target_host = self._capability_target_host(action, inputs)
@@ -11940,6 +12000,85 @@ class MythicTools:
             self._capability_text(account).casefold(),
             self._capability_text(domain).casefold(),
         )
+
+    def _callback_current_identity_matches_account_context(
+        self,
+        callback_display_id,
+        account: str,
+        domain: str,
+    ) -> bool:
+        callback_id = self._capability_text(callback_display_id).casefold().lstrip("#")
+        account_cf = self._canonical_credential_account(account)
+        domain_cf = self._capability_text(domain).casefold()
+        if not callback_id or not account_cf or not domain_cf:
+            return False
+        for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+            if getattr(foothold, "alive", False) is not True:
+                continue
+            if self._capability_text(getattr(foothold, "agent", "")).casefold() == "sage":
+                continue
+            foothold_callback = self._capability_text(getattr(foothold, "callback_id", "")).casefold().lstrip("#")
+            if foothold_callback != callback_id:
+                continue
+            identity_account = self._canonical_credential_account(getattr(foothold, "identity", ""))
+            foothold_domain = self._capability_text(getattr(foothold, "forest", "")).casefold()
+            identity_domain = self._callback_identity_domain(getattr(foothold, "identity", ""))
+            if (
+                identity_account == account_cf
+                and foothold_domain == domain_cf
+                and (not identity_domain or self._callback_domains_equivalent(identity_domain, foothold_domain))
+            ):
+                return True
+        return False
+
+    def _callback_identity_domain(self, identity) -> str:
+        text = self._capability_text(identity).strip()
+        if "\\" in text:
+            return text.split("\\", 1)[0].strip().casefold()
+        if "@" in text:
+            return text.rsplit("@", 1)[1].strip().casefold()
+        return ""
+
+    def _callback_domains_equivalent(self, left: str, right: str) -> bool:
+        left_cf = self._capability_text(left).strip().casefold()
+        right_cf = self._capability_text(right).strip().casefold()
+        if not left_cf or not right_cf:
+            return False
+        if left_cf == right_cf:
+            return True
+        if "." not in left_cf and "." in right_cf:
+            return left_cf == right_cf.split(".", 1)[0]
+        if "." not in right_cf and "." in left_cf:
+            return right_cf == left_cf.split(".", 1)[0]
+        return False
+
+    def _callback_has_local_admin_logon_context(
+        self,
+        callback_display_id,
+        target_host: str,
+        target_domain: str,
+        local_account: str,
+    ) -> bool:
+        try:
+            callback_id = int(self._capability_text(callback_display_id).lstrip("#"))
+        except (TypeError, ValueError):
+            return False
+        account_cf = self._canonical_credential_account(local_account)
+        host_cf = self._capability_text(target_host).strip().casefold()
+        fqdn_cf = self._capability_host_name(target_host, target_domain).casefold()
+        if not account_cf or not host_cf:
+            return False
+        for key in getattr(self, "_kerberos_logon_context_keys", set()):
+            if not isinstance(key, tuple) or len(key) < 4:
+                continue
+            key_callback, realm, account, netonly = key[:4]
+            if int(key_callback) != callback_id or bool(netonly) is not True:
+                continue
+            if self._canonical_credential_account(account) != account_cf:
+                continue
+            if self._callback_domains_equivalent(realm, host_cf) or self._callback_domains_equivalent(realm, fqdn_cf):
+                return True
+        return False
 
     def _record_verified_account_kerberos_context(self, action, inputs: dict, callback_display_id) -> tuple | None:
         if self._capability_text(getattr(action, "name", "")).casefold() != "ensure-account-kerberos-context":

@@ -82,9 +82,10 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                 reader,
                 OBJECTIVE,
                 baseline=baseline.get(OBJECTIVE, set()),
-                settle_timeout=settle_timeout,
-                settle_interval=settle_interval,
+                settle_timeout=0,
             ),
+            settle_timeout=settle_timeout,
+            settle_interval=settle_interval,
         )
     if Milestone.GRAPH_COLLECTED in sub:
         # Ground-truth, ledger-independent: BloodHound holds >=1 ingested Domain == a SharpHound

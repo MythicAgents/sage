@@ -300,6 +300,10 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         callback_id = _normalize_key(getattr(foothold, "callback_id", ""))
         host = _normalize_key(getattr(foothold, "host", ""))
         forest = _normalize_key(getattr(foothold, "forest", ""))
+        identity_account = _identity_account_for_forest(
+            getattr(foothold, "identity", ""),
+            forest,
+        )
         identity_domain = _identity_domain(getattr(foothold, "identity", ""))
         integrity = _normalize_key(getattr(foothold, "integrity", ""))
         if callback_id:
@@ -307,6 +311,8 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         if forest:
             predicates.add(f"live-foothold:{forest}")
             predicates.add(f"authenticated:{forest}")
+            if callback_id and identity_account:
+                predicates.add(f"kerberos-account-context:{identity_account}@{forest}@callback:{callback_id}")
         if identity_domain:
             predicates.add(f"authenticated:{identity_domain}")
         if host:
@@ -1387,6 +1393,35 @@ def _identity_domain(identity: Any) -> str:
     if "@" in text:
         return _normalize_key(text.split("@", 1)[1])
     return ""
+
+
+def _identity_account(identity: Any) -> str:
+    text = _text(identity).strip()
+    normalized = _normalize_key(text)
+    if not normalized or normalized in {"sage", "system", "nt authority\\system"}:
+        return ""
+    if "\\" in text:
+        return _normalize_key(text.rsplit("\\", 1)[1])
+    if "@" in text:
+        return _normalize_key(text.split("@", 1)[0])
+    return normalized
+
+
+def _identity_account_for_forest(identity: Any, forest: Any) -> str:
+    """Return the current account only when its explicit domain agrees with the foothold forest.
+
+    Mythic sometimes reports a bare username for the initial callback identity; in that case the callback's
+    canonicalized forest is the only available domain witness. When Mythic does provide DOMAIN\\user or
+    user@domain, do not reinterpret a cross-domain identity as a same-forest Kerberos account context.
+    """
+    account = _identity_account(identity)
+    forest_domain = _normalize_key(forest)
+    if not account or not forest_domain:
+        return ""
+    identity_domain = _identity_domain(identity)
+    if identity_domain and not _domains_equivalent(identity_domain, forest_domain):
+        return ""
+    return account
 
 
 def _probe_all_true(probe_result: dict, keys: list[str]) -> bool:

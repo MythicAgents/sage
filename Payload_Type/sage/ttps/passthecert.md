@@ -43,6 +43,9 @@ gotchas: |
   domain object. Shadow credential add requires write to msDS-KeyCredentialLink. LDAP
   signing enforcement (LDAP channel binding) may block PassTheCert on modern DCs —
   check `LdapEnforceChannelBinding` registry value. Use LDAPS (port 636) for TLS-based auth.
+  When implementing Schannel proof with .NET `LdapConnection`, disable referral chasing
+  if the query only needs the target naming context; otherwise a valid certificate-backed
+  bind can surface a generic `An operation error occurred` while following referrals.
 related_ttps: [certify, forgecert, rubeus, pkinittools, whisker]
 alternatives: [rubeus-asktgt-ptt, certipy, impacket-passthecert]
 common_args:
@@ -65,7 +68,7 @@ common_args:
     description: Target account or object for the action
     typical_values: ["jon.snow", "administrator", "VICTIM$"]
     required: true
-last_updated: 2026-05-29
+last_updated: 2026-07-11
 ---
 
 # PassTheCert
@@ -91,3 +94,22 @@ Mimikatz DCSync to pull krbtgt hash.
 
 ## Output
 Text confirmation of LDAP operation success or failure.
+
+## .NET Schannel Query Note
+
+On the current GOAD ESSOS path, the forged Administrator PFX authenticated successfully
+over LDAPS and `WhoAmI` returned `u:ESSOS\Administrator`, but a subtree search rooted at
+`DC=essos,DC=local` failed when `LdapConnection` used its default referral chasing.
+Setting `SessionOptions.ReferralChasing` to `None` kept the request in the target naming
+context and let the same certificate-backed search return the Administrator entry.
+
+## Public Source Trail
+
+Microsoft's `LdapSessionOptions.ReferralChasing` documentation states that the property controls how
+the LDAP library follows referrals, and `ReferralChasingOptions.None` means it does not contact the
+referred-to server. That matches the fix applied here: keep the Schannel-authenticated query inside the
+target naming context instead of letting a valid bind fail during referral processing.
+
+I did not find a public PassTheCert-specific write-up for this exact `.NET LdapConnection` Schannel
+failure mode. Treat the referral-chasing diagnosis as a reproduced lab lesson grounded in the documented
+LDAP client behavior, not as a universal PassTheCert failure signature.

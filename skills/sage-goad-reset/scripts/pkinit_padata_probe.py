@@ -3,6 +3,7 @@
 
 The probe sends an AS-REQ without pre-authentication and parses the
 KDC_ERR_PREAUTH_REQUIRED METHOD-DATA list. PA type 16 is PA-PK-AS-REQ.
+This is not a proof that the KDC has a usable KDC-authentication certificate.
 """
 
 from __future__ import annotations
@@ -203,6 +204,8 @@ def parse_krb_error(data: bytes) -> dict[str, object]:
         "padata_types": sorted(set(padata_types)),
         "padata_names": [PA_NAMES.get(value, f"PA-{value}") for value in sorted(set(padata_types))],
         "pkinit_advertised": 16 in padata_types,
+        "usable_pkinit_verified": False,
+        "probe_scope": "method-data-only",
     }
 
 
@@ -244,6 +247,8 @@ def main() -> int:
             "transport": transport,
             "error": str(exc),
             "pkinit_advertised": False,
+            "usable_pkinit_verified": False,
+            "probe_scope": "method-data-only",
         }
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("ok") and result.get("pkinit_advertised") else 2

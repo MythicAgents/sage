@@ -2567,6 +2567,65 @@ def test_account_context_and_laps_fact_unlock_managed_secret_read():
     assert action.intent["target_host"] == "ws01"
 
 
+def test_live_foothold_identity_unlocks_direct_managed_secret_read():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[
+            _foothold(
+                "essos.local",
+                callback_id="2",
+                identity="jorah.mormont",
+            ),
+        ],
+        graph_facts=[
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=jorah.mormont;account_domain=essos.local;"
+                "target=braavos;target_domain=essos.local"
+            ),
+        ],
+    )
+
+    actions = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "read-managed-local-admin-secret"
+    ]
+
+    assert len(actions) == 1
+    assert actions[0].target == (
+        "account=jorah.mormont;account_domain=essos.local;"
+        "target=braavos;target_domain=essos.local;callback=2"
+    )
+    assert actions[0].preconditions[0] == (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+    )
+
+
+def test_cross_domain_live_foothold_identity_does_not_unlock_direct_managed_secret_read():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[
+            _foothold(
+                "essos.local",
+                callback_id="2",
+                identity="NORTH\\jorah.mormont",
+            ),
+        ],
+        graph_facts=[
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=jorah.mormont;account_domain=essos.local;"
+                "target=braavos;target_domain=essos.local"
+            ),
+        ],
+    )
+
+    assert "read-managed-local-admin-secret" not in [
+        action.name for action in capabilities.actions_from_state(state)
+    ]
+
+
 def test_graph_selected_laps_reader_unlocks_dcsync_account():
     state = es.EngagementState(
         objective="obtain administrative control of child.lab.local",

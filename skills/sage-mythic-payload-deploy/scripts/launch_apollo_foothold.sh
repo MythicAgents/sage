@@ -24,6 +24,25 @@ RUN_AS="${2:-NORTH\\samwell.tarly}"
 shift $(( $# >= 2 ? 2 : $# )) || true
 [ "${1:-}" = "--" ] && shift || true
 
+# The retained-launch arguments also carry the target host selector. Reuse it for the
+# pre-RDP localuser logoff instead of letting that helper fall back to CASTELBLACK.
+TARGET_HOST="CASTELBLACK"
+EXTRA_ARGS=("$@")
+for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
+  case "${EXTRA_ARGS[$i]}" in
+    --target-host)
+      if (( i + 1 >= ${#EXTRA_ARGS[@]} )); then
+        echo "launch_apollo_foothold: --target-host requires a value" >&2
+        exit 2
+      fi
+      TARGET_HOST="${EXTRA_ARGS[$((i + 1))]}"
+      ;;
+    --target-host=*)
+      TARGET_HOST="${EXTRA_ARGS[$i]#*=}"
+      ;;
+  esac
+done
+
 # Prefer an explicitly configured display. Otherwise select a live local display instead of assuming
 # the historical :99 Xvfb still exists.
 if [ -n "${SAGE_RDP_DISPLAY:-}" ]; then
@@ -76,7 +95,7 @@ fi
 LOGOFF_LOG=/tmp/sage_localuser_logoff.log
 for attempt in $(seq 1 30); do
   if "$REPO/.venv/bin/python" "$HERE/deploy_payload_via_ludus.py" logoff-user \
-      --target-ip "$TARGET_IP" --username localuser >"$LOGOFF_LOG" 2>&1; then
+      --target-host "$TARGET_HOST" --target-ip "$TARGET_IP" --username localuser >"$LOGOFF_LOG" 2>&1; then
     echo "Apollo foothold: localuser session cleared"
     break
   fi

@@ -60,13 +60,58 @@ def test_dry_run_accepts_hybrid_policy_treatment():
     assert "Sage policy mode -> hybrid" in result.stdout
 
 
+def test_dry_run_accepts_alternate_foothold_spec():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "direct-laps-objective",
+            "--side",
+            "harness",
+            "--foothold-host",
+            "MEEREEN",
+            "--foothold-ip",
+            "10.4.10.12",
+            "--foothold-user",
+            r"ESSOS\jorah.mormont",
+            "--foothold-callback-user",
+            "jorah.mormont",
+            "--foothold-password-env",
+            "SAGE_MEEREEN_JORAH_PASSWORD",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert "launch_apollo_foothold.sh 10.4.10.12 ESSOS\\jorah.mormont" in output
+    assert "--target-host MEEREEN" in output
+    assert "--callback-host MEEREEN" in output
+    assert "--callback-user jorah.mormont" in output
+    assert "--foothold-host MEEREEN" in output
+    assert "--foothold-user-match jorah.mormont" in output
+    assert "password source=SAGE_MEEREEN_JORAH_PASSWORD" in output
+
+
+def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
+    monkeypatch.setenv("SAGE_RUN_AS_PASSWORD", "samwell-password")
+    monkeypatch.setenv("SAGE_MEEREEN_JORAH_PASSWORD", "jorah-password")
+
+    foothold = orchestrate.FootholdSpec(password_env="SAGE_MEEREEN_JORAH_PASSWORD")
+
+    assert foothold.launch_env()["SAGE_RUN_AS_PASSWORD"] == "jorah-password"
+
+
 def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):
     seen = {}
 
     monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
 
-    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config):
-        del snapshot, retained_callback_config
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold):
+        del snapshot, retained_callback_config, foothold
         seen[restart_env["SAGE_POLICY_MODE"]] = dict(restart_env)
         return None, 7
 

@@ -237,6 +237,42 @@ def test_sage_control_callback_is_not_rendered_as_target_foothold():
     assert "CASTELBLACK | forest=north.sevenkingdoms.local" in rendered
 
 
+def test_live_foothold_projects_current_account_context_predicate():
+    state = engagement_state.EngagementState(
+        objective="read laps",
+        footholds=[
+            _foothold(
+                forest="essos.local",
+                callback_id="2",
+                identity="jorah.mormont",
+            ),
+        ],
+    )
+
+    assert (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+        in engagement_state.foothold_predicates(state)
+    )
+
+
+def test_cross_domain_live_foothold_does_not_project_same_forest_account_context():
+    state = engagement_state.EngagementState(
+        objective="read laps",
+        footholds=[
+            _foothold(
+                forest="essos.local",
+                callback_id="2",
+                identity="NORTH\\jorah.mormont",
+            ),
+        ],
+    )
+
+    assert (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+        not in engagement_state.foothold_predicates(state)
+    )
+
+
 def test_render_no_longer_emits_planning_lines():
     state = engagement_state.EngagementState(
         objective="reach essos DA",

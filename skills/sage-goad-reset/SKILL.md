@@ -130,9 +130,12 @@ Optional MEEREEN PKINIT readiness check before launching Apollo:
 .venv/bin/python skills/sage-goad-reset/scripts/pkinit_padata_probe.py --kdc 10.4.10.12 --realm ESSOS.LOCAL --user administrator
 ```
 
-Proceed when the JSON shows `error_name: KDC_ERR_PREAUTH_REQUIRED` and `pkinit_advertised: true` with PA type
-`16`. This does not use Sage, Mythic, Apollo, or a PFX; it only checks whether the KDC advertises PKINIT in
-pre-authentication METHOD-DATA.
+Treat this as a method-data diagnostic, not a go/no-go readiness gate. JSON with
+`error_name: KDC_ERR_PREAUTH_REQUIRED` and `pkinit_advertised: true` means only that the
+KDC advertised PA type `16`; it does not prove the DC currently has a usable
+KDC-authentication certificate. A real PKINIT attempt or target-side KDC certificate
+inspection is still required to establish usable PKINIT. This probe does not use Sage,
+Mythic, Apollo, or a PFX.
 
 ## BloodHound
 

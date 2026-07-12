@@ -211,6 +211,28 @@ def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
     )() is False
 
 
+def test_any_probe_retries_all_paths_within_one_shared_settle_window(monkeypatch):
+    calls = {"certificate": 0, "ldap": 0}
+
+    def delayed_certificate():
+        calls["certificate"] += 1
+        return calls["certificate"] >= 2
+
+    def unchanged_ldap():
+        calls["ldap"] += 1
+        return False
+
+    monkeypatch.setattr(ls.time, "sleep", lambda _seconds: None)
+
+    assert ls.any_probe(
+        delayed_certificate,
+        unchanged_ldap,
+        settle_timeout=1,
+        settle_interval=1,
+    )() is True
+    assert calls == {"certificate": 2, "ldap": 1}
+
+
 def test_decode_mythic_response_rows_base64_with_raw_fallback():
     encoded = base64.b64encode(b"decoded output").decode("ascii")
     assert ls._decode_mythic_response_rows([{"response_text": encoded}]) == "decoded output"

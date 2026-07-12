@@ -856,6 +856,32 @@ def test_callback_readiness_selects_merlin_when_requested():
     assert status["selected_apollo_cb"] is None
 
 
+def test_callback_readiness_accepts_alternate_foothold_selector():
+    callbacks = [
+        {
+            "display_id": 12,
+            "host": "MEEREEN",
+            "user": r"ESSOS\jorah.mormont",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+    ]
+    liveness = {12: {"alive": True, "reason": "fresh"}}
+
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        foothold_host="MEEREEN",
+        foothold_user_match="jorah.mormont",
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
+
+    assert status["ready"] is True
+    assert status["selected_apollo_cb"] == 12
+    assert "MEEREEN" in status["required"]
+    assert "jorah.mormont" in status["required"]
+
+
 def test_callback_readiness_rejects_dead_or_wrong_foothold():
     callbacks = [
         {

@@ -40,12 +40,64 @@ DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '"SEVENKINGDOMS":"sevenkingdoms.local",'
     '"ESSOS":"essos.local"}'
 )
-LAUNCH_FOOTHOLD = [
-    "/bin/bash",
-    "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh",
-    "10.4.10.22",
-    r"NORTH\samwell.tarly",
-]
+DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
+DEFAULT_FOOTHOLD_IP = "10.4.10.22"
+DEFAULT_FOOTHOLD_USER = r"NORTH\samwell.tarly"
+DEFAULT_FOOTHOLD_CALLBACK_USER = "samwell.tarly"
+DEFAULT_FOOTHOLD_PASSWORD_ENV = "SAGE_RUN_AS_PASSWORD"
+
+
+class FootholdSpec:
+    def __init__(
+        self,
+        host: str = DEFAULT_FOOTHOLD_HOST,
+        ip: str = DEFAULT_FOOTHOLD_IP,
+        user: str = DEFAULT_FOOTHOLD_USER,
+        callback_user: str = DEFAULT_FOOTHOLD_CALLBACK_USER,
+        password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV,
+    ) -> None:
+        self.host = host
+        self.ip = ip
+        self.user = user
+        self.callback_user = callback_user
+        self.password_env = password_env
+
+    def launch_argv(self) -> list[str]:
+        return [
+            "/bin/bash",
+            "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh",
+            self.ip,
+            self.user,
+            "--",
+            "--target-host",
+            self.host,
+            "--callback-host",
+            self.host,
+            "--callback-user",
+            self.callback_user,
+        ]
+
+    def launch_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        password = _resolve_password_source(self.password_env)
+        if password:
+            env["SAGE_RUN_AS_PASSWORD"] = password
+        return env
+
+    def readiness_argv(self) -> list[str]:
+        return [
+            PY,
+            "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py",
+            "readiness",
+            "--runtime-dbs-archived",
+            "--foothold-host",
+            self.host,
+            "--foothold-user-match",
+            self.callback_user,
+        ]
+
+    def label(self) -> str:
+        return f"{self.host}/{self.user}"
 
 # (name, argv, cwd, timeout_s). Reset + bootstrap, in order, per sage-goad-reset + sage-callback-bootstrap.
 RESET_STEPS = [
@@ -73,7 +125,6 @@ RESET_STEPS = [
     ),
 ]
 LUDUS_STATUS = [PY, "skills/sage-goad-reset/scripts/ludus.py", "status"]
-READINESS = [PY, "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py", "readiness", "--runtime-dbs-archived"]
 CALLBACKS = [PY, "skills/sage-live-runner/scripts/sage_task.py", "callbacks"]
 
 
@@ -106,15 +157,24 @@ def _readiness_ok(out: str) -> bool:
         return False
 
 
-def _foothold_guest_up(out: str) -> bool:
-    return bool(re.search(r"^\s*ON\s+\S*GOAD-SRV02\s+ip=10\.4\.10\.22\b", out, re.MULTILINE))
+def _foothold_guest_up(out: str, foothold_ip: str = DEFAULT_FOOTHOLD_IP) -> bool:
+    return bool(re.search(rf"^\s*ON\s+\S+\s+ip={re.escape(foothold_ip)}\b", out, re.MULTILINE))
 
 
-def discover_callbacks() -> int:
+def discover_callbacks(foothold: FootholdSpec | None = None) -> int:
+    foothold = foothold or FootholdSpec()
     out = subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True).stdout
-    apollo = [int(m) for m in re.findall(r"id=(\d+)\s+payloadtype=apollo", out)]
+    apollo = [
+        int(match.group("id"))
+        for match in re.finditer(
+            r"id=(?P<id>\d+)\s+payloadtype=apollo\s+host=(?P<host>\S+)\s+user=(?P<user>\S+)",
+            out,
+        )
+        if match.group("host").casefold() == foothold.host.casefold()
+        and foothold.callback_user.casefold() in match.group("user").casefold()
+    ]
     if not apollo:
-        raise SystemExit(f"ABORT: missing Apollo foothold callback.\n{out}")
+        raise SystemExit(f"ABORT: missing Apollo foothold callback for {foothold.label()}.\n{out}")
     return apollo[-1]
 
 
@@ -136,9 +196,9 @@ def _available_snapshots() -> set[str]:
         raise SystemExit(f"ABORT: could not parse Ludus snapshots: {exc}") from exc
 
 
-def _password_source_exists() -> bool:
-    if os.environ.get("SAGE_RUN_AS_PASSWORD"):
-        return True
+def _resolve_password_source(password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV) -> str | None:
+    if os.environ.get(password_env):
+        return os.environ[password_env]
     candidates = [
         os.environ.get("SAGE_RUNAS_FILE"),
         str(Path.home() / ".config" / "sage" / "runas.env"),
@@ -149,16 +209,22 @@ def _password_source_exists() -> bool:
         path = Path(value).expanduser() if value else None
         if not path or not path.is_file():
             continue
-        if any(
-            line.strip().startswith("SAGE_RUN_AS_PASSWORD=")
-            and line.strip().split("=", 1)[1].strip().strip("'\"")
-            for line in path.read_text(errors="replace").splitlines()
-        ):
-            return True
-    return False
+        for line in path.read_text(errors="replace").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(f"{password_env}="):
+                continue
+            value = stripped.split("=", 1)[1].strip().strip("'\"")
+            if value:
+                return value
+    return None
 
 
-def validate_reset_inputs(snapshot: str, retained_callback_config: Path) -> None:
+def validate_reset_inputs(
+    snapshot: str,
+    retained_callback_config: Path,
+    foothold: FootholdSpec | None = None,
+) -> None:
+    foothold = foothold or FootholdSpec()
     available_snapshots = _available_snapshots()
     if snapshot not in available_snapshots:
         available = ", ".join(sorted(available_snapshots))
@@ -174,10 +240,11 @@ def validate_reset_inputs(snapshot: str, retained_callback_config: Path) -> None
         raise SystemExit(
             f"ABORT: retained callback config is for {payload_type!r}, expected 'apollo'."
         )
-    if not _password_source_exists():
+    if not _resolve_password_source(foothold.password_env):
         raise SystemExit(
-            "ABORT: no durable SAGE_RUN_AS_PASSWORD source; set the environment variable or add it "
-            "to Payload_Type/sage/.env or ~/.config/sage/runas.env before resetting."
+            f"ABORT: no durable {foothold.password_env} source for {foothold.label()}; set the "
+            "environment variable or add it to Payload_Type/sage/.env or ~/.config/sage/runas.env "
+            "before resetting."
         )
 
 
@@ -223,6 +290,7 @@ def full_reset_and_ready(
     restart_env: dict | None = None,
     snapshot: str = DEFAULT_SNAPSHOT,
     retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG,
+    foothold: FootholdSpec | None = None,
 ) -> tuple[None, int]:
     """Full clean reset -> readiness -> callback discovery; returns (None, apollo_cb).
 
@@ -234,6 +302,7 @@ def full_reset_and_ready(
     (last value wins), so these override the snapshot. Which config keys actually change behavior depends on
     what Sage reads at startup (SAGE_ENGAGEMENT_ID always; model/provider if read from env; a prompt-set
     selector would need its own knob)."""
+    foothold = foothold or FootholdSpec()
     for name, argv, cwd, timeout in RESET_STEPS:
         step_argv = argv
         if name == "ludus rollback" and snapshot:
@@ -250,10 +319,16 @@ def full_reset_and_ready(
         if name == "restart sage" and restart_env:
             step_argv = list(argv) + [f"{k}={v}" for k, v in restart_env.items()]
         _run(name, step_argv, cwd, timeout)
-    _poll("CASTELBLACK powered on", LUDUS_STATUS, ROOT, _foothold_guest_up, timeout=1800)
-    _run("launch retained apollo", LAUNCH_FOOTHOLD, ROOT, 900)
-    _poll("sage chat + apollo ready", READINESS, ROOT, _readiness_ok, timeout=1200)
-    return None, discover_callbacks()
+    _poll(
+        f"{foothold.host} powered on",
+        LUDUS_STATUS,
+        ROOT,
+        lambda out: _foothold_guest_up(out, foothold.ip),
+        timeout=1800,
+    )
+    _run("launch retained apollo", foothold.launch_argv(), ROOT, 900, env=foothold.launch_env())
+    _poll("sage chat + apollo ready", foothold.readiness_argv(), ROOT, _readiness_ok, timeout=1200)
+    return None, discover_callbacks(foothold)
 
 
 # Seconds the per-run gauge SUBPROCESS may take ON TOP OF the solve itself — covers reset-independent
@@ -267,7 +342,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              null_model: bool = False,
              route_env: dict[str, str] | None = None,
              snapshot: str = DEFAULT_SNAPSHOT,
-             retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG) -> None:
+             retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG,
+             foothold: FootholdSpec | None = None) -> None:
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
@@ -289,6 +365,7 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         restart_env=restart_env,
         snapshot=snapshot,
         retained_callback_config=retained_callback_config,
+        foothold=foothold,
     )
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
             "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout),
@@ -318,7 +395,9 @@ def compare(scenario: str) -> None:
 def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=None, model=None,
                   null_model=False,
                   snapshot=DEFAULT_SNAPSHOT,
-                  retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG):
+                  retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG,
+                  foothold: FootholdSpec | None = None):
+    foothold = foothold or FootholdSpec()
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
@@ -338,10 +417,14 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                         str(retained_callback_config),
                     ]
                 print(f"  (cd {cwd}) {' '.join(argv)}")
-            print(f"  (cd {ROOT}) {' '.join(LUDUS_STATUS)}     # poll until guests up")
-            print(f"  (cd {ROOT}) {' '.join(LAUNCH_FOOTHOLD)} # log off localuser, RDP Samwell, launch staged Apollo")
+            print(f"  (cd {ROOT}) {' '.join(LUDUS_STATUS)}     # poll until {foothold.host} is up")
             print(
-                f"  (cd {ROOT}) {' '.join(READINESS)}        "
+                f"  (cd {ROOT}) {' '.join(foothold.launch_argv())} "
+                f"# log off localuser, RDP {foothold.user}, launch staged Apollo "
+                f"(password source={foothold.password_env})"
+            )
+            print(
+                f"  (cd {ROOT}) {' '.join(foothold.readiness_argv())}        "
                 "# poll until Sage chat and Apollo are ready"
             )
             print(f"  (cd {ROOT}) {' '.join(CALLBACKS)}        # parse apollo_cb")
@@ -387,14 +470,37 @@ def main(argv=None) -> int:
         default=DEFAULT_RETAINED_CALLBACK_CONFIG,
         help="Apollo callback export imported after Mythic reset",
     )
+    ap.add_argument("--foothold-host", default=DEFAULT_FOOTHOLD_HOST,
+                    help=f"staged foothold host/callback host (default: {DEFAULT_FOOTHOLD_HOST})")
+    ap.add_argument("--foothold-ip", default=DEFAULT_FOOTHOLD_IP,
+                    help=f"staged foothold host IP (default: {DEFAULT_FOOTHOLD_IP})")
+    ap.add_argument("--foothold-user", default=DEFAULT_FOOTHOLD_USER,
+                    help=f"interactive run-as identity for the foothold (default: {DEFAULT_FOOTHOLD_USER})")
+    ap.add_argument("--foothold-callback-user", default=DEFAULT_FOOTHOLD_CALLBACK_USER,
+                    help=(
+                        "callback user value used to match the retained Apollo check-in "
+                        f"(default: {DEFAULT_FOOTHOLD_CALLBACK_USER})"
+                    ))
+    ap.add_argument("--foothold-password-env", default=DEFAULT_FOOTHOLD_PASSWORD_ENV,
+                    help=(
+                        "environment/durable-env key containing the foothold run-as password "
+                        f"(default: {DEFAULT_FOOTHOLD_PASSWORD_ENV})"
+                    ))
     ap.add_argument("--controller", action="store_true",
                     help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    foothold = FootholdSpec(
+        host=args.foothold_host,
+        ip=args.foothold_ip,
+        user=args.foothold_user,
+        callback_user=args.foothold_callback_user,
+        password_env=args.foothold_password_env,
+    )
     policy_mode = "symbolic" if args.controller else args.policy_mode
     if args.null_model_factorial and args.side not in (None, "harness"):
         ap.error("--null-model-factorial only supports the harness side")
     if args.null_model_factorial and args.treatment:
-        ap.error("--null-model-factorial cannot be combined with a paid model treatment")
+        ap.error("--null-model-factorial cannot be combined with a named model treatment")
     policy_modes = ["symbolic", "llm", "hybrid"] if args.null_model_factorial else [policy_mode]
     null_model = bool(args.null_model or args.null_model_factorial)
     route_env = None
@@ -412,11 +518,11 @@ def main(argv=None) -> int:
             _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
                           args.seeds, args.solve_timeout, selected_mode,
                           args.provider, args.model, null_model,
-                          args.snapshot, args.retained_callback_config)
+                          args.snapshot, args.retained_callback_config, foothold)
             print(f"\n  NOTE: Sage policy mode -> {selected_mode}; null_model={null_model}.")
         return 0
 
-    validate_reset_inputs(args.snapshot, args.retained_callback_config)
+    validate_reset_inputs(args.snapshot, args.retained_callback_config, foothold)
     for selected_mode in policy_modes:
         for _ in range(args.seeds):
             sides = ["harness"] if args.null_model_factorial else (
@@ -427,7 +533,8 @@ def main(argv=None) -> int:
                          policy_mode=selected_mode, provider=args.provider, model=args.model,
                          null_model=null_model, route_env=route_env,
                          snapshot=args.snapshot,
-                         retained_callback_config=args.retained_callback_config)
+                         retained_callback_config=args.retained_callback_config,
+                         foothold=foothold)
     if not args.side and not args.null_model_factorial:
         compare(args.scenario)
     return 0

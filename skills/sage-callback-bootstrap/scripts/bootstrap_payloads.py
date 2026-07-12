@@ -58,6 +58,8 @@ SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "s
 NATIVE_CHAT_PATH = REPO_ROOT / "skills" / "sage-live-runner" / "scripts" / "native_chat.py"
 DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
+DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
+DEFAULT_FOOTHOLD_USER_MATCH = "samwell.tarly"
 REQUIRED_RUNTIME_DBS = (
     "Payload_Type/sage/sage.db",
     "Payload_Type/sage/.phoenix/phoenix.db",
@@ -407,10 +409,16 @@ def summarize_callback_readiness(
     *,
     foothold_payload_type: str = "apollo",
     chat_containers: list[dict[str, Any]] | None = None,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
     foothold_payload_type = str(foothold_payload_type or "").strip().casefold()
     if not foothold_payload_type:
         raise ValueError("foothold_payload_type cannot be empty")
+    foothold_host = str(foothold_host or "").strip().casefold()
+    foothold_user_match = str(foothold_user_match or "").strip().casefold()
+    if not foothold_host or not foothold_user_match:
+        raise ValueError("foothold_host and foothold_user_match cannot be empty")
     rows = []
     for callback in callbacks:
         display_id = callback.get("display_id")
@@ -435,8 +443,8 @@ def summarize_callback_readiness(
         row for row in rows
         if row["payloadtype"] == foothold_payload_type
         and row["live"]
-        and str(row.get("host") or "").casefold() == "castelblack"
-        and "samwell" in str(row.get("user") or "").casefold()
+        and str(row.get("host") or "").casefold() == foothold_host
+        and foothold_user_match in str(row.get("user") or "").casefold()
     ]
     selected_foothold_cb = max((row["display_id"] for row in live_foothold), default=None)
     return {
@@ -450,7 +458,7 @@ def summarize_callback_readiness(
         "selected_apollo_cb": selected_foothold_cb if foothold_payload_type == "apollo" else None,
         "required": (
             "running Sage chat container plus live "
-            f"{foothold_payload_type} callback on CASTELBLACK as samwell.tarly"
+            f"{foothold_payload_type} callback on {foothold_host.upper()} as {foothold_user_match}"
         ),
     }
 
@@ -565,6 +573,8 @@ async def readiness(
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
     foothold_payload_type: str = "apollo",
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
@@ -590,6 +600,8 @@ async def readiness(
         liveness_by_display_id,
         foothold_payload_type=foothold_payload_type,
         chat_containers=observed.get("chat_containers", []),
+        foothold_host=foothold_host,
+        foothold_user_match=foothold_user_match,
     )
     blockers = []
     if not runtime["ready"]:
@@ -633,12 +645,18 @@ def synchronize_range_clocks(max_skew_seconds: float) -> dict[str, Any]:
     return result
 
 
-async def wait_for_samwell_apollo_callback(
+async def wait_for_foothold_apollo_callback(
     client,
     *,
     timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
     poll_seconds: float = 3.0,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
+    foothold_host = str(foothold_host or "").strip().casefold()
+    foothold_user_match = str(foothold_user_match or "").strip().casefold()
+    if not foothold_host or not foothold_user_match:
+        raise ValueError("foothold_host and foothold_user_match cannot be empty")
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_rows: list[dict[str, Any]] = []
     while True:
@@ -648,8 +666,8 @@ async def wait_for_samwell_apollo_callback(
             callback
             for callback in last_rows
             if payload_type_name(callback).casefold() == "apollo"
-            and str(callback.get("host") or "").casefold() == "castelblack"
-            and "samwell" in str(callback.get("user") or "").casefold()
+            and str(callback.get("host") or "").casefold() == foothold_host
+            and foothold_user_match in str(callback.get("user") or "").casefold()
             and isinstance(callback.get("display_id"), int)
         ]
         for callback in sorted(
@@ -667,10 +685,25 @@ async def wait_for_samwell_apollo_callback(
                 }
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError(
-                "Timed out waiting for live Apollo callback on CASTELBLACK as samwell.tarly; "
+                f"Timed out waiting for live Apollo callback on {foothold_host.upper()} "
+                f"as {foothold_user_match}; "
                 f"last callbacks: {json.dumps(last_rows, sort_keys=True)}"
             )
         await asyncio.sleep(poll_seconds)
+
+
+async def wait_for_samwell_apollo_callback(
+    client,
+    *,
+    timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the historical CASTELBLACK/Samwell bootstrap path."""
+    return await wait_for_foothold_apollo_callback(
+        client,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
 
 
 wait_for_baked_apollo_callback = wait_for_samwell_apollo_callback
@@ -758,10 +791,14 @@ async def post_callback_preflight(
     *,
     timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
     max_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
-    callback = await wait_for_samwell_apollo_callback(
+    callback = await wait_for_foothold_apollo_callback(
         client,
         timeout_seconds=timeout_seconds,
+        foothold_host=foothold_host,
+        foothold_user_match=foothold_user_match,
     )
     clocks = await asyncio.to_thread(synchronize_range_clocks, max_skew_seconds)
     callback_id = callback["display_id"]
@@ -863,6 +900,8 @@ async def command_readiness(args: argparse.Namespace) -> None:
             Path(args.repo_root),
             runtime_dbs_archived=args.runtime_dbs_archived,
             foothold_payload_type=args.foothold_payload_type,
+            foothold_host=args.foothold_host,
+            foothold_user_match=args.foothold_user_match,
         ),
         indent=2,
         sort_keys=True,
@@ -1006,11 +1045,15 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
         )
         result["apollo_callback_config"] = str(path)
         result["mode"] = "legacy-imported-baked-apollo"
-        result["post_callback_preflight"] = await post_callback_preflight(
-            client,
-            timeout_seconds=args.post_callback_timeout,
-            max_skew_seconds=args.max_clock_skew_seconds,
-        )
+        preflight_kwargs = {
+            "timeout_seconds": args.post_callback_timeout,
+            "max_skew_seconds": args.max_clock_skew_seconds,
+        }
+        if hasattr(args, "foothold_host"):
+            preflight_kwargs["foothold_host"] = args.foothold_host
+        if hasattr(args, "foothold_user_match"):
+            preflight_kwargs["foothold_user_match"] = args.foothold_user_match
+        result["post_callback_preflight"] = await post_callback_preflight(client, **preflight_kwargs)
     elif use_retained_callback:
         assert retained_path is not None
         assert retained_payload_type is not None
@@ -1043,6 +1086,8 @@ async def command_post_callback_preflight(args: argparse.Namespace) -> None:
             client,
             timeout_seconds=args.post_callback_timeout,
             max_skew_seconds=args.max_clock_skew_seconds,
+            foothold_host=args.foothold_host,
+            foothold_user_match=args.foothold_user_match,
         ),
         indent=2,
         sort_keys=True,
@@ -1135,7 +1180,20 @@ def build_parser() -> argparse.ArgumentParser:
     readiness_parser.add_argument(
         "--foothold-payload-type",
         default=os.environ.get("FOOTHOLD_PAYLOAD_TYPE", "apollo"),
-        help="Payload type expected on CASTELBLACK as samwell.tarly (default: apollo).",
+        help="Payload type expected on the foothold callback (default: apollo).",
+    )
+    readiness_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    readiness_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
     )
     readiness_parser.set_defaults(func=command_readiness)
 
@@ -1231,24 +1289,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         help="Maximum accepted guest/controller clock skew after synchronization.",
     )
+    reset_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require for baked-callback preflight (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    reset_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the baked foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
+    )
     reset_parser.set_defaults(func=command_bootstrap_reset)
 
     preflight_parser = sub.add_parser(
         "post-callback-preflight",
-        help="Wait for live Samwell Apollo, synchronize clocks, purge tickets, and verify callback identity.",
+        help="Wait for the live foothold Apollo, synchronize clocks, purge tickets, and verify callback identity.",
     )
     add_common(preflight_parser)
     preflight_parser.add_argument(
         "--post-callback-timeout",
         type=int,
         default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
-        help="Seconds to wait for the Samwell Apollo callback before failing.",
+        help="Seconds to wait for the foothold Apollo callback before failing.",
     )
     preflight_parser.add_argument(
         "--max-clock-skew-seconds",
         type=float,
         default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         help="Maximum accepted guest/controller clock skew after synchronization.",
+    )
+    preflight_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    preflight_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
     )
     preflight_parser.set_defaults(func=command_post_callback_preflight)
 

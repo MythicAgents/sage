@@ -129,6 +129,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     live_callback_ids = _live_callback_ids(state)
     preferred_callback_id = _preferred_live_callback_id(state, live_callback_ids)
     achieved = _achieved_effects(state)
+    available_account_contexts = achieved | _live_foothold_account_context_effects(state)
     terminal_failed = _terminal_failed_effects(state)
     ca_key_blocked_targets = _adcs_ca_private_key_blocked_targets(state)
     explicit_replication_domains = set(_replication_right_domains(achieved | facts))
@@ -211,7 +212,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     downstream_account_targets = _credential_accounts_required_by_downstream(
         facts,
         getattr(state, "objective", ""),
-        achieved=achieved,
+        achieved=available_account_contexts,
         terminal_failed=terminal_failed,
     )
     restrict_opportunistic_account_targets = (
@@ -271,7 +272,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
             account,
         ):
             continue
-        if _live_account_kerberos_context_callbacks(achieved, live_callback_ids, domain, account):
+        if _live_account_kerberos_context_callbacks(available_account_contexts, live_callback_ids, domain, account):
             continue
         callback_id = _select_context_callback_id(
             live_callback_ids,
@@ -316,7 +317,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         if effect in achieved:
             continue
         for callback_id in _live_account_kerberos_context_callbacks(
-            achieved,
+            available_account_contexts,
             live_callback_ids,
             account_domain,
             account,
@@ -6637,6 +6638,23 @@ def _live_callback_ids(state: Any) -> set[str]:
     return callback_ids
 
 
+def _live_foothold_account_context_effects(state: Any) -> set[str]:
+    """Return current callback account contexts implied by live authenticated footholds."""
+    effects: set[str] = set()
+    for foothold in getattr(state, "footholds", []) or []:
+        if not _is_live_target_callback_foothold(foothold):
+            continue
+        callback_id = _normalize_callback_id(getattr(foothold, "callback_id", ""))
+        domain = _normalize(getattr(foothold, "forest", ""))
+        account = _identity_account_for_forest(
+            getattr(foothold, "identity", ""),
+            domain,
+        )
+        if callback_id and domain and account:
+            effects.add(_kerberos_account_context_effect(domain, account, callback_id))
+    return effects
+
+
 def _preferred_live_callback_id(state: Any, live_callback_ids: set[str]) -> str:
     """Return the latest live callback that actually proved an achieved hop.
 
@@ -6831,6 +6849,30 @@ def _identity_domain(identity: Any) -> str:
     if "@" in text:
         return _normalize(text.rsplit("@", 1)[1])
     return ""
+
+
+def _identity_account(identity: Any) -> str:
+    text = _text(identity).strip()
+    normalized = _normalize(text)
+    if not normalized or normalized in {"sage", "system", "nt authority\\system"}:
+        return ""
+    if "\\" in text:
+        return _normalize(text.rsplit("\\", 1)[1])
+    if "@" in text:
+        return _normalize(text.split("@", 1)[0])
+    return normalized
+
+
+def _identity_account_for_forest(identity: Any, forest: Any) -> str:
+    """Return the callback account only when an explicit identity domain matches its forest."""
+    account = _identity_account(identity)
+    forest_domain = _normalize(forest)
+    if not account or not forest_domain:
+        return ""
+    identity_domain = _identity_domain(identity)
+    if identity_domain and not _domains_equivalent(identity_domain, forest_domain):
+        return ""
+    return account
 
 
 def _any_true(probe_result: dict[str, Any], keys) -> bool:

@@ -1490,6 +1490,86 @@ def test_adapter_translates_remote_execution_to_wmiexecute_and_cat():
     assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt"}
 
 
+def test_apollo_adapter_translates_remote_execution_to_token_backed_wmiexecute_and_cleanup():
+    action = capabilities.CapabilityAction(
+        name="execute-as-local-admin",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["local-admin:ws01@child.lab.local", "live-callback:13"],
+        effects=["remote-exec:ws01@child.lab.local", "host-exec:ws01"],
+        intent={
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.APOLLO_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    token, remote, proof, cleanup = mythic_plan.commands
+    assert token.parameters == {
+        "Credential": {
+            "account": "Administrator",
+            "credential": "CorrectHorseBatteryStaple!",
+            "realm": "ws01",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    assert token.produces == ["local_admin_logon_context"]
+    assert remote.parameters["host"] == "ws01.child.lab.local"
+    assert "username" not in remote.parameters
+    assert "password" not in remote.parameters
+    assert "domain" not in remote.parameters
+    assert remote.consumes == ["local_admin_logon_context"]
+    assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt"}
+    assert cleanup.command == "rev2self"
+    assert cleanup.operation == "local-admin-logon-session-revert"
+    assert cleanup.consumes == ["local_admin_logon_context"]
+
+
+def test_apollo_adapter_reuses_existing_token_context_for_remote_execution():
+    action = capabilities.CapabilityAction(
+        name="execute-as-local-admin",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["local-admin:ws01@child.lab.local", "live-callback:13"],
+        effects=["remote-exec:ws01@child.lab.local", "host-exec:ws01"],
+        intent={
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+    })
+    config = {
+        **adapter.APOLLO_MYTHIC_ADAPTER,
+        "local_admin_remote_exec_reuse_token_context": True,
+    }
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, config)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["wmiexecute", "cat", "rev2self"]
+    remote = mythic_plan.commands[0]
+    assert remote.parameters == {
+        "command": (
+            r'cmd.exe /c echo SAGE_REMOTE_EXEC_PROOF_ws01_13 & whoami & hostname '
+            r'& echo SAGE_REMOTE_EXEC_PROOF_ws01_13 > "C:\Windows\Temp\sage_remote_exec_ws01_13.txt" '
+            r'& whoami >> "C:\Windows\Temp\sage_remote_exec_ws01_13.txt" '
+            r'& hostname >> "C:\Windows\Temp\sage_remote_exec_ws01_13.txt"'
+        ),
+        "host": "ws01.child.lab.local",
+    }
+
+
 def test_adapter_translates_remote_execution_to_merlin_native_shell_proof():
     action = capabilities.CapabilityAction(
         name="execute-as-local-admin",
@@ -2013,6 +2093,58 @@ def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
     assert readback.parameters == {"path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_8.txt"}
 
 
+def test_apollo_adapter_translates_adcs_ca_export_to_token_backed_wmiexecute_readback():
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=lab.local;callback=8",
+        preconditions=[
+            "remote-exec:ca01@lab.local",
+            "local-admin:ca01@lab.local",
+            "live-callback:8",
+        ],
+        effects=[
+            "adcs-ca-private-key:ca01@lab.local",
+            "adcs-ca:ca01@lab.local",
+        ],
+        intent={
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "Correct Horse Battery Staple!",
+        "pfx_password": "Pfx Secret!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.APOLLO_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    token, remote, readback, cleanup = mythic_plan.commands
+    assert token.parameters == {
+        "Credential": {
+            "account": "Administrator",
+            "credential": "Correct Horse Battery Staple!",
+            "realm": "ca01",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    assert remote.parameters["host"] == "ca01.lab.local"
+    assert "username" not in remote.parameters
+    assert "password" not in remote.parameters
+    assert "domain" not in remote.parameters
+    assert remote.expected_probe == ""
+    assert remote.consumes == ["local_admin_logon_context"]
+    assert readback.expected_probe == "extract_adcs_ca_private_key_probe"
+    assert readback.consumes == ["local_admin_logon_context", "remote_process_created"]
+    assert readback.parameters == {"path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_8.txt"}
+    assert cleanup.operation == "local-admin-logon-session-revert"
+    assert cleanup.consumes == ["local_admin_logon_context"]
+
+
 def test_adapter_defaults_adcs_ca_private_key_export_to_wmiexecute_readback():
     action = capabilities.CapabilityAction(
         name="adcs-ca-private-key-export",
@@ -2372,6 +2504,7 @@ def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
     assert "AuthType]::External" in script
     assert "QueryClientCertificate" in script
     assert "StartTransportLayerSecurity" in script
+    assert "ReferralChasingOptions]::None" in script
     assert ".Bind();" not in script
     assert "$searchResponse=$candidate.SendRequest($probeRequest)" in script
     assert "X509KeyStorageFlags]::Exportable" in script

@@ -667,7 +667,8 @@ def certificate_admin_control_probe(
             try:
                 from ..langgraph import capabilities
             except Exception:
-                from ai.langgraph import capabilities  # type: ignore
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+                import capabilities  # type: ignore
 
             rows = _fetch_certificate_auth_task_outputs(timeout=timeout)
             for anchor in rows:
@@ -701,10 +702,28 @@ def certificate_admin_control_probe(
     return probe
 
 
-def any_probe(*probes: DirectProbe) -> DirectProbe:
-    """Return a short-circuiting OR over independent proof paths."""
+def any_probe(
+    *probes: DirectProbe,
+    settle_timeout: float = 0,
+    settle_interval: float = 20,
+) -> DirectProbe:
+    """Return a short-circuiting OR over independent proof paths.
+
+    With a settling window, re-run every proof path until one succeeds or the shared
+    window expires. This matters for objective proof paths that become visible on
+    different clocks: Mythic task responses can lag task completion by a few seconds,
+    while LDAP membership changes can take much longer to propagate.
+    """
     def probe() -> bool:
-        return any(candidate() for candidate in probes)
+        waited = 0.0
+        while True:
+            if any(candidate() for candidate in probes):
+                return True
+            if waited >= settle_timeout:
+                return False
+            step = min(settle_interval, settle_timeout - waited)
+            time.sleep(step)
+            waited += step
 
     return probe
 

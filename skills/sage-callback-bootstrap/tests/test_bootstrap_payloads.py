@@ -66,7 +66,7 @@ def test_post_callback_preflight_requires_purge_and_probe(monkeypatch) -> None:
             ),
         }
 
-    monkeypatch.setattr(bootstrap, "wait_for_samwell_apollo_callback", fake_wait)
+    monkeypatch.setattr(bootstrap, "wait_for_foothold_apollo_callback", fake_wait)
     monkeypatch.setattr(bootstrap, "synchronize_range_clocks", fake_sync)
     monkeypatch.setattr(bootstrap, "issue_callback_task", fake_task)
 

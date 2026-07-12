@@ -83,7 +83,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
 
     # The overnight local-test env (Plans/OVERNIGHT-RUN.md) supplies provider/model under those
     # exact lowercase keys plus API_ENDPOINT/API_KEY — resolve under the same names the legacy
-    # get_secret path used so the local gpt-5.4-mini endpoint keeps working with no ChatRequest.
+    # get_secret path used so the local loopback endpoint keeps working with no ChatRequest.
     provider = _resolve(config, secrets, "provider", env_key="provider", default="openai").lower()
     model = _resolve(config, secrets, "model", env_key="model").lower()
     system_prompt = _resolve(config, secrets, "system_prompt", env_key="system_prompt", default="")
