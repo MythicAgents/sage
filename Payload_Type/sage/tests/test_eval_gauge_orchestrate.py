@@ -1,5 +1,6 @@
 import subprocess
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -110,8 +111,8 @@ def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):
 
     monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
 
-    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold):
-        del snapshot, retained_callback_config, foothold
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del snapshot, retained_callback_config, foothold, ludus_range_id
         seen[restart_env["SAGE_POLICY_MODE"]] = dict(restart_env)
         return None, 7
 
@@ -135,6 +136,47 @@ def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):
         values["SAGE_AUTONOMOUS_CONTROLLER"]
         for values in seen.values()
     } == {"1"}
+
+
+def test_run_side_uses_purpose_range_map_and_passes_range_id(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del snapshot, retained_callback_config, foothold
+        seen["restart_env"] = dict(restart_env)
+        seen["range_id"] = ludus_range_id
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "purpose-range-visible-cost",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="hybrid",
+        ludus_range_id="SAGEPOLICY20260712",
+    )
+
+    assert seen["range_id"] == "SAGEPOLICY20260712"
+    assert seen["restart_env"]["SAGE_ENGAGEMENT_NETBIOS_MAP"] == orchestrate.DEFAULT_PURPOSE_RANGE_NETBIOS_MAP
+    assert seen["restart_env"]["SAGE_GPO_PROOF_SHARE_NAME"] == "SageProof"
+    assert seen["restart_env"]["SAGE_GPO_PROOF_LOCAL_ROOT"] == r"C:\SageProof"
+    assert seen["restart_env"]["SAGE_GPO_WAIT_SECONDS"] == "120"
+
+
+def test_purpose_range_recovery_adds_explicit_gpo_blocker_only_for_recovery_variant():
+    visible = orchestrate._scenario_restart_env("purpose-range-visible-cost")
+    recovery = orchestrate._scenario_restart_env("purpose-range-recovery")
+
+    assert "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON" not in visible
+    blocker = json.loads(recovery["SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON"])
+    assert blocker["capability"] == "gpo-controlled-system-exec"
+    assert blocker["target_contains"] == "gpo=srv02-policy;domain=range.local"
+    assert blocker["reason"] == "endpoint protection blocked the staged GPO payload on srv02"
+    assert blocker["probe"]["defender_blocked"] is True
 
 
 def test_treatment_route_rejects_loopback_proxy(tmp_path):

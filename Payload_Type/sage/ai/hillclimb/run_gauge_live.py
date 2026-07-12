@@ -27,13 +27,13 @@ from pathlib import Path
 
 try:
     from . import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod
-    from .scenarios import goad_scenarios, CHILD, OBJECTIVE
+    from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod  # type: ignore
-    from scenarios import goad_scenarios, CHILD, OBJECTIVE  # type: ignore
+    from scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
     from range_state import Milestone  # type: ignore
     from fitness import ScoreCard  # type: ignore
 
@@ -58,6 +58,9 @@ class Config:
 
     @property
     def results_path(self) -> Path:
+        override = str(os.environ.get("SAGE_EVAL_RESULTS_PATH") or "").strip()
+        if override:
+            return Path(override).expanduser()
         return Path(__file__).resolve().parents[2] / ".hillclimb" / "results" / "bare_vs_harness.jsonl"
 
 
@@ -67,21 +70,26 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
 
     KRBTGT is proven from Mythic loot/task output. DA is proven from out-of-band LDAP membership delta.
     OBJECTIVE accepts either LDAP admin membership or completed Mythic task output that independently
-    replays the certificate-auth verifier; certificate access does not mutate group membership.
+    replays the certificate-auth / forged-ticket verifiers; those access paths do not mutate group
+    membership.
     """
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
-    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=CHILD)}
+    domains = dict(getattr(scenario, "domains", {}) or {})
+    child_domain = str(domains.get("child") or CHILD)
+    objective_domain = str(domains.get("objective") or OBJECTIVE)
+    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=child_domain)}
     if Milestone.DA_CHILD in sub:
         probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
-            reader, CHILD, baseline=baseline.get(CHILD, set()),
+            reader, child_domain, baseline=baseline.get(child_domain, set()),
             settle_timeout=settle_timeout, settle_interval=settle_interval)
     if Milestone.OBJECTIVE in sub:
         probes[Milestone.OBJECTIVE] = live_seams.any_probe(
-            live_seams.certificate_admin_control_probe("administrator", realm=OBJECTIVE),
+            live_seams.certificate_admin_control_probe("administrator", realm=objective_domain),
+            live_seams.ticket_admin_control_probe(realm=objective_domain),
             live_seams.ad_domain_admins_probe_via_reader(
                 reader,
-                OBJECTIVE,
-                baseline=baseline.get(OBJECTIVE, set()),
+                objective_domain,
+                baseline=baseline.get(objective_domain, set()),
                 settle_timeout=0,
             ),
             settle_timeout=settle_timeout,
@@ -98,10 +106,11 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
 
 
 def _scenario(cfg: Config, name: str):
-    for s in goad_scenarios(cfg.engagement_op):
+    scenarios = all_scenarios(cfg.engagement_op)
+    for s in scenarios:
         if s.name == name:
             return s
-    raise SystemExit(f"unknown scenario {name!r}; choices: {[s.name for s in goad_scenarios(cfg.engagement_op)]}")
+    raise SystemExit(f"unknown scenario {name!r}; choices: {[s.name for s in scenarios]}")
 
 
 def objective_recognizable(objective: str) -> tuple[bool, str]:
@@ -134,7 +143,14 @@ def _scored_referee_domains(scn) -> set:
     Mirrors run_side's baseline scope EXACTLY, so the preflight validates precisely the creds the run will
     require — no more, no less."""
     sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
-    return {d for m, d in ((Milestone.DA_CHILD, CHILD), (Milestone.OBJECTIVE, OBJECTIVE)) if m in sub}
+    domains = dict(getattr(scn, "domains", {}) or {})
+    return {
+        domain
+        for milestone, role in ((Milestone.DA_CHILD, "child"), (Milestone.OBJECTIVE, "objective"))
+        if milestone in sub
+        for domain in [str(domains.get(role) or "").strip()]
+        if domain
+    }
 
 
 def _referee_creds_present(domain: str) -> tuple[bool, str]:
@@ -228,12 +244,50 @@ def validate_harness_runtime_telemetry(
         raise RuntimeError(
             f"semantic policy provenance incomplete: {authorized}/{total} transactions authorized"
         )
+    model_calls = int(telemetry.get("model_calls", 0) or 0)
+    if configured in {"llm", "hybrid"} and model_calls:
+        backend_requests = telemetry.get("effective_backend_requests")
+        if not isinstance(backend_requests, list):
+            raise RuntimeError("runtime telemetry omitted effective backend request records")
+        if len(backend_requests) != model_calls:
+            raise RuntimeError(
+                f"effective backend provenance incomplete: {len(backend_requests)}/{model_calls} model responses"
+            )
+        for request in backend_requests:
+            if not isinstance(request, dict):
+                raise RuntimeError("runtime telemetry contains a malformed effective backend record")
+            if not str(request.get("effective_backend") or "").strip():
+                raise RuntimeError("runtime telemetry omitted the response-derived effective backend")
+            if str(request.get("backend_provenance_source") or "").strip() in {"", "unavailable"}:
+                raise RuntimeError("runtime telemetry omitted the effective backend provenance source")
+        if telemetry.get("backend_provenance_complete") is not True:
+            raise RuntimeError("runtime telemetry marked effective backend provenance incomplete")
+
+
+def runtime_evidence_fields(telemetry: dict | None) -> dict:
+    """Persist the controller evidence needed to audit branch quality after the next lab reset."""
+    if not isinstance(telemetry, dict):
+        return {}
+    keys = (
+        "controller_status",
+        "controller_cycle_count",
+        "controller_cycles",
+        "controller_blocker",
+        "achieved_effects",
+        "model_calls",
+        "backend_provenance_complete",
+        "policy_switches",
+        "decisions",
+        "transactions",
+    )
+    return {key: telemetry[key] for key in keys if key in telemetry}
 
 
 def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     scn = _scenario(cfg, scenario_name)
     client = live_seams.default_mythic_client()
+    runtime_telemetry: dict = {}
 
     # GROUND TRUTH is read OUT-OF-BAND over LDAP (the referee), NOT through the agent's Apollo callback.
     # Routing it through that callback would (a) pollute the HARNESS — Sage reconciles the callback's task
@@ -348,10 +402,13 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
            "semantic_transaction_count": card.semantic_transaction_count,
            "authorized_transaction_count": card.authorized_transaction_count,
            "semantic_policy_coverage": card.semantic_policy_coverage,
+           "effective_backends": list(card.effective_backends),
+           "effective_backend_requests": list(card.effective_backend_requests),
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
            "card": asdict(card)}
+    rec.update(runtime_evidence_fields(runtime_telemetry))
     native_result = getattr(locals().get("solve"), "last_result", None)
     if isinstance(native_result, dict):
         rec["chat_channel_id"] = native_result.get("chat_channel_id")

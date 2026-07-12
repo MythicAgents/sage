@@ -97,6 +97,17 @@ def test_default_remote_filename_preserves_interactive_payload_name():
     assert deploy.default_remote_filename("apollo.exe", "scheduled-task-interactive") == "apollo.exe"
 
 
+def test_with_ludus_range_id_preserves_existing_query_and_does_not_duplicate():
+    assert (
+        deploy.with_ludus_range_id("/api/v2/range/logs?tail=60", "SAGEPOLICY20260712")
+        == "/api/v2/range/logs?tail=60&rangeID=SAGEPOLICY20260712"
+    )
+    assert (
+        deploy.with_ludus_range_id("/api/v2/range?rangeID=existing", "SAGEPOLICY20260712")
+        == "/api/v2/range?rangeID=existing"
+    )
+
+
 def test_launch_payload_interactive_waits_for_session_and_uses_interactive_task(monkeypatch):
     calls = []
 

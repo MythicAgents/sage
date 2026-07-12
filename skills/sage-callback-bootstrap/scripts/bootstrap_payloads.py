@@ -637,7 +637,7 @@ def synchronize_range_clocks(max_skew_seconds: float) -> dict[str, Any]:
     module = _load_sync_range_time_module()
     hosts = module.windows_hosts(module.load_inventory(module.DEFAULT_MCP_PATH))
     if not hosts:
-        raise RuntimeError("No GOAD Windows hosts found in Ludus inventory")
+        raise RuntimeError("No Windows hosts found in Ludus inventory")
     module.sync_clocks(hosts)
     result = module.check_clocks(hosts, max_skew_seconds)
     if not result.get("ready"):

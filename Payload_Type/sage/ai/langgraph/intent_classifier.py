@@ -269,7 +269,7 @@ def _is_krbtgt_dcsync_target(value: str) -> bool:
 
 def _is_domain_dn(value: str) -> bool:
     try:
-        return re.search(r"(?:^|,)DC=[^,]+(?:,DC=[^,]+)+", _text(value), re.IGNORECASE) is not None
+        return re.search(r"(?:^|[=,])DC=[^,]+(?:,DC=[^,]+)+", _text(value), re.IGNORECASE) is not None
     except Exception:
         return False
 

@@ -82,6 +82,10 @@ def test_string_capability_failure_flows_to_blocked_not_silent_success():
     # the STRING result was parsed as a FAILURE (not coerced to success) -> clean terminal blocker
     assert "halted_blocked" in report, report
     assert "adcs-ca-private-key-export" in report
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["controller_cycle_count"] == len(telemetry["controller_cycles"])
+    assert telemetry["controller_cycles"][0]["action"] == "adcs-ca-private-key-export"
+    assert telemetry["controller_cycles"][0]["ok"] is False
 
 
 def test_observe_none_halts_cleanly_without_crash():
@@ -202,6 +206,65 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
     assert telemetry["configured_policy_mode"] == policy_mode
     assert telemetry["policy_identity_valid"] is True
     assert telemetry["policy_switches"] == []
+
+
+def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry():
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = True
+    m.policy_mode = "llm"
+    m.provider = "configured-provider"
+    m.model = "configured-model"
+    m._controller_hitl_pending = None
+    m._controller_hitl_approved_key = ""
+    m._controller_hitl_approved_pending = None
+    m._controller_hitl_objective = ""
+    m._write_hitl_audit = lambda *_args, **_kwargs: None
+
+    class FakeLLM:
+        async def ainvoke(self, _messages):
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "select",
+                    "capability": "adcs-ca-private-key-export",
+                    "rationale": "select the only admissible action",
+                }),
+                "response_metadata": {
+                    "model_provider": "runtime-provider",
+                    "model_name": "runtime-model",
+                },
+            })()
+
+    m.llm = FakeLLM()
+    assert asyncio.run(m._run_autonomous_controller(_state_with_remote_exec().objective)) == ""
+    assert calls == []
+
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["model_calls"] == 1
+    assert telemetry["semantic_transaction_count"] == 0
+    assert telemetry["backend_provenance_complete"] is True
+    assert telemetry["effective_backend_requests"] == [{
+        "decision_id": telemetry["decisions"][0]["decision_id"],
+        "policy_mode": "llm",
+        "effective_backend": "runtime-provider:runtime-model",
+        "effective_model_provider": "runtime-provider",
+        "effective_model_id": "runtime-model",
+        "backend_provenance_source": "response_metadata.model_name",
+        "response_metadata": {
+            "model_name": "runtime-model",
+            "model_provider": "runtime-provider",
+        },
+    }]
+
+    assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["controller_status"] == "halted_denied"
+    assert telemetry["controller_terminal_reason"] == "operator denied adcs-ca-private-key-export"
+    assert telemetry["model_calls"] == 1
+    assert telemetry["effective_backends"] == ["runtime-provider:runtime-model"]
+    assert telemetry["backend_provenance_complete"] is True
 
 
 def test_verbose_controller_streams_progress_before_terminal_report():
@@ -1349,6 +1412,61 @@ def test_capability_inputs_pass_controlled_principal():
     inputs = model._autonomous_capability_inputs(action, snap)
     assert inputs.get("controlled_principal") == "north\\samwell.tarly", inputs
     assert inputs.get("current_user") == "north\\samwell.tarly", inputs
+
+
+def test_capability_inputs_enable_proof_only_for_non_dc_gpo_system_exec():
+    """Non-DC GPO actions explicitly model a SYSTEM proof hop, so the autonomous builder must authorize the
+    proof marker path instead of rejecting the action for lacking a durable domain-visible command."""
+    from ai.langgraph import capabilities as cap
+
+    snap = es.EngagementState(
+        objective="x",
+        footholds=[_foothold("2", "apollo", "ws01", "range\\user1", "range.local")],
+        hops=[],
+        graph_facts=[],
+    )
+    proof_action = cap.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        intent={"preferred_effect": "system-exec-proof"},
+    )
+    durable_action = cap.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=dc-policy;domain=range.local",
+        intent={"preferred_effect": "domain-admin-membership"},
+    )
+
+    assert model._autonomous_capability_inputs(proof_action, snap).get("allow_proof_only") is True
+    assert "allow_proof_only" not in model._autonomous_capability_inputs(durable_action, snap)
+
+
+def test_capability_inputs_use_bounded_gpo_wait_override_for_gpo_lane(monkeypatch):
+    from ai.langgraph import capabilities as cap
+
+    snap = es.EngagementState(
+        objective="x",
+        footholds=[_foothold("2", "apollo", "ws01", "range\\user1", "range.local")],
+        hops=[],
+        graph_facts=[],
+    )
+    monkeypatch.setenv("SAGE_GPO_WAIT_SECONDS", "120")
+
+    gpo_inputs = model._autonomous_capability_inputs(
+        cap.CapabilityAction(name="gpo-controlled-system-exec", target="gpo=srv02-policy;domain=range.local"),
+        snap,
+    )
+    grant_inputs = model._autonomous_capability_inputs(
+        cap.CapabilityAction(name="grant-directory-rights", target="domain=range.local"),
+        snap,
+    )
+    laps_inputs = model._autonomous_capability_inputs(
+        cap.CapabilityAction(name="read-managed-local-admin-secret", target="host=ca01;domain=range.local"),
+        snap,
+    )
+
+    assert gpo_inputs["gpo_wait_seconds"] == 120
+    assert grant_inputs["gpo_wait_seconds"] == 120
+    assert "gpo_wait_seconds" not in laps_inputs
 
 
 def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():

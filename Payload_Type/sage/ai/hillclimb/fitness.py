@@ -115,6 +115,8 @@ class ScoreCard:
     policy_identity_valid: bool = False
     model_provider: str = ""
     model_id: str = ""
+    effective_backends: list = field(default_factory=list)
+    effective_backend_requests: list = field(default_factory=list)
     semantic_transaction_count: int = 0
     authorized_transaction_count: int = 0
     semantic_policy_coverage: float = 0.0
@@ -232,6 +234,8 @@ def score(
         policy_identity_valid=bool(r.get("policy_identity_valid", False)),
         model_provider=str(r.get("model_provider", "") or ""),
         model_id=str(r.get("model_id", "") or ""),
+        effective_backends=list(r.get("effective_backends") or []),
+        effective_backend_requests=list(r.get("effective_backend_requests") or []),
         semantic_transaction_count=_i(r, "semantic_transaction_count"),
         authorized_transaction_count=_i(r, "authorized_transaction_count"),
         semantic_policy_coverage=_f(r, "semantic_policy_coverage"),

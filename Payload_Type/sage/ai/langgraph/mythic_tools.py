@@ -15,6 +15,42 @@ _task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.Cont
     "sage_mythic_task_visibility_context",
     default=None,
 )
+_POLICY_EVIDENCE_FIELDS = (
+    "episode_id",
+    "decision_id",
+    "policy_mode",
+    "candidate_hash",
+    "candidate_count",
+    "selected_index",
+    "selected_family",
+    "selected_is_first_admissible",
+    "disposition",
+    "rationale",
+    "raw_response",
+    "raw_disposition",
+    "raw_rationale",
+    "model_response_observed",
+    "effective_backend",
+    "effective_model_provider",
+    "effective_model_id",
+    "backend_provenance_source",
+)
+
+
+def _policy_decision_evidence(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    evidence = {}
+    for key in _POLICY_EVIDENCE_FIELDS:
+        if key not in value:
+            continue
+        item = value.get(key)
+        if item is None or item == "":
+            continue
+        evidence[key] = item
+    return evidence
+
+
 # Durable-hop TTL (hours). A loaded "achieved" hop older than this is dropped at load so a stale belief
 # (e.g. after a GOAD redeploy) cannot suppress a real hop. Default 0 = disabled (no expiry). The gate
 # also refuses to SILENTLY hard-SKIP a durable hop unless live footholds corroborate it — TTL is the
@@ -4063,19 +4099,27 @@ class MythicTools:
             self._collection_in_flight.pop(collection_key, None)
             if not verified:
                 return
+            visibility_context = _task_visibility_context.get() or {}
+            policy_decision = (
+                visibility_context.get("policy_decision")
+                if isinstance(visibility_context.get("policy_decision"), dict)
+                else {}
+            )
+            evidence = {
+                "source": "ingest_collection",
+                "provenance": "run",
+                "graph_verified": True,
+                "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
+                "covered_domains": sorted({
+                    str(domain or "").strip().casefold()
+                    for domain in covered_domains or []
+                    if str(domain or "").strip()
+                }),
+            }
+            evidence.update(_policy_decision_evidence(policy_decision))
             updated = engagement_state.record_hop_result(
                 state, "collect-graph", collection_key, "achieved",
-                {
-                    "source": "ingest_collection",
-                    "provenance": "run",
-                    "graph_verified": True,
-                    "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
-                    "covered_domains": sorted({
-                        str(domain or "").strip().casefold()
-                        for domain in covered_domains or []
-                        if str(domain or "").strip()
-                    }),
-                },
+                evidence,
                 now,
             )
             self._engagement_hops = updated.hops
@@ -5005,10 +5049,8 @@ class MythicTools:
             action_intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
             policy_decision = action_intent.get("policy_decision")
             if isinstance(policy_decision, dict):
-                evidence.setdefault("episode_id", self._capability_text(policy_decision.get("episode_id")))
-                evidence.setdefault("decision_id", self._capability_text(policy_decision.get("decision_id")))
-                evidence.setdefault("policy_mode", self._capability_text(policy_decision.get("policy_mode")))
-                evidence.setdefault("candidate_hash", self._capability_text(policy_decision.get("candidate_hash")))
+                for key, value in _policy_decision_evidence(policy_decision).items():
+                    evidence.setdefault(key, value)
             updated, verification = capabilities.record_capability_result(
                 state,
                 action,
@@ -5837,6 +5879,7 @@ class MythicTools:
             "gpo", "gpo_name", "gponame", "gpo_display_name",
             "account", "user", "rights", "execution_context", "callback_id", "callback",
             "gpo_guid", "guid", "gpo_object_guid", "ldap_server",
+            "affected_hosts", "affected_computer_hosts", "affected_computers", "computer_hosts",
             "affected_dc_hosts", "affected_dcs", "dc_hosts",
             "current_host", "callback_host", "foothold_host", "local_host",
             "account_domain", "reader_domain", "principal_domain", "target_host", "host", "computer",
@@ -6067,6 +6110,15 @@ class MythicTools:
                     "issued": [],
                     "recorded_effects": [],
                 }, action_obj, input_values, callback_id)
+
+            injected_blocker = self._capability_executor_injected_blocker(
+                action_obj,
+                input_values,
+                callback_id,
+                capabilities,
+            )
+            if injected_blocker is not None:
+                return injected_blocker
 
             timeout = self._capability_executor_timeout(input_values)
             all_issued: list[dict] = []
@@ -6596,6 +6648,55 @@ class MythicTools:
                 "issued": [],
             }, {}, {}, None, reason=str(exc), issued=[])
 
+    def _capability_executor_injected_blocker(
+        self,
+        action,
+        inputs: dict,
+        callback_id: str | int | None,
+        capabilities_mod,
+    ) -> str | None:
+        """Return one explicit eval-only verifier blocker when configured by the harness."""
+        raw = self._capability_text(os.environ.get("SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON")).strip()
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except Exception:
+            return None
+        specs = decoded if isinstance(decoded, list) else [decoded]
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        target = self._capability_text(getattr(action, "target", "")).casefold()
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            if self._capability_text(spec.get("capability")).casefold() != capability:
+                continue
+            target_contains = self._capability_text(spec.get("target_contains")).casefold()
+            if target_contains and target_contains not in target:
+                continue
+            probe = dict(spec.get("probe") or {}) if isinstance(spec.get("probe"), dict) else {}
+            if not probe:
+                continue
+            verification = capabilities_mod.verify_capability(capability, probe)
+            if self._capability_text(getattr(verification, "verdict", "")).casefold() != "blocked":
+                continue
+            reason = self._capability_text(spec.get("reason") or getattr(verification, "reason", "")).strip()
+            if not reason:
+                reason = "eval-injected capability blocker"
+            return self._capability_executor_failure_json({
+                "ok": False,
+                "verdict": "blocked",
+                "capability": capability,
+                "reason": reason,
+                "failure_class": "genuine",
+                "action": asdict(action) if is_dataclass(action) else {},
+                "issued": [],
+                "recorded_effects": [],
+                "stopped_after": "eval_injected_blocker",
+                "eval_injected_blocker": True,
+            }, action, inputs, callback_id, record_failed=True, failure_probe=probe)
+        return None
+
     async def materialize_capability_inputs(
         self,
         action: Annotated[dict | str, (
@@ -7009,15 +7110,17 @@ class MythicTools:
             return
         if capability == "gpo-controlled-system-exec":
             intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-            explicit_proof_path = self._capability_text(
-                inputs.get("proof_path")
-                or inputs.get("proof_unc")
-                or intent.get("proof_path")
-                or intent.get("proof_unc")
-            )
-            if explicit_proof_path:
-                inputs.setdefault("proof_path", explicit_proof_path)
-                inputs.setdefault("proof_unc", explicit_proof_path)
+            explicit_proof_path = self._capability_text(inputs.get("proof_path") or intent.get("proof_path"))
+            explicit_proof_unc = self._capability_text(inputs.get("proof_unc") or intent.get("proof_unc"))
+            if explicit_proof_path or explicit_proof_unc:
+                if explicit_proof_path:
+                    inputs.setdefault("proof_path", explicit_proof_path)
+                if explicit_proof_unc:
+                    inputs.setdefault("proof_unc", explicit_proof_unc)
+                if explicit_proof_path and not explicit_proof_unc:
+                    inputs.setdefault("proof_unc", explicit_proof_path)
+                if explicit_proof_unc and not explicit_proof_path:
+                    inputs.setdefault("proof_path", explicit_proof_unc)
                 return
             if self._capability_text(inputs.get("proof_path") or inputs.get("proof_unc")):
                 return
@@ -7038,18 +7141,36 @@ class MythicTools:
                 or intent.get("guid")
                 or intent.get("gpo_object_guid")
             ).strip().strip("{}")
-            affected = {
+            affected_dc_hosts = {
                 self._capability_text(host).split(".", 1)[0].casefold()
-                for host in (inputs.get("affected_dc_hosts") or intent.get("affected_dc_hosts") or [])
+                for host in self._capability_list(inputs.get("affected_dc_hosts") or intent.get("affected_dc_hosts"))
                 if self._capability_text(host)
             }
+            affected_hosts = {
+                self._capability_text(host).split(".", 1)[0].casefold()
+                for host in self._capability_list(inputs.get("affected_hosts") or intent.get("affected_hosts"))
+                if self._capability_text(host)
+            }
+            affected_hosts.update(affected_dc_hosts)
             current_host = self._capability_text(
                 inputs.get("current_host")
                 or inputs.get("callback_host")
                 or inputs.get("foothold_host")
                 or inputs.get("local_host")
             ).split(".", 1)[0].casefold()
-            if domain and gpo_guid and (affected and current_host not in affected):
+            dedicated_proof_target = self._gpo_dedicated_proof_target(
+                domain=domain,
+                gpo=gpo or gpo_guid,
+                current_host=current_host,
+                affected_hosts=affected_hosts,
+                affected_dc_hosts=affected_dc_hosts,
+            )
+            if dedicated_proof_target:
+                proof_path, proof_unc = dedicated_proof_target
+                inputs["proof_path"] = proof_path
+                inputs["proof_unc"] = proof_unc
+                return
+            if domain and gpo_guid and (affected_dc_hosts and current_host not in affected_dc_hosts):
                 slug = self._capability_slug(gpo or gpo_guid)
                 proof_path = (
                     f"\\\\{domain}\\SYSVOL\\{domain}\\Policies\\{{{gpo_guid}}}"
@@ -8229,6 +8350,26 @@ class MythicTools:
             else:
                 probe = dict(capabilities_mod.extract_gpo_system_exec_probe(output))
                 probe["callback_id"] = self._capability_text(callback_id)
+                if not self._capability_executor_is_final_probe(command_obj):
+                    # A structured GPO artifact can legitimately contain strings like
+                    # `NT AUTHORITY\SYSTEM` in its author field. Those setup reads are
+                    # useful for artifact validation, but they are not execution proof.
+                    probe["system_callback_observed"] = False
+                    probe["system_command_succeeded"] = False
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "grant-directory-rights":
+            if (
+                expected_probe != "extract_directory_rights_probe"
+                or not self._capability_executor_is_final_probe(command_obj)
+            ):
+                return None, None
+            probe = dict(capabilities_mod.extract_directory_rights_probe(
+                output,
+                acl_entries=[output],
+                domain=self._capability_domain(action, inputs),
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
         if capability == "adcs-certificate-auth":
@@ -8789,6 +8930,8 @@ class MythicTools:
             if any(item.startswith("artifact:") and item.endswith("_validated") for item in produces):
                 return False
             return "event:group_policy_refresh" in consumes or "proof" in purpose
+        if expected_probe == "extract_directory_rights_probe":
+            return self._capability_text(command_obj.get("operation")).casefold() == "ldap-acl-read"
         final_probe_names = {
             "extract_adcs_ca_private_key_probe",
             "extract_adcs_enrolled_certificate_probe",
@@ -9333,6 +9476,9 @@ class MythicTools:
         payload: dict,
         issued: list[dict] | None,
     ) -> str:
+        explicit = self._capability_text(payload.get("failure_class") if isinstance(payload, dict) else "").casefold()
+        if explicit in {"construction", "genuine", "transient"}:
+            return explicit
         issued_rows = [item for item in list(issued or []) if isinstance(item, dict)]
         last = issued_rows[-1] if issued_rows else {}
         result_class = self._capability_text(last.get("result_class")).casefold()
@@ -9405,6 +9551,17 @@ class MythicTools:
             "verify_reason": reason,
             "result_preview": preview,
         }
+        for key in (
+            "defender_blocked",
+            "payload_quarantined",
+            "endpoint_blocked",
+            "endpoint_protection_blocked",
+            "target_host",
+            "target_domain",
+        ):
+            value = probe.get(key)
+            if value not in (None, "", False):
+                evidence[key] = value
         if isinstance(payload.get("transaction"), dict):
             evidence["transaction_status"] = payload["transaction"].get("status")
         if isinstance(inputs, dict):
@@ -9983,6 +10140,23 @@ class MythicTools:
                         if guid:
                             inputs["gpo_guid"] = guid
                             break
+            if not inputs.get("affected_hosts") and gpo and domain:
+                prefix = f"gpo-affects-computer:{gpo}:"
+                hosts = []
+                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                    predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
+                    if not predicate.startswith(prefix):
+                        continue
+                    tail = predicate[len(prefix):]
+                    parts = tail.split(":")
+                    if len(parts) < 2:
+                        continue
+                    host = parts[0].strip()
+                    fact_domain = ":".join(parts[1:]).strip()
+                    if host and fact_domain == domain and host not in hosts:
+                        hosts.append(host)
+                if hosts:
+                    inputs["affected_hosts"] = hosts
             if not inputs.get("affected_dc_hosts") and gpo and domain:
                 prefix = f"gpo-affects-dc:{gpo}:"
                 hosts = []
@@ -11970,6 +12144,44 @@ class MythicTools:
         if "." not in host and domain:
             host = f"{host}.{self._capability_text(domain).strip().strip('.')}"
         return host
+
+    def _gpo_dedicated_proof_target(
+        self,
+        *,
+        domain: str,
+        gpo: str,
+        current_host: str,
+        affected_hosts: set[str],
+        affected_dc_hosts: set[str],
+    ) -> tuple[str, str] | None:
+        """Return a local-write/UNC-read proof pair for one remote non-DC GPO target.
+
+        This is opt-in runtime plumbing for benchmark ranges that provision a read-only proof share. It keeps
+        the SYSTEM task's write local to the affected host while giving the callback a separate readable path.
+        """
+        share = self._capability_text(os.environ.get("SAGE_GPO_PROOF_SHARE_NAME")).strip()
+        local_root = self._capability_text(os.environ.get("SAGE_GPO_PROOF_LOCAL_ROOT")).strip().replace("/", "\\")
+        if (
+            not domain
+            or not current_host
+            or not share
+            or not local_root
+            or affected_dc_hosts
+            or not _re_mod.fullmatch(r"[A-Za-z0-9_$-]+", share)
+            or not _re_mod.match(r"^[A-Za-z]:\\", local_root)
+            or any(ch in local_root for ch in "\r\n\"'&|<>")
+        ):
+            return None
+        remote_hosts = sorted(host for host in affected_hosts if host and host != current_host)
+        if len(remote_hosts) != 1:
+            return None
+        target_host = self._capability_host_name(remote_hosts[0], domain)
+        if not target_host:
+            return None
+        filename = f"sage_gpo_{self._capability_slug(gpo or target_host)}_whoami.txt"
+        proof_path = local_root.rstrip("\\") + "\\" + filename
+        proof_unc = f"\\\\{target_host}\\{share}\\{filename}"
+        return proof_path, proof_unc
 
     def _capability_unc_from_windows_path(self, host: str, path: str) -> str:
         host_text = self._capability_text(host).strip().strip("\\/")

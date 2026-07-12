@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import ssl
 import sys
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import urllib.request
 
 import yaml
@@ -17,6 +19,7 @@ import yaml
 
 DEFAULT_MCP_PATH = Path("/home/john/dev/sage/.mcp.json")
 DEFAULT_MAX_SKEW_SECONDS = 60.0
+RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 
 
 def ludus_creds(mcp_path: Path) -> tuple[str, str]:
@@ -26,10 +29,26 @@ def ludus_creds(mcp_path: Path) -> tuple[str, str]:
     return env["LUDUS_URL"].rstrip("/"), env["LUDUS_API_KEY"]
 
 
-def load_inventory(mcp_path: Path) -> dict[str, Any]:
+def selected_range_id(range_id: str | None = None) -> str | None:
+    value = str(range_id or os.environ.get(RANGE_ID_ENV) or "").strip()
+    return value or None
+
+
+def with_range_id(path: str, range_id: str | None = None) -> str:
+    selected = selected_range_id(range_id)
+    if not selected:
+        return path
+    parts = urlsplit(path)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == "rangeID" for key, _value in query):
+        query.append(("rangeID", selected))
+    return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+
+
+def load_inventory(mcp_path: Path, range_id: str | None = None) -> dict[str, Any]:
     url, api_key = ludus_creds(mcp_path)
     request = urllib.request.Request(
-        f"{url}/api/v2/range/ansibleinventory",
+        f"{url}{with_range_id('/api/v2/range/ansibleinventory', range_id)}",
         headers={"X-API-KEY": api_key},
     )
     context = ssl.create_default_context()
@@ -229,6 +248,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("check", "sync"))
     parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
+    parser.add_argument(
+        "--range-id",
+        default=os.environ.get(RANGE_ID_ENV),
+        help=f"Ludus range ID override (default: ${RANGE_ID_ENV} or API user's default range).",
+    )
     parser.add_argument("--max-skew-seconds", type=float, default=DEFAULT_MAX_SKEW_SECONDS)
     parser.add_argument("--yes", action="store_true")
     return parser.parse_args()
@@ -236,9 +260,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    hosts = windows_hosts(load_inventory(Path(args.mcp_path)))
+    hosts = windows_hosts(load_inventory(Path(args.mcp_path), args.range_id))
     if not hosts:
-        raise RuntimeError("No GOAD Windows hosts found in Ludus inventory")
+        raise RuntimeError("No Windows hosts found in Ludus inventory")
     if args.action == "sync":
         if not args.yes:
             print("sync changes guest clocks; pass --yes", file=sys.stderr)

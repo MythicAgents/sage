@@ -18,10 +18,18 @@ NOTE: destructive ops (rollback) require --yes. Snapshot/rollback endpoints are 
 live API on first use; if an endpoint path differs this prints the API error verbatim (no silent guess).
 """
 from __future__ import annotations
-import json, sys, urllib.request, urllib.error, ssl
+import argparse
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 MCP = "/home/john/dev/sage/.mcp.json"
 EXIT_AMBIGUOUS = 3  # no name given + multiple snapshots: caller (agent) must pick and re-invoke
+RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 
 def _creds():
     c = json.load(open(MCP))
@@ -29,8 +37,25 @@ def _creds():
     env = srv.get("env", {})
     return env["LUDUS_URL"].rstrip("/"), env["LUDUS_API_KEY"]
 
-def _call(method, path, body=None):
+def _selected_range_id(range_id=None):
+    value = str(range_id or os.environ.get(RANGE_ID_ENV) or "").strip()
+    return value or None
+
+
+def _with_range_id(path, range_id=None):
+    selected = _selected_range_id(range_id)
+    if not selected:
+        return path
+    parts = urlsplit(path)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == "rangeID" for key, _value in query):
+        query.append(("rangeID", selected))
+    return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+
+
+def _call(method, path, body=None, range_id=None):
     url, key = _creds()
+    path = _with_range_id(path, range_id)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url + path, data=data, method=method,
                                  headers={"X-API-KEY": key, "Content-Type": "application/json"})
@@ -43,8 +68,8 @@ def _call(method, path, body=None):
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()[:500]
 
-def status():
-    code, r = _call("GET", "/api/v2/range")
+def status(range_id=None):
+    code, r = _call("GET", "/api/v2/range", range_id=range_id)
     if isinstance(r, dict):
         print(f"range #{r.get('rangeNumber')} state={r.get('rangeState')} lastDeploy={r.get('lastDeployment')}")
         for vm in r.get("VMs", []):
@@ -52,36 +77,36 @@ def status():
     else:
         print(code, r)
 
-def logs():
-    code, r = _call("GET", "/api/v2/range/logs?tail=60")
+def logs(range_id=None):
+    code, r = _call("GET", "/api/v2/range/logs?tail=60", range_id=range_id)
     print(code); print(r.get("result", r) if isinstance(r, dict) else r)
 
-def snapshots():
-    print(_call("GET", "/api/v2/snapshots/list"))
+def snapshots(range_id=None):
+    print(_call("GET", "/api/v2/snapshots/list", range_id=range_id))
 
-def snapshot(name, *, include_ram=False, description=None):
+def snapshot(name, *, include_ram=False, description=None, range_id=None):
     print(_call("POST", "/api/v2/snapshots/create", {
         "name": name,
         "description": description or f"snapshot {name}",
         "includeRAM": include_ram,
-    }))
+    }, range_id=range_id))
 
-def rollback(name):
-    print(_call("POST", "/api/v2/snapshots/rollback", {"name": name}))
+def rollback(name, range_id=None):
+    print(_call("POST", "/api/v2/snapshots/rollback", {"name": name}, range_id=range_id))
 
-def _snapshot_names():
+def _snapshot_names(range_id=None):
     """Distinct snapshot names for the range. The API returns one row per VM, so a
     range-wide snapshot appears N times — dedupe by name. Exclude the live 'current'
     ('You are here!') pointer, which is not a restore target."""
-    _, r = _call("GET", "/api/v2/snapshots/list")
+    _, r = _call("GET", "/api/v2/snapshots/list", range_id=range_id)
     snaps = r.get("snapshots", []) if isinstance(r, dict) else []
     return sorted({s["name"] for s in snaps if s.get("name") and s.get("name") != "current"})
 
-def _resolve_rollback_target(name):
+def _resolve_rollback_target(name, range_id=None):
     """Explicit name wins; else one -> use it, many -> disambiguate, none -> fail.
     Non-interactive callers (no TTY) get the list on stdout + EXIT_AMBIGUOUS so the
     orchestrator can prompt the user and re-invoke. Never silently guesses a default."""
-    names = _snapshot_names()
+    names = _snapshot_names(range_id)
     if not names:
         print("no snapshots exist for this range — nothing to roll back to", file=sys.stderr)
         sys.exit(2)
@@ -114,26 +139,73 @@ def _machines_body(machines):
     items = [m.strip() for m in machines.split(",")] if isinstance(machines, str) else list(machines)
     return {"machines": items or ["all"]}
 
-def poweron(machines="all"):
-    print(_call("PUT", "/api/v2/range/poweron", _machines_body(machines)))
+def poweron(machines="all", range_id=None):
+    print(_call("PUT", "/api/v2/range/poweron", _machines_body(machines), range_id=range_id))
 
-def poweroff(machines="all"):
-    print(_call("PUT", "/api/v2/range/poweroff", _machines_body(machines)))
+def poweroff(machines="all", range_id=None):
+    print(_call("PUT", "/api/v2/range/poweroff", _machines_body(machines), range_id=range_id))
+
+def _add_range_arg(parser):
+    parser.add_argument(
+        "--range-id",
+        default=argparse.SUPPRESS,
+        help=f"Ludus range ID override (default: ${RANGE_ID_ENV} or API user's default range).",
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    _add_range_arg(parser)
+    sub = parser.add_subparsers(dest="command")
+
+    for name in ("status", "logs", "snapshots"):
+        command = sub.add_parser(name)
+        _add_range_arg(command)
+
+    snapshot_parser = sub.add_parser("snapshot")
+    _add_range_arg(snapshot_parser)
+    snapshot_parser.add_argument("name")
+    snapshot_parser.add_argument("--include-ram", action="store_true")
+    snapshot_parser.add_argument("-d", "--description", default=None)
+
+    rollback_parser = sub.add_parser("rollback")
+    _add_range_arg(rollback_parser)
+    rollback_parser.add_argument("name", nargs="?")
+    rollback_parser.add_argument("--yes", action="store_true")
+
+    for name in ("poweron", "poweroff"):
+        command = sub.add_parser(name)
+        _add_range_arg(command)
+        command.add_argument("machines", nargs="?", default="all")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    command = args.command or "status"
+    range_id = getattr(args, "range_id", None)
+    if command == "status":
+        status(range_id)
+    elif command == "logs":
+        logs(range_id)
+    elif command == "snapshots":
+        snapshots(range_id)
+    elif command == "snapshot":
+        snapshot(args.name, include_ram=args.include_ram, description=args.description, range_id=range_id)
+    elif command == "poweron":
+        poweron(args.machines, range_id)
+    elif command == "poweroff":
+        poweroff(args.machines, range_id)
+    elif command == "rollback":
+        if not args.yes:
+            print("rollback is destructive — pass --yes")
+            return 2
+        rollback(_resolve_rollback_target(args.name, range_id), range_id)
+    else:
+        print(f"unknown: {command}")
+        return 2
+    return 0
+
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if cmd == "status": status()
-    elif cmd == "logs": logs()
-    elif cmd == "snapshots": snapshots()
-    elif cmd == "snapshot":
-        extra = sys.argv[3:]
-        desc = next((extra[i+1] for i, a in enumerate(extra)
-                     if a in ("--description", "-d") and i+1 < len(extra)), None)
-        snapshot(sys.argv[2], include_ram="--include-ram" in extra, description=desc)
-    elif cmd == "poweron": poweron(sys.argv[2] if len(sys.argv) > 2 else "all")
-    elif cmd == "poweroff": poweroff(sys.argv[2] if len(sys.argv) > 2 else "all")
-    elif cmd == "rollback":
-        if "--yes" not in sys.argv: print("rollback is destructive — pass --yes"); sys.exit(2)
-        name_arg = next((a for a in sys.argv[2:] if not a.startswith("--")), None)
-        rollback(_resolve_rollback_target(name_arg))
-    else: print(f"unknown: {cmd}"); sys.exit(2)
+    raise SystemExit(main())

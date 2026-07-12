@@ -23,6 +23,8 @@ try:  # package import
     from . import decision_benchmark
     from . import null_model_factorial
     from . import operator_replay_benchmark
+    from . import frontier_census
+    from . import purpose_range
     from . import reliability
     from .scenarios import goad_scenarios
     from .range_state import Milestone
@@ -33,6 +35,8 @@ except Exception:  # script / sys.path import
     import decision_benchmark  # type: ignore
     import null_model_factorial  # type: ignore
     import operator_replay_benchmark  # type: ignore
+    import frontier_census  # type: ignore
+    import purpose_range  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
     from range_state import Milestone  # type: ignore
@@ -154,6 +158,47 @@ def _cmd_null_model_factorial(_args: argparse.Namespace) -> int:
     return 0 if report["verdict"] == "PASS" else 1
 
 
+def _cmd_frontier_census(args: argparse.Namespace) -> int:
+    starts = frontier_census.candidate_starts()
+    if args.start:
+        wanted = set(args.start)
+        starts = [item for item in starts if item.name in wanted]
+        missing = sorted(wanted - {item.name for item in starts})
+        if missing:
+            print(f"unknown frontier census start(s): {', '.join(missing)}", file=sys.stderr)
+            return 2
+    report = frontier_census.run_live_frontier_census(
+        starts=starts,
+        ttl_seconds=args.ttl_seconds,
+        max_depth=args.max_depth,
+        max_nodes=args.max_nodes,
+    )
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(recommended_discriminator={report['recommended_discriminator']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_purpose_range_validate(args: argparse.Namespace) -> int:
+    report = purpose_range.validate_purpose_range()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(range_source={report['spec']['source_dir']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai.hillclimb", description="Sage eval gauge (Phase 0)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -186,6 +231,24 @@ def main(argv: list[str] | None = None) -> int:
         help="run the offline symbolic/llm/hybrid null-model policy factorial",
     )
     nm.set_defaults(func=_cmd_null_model_factorial)
+
+    fc = sub.add_parser(
+        "frontier-census",
+        help="run the read-only GOAD frontier census against the current BloodHound graph",
+    )
+    fc.add_argument("--ttl-seconds", type=int, default=frontier_census.DEFAULT_TTL_SECONDS)
+    fc.add_argument("--max-depth", type=int, default=frontier_census.DEFAULT_MAX_DEPTH)
+    fc.add_argument("--max-nodes", type=int, default=frontier_census.DEFAULT_MAX_NODES)
+    fc.add_argument("--start", action="append", default=None, help="restrict to one named start; repeatable")
+    fc.add_argument("--output", default=None, help="optional JSON output path")
+    fc.set_defaults(func=_cmd_frontier_census)
+
+    pr = sub.add_parser(
+        "purpose-range-validate",
+        help="validate the minimal two-lane purpose-range manifest against the current capability frontier",
+    )
+    pr.add_argument("--output", default=None, help="optional JSON report path")
+    pr.set_defaults(func=_cmd_purpose_range_validate)
 
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)

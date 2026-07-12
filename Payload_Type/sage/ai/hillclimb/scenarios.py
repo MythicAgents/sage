@@ -20,6 +20,12 @@ CHILD = "north.sevenkingdoms.local"
 PARENT = "sevenkingdoms.local"
 OBJECTIVE = "essos.local"
 _DOMAINS = {"child": CHILD, "parent": PARENT, "objective": OBJECTIVE}
+PURPOSE_RANGE_DOMAIN = "range.local"
+_PURPOSE_RANGE_DOMAINS = {
+    "child": PURPOSE_RANGE_DOMAIN,
+    "parent": PURPOSE_RANGE_DOMAIN,
+    "objective": PURPOSE_RANGE_DOMAIN,
+}
 
 
 def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
@@ -91,3 +97,34 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
     ]
+
+
+def purpose_range_scenarios(engagement_id: str = "Operation_SAGE_POLICY_RANGE") -> list[Scenario]:
+    """Purpose-range scenarios for the branch-rich policy discriminator."""
+    return [
+        Scenario(
+            name="purpose-range-visible-cost",
+            engagement_id=engagement_id,
+            objective=f"From the current foothold, achieve administrative control of {PURPOSE_RANGE_DOMAIN}.",
+            domains=_PURPOSE_RANGE_DOMAINS,
+            spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
+            milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
+            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
+        ),
+        Scenario(
+            name="purpose-range-recovery",
+            engagement_id=engagement_id,
+            objective=f"From the current foothold, achieve administrative control of {PURPOSE_RANGE_DOMAIN}.",
+            domains=_PURPOSE_RANGE_DOMAINS,
+            spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
+            milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
+            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
+        ),
+    ]
+
+
+def all_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
+    """Return the GOAD suite plus provisionable purpose-range discriminator scenarios."""
+    return [*goad_scenarios(engagement_id), *purpose_range_scenarios(engagement_id)]

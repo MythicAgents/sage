@@ -702,6 +702,98 @@ def certificate_admin_control_probe(
     return probe
 
 
+def ticket_admin_control_probe(
+    *,
+    realm: str,
+    timeout: int = 60,
+    task_window: int = 12,
+) -> DirectProbe:
+    """True iff completed Mythic tasks prove forged-ticket admin-share access.
+
+    The golden-ticket lane commonly performs a denied preflight read before the forge. Anchor on the
+    successful target-domain admin-share listing, then replay only the same-callback tasks from the most
+    recent preceding forge through that anchor. Excluding earlier denied output keeps the referee aligned
+    with the capability verifier instead of poisoning a valid post-forge proof window.
+    """
+    def _display_id(row: dict) -> int:
+        try:
+            return int(row.get("display_id") or 0)
+        except Exception:
+            return 0
+
+    def probe() -> bool:
+        try:
+            try:
+                from ..langgraph import capabilities, credential_artifacts
+            except Exception:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+                import capabilities  # type: ignore
+                import credential_artifacts  # type: ignore
+
+            rows = _fetch_certificate_auth_task_outputs(timeout=timeout)
+            window = max(0, int(task_window))
+            for anchor in rows:
+                anchor_output = str(anchor.get("output") or "")
+                anchor_probe = credential_artifacts.extract_ticket_probe(
+                    anchor_output,
+                    expected_domain=realm,
+                )
+                if not anchor_probe.get("service_access_proven"):
+                    continue
+
+                anchor_id = _display_id(anchor)
+                callback_id = anchor.get("callback_display_id")
+                if not anchor_id or callback_id in (None, ""):
+                    continue
+                related = [
+                    row
+                    for row in rows
+                    if row.get("callback_display_id") == callback_id
+                    and anchor_id - window <= _display_id(row) <= anchor_id
+                ]
+                forge_rows = [
+                    row
+                    for row in related
+                    if _display_id(row) < anchor_id
+                    and credential_artifacts.extract_ticket_probe(
+                        str(row.get("output") or ""),
+                        expected_domain=realm,
+                    ).get("ticket_forged")
+                ]
+                if not forge_rows:
+                    continue
+
+                forge_id = max(_display_id(row) for row in forge_rows)
+                proof_rows = sorted(
+                    (
+                        row
+                        for row in related
+                        if forge_id <= _display_id(row) <= anchor_id
+                    ),
+                    key=_display_id,
+                )
+                combined = "\n".join(str(row.get("output") or "") for row in proof_rows)
+                structured = dict(
+                    credential_artifacts.extract_ticket_probe(
+                        combined,
+                        expected_domain=realm,
+                    )
+                )
+                structured["callback_id"] = str(callback_id)
+                if not (structured.get("ticket_forged") or structured.get("tgt_present")):
+                    continue
+                if capabilities.verify_capability(
+                    "forge-golden-ticket",
+                    structured,
+                ).verdict == "achieved":
+                    return True
+        except Exception:
+            return False
+        return False
+
+    return probe
+
+
 def any_probe(
     *probes: DirectProbe,
     settle_timeout: float = 0,

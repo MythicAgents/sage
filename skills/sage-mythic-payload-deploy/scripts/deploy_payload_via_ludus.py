@@ -22,7 +22,7 @@ import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 import urllib.error
 import urllib.request
 
@@ -44,6 +44,7 @@ DEFAULT_MCP_PATH = REPO_ROOT / ".mcp.json"
 DEFAULT_DOWNLOAD_DIR = Path("/tmp/sage_payloads")
 DEFAULT_REMOTE_DIR = r"C:\Users\Public"
 DEFAULT_RUBEUS_PATH = REPO_ROOT / "Payload_Type" / "sage" / "tools" / "Rubeus.exe"
+LUDUS_RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 
 PAYLOAD_ATTRS = """
 id
@@ -351,8 +352,25 @@ def ludus_creds(mcp_path: Path) -> tuple[str, str]:
     return str(url).rstrip("/"), str(api_key)
 
 
-def ludus_get(path: str, mcp_path: Path) -> Any:
+def selected_ludus_range_id(range_id: str | None = None) -> str | None:
+    value = str(range_id or os.environ.get(LUDUS_RANGE_ID_ENV) or "").strip()
+    return value or None
+
+
+def with_ludus_range_id(path: str, range_id: str | None = None) -> str:
+    selected = selected_ludus_range_id(range_id)
+    if not selected:
+        return path
+    parts = urlsplit(path)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == "rangeID" for key, _value in query):
+        query.append(("rangeID", selected))
+    return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+
+
+def ludus_get(path: str, mcp_path: Path, range_id: str | None = None) -> Any:
     url, api_key = ludus_creds(mcp_path)
+    path = with_ludus_range_id(path, range_id)
     request = urllib.request.Request(
         url + path,
         method="GET",
@@ -382,8 +400,8 @@ def extract_inventory_payload(response: Any) -> Any:
     return response
 
 
-def load_ludus_inventory(mcp_path: Path) -> dict[str, dict[str, Any]]:
-    response = ludus_get("/api/v2/range/ansibleinventory", mcp_path)
+def load_ludus_inventory(mcp_path: Path, range_id: str | None = None) -> dict[str, dict[str, Any]]:
+    response = ludus_get("/api/v2/range/ansibleinventory", mcp_path, range_id)
     payload = extract_inventory_payload(response)
     if isinstance(payload, str):
         data = yaml.safe_load(payload)
@@ -427,7 +445,7 @@ def load_ludus_inventory(mcp_path: Path) -> dict[str, dict[str, Any]]:
 
 
 def select_ludus_host(args: argparse.Namespace) -> dict[str, Any]:
-    hosts = load_ludus_inventory(Path(args.mcp_path))
+    hosts = load_ludus_inventory(Path(args.mcp_path), getattr(args, "ludus_range_id", None))
     if args.ludus_host:
         host = hosts.get(args.ludus_host)
         if not host:
@@ -1397,6 +1415,16 @@ def add_payload_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--payload-limit", type=int, default=20)
 
 
+def add_ludus_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
+    parser.add_argument(
+        "--ludus-range-id",
+        default=os.environ.get(LUDUS_RANGE_ID_ENV),
+        help=f"Ludus range ID override (default: ${LUDUS_RANGE_ID_ENV} or API user's default range).",
+    )
+    parser.add_argument("--ludus-host", default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1425,8 +1453,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--serve-host", default=os.environ.get("SAGE_SERVE_HOST"))
     deploy_parser.add_argument("--bind-host", default="0.0.0.0")
     deploy_parser.add_argument("--serve-port", type=int, default=8765)
-    deploy_parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
-    deploy_parser.add_argument("--ludus-host", default=None)
+    add_ludus_args(deploy_parser)
     deploy_parser.add_argument("--target-host", default="CASTELBLACK")
     deploy_parser.add_argument("--target-ip", default=None)
     deploy_parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
@@ -1494,8 +1521,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_mythic_args(relaunch_parser)
     relaunch_parser.add_argument("--payload-type", default="apollo")
-    relaunch_parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
-    relaunch_parser.add_argument("--ludus-host", default=None)
+    add_ludus_args(relaunch_parser)
     relaunch_parser.add_argument("--target-host", default="CASTELBLACK")
     relaunch_parser.add_argument("--target-ip", default=None)
     relaunch_parser.add_argument("--task-name", default="SageApolloBootstrap")
@@ -1514,8 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
         "logoff-user",
         help="Log off only the named user's Windows sessions before opening the foothold RDP session.",
     )
-    logoff_parser.add_argument("--mcp-path", default=str(DEFAULT_MCP_PATH))
-    logoff_parser.add_argument("--ludus-host", default=None)
+    add_ludus_args(logoff_parser)
     logoff_parser.add_argument("--target-host", default="CASTELBLACK")
     logoff_parser.add_argument("--target-ip", default=None)
     logoff_parser.add_argument("--username", default="localuser")

@@ -19,6 +19,20 @@ def _telemetry(**overrides):
         "configured_policy_mode": "llm",
         "policy_identity_valid": True,
         "policy_switches": [],
+        "model_calls": 2,
+        "effective_backend_requests": [
+            {
+                "decision_id": "decision-1",
+                "effective_backend": "openai:bedrock-claude-4-6-sonnet",
+                "backend_provenance_source": "response_metadata.model_name",
+            },
+            {
+                "decision_id": "decision-2",
+                "effective_backend": "openai:bedrock-claude-4-6-sonnet",
+                "backend_provenance_source": "response_metadata.model_name",
+            },
+        ],
+        "backend_provenance_complete": True,
         "semantic_transaction_count": 2,
         "authorized_transaction_count": 2,
         "semantic_policy_coverage": 1.0,
@@ -94,9 +108,57 @@ def test_runtime_telemetry_validation_rejects_missing_record():
         rgl.validate_harness_runtime_telemetry("llm", {})
 
 
+def test_runtime_telemetry_validation_rejects_missing_effective_backend_provenance():
+    with pytest.raises(RuntimeError, match="response-derived effective backend"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            _telemetry(
+                effective_backend_requests=[
+                    {
+                        "decision_id": "decision-1",
+                        "effective_backend": "",
+                        "backend_provenance_source": "unavailable",
+                    },
+                    {
+                        "decision_id": "decision-2",
+                        "effective_backend": "openai:bedrock-claude-4-6-sonnet",
+                        "backend_provenance_source": "response_metadata.model_name",
+                    },
+                ],
+                backend_provenance_complete=False,
+            ),
+        )
+
+
 class _Scn:
     def __init__(self, subset):
         self.milestone_subset = subset
+
+
+def test_config_results_path_honors_eval_override(tmp_path, monkeypatch):
+    path = tmp_path / "purpose-range-clean.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+
+    assert rgl.Config().results_path == path
+
+
+def test_runtime_evidence_fields_persists_branch_and_cycle_provenance():
+    evidence = rgl.runtime_evidence_fields(
+        _telemetry(
+            controller_status="complete",
+            controller_cycle_count=2,
+            controller_cycles=[{"cycle": 1, "action": "collect-graph"}, {"cycle": 2, "action": "gpo-controlled-system-exec"}],
+            controller_blocker=None,
+            achieved_effects=["domain-collected:range.local"],
+            decisions=[{"selected_index": 0, "selected_family": "gpo-directory"}],
+            transactions=[{"capability": "gpo-controlled-system-exec"}],
+        )
+    )
+
+    assert evidence["controller_cycle_count"] == 2
+    assert evidence["controller_cycles"][1]["action"] == "gpo-controlled-system-exec"
+    assert evidence["decisions"][0]["selected_family"] == "gpo-directory"
+    assert evidence["transactions"][0]["capability"] == "gpo-controlled-system-exec"
 
 
 def test_build_probes_scopes_to_subset_child_da():
@@ -127,6 +189,27 @@ def test_objective_probe_accepts_certificate_admin_control_without_ldap_wait(mon
 
     def unexpected_reader(_domain):
         raise AssertionError("LDAP membership path should short-circuit after certificate proof")
+
+    scn = _Scn((Milestone.OBJECTIVE,))
+    probes = rgl.build_probes(unexpected_reader, {}, scn, settle_timeout=300)
+
+    assert probes[Milestone.OBJECTIVE]() is True
+
+
+def test_objective_probe_accepts_ticket_admin_control_without_ldap_wait(monkeypatch):
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "certificate_admin_control_probe",
+        lambda *args, **kwargs: (lambda: False),
+    )
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "ticket_admin_control_probe",
+        lambda *args, **kwargs: (lambda: True),
+    )
+
+    def unexpected_reader(_domain):
+        raise AssertionError("LDAP membership path should short-circuit after ticket proof")
 
     scn = _Scn((Milestone.OBJECTIVE,))
     probes = rgl.build_probes(unexpected_reader, {}, scn, settle_timeout=300)

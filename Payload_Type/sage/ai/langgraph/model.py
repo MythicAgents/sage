@@ -1741,6 +1741,8 @@ class Model:
         self._policy_model_calls = 0
         self._policy_episode_id = ""
         self._controller_runtime_telemetry: dict[str, Any] = {}
+        self._controller_observed_decisions: list[dict[str, Any]] = []
+        self._controller_observed_transactions: list[dict[str, Any]] = []
         self.graph = None
         self.verbose = False
         self.is_interactive = False
@@ -3962,7 +3964,12 @@ class Model:
             "objective": str(objective or ""),
         }
 
-    def _controller_hitl_collection_request(self, request: Any, objective: str) -> dict[str, Any]:
+    def _controller_hitl_collection_request(
+        self,
+        request: Any,
+        objective: str,
+        decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         foothold = getattr(request, "foothold", None)
         args = {
             "collection_key": str(getattr(request, "collection_key", "") or ""),
@@ -3973,6 +3980,8 @@ class Model:
             "host": str(getattr(foothold, "host", "") or ""),
             "agent": str(getattr(foothold, "agent", "") or ""),
         }
+        if decision:
+            args["policy_decision"] = _jsonable_value(decision)
         return {
             "kind": "collection",
             "key": self._controller_hitl_key("collection", args),
@@ -4076,6 +4085,11 @@ class Model:
             self._controller_hitl_approved_pending = None
             self._controller_hitl_objective = ""
             self._supervised_objective_active = False
+            self._controller_refresh_runtime_policy_telemetry(
+                status="halted_denied",
+                reason=f"operator denied {display_name}",
+                objective_recognized=False,
+            )
             msg = (
                 "**Execution stopped**\n"
                 f"Operator denied `{display_name}`. Sage stopped before execution.\n"
@@ -4261,21 +4275,182 @@ class Model:
         else:
             instruction = (
                 "Choose the next semantic capability and target for the stated objective using the normalized "
-                "state and capability catalog. Return JSON only. Use disposition=select with capability and "
-                "target, or stop/ask. Deterministic code will reject proposals that are not currently admissible. "
-                "Do not emit commands or additional steps."
+                "state, capability catalog, and current_admissible_actions. Return JSON only. Use "
+                "disposition=select with a capability and target from current_admissible_actions, or stop/ask. "
+                "Collection is a normal semantic action when collect-graph appears there. Deterministic code "
+                "will reject proposals that are not currently admissible. Do not emit commands or additional "
+                "steps."
             )
         return await self.llm.ainvoke([
             SystemMessage(content=instruction),
             HumanMessage(content=json.dumps(request, sort_keys=True)),
         ])
 
+    @staticmethod
+    def _controller_effective_backend_requests(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return one response-derived backend record for each observed model response."""
+        requests: list[dict[str, Any]] = []
+        for decision in decisions:
+            if not isinstance(decision, dict) or decision.get("model_response_observed") is not True:
+                continue
+            requests.append({
+                "decision_id": str(decision.get("decision_id") or ""),
+                "policy_mode": str(decision.get("policy_mode") or ""),
+                "effective_backend": str(decision.get("effective_backend") or ""),
+                "effective_model_provider": str(decision.get("effective_model_provider") or ""),
+                "effective_model_id": str(decision.get("effective_model_id") or ""),
+                "backend_provenance_source": str(decision.get("backend_provenance_source") or ""),
+                "response_metadata": dict(decision.get("response_metadata") or {}),
+            })
+        return requests
+
+    @staticmethod
+    def _controller_decision_dict(decision: Any | None) -> dict[str, Any]:
+        if decision is None:
+            return {}
+        if hasattr(decision, "to_dict"):
+            value = decision.to_dict()
+        elif isinstance(decision, dict):
+            value = dict(decision)
+        else:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _controller_pending_policy_decision(pending: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(pending, dict):
+            return {}
+        args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
+        decision = args.get("policy_decision")
+        if isinstance(decision, dict):
+            return dict(decision)
+        inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
+        decision = inputs.get("policy_decision")
+        if isinstance(decision, dict):
+            return dict(decision)
+        capability = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+        intent = capability.get("intent") if isinstance(capability.get("intent"), dict) else {}
+        decision = intent.get("policy_decision")
+        return dict(decision) if isinstance(decision, dict) else {}
+
+    def _controller_record_policy_decision(self, decision: Any | None) -> dict[str, Any]:
+        """Keep one episode-level copy of every semantic decision across HITL pauses."""
+        data = self._controller_decision_dict(decision)
+        if not data:
+            return {}
+        observed = list(getattr(self, "_controller_observed_decisions", []) or [])
+        decision_id = str(data.get("decision_id") or "")
+        if decision_id:
+            for existing in observed:
+                if str(existing.get("decision_id") or "") == decision_id:
+                    return existing
+        elif data in observed:
+            return data
+        observed.append(data)
+        self._controller_observed_decisions = observed
+        self._controller_refresh_runtime_policy_telemetry()
+        return data
+
+    def _controller_record_semantic_transaction(
+        self,
+        *,
+        kind: str,
+        capability: str,
+        target: str,
+        decision: Any | None,
+    ) -> dict[str, Any]:
+        """Record only authorized semantic moves, before the side-effecting seam starts."""
+        data = {
+            "kind": str(kind or ""),
+            "capability": str(capability or ""),
+            "target": str(target or ""),
+            **self._controller_decision_dict(decision),
+        }
+        observed = list(getattr(self, "_controller_observed_transactions", []) or [])
+        observed.append(data)
+        self._controller_observed_transactions = observed
+        self._controller_refresh_runtime_policy_telemetry()
+        return data
+
+    @staticmethod
+    def _controller_policy_switches(
+        policy_mode: str,
+        decisions: list[dict[str, Any]],
+        transactions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        switches: list[dict[str, Any]] = []
+        for source, items in (("decision", decisions), ("transaction", transactions)):
+            for index, item in enumerate(items):
+                observed = str(item.get("policy_mode") or "")
+                if observed != policy_mode:
+                    switches.append({
+                        "source": source,
+                        "index": index,
+                        "configured_policy_mode": policy_mode,
+                        "observed_policy_mode": observed,
+                    })
+        return switches
+
+    def _controller_refresh_runtime_policy_telemetry(
+        self,
+        *,
+        status: str | None = None,
+        reason: str | None = None,
+        objective_recognized: bool | None = None,
+    ) -> dict[str, Any]:
+        """Refresh episode telemetry from observations that survive controller HITL pauses."""
+        telemetry = dict(getattr(self, "_controller_runtime_telemetry", {}) or {})
+        if not telemetry:
+            return {}
+        decisions = list(getattr(self, "_controller_observed_decisions", []) or [])
+        transactions = list(getattr(self, "_controller_observed_transactions", []) or [])
+        policy_mode = str(telemetry.get("configured_policy_mode") or getattr(self, "policy_mode", "") or "")
+        effective_backend_requests = self._controller_effective_backend_requests(decisions)
+        effective_backends = sorted({
+            str(item.get("effective_backend") or "")
+            for item in effective_backend_requests
+            if str(item.get("effective_backend") or "")
+        })
+        model_calls = int(getattr(self, "_policy_model_calls", 0) or 0)
+        policy_switches = self._controller_policy_switches(policy_mode, decisions, transactions)
+        authorized = sum(
+            1
+            for item in transactions
+            if item.get("decision_id") and str(item.get("policy_mode") or "") == policy_mode
+        )
+        telemetry.update({
+            "model_calls": model_calls,
+            "effective_backend_requests": effective_backend_requests,
+            "effective_backends": effective_backends,
+            "backend_provenance_complete": (
+                len(effective_backend_requests) == model_calls
+                and all(
+                    str(item.get("effective_backend") or "")
+                    and str(item.get("backend_provenance_source") or "") not in {"", "unavailable"}
+                    for item in effective_backend_requests
+                )
+            ),
+            "policy_identity_valid": not policy_switches,
+            "policy_switches": policy_switches,
+            "semantic_transaction_count": len(transactions),
+            "authorized_transaction_count": authorized,
+            "semantic_policy_coverage": authorized / len(transactions) if transactions else 1.0,
+            "decisions": decisions,
+            "transactions": transactions,
+        })
+        if status is not None:
+            telemetry["controller_status"] = status
+        if reason is not None:
+            telemetry["controller_terminal_reason"] = reason
+        if objective_recognized is not None:
+            telemetry["objective_recognized"] = bool(objective_recognized)
+        self._controller_runtime_telemetry = telemetry
+        return telemetry
+
     def controller_runtime_telemetry(self) -> dict[str, Any]:
         """Return the latest observed policy/controller telemetry for this session."""
-        telemetry = dict(getattr(self, "_controller_runtime_telemetry", {}) or {})
-        if telemetry:
-            telemetry["model_calls"] = int(getattr(self, "_policy_model_calls", 0) or 0)
-        return telemetry
+        self._controller_refresh_runtime_policy_telemetry()
+        return dict(getattr(self, "_controller_runtime_telemetry", {}) or {})
 
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the policy-selected AutonomousController execution kernel.
@@ -4349,6 +4524,11 @@ class Model:
                 else dict(decision) if isinstance(decision, dict)
                 else {}
             )
+            if decision_context.get("model_response_observed") is False:
+                approved_decision = self._controller_pending_policy_decision(approved_pending)
+                if approved_decision.get("policy_mode"):
+                    decision_context = approved_decision
+            self._controller_record_policy_decision(decision_context)
             if decision_context:
                 payload["intent"] = dict(payload.get("intent") or {})
                 payload["intent"]["policy_decision"] = decision_context
@@ -4363,6 +4543,12 @@ class Model:
                     operator_message=self._controller_selected_action_progress(payload, inputs),
                 )
             await self._require_controller_hitl_approval(pending)
+            self._controller_record_semantic_transaction(
+                kind="capability",
+                capability=str(payload.get("name") or ""),
+                target=str(payload.get("target") or ""),
+                decision=decision_context,
+            )
             capability_name = str(payload.get("name") or "capability")
             target = str(payload.get("target") or "").strip()
             activity = await self._open_execution_activity(
@@ -4433,7 +4619,17 @@ class Model:
         async def collect(state, decision=None):
             request = snap.get("collection_request")
             snap["collection_request"] = None
-            pending = self._controller_hitl_collection_request(request, prompt)
+            decision_context = (
+                decision.to_dict() if hasattr(decision, "to_dict")
+                else dict(decision) if isinstance(decision, dict)
+                else {}
+            )
+            if decision_context.get("model_response_observed") is False:
+                approved_decision = self._controller_pending_policy_decision(approved_pending)
+                if approved_decision.get("policy_mode"):
+                    decision_context = approved_decision
+            self._controller_record_policy_decision(decision_context)
+            pending = self._controller_hitl_collection_request(request, prompt, decision_context)
             if (
                 not self._controller_hitl_enabled()
                 or str(getattr(self, "_controller_hitl_approved_key", "") or "") != str(pending.get("key") or "")
@@ -4443,6 +4639,12 @@ class Model:
                     operator_message=self._controller_collection_selection_progress(request),
                 )
             await self._require_controller_hitl_approval(pending)
+            self._controller_record_semantic_transaction(
+                kind="collection",
+                capability="collect-graph",
+                target=str(getattr(request, "collection_key", "") or ""),
+                decision=decision_context,
+            )
             activity = await self._open_execution_activity(
                 "Collection",
                 title="Collect and ingest graph data",
@@ -4453,11 +4655,6 @@ class Model:
             activity_status = "finished"
             visibility_token = None
             try:
-                decision_context = (
-                    decision.to_dict() if hasattr(decision, "to_dict")
-                    else dict(decision) if isinstance(decision, dict)
-                    else {}
-                )
                 if decision_context:
                     try:
                         from . import mythic_tools as _mt
@@ -4515,8 +4712,12 @@ class Model:
         )
 
         objective_text = str(prompt or "").strip()
-        self._policy_episode_id = _policy.new_episode_id()
-        self._policy_model_calls = 0
+        continuing_episode = resumed_after_approval and bool(getattr(self, "_policy_episode_id", ""))
+        if not continuing_episode:
+            self._policy_episode_id = _policy.new_episode_id()
+            self._policy_model_calls = 0
+            self._controller_observed_decisions = []
+            self._controller_observed_transactions = []
         policy_mode = _policy.normalize_policy_mode(
             getattr(self, "policy_mode", _policy.POLICY_SYMBOLIC),
             default=_policy.POLICY_SYMBOLIC,
@@ -4569,6 +4770,8 @@ class Model:
                                 "rationale": "resume the exact operator-approved collection after revalidation",
                                 "confidence": 1.0,
                                 "expected_evidence": "verified graph collection and ingest",
+                                "_policy_model_response_observed": False,
+                                "_policy_replay_decision": self._controller_pending_policy_decision(approved_pending),
                             }
                         for candidate in candidates:
                             if (
@@ -4588,6 +4791,8 @@ class Model:
                                 "rationale": "resume the exact operator-approved action after deterministic revalidation",
                                 "confidence": 1.0,
                                 "expected_evidence": "the approved capability's declared effects",
+                                "_policy_model_response_observed": False,
+                                "_policy_replay_decision": self._controller_pending_policy_decision(approved_pending),
                             }
                         return {
                             "disposition": "select",
@@ -4595,10 +4800,13 @@ class Model:
                             "rationale": "resume the exact operator-approved action after deterministic revalidation",
                             "confidence": 1.0,
                             "expected_evidence": "the approved capability's declared effects",
+                            "_policy_model_response_observed": False,
+                            "_policy_replay_decision": self._controller_pending_policy_decision(approved_pending),
                         }
                     return {
                         "disposition": "stop",
                         "rationale": "the operator-approved action is no longer admissible in the observed state",
+                        "_policy_model_response_observed": False,
                     }
                 return await self._controller_llm_policy_decide(request)
 
@@ -4622,8 +4830,15 @@ class Model:
             "model_provider": str(getattr(self, "provider", "") or ""),
             "model_id": str(getattr(self, "model", "") or ""),
             "model_calls": 0,
+            "effective_backend_requests": [],
+            "effective_backends": [],
+            "backend_provenance_complete": True,
             "controller_status": "running",
             "controller_terminal_reason": "",
+            "controller_cycle_count": 0,
+            "controller_cycles": [],
+            "controller_blocker": None,
+            "achieved_effects": [],
             "objective_recognized": False,
             "semantic_transaction_count": 0,
             "authorized_transaction_count": 0,
@@ -4666,27 +4881,40 @@ class Model:
         try:
             result = await controller.run()
         except _ControllerHitlPause:
+            self._controller_refresh_runtime_policy_telemetry()
             await self._flush_controller_verbose_events()
             return ""
         result_data = result.to_dict()
+        for decision in result_data["decisions"]:
+            self._controller_record_policy_decision(decision)
         self._controller_runtime_telemetry = {
             "episode_id": result.episode_id,
             "policy_mode": result.policy_mode,
             "configured_policy_mode": policy_mode,
-            "policy_identity_valid": result_data["policy_identity_valid"],
-            "policy_switches": result_data["policy_switches"],
+            "policy_identity_valid": True,
+            "policy_switches": [],
             "model_provider": str(getattr(self, "provider", "") or ""),
             "model_id": str(getattr(self, "model", "") or ""),
-            "model_calls": int(getattr(self, "_policy_model_calls", 0) or 0),
+            "model_calls": 0,
+            "effective_backend_requests": [],
+            "effective_backends": [],
+            "backend_provenance_complete": True,
             "controller_status": result.status,
             "controller_terminal_reason": result.reason,
+            "controller_cycle_count": int(result_data.get("cycle_count", 0) or 0),
+            "controller_cycles": list(result_data.get("cycles") or []),
+            "controller_blocker": result_data.get("blocker"),
+            "achieved_effects": list(result_data.get("achieved_effects") or []),
             "objective_recognized": result.status == _ctrl.STATUS_COMPLETE,
-            "semantic_transaction_count": result_data["semantic_transaction_count"],
-            "authorized_transaction_count": result_data["authorized_transaction_count"],
-            "semantic_policy_coverage": result_data["semantic_policy_coverage"],
-            "decisions": result_data["decisions"],
-            "transactions": result_data["transactions"],
+            "semantic_transaction_count": 0,
+            "authorized_transaction_count": 0,
+            "semantic_policy_coverage": 1.0,
         }
+        self._controller_refresh_runtime_policy_telemetry(
+            status=result.status,
+            reason=result.reason,
+            objective_recognized=result.status == _ctrl.STATUS_COMPLETE,
+        )
         fire(
             f"DONE status={result.status} cycles={result.cycle_count} "
             f"effects={len(result.achieved_effects)} reason={result.reason}",
@@ -8022,6 +8250,17 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
     if identity:
         inputs["controlled_principal"] = identity
         inputs["current_user"] = identity
+    intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+    if (
+        str(getattr(action, "name", "") or "").strip().casefold() == "gpo-controlled-system-exec"
+        and str(intent.get("preferred_effect") or "").strip().casefold() == "system-exec-proof"
+    ):
+        inputs["allow_proof_only"] = True
+    action_name = str(getattr(action, "name", "") or "").strip().casefold()
+    if action_name in {"gpo-controlled-system-exec", "grant-directory-rights"}:
+        wait_seconds = _env_positive_int("SAGE_GPO_WAIT_SECONDS", 0)
+        if wait_seconds:
+            inputs["gpo_wait_seconds"] = min(wait_seconds, 600)
     return inputs
 
 

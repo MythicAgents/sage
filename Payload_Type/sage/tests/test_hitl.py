@@ -229,6 +229,36 @@ def test_controller_hitl_collection_pauses_with_scope_and_reason():
     assert "merlin" in sent[0]
 
 
+def test_controller_hitl_collection_preserves_policy_decision_without_changing_approval_key():
+    m = _controller_hitl_model()
+    request = _ControllerCollectionRequest(
+        foothold=SimpleNamespace(callback_id="7", host="workstation01", agent="merlin"),
+        scope_domain="child.lab.local",
+        reason="objective-scope-expansion",
+        collection_key="collection:7:child.lab.local",
+        support="objective domain child.lab.local is trusted and uncollected",
+    )
+    decision = {
+        "decision_id": "decision-original",
+        "policy_mode": "llm",
+        "effective_backend": "runtime-provider:runtime-model",
+    }
+
+    without_decision = m._controller_hitl_collection_request(
+        request,
+        "obtain administrative control of child.lab.local",
+    )
+    with_decision = m._controller_hitl_collection_request(
+        request,
+        "obtain administrative control of child.lab.local",
+        decision,
+    )
+
+    assert with_decision["key"] == without_decision["key"]
+    assert with_decision["args"]["policy_decision"] == decision
+    assert m._controller_pending_policy_decision(with_decision) == decision
+
+
 def test_controller_hitl_uses_native_input_card_when_chat_emitter_is_bound():
     m = _controller_hitl_model()
     emitted = []

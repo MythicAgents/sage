@@ -48,3 +48,14 @@ def test_clock_sync_disables_time_service_before_setting_clock():
 
     assert "Set-Service -Name w32time -StartupType Disabled" in script
     assert script.index("StartupType Disabled") < script.index("Set-Date")
+
+
+def test_with_range_id_preserves_existing_query_and_does_not_duplicate():
+    assert (
+        MODULE.with_range_id("/api/v2/range/logs?tail=60", "SAGEPOLICY20260712")
+        == "/api/v2/range/logs?tail=60&rangeID=SAGEPOLICY20260712"
+    )
+    assert (
+        MODULE.with_range_id("/api/v2/range?rangeID=existing", "SAGEPOLICY20260712")
+        == "/api/v2/range?rangeID=existing"
+    )

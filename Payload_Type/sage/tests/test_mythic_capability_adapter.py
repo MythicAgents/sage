@@ -325,10 +325,48 @@ def test_adapter_translates_direct_rights_grant_to_mythic_command():
     first = mythic_plan.commands[0]
     assert first.command == "execute_assembly"
     assert first.parameters["assembly_name"] == "StandIn.exe"
-    assert first.parameters["assembly_arguments"].startswith("--object DC=lab,DC=local --grant LAB\\operator")
+    assert first.parameters["assembly_arguments"].startswith(
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator"
+    )
     assert intent_classifier.classify_tool_call(first.command, first.parameters) == (
         "dcsync-rights-grant",
         "lab.local",
+    )
+
+
+def test_adapter_binds_option_like_gpo_task_arguments_with_long_option_equals_form():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    args = mythic_plan.commands[0].parameters["assembly_arguments"]
+    assert '"--Arguments=--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"' in args
+    assert '--Arguments "--object ' not in args
+
+
+def test_adapter_uses_standin_access_read_for_gpo_rights_verification():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    acl_read = mythic_plan.commands[-1]
+    assert acl_read.parameters["assembly_name"] == "StandIn.exe"
+    assert acl_read.parameters["assembly_arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --access --ntaccount LAB\\operator"
     )
 
 

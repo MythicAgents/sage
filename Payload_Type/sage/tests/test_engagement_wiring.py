@@ -1353,6 +1353,45 @@ def test_record_capability_result_bridge_records_and_persists():
     assert hop.evidence["mythic_task_id"] == 31337
 
 
+def test_record_graph_built_persists_policy_decision_provenance():
+    mt = _make_tools()
+    mt._engagement_footholds = [_foothold()]
+    token = mythic_tools._task_visibility_context.set({
+        "capability": "collect-graph",
+        "policy_decision": {
+            "episode_id": "episode-collect",
+            "decision_id": "decision-collect",
+            "policy_mode": "llm",
+            "candidate_hash": "sha256:collect",
+            "candidate_count": 1,
+            "selected_index": 0,
+            "selected_family": "collection",
+            "selected_is_first_admissible": True,
+            "disposition": "select",
+            "raw_response": '{"disposition":"select","capability":"collect-graph"}',
+            "raw_disposition": "select",
+            "raw_rationale": "only legal first step",
+            "model_response_observed": True,
+            "effective_backend": "runtime-provider:runtime-model",
+            "backend_provenance_source": "response_metadata.model_name",
+        },
+    })
+    try:
+        with patch.object(mt, "_persist_engagement_ledger") as persist:
+            asyncio.run(mt._record_graph_built("50", True, covered_domains=["north.local"]))
+    finally:
+        mythic_tools._task_visibility_context.reset(token)
+
+    persist.assert_called_once()
+    hop = mt._engagement_hops[0]
+    assert hop.technique == "collect-graph"
+    assert hop.evidence["decision_id"] == "decision-collect"
+    assert hop.evidence["selected_family"] == "collection"
+    assert hop.evidence["selected_is_first_admissible"] is True
+    assert hop.evidence["raw_disposition"] == "select"
+    assert hop.evidence["effective_backend"] == "runtime-provider:runtime-model"
+
+
 def test_build_capability_execution_plan_bridge_delegates_to_pure_builder():
     mt = _make_tools()
     action = capabilities.CapabilityAction(
@@ -1869,7 +1908,9 @@ def test_build_capability_commands_dc_scoped_sparse_gpo_defaults_to_group_add():
     assert plan["commands"][-1]["expected_probe"] == "extract_gpo_domain_admin_membership_probe"
 
 
-def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_host():
+def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_host(monkeypatch):
+    monkeypatch.setenv("SAGE_GPO_PROOF_SHARE_NAME", "SageProof")
+    monkeypatch.setenv("SAGE_GPO_PROOF_LOCAL_ROOT", r"C:\SageProof")
     mt = _make_tools()
     mt._engagement_footholds = [
         engagement_state.Foothold(
@@ -1908,6 +1949,46 @@ def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_
         r"\{0a93e998-2599-4da8-9717-6744993ded3a}"
         r"\Machine\Preferences\ScheduledTasks\sage_gpo_starkwallpaper_whoami.txt"
     )
+
+
+def test_gpo_proof_target_uses_dedicated_share_for_remote_non_dc_host(monkeypatch):
+    monkeypatch.setenv("SAGE_GPO_PROOF_SHARE_NAME", "SageProof")
+    monkeypatch.setenv("SAGE_GPO_PROOF_LOCAL_ROOT", r"C:\SageProof")
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="apollo",
+            host="WS01",
+            forest="range.local",
+            identity=r"RANGE\user1",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-07-12T20:00:00Z",
+        )
+    ]
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=[],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+            "affected_dc_hosts": [],
+        },
+    )
+    inputs = {"callback_id": 3}
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+    asyncio.run(mt._ensure_capability_executor_proof_target(action, inputs))
+
+    assert inputs["current_host"] == "WS01"
+    assert inputs["proof_path"] == r"C:\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    assert inputs["proof_unc"] == r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt"
 
 
 def test_gpo_proof_target_preserves_explicit_action_proof_path():
@@ -2415,7 +2496,7 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
     assert waits == [1]
     assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
     assert result["issued"][1]["expected_probe"] == "extract_gpo_system_exec_probe"
-    assert result["issued"][1]["verify_verdict"] == "achieved"
+    assert result["issued"][1]["verify_verdict"] == "partial"
     assert result["issued"][-1]["expected_probe"] == "extract_gpo_domain_admin_membership_probe"
     assert result["issued"][-1]["verify_verdict"] == "achieved"
     assert [call["command_name"] for call in calls["issued"]].count("execute_assembly") == 1
@@ -2424,7 +2505,7 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
         if event["stage"] == "effect_verification"
     ]
     assert any(
-        event["final_probe"] is False and event["verdict"] == "achieved"
+        event["final_probe"] is False and event["verdict"] == "partial"
         for event in verification_events
     )
     assert verification_events[-1]["final_probe"] is True
@@ -2434,6 +2515,67 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
         if "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in hop.satisfied_effects
     )
     assert hop.evidence["source"] == "execute_capability"
+
+
+def test_execute_capability_gpo_proof_only_does_not_inherit_system_author_from_xml(monkeypatch):
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-15T20:00:00Z",
+        )
+    ]
+
+    async def fake_sleep(seconds, result=None):
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    valid_xml = (
+        "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+        "<Arguments>/c whoami &gt; C:\\Users\\Public\\sage_gpo_starkwallpaper_whoami.txt</Arguments>"
+        "</Properties></Task></ScheduledTasks>"
+    )
+    outputs = iter([
+        "GPO was modified successfully",
+        valid_xml,
+        "The system cannot find the file specified.",
+    ])
+    calls = {}
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3141):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+                "callback_id": 3,
+            },
+            {
+                "callback_id": 3,
+                "allow_proof_only": True,
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["ok"] is False
+    assert result["stopped_after"] == "unresolved_effect_transaction"
+    assert result["issued"][1]["verify_verdict"] == "partial"
+    assert result["issued"][-1]["verify_verdict"] == "partial"
+    assert "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" not in mt._capability_achieved_effects()
 
 
 def test_execute_capability_gpo_direct_missing_membership_pins_transaction(monkeypatch):
@@ -5223,6 +5365,72 @@ def test_direct_dcsync_capabilities_verify_only_final_secret_probe(capability_na
     assert no_secret_verification.verdict != "achieved"
 
 
+def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="grant-directory-rights",
+        target="domain=range.local;source=gpo-system-exec:srv02-policy",
+        preconditions=["system-exec:gpo:srv02-policy@range.local"],
+        effects=["ds-replication-rights:range.local"],
+        intent={"capability": "grant-directory-rights", "domain": "range.local"},
+    )
+    setup_cmd = {
+        "command": "execute_assembly",
+        "operation": "gpo-computer-task",
+        "expected_probe": "extract_directory_rights_probe",
+        "produces": ["artifact:gpo_immediate_task"],
+        "consumes": [],
+        "purpose": "schedule StandIn to grant DCSync rights through srv02-policy",
+    }
+    acl_cmd = {
+        "command": "execute_assembly",
+        "operation": "ldap-acl-read",
+        "expected_probe": "extract_directory_rights_probe",
+        "produces": [],
+        "consumes": ["event:group_policy_refresh"],
+        "purpose": "read target domain ACL for DS-Replication ACE verification",
+    }
+
+    setup_probe, setup_verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        9,
+        "[+] Set object access rules\n    |_ Success, added dcsync privileges to object for RANGE\\user1",
+        setup_cmd,
+        capabilities,
+    )
+    assert setup_probe is None
+    assert setup_verification is None
+    assert mt._capability_executor_is_final_probe(setup_cmd) is False
+
+    acl_output = """
+[+] Identity --> RANGE\\user1
+    |_ Type       : Allow
+    |_ Permission : ExtendedRight
+    |_ Object     : DS-Replication-Get-Changes-All
+
+[+] Identity --> RANGE\\user1
+    |_ Type       : Allow
+    |_ Permission : ExtendedRight
+    |_ Object     : DS-Replication-Get-Changes
+"""
+    probe, verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        9,
+        acl_output,
+        acl_cmd,
+        capabilities,
+    )
+
+    assert mt._capability_executor_is_final_probe(acl_cmd) is True
+    assert probe["get_changes"] is True
+    assert probe["get_changes_all"] is True
+    assert probe["ds_replication_rights"] is True
+    assert probe["callback_id"] == "9"
+    assert verification.verdict == "achieved"
+
+
 def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(monkeypatch):
     # The DCSync rights precheck blocks a premature DCSync (no replication rights, graph populated). The
     # cross-domain forge's proof DCSync was blocked the same way — even though the imported EA-capable child TGT
@@ -6606,6 +6814,48 @@ def test_capability_executor_records_transient_failure_as_retryable():
     assert failed.evidence["terminal_failure"] is False
     assert failed.evidence["retryable_failure"] is True
     assert mt._capability_failed_effects() == set()
+
+
+def test_execute_capability_eval_injected_blocker_records_terminal_gpo_failure(monkeypatch):
+    mt = _make_tools()
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "gpo-controlled-system-exec",
+            "target_contains": "gpo=srv02-policy;domain=range.local",
+            "reason": "endpoint protection blocked the staged GPO payload on srv02",
+            "probe": {
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "srv02",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=[],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "gpo": "srv02-policy",
+            "domain": "range.local",
+        },
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["eval_injected_blocker"] is True
+    assert result["issued"] == []
+    assert result["recorded_failed_effects"] == ["system-exec:gpo:srv02-policy@range.local"]
+    failed = mt._engagement_hops[-1]
+    assert failed.status == "blocked"
+    assert failed.evidence["defender_blocked"] is True
+    assert failed.evidence["terminal_failure"] is True
+    assert failed.evidence["failure_class"] == "genuine"
+    assert failed.evidence["verify_reason"] == "endpoint protection blocked the staged GPO payload on srv02"
 
 
 def test_execute_capability_output_preview_redacts_ticket_store_json():

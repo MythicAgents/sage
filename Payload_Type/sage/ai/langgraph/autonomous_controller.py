@@ -193,6 +193,35 @@ def _collection_request_key(value: Any) -> str:
     return str(key or "").strip()
 
 
+def _decision_transaction_fields(decision: Any | None) -> dict[str, Any]:
+    """Return the decision provenance worth carrying on each semantic transaction."""
+    if decision is None:
+        return {"decision_id": "", "policy_mode": ""}
+    data = decision.to_dict() if hasattr(decision, "to_dict") else (
+        dict(decision) if isinstance(decision, dict) else {}
+    )
+    keys = (
+        "decision_id",
+        "policy_mode",
+        "candidate_hash",
+        "candidate_count",
+        "selected_index",
+        "selected_family",
+        "selected_is_first_admissible",
+        "disposition",
+        "rationale",
+        "raw_response",
+        "raw_disposition",
+        "raw_rationale",
+        "model_response_observed",
+        "effective_backend",
+        "effective_model_provider",
+        "effective_model_id",
+        "backend_provenance_source",
+    )
+    return {key: data.get(key) for key in keys if key in data}
+
+
 class AutonomousController:
     """Owns the deterministic autonomous control loop. All boundaries are injected callables.
 
@@ -476,8 +505,7 @@ class AutonomousController:
                         "kind": "collection",
                         "capability": "collect-graph",
                         "target": request_key,
-                        "decision_id": str(getattr(decision, "decision_id", "") or ""),
-                        "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+                        **_decision_transaction_fields(decision),
                     })
                     cst, cres = await self._collect_seam(state, decision)
                     self._collections += 1
@@ -564,8 +592,7 @@ class AutonomousController:
                 "kind": "capability",
                 "capability": name,
                 "target": target,
-                "decision_id": str(getattr(decision, "decision_id", "") or ""),
-                "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+                **_decision_transaction_fields(decision),
             })
             est, eres = await self._execute_seam(action, decision)
             result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}

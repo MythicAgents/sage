@@ -40,6 +40,31 @@ DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '"SEVENKINGDOMS":"sevenkingdoms.local",'
     '"ESSOS":"essos.local"}'
 )
+DEFAULT_PURPOSE_RANGE_NETBIOS_MAP = '{"RANGE":"range.local"}'
+DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV = {
+    "SAGE_GPO_PROOF_SHARE_NAME": "SageProof",
+    "SAGE_GPO_PROOF_LOCAL_ROOT": r"C:\SageProof",
+    # SRV02 is provisioned with a one-minute computer GP refresh and zero random offset.
+    # Keep the live discriminator conservative but avoid paying the generic five-minute wait twice per GPO run.
+    "SAGE_GPO_WAIT_SECONDS": "120",
+}
+DEFAULT_PURPOSE_RANGE_RECOVERY_BLOCKER_ENV = {
+    "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON": json.dumps(
+        {
+            "capability": "gpo-controlled-system-exec",
+            "target_contains": "gpo=srv02-policy;domain=range.local",
+            "reason": "endpoint protection blocked the staged GPO payload on srv02",
+            "probe": {
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "srv02",
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+}
+DEFAULT_LUDUS_RANGE_ID = os.environ.get("SAGE_LUDUS_RANGE_ID") or None
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
 DEFAULT_FOOTHOLD_IP = "10.4.10.22"
 DEFAULT_FOOTHOLD_USER = r"NORTH\samwell.tarly"
@@ -55,15 +80,17 @@ class FootholdSpec:
         user: str = DEFAULT_FOOTHOLD_USER,
         callback_user: str = DEFAULT_FOOTHOLD_CALLBACK_USER,
         password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV,
+        ludus_range_id: str | None = DEFAULT_LUDUS_RANGE_ID,
     ) -> None:
         self.host = host
         self.ip = ip
         self.user = user
         self.callback_user = callback_user
         self.password_env = password_env
+        self.ludus_range_id = ludus_range_id
 
     def launch_argv(self) -> list[str]:
-        return [
+        argv = [
             "/bin/bash",
             "skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh",
             self.ip,
@@ -76,12 +103,17 @@ class FootholdSpec:
             "--callback-user",
             self.callback_user,
         ]
+        if self.ludus_range_id:
+            argv.extend(["--ludus-range-id", self.ludus_range_id])
+        return argv
 
     def launch_env(self) -> dict[str, str]:
         env = dict(os.environ)
         password = _resolve_password_source(self.password_env)
         if password:
             env["SAGE_RUN_AS_PASSWORD"] = password
+        if self.ludus_range_id:
+            env["SAGE_LUDUS_RANGE_ID"] = self.ludus_range_id
         return env
 
     def readiness_argv(self) -> list[str]:
@@ -128,6 +160,37 @@ LUDUS_STATUS = [PY, "skills/sage-goad-reset/scripts/ludus.py", "status"]
 CALLBACKS = [PY, "skills/sage-live-runner/scripts/sage_task.py", "callbacks"]
 
 
+def _ludus_argv(*args: str, range_id: str | None = None) -> list[str]:
+    argv = [PY, "skills/sage-goad-reset/scripts/ludus.py"]
+    if range_id:
+        argv.extend(["--range-id", range_id])
+    argv.extend(args)
+    return argv
+
+
+def _range_env(range_id: str | None = None) -> dict[str, str] | None:
+    if not range_id:
+        return None
+    return {**os.environ, "SAGE_LUDUS_RANGE_ID": range_id}
+
+
+def _engagement_netbios_map(scenario: str, explicit: str | None = None) -> str:
+    if explicit:
+        return explicit
+    if scenario.startswith("purpose-range-"):
+        return DEFAULT_PURPOSE_RANGE_NETBIOS_MAP
+    return DEFAULT_ENGAGEMENT_NETBIOS_MAP
+
+
+def _scenario_restart_env(scenario: str) -> dict[str, str]:
+    if scenario.startswith("purpose-range-"):
+        env = dict(DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV)
+        if scenario == "purpose-range-recovery":
+            env.update(DEFAULT_PURPOSE_RANGE_RECOVERY_BLOCKER_ENV)
+        return env
+    return {}
+
+
 def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
     print(f"\n=== {name} ===\n$ (cd {cwd}) {' '.join(argv)}", flush=True)
     proc = subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
@@ -135,11 +198,11 @@ def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
         raise SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
 
 
-def _poll(name, argv, cwd, predicate, *, timeout, interval=20):
+def _poll(name, argv, cwd, predicate, *, timeout, interval=20, env: dict[str, str] | None = None):
     print(f"\n=== poll: {name} (<= {timeout}s) ===", flush=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        out = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True).stdout
+        out = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, env=env).stdout
         if predicate(out):
             return out
         time.sleep(interval)
@@ -178,9 +241,9 @@ def discover_callbacks(foothold: FootholdSpec | None = None) -> int:
     return apollo[-1]
 
 
-def _available_snapshots() -> set[str]:
+def _available_snapshots(range_id: str | None = None) -> set[str]:
     proc = subprocess.run(
-        [PY, "skills/sage-goad-reset/scripts/ludus.py", "snapshots"],
+        _ludus_argv("snapshots", range_id=range_id),
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -223,9 +286,10 @@ def validate_reset_inputs(
     snapshot: str,
     retained_callback_config: Path,
     foothold: FootholdSpec | None = None,
+    ludus_range_id: str | None = None,
 ) -> None:
     foothold = foothold or FootholdSpec()
-    available_snapshots = _available_snapshots()
+    available_snapshots = _available_snapshots(ludus_range_id or foothold.ludus_range_id)
     if snapshot not in available_snapshots:
         available = ", ".join(sorted(available_snapshots))
         raise SystemExit(f"ABORT: Ludus snapshot {snapshot!r} not found. Available: {available}")
@@ -291,6 +355,7 @@ def full_reset_and_ready(
     snapshot: str = DEFAULT_SNAPSHOT,
     retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG,
     foothold: FootholdSpec | None = None,
+    ludus_range_id: str | None = None,
 ) -> tuple[None, int]:
     """Full clean reset -> readiness -> callback discovery; returns (None, apollo_cb).
 
@@ -303,10 +368,14 @@ def full_reset_and_ready(
     what Sage reads at startup (SAGE_ENGAGEMENT_ID always; model/provider if read from env; a prompt-set
     selector would need its own knob)."""
     foothold = foothold or FootholdSpec()
+    ludus_range_id = ludus_range_id or foothold.ludus_range_id
+    range_env = _range_env(ludus_range_id)
     for name, argv, cwd, timeout in RESET_STEPS:
         step_argv = argv
         if name == "ludus rollback" and snapshot:
-            step_argv = [PY, "skills/sage-goad-reset/scripts/ludus.py", "rollback", snapshot, "--yes"]
+            step_argv = _ludus_argv("rollback", snapshot, "--yes", range_id=ludus_range_id)
+        if name == "ludus poweron":
+            step_argv = _ludus_argv("poweron", "all", range_id=ludus_range_id)
         if name == "bootstrap foothold":
             step_argv = [
                 PY,
@@ -318,16 +387,24 @@ def full_reset_and_ready(
             ]
         if name == "restart sage" and restart_env:
             step_argv = list(argv) + [f"{k}={v}" for k, v in restart_env.items()]
-        _run(name, step_argv, cwd, timeout)
+        _run(name, step_argv, cwd, timeout, env=range_env)
     _poll(
         f"{foothold.host} powered on",
-        LUDUS_STATUS,
+        _ludus_argv("status", range_id=ludus_range_id),
         ROOT,
         lambda out: _foothold_guest_up(out, foothold.ip),
         timeout=1800,
+        env=range_env,
     )
     _run("launch retained apollo", foothold.launch_argv(), ROOT, 900, env=foothold.launch_env())
-    _poll("sage chat + apollo ready", foothold.readiness_argv(), ROOT, _readiness_ok, timeout=1200)
+    _poll(
+        "sage chat + apollo ready",
+        foothold.readiness_argv(),
+        ROOT,
+        _readiness_ok,
+        timeout=1200,
+        env=range_env,
+    )
     return None, discover_callbacks(foothold)
 
 
@@ -343,7 +420,9 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              route_env: dict[str, str] | None = None,
              snapshot: str = DEFAULT_SNAPSHOT,
              retained_callback_config: Path = DEFAULT_RETAINED_CALLBACK_CONFIG,
-             foothold: FootholdSpec | None = None) -> None:
+             foothold: FootholdSpec | None = None,
+             ludus_range_id: str | None = None,
+             engagement_netbios_map: str | None = None) -> None:
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
@@ -359,13 +438,15 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     restart_env = {
         "SAGE_AUTONOMOUS_CONTROLLER": "1",
         "SAGE_POLICY_MODE": policy_mode,
-        "SAGE_ENGAGEMENT_NETBIOS_MAP": DEFAULT_ENGAGEMENT_NETBIOS_MAP,
+        "SAGE_ENGAGEMENT_NETBIOS_MAP": _engagement_netbios_map(scenario, engagement_netbios_map),
     }
+    restart_env.update(_scenario_restart_env(scenario))
     _sage_cb, apollo_cb = full_reset_and_ready(
         restart_env=restart_env,
         snapshot=snapshot,
         retained_callback_config=retained_callback_config,
         foothold=foothold,
+        ludus_range_id=ludus_range_id,
     )
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
             "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout),
@@ -396,8 +477,10 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   null_model=False,
                   snapshot=DEFAULT_SNAPSHOT,
                   retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG,
-                  foothold: FootholdSpec | None = None):
+                  foothold: FootholdSpec | None = None,
+                  ludus_range_id: str | None = None):
     foothold = foothold or FootholdSpec()
+    ludus_range_id = ludus_range_id or foothold.ludus_range_id
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
@@ -406,7 +489,9 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
             print(f"--- iteration seed={s} side={sd} ---")
             for name, argv, cwd, _ in RESET_STEPS:
                 if name == "ludus rollback" and snapshot:
-                    argv = [PY, "skills/sage-goad-reset/scripts/ludus.py", "rollback", snapshot, "--yes"]
+                    argv = _ludus_argv("rollback", snapshot, "--yes", range_id=ludus_range_id)
+                if name == "ludus poweron":
+                    argv = _ludus_argv("poweron", "all", range_id=ludus_range_id)
                 if name == "bootstrap foothold":
                     argv = [
                         PY,
@@ -417,7 +502,7 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                         str(retained_callback_config),
                     ]
                 print(f"  (cd {cwd}) {' '.join(argv)}")
-            print(f"  (cd {ROOT}) {' '.join(LUDUS_STATUS)}     # poll until {foothold.host} is up")
+            print(f"  (cd {ROOT}) {' '.join(_ludus_argv('status', range_id=ludus_range_id))}     # poll until {foothold.host} is up")
             print(
                 f"  (cd {ROOT}) {' '.join(foothold.launch_argv())} "
                 f"# log off localuser, RDP {foothold.user}, launch staged Apollo "
@@ -465,6 +550,19 @@ def main(argv=None) -> int:
     ap.add_argument("--snapshot", default=DEFAULT_SNAPSHOT,
                     help=f"Ludus staged-Apollo restore target (default: {DEFAULT_SNAPSHOT})")
     ap.add_argument(
+        "--ludus-range-id",
+        default=DEFAULT_LUDUS_RANGE_ID,
+        help="Ludus range ID override for reset, inventory, and foothold deployment.",
+    )
+    ap.add_argument(
+        "--engagement-netbios-map",
+        default=None,
+        help=(
+            "JSON NetBIOS-to-FQDN map passed to Sage. "
+            "Defaults to the GOAD map or the purpose-range map based on --scenario."
+        ),
+    )
+    ap.add_argument(
         "--retained-callback-config",
         type=Path,
         default=DEFAULT_RETAINED_CALLBACK_CONFIG,
@@ -495,6 +593,7 @@ def main(argv=None) -> int:
         user=args.foothold_user,
         callback_user=args.foothold_callback_user,
         password_env=args.foothold_password_env,
+        ludus_range_id=args.ludus_range_id,
     )
     policy_mode = "symbolic" if args.controller else args.policy_mode
     if args.null_model_factorial and args.side not in (None, "harness"):
@@ -518,11 +617,12 @@ def main(argv=None) -> int:
             _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
                           args.seeds, args.solve_timeout, selected_mode,
                           args.provider, args.model, null_model,
-                          args.snapshot, args.retained_callback_config, foothold)
+                          args.snapshot, args.retained_callback_config, foothold,
+                          args.ludus_range_id)
             print(f"\n  NOTE: Sage policy mode -> {selected_mode}; null_model={null_model}.")
         return 0
 
-    validate_reset_inputs(args.snapshot, args.retained_callback_config, foothold)
+    validate_reset_inputs(args.snapshot, args.retained_callback_config, foothold, args.ludus_range_id)
     for selected_mode in policy_modes:
         for _ in range(args.seeds):
             sides = ["harness"] if args.null_model_factorial else (
@@ -534,7 +634,9 @@ def main(argv=None) -> int:
                          null_model=null_model, route_env=route_env,
                          snapshot=args.snapshot,
                          retained_callback_config=args.retained_callback_config,
-                         foothold=foothold)
+                         foothold=foothold,
+                         ludus_range_id=args.ludus_range_id,
+                         engagement_netbios_map=args.engagement_netbios_map)
     if not args.side and not args.null_model_factorial:
         compare(args.scenario)
     return 0

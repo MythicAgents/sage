@@ -40,6 +40,16 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
     --target-host=*)
       TARGET_HOST="${EXTRA_ARGS[$i]#*=}"
       ;;
+    --ludus-range-id)
+      if (( i + 1 >= ${#EXTRA_ARGS[@]} )); then
+        echo "launch_apollo_foothold: --ludus-range-id requires a value" >&2
+        exit 2
+      fi
+      export SAGE_LUDUS_RANGE_ID="${EXTRA_ARGS[$((i + 1))]}"
+      ;;
+    --ludus-range-id=*)
+      export SAGE_LUDUS_RANGE_ID="${EXTRA_ARGS[$i]#*=}"
+      ;;
   esac
 done
 
