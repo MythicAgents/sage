@@ -23,6 +23,8 @@ try:  # package import
     from . import decision_benchmark
     from . import null_model_factorial
     from . import operator_replay_benchmark
+    from . import policy_replay_calibration
+    from . import policy_replay_corpus
     from . import frontier_census
     from . import purpose_range
     from . import replication_purpose_range
@@ -37,6 +39,8 @@ except Exception:  # script / sys.path import
     import decision_benchmark  # type: ignore
     import null_model_factorial  # type: ignore
     import operator_replay_benchmark  # type: ignore
+    import policy_replay_calibration  # type: ignore
+    import policy_replay_corpus  # type: ignore
     import frontier_census  # type: ignore
     import purpose_range  # type: ignore
     import replication_purpose_range  # type: ignore
@@ -298,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
 
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)
+    policy_replay_calibration.add_cli(sub)
+    policy_replay_corpus.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

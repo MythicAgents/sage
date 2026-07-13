@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "policy-replay-frontier-corpus-2026-07-13",
+  "purpose": "Freeze one packet-backed live decisive frontier for each stable calibration case so offline selector work can replay real policy inputs without claiming unseen-branch simulation.",
+  "calibration_manifest": "policy_replay_calibration_manifest.json",
+  "packet_sources": [
+    {
+      "case_id": "replication-visible-cost",
+      "relative_path": "replication_purpose_range_packet_canary_20260713.jsonl",
+      "sha256": "2431a019916087d4e6e3c7a6a0b472f54396be41bc03f02eba01048e26b95c4a",
+      "policy_mode": "hybrid",
+      "decision_packet_hash": "sha256:389a5bd3abf4d9b30c1e92cff0cd71975004b54c1dd4b3d6bf033ca75949df37"
+    },
+    {
+      "case_id": "ca-export-replanning",
+      "relative_path": "purpose_range_ca_export_replanning_packet_canary_v2_20260713.jsonl",
+      "sha256": "13b5d34d0b1a9a0cf7b9a36cac17bf9f77c6c375afde538fefec1136d982bcb1",
+      "policy_mode": "hybrid",
+      "decision_packet_hash": "sha256:728062a682bf0825b4bd2cf52f6491376dbd1069650d37f55ab555b0a410a7f0"
+    }
+  ]
+}

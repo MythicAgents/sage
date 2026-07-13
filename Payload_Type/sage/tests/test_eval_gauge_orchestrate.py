@@ -169,6 +169,10 @@ def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):
         values["SAGE_AUTONOMOUS_CONTROLLER"]
         for values in seen.values()
     } == {"1"}
+    assert {
+        values["SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS"]
+        for values in seen.values()
+    } == {"1"}
 
 
 def test_run_side_uses_purpose_range_map_and_passes_range_id(monkeypatch):

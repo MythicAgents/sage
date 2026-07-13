@@ -521,6 +521,7 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     restart_env = {
         "SAGE_AUTONOMOUS_CONTROLLER": "1",
         "SAGE_POLICY_MODE": policy_mode,
+        "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS": "1",
         "SAGE_ENGAGEMENT_NETBIOS_MAP": _engagement_netbios_map(scenario, engagement_netbios_map),
     }
     restart_env.update(_scenario_restart_env(scenario))

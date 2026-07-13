@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 
 from ai.langgraph import autonomous_controller as ac
@@ -184,6 +185,42 @@ def test_candidate_hash_includes_visible_operational_cost_metadata():
     delayed = Action("same", "target", "effect", operational_cost=_gpo_cost(120))
 
     assert policy.candidate_hash([immediate]) != policy.candidate_hash([delayed])
+
+
+def test_eval_decision_packet_capture_is_opt_in_and_hashes_common_frontier(monkeypatch):
+    candidates = [Action("first", "a", "effect:a"), Action("second", "b", "effect:b")]
+
+    without_capture = asyncio.run(policy.SymbolicPolicy().select(
+        episode_id="episode-1",
+        objective="test",
+        state=State(),
+        candidates=candidates,
+        history=[],
+    ))
+    assert without_capture.decision_packet == {}
+    assert without_capture.decision_packet_hash == ""
+
+    monkeypatch.setenv("SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS", "1")
+    with_capture = asyncio.run(policy.SymbolicPolicy().select(
+        episode_id="episode-2",
+        objective="test",
+        state=State(),
+        candidates=candidates,
+        history=[],
+        budgets={"max_cycles": 7, "wall_clock_budget_s": 2700.0},
+    ))
+
+    assert with_capture.decision_packet["selection_contract"] == "symbolic_frontier"
+    assert with_capture.decision_packet["candidate_hash"] == with_capture.candidate_hash
+    assert [item["name"] for item in with_capture.decision_packet["admissible_frontier"]] == ["first", "second"]
+    assert with_capture.decision_packet["budgets"] == {"max_cycles": 7, "wall_clock_budget_s": 2700}
+    raw = json.dumps(
+        with_capture.decision_packet,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    assert with_capture.decision_packet_hash == f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
 def test_llm_policy_persists_raw_decline_and_response_backend_provenance():

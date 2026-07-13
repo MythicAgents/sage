@@ -14,7 +14,7 @@ description: Repo-local Sage eval-gauge / hill-climbing Phase-0 toolkit. Use whe
 A measurement instrument: VERIFIED milestones (ground truth) → a vector `ScoreCard` (C2) carrying a Goodhart gap + a `verifier_hash`; a noise floor (C3, `min_detectable_effect`); the **Gate Experiment** (Spearman ρ of eval-vs-ground-truth + the high-eval/low-truth count, with a PASS/FAIL verdict); ledger-independent **probes** (so a non-Sage agent is scoreable); a **bare-model runner**; and a **live driver**.
 
 ## Components
-`range_state` (C1 ledger ground truth) · `process_state` (C1b tradecraft + unclassified_rate) · `fitness` (C2 vector; carries `objective_clean_stop` + `wall_seconds`) · `reliability` (C3 noise floor) · `scenarios` · `gate_experiment` · `gate_live` · `hermetic` · `probes` · `bare_runner` · `live_runner` · `live_seams` · `run_gauge_live`. The harness side creates a fresh locked Mythic v4 Sage chat channel per run; no Sage callback is required.
+`range_state` (C1 ledger ground truth) · `process_state` (C1b tradecraft + unclassified_rate) · `fitness` (C2 vector; carries `objective_clean_stop` + `wall_seconds`) · `reliability` (C3 noise floor) · `scenarios` · `gate_experiment` · `gate_live` · `hermetic` · `policy_replay_calibration` · `policy_replay_corpus` · `probes` · `bare_runner` · `live_runner` · `live_seams` · `run_gauge_live`. The harness side creates a fresh locked Mythic v4 Sage chat channel per run; no Sage callback is required.
 
 ## Run
 - Offline tests: `../../.venv/bin/python -m pytest tests/ -q`
@@ -23,6 +23,12 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - Operator replay dry-run (safe; no model calls): `../../.venv/bin/python -m ai.hillclimb operator-replay run --dry-run`
 - Null-model policy factorial (safe; no lab or model calls):
   `../../.venv/bin/python -m ai.hillclimb null-model-factorial`
+- Policy replay calibration against frozen live matrices (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-calibrate`
+- Export packet-backed decisive frontiers from pinned live canaries (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-corpus-export`
+- Validate the packet-backed frontier corpus against the frozen matrices and source rows (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-corpus-validate`
 - Live null-model factorial (OFFENSIVE symbolic baseline; clean reset per policy):
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario cross-forest-objective --side harness --null-model-factorial --seeds 1 --solve-timeout 5400 --go`
 - Live driver dry-run (safe; resolves Sage model, Apollo catalog, BloodHound): `../../.venv/bin/python ai/hillclimb/run_gauge_live.py`
@@ -66,4 +72,6 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - **child-da is saturated** (cap ceils at 0.444) — a regression guard, not an improvement signal; measure capability gains on `cross-forest-objective`. `GRAPH_COLLECTED` is not scored on child-da (off-path → Goodhart); `DA_CHILD` credits DA-equivalent control via the DC's Builtin\Administrators, not just Domain Admins.
 - **No Sage restart** needed for *gauge package* changes (additive, read-only to Sage). The *live gate's reset* DOES restart Sage (to apply the token/config).
 - **Hermetic inner loop (`hermetic.py`)** re-scores RECORDED runs offline (no lab); scoring a NEW candidate's capability hermetically (mock-Mythic re-execution) is the Phase-3 frontier (`mock_mythic_candidate_eval` is a documented `NotImplementedError` stub).
+- **Policy replay calibration (`policy_replay_calibration.py`)** is the intermediate gate before that frontier: it replays decisive recorded policy frontiers from hashed live matrices and proves the offline reading preserves known live separations and ties. It does not score unseen candidates.
+- **Packet-backed replay corpus (`policy_replay_corpus.py`)** reconstructs the decisive frontiers from pinned clean packet canaries and grades only selectors whose chosen branch already has a live-observed cost. It rechecks source artifact hashes and still does not score unseen branches.
 - `krbtgt`/creds milestones are Mythic-loot, not graph — a separate probe source still to wire.
