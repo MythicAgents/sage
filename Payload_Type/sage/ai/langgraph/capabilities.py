@@ -18,12 +18,51 @@ from typing import Any, Callable, Iterable
 # process so these passwords are NOT hardcoded source-visible constants an artifact recoverer could reuse,
 # yet deterministic within a run+slug so the same artifact's forge step and use step agree on the password.
 ARTIFACT_SECRET_SALT = secrets.token_hex(8)
+DEFAULT_GPO_PROPAGATION_WAIT_SECONDS = 300
+MAX_OPERATIONAL_WAIT_SECONDS = 600
+_GPO_PROPAGATION_CAPABILITIES = frozenset({
+    "gpo-controlled-system-exec",
+    "grant-directory-rights",
+})
 
 
 def artifact_secret(prefix: str, slug: str = "") -> str:
     """A non-source-visible, per-run password for a forged/exported offensive artifact."""
     suffix = f"-{slug}" if slug else ""
     return f"{prefix}-{ARTIFACT_SECRET_SALT}{suffix}"
+
+
+def _bounded_operational_wait_seconds(value: Any, *, default: int = 0) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = default
+    return max(0, min(seconds, MAX_OPERATIONAL_WAIT_SECONDS))
+
+
+def immediate_operational_cost(*, execution_scope: str = "direct") -> dict[str, Any]:
+    """Return the explicit zero-wait cost profile for direct actions."""
+    return {
+        "interaction_class": "direct",
+        "execution_scope": str(execution_scope or "direct"),
+        "requires_propagation_wait": False,
+        "expected_wait_seconds": 0,
+        "wait_reasons": [],
+    }
+
+
+def gpo_operational_cost(wait_seconds: Any = DEFAULT_GPO_PROPAGATION_WAIT_SECONDS) -> dict[str, Any]:
+    """Return the bounded propagation cost profile for GPO-backed actions."""
+    return {
+        "interaction_class": "propagation-bound",
+        "execution_scope": "domain-policy",
+        "requires_propagation_wait": True,
+        "expected_wait_seconds": _bounded_operational_wait_seconds(
+            wait_seconds,
+            default=DEFAULT_GPO_PROPAGATION_WAIT_SECONDS,
+        ),
+        "wait_reasons": ["group-policy-refresh"],
+    }
 
 
 @dataclass(frozen=True)
@@ -38,6 +77,7 @@ class CapabilityAction:
     verifier: dict[str, list[str]] = field(default_factory=dict)
     reason: str = ""
     source_facts: list[str] = field(default_factory=list)
+    operational_cost: dict[str, Any] = field(default_factory=immediate_operational_cost)
 
     def render_line(self) -> str:
         """Compact line for prompt injection."""
@@ -48,6 +88,61 @@ class CapabilityAction:
         if achieved:
             pieces.append("verify: " + " OR ".join(achieved))
         return " | ".join(pieces)
+
+
+def normalize_operational_cost(value: Any) -> dict[str, Any]:
+    """Normalize one candidate's policy-visible operational cost contract."""
+    if not isinstance(value, dict):
+        return immediate_operational_cost()
+    raw_reasons = value.get("wait_reasons")
+    if isinstance(raw_reasons, str):
+        raw_reasons = [raw_reasons]
+    elif not isinstance(raw_reasons, (list, tuple, set)):
+        raw_reasons = []
+    wait_seconds = _bounded_operational_wait_seconds(value.get("expected_wait_seconds"), default=0)
+    requires_wait = value.get("requires_propagation_wait")
+    if isinstance(requires_wait, str):
+        requires_wait = requires_wait.strip().casefold() in {"1", "true", "yes", "on"}
+    else:
+        requires_wait = bool(requires_wait)
+    requires_wait = requires_wait or wait_seconds > 0
+    return {
+        "interaction_class": str(
+            value.get("interaction_class") or ("propagation-bound" if requires_wait else "direct")
+        ),
+        "execution_scope": str(
+            value.get("execution_scope") or ("domain-policy" if requires_wait else "direct")
+        ),
+        "requires_propagation_wait": requires_wait,
+        "expected_wait_seconds": wait_seconds,
+        "wait_reasons": [str(reason) for reason in raw_reasons if str(reason)],
+    }
+
+
+def operational_cost_for_action(
+    action: Any,
+    *,
+    gpo_wait_seconds: Any | None = None,
+) -> dict[str, Any]:
+    """Return the current policy-visible cost profile for one action."""
+    action_name = str(getattr(action, "name", "") or "").strip().casefold()
+    if action_name in _GPO_PROPAGATION_CAPABILITIES:
+        return gpo_operational_cost(
+            DEFAULT_GPO_PROPAGATION_WAIT_SECONDS if gpo_wait_seconds is None else gpo_wait_seconds
+        )
+    return normalize_operational_cost(getattr(action, "operational_cost", None))
+
+
+def with_operational_cost(
+    action: CapabilityAction,
+    *,
+    gpo_wait_seconds: Any | None = None,
+) -> CapabilityAction:
+    """Return an action whose cost metadata matches the current runtime wait configuration."""
+    return replace(
+        action,
+        operational_cost=operational_cost_for_action(action, gpo_wait_seconds=gpo_wait_seconds),
+    )
 
 
 @dataclass(frozen=True)
@@ -4749,6 +4844,7 @@ def _gpo_controlled_system_exec_action(
             *source_facts,
             *([f"gpo-guid:{gpo}:{gpo_guid}"] if gpo_guid else []),
         ],
+        operational_cost=gpo_operational_cost(),
     )
 
 
@@ -4796,6 +4892,7 @@ def _grant_directory_rights_action(gpo: str, domain: str) -> CapabilityAction:
         },
         reason="SYSTEM execution context can apply directory ACLs; verify the ACE before any DCSync",
         source_facts=[f"system-exec:gpo:{gpo}@{domain}"],
+        operational_cost=gpo_operational_cost(),
     )
 
 

@@ -13,9 +13,7 @@ Payload_Type/sage/sage*.db*
 .claude/
 tasks/
 .env
-skills/sage-callback-bootstrap/apollo_callback_config.json
-skills/sage-callback-bootstrap/apollo_meereen_jorah_callback_config.json
-skills/sage-callback-bootstrap/merlin_callback_config.json
+skills/sage-callback-bootstrap/*_callback_config.json
 .evals/
 .mcp.json
 .envrc
@@ -34,8 +32,8 @@ Payload_Type/sage/certs/*.pem
 Payload_Type/sage/sage.log
 Payload_Type/sage/evals/results/
 
-# Sage durable engagement-state ledger (runtime state — never commit)
+# Sage durable engagement-state ledger and local analysis artifacts (runtime state — never commit)
 .sage_engagement/
-Payload_Type/sage/.trajectory/
+.hillclimb/
+**/.trajectory/
 Payload_Type/sage/MEMORY/audit.jsonl
-Payload_Type/sage/Payload_Type/sage/.trajectory/

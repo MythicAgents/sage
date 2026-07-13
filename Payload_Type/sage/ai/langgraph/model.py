@@ -4596,12 +4596,15 @@ class Model:
                     status=activity_status,
                 )
 
+        def policy_frontier(state):
+            return _autonomous_policy_candidates(_cap.actions_from_state(state))
+
         def needs_collection(state):
             # N2: signal collection ONLY when a SUPPORTED collector-profile foothold actually needs it — aligned with
             # _controller_collection_target — so an unsupported-agent missing foothold doesn't trigger a
             # collect()->no_target slot burn. (current_access_collection_missing counts ALL agents.)
             try:
-                frontier_empty = not bool(_cap.actions_from_state(state))
+                frontier_empty = not bool(policy_frontier(state))
                 if not frontier_empty:
                     snap["collection_request"] = None
                     return False
@@ -4747,7 +4750,7 @@ class Model:
                                     "preconditions": list(getattr(candidate, "preconditions", None) or []),
                                     "effects": list(getattr(candidate, "effects", None) or []),
                                 }
-                                for index, candidate in enumerate(_cap.actions_from_state(snap.get("state")))
+                                for index, candidate in enumerate(policy_frontier(snap.get("state")))
                             ]
                         for candidate in candidates:
                             if not isinstance(candidate, dict):
@@ -4869,7 +4872,7 @@ class Model:
             objective_met=objective_met,
             needs_collection=needs_collection,
             collect=collect,
-            frontier_fn=_cap.actions_from_state,
+            frontier_fn=policy_frontier,
             policy_backend=policy_backend,
             objective=objective_text,
             episode_id=self._policy_episode_id,
@@ -8220,6 +8223,7 @@ def _capability_action_payload(action: Any) -> dict[str, Any]:
         "target": _jsonable_value(getattr(action, "target", "")),
         "preconditions": _jsonable_value(list(getattr(action, "preconditions", []) or [])),
         "effects": _jsonable_value(list(getattr(action, "effects", []) or [])),
+        "operational_cost": _jsonable_value(getattr(action, "operational_cost", {}) or {}),
         "intent": _jsonable_value(getattr(action, "intent", {}) or {}),
         "verifier": _jsonable_value(getattr(action, "verifier", {}) or {}),
         "reason": _jsonable_value(getattr(action, "reason", "") or ""),
@@ -8235,6 +8239,43 @@ def _jsonable_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonable_value(item) for item in value]
     return str(value)
+
+
+_AUTONOMOUS_GPO_WAIT_ALIASES = (
+    "wait_seconds",
+    "gpo_wait_seconds",
+    "gp_refresh_wait_seconds",
+    "dc_refresh_wait_seconds",
+    "delay_seconds",
+)
+
+
+def _autonomous_gpo_wait_seconds(action: Any = None) -> int:
+    """Return the bounded GPO wait window used by both policy metadata and execution inputs."""
+    override = _env_positive_int("SAGE_GPO_WAIT_SECONDS", 0)
+    if override:
+        return min(override, 600)
+    intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+    for alias in _AUTONOMOUS_GPO_WAIT_ALIASES:
+        value = intent.get(alias)
+        if value is None or value == "":
+            continue
+        try:
+            return max(0, min(int(value), 600))
+        except (TypeError, ValueError):
+            continue
+    return 300
+
+
+def _autonomous_policy_candidates(actions: list[Any]) -> list[Any]:
+    try:
+        from . import capabilities as _cap
+    except ImportError:
+        import capabilities as _cap
+    return [
+        _cap.with_operational_cost(action, gpo_wait_seconds=_autonomous_gpo_wait_seconds(action))
+        for action in (actions or [])
+    ]
 
 
 def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict[str, Any]:
@@ -8258,9 +8299,7 @@ def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict
         inputs["allow_proof_only"] = True
     action_name = str(getattr(action, "name", "") or "").strip().casefold()
     if action_name in {"gpo-controlled-system-exec", "grant-directory-rights"}:
-        wait_seconds = _env_positive_int("SAGE_GPO_WAIT_SECONDS", 0)
-        if wait_seconds:
-            inputs["gpo_wait_seconds"] = min(wait_seconds, 600)
+        inputs["gpo_wait_seconds"] = _autonomous_gpo_wait_seconds(action)
     return inputs
 
 

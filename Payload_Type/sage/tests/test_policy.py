@@ -6,12 +6,34 @@ from ai.langgraph import policy
 
 
 class Action:
-    def __init__(self, name, target, effect):
+    def __init__(self, name, target, effect, operational_cost=None):
         self.name = name
         self.target = target
         self.preconditions = []
         self.effects = [effect]
         self.reason = ""
+        if operational_cost is not None:
+            self.operational_cost = operational_cost
+
+
+def _immediate_cost():
+    return {
+        "interaction_class": "direct",
+        "execution_scope": "direct",
+        "requires_propagation_wait": False,
+        "expected_wait_seconds": 0,
+        "wait_reasons": [],
+    }
+
+
+def _gpo_cost(wait_seconds=300):
+    return {
+        "interaction_class": "propagation-bound",
+        "execution_scope": "domain-policy",
+        "requires_propagation_wait": True,
+        "expected_wait_seconds": wait_seconds,
+        "wait_reasons": ["group-policy-refresh"],
+    }
 
 
 class State:
@@ -123,8 +145,45 @@ def test_llm_policy_can_select_collection_when_it_is_the_only_admissible_action(
         "target": "north.sevenkingdoms.local|baseline",
         "preconditions": [],
         "effects": ["graph-collected"],
+        "operational_cost": _immediate_cost(),
         "reason": "",
     }]
+
+
+def test_learned_policy_payloads_expose_same_operational_cost_contract():
+    action = Action(
+        "gpo-controlled-system-exec",
+        "gpo=workstation-policy;domain=lab.local",
+        "system-exec:gpo:workstation-policy@lab.local",
+        operational_cost=_gpo_cost(120),
+    )
+
+    llm_payload = policy.LLMPolicy(
+        None,
+        catalog=[{"name": action.name, "description": "test capability"}],
+    ).request_payload("test", State(), [action], [], None)
+    hybrid_payload = policy.HybridPolicy(None).request_payload("test", State(), [action], [], None)
+
+    assert llm_payload["current_admissible_actions"][0]["operational_cost"] == _gpo_cost(120)
+    assert hybrid_payload["candidates"][0]["operational_cost"] == _gpo_cost(120)
+
+
+def test_policy_payload_defaults_missing_operational_cost_to_explicit_immediate_profile():
+    action = Action("collect-graph", "lab.local|baseline", "graph-collected")
+
+    payload = policy.LLMPolicy(
+        None,
+        catalog=[{"name": action.name, "description": "test capability"}],
+    ).request_payload("test", State(), [action], [], None)
+
+    assert payload["current_admissible_actions"][0]["operational_cost"] == _immediate_cost()
+
+
+def test_candidate_hash_includes_visible_operational_cost_metadata():
+    immediate = Action("same", "target", "effect")
+    delayed = Action("same", "target", "effect", operational_cost=_gpo_cost(120))
+
+    assert policy.candidate_hash([immediate]) != policy.candidate_hash([delayed])
 
 
 def test_llm_policy_persists_raw_decline_and_response_backend_provenance():

@@ -93,6 +93,24 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
     assert "gpo-affects-computer:workstation-policy:dc01:lab.local" in action.source_facts
     assert "gpo-affects-dc:workstation-policy:dc01:lab.local" in action.source_facts
     assert "BloodHound scope includes DC host(s): dc01" in action.reason
+    assert action.operational_cost == capabilities.gpo_operational_cost()
+
+
+def test_operational_cost_override_changes_only_gpo_wait_metadata():
+    gpo_action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=workstation-policy;domain=lab.local",
+    )
+    direct_action = capabilities.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="target=ws01;target_domain=lab.local",
+    )
+
+    enriched_gpo = capabilities.with_operational_cost(gpo_action, gpo_wait_seconds=120)
+    enriched_direct = capabilities.with_operational_cost(direct_action, gpo_wait_seconds=120)
+
+    assert enriched_gpo.operational_cost == capabilities.gpo_operational_cost(120)
+    assert enriched_direct.operational_cost == capabilities.immediate_operational_cost()
 
 
 def test_gpo_non_dc_candidate_preserves_affected_host_without_da_effect():

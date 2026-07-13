@@ -1451,22 +1451,52 @@ def test_capability_inputs_use_bounded_gpo_wait_override_for_gpo_lane(monkeypatc
     )
     monkeypatch.setenv("SAGE_GPO_WAIT_SECONDS", "120")
 
+    gpo_action = cap.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+    )
+    grant_action = cap.CapabilityAction(name="grant-directory-rights", target="domain=range.local")
+    laps_action = cap.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="host=ca01;domain=range.local",
+    )
     gpo_inputs = model._autonomous_capability_inputs(
-        cap.CapabilityAction(name="gpo-controlled-system-exec", target="gpo=srv02-policy;domain=range.local"),
+        gpo_action,
         snap,
     )
     grant_inputs = model._autonomous_capability_inputs(
-        cap.CapabilityAction(name="grant-directory-rights", target="domain=range.local"),
+        grant_action,
         snap,
     )
     laps_inputs = model._autonomous_capability_inputs(
-        cap.CapabilityAction(name="read-managed-local-admin-secret", target="host=ca01;domain=range.local"),
+        laps_action,
         snap,
     )
+    policy_candidates = model._autonomous_policy_candidates([gpo_action, grant_action, laps_action])
 
     assert gpo_inputs["gpo_wait_seconds"] == 120
     assert grant_inputs["gpo_wait_seconds"] == 120
     assert "gpo_wait_seconds" not in laps_inputs
+    assert policy_candidates[0].operational_cost == cap.gpo_operational_cost(120)
+    assert policy_candidates[1].operational_cost == cap.gpo_operational_cost(120)
+    assert policy_candidates[2].operational_cost == cap.immediate_operational_cost()
+
+
+def test_capability_inputs_and_policy_cost_share_gpo_wait_alias_without_env_override(monkeypatch):
+    from ai.langgraph import capabilities as cap
+
+    monkeypatch.delenv("SAGE_GPO_WAIT_SECONDS", raising=False)
+    action = cap.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        intent={"gp_refresh_wait_seconds": 45},
+    )
+
+    inputs = model._autonomous_capability_inputs(action, None)
+    policy_candidate = model._autonomous_policy_candidates([action])[0]
+
+    assert inputs["gpo_wait_seconds"] == 45
+    assert policy_candidate.operational_cost == cap.gpo_operational_cost(45)
 
 
 def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():

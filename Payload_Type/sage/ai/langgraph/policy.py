@@ -14,6 +14,7 @@ POLICY_LLM = "llm"
 POLICY_SYMBOLIC = "symbolic"
 POLICY_HYBRID = "hybrid"
 POLICY_MODES = frozenset((POLICY_LLM, POLICY_SYMBOLIC, POLICY_HYBRID))
+_MAX_OPERATIONAL_WAIT_SECONDS = 600
 
 
 def normalize_policy_mode(value: Any, default: str = POLICY_LLM) -> str:
@@ -29,12 +30,56 @@ def new_episode_id() -> str:
     return f"episode-{uuid4().hex}"
 
 
+def _default_operational_cost() -> dict[str, Any]:
+    return {
+        "interaction_class": "direct",
+        "execution_scope": "direct",
+        "requires_propagation_wait": False,
+        "expected_wait_seconds": 0,
+        "wait_reasons": [],
+    }
+
+
+def _candidate_operational_cost(candidate: Any) -> dict[str, Any]:
+    raw = getattr(candidate, "operational_cost", None)
+    if not isinstance(raw, dict):
+        return _default_operational_cost()
+    raw_reasons = raw.get("wait_reasons")
+    if isinstance(raw_reasons, str):
+        raw_reasons = [raw_reasons]
+    elif not isinstance(raw_reasons, (list, tuple, set)):
+        raw_reasons = []
+    try:
+        wait_seconds = int(raw.get("expected_wait_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        wait_seconds = 0
+    wait_seconds = max(0, min(wait_seconds, _MAX_OPERATIONAL_WAIT_SECONDS))
+    requires_wait = raw.get("requires_propagation_wait")
+    if isinstance(requires_wait, str):
+        requires_wait = requires_wait.strip().casefold() in {"1", "true", "yes", "on"}
+    else:
+        requires_wait = bool(requires_wait)
+    requires_wait = requires_wait or wait_seconds > 0
+    return {
+        "interaction_class": str(
+            raw.get("interaction_class") or ("propagation-bound" if requires_wait else "direct")
+        ),
+        "execution_scope": str(
+            raw.get("execution_scope") or ("domain-policy" if requires_wait else "direct")
+        ),
+        "requires_propagation_wait": requires_wait,
+        "expected_wait_seconds": wait_seconds,
+        "wait_reasons": [str(reason) for reason in raw_reasons if str(reason)],
+    }
+
+
 def _candidate_payload(candidate: Any) -> dict[str, Any]:
     return {
         "name": str(getattr(candidate, "name", "") or ""),
         "target": str(getattr(candidate, "target", "") or ""),
         "preconditions": [str(v) for v in (getattr(candidate, "preconditions", None) or [])],
         "effects": [str(v) for v in (getattr(candidate, "effects", None) or [])],
+        "operational_cost": _candidate_operational_cost(candidate),
         "reason": str(getattr(candidate, "reason", "") or ""),
     }
 
