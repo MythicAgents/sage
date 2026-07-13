@@ -25,6 +25,8 @@ try:  # package import
     from . import operator_replay_benchmark
     from . import frontier_census
     from . import purpose_range
+    from . import replication_purpose_range
+    from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
     from .range_state import Milestone
@@ -37,6 +39,8 @@ except Exception:  # script / sys.path import
     import operator_replay_benchmark  # type: ignore
     import frontier_census  # type: ignore
     import purpose_range  # type: ignore
+    import replication_purpose_range  # type: ignore
+    import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
     from range_state import Milestone  # type: ignore
@@ -199,6 +203,34 @@ def _cmd_purpose_range_validate(args: argparse.Namespace) -> int:
     return 0 if report["passes_gate"] else 1
 
 
+def _cmd_replication_purpose_range_validate(args: argparse.Namespace) -> int:
+    report = replication_purpose_range.validate_replication_purpose_range()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(range_source={report['spec']['source_dir']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_replanning_benchmark_validate(args: argparse.Namespace) -> int:
+    report = replanning_benchmark.validate_replanning_benchmark()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(scenario={report['spec']['scenario']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai.hillclimb", description="Sage eval gauge (Phase 0)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -249,6 +281,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     pr.add_argument("--output", default=None, help="optional JSON report path")
     pr.set_defaults(func=_cmd_purpose_range_validate)
+
+    rpr = sub.add_parser(
+        "replication-purpose-range-validate",
+        help="validate the GPO-vs-direct-replication second purpose-range manifest",
+    )
+    rpr.add_argument("--output", default=None, help="optional JSON report path")
+    rpr.set_defaults(func=_cmd_replication_purpose_range_validate)
+
+    rb = sub.add_parser(
+        "replanning-benchmark-validate",
+        help="validate the shared-lane late-blocker recovery benchmark contract",
+    )
+    rb.add_argument("--output", default=None, help="optional JSON report path")
+    rb.set_defaults(func=_cmd_replanning_benchmark_validate)
 
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)

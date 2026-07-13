@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -59,3 +60,26 @@ def test_with_range_id_preserves_existing_query_and_does_not_duplicate():
         MODULE.with_range_id("/api/v2/range?rangeID=existing", "SAGEPOLICY20260712")
         == "/api/v2/range?rangeID=existing"
     )
+
+
+def test_ludus_creds_selects_named_mcp_server_without_changing_default(monkeypatch, tmp_path):
+    mcp_path = tmp_path / ".mcp.json"
+    mcp_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "ludus": {"env": {"LUDUS_URL": "https://goad", "LUDUS_API_KEY": "goad.key"}},
+                    "ludus_sagerepl": {
+                        "env": {"LUDUS_URL": "https://sagerepl", "LUDUS_API_KEY": "sagerepl.key"}
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert MODULE.ludus_creds(mcp_path) == ("https://goad", "goad.key")
+    assert MODULE.ludus_creds(mcp_path, "ludus_sagerepl") == ("https://sagerepl", "sagerepl.key")
+
+    monkeypatch.setenv(MODULE.MCP_SERVER_ENV, "ludus_sagerepl")
+    assert MODULE.ludus_creds(mcp_path) == ("https://sagerepl", "sagerepl.key")

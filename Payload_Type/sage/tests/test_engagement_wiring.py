@@ -1991,6 +1991,78 @@ def test_gpo_proof_target_uses_dedicated_share_for_remote_non_dc_host(monkeypatc
     assert inputs["proof_unc"] == r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt"
 
 
+def test_adcs_esc_enroll_runtime_inputs_use_scoped_eval_hint(monkeypatch):
+    monkeypatch.setenv(
+        "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON",
+        json.dumps([{
+            "domain": "lab.local",
+            "ca_host": "ca01",
+            "ca_name": r"ca01.lab.local\LAB-CA",
+            "template": "VulnerableUser",
+            "esc_type": "esc1",
+        }]),
+    )
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-esc-certificate-enroll",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-key-export-blocked:ca01@lab.local", "live-callback:13"],
+        effects=["adcs-enrolled-certificate:administrator@lab.local"],
+        intent={
+            "capability": "adcs-esc-certificate-enroll",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+    inputs = {"callback_id": "13"}
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+
+    assert inputs["ca_name"] == r"ca01.lab.local\LAB-CA"
+    assert inputs["template"] == "VulnerableUser"
+    assert inputs["esc_type"] == "esc1"
+    assert inputs["adcs_esc_enrollment_hint_source"] == "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON"
+
+
+def test_adcs_esc_enroll_runtime_inputs_do_not_override_explicit_or_mismatched_hint(monkeypatch):
+    monkeypatch.setenv(
+        "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON",
+        json.dumps([{
+            "domain": "other.local",
+            "ca_host": "ca99",
+            "ca_name": r"ca99.other.local\OTHER-CA",
+            "template": "OtherTemplate",
+        }]),
+    )
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-esc-certificate-enroll",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-key-export-blocked:ca01@lab.local", "live-callback:13"],
+        effects=["adcs-enrolled-certificate:administrator@lab.local"],
+        intent={
+            "capability": "adcs-esc-certificate-enroll",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+    inputs = {
+        "callback_id": "13",
+        "ca_name": r"ca01.lab.local\EXPLICIT-CA",
+        "template": "ExplicitTemplate",
+    }
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+
+    assert inputs["ca_name"] == r"ca01.lab.local\EXPLICIT-CA"
+    assert inputs["template"] == "ExplicitTemplate"
+    assert "adcs_esc_enrollment_hint_source" not in inputs
+
+
 def test_gpo_proof_target_preserves_explicit_action_proof_path():
     mt = _make_tools()
     action = capabilities.CapabilityAction(
@@ -6856,6 +6928,48 @@ def test_execute_capability_eval_injected_blocker_records_terminal_gpo_failure(m
     assert failed.evidence["terminal_failure"] is True
     assert failed.evidence["failure_class"] == "genuine"
     assert failed.evidence["verify_reason"] == "endpoint protection blocked the staged GPO payload on srv02"
+
+
+def test_execute_capability_eval_injected_transient_blocker_releases_after_repair_effect(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("local-admin:ca01@range.local", 55),
+        _proof_hop("remote-exec:ca01@range.local", 56),
+    ]
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "adcs-ca-private-key-export",
+            "target_contains": "target=ca01;target_domain=range.local",
+            "reason": "endpoint protection blocked CA export tooling on ca01",
+            "failure_class": "transient",
+            "skip_if_achieved_effect": "endpoint-protection-adjusted:ca01@range.local",
+            "probe": {
+                "tool_execution_failed": True,
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "ca01",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=range.local",
+        preconditions=[],
+        effects=["adcs-ca-private-key:ca01@range.local"],
+        intent={"capability": "adcs-ca-private-key-export"},
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["failure_class"] == "transient"
+    failed = mt._engagement_hops[-1]
+    assert failed.evidence["terminal_failure"] is False
+    assert failed.evidence["retryable_failure"] is True
+    mt._engagement_hops.append(_proof_hop("endpoint-protection-adjusted:ca01@range.local", 57))
+    assert mt._capability_executor_injected_blocker(action, {"callback_id": "13"}, "13", capabilities) is None
 
 
 def test_execute_capability_output_preview_redacts_ticket_store_json():

@@ -272,7 +272,7 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         )
 
     for gpo, domain in system_exec_gpos:
-        if f"ds-replication-rights:{domain}" in achieved:
+        if any(_domains_equivalent(domain, rights_domain) for rights_domain in explicit_replication_domains):
             continue
         if _gpo_downstream_effect_proves_progress(domain, achieved):
             continue
@@ -6242,6 +6242,8 @@ def _adcs_ca_private_key_blocked_targets(state: Any) -> set[tuple[str, str]]:
         technique = _normalize(getattr(hop, "technique", ""))
         effect = _normalize(getattr(hop, "effect", ""))
         evidence = getattr(hop, "evidence", {}) if isinstance(getattr(hop, "evidence", {}), dict) else {}
+        if evidence.get("terminal_failure") is False:
+            continue
         if "adcs-ca-private-key-export" not in technique and not effect.startswith("adcs-ca-private-key:"):
             continue
         evidence_text = " ".join(

@@ -1,0 +1,138 @@
+# yaml-language-server: $schema=https://docs.ludus.cloud/schemas/range-config.json
+# =============================================================================
+# Sage Replication Purpose Range
+# =============================================================================
+#
+# Domain:
+#   replication.local
+#
+# Topology:
+#   DC01  - primary domain controller
+#   SRV02 - member server governed only by SRV02-Policy
+#   WS01  - low-privileged foothold for REPLICATION\user1
+#
+# Branch point after graph collection from WS01:
+#   - gpo-controlled-system-exec through SRV02-Policy
+#   - dcsync-krbtgt through direct domain-root replication rights
+#
+# The GPO path is intentionally valid but more expensive. The direct DCSync
+# path should be the better choice when policy reasoning accounts for cost.
+# =============================================================================
+
+ludus:
+  - vm_name: "{{ range_id }}-DC01"
+    hostname: dc01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 10
+    ram_gb: 4
+    cpus: 2
+    windows:
+      # Every Windows VM in this range clones the same Server 2022 template.
+      # Generalize the DC too so the new domain SID cannot equal a member SID.
+      sysprep: true
+      gpos:
+        - disable_defender
+    domain:
+      fqdn: replication.local
+      role: primary-dc
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_password_policy
+      - name: badsectorlabs.ludus_windows_utils.ludus_bulk_ad_content
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+      - name: sage_replication_range
+        depends_on:
+          - vm_name: "{{ range_id }}-SRV02"
+            role: sage_replication_range
+    role_vars:
+      ludus_password_policy_mode: custom
+      ludus_password_policy_min_length: 8
+      ludus_password_policy_complexity: false
+      ludus_password_policy_lockout_threshold: 0
+
+      ludus_ad_content_mode: custom
+      ludus_organisation_units:
+        - name: Servers
+          path: "DC=replication,DC=local"
+      ludus_groups:
+        global: []
+        domainlocal: []
+        universal: []
+      ludus_users:
+        - name: user1
+          firstname: Range
+          surname: User
+          password: "ReplicationUser1-2026!"
+          description: "Low-privileged Sage replication purpose-range foothold"
+          path: "CN=Users,DC=replication,DC=local"
+          groups: []
+          password_never_expires: true
+
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+      ludus_gpo_abuse_enabled: true
+      ludus_gpo_name: "SRV02-Policy"
+      ludus_gpo_link_target: "OU=Servers,DC=replication,DC=local"
+      ludus_gpo_editors:
+        - name: "user1"
+          permission: "GpoEditDeleteModifySecurity"
+
+      sage_replication_range_mode: domain
+      sage_replication_domain_fqdn: replication.local
+      sage_replication_foothold_user: user1
+      sage_replication_gpo_name: "SRV02-Policy"
+      sage_replication_target_ou: "OU=Servers,DC=replication,DC=local"
+      sage_replication_target_computer: "SRV02"
+
+  - vm_name: "{{ range_id }}-SRV02"
+    hostname: srv02
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 22
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    domain:
+      fqdn: replication.local
+      role: member
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+        depends_on:
+          - vm_name: "{{ range_id }}-DC01"
+            role: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+      - name: sage_replication_range
+    role_vars:
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+
+      sage_replication_range_mode: gpo-target
+      sage_replication_domain_netbios: REPLICATION
+      sage_replication_proof_path: 'C:\SageProof'
+      sage_replication_proof_share: SageProof
+      sage_replication_group_policy_refresh_minutes: 1
+
+  - vm_name: "{{ range_id }}-WS01"
+    hostname: ws01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 31
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    domain:
+      fqdn: replication.local
+      role: member
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+        depends_on:
+          - vm_name: "{{ range_id }}-DC01"
+            role: badsectorlabs.ludus_windows_utils.ludus_bulk_ad_content
+    role_vars:
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+      ludus_local_groups:
+        - group: "Remote Desktop Users"
+          members:
+            - "REPLICATION\\user1"

@@ -2300,7 +2300,11 @@ def test_adapter_translates_adcs_esc_certificate_enroll_to_native_certreq_powerp
     assert "CERT_ENROLL_METHOD=native-certreq" in command.parameters
     assert "certreq.exe -new" in command.parameters
     assert "certreq.exe -submit" in command.parameters
-    assert "Export-PfxCertificate" in command.parameters
+    assert "if($null -ne $newOut){$lines.AddRange" in command.parameters
+    assert "if($null -ne $submitOut){$lines.AddRange" in command.parameters
+    assert "if($null -ne $acceptOut){$lines.AddRange" in command.parameters
+    assert "$cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx" in command.parameters
+    assert "[IO.File]::WriteAllBytes($pfxPath,$bytes)" in command.parameters
     assert "PFX_BASE64=" in command.parameters
     assert "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_14" in command.parameters
 

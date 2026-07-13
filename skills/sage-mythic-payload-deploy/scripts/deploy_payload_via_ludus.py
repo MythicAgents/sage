@@ -45,6 +45,8 @@ DEFAULT_DOWNLOAD_DIR = Path("/tmp/sage_payloads")
 DEFAULT_REMOTE_DIR = r"C:\Users\Public"
 DEFAULT_RUBEUS_PATH = REPO_ROOT / "Payload_Type" / "sage" / "tools" / "Rubeus.exe"
 LUDUS_RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
+LUDUS_MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"
+DEFAULT_LUDUS_MCP_SERVER = "ludus"
 
 PAYLOAD_ATTRS = """
 id
@@ -338,17 +340,25 @@ async def resolve_run_as_hash_from_mythic(client: Any, args: argparse.Namespace)
     )
 
 
-def ludus_creds(mcp_path: Path) -> tuple[str, str]:
+def selected_ludus_mcp_server(mcp_server: str | None = None) -> str:
+    value = str(mcp_server or os.environ.get(LUDUS_MCP_SERVER_ENV) or DEFAULT_LUDUS_MCP_SERVER).strip()
+    return value or DEFAULT_LUDUS_MCP_SERVER
+
+
+def ludus_creds(mcp_path: Path, mcp_server: str | None = None) -> tuple[str, str]:
     try:
         data = json.loads(mcp_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise DeployError(f"Ludus MCP config not found: {mcp_path}") from exc
-    server = (data.get("mcpServers") or data).get("ludus", {})
+    server_name = selected_ludus_mcp_server(mcp_server)
+    server = (data.get("mcpServers") or data).get(server_name, {})
     env = server.get("env", {})
     url = env.get("LUDUS_URL")
     api_key = env.get("LUDUS_API_KEY")
     if not url or not api_key:
-        raise DeployError(f"{mcp_path} does not contain LUDUS_URL and LUDUS_API_KEY for the ludus server.")
+        raise DeployError(
+            f"{mcp_path} does not contain LUDUS_URL and LUDUS_API_KEY for MCP server {server_name!r}."
+        )
     return str(url).rstrip("/"), str(api_key)
 
 
@@ -368,8 +378,13 @@ def with_ludus_range_id(path: str, range_id: str | None = None) -> str:
     return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
 
 
-def ludus_get(path: str, mcp_path: Path, range_id: str | None = None) -> Any:
-    url, api_key = ludus_creds(mcp_path)
+def ludus_get(
+    path: str,
+    mcp_path: Path,
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> Any:
+    url, api_key = ludus_creds(mcp_path, mcp_server)
     path = with_ludus_range_id(path, range_id)
     request = urllib.request.Request(
         url + path,
@@ -400,8 +415,12 @@ def extract_inventory_payload(response: Any) -> Any:
     return response
 
 
-def load_ludus_inventory(mcp_path: Path, range_id: str | None = None) -> dict[str, dict[str, Any]]:
-    response = ludus_get("/api/v2/range/ansibleinventory", mcp_path, range_id)
+def load_ludus_inventory(
+    mcp_path: Path,
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    response = ludus_get("/api/v2/range/ansibleinventory", mcp_path, range_id, mcp_server)
     payload = extract_inventory_payload(response)
     if isinstance(payload, str):
         data = yaml.safe_load(payload)
@@ -445,7 +464,11 @@ def load_ludus_inventory(mcp_path: Path, range_id: str | None = None) -> dict[st
 
 
 def select_ludus_host(args: argparse.Namespace) -> dict[str, Any]:
-    hosts = load_ludus_inventory(Path(args.mcp_path), getattr(args, "ludus_range_id", None))
+    hosts = load_ludus_inventory(
+        Path(args.mcp_path),
+        getattr(args, "ludus_range_id", None),
+        getattr(args, "ludus_mcp_server", None),
+    )
     if args.ludus_host:
         host = hosts.get(args.ludus_host)
         if not host:
@@ -1421,6 +1444,14 @@ def add_ludus_args(parser: argparse.ArgumentParser) -> None:
         "--ludus-range-id",
         default=os.environ.get(LUDUS_RANGE_ID_ENV),
         help=f"Ludus range ID override (default: ${LUDUS_RANGE_ID_ENV} or API user's default range).",
+    )
+    parser.add_argument(
+        "--ludus-mcp-server",
+        default=os.environ.get(LUDUS_MCP_SERVER_ENV),
+        help=(
+            f"Ludus MCP server entry (default: ${LUDUS_MCP_SERVER_ENV} "
+            f"or {DEFAULT_LUDUS_MCP_SERVER})."
+        ),
     )
     parser.add_argument("--ludus-host", default=None)
 

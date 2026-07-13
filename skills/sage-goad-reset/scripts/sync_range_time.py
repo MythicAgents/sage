@@ -20,13 +20,26 @@ import yaml
 DEFAULT_MCP_PATH = Path("/home/john/dev/sage/.mcp.json")
 DEFAULT_MAX_SKEW_SECONDS = 60.0
 RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
+MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"
+DEFAULT_MCP_SERVER = "ludus"
 
 
-def ludus_creds(mcp_path: Path) -> tuple[str, str]:
+def selected_mcp_server(mcp_server: str | None = None) -> str:
+    value = str(mcp_server or os.environ.get(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER).strip()
+    return value or DEFAULT_MCP_SERVER
+
+
+def ludus_creds(mcp_path: Path, mcp_server: str | None = None) -> tuple[str, str]:
     data = json.loads(mcp_path.read_text(encoding="utf-8"))
-    server = (data.get("mcpServers") or data).get("ludus", {})
+    server_name = selected_mcp_server(mcp_server)
+    server = (data.get("mcpServers") or data).get(server_name, {})
     env = server.get("env", {})
-    return env["LUDUS_URL"].rstrip("/"), env["LUDUS_API_KEY"]
+    try:
+        return env["LUDUS_URL"].rstrip("/"), env["LUDUS_API_KEY"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"{mcp_path} does not contain LUDUS_URL and LUDUS_API_KEY for MCP server {server_name!r}"
+        ) from exc
 
 
 def selected_range_id(range_id: str | None = None) -> str | None:
@@ -45,8 +58,12 @@ def with_range_id(path: str, range_id: str | None = None) -> str:
     return urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
 
 
-def load_inventory(mcp_path: Path, range_id: str | None = None) -> dict[str, Any]:
-    url, api_key = ludus_creds(mcp_path)
+def load_inventory(
+    mcp_path: Path,
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, Any]:
+    url, api_key = ludus_creds(mcp_path, mcp_server)
     request = urllib.request.Request(
         f"{url}{with_range_id('/api/v2/range/ansibleinventory', range_id)}",
         headers={"X-API-KEY": api_key},
@@ -253,6 +270,11 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get(RANGE_ID_ENV),
         help=f"Ludus range ID override (default: ${RANGE_ID_ENV} or API user's default range).",
     )
+    parser.add_argument(
+        "--mcp-server",
+        default=os.environ.get(MCP_SERVER_ENV),
+        help=f"Ludus MCP server entry (default: ${MCP_SERVER_ENV} or {DEFAULT_MCP_SERVER}).",
+    )
     parser.add_argument("--max-skew-seconds", type=float, default=DEFAULT_MAX_SKEW_SECONDS)
     parser.add_argument("--yes", action="store_true")
     return parser.parse_args()
@@ -260,7 +282,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    hosts = windows_hosts(load_inventory(Path(args.mcp_path), args.range_id))
+    hosts = windows_hosts(load_inventory(Path(args.mcp_path), args.range_id, args.mcp_server))
     if not hosts:
         raise RuntimeError("No Windows hosts found in Ludus inventory")
     if args.action == "sync":

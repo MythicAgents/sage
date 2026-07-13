@@ -12,8 +12,10 @@ Expected edge-record shape for pure projection:
     "domain": str,
 }
 
-Only write-like BloodHound edge labels are emitted. Unknown edge labels,
-unknown target kinds, missing keys, and malformed records are skipped.
+Only modeled BloodHound edge labels are emitted: write-like ACL control,
+managed-secret read authority, and direct DCSync authority on a domain.
+Unknown edge labels, unknown target kinds, missing keys, and malformed records
+are skipped.
 """
 
 import asyncio
@@ -34,6 +36,7 @@ GraphFact = engagement_state.GraphFact
 _SOURCE = "bloodhound:cypher"
 _WRITE_EDGE_TYPES = {"genericwrite", "genericall", "writedacl", "writeowner", "owns"}
 _MANAGED_SECRET_EDGE_TYPES = {"readlapspassword", "readlaps", "readmslapspassword"}
+_REPLICATION_EDGE_TYPES = {"dcsync"}
 _CYPHER_TOOL = "cypher_query"
 _MCP_TIMEOUT_SECONDS = 15.0
 
@@ -43,7 +46,8 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
 
     GPO edges emit one ``generic-write:gpo:{short_host}`` predicate per linked
     computer. Computer edges emit ``generic-write:computer:{short_host}``.
-    Domain edges emit ``write-dacl:domain:{fqdn}``.
+    Domain write edges emit ``write-dacl:domain:{fqdn}``. Direct DCSync edges
+    to domains emit ``ds-replication-rights:{fqdn}``.
     """
 
     facts: list[GraphFact] = []
@@ -53,6 +57,11 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
             continue
         if _is_managed_secret_edge(edge_record):
             fact = _managed_secret_fact(edge_record, now, ttl_seconds)
+            if fact is not None:
+                facts.append(fact)
+            continue
+        if _is_replication_edge(edge_record):
+            fact = _replication_fact(edge_record, now, ttl_seconds)
             if fact is not None:
                 facts.append(fact)
             continue
@@ -156,6 +165,7 @@ def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState
 
 _WRITE_LABELS_CYPHER = "['GenericWrite', 'GenericAll', 'WriteDacl', 'WriteOwner', 'Owns']"
 _MANAGED_SECRET_LABELS_CYPHER = "['ReadLAPSPassword', 'ReadLAPS', 'ReadMSLAPSPassword']"
+_REPLICATION_LABELS_CYPHER = "['DCSync']"
 
 
 async def reconcile_graph_position(
@@ -166,8 +176,8 @@ async def reconcile_graph_position(
     ttl_seconds: int,
     credential_domains: list[str] | None = None,
 ) -> list[GraphFact]:
-    """Project the ACL edges our controlled principals hold over GPOs / computers / domains into
-    engagement predicates, via the BloodHound MCP ``cypher_query`` tool.
+    """Project modeled BloodHound edges for controlled principals into engagement
+    predicates via the BloodHound MCP ``cypher_query`` tool.
 
     The real BloodHound CE cypher API (1) requires ``info_type="run"``, (2) does NOT support query
     parameters, and (3) returns scalar RETURNs under ``data.literals`` (a flat ``{value,key}`` list), NOT
@@ -253,6 +263,17 @@ async def reconcile_graph_position(
                             facts.append(_graph_fact(predicate, now, ttl_seconds))
         await _collect("Computer", "generic-write:computer", _short_host)
         await _collect("Domain", "write-dacl:domain", lambda n: access_reconciler.normalize_forest(_text(n)))
+        if principals:
+            replication_query = (
+                f"MATCH (p)-[e]->(t:Domain) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_REPLICATION_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, replication_query):
+                domain = access_reconciler.normalize_forest(_text(raw_name))
+                predicate = f"ds-replication-rights:{domain}" if domain else ""
+                if predicate and predicate not in seen:
+                    seen.add(predicate)
+                    facts.append(_graph_fact(predicate, now, ttl_seconds))
         if principals:
             laps_query = (
                 f"MATCH (p)-[e]->(c:Computer) WHERE toLower(p.name) IN {inlist} "
@@ -522,6 +543,15 @@ def _domain_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | N
     return _graph_fact(f"write-dacl:domain:{domain}", now, ttl_seconds)
 
 
+def _replication_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | None:
+    if _text(edge_record.get("target_kind")).casefold() != "domain":
+        return None
+    domain = access_reconciler.normalize_forest(_text(edge_record.get("domain")))
+    if not domain:
+        return None
+    return _graph_fact(f"ds-replication-rights:{domain}", now, ttl_seconds)
+
+
 def _graph_fact(predicate: str, now: str, ttl_seconds: int) -> GraphFact:
     return GraphFact(predicate=predicate, source=_SOURCE, timestamp=now, ttl_seconds=ttl_seconds)
 
@@ -559,6 +589,10 @@ def _is_write_edge(edge_record: dict) -> bool:
 
 def _is_managed_secret_edge(edge_record: dict) -> bool:
     return _text(edge_record.get("type")).casefold() in _MANAGED_SECRET_EDGE_TYPES
+
+
+def _is_replication_edge(edge_record: dict) -> bool:
+    return _text(edge_record.get("type")).casefold() in _REPLICATION_EDGE_TYPES
 
 
 def _managed_secret_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | None:

@@ -1,4 +1,4 @@
-"""Read-only GOAD frontier census for policy discriminator selection.
+"""Read-only frontier census for policy discriminator selection.
 
 The census never tasks Mythic or mutates BloodHound. It projects graph facts through
 the existing reconciler, renders the existing capability frontier, then runs a
@@ -113,6 +113,8 @@ def _retained_proof_scenario_for_forest(forest: str) -> str:
         return "direct-laps-objective"
     if forest in {"north.sevenkingdoms.local", "sevenkingdoms.local"}:
         return "cross-forest-objective"
+    if forest == "replication.local":
+        return "replication-purpose-range-visible-cost"
     return "purpose-range-visible-cost"
 
 
@@ -303,6 +305,8 @@ def _proofability(spec: StartSpec) -> dict[str, Any]:
         "direct-laps-objective",
         "purpose-range-visible-cost",
         "purpose-range-recovery",
+        "purpose-range-ca-export-replanning",
+        "replication-purpose-range-visible-cost",
     }
     stable_reset = bool(spec.bootstrap_evidence)
     return {
@@ -320,6 +324,13 @@ def _proofability(spec: StartSpec) -> dict[str, Any]:
             else "no existing gauge scenario covers this objective"
         ),
     }
+
+
+def _recommended_discriminator_for_report(report: dict[str, Any]) -> str:
+    proof_scenario = _text((report.get("start") or {}).get("proof_scenario"))
+    if proof_scenario in {"cross-forest-objective", "direct-laps-objective"}:
+        return "goad"
+    return proof_scenario or "minimal-two-lane-purpose-range"
 
 
 def _graph_input_report(spec: StartSpec, collected_domains: list[str] | None) -> dict[str, Any] | None:
@@ -513,6 +524,8 @@ async def _run_census(
         for spec in starts
     ]
     passing = [item for item in reports if item.get("passes_gate") is True]
+    selected = passing[0] if passing else {}
+    selected_start = selected.get("start") or {}
     return {
         "kind": "frontier_census",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -521,12 +534,12 @@ async def _run_census(
         "collected_domains": sorted({_text(item).casefold() for item in (collected_domains or []) if _text(item)}),
         "starts": reports,
         "passes_gate": bool(passing),
-        "selected_start": (passing[0].get("start") or {}).get("name") if passing else "",
-        "recommended_discriminator": "goad" if passing else "minimal-two-lane-purpose-range",
+        "selected_start": selected_start.get("name") if passing else "",
+        "recommended_discriminator": _recommended_discriminator_for_report(selected),
         "gate_reason": (
-            f"{len(passing)} GOAD start(s) satisfy the branch-rich discriminator gate"
+            f"{len(passing)} censused start(s) satisfy the branch-rich discriminator gate"
             if passing
-            else "no censused GOAD start satisfies the branch-rich discriminator gate"
+            else "no censused start satisfies the branch-rich discriminator gate"
         ),
     }
 

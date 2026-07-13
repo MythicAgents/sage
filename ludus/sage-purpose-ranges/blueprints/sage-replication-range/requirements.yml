@@ -1,0 +1,6 @@
+# External dependencies for the Sage replication purpose range.
+# The benchmark-specific sage_replication_range role ships in this source.
+
+collections:
+  - name: badsectorlabs.ludus_windows_utils
+    version: ">=1.2.0"

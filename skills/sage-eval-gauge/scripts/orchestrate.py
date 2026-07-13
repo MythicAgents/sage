@@ -41,6 +41,7 @@ DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '"ESSOS":"essos.local"}'
 )
 DEFAULT_PURPOSE_RANGE_NETBIOS_MAP = '{"RANGE":"range.local"}'
+DEFAULT_REPLICATION_PURPOSE_RANGE_NETBIOS_MAP = '{"REPLICATION":"replication.local"}'
 DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV = {
     "SAGE_GPO_PROOF_SHARE_NAME": "SageProof",
     "SAGE_GPO_PROOF_LOCAL_ROOT": r"C:\SageProof",
@@ -64,10 +65,84 @@ DEFAULT_PURPOSE_RANGE_RECOVERY_BLOCKER_ENV = {
         sort_keys=True,
     ),
 }
+DEFAULT_DIRECT_LAPS_CA_EXPORT_RECOVERY_ENV = {
+    "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON": json.dumps(
+        {
+            "capability": "adcs-ca-private-key-export",
+            "target_contains": "target=braavos;target_domain=essos.local",
+            "reason": "key not exportable",
+            "probe": {
+                "key_not_exportable": True,
+                "target_domain": "essos.local",
+                "target_host": "braavos",
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+    # This keeps the live benchmark about post-blocker policy recovery rather than ADCS discovery.
+    # Sage consumes only the generic hint schema; the GOAD literals stay in this eval harness.
+    "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON": json.dumps(
+        [
+            {
+                "domain": "essos.local",
+                "ca_host": "braavos",
+                "ca_name": r"braavos.essos.local\ESSOS-CA",
+                "template": "ESC1",
+                "esc_type": "esc1",
+            },
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+}
+DEFAULT_PURPOSE_RANGE_CA_EXPORT_REPLANNING_ENV = {
+    "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON": json.dumps(
+        [
+            {
+                "capability": "read-managed-local-admin-secret",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "use-managed-local-admin-secret",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "execute-as-local-admin",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "adcs-ca-private-key-export",
+                "target_contains": "target=ca01;target_domain=range.local",
+                "release_on_failure": True,
+            },
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+    "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON": json.dumps(
+        {
+            "capability": "adcs-ca-private-key-export",
+            "target_contains": "target=ca01;target_domain=range.local",
+            "reason": "endpoint protection blocked CA export tooling on ca01",
+            "failure_class": "transient",
+            "skip_if_achieved_effect": "endpoint-protection-adjusted:ca01@range.local",
+            "probe": {
+                "tool_execution_failed": True,
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "ca01",
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+}
 DEFAULT_LUDUS_RANGE_ID = os.environ.get("SAGE_LUDUS_RANGE_ID") or None
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
 DEFAULT_FOOTHOLD_IP = "10.4.10.22"
 DEFAULT_FOOTHOLD_USER = r"NORTH\samwell.tarly"
+DEFAULT_FOOTHOLD_CALLBACK_HOST = DEFAULT_FOOTHOLD_HOST
 DEFAULT_FOOTHOLD_CALLBACK_USER = "samwell.tarly"
 DEFAULT_FOOTHOLD_PASSWORD_ENV = "SAGE_RUN_AS_PASSWORD"
 
@@ -78,6 +153,7 @@ class FootholdSpec:
         host: str = DEFAULT_FOOTHOLD_HOST,
         ip: str = DEFAULT_FOOTHOLD_IP,
         user: str = DEFAULT_FOOTHOLD_USER,
+        callback_host: str | None = None,
         callback_user: str = DEFAULT_FOOTHOLD_CALLBACK_USER,
         password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV,
         ludus_range_id: str | None = DEFAULT_LUDUS_RANGE_ID,
@@ -85,6 +161,7 @@ class FootholdSpec:
         self.host = host
         self.ip = ip
         self.user = user
+        self.callback_host = callback_host or host
         self.callback_user = callback_user
         self.password_env = password_env
         self.ludus_range_id = ludus_range_id
@@ -99,7 +176,7 @@ class FootholdSpec:
             "--target-host",
             self.host,
             "--callback-host",
-            self.host,
+            self.callback_host,
             "--callback-user",
             self.callback_user,
         ]
@@ -123,7 +200,7 @@ class FootholdSpec:
             "readiness",
             "--runtime-dbs-archived",
             "--foothold-host",
-            self.host,
+            self.callback_host,
             "--foothold-user-match",
             self.callback_user,
         ]
@@ -177,17 +254,23 @@ def _range_env(range_id: str | None = None) -> dict[str, str] | None:
 def _engagement_netbios_map(scenario: str, explicit: str | None = None) -> str:
     if explicit:
         return explicit
+    if scenario.startswith("replication-purpose-range-"):
+        return DEFAULT_REPLICATION_PURPOSE_RANGE_NETBIOS_MAP
     if scenario.startswith("purpose-range-"):
         return DEFAULT_PURPOSE_RANGE_NETBIOS_MAP
     return DEFAULT_ENGAGEMENT_NETBIOS_MAP
 
 
 def _scenario_restart_env(scenario: str) -> dict[str, str]:
-    if scenario.startswith("purpose-range-"):
+    if scenario.startswith(("purpose-range-", "replication-purpose-range-")):
         env = dict(DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV)
-        if scenario == "purpose-range-recovery":
+        if scenario == "purpose-range-ca-export-replanning":
+            env.update(DEFAULT_PURPOSE_RANGE_CA_EXPORT_REPLANNING_ENV)
+        elif scenario == "purpose-range-recovery":
             env.update(DEFAULT_PURPOSE_RANGE_RECOVERY_BLOCKER_ENV)
         return env
+    if scenario == "direct-laps-ca-export-recovery":
+        return dict(DEFAULT_DIRECT_LAPS_CA_EXPORT_RECOVERY_ENV)
     return {}
 
 
@@ -233,7 +316,7 @@ def discover_callbacks(foothold: FootholdSpec | None = None) -> int:
             r"id=(?P<id>\d+)\s+payloadtype=apollo\s+host=(?P<host>\S+)\s+user=(?P<user>\S+)",
             out,
         )
-        if match.group("host").casefold() == foothold.host.casefold()
+        if match.group("host").casefold() == foothold.callback_host.casefold()
         and foothold.callback_user.casefold() in match.group("user").casefold()
     ]
     if not apollo:
@@ -559,7 +642,7 @@ def main(argv=None) -> int:
         default=None,
         help=(
             "JSON NetBIOS-to-FQDN map passed to Sage. "
-            "Defaults to the GOAD map or the purpose-range map based on --scenario."
+            "Defaults to the GOAD map or the selected purpose-range map based on --scenario."
         ),
     )
     ap.add_argument(
@@ -569,11 +652,16 @@ def main(argv=None) -> int:
         help="Apollo callback export imported after Mythic reset",
     )
     ap.add_argument("--foothold-host", default=DEFAULT_FOOTHOLD_HOST,
-                    help=f"staged foothold host/callback host (default: {DEFAULT_FOOTHOLD_HOST})")
+                    help=f"Ludus inventory host for the staged foothold (default: {DEFAULT_FOOTHOLD_HOST})")
     ap.add_argument("--foothold-ip", default=DEFAULT_FOOTHOLD_IP,
                     help=f"staged foothold host IP (default: {DEFAULT_FOOTHOLD_IP})")
     ap.add_argument("--foothold-user", default=DEFAULT_FOOTHOLD_USER,
                     help=f"interactive run-as identity for the foothold (default: {DEFAULT_FOOTHOLD_USER})")
+    ap.add_argument("--foothold-callback-host", default=None,
+                    help=(
+                        "Mythic callback host value used for readiness/discovery "
+                        "(default: same as --foothold-host)"
+                    ))
     ap.add_argument("--foothold-callback-user", default=DEFAULT_FOOTHOLD_CALLBACK_USER,
                     help=(
                         "callback user value used to match the retained Apollo check-in "
@@ -591,6 +679,7 @@ def main(argv=None) -> int:
         host=args.foothold_host,
         ip=args.foothold_ip,
         user=args.foothold_user,
+        callback_host=args.foothold_callback_host,
         callback_user=args.foothold_callback_user,
         password_env=args.foothold_password_env,
         ludus_range_id=args.ludus_range_id,

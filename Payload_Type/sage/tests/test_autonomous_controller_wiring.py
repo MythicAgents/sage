@@ -1499,6 +1499,82 @@ def test_capability_inputs_and_policy_cost_share_gpo_wait_alias_without_env_over
     assert policy_candidate.operational_cost == cap.gpo_operational_cost(45)
 
 
+def test_eval_forced_capability_prefix_filters_until_release_on_failure(monkeypatch):
+    from ai.langgraph import capabilities as cap
+
+    monkeypatch.setenv(
+        "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        json.dumps([
+            {
+                "capability": "read-managed-local-admin-secret",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "adcs-ca-private-key-export",
+                "target_contains": "target=ca01;target_domain=range.local",
+                "release_on_failure": True,
+            },
+        ]),
+    )
+    read_action = cap.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="account=user1;target=ca01;target_domain=range.local",
+    )
+    export_action = cap.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=range.local",
+    )
+    gpo_action = cap.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+    )
+    actions = [gpo_action, read_action, export_action]
+    empty = es.EngagementState(objective="x")
+    achieved_read = es.EngagementState(
+        objective="x",
+        hops=[
+            es.Hop(
+                id="read",
+                technique="capability:read-managed-local-admin-secret",
+                target=read_action.target,
+                effect="managed-local-admin-secret:ca01@range.local",
+                status="achieved",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["managed-local-admin-secret:ca01@range.local"],
+                source="test",
+                timestamp="",
+            ),
+        ],
+    )
+    blocked_export = es.EngagementState(
+        objective="x",
+        hops=[
+            *achieved_read.hops,
+            es.Hop(
+                id="export",
+                technique="capability:adcs-ca-private-key-export",
+                target=export_action.target,
+                effect="adcs-ca-private-key:ca01@range.local",
+                status="blocked",
+                evidence={},
+                preconditions=[],
+                satisfied_effects=["adcs-ca-private-key:ca01@range.local"],
+                source="test",
+                timestamp="",
+            ),
+        ],
+    )
+
+    assert [item.name for item in model._eval_forced_capability_prefix_candidates(actions, empty)] == [
+        "read-managed-local-admin-secret",
+    ]
+    assert [item.name for item in model._eval_forced_capability_prefix_candidates(actions, achieved_read)] == [
+        "adcs-ca-private-key-export",
+    ]
+    assert model._eval_forced_capability_prefix_candidates(actions, blocked_export) == actions
+
+
 def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():
     """A stale achieved Kerberos context must not retarget a fresh capability to a dead callback."""
     from ai.langgraph import capabilities as cap

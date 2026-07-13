@@ -6674,6 +6674,16 @@ class MythicTools:
             target_contains = self._capability_text(spec.get("target_contains")).casefold()
             if target_contains and target_contains not in target:
                 continue
+            skip_effects = spec.get("skip_if_achieved_effects")
+            if not isinstance(skip_effects, list):
+                skip_effects = [spec.get("skip_if_achieved_effect")]
+            achieved_effects = self._capability_achieved_effects()
+            if any(
+                self._canonical_capability_effect(effect) in achieved_effects
+                for effect in skip_effects
+                if self._capability_text(effect)
+            ):
+                continue
             probe = dict(spec.get("probe") or {}) if isinstance(spec.get("probe"), dict) else {}
             if not probe:
                 continue
@@ -6683,12 +6693,15 @@ class MythicTools:
             reason = self._capability_text(spec.get("reason") or getattr(verification, "reason", "")).strip()
             if not reason:
                 reason = "eval-injected capability blocker"
+            failure_class = self._capability_text(spec.get("failure_class")).casefold()
+            if failure_class not in {"construction", "genuine", "transient"}:
+                failure_class = "genuine"
             return self._capability_executor_failure_json({
                 "ok": False,
                 "verdict": "blocked",
                 "capability": capability,
                 "reason": reason,
-                "failure_class": "genuine",
+                "failure_class": failure_class,
                 "action": asdict(action) if is_dataclass(action) else {},
                 "issued": [],
                 "recorded_effects": [],
@@ -10026,6 +10039,55 @@ class MythicTools:
             return value
         return self._capability_text(value).casefold() in {"1", "true", "yes", "y", "on"}
 
+    def _eval_adcs_esc_enrollment_hints(self) -> list[dict]:
+        """Return scoped eval-only ADCS enrollment hints from the harness environment."""
+        raw = self._capability_text(os.environ.get("SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON")).strip()
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+        except Exception:
+            return []
+        specs = decoded if isinstance(decoded, list) else [decoded]
+        hints: list[dict] = []
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            domain = self._capability_text(spec.get("domain") or spec.get("target_domain")).casefold()
+            ca_host = self._capability_text(spec.get("ca_host") or spec.get("host")).casefold()
+            ca_name = self._capability_text(
+                spec.get("ca_name") or spec.get("certificate_authority") or spec.get("ca")
+            )
+            template = self._capability_text(
+                spec.get("template") or spec.get("certificate_template") or spec.get("adcs_template")
+            )
+            if not (domain or ca_host) or not ca_name or not template:
+                continue
+            hint = {
+                "domain": domain,
+                "ca_host": ca_host,
+                "ca_name": ca_name,
+                "template": template,
+            }
+            esc_type = self._capability_text(spec.get("esc_type") or spec.get("adcs_esc_type"))
+            if esc_type:
+                hint["esc_type"] = esc_type
+            hints.append(hint)
+        return hints
+
+    def _eval_adcs_esc_enrollment_hint(self, domain: str, ca_host: str) -> dict | None:
+        domain = self._capability_text(domain).casefold()
+        ca_host = self._capability_host_short(self._capability_text(ca_host).casefold())
+        for hint in self._eval_adcs_esc_enrollment_hints():
+            hint_domain = self._capability_text(hint.get("domain")).casefold()
+            hint_host = self._capability_host_short(self._capability_text(hint.get("ca_host")).casefold())
+            if hint_domain and hint_domain != domain:
+                continue
+            if hint_host and hint_host != ca_host:
+                continue
+            return hint
+        return None
+
     async def _augment_capability_runtime_inputs(self, action, inputs: dict) -> None:
         capability = self._capability_text(getattr(action, "name", "")).casefold()
         if capability not in {
@@ -10270,9 +10332,10 @@ class MythicTools:
             domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
             account = self._capability_account(action, inputs) or "administrator"
             callback_id = self._capability_callback_id(action, inputs)
+            intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
             ca_host = self._capability_text(
                 inputs.get("ca_host")
-                or getattr(action, "intent", {}).get("ca_host")
+                or intent.get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
             ).casefold()
             if domain:
@@ -10284,6 +10347,38 @@ class MythicTools:
                 inputs["callback_id"] = callback_id
             if ca_host:
                 inputs["ca_host"] = ca_host
+            hint = self._eval_adcs_esc_enrollment_hint(domain, ca_host)
+            hint_applied = False
+            if hint and not self._capability_text(
+                inputs.get("ca_name")
+                or inputs.get("certificate_authority")
+                or inputs.get("ca")
+                or intent.get("ca_name")
+                or intent.get("certificate_authority")
+                or intent.get("ca")
+            ):
+                inputs["ca_name"] = hint["ca_name"]
+                hint_applied = True
+            if hint and not self._capability_text(
+                inputs.get("template")
+                or inputs.get("certificate_template")
+                or inputs.get("adcs_template")
+                or intent.get("template")
+                or intent.get("certificate_template")
+                or intent.get("adcs_template")
+            ):
+                inputs["template"] = hint["template"]
+                hint_applied = True
+            if hint and hint.get("esc_type") and not self._capability_text(
+                inputs.get("esc_type")
+                or inputs.get("adcs_esc_type")
+                or intent.get("esc_type")
+                or intent.get("adcs_esc_type")
+            ):
+                inputs["esc_type"] = hint["esc_type"]
+                hint_applied = True
+            if hint_applied:
+                inputs["adcs_esc_enrollment_hint_source"] = "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON"
             slug = self._capability_slug("_".join(part for part in (account, domain, callback_id) if part))
             if not self._capability_text(inputs.get("proof_marker") or inputs.get("enroll_marker")):
                 inputs["proof_marker"] = f"SAGE_CERT_ENROLL_PROOF_{slug}"

@@ -287,6 +287,21 @@ def test_project_graph_predicates_maps_laps_read_edge_to_managed_secret_fact():
     ]
 
 
+def test_project_graph_predicates_maps_direct_dcsync_edge_to_replication_fact():
+    records = [
+        {
+            "principal": "alice@LAB.LOCAL",
+            "type": "DCSync",
+            "target_kind": "domain",
+            "domain": "LAB.LOCAL",
+        },
+    ]
+
+    facts = graph_reconciler.project_graph_predicates(records, NOW, TTL_SECONDS)
+
+    assert [fact.predicate for fact in facts] == ["ds-replication-rights:lab.local"]
+
+
 def test_project_graph_predicates_skips_unknown_edges_and_malformed_records():
     records = [
         {"principal": "arya.stark", "type": "MemberOf", "target_kind": "domain", "domain": "essos.local"},
@@ -462,6 +477,34 @@ def test_reconcile_graph_position_keys_gpo_by_name_via_literals():
     assert all(call.get("info_type") == "run" for call in tool.calls)
     assert any("samwell.tarly@north.sevenkingdoms.local" in call.get("query", "") for call in tool.calls)
     assert all("parameters" not in call for call in tool.calls)
+
+
+def test_reconcile_graph_position_projects_direct_dcsync_authority():
+    class _DirectDCSyncTool:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            query = args.get("query", "")
+            if "type(e) IN ['DCSync']" in query:
+                return _literals_response("LAB.LOCAL")
+            return _literals_response()
+
+    tool = _DirectDCSyncTool()
+
+    facts = asyncio.run(
+        graph_reconciler.reconcile_graph_position(
+            _FakeMCPManager(tool),
+            ["alice@lab.local"],
+            "reach lab DA",
+            NOW,
+            TTL_SECONDS,
+        )
+    )
+
+    assert "ds-replication-rights:lab.local" in [fact.predicate for fact in facts]
+    assert any("type(e) IN ['DCSync']" in call.get("query", "") for call in tool.calls)
 
 
 def test_credential_target_domains_from_state_uses_live_kerberos_context():

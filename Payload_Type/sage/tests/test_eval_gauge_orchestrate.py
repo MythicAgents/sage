@@ -97,6 +97,39 @@ def test_dry_run_accepts_alternate_foothold_spec():
     assert "password source=SAGE_MEEREEN_JORAH_PASSWORD" in output
 
 
+def test_dry_run_accepts_distinct_ludus_and_callback_hosts():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "replication-purpose-range-visible-cost",
+            "--side",
+            "harness",
+            "--foothold-host",
+            "SAGEREPL-WS01",
+            "--foothold-callback-host",
+            "WS01",
+            "--foothold-ip",
+            "10.7.10.31",
+            "--foothold-user",
+            r"REPLICATION\user1",
+            "--foothold-callback-user",
+            "user1",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert "--target-host SAGEREPL-WS01" in output
+    assert "--callback-host WS01" in output
+    assert "--foothold-host WS01" in output
+    assert "--foothold-user-match user1" in output
+
+
 def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
     monkeypatch.setenv("SAGE_RUN_AS_PASSWORD", "samwell-password")
     monkeypatch.setenv("SAGE_MEEREEN_JORAH_PASSWORD", "jorah-password")
@@ -167,6 +200,39 @@ def test_run_side_uses_purpose_range_map_and_passes_range_id(monkeypatch):
     assert seen["restart_env"]["SAGE_GPO_WAIT_SECONDS"] == "120"
 
 
+def test_run_side_uses_replication_range_map_and_gpo_proof_env(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del snapshot, retained_callback_config, foothold
+        seen["restart_env"] = dict(restart_env)
+        seen["range_id"] = ludus_range_id
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "replication-purpose-range-visible-cost",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="hybrid",
+        ludus_range_id="SAGEREPLICATION20260712",
+    )
+
+    assert seen["range_id"] == "SAGEREPLICATION20260712"
+    assert (
+        seen["restart_env"]["SAGE_ENGAGEMENT_NETBIOS_MAP"]
+        == orchestrate.DEFAULT_REPLICATION_PURPOSE_RANGE_NETBIOS_MAP
+    )
+    assert seen["restart_env"]["SAGE_GPO_PROOF_SHARE_NAME"] == "SageProof"
+    assert seen["restart_env"]["SAGE_GPO_PROOF_LOCAL_ROOT"] == r"C:\SageProof"
+    assert seen["restart_env"]["SAGE_GPO_WAIT_SECONDS"] == "120"
+    assert "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON" not in seen["restart_env"]
+
+
 def test_purpose_range_recovery_adds_explicit_gpo_blocker_only_for_recovery_variant():
     visible = orchestrate._scenario_restart_env("purpose-range-visible-cost")
     recovery = orchestrate._scenario_restart_env("purpose-range-recovery")
@@ -176,6 +242,48 @@ def test_purpose_range_recovery_adds_explicit_gpo_blocker_only_for_recovery_vari
     assert blocker["capability"] == "gpo-controlled-system-exec"
     assert blocker["target_contains"] == "gpo=srv02-policy;domain=range.local"
     assert blocker["reason"] == "endpoint protection blocked the staged GPO payload on srv02"
+    assert blocker["probe"]["defender_blocked"] is True
+
+
+def test_direct_laps_ca_export_recovery_adds_late_blocker_and_scoped_enrollment_hint():
+    visible = orchestrate._scenario_restart_env("direct-laps-objective")
+    recovery = orchestrate._scenario_restart_env("direct-laps-ca-export-recovery")
+
+    assert visible == {}
+    blocker = json.loads(recovery["SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON"])
+    assert blocker["capability"] == "adcs-ca-private-key-export"
+    assert blocker["target_contains"] == "target=braavos;target_domain=essos.local"
+    assert blocker["reason"] == "key not exportable"
+    assert blocker["probe"]["key_not_exportable"] is True
+    hints = json.loads(recovery["SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON"])
+    assert hints == [{
+        "ca_host": "braavos",
+        "ca_name": r"braavos.essos.local\ESSOS-CA",
+        "domain": "essos.local",
+        "esc_type": "esc1",
+        "template": "ESC1",
+    }]
+
+
+def test_purpose_range_ca_export_replanning_forces_prefix_and_releases_repairable_blocker():
+    visible = orchestrate._scenario_restart_env("purpose-range-visible-cost")
+    replanning = orchestrate._scenario_restart_env("purpose-range-ca-export-replanning")
+
+    assert "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON" not in visible
+    prefix = json.loads(replanning["SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"])
+    assert [item["capability"] for item in prefix] == [
+        "read-managed-local-admin-secret",
+        "use-managed-local-admin-secret",
+        "execute-as-local-admin",
+        "adcs-ca-private-key-export",
+    ]
+    assert prefix[-1]["release_on_failure"] is True
+    blocker = json.loads(replanning["SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON"])
+    assert blocker["capability"] == "adcs-ca-private-key-export"
+    assert blocker["target_contains"] == "target=ca01;target_domain=range.local"
+    assert blocker["failure_class"] == "transient"
+    assert blocker["skip_if_achieved_effect"] == "endpoint-protection-adjusted:ca01@range.local"
+    assert blocker["probe"]["tool_execution_failed"] is True
     assert blocker["probe"]["defender_blocked"] is True
 
 

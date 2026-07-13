@@ -145,3 +145,97 @@ def test_retained_purpose_range_start_uses_engagement_netbios_map(monkeypatch, t
     assert starts[0].objective.endswith("administrative control of range.local.")
     assert starts[0].proof_scenario == "purpose-range-visible-cost"
     assert census._proofability(starts[0])["proofable"] is True
+
+
+def test_retained_replication_range_start_uses_replication_proof_scenario(monkeypatch, tmp_path):
+    path = tmp_path / "apollo_replication_ws01_callback_config.json"
+    path.write_text(json.dumps({
+        "config": {
+            "callback": {
+                "host": "WS01",
+                "domain": "REPLICATION",
+                "user": "user1",
+            }
+        }
+    }))
+    monkeypatch.setenv("SAGE_ENGAGEMENT_NETBIOS_MAP", '{"REPLICATION":"replication.local"}')
+
+    starts = census.discover_retained_starts(tmp_path)
+
+    assert len(starts) == 1
+    assert starts[0].forest == "replication.local"
+    assert starts[0].objective.endswith("administrative control of replication.local.")
+    assert starts[0].proof_scenario == "replication-purpose-range-visible-cost"
+    assert census._proofability(starts[0])["proofable"] is True
+
+
+def test_run_census_labels_purpose_range_without_calling_it_goad(monkeypatch):
+    spec = census.StartSpec(
+        name="retained-apollo_replication_range_ws01",
+        host="WS01",
+        forest="replication.local",
+        identity=r"REPLICATION\user1",
+        proof_scenario="replication-purpose-range-visible-cost",
+        bootstrap_evidence="retained callback config",
+    )
+
+    async def fake_analyze_start(*args, **kwargs):
+        return {
+            "start": {
+                "name": spec.name,
+                "proof_scenario": spec.proof_scenario,
+            },
+            "passes_gate": True,
+        }
+
+    async def refresh(state):
+        return state
+
+    monkeypatch.setattr(census, "analyze_start", fake_analyze_start)
+
+    report = asyncio.run(census._run_census(
+        [spec],
+        refresh,
+        collected_domains=["replication.local"],
+        max_depth=1,
+        max_nodes=1,
+    ))
+
+    assert report["selected_start"] == spec.name
+    assert report["recommended_discriminator"] == "replication-purpose-range-visible-cost"
+    assert report["gate_reason"] == "1 censused start(s) satisfy the branch-rich discriminator gate"
+
+
+def test_run_census_preserves_goad_discriminator_for_goad_start(monkeypatch):
+    spec = census.StartSpec(
+        name="jorah-meereen",
+        host="MEEREEN",
+        forest="essos.local",
+        identity=r"ESSOS\jorah.mormont",
+        proof_scenario="direct-laps-objective",
+        bootstrap_evidence="retained callback config",
+    )
+
+    async def fake_analyze_start(*args, **kwargs):
+        return {
+            "start": {
+                "name": spec.name,
+                "proof_scenario": spec.proof_scenario,
+            },
+            "passes_gate": True,
+        }
+
+    async def refresh(state):
+        return state
+
+    monkeypatch.setattr(census, "analyze_start", fake_analyze_start)
+
+    report = asyncio.run(census._run_census(
+        [spec],
+        refresh,
+        collected_domains=["essos.local"],
+        max_depth=1,
+        max_nodes=1,
+    ))
+
+    assert report["recommended_discriminator"] == "goad"

@@ -51,5 +51,6 @@ def test_purpose_range_scenarios_use_range_referee_domain():
     assert [scenario.name for scenario in scenarios] == [
         "purpose-range-visible-cost",
         "purpose-range-recovery",
+        "purpose-range-ca-export-replanning",
     ]
     assert run_gauge_live._scored_referee_domains(scenarios[0]) == {"range.local"}

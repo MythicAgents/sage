@@ -4597,7 +4597,10 @@ class Model:
                 )
 
         def policy_frontier(state):
-            return _autonomous_policy_candidates(_cap.actions_from_state(state))
+            return _eval_forced_capability_prefix_candidates(
+                _autonomous_policy_candidates(_cap.actions_from_state(state)),
+                state,
+            )
 
         def needs_collection(state):
             # N2: signal collection ONLY when a SUPPORTED collector-profile foothold actually needs it — aligned with
@@ -8276,6 +8279,46 @@ def _autonomous_policy_candidates(actions: list[Any]) -> list[Any]:
         _cap.with_operational_cost(action, gpo_wait_seconds=_autonomous_gpo_wait_seconds(action))
         for action in (actions or [])
     ]
+
+
+def _eval_forced_capability_prefix_candidates(actions: list[Any], state: Any) -> list[Any]:
+    """Restrict an eval run to one declared capability prefix until it completes or releases."""
+    raw = str(os.environ.get("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON") or "").strip()
+    if not raw:
+        return list(actions or [])
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return list(actions or [])
+    if not isinstance(decoded, list):
+        return list(actions or [])
+
+    def _name(value: Any) -> str:
+        text = str(value or "").strip().casefold()
+        return text.rsplit(":", 1)[-1] if ":" in text else text
+
+    def _matches(value: Any, spec: dict[str, Any]) -> bool:
+        if _name(getattr(value, "name", None) or getattr(value, "technique", "")) != _name(spec.get("capability")):
+            return False
+        target_contains = str(spec.get("target_contains") or "").strip().casefold()
+        target = str(getattr(value, "target", "") or "").strip().casefold()
+        return not target_contains or target_contains in target
+
+    hops = list(getattr(state, "hops", []) or [])
+    candidates = list(actions or [])
+    for spec in decoded:
+        if not isinstance(spec, dict) or not _name(spec.get("capability")):
+            continue
+        if any(_matches(hop, spec) and str(getattr(hop, "status", "") or "").strip().casefold() == "achieved" for hop in hops):
+            continue
+        if spec.get("release_on_failure") is True and any(
+            _matches(hop, spec)
+            and str(getattr(hop, "status", "") or "").strip().casefold() in {"failed", "blocked"}
+            for hop in hops
+        ):
+            continue
+        return [action for action in candidates if _matches(action, spec)]
+    return candidates
 
 
 def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict[str, Any]:

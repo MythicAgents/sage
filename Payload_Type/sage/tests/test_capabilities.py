@@ -388,6 +388,20 @@ def test_grant_directory_rights_candidate_suppressed_when_rights_verified():
     assert "grant-directory-rights" not in [action.name for action in actions]
 
 
+def test_grant_directory_rights_candidate_suppressed_when_graph_already_proves_rights():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert "grant-directory-rights" not in [action.name for action in actions]
+    assert "dcsync-krbtgt" in [action.name for action in actions]
+
+
 def test_netbios_da_dominates_fqdn_grant_and_selects_context_refresh():
     state = es.EngagementState(
         objective="domain admin",

@@ -1,0 +1,4 @@
+manifest_version: 1
+name: "Sage Purpose Ranges"
+description: "Ludus-native benchmark ranges for Sage branch-selection and transfer evaluation."
+license: GPL-3.0-or-later
