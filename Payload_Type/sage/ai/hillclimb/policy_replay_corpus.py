@@ -186,6 +186,41 @@ def _resolve_choice(frontier: list[dict[str, Any]], choice: dict[str, Any]) -> i
     return matches[0] if len(matches) == 1 else None
 
 
+def _branch_outcome_scope(
+    frontier: list[dict[str, Any]],
+    policy_replays: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    coverage: list[dict[str, Any]] = []
+    observed_indices: list[int] = []
+    for index, item in enumerate(frontier):
+        observed_by = sorted(
+            policy_mode
+            for policy_mode in POLICY_MODES
+            if _resolve_choice(frontier, policy_replays.get(policy_mode) or {}) == index
+        )
+        if observed_by:
+            observed_indices.append(index)
+        coverage.append({
+            "frontier_index": index,
+            "selected_capability": item.get("name"),
+            "selected_target": item.get("target"),
+            "live_observed": bool(observed_by),
+            "observed_by_policy_modes": observed_by,
+        })
+    unobserved_indices = [
+        index
+        for index in range(len(frontier))
+        if index not in observed_indices
+    ]
+    return {
+        "kind": "live_observed_frontier_choices_only",
+        "can_score_unseen_candidates": False,
+        "frontier_indices_with_live_observed_outcomes": observed_indices,
+        "frontier_indices_without_live_observed_outcomes": unobserved_indices,
+        "frontier_coverage": coverage,
+    }
+
+
 def _packet_source_row(
     source: dict[str, Any],
     case: dict[str, Any],
@@ -271,6 +306,7 @@ def export_corpus(
             raise CorpusError(f"packet source references unknown calibration case: {case_id}")
         source_meta, packet = _packet_source_row(source, case, results_root=root, verify_hashes=verify_hashes)
         policy_replays = _stable_policy_replays(case, artifact_rows[str(case["artifact_id"])])
+        frontier = _packet_frontier(packet)
         exported_cases.append({
             "id": case_id,
             "scenario": str(case["scenario"]),
@@ -283,6 +319,7 @@ def export_corpus(
             "decision_packet_hash": source_meta["decision_packet_hash"],
             "decision_packet": packet,
             "policy_replays": policy_replays,
+            "branch_outcome_scope": _branch_outcome_scope(frontier, policy_replays),
         })
     expected_case_ids = set(cases)
     exported_case_ids = {str(case["id"]) for case in exported_cases}
@@ -298,6 +335,10 @@ def export_corpus(
         "calibration_manifest": str(source_manifest["calibration_manifest"]),
         "calibration_manifest_hash": _hash_json(calibration_manifest),
         "source_manifest_hash": _hash_json(source_manifest),
+        "outcome_scope": {
+            "kind": "live_observed_frontier_choices_only",
+            "can_score_unseen_candidates": False,
+        },
         "cases": exported_cases,
     }
 
@@ -359,6 +400,7 @@ def _validate_case(
         policy_mode: _resolve_choice(frontier, stored_replays.get(policy_mode) or {})
         for policy_mode in POLICY_MODES
     }
+    expected_branch_outcome_scope = _branch_outcome_scope(frontier, expected_policy_replays)
     observed_metrics_by_index: dict[int, float] = {}
     for policy_mode, index in replay_indices.items():
         if index is None or policy_mode not in policy_metrics:
@@ -392,6 +434,8 @@ def _validate_case(
         and _reconstructed_candidate_hash(packet) == str(calibration_case["decisive_frontier_hash"]),
         "candidate_count_matches_case": len(frontier) == int(calibration_case["expected_candidate_count"]),
         "policy_replays_match_frozen_matrix": _canonical_json(stored_replays) == _canonical_json(expected_policy_replays),
+        "branch_outcome_scope_matches_live_observation": _canonical_json(stored_case.get("branch_outcome_scope") or {})
+        == _canonical_json(expected_branch_outcome_scope),
         "policy_replays_resolve_on_frontier": all(index is not None for index in replay_indices.values()),
         "expected_policy_order_preserved": observed_order == expected_order,
         "pairwise_agreement": bool(pairwise) and all(item["passes"] for item in pairwise),
@@ -404,6 +448,7 @@ def _validate_case(
         "decision_packet_hash": stored_case.get("decision_packet_hash"),
         "frontier": frontier,
         "policy_replays": stored_replays,
+        "branch_outcome_scope": stored_case.get("branch_outcome_scope"),
         "replay_indices": replay_indices,
         "expected_policy_order": expected_order,
         "observed_policy_order": observed_order,
@@ -477,6 +522,11 @@ def validate_corpus(
         "calibration_manifest_hash_matches": str(corpus.get("calibration_manifest_hash") or "")
         == _hash_json(calibration_manifest),
         "source_manifest_hash_matches": str(corpus.get("source_manifest_hash") or "") == _hash_json(source_manifest),
+        "outcome_scope_is_live_observed_only": _canonical_json(corpus.get("outcome_scope") or {})
+        == _canonical_json({
+            "kind": "live_observed_frontier_choices_only",
+            "can_score_unseen_candidates": False,
+        }),
         "cases_cover_calibration_manifest": {str(case.get("id") or "") for case in stored_cases}
         == set(calibration_cases),
         "cases_pass": bool(case_reports) and all(case["passes_gate"] for case in case_reports),

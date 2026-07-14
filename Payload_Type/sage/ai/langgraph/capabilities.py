@@ -281,26 +281,21 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
     for domain in sorted(explicit_replication_domains | admin_domains):
         if f"krbtgt-hash:{domain}" in achieved:
             continue
-        if domain in admin_domains and domain not in explicit_replication_domains:
-            context_callback = _current_kerberos_context_callback(domain, state, live_callback_ids)
+        context_callback, context_actions, context_required = _admin_dcsync_context_gate(
+            domain,
+            state,
+            achieved,
+            live_callback_ids,
+            explicit_replication_domains,
+            admin_effects,
+            preferred_callback_id=preferred_callback_id,
+            terminal_failed=terminal_failed,
+        )
+        if context_required:
+            if context_actions:
+                actions.extend(context_actions)
+                continue
             if not context_callback:
-                same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
-                if same_domain_callbacks:
-                    actions.extend(_refresh_kerberos_context_actions(
-                        domain,
-                        same_domain_callbacks,
-                        authorization_effect=admin_effects.get(domain, f"da:{domain}"),
-                        preferred_callback_id=preferred_callback_id,
-                        terminal_failed=terminal_failed,
-                    ))
-                else:
-                    actions.extend(_ensure_kerberos_context_actions(
-                        domain,
-                        achieved,
-                        live_callback_ids,
-                        preferred_callback_id=preferred_callback_id,
-                        terminal_failed=terminal_failed,
-                    ))
                 continue
             actions.append(_dcsync_krbtgt_action(domain, context_callback_id=context_callback))
             continue
@@ -327,26 +322,21 @@ def actions_from_state(state: Any) -> list[CapabilityAction]:
         effect = f"creds:{account}@{domain}"
         if effect in achieved or effect in terminal_failed:
             continue
-        if domain in admin_domains and domain not in explicit_replication_domains:
-            context_callback = _current_kerberos_context_callback(domain, state, live_callback_ids)
+        context_callback, context_actions, context_required = _admin_dcsync_context_gate(
+            domain,
+            state,
+            achieved,
+            live_callback_ids,
+            explicit_replication_domains,
+            admin_effects,
+            preferred_callback_id=preferred_callback_id,
+            terminal_failed=terminal_failed,
+        )
+        if context_required:
+            if context_actions:
+                actions.extend(context_actions)
+                continue
             if not context_callback:
-                same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
-                if same_domain_callbacks:
-                    actions.extend(_refresh_kerberos_context_actions(
-                        domain,
-                        same_domain_callbacks,
-                        authorization_effect=admin_effects.get(domain, f"da:{domain}"),
-                        preferred_callback_id=preferred_callback_id,
-                        terminal_failed=terminal_failed,
-                    ))
-                else:
-                    actions.extend(_ensure_kerberos_context_actions(
-                        domain,
-                        achieved,
-                        live_callback_ids,
-                        preferred_callback_id=preferred_callback_id,
-                        terminal_failed=terminal_failed,
-                    ))
                 continue
             actions.append(_dcsync_account_action(domain, account, context_callback_id=context_callback, source_fact=source_fact))
             continue
@@ -6394,6 +6384,49 @@ def _admin_domain_effects(predicates: set[str], known_domains: set[str] | None =
 
 def _admin_domains(predicates: set[str], known_domains: set[str] | None = None) -> set[str]:
     return set(_admin_domain_effects(predicates, known_domains))
+
+
+def _admin_dcsync_context_gate(
+    domain: str,
+    state: Any,
+    achieved: set[str],
+    live_callback_ids: set[str],
+    explicit_replication_domains: set[str],
+    admin_effects: dict[str, str],
+    *,
+    preferred_callback_id: str = "",
+    terminal_failed: set[str] | None = None,
+) -> tuple[str, list[CapabilityAction], bool]:
+    """Return the callback context or prerequisite actions required before admin-backed DCSync.
+
+    A graph refresh can project the Domain Admins DCSync edge immediately after membership is verified, before
+    the active callback's Kerberos PAC is refreshed. Same-domain admin authority therefore still needs a proven
+    callback-scoped context even when a graph fact now also names replication rights. Direct graph-only
+    replication rights without a matching admin effect remain immediately usable.
+    """
+    if domain not in admin_effects:
+        return "", [], False
+    context_callback = _current_kerberos_context_callback(domain, state, live_callback_ids)
+    if context_callback:
+        return context_callback, [], True
+    same_domain_callbacks = _live_callback_ids_for_domain(state, domain)
+    if same_domain_callbacks:
+        return "", _refresh_kerberos_context_actions(
+            domain,
+            same_domain_callbacks,
+            authorization_effect=admin_effects.get(domain, f"da:{domain}"),
+            preferred_callback_id=preferred_callback_id,
+            terminal_failed=terminal_failed,
+        ), True
+    if domain not in explicit_replication_domains:
+        return "", _ensure_kerberos_context_actions(
+            domain,
+            achieved,
+            live_callback_ids,
+            preferred_callback_id=preferred_callback_id,
+            terminal_failed=terminal_failed,
+        ), True
+    return "", [], False
 
 
 def _ensure_kerberos_context_actions(

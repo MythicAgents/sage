@@ -14,7 +14,7 @@ description: Repo-local Sage eval-gauge / hill-climbing Phase-0 toolkit. Use whe
 A measurement instrument: VERIFIED milestones (ground truth) → a vector `ScoreCard` (C2) carrying a Goodhart gap + a `verifier_hash`; a noise floor (C3, `min_detectable_effect`); the **Gate Experiment** (Spearman ρ of eval-vs-ground-truth + the high-eval/low-truth count, with a PASS/FAIL verdict); ledger-independent **probes** (so a non-Sage agent is scoreable); a **bare-model runner**; and a **live driver**.
 
 ## Components
-`range_state` (C1 ledger ground truth) · `process_state` (C1b tradecraft + unclassified_rate) · `fitness` (C2 vector; carries `objective_clean_stop` + `wall_seconds`) · `reliability` (C3 noise floor) · `scenarios` · `gate_experiment` · `gate_live` · `hermetic` · `policy_replay_calibration` · `policy_replay_corpus` · `probes` · `bare_runner` · `live_runner` · `live_seams` · `run_gauge_live`. The harness side creates a fresh locked Mythic v4 Sage chat channel per run; no Sage callback is required.
+`range_state` (C1 ledger ground truth) · `process_state` (C1b tradecraft + unclassified_rate) · `fitness` (C2 vector; carries `objective_clean_stop` + `wall_seconds`) · `reliability` (C3 noise floor) · `scenarios` · `gate_experiment` · `gate_live` · `hermetic` · `policy_replay_calibration` · `policy_replay_corpus` · `policy_replay_selector_experiment` · `target_disambiguation_contract` · `target_value_census` · `target_value_proofability` · `gpo_dc_scope_late_blocker_contract` · `gpo_dc_scope_late_blocker_authorization` · `gpo_dc_scope_live_surface` · `gpo_dc_scope_canary` · `gpo_dc_scope_matrix` · `probes` · `bare_runner` · `live_runner` · `live_seams` · `run_gauge_live`. The harness side creates a fresh locked Mythic v4 Sage chat channel per run; no Sage callback is required.
 
 ## Run
 - Offline tests: `../../.venv/bin/python -m pytest tests/ -q`
@@ -29,6 +29,34 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
   `../../.venv/bin/python -m ai.hillclimb policy-replay-corpus-export`
 - Validate the packet-backed frontier corpus against the frozen matrices and source rows (safe; no lab or model calls):
   `../../.venv/bin/python -m ai.hillclimb policy-replay-corpus-validate`
+- Run the bounded packet-backed selector experiment (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-selector-experiment`
+- Score packet-corpus branches without live outcomes using hermetic declared-effect reachability (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-unseen-candidate-evaluate`
+- Run one bounded eval-only propose/evaluate/keep-or-revert iteration (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-hillclimb-iteration`
+- Evaluate the kept candidate on one structurally different held-out surface and emit promotion requirements (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb policy-replay-promotion-gate`
+- Audit whether the proposed next target-disambiguated benchmark contract is real (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb target-disambiguation-contract-audit`
+- Census current same-capability target-value surfaces before adding new runtime modeling (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb target-value-census`
+- Screen the natural-asymmetry census winners for the next proofable live-contract direction (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb target-value-proofability-screen`
+- Decide whether current evidence justifies a generic runtime target-value abstraction (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb target-value-runtime-decision`
+- Validate the dedicated same-domain GPO DC-scope late-blocker contract (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-late-blocker-contract-validate`
+- Audit whether the dedicated GPO DC-scope contract authorizes live surface work (safe; no lab or model calls):
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-late-blocker-authorization-audit`
+- Capture one read-only BloodHound observation for the GPO DC-scope live surface after a clean graph-only setup:
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-live-surface-capture --label clean-reset-1 --evidence <json> --replace`
+- Validate repeated clean-reset graph observations against the authorized GPO DC-scope contract (safe; no model calls):
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-live-surface-validate --evidence <json>`
+- Validate one packet-backed GPO DC-scope canary row before any matrix expansion (safe; no model calls):
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-canary-validate --results <jsonl> --surface-report <json>`
+- Validate the repeated packet-backed GPO DC-scope matrix after the accepted canary (safe; no model calls):
+  `../../.venv/bin/python -m ai.hillclimb gpo-dc-scope-matrix-validate --results <jsonl> --canary-report <json>`
 - Live null-model factorial (OFFENSIVE symbolic baseline; clean reset per policy):
   `.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario cross-forest-objective --side harness --null-model-factorial --seeds 1 --solve-timeout 5400 --go`
 - Live driver dry-run (safe; resolves Sage model, Apollo catalog, BloodHound): `../../.venv/bin/python ai/hillclimb/run_gauge_live.py`
@@ -74,4 +102,17 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - **Hermetic inner loop (`hermetic.py`)** re-scores RECORDED runs offline (no lab); scoring a NEW candidate's capability hermetically (mock-Mythic re-execution) is the Phase-3 frontier (`mock_mythic_candidate_eval` is a documented `NotImplementedError` stub).
 - **Policy replay calibration (`policy_replay_calibration.py`)** is the intermediate gate before that frontier: it replays decisive recorded policy frontiers from hashed live matrices and proves the offline reading preserves known live separations and ties. It does not score unseen candidates.
 - **Packet-backed replay corpus (`policy_replay_corpus.py`)** reconstructs the decisive frontiers from pinned clean packet canaries and grades only selectors whose chosen branch already has a live-observed cost. It rechecks source artifact hashes and still does not score unseen branches.
+- **Bounded selector experiment (`policy_replay_selector_experiment.py`)** validates the packet corpus first, then compares `first_admissible`, `lowest_visible_wait`, and one generic blocked-effect-aware visible-cost selector using only packet-local fields. Passing this experiment is replay agreement on the frozen cases, not a general selector claim or a reason to skip a target-disambiguated live benchmark.
+- **Unseen-candidate evaluator (`policy_replay_unseen_candidate_evaluator.py`)** validates the packet corpus first, preserves live-observed branch metrics as authoritative, and attaches declared-effect reachability scores only to frontier branches with no live-observed outcome. Those synthetic scores are explicitly not ground truth and still require live promotion before any policy claim.
+- **Replay hill-climb iteration (`policy_replay_hillclimb_iteration.py`)** runs one eval-only single-variable proposal against the cheap evaluator, records paired score deltas plus a verifier hash, and keeps or reverts the candidate without mutating runtime policy or scorer boundaries.
+- **Replay promotion gate (`policy_replay_promotion_gate.py`)** evaluates the kept candidate on a structurally different census holdout outside the packet training corpus, tracks the consumed holdout budget, and keeps runtime promotion blocked until live objective-proof and clean-stop checks are run.
+- **Target-disambiguation contract audit (`target_disambiguation_contract.py`)** is an eval-only synthetic check before live spend. It rejects a proposed benchmark when same-capability, equal-visible-cost targets collapse to the same modeled objective cost, and includes a control shape that proves the checker can detect real asymmetric downstream value.
+- **Target-value census (`target_value_census.py`)** is the next eval-only decision gate. It compares several same-capability, equal-visible-cost synthetic target surfaces across ADCS, GPO, DCSync, and managed-local-admin using only current frontier generation and modeled reachability, then recommends whether existing natural asymmetry is enough or a generic target-value abstraction is justified.
+- **Target-value proofability screen (`target_value_proofability.py`)** compares only the natural-asymmetry census winners. It checks current selector failure, generic fact projection, current proof/execution support, and existing late-blocker substrate reuse, then recommends the next contract to build without authorizing a live matrix.
+- **Target-value runtime decision (`target_value_runtime_decision.py`)** combines the multi-family census with the expanded packet-backed selector result and decides whether the failure is a runtime modeling gap or an offline downstream-reachability gap. It currently keeps runtime policy unchanged and points the next step at an eval-only unseen-candidate scorer.
+- **GPO DC-scope late-blocker contract (`gpo_dc_scope_late_blocker_contract.py`)** extends the current purpose-range late lane through verified CA export, records one eval-only terminal certificate-auth blocker, and proves that the resulting full recovery frontier is exactly two equal-visible-cost GPO targets with asymmetric modeled downstream value. It is still an offline contract and does not authorize live spend by itself.
+- **GPO DC-scope late-blocker authorization audit (`gpo_dc_scope_late_blocker_authorization.py`)** consumes the dedicated contract report, rechecks current selector failure, generic `gpo-affects-dc:` projection, current GPO proof/execution support, current ADCS blocker support, and existing purpose-range substrate validation, then emits the explicit `live_benchmark_authorized` decision for the next surface build. It does not prove that a live range already exists.
+- **GPO DC-scope live-surface validator (`gpo_dc_scope_live_surface.py`)** consumes only read-only BloodHound observations captured after clean reset plus graph collection, reconstructs the authorized late-blocker frontier through the current generic capability model, and requires repeated frontier hashes before it releases a canary. It does not task Mythic, mutate BloodHound, or replace packet-backed canary validation.
+- **GPO DC-scope canary validator (`gpo_dc_scope_canary.py`)** consumes one persisted gauge row plus the repeated live-surface report, recomputes the decisive packet hash, reconstructs the authorized two-GPO frontier, checks the blocker survives in packet state, and releases matrix work only when the row also has objective proof and clean-stop telemetry.
+- **GPO DC-scope matrix validator (`gpo_dc_scope_matrix.py`)** consumes only post-canary persisted gauge rows, requires three clean rows per policy arm by default, rechecks the accepted packet/frontier contract on every row, and reports the observed recovery-work ordering plus learned-policy tie status without assuming a winner in advance.
 - `krbtgt`/creds milestones are Mythic-loot, not graph — a separate probe source still to wire.

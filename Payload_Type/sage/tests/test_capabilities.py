@@ -1146,6 +1146,42 @@ def test_same_domain_da_unlocks_keyless_kerberos_context_refresh():
     assert "krbtgt-hash:lab.local" not in contexts[0].preconditions
 
 
+def test_same_domain_da_graph_replication_fact_still_requires_current_context_refresh():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[_hop("da:lab.local")],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=lab.local;callback=13"
+    assert contexts[0].intent["refresh_current_context"] is True
+    assert "dcsync-krbtgt" not in [action.name for action in actions]
+
+
+def test_same_domain_da_graph_replication_fact_allows_dcsync_after_context_refresh():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("da:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+        ],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name == "dcsync-krbtgt"]
+
+    assert len(dcsync) == 1
+    assert "kerberos-context:lab.local@callback:13" in dcsync[0].preconditions
+    assert "ensure-kerberos-context" not in [action.name for action in actions]
+
+
 def test_same_domain_da_with_krbtgt_still_prefers_current_context_refresh():
     state = es.EngagementState(
         objective="domain admin",

@@ -291,6 +291,31 @@ def test_purpose_range_ca_export_replanning_forces_prefix_and_releases_repairabl
     assert blocker["probe"]["defender_blocked"] is True
 
 
+def test_purpose_range_gpo_dc_scope_late_blocker_forces_terminal_certificate_auth_blocker():
+    visible = orchestrate._scenario_restart_env("purpose-range-visible-cost")
+    late_blocker = orchestrate._scenario_restart_env("purpose-range-gpo-dc-scope-late-blocker")
+
+    assert "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON" not in visible
+    assert late_blocker["SAGE_GPO_WAIT_SECONDS"] == "300"
+    prefix = json.loads(late_blocker["SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"])
+    assert [item["capability"] for item in prefix] == [
+        "read-managed-local-admin-secret",
+        "use-managed-local-admin-secret",
+        "execute-as-local-admin",
+        "adcs-ca-private-key-export",
+        "adcs-certificate-auth",
+    ]
+    assert prefix[-1]["release_on_failure"] is True
+    blocker = json.loads(late_blocker["SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON"])
+    assert blocker["capability"] == "adcs-certificate-auth"
+    assert blocker["target_contains"] == "domain=range.local;account=administrator;ca_host=ca01"
+    assert blocker["failure_class"] == "genuine"
+    assert blocker["record_failed_effect"] == "certificate-auth:administrator@range.local"
+    assert blocker["probe"]["pkinit_failed"] is True
+    assert blocker["probe"]["target_host"] == "ca01"
+    assert blocker["probe"]["account"] == "administrator"
+
+
 def test_treatment_route_rejects_loopback_proxy(tmp_path):
     route = tmp_path / ".env.local"
     route.write_text(

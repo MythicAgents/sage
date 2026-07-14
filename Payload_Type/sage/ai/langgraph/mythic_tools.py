@@ -1,7 +1,7 @@
 import os
 import contextvars
 import inspect
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 try:
     from . import auth_context
 except ImportError:
@@ -6702,6 +6702,7 @@ class MythicTools:
                 "capability": capability,
                 "reason": reason,
                 "failure_class": failure_class,
+                "record_failed_effect": self._capability_text(spec.get("record_failed_effect")).strip(),
                 "action": asdict(action) if is_dataclass(action) else {},
                 "issued": [],
                 "recorded_effects": [],
@@ -9579,8 +9580,25 @@ class MythicTools:
             evidence["transaction_status"] = payload["transaction"].get("status")
         if isinstance(inputs, dict):
             evidence["capability_inputs"] = self._capability_executor_safe_parameters(inputs)
+        record_action = action
+        preferred_effect = self._canonical_capability_effect(payload.get("record_failed_effect"))
+        if preferred_effect and preferred_effect in wanted and is_dataclass(action):
+            action_effects = list(getattr(action, "effects", []) or [])
+            reordered_effects = [
+                effect
+                for effect in action_effects
+                if self._canonical_capability_effect(effect) == preferred_effect
+            ] + [
+                effect
+                for effect in action_effects
+                if self._canonical_capability_effect(effect) != preferred_effect
+            ]
+            try:
+                record_action = replace(action, effects=reordered_effects)
+            except Exception:
+                record_action = action
         verification = self.record_capability_result(
-            action,
+            record_action,
             probe,
             evidence=evidence,
         )

@@ -6972,6 +6972,53 @@ def test_execute_capability_eval_injected_transient_blocker_releases_after_repai
     assert mt._capability_executor_injected_blocker(action, {"callback_id": "13"}, "13", capabilities) is None
 
 
+def test_execute_capability_eval_injected_blocker_can_record_declared_action_effect(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 58)]
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "adcs-certificate-auth",
+            "target_contains": "domain=lab.local;account=administrator;ca_host=ca01",
+            "reason": "certificate authentication failed after verified CA export on ca01",
+            "failure_class": "genuine",
+            "record_failed_effect": "certificate-auth:administrator@lab.local",
+            "probe": {
+                "pkinit_failed": True,
+                "target_domain": "lab.local",
+                "target_host": "ca01",
+                "account": "administrator",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=[],
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["record_failed_effect"] == "certificate-auth:administrator@lab.local"
+    failed = mt._engagement_hops[-1]
+    assert failed.status == "blocked"
+    assert failed.effect == "certificate-auth:administrator@lab.local"
+    assert failed.satisfied_effects == [
+        "certificate-auth:administrator@lab.local",
+        "da:lab.local",
+    ]
+
+
 def test_execute_capability_output_preview_redacts_ticket_store_json():
     mt = _make_tools()
     ticket = base64.b64encode(b"C" * 220).decode()

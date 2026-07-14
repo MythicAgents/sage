@@ -138,6 +138,56 @@ DEFAULT_PURPOSE_RANGE_CA_EXPORT_REPLANNING_ENV = {
         sort_keys=True,
     ),
 }
+DEFAULT_PURPOSE_RANGE_GPO_DC_SCOPE_LATE_BLOCKER_ENV = {
+    # Keep the live canary's packet/frontier identity aligned with the generic offline contract.
+    # The existing purpose-range variants shorten this wait for throughput, but this benchmark is
+    # explicitly about equal visible GPO costs and must preserve the default 300-second metadata.
+    "SAGE_GPO_WAIT_SECONDS": "300",
+    "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON": json.dumps(
+        [
+            {
+                "capability": "read-managed-local-admin-secret",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "use-managed-local-admin-secret",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "execute-as-local-admin",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "adcs-ca-private-key-export",
+                "target_contains": "target=ca01;target_domain=range.local",
+            },
+            {
+                "capability": "adcs-certificate-auth",
+                "target_contains": "domain=range.local;account=administrator;ca_host=ca01",
+                "release_on_failure": True,
+            },
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+    "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON": json.dumps(
+        {
+            "capability": "adcs-certificate-auth",
+            "target_contains": "domain=range.local;account=administrator;ca_host=ca01",
+            "reason": "certificate authentication failed after verified CA export on ca01",
+            "failure_class": "genuine",
+            "record_failed_effect": "certificate-auth:administrator@range.local",
+            "probe": {
+                "pkinit_failed": True,
+                "target_domain": "range.local",
+                "target_host": "ca01",
+                "account": "administrator",
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ),
+}
 DEFAULT_LUDUS_RANGE_ID = os.environ.get("SAGE_LUDUS_RANGE_ID") or None
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
 DEFAULT_FOOTHOLD_IP = "10.4.10.22"
@@ -266,6 +316,8 @@ def _scenario_restart_env(scenario: str) -> dict[str, str]:
         env = dict(DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV)
         if scenario == "purpose-range-ca-export-replanning":
             env.update(DEFAULT_PURPOSE_RANGE_CA_EXPORT_REPLANNING_ENV)
+        elif scenario == "purpose-range-gpo-dc-scope-late-blocker":
+            env.update(DEFAULT_PURPOSE_RANGE_GPO_DC_SCOPE_LATE_BLOCKER_ENV)
         elif scenario == "purpose-range-recovery":
             env.update(DEFAULT_PURPOSE_RANGE_RECOVERY_BLOCKER_ENV)
         return env

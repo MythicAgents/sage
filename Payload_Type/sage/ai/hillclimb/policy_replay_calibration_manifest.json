@@ -20,6 +20,12 @@
       "relative_path": "purpose_range_ca_export_replanning_repeat_20260713.jsonl",
       "sha256": "07a0eb51cc9e3da4b72608ec0520738d53b29ad309c43b43fa64ff96b815ff7c",
       "role": "pairwise_calibration"
+    },
+    {
+      "id": "gpo-dc-scope-late-blocker-matrix",
+      "relative_path": "gpo_dc_scope_late_blocker_matrix_20260713.jsonl",
+      "sha256": "b7f5f0e56c6c8e3ed272bbb37d252f3c430b64d1f9799bd35bf37f4db98700d8",
+      "role": "pairwise_calibration"
     }
   ],
   "cases": [
@@ -57,6 +63,32 @@
       "expected_rows_per_policy": 3,
       "choice_fields": [
         "selected_capability"
+      ],
+      "metric": {
+        "kind": "transactions_from_frontier",
+        "direction": "lower_is_better"
+      },
+      "expected_policy_order": [
+        [
+          "llm",
+          "hybrid"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "tie_tolerance": 0.0
+    },
+    {
+      "id": "gpo-dc-scope-late-blocker",
+      "artifact_id": "gpo-dc-scope-late-blocker-matrix",
+      "scenario": "purpose-range-gpo-dc-scope-late-blocker",
+      "decisive_frontier_hash": "sha256:b524358fc4972777",
+      "expected_candidate_count": 2,
+      "expected_rows_per_policy": 3,
+      "choice_fields": [
+        "selected_capability",
+        "selected_target"
       ],
       "metric": {
         "kind": "transactions_from_frontier",

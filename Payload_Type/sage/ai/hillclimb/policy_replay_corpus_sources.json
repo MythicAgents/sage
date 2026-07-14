@@ -17,6 +17,13 @@
       "sha256": "13b5d34d0b1a9a0cf7b9a36cac17bf9f77c6c375afde538fefec1136d982bcb1",
       "policy_mode": "hybrid",
       "decision_packet_hash": "sha256:728062a682bf0825b4bd2cf52f6491376dbd1069650d37f55ab555b0a410a7f0"
+    },
+    {
+      "case_id": "gpo-dc-scope-late-blocker",
+      "relative_path": "gpo_dc_scope_late_blocker_packet_canary_20260713.jsonl",
+      "sha256": "16423c43e9e9d159f3dcaf7cfe4a3785a9d7a2525270d9004a75490726c5b9e9",
+      "policy_mode": "hybrid",
+      "decision_packet_hash": "sha256:671944d41d59064063708789559645d22368a8c6282e76b3467ac29401206d16"
     }
   ]
 }

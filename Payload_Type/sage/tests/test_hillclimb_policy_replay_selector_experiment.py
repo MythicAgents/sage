@@ -1,4 +1,4 @@
-"""Focused tests for packet-backed policy replay corpus export and validation."""
+"""Focused tests for the bounded packet-backed selector experiment."""
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai.hillclimb import policy_replay_corpus as corpus
+from ai.hillclimb import policy_replay_selector_experiment as experiment
 from ai.langgraph import policy
 
 
@@ -19,27 +20,27 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _frontier() -> list[dict]:
+def _frontier(*, equal_wait: bool = False) -> list[dict]:
     return [
         {
-            "name": "detour",
-            "target": "target=detour",
+            "name": "route-a",
+            "target": "target=a",
             "preconditions": ["ready"],
-            "effects": ["effect:detour"],
+            "effects": ["effect:a"],
             "operational_cost": {
                 "interaction_class": "propagation-bound",
-                "execution_scope": "domain-policy",
+                "execution_scope": "policy",
                 "requires_propagation_wait": True,
-                "expected_wait_seconds": 120,
-                "wait_reasons": ["group-policy-refresh"],
+                "expected_wait_seconds": 0 if equal_wait else 120,
+                "wait_reasons": ["refresh"],
             },
-            "reason": "slower branch",
+            "reason": "delayed branch",
         },
         {
-            "name": "repair",
-            "target": "target=repair",
+            "name": "route-b",
+            "target": "target=b",
             "preconditions": ["ready"],
-            "effects": ["effect:repair"],
+            "effects": ["effect:b"],
             "operational_cost": {
                 "interaction_class": "direct",
                 "execution_scope": "direct",
@@ -47,7 +48,7 @@ def _frontier() -> list[dict]:
                 "expected_wait_seconds": 0,
                 "wait_reasons": [],
             },
-            "reason": "faster branch",
+            "reason": "immediate branch",
         },
     ]
 
@@ -72,7 +73,7 @@ def _packet(frontier: list[dict]) -> tuple[dict, str]:
         "schema_version": 1,
         "objective": "test objective",
         "normalized_state": {
-            "achieved_effects": ["graph-built:test.local|baseline"],
+            "achieved_effects": ["state:ready"],
             "footholds": [],
             "graph_facts": ["ready"],
             "recent_outcomes": [],
@@ -123,30 +124,30 @@ def _row(
     }
 
 
-def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
-    frontier = _frontier()
+def _write_inputs(tmp_path: Path, *, equal_wait: bool = False) -> tuple[Path, Path]:
+    frontier = _frontier(equal_wait=equal_wait)
     frontier_hash = _frontier_hash(frontier)
     packet, packet_hash = _packet(frontier)
     matrix_rows = [
         _row(
             policy_mode="symbolic",
             frontier_hash=frontier_hash,
-            selected_capability="detour",
-            selected_target="target=detour",
+            selected_capability="route-a",
+            selected_target="target=a",
             semantic_transaction_count=4,
         ),
         _row(
             policy_mode="llm",
             frontier_hash=frontier_hash,
-            selected_capability="repair",
-            selected_target="target=repair",
+            selected_capability="route-b",
+            selected_target="target=b",
             semantic_transaction_count=3,
         ),
         _row(
             policy_mode="hybrid",
             frontier_hash=frontier_hash,
-            selected_capability="repair",
-            selected_target="target=repair",
+            selected_capability="route-b",
+            selected_target="target=b",
             semantic_transaction_count=3,
         ),
     ]
@@ -158,8 +159,8 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
             _row(
                 policy_mode="hybrid",
                 frontier_hash=frontier_hash,
-                selected_capability="repair",
-                selected_target="target=repair",
+                selected_capability="route-b",
+                selected_target="target=b",
                 semantic_transaction_count=3,
                 packet=packet,
                 packet_hash=packet_hash,
@@ -211,95 +212,113 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return source_path, packet_source
 
 
-def test_policy_replay_corpus_export_and_validate_preserves_frontier_order(tmp_path):
+def test_selector_uses_blocked_effect_overlap_before_visible_wait():
+    packet, _packet_hash = _packet([
+        {
+            "name": "slow",
+            "target": "target=slow",
+            "preconditions": [],
+            "effects": ["effect:slow"],
+            "operational_cost": {"expected_wait_seconds": 30},
+            "reason": "",
+        },
+        {
+            "name": "retry",
+            "target": "target=retry",
+            "preconditions": [],
+            "effects": ["effect:retry"],
+            "operational_cost": {"expected_wait_seconds": 0},
+            "reason": "",
+        },
+        {
+            "name": "repair",
+            "target": "target=repair",
+            "preconditions": [],
+            "effects": ["effect:repair"],
+            "operational_cost": {"expected_wait_seconds": 0},
+            "reason": "",
+        },
+    ])
+    packet["normalized_state"]["recent_outcomes"] = [{
+        "capability": "prior",
+        "target": "target=retry",
+        "effect": "effect:retry",
+        "status": "blocked",
+    }]
+
+    index, ranking = experiment.select_blocked_effect_aware_visible_cost(packet)
+
+    assert index == 2
+    assert ranking[1]["blocked_effect_overlap_count"] == 1
+    assert ranking[2]["blocked_effect_overlap_count"] == 0
+    assert ranking[2]["expected_wait_seconds"] == 0
+
+
+def test_selector_experiment_preserves_live_order_and_reports_bounded_claim(tmp_path):
     source_path, _packet_source = _write_inputs(tmp_path)
     exported = corpus.export_corpus(source_manifest_path=source_path, results_root=tmp_path)
     corpus_path = tmp_path / "corpus.json"
     corpus_path.write_text(json.dumps(exported), encoding="utf-8")
 
-    report = corpus.validate_corpus(
+    report = experiment.run_selector_experiment(
         corpus_path=corpus_path,
         source_manifest_path=source_path,
         results_root=tmp_path,
     )
 
     assert report["passes_gate"] is True
+    assert report["selector"]["name"] == experiment.SELECTOR_NAME
+    assert report["aggregate"]["general_selector_claim_supported"] is False
+    assert report["aggregate"]["adds_discrimination_over_lowest_visible_wait"] is False
     case = report["cases"][0]
-    assert case["observed_policy_order"] == [["hybrid", "llm"], ["symbolic"]]
-    assert case["checks"]["reconstructed_frontier_hash_matches_case"] is True
-    assert case["checks"]["pairwise_agreement"] is True
-    assert case["checks"]["branch_outcome_scope_matches_live_observation"] is True
-    assert case["branch_outcome_scope"]["can_score_unseen_candidates"] is False
-    assert case["branch_outcome_scope"]["frontier_indices_with_live_observed_outcomes"] == [0, 1]
-    assert case["branch_outcome_scope"]["frontier_indices_without_live_observed_outcomes"] == []
-    scores = {item["selector"]: item for item in case["selector_scores"]}
-    assert scores["first_admissible"]["selected_capability"] == "detour"
-    assert scores["lowest_visible_wait"]["selected_capability"] == "repair"
-    assert all(item["scored_from_live_observation"] for item in scores.values())
+    assert case["experimental_policy_order"] == [["hybrid", "llm"], ["symbolic"]]
+    assert case["checks"]["experimental_selector_matches_live_learned_choices"] is True
+    assert case["checks"]["experimental_selector_preserves_learned_policy_tie"] is True
 
 
-def test_policy_replay_corpus_branch_scope_marks_unobserved_frontier_indices():
-    frontier = _frontier() + [{
-        "name": "unseen",
-        "target": "target=unseen",
-        "preconditions": ["ready"],
-        "effects": ["effect:unseen"],
-        "operational_cost": {"expected_wait_seconds": 0},
-        "reason": "not chosen live",
-    }]
-    scope = corpus._branch_outcome_scope(
-        frontier,
-        {
-            "symbolic": {
-                "selected_capability": "detour",
-                "selected_target": "target=detour",
-            },
-            "llm": {
-                "selected_capability": "repair",
-                "selected_target": "target=repair",
-            },
-            "hybrid": {
-                "selected_capability": "repair",
-                "selected_target": "target=repair",
-            },
-        },
-    )
-
-    assert scope["kind"] == "live_observed_frontier_choices_only"
-    assert scope["can_score_unseen_candidates"] is False
-    assert scope["frontier_indices_with_live_observed_outcomes"] == [0, 1]
-    assert scope["frontier_indices_without_live_observed_outcomes"] == [2]
-    assert scope["frontier_coverage"][2]["live_observed"] is False
-
-
-def test_policy_replay_corpus_validation_fails_when_packet_frontier_drifts(tmp_path):
-    source_path, _packet_source = _write_inputs(tmp_path)
+def test_selector_experiment_reports_failure_without_failing_the_evaluation_gate(tmp_path):
+    source_path, _packet_source = _write_inputs(tmp_path, equal_wait=True)
     exported = corpus.export_corpus(source_manifest_path=source_path, results_root=tmp_path)
-    exported["cases"][0]["decision_packet"]["admissible_frontier"][0]["name"] = "drifted-detour"
     corpus_path = tmp_path / "corpus.json"
     corpus_path.write_text(json.dumps(exported), encoding="utf-8")
 
-    report = corpus.validate_corpus(
+    report = experiment.run_selector_experiment(
         corpus_path=corpus_path,
         source_manifest_path=source_path,
         results_root=tmp_path,
     )
 
-    assert report["passes_gate"] is False
-    checks = report["cases"][0]["checks"]
-    assert checks["packet_hash_recomputes"] is False
-    assert checks["reconstructed_frontier_hash_matches_case"] is False
+    assert report["passes_gate"] is True
+    assert report["selector_findings"]["experimental_selector_matches_live_learned_choices"] is False
+    assert report["selector_findings"]["experimental_selector_preserves_expected_order"] is False
+    assert report["selector_findings"]["experimental_selector_preserves_learned_policy_tie"] is True
+    assert report["aggregate"]["any_selector_improves_over_lowest_visible_wait"] is False
+    assert report["aggregate"]["case_ids_where_experimental_selector_diverges_from_live_learned_choices"] == ["case"]
 
 
-def test_policy_replay_corpus_validation_rejects_packet_source_artifact_drift(tmp_path):
-    source_path, packet_source = _write_inputs(tmp_path)
+def test_selector_source_does_not_embed_current_corpus_branch_literals():
+    source = Path(experiment.__file__).read_text(encoding="utf-8")
+    stored_corpus = json.loads(experiment.DEFAULT_CORPUS_PATH.read_text(encoding="utf-8"))
+    forbidden = set()
+    for case in stored_corpus["cases"]:
+        forbidden.add(case["id"])
+        forbidden.add(case["scenario"])
+        for candidate in case["decision_packet"]["admissible_frontier"]:
+            forbidden.add(candidate["name"])
+            forbidden.add(candidate["target"])
+
+    assert all(value not in source for value in forbidden)
+
+
+def test_selector_experiment_rejects_invalid_packet_corpus_before_scoring(tmp_path):
+    source_path, _packet_source = _write_inputs(tmp_path)
     exported = corpus.export_corpus(source_manifest_path=source_path, results_root=tmp_path)
+    exported["cases"][0]["decision_packet"]["admissible_frontier"][0]["name"] = "drifted-route"
     corpus_path = tmp_path / "corpus.json"
     corpus_path.write_text(json.dumps(exported), encoding="utf-8")
-    packet_source.write_text(packet_source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
 
-    with pytest.raises(corpus.CorpusError, match="packet source hash mismatch"):
-        corpus.validate_corpus(
+    with pytest.raises(experiment.SelectorExperimentError, match="validation gate"):
+        experiment.run_selector_experiment(
             corpus_path=corpus_path,
             source_manifest_path=source_path,
             results_root=tmp_path,

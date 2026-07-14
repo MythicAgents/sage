@@ -4,6 +4,19 @@
   python -m ai.hillclimb null-model-factorial             # no lab or model calls
   python -m ai.hillclimb decision-benchmark run --dry-run  # no lab or model calls
   python -m ai.hillclimb operator-replay run --dry-run     # no lab or model calls
+  python -m ai.hillclimb policy-replay-selector-experiment # no lab or model calls
+  python -m ai.hillclimb policy-replay-unseen-candidate-evaluate # no lab or model calls
+  python -m ai.hillclimb policy-replay-hillclimb-iteration # no lab or model calls
+  python -m ai.hillclimb policy-replay-promotion-gate # no lab or model calls
+  python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
+  python -m ai.hillclimb target-value-census             # no lab or model calls
+  python -m ai.hillclimb target-value-proofability-screen # no lab or model calls
+  python -m ai.hillclimb target-value-runtime-decision    # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-late-blocker-contract-validate # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-late-blocker-authorization-audit # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-live-surface-validate --evidence <json> # no model calls
+  python -m ai.hillclimb gpo-dc-scope-canary-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb gpo-dc-scope-matrix-validate --results <jsonl> # no model calls
   python ai/hillclimb/__main__.py gate-experiment --dry-run
 
 A LIVE gate-experiment needs the GOAD lab (each config run through evals/harness.py, scored by
@@ -25,6 +38,19 @@ try:  # package import
     from . import operator_replay_benchmark
     from . import policy_replay_calibration
     from . import policy_replay_corpus
+    from . import policy_replay_selector_experiment
+    from . import policy_replay_unseen_candidate_evaluator
+    from . import policy_replay_hillclimb_iteration
+    from . import policy_replay_promotion_gate
+    from . import target_disambiguation_contract
+    from . import target_value_census
+    from . import target_value_proofability
+    from . import target_value_runtime_decision
+    from . import gpo_dc_scope_late_blocker_contract
+    from . import gpo_dc_scope_late_blocker_authorization
+    from . import gpo_dc_scope_live_surface
+    from . import gpo_dc_scope_canary
+    from . import gpo_dc_scope_matrix
     from . import frontier_census
     from . import purpose_range
     from . import replication_purpose_range
@@ -41,6 +67,19 @@ except Exception:  # script / sys.path import
     import operator_replay_benchmark  # type: ignore
     import policy_replay_calibration  # type: ignore
     import policy_replay_corpus  # type: ignore
+    import policy_replay_selector_experiment  # type: ignore
+    import policy_replay_unseen_candidate_evaluator  # type: ignore
+    import policy_replay_hillclimb_iteration  # type: ignore
+    import policy_replay_promotion_gate  # type: ignore
+    import target_disambiguation_contract  # type: ignore
+    import target_value_census  # type: ignore
+    import target_value_proofability  # type: ignore
+    import target_value_runtime_decision  # type: ignore
+    import gpo_dc_scope_late_blocker_contract  # type: ignore
+    import gpo_dc_scope_late_blocker_authorization  # type: ignore
+    import gpo_dc_scope_live_surface  # type: ignore
+    import gpo_dc_scope_canary  # type: ignore
+    import gpo_dc_scope_matrix  # type: ignore
     import frontier_census  # type: ignore
     import purpose_range  # type: ignore
     import replication_purpose_range  # type: ignore
@@ -304,6 +343,19 @@ def main(argv: list[str] | None = None) -> int:
     operator_replay_benchmark.add_cli(sub)
     policy_replay_calibration.add_cli(sub)
     policy_replay_corpus.add_cli(sub)
+    policy_replay_selector_experiment.add_cli(sub)
+    policy_replay_unseen_candidate_evaluator.add_cli(sub)
+    policy_replay_hillclimb_iteration.add_cli(sub)
+    policy_replay_promotion_gate.add_cli(sub)
+    target_disambiguation_contract.add_cli(sub)
+    target_value_census.add_cli(sub)
+    target_value_proofability.add_cli(sub)
+    target_value_runtime_decision.add_cli(sub)
+    gpo_dc_scope_late_blocker_contract.add_cli(sub)
+    gpo_dc_scope_late_blocker_authorization.add_cli(sub)
+    gpo_dc_scope_live_surface.add_cli(sub)
+    gpo_dc_scope_canary.add_cli(sub)
+    gpo_dc_scope_matrix.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)
