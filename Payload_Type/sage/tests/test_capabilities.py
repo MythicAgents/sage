@@ -547,7 +547,7 @@ def test_record_capability_result_requires_achieved_verdict_for_effect():
     hop = achieved_state.hops[0]
     assert hop.technique == "capability:gpo-controlled-system-exec"
     assert hop.effect == "system-exec:gpo:workstation-policy@lab.local"
-    assert hop.evidence["mythic_task_id"] == 4242
+    assert "mythic_task_id" not in hop.evidence  # lineage aliases require a boundary-owned proof envelope
 
 
 def test_recorded_grant_capability_unlocks_generic_dcsync():
@@ -599,8 +599,8 @@ def test_record_kerberos_context_accepts_callback_id_from_evidence():
     assert verification.verdict == "achieved"
     assert "kerberos-context:root.local@callback:13" in updated.achieved_effects()
     hop = updated.hops[-1]
-    assert hop.evidence["callback_id"] == "13"
-    assert hop.evidence["mythic_task_id"] == 416
+    assert "callback_id" not in hop.evidence  # callback still shaped the effect, but is not proof lineage
+    assert "mythic_task_id" not in hop.evidence
 
 
 def test_cross_domain_ensure_context_records_admin_coeffect_and_unlocks_dcsync():
@@ -759,7 +759,7 @@ def test_record_adcs_certificate_auth_current_context_records_specific_effect():
         "kerberos-context:essos.local@callback:2",
     ]
     assert hop.evidence["provenance"] == "current_context_preflight"
-    assert hop.evidence["mythic_task_id"] == 286
+    assert "mythic_task_id" not in hop.evidence
 
 
 def test_record_adcs_certificate_auth_ntlm_material_does_not_record_kerberos_context():

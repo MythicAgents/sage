@@ -11,11 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from . import credential_artifacts, engagement_state, intent_classifier
+    from . import credential_artifacts, engagement_state, intent_classifier, proof_boundary
 except ImportError:
     import credential_artifacts
     import engagement_state
     import intent_classifier
+    import proof_boundary
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,13 @@ class ReconciledTask:
     credential_material: tuple[dict[str, str], ...] = field(default_factory=tuple, repr=False)
 
 
-def reconcile_task(task: dict[str, Any], output: Any, now: str) -> ReconciledTask | None:
+def reconcile_task(
+    task: dict[str, Any],
+    output: Any,
+    now: str,
+    *,
+    engagement_id: str = "",
+) -> ReconciledTask | None:
     """Return a verified ledger record for a completed Mythic task, or None.
 
     Reconciliation imports achieved effects only. Failed/manual experiments are useful task history,
@@ -84,6 +91,18 @@ def reconcile_task(task: dict[str, Any], output: Any, now: str) -> ReconciledTas
         "reconciled_at": now,
         "result_preview": _preview(output),
     }
+    if engagement_id:
+        envelope = proof_boundary.make_runtime_task_envelope(
+            engagement_id=engagement_id,
+            callback_id=evidence["callback_id"],
+            task_id=task_id,
+            terminal_status=_terminal_status(task),
+            command=command,
+            verifier_id=f"task_reconciler:{technique}",
+            captured_at=now,
+            metadata={"reconciled": True},
+        )
+        evidence["proof_envelope"] = envelope.to_dict()
     material = _credential_material_for_record(technique, target, output)
     return ReconciledTask(
         technique=technique,
@@ -191,6 +210,13 @@ def _is_terminal(task: dict[str, Any]) -> bool:
         return True
     status = _text(task.get("status")).casefold()
     return status in {"success", "completed", "error", "failed"}
+
+
+def _terminal_status(task: dict[str, Any]) -> str:
+    status = _text(task.get("status")).casefold()
+    if status:
+        return status
+    return "completed" if task.get("completed") is True else ""
 
 
 def _operator_name(value: Any) -> str:

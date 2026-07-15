@@ -199,13 +199,21 @@ def test_controller_resume_executes_exact_approved_action_without_second_model_d
     assert len(calls) == 1
     assert calls[0][0]["name"] == action.name
     assert calls[0][0]["target"] == action.target
-    assert events == ["execute", "llm"]
-    assert "halted_no_action" in report
+    assert events == (["execute", "llm"] if policy_mode == "llm" else ["execute"])
+    if policy_mode == "llm":
+        assert "halted_no_action" in report
+    else:
+        # The static fake state does not record the blocked outcome, so branch-only Hybrid
+        # deterministically reaches the same singleton again and pauses for a fresh approval.
+        assert report == ""
     telemetry = m.controller_runtime_telemetry()
     assert telemetry["policy_mode"] == policy_mode
     assert telemetry["configured_policy_mode"] == policy_mode
     assert telemetry["policy_identity_valid"] is True
     assert telemetry["policy_switches"] == []
+    if policy_mode == "hybrid":
+        assert telemetry["kernel_singleton_count"] >= 1
+        assert telemetry["model_calls"] == 0
 
 
 def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry():
@@ -1573,6 +1581,182 @@ def test_eval_forced_capability_prefix_filters_until_release_on_failure(monkeypa
         "adcs-ca-private-key-export",
     ]
     assert model._eval_forced_capability_prefix_candidates(actions, blocked_export) == actions
+
+
+def test_eval_forced_exact_target_prefix_marks_label_only_intervention(monkeypatch):
+    from ai.langgraph import capabilities as cap
+
+    monkeypatch.setenv(
+        "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        json.dumps([{
+            "capability": "dcsync-account",
+            "exact_target": "domain=lab.local;account=krbtgt",
+            "intervention_id": "forced-exact-1",
+        }]),
+    )
+    selected = cap.CapabilityAction(name="dcsync-account", target="domain=lab.local;account=krbtgt")
+    alternate = cap.CapabilityAction(name="dcsync-account", target="domain=other.local;account=krbtgt")
+
+    result = model._eval_forced_capability_prefix_candidates([alternate, selected], es.EngagementState(objective="x"))
+
+    assert len(result) == 1
+    intervention = result[0].intent["eval_intervention"]
+    assert result[0].target == selected.target
+    assert intervention == {
+        "forced": True,
+        "intervention_id": "forced-exact-1",
+        "exact_target": selected.target,
+        "credit_policy_win": False,
+        "label_only": True,
+    }
+
+
+def test_eval_forced_exact_target_prefix_accepts_session_override_without_process_env(monkeypatch):
+    from ai.langgraph import capabilities as cap
+
+    monkeypatch.delenv("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON", raising=False)
+    selected = cap.CapabilityAction(name="dcsync-account", target="domain=lab.local;account=krbtgt")
+    alternate = cap.CapabilityAction(name="dcsync-account", target="domain=other.local;account=krbtgt")
+    raw_override = json.dumps([{
+        "capability": "dcsync-account",
+        "exact_target": selected.target,
+        "intervention_id": "session-forced-exact-1",
+    }])
+
+    result = model._eval_forced_capability_prefix_candidates(
+        [alternate, selected],
+        es.EngagementState(objective="x"),
+        raw_override=raw_override,
+    )
+
+    assert len(result) == 1
+    assert result[0].target == selected.target
+    assert result[0].intent["eval_intervention"]["intervention_id"] == "session-forced-exact-1"
+
+
+def test_eval_forced_exact_target_prefix_preserves_full_packet_frontier_while_overriding_execution(monkeypatch):
+    from ai.langgraph import capabilities as cap
+    from ai.langgraph import policy
+
+    monkeypatch.setenv("SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS", "1")
+    monkeypatch.setenv(
+        "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        json.dumps([{
+            "capability": "read-managed-local-admin-secret",
+            "exact_target": "account=user1;target=west-ops01;target_domain=west.hub.local;callback=2",
+            "intervention_id": "phase6-west-first-read",
+        }]),
+    )
+    east = cap.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="account=user1;target=east-ops01;target_domain=east.hub.local;callback=2",
+    )
+    west = cap.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="account=user1;target=west-ops01;target_domain=west.hub.local;callback=2",
+    )
+
+    frontier = model._eval_forced_capability_prefix_frontier(
+        [east, west],
+        es.EngagementState(objective="x"),
+    )
+    decision = asyncio.run(model._EvalForcedInterventionPolicy(policy.SymbolicPolicy()).select(
+        episode_id="episode-phase6",
+        objective="x",
+        state=es.EngagementState(objective="x"),
+        candidates=frontier,
+        history=[],
+    ))
+
+    assert [item.target for item in frontier] == [east.target, west.target]
+    assert "eval_intervention" not in frontier[0].intent
+    assert frontier[1].intent["eval_intervention"]["intervention_id"] == "phase6-west-first-read"
+    assert decision.selected_index == 1
+    assert decision.selected_target == west.target
+    assert decision.candidate_count == 2
+    assert decision.decision_owner == "forced_intervention"
+    assert decision.forced_intervention is True
+    assert decision.forced_policy_win_credit is False
+    assert decision.candidate_set_hash == policy.candidate_set_hash(frontier)
+    assert decision.ordered_frontier_hash == policy.ordered_frontier_hash(frontier)
+    assert [item["target"] for item in decision.decision_packet["admissible_frontier"]] == [
+        east.target,
+        west.target,
+    ]
+
+
+def test_controller_runtime_lineage_joins_task_event_and_persisted_proof():
+    from ai.langgraph import proof_boundary as pb
+
+    m = object.__new__(model.Model)
+    m._controller_runtime_telemetry = {}
+    m._controller_observed_transactions = [{
+        "transaction_id": "transaction-1",
+        "decision_id": "decision-1",
+        "policy_mode": "symbolic",
+        "callback_id": "7",
+        "child_tasks": [],
+        "verifier_ids": [],
+        "proof_envelope_ids": [],
+        "proof_lineage": [],
+    }]
+    m._controller_update_transaction_task_lineage({
+        "transaction_id": "transaction-1",
+        "task_id": "42",
+        "callback_id": "7",
+        "tool_name": "dcsync",
+        "status": "completed",
+        "terminal_status": "completed",
+    })
+
+    envelope = pb.make_runtime_task_envelope(
+        engagement_id="eng-1",
+        callback_id="7",
+        transaction_id="transaction-1",
+        task_id="42",
+        terminal_status="completed",
+        command="dcsync",
+        verifier_id="capability:dcsync-account",
+        captured_at="2026-07-14T00:00:00+00:00",
+    )
+    evidence, admission = pb.attach_proof({}, envelope, current_engagement_id="eng-1")
+    assert admission.admitted is True
+    hop = es.Hop(
+        id="hop-1",
+        technique="capability:dcsync-account",
+        target="domain=lab.local;account=krbtgt",
+        effect="krbtgt-hash:lab.local",
+        status="achieved",
+        evidence=evidence,
+        preconditions=[],
+        satisfied_effects=["krbtgt-hash:lab.local"],
+        source="test",
+        timestamp="2026-07-14T00:00:00+00:00",
+        proof_envelope=envelope.to_dict(),
+    )
+
+    class FakeMythic:
+        _engagement_hops = [hop]
+        _engagement_graph_facts = []
+
+        @staticmethod
+        def _eng_key():
+            return "eng-1"
+
+    m.mythic_client = FakeMythic()
+    m._controller_refresh_transaction_proof_lineage("transaction-1")
+
+    transaction = m._controller_observed_transactions[0]
+    assert transaction["child_tasks"] == [{
+        "task_id": "42",
+        "command": "dcsync",
+        "terminal_status": "completed",
+        "artifact_ids": [],
+    }]
+    assert transaction["verifier_ids"] == ["capability:dcsync-account"]
+    assert transaction["proof_envelope_ids"] == [envelope.hash]
+    assert transaction["proof_lineage"][0]["transaction_id"] == "transaction-1"
+    assert transaction["proof_lineage"][0]["admissible_for_runtime_achievement"] is True
 
 
 def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():

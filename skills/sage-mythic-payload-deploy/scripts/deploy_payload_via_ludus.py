@@ -47,6 +47,7 @@ DEFAULT_RUBEUS_PATH = REPO_ROOT / "Payload_Type" / "sage" / "tools" / "Rubeus.ex
 LUDUS_RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 LUDUS_MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"
 DEFAULT_LUDUS_MCP_SERVER = "ludus"
+DEFAULT_MANUAL_TASK_TRIGGER_YEARS = 10
 
 PAYLOAD_ATTRS = """
 id
@@ -491,6 +492,26 @@ def select_ludus_host(args: argparse.Namespace) -> dict[str, Any]:
         if all(str(needle).casefold() in haystack for needle in needles):
             return values
 
+    # Custom Ludus ranges often preserve generic inventory names (for example
+    # ``...-WS01``) even when the guest hostname is range-specific (for example
+    # ``HARBOR-WS01``). If the caller supplied an explicit target IP and the
+    # stricter host+IP match above failed, allow only one exact IP match as a
+    # deterministic fallback. This keeps custom range launches working without
+    # weakening selection when inventory names do contain the requested host.
+    target_ip = str(args.target_ip or "").strip().casefold()
+    if target_ip:
+        exact_ip_matches = [
+            values
+            for values in hosts.values()
+            if str(values.get("ansible_host") or "").strip().casefold() == target_ip
+        ]
+        if len(exact_ip_matches) == 1:
+            return exact_ip_matches[0]
+        if len(exact_ip_matches) > 1:
+            raise DeployError(
+                f"Multiple Ludus inventory hosts matched explicit target IP {args.target_ip!r}."
+            )
+
     rendered = [
         {"inventory_hostname": name, "ansible_host": values.get("ansible_host")}
         for name, values in sorted(hosts.items())
@@ -826,7 +847,7 @@ $taskName = {ps_quote(task)}
 $remotePath = {ps_quote(remote_path)}
 $runAsUser = {ps_quote(run_as_user)}
 $action = New-ScheduledTaskAction -Execute $remotePath
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears({DEFAULT_MANUAL_TASK_TRIGGER_YEARS})
 $principal = New-ScheduledTaskPrincipal -UserId $runAsUser -LogonType Interactive -RunLevel Limited
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
@@ -840,6 +861,7 @@ $registered = Get-ScheduledTask -TaskName $taskName
   State = $registered.State.ToString()
   LastTaskResult = $info.LastTaskResult
   LastRunTime = $info.LastRunTime
+  NextRunTime = $info.NextRunTime
 }} | ConvertTo-Json -Compress
 """
     result = run_ps(session, script)
@@ -1179,6 +1201,62 @@ async def wait_for_callback_checkin_advance(
         latest = await get_callbacks(client)
 
 
+def matching_advanced_callback_lanes(
+    rows: list[dict[str, Any]],
+    before_checkins: dict[int, Any],
+    *,
+    payload_type: str,
+    host: str,
+    user: str,
+) -> list[dict[str, Any]]:
+    """Return active matching callbacks that checked in after this launch began."""
+
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        display_id = row.get("display_id")
+        current = row.get("last_checkin")
+        row_payload_type = str(
+            ((row.get("payload") or {}).get("payloadtype") or {}).get("name") or ""
+        )
+        if (
+            isinstance(display_id, int)
+            and row.get("active") is True
+            and current
+            and current != before_checkins.get(display_id)
+            and row_payload_type.casefold() == payload_type.casefold()
+            and str(row.get("host") or "").casefold() == host.casefold()
+            and str(row.get("user") or "").casefold() == user.casefold()
+        ):
+            matches.append(row)
+    return sorted(matches, key=lambda row: int(row["display_id"]))
+
+
+async def wait_for_settled_callback_lanes(
+    client: Any,
+    before_checkins: dict[int, Any],
+    *,
+    payload_type: str,
+    host: str,
+    user: str,
+    seconds: int,
+    poll_interval: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Wait through a post-launch settle window and return matching live lanes."""
+
+    deadline = time.monotonic() + max(0, seconds)
+    latest = await get_callbacks(client)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(min(max(0.25, poll_interval), max(0.0, deadline - time.monotonic())))
+        latest = await get_callbacks(client)
+    return latest, matching_advanced_callback_lanes(
+        latest,
+        before_checkins,
+        payload_type=payload_type,
+        host=host,
+        user=user,
+    )
+
+
 async def command_list_payloads(args: argparse.Namespace) -> None:
     client = await mythic_login(args)
     rows = await list_payloads(client, args.payload_type, args.payload_limit)
@@ -1359,6 +1437,8 @@ async def command_deploy(args: argparse.Namespace) -> None:
 
 
 async def command_launch_existing(args: argparse.Namespace) -> None:
+    if args.require_unique_callback and args.callback_settle_seconds <= 0:
+        raise DeployError("--require-unique-callback requires --callback-settle-seconds > 0.")
     client = await mythic_login(args)
     callbacks_before = await get_callbacks(client)
     before_checkins = {
@@ -1388,6 +1468,19 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         seconds=args.wait_callbacks_seconds,
         poll_interval=args.poll_interval,
     )
+    settled_lanes: list[dict[str, Any]] = []
+    if callback and args.callback_settle_seconds > 0:
+        callbacks_after, settled_lanes = await wait_for_settled_callback_lanes(
+            client,
+            before_checkins,
+            payload_type=args.payload_type,
+            host=args.callback_host,
+            user=args.callback_user,
+            seconds=args.callback_settle_seconds,
+            poll_interval=args.poll_interval,
+        )
+        if len(settled_lanes) == 1:
+            callback = settled_lanes[0]
     disconnect = None
     if callback and args.disconnect_interactive_session:
         session_id = str((launch.get("interactive_session") or {}).get("session_id") or "")
@@ -1399,6 +1492,11 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         },
         "launch": launch,
         "callback": callback_identity(callback) if callback else None,
+        "callback_settle": {
+            "seconds": args.callback_settle_seconds,
+            "require_unique": args.require_unique_callback,
+            "matching_advanced_active_callbacks": [callback_identity(row) for row in settled_lanes],
+        },
         "interactive_session_disconnect": disconnect,
         "callbacks_after": [callback_identity(row) for row in callbacks_after],
     }
@@ -1407,6 +1505,11 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         raise DeployError(
             f"No {args.payload_type} callback check-in advanced on "
             f"{args.callback_host} as {args.callback_user} within {args.wait_callbacks_seconds}s."
+        )
+    if args.require_unique_callback and len(settled_lanes) != 1:
+        raise DeployError(
+            f"Expected exactly one settled active {args.payload_type} callback lane on "
+            f"{args.callback_host} as {args.callback_user}, observed {len(settled_lanes)}."
         )
 
 
@@ -1560,6 +1663,24 @@ def build_parser() -> argparse.ArgumentParser:
     relaunch_parser.add_argument("--callback-host", default="CASTELBLACK")
     relaunch_parser.add_argument("--callback-user", default="samwell.tarly")
     relaunch_parser.add_argument("--wait-callbacks-seconds", type=int, default=90)
+    relaunch_parser.add_argument(
+        "--callback-settle-seconds",
+        type=int,
+        default=0,
+        help=(
+            "After the first retained callback check-in, wait this many seconds before returning so delayed "
+            "duplicate foothold lanes can surface."
+        ),
+    )
+    relaunch_parser.add_argument(
+        "--require-unique-callback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fail closed unless the settle window ends with exactly one active matching callback lane that "
+            "checked in after launch began."
+        ),
+    )
     relaunch_parser.add_argument("--wait-interactive-session-seconds", type=int, default=120)
     relaunch_parser.add_argument("--disconnect-interactive-session", action=argparse.BooleanOptionalAction, default=True)
     relaunch_parser.add_argument("--poll-interval", type=float, default=3.0)

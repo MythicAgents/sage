@@ -17,6 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import mythic_tools  # noqa: E402
 import engagement_state as es  # noqa: E402
+import proof_boundary as pb  # noqa: E402
 from mythic_tools import MythicTools  # noqa: E402
 
 NOW = "2026-06-09T12:00:00Z"
@@ -146,3 +147,72 @@ def test_corroboration_facts_from_cred_store_and_graph():
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in facts  # chains gpo-abuse->dcsync IN THE GATE
     assert not any(p.startswith("generic-write:") for p in facts)    # never emit precondition prefixes
     assert "creds:empty@north.sevenkingdoms.local" not in facts      # no secret -> not corroborated
+
+
+def test_runtime_corroboration_admits_only_task_linked_credential_rows():
+    mt = _make_tools()
+    mt._cred_cache = [
+        {
+            "id": 91,
+            "account": "krbtgt",
+            "realm": "north.sevenkingdoms.local",
+            "credential_text": "deadbeef",
+            "task": {
+                "display_id": 450,
+                "status": "completed",
+                "completed": True,
+                "command_name": "dcsync",
+                "callback": {"display_id": 13},
+            },
+        },
+        {
+            "id": 92,
+            "account": "unbound",
+            "realm": "north.sevenkingdoms.local",
+            "credential_text": "x",
+        },
+    ]
+    mt._cred_cache_ts = NOW
+
+    facts = asyncio.run(mt._corroboration_facts(NOW))
+    by_predicate = {fact.predicate: fact for fact in facts}
+    state = es.EngagementState(
+        objective="x",
+        graph_facts=facts,
+        engagement_id=mt._eng_key(),
+        runtime_scope=True,
+    )
+
+    assert by_predicate["krbtgt-hash:north.sevenkingdoms.local"].proof_envelope["origin"] == pb.ORIGIN_MYTHIC_CREDENTIAL
+    assert by_predicate["creds:unbound@north.sevenkingdoms.local"].proof_envelope == {}
+    assert "krbtgt-hash:north.sevenkingdoms.local" in state.satisfied_predicates()
+    assert "creds:unbound@north.sevenkingdoms.local" not in state.satisfied_predicates()
+
+
+def test_corroboration_preserves_bloodhound_lineage_for_graph_derived_facts():
+    mt = _make_tools()
+    proof = pb.make_runtime_bloodhound_envelope(
+        engagement_id=mt._eng_key(),
+        callback_id="13",
+        task_id="451",
+        terminal_status="completed",
+        command="execute_assembly",
+        ingest_job_id="job-1",
+        ingest_status="complete",
+        source_artifact_id="file-1",
+        source_artifact_sha256="a" * 64,
+        verifier_id="test:bloodhound",
+        captured_at=NOW,
+    ).to_dict()
+    mt._cred_cache = []
+    mt._cred_cache_ts = NOW
+    mt._engagement_graph_facts = [
+        es.GraphFact("generic-write:gpo:starkwallpaper", "bloodhound:cypher", NOW, 600, proof),
+        es.GraphFact("gpo-domain:starkwallpaper:north.sevenkingdoms.local", "bloodhound:cypher", NOW, 600, proof),
+    ]
+
+    facts = asyncio.run(mt._corroboration_facts(NOW))
+    by_predicate = {fact.predicate: fact for fact in facts}
+
+    assert by_predicate["system:starkwallpaper"].proof_envelope == proof
+    assert by_predicate["gpo-domain:starkwallpaper:north.sevenkingdoms.local"].proof_envelope == proof

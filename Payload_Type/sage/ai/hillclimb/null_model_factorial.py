@@ -128,8 +128,11 @@ def _row_failures(row: dict[str, Any]) -> list[str]:
     executions = row["executed_capabilities"]
     failures: list[str] = []
 
-    expected_transactions = 1 if mode == policy.POLICY_SYMBOLIC else 0
-    expected_objective = mode == policy.POLICY_SYMBOLIC
+    # Phase 1 Hybrid v2 is branch-only: a singleton is kernel-owned and must
+    # execute even when the model seam is absent. Pure LLM still fails closed
+    # because it owns every nonempty frontier, including singletons.
+    expected_transactions = 0 if mode == policy.POLICY_LLM else 1
+    expected_objective = mode != policy.POLICY_LLM
     checks = {
         "policy identity": telemetry["policy_mode"] == mode
         and telemetry["configured_policy_mode"] == mode

@@ -14,19 +14,25 @@ than reinvented:
   * REPAIR-POLICY fitness (trajectory replay): `replay_repair_fitness` wraps `trajectory.replay.replay_score`
     — a pure offline scorer of whether a repair policy chooses the historically-correct repair.
 
-FRONTIER — NOT built here (Phase 3 / GEPA): scoring a NEW candidate's *capability* hermetically requires
-re-running the agent (with the candidate prompt) against a MOCKED Mythic that serves recorded/synthetic
-observations — `mock_mythic_candidate_eval` marks that seam. The mocking points are proven (construct the
-Model, set `MythicTools.client = object()`, patch module-level `mythic_tools.mythic.issue_task` /
-`waitfor_for_task_output` to serve deterministic tool results — the pattern test_circuit_breaker.py uses),
-but off-trajectory commands (a new prompt issuing actions the recording never saw) and replay ground-truth
-are open research problems and must not be shipped half-built — see spec Phase 3.
+FRONTIER — intentionally not built: the current completion plan supersedes the old
+mock-Mythic counterfactual assumption.  T0 may re-score recorded outcomes, but a novel
+candidate behavior is `unscorable_new_behavior` until separately authorized live T1.
+`mock_mythic_candidate_eval` remains a fail-closed compatibility stub so old callers
+cannot silently manufacture a favorable outcome.
 """
 from __future__ import annotations
 
 from typing import Any, Iterable, Sequence
 
 try:  # package import
+    from .experiment_contracts import (
+        AuthorizationBoundary,
+        EvalResult,
+        Measurement,
+        OUTCOME_DIAGNOSTIC_ONLY,
+        T0_TRIAGE_ONLY,
+        TypedVerdict,
+    )
     from .gate_experiment import build_scorecard_from_run
     from .fitness import ScoreCard, GAUGE_VERSION, to_scalar
     from ..trajectory.replay import replay_score
@@ -36,6 +42,14 @@ except Exception:  # script / sys.path import
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))          # hillclimb dir -> gate_experiment, fitness
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))      # ai dir -> trajectory PACKAGE (.schema resolves)
+    from experiment_contracts import (  # type: ignore
+        AuthorizationBoundary,
+        EvalResult,
+        Measurement,
+        OUTCOME_DIAGNOSTIC_ONLY,
+        T0_TRIAGE_ONLY,
+        TypedVerdict,
+    )
     from gate_experiment import build_scorecard_from_run  # type: ignore
     from fitness import ScoreCard, GAUGE_VERSION, to_scalar  # type: ignore
     from trajectory.replay import replay_score  # type: ignore
@@ -88,8 +102,10 @@ def replay_consistency(
 def replay_repair_fitness(train_records: Iterable, eval_records: Iterable) -> dict[str, Any]:
     """Hermetic repair-policy fitness over recorded transitions (wraps trajectory.replay.replay_score): does a
     frequency repair policy learned on `train_records` choose the historically-correct repair on `eval_records`?
-    Pure, deterministic, no lab. `*_records` are `trajectory.schema.TransitionRecord` (use schema.load_jsonl)."""
-    result = replay_score(list(train_records), list(eval_records))
+    Pure, deterministic, no lab. This legacy fitness wrapper is explicitly diagnostic: historical text exports
+    remain useful for smoke-testing repair retrieval, but Phase 3 never treats them as positive training evidence.
+    `*_records` are `trajectory.schema.TransitionRecord` (use schema.load_jsonl)."""
+    result = replay_score(list(train_records), list(eval_records), include_diagnostic=True)
     return {
         "total": result.total,
         "exact_repair_matches": result.exact_repair_matches,
@@ -112,6 +128,27 @@ def inner_eval_result(
     """Compose a SPEC §2.2-shaped inner-loop eval-result from a recorded run, hermetically — the record the
     future statistical acceptor (C6) consumes. tier=inner, mode=replay, cost zeroed (no live execution)."""
     card = score_recorded_run(harness_record, scenario, engagement_id=engagement_id, gauge_version=gauge_version)
+    result = EvalResult(
+        candidate_id=candidate_id,
+        tier="T0",
+        mode="replay",
+        disposition=T0_TRIAGE_ONLY,
+        outcome_source=OUTCOME_DIAGNOSTIC_ONLY,
+        measurement=Measurement(
+            reward_version=card.dense_reward_version,
+            t0_disposition=T0_TRIAGE_ONLY,
+        ),
+        typed_verdict=TypedVerdict(),
+        dense_reward=dict(card.dense_reward),
+        authorization_boundary=AuthorizationBoundary(
+            live_work_authorized=False,
+            operator_invocation_required=True,
+            controller_halted_before_live=True,
+            source_edits_authorized=False,
+            product_default_change_authorized=False,
+        ),
+        reason_codes=("t0_triage_only",),
+    )
     return {
         "candidate_id": candidate_id,
         "verifier_hash": card.verifier_hash,
@@ -127,17 +164,13 @@ def inner_eval_result(
         "ground_truth": {"furthest": card.furthest_milestone, "milestones": dict(card.milestones)},
         "cost": {"model_calls": 0, "tool_calls": 0, "tokens": 0, "wall_seconds": 0.0},
         "probe_disagreements": list(card.probe_disagreements),
+        "typed_eval_result": result.to_dict(),
     }
 
 
 def mock_mythic_candidate_eval(*_args, **_kwargs):
-    """FRONTIER (NOT IMPLEMENTED — spec Phase 3 / GEPA): hermetically score a NEW candidate's capability by
-    re-running the agent against a mocked Mythic serving recorded/synthetic observations. The mocking seam is
-    proven (construct Model; `MythicTools.client = object()`; patch `mythic_tools.mythic.issue_task` /
-    `waitfor_for_task_output`), but off-trajectory actions and replay ground-truth are unsolved and must not
-    ship half-built. Until then the optimizer's hermetic capability signal comes from `score_recorded_run`
-    over recorded runs; new-candidate capability is validated at the (expensive) live promotion gate."""
+    """Compatibility stub: novel behavior is unscorable until separately authorized live T1."""
     raise NotImplementedError(
-        "mock-Mythic candidate re-execution is the Phase-3/GEPA frontier — not implemented. Use "
-        "score_recorded_run for hermetic scoring of recorded runs; validate new candidates at the live gate."
+        "mock-Mythic counterfactual scoring is intentionally unsupported. Use score_recorded_run for recorded "
+        "outcomes; novel candidate behavior must return unscorable_new_behavior and wait for authorized live T1."
     )

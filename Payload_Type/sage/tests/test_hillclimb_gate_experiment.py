@@ -63,6 +63,35 @@ def test_single_verifier_hash_when_frozen():
     assert rep.verifier_hash.startswith("sha256:")  # one frozen gauge across all runs
 
 
+def test_gate_report_carries_candidate_surface_calibration_fields():
+    rep = gx.run_gate_experiment(
+        list(_ALIGNED),
+        goad_scenarios(),
+        gx.synthetic_runner(_ALIGNED),
+        seeds=1,
+        write_record=False,
+        candidate_surface="retrieval-v1",
+        t0_disposition="survived_triage",
+        t1_substrate_status="verified",
+        t2_anchor_present=True,
+        smallest_relevant_effect=0.2,
+        target_power=0.8,
+        achieved_power=0.9,
+        measured_noise=0.05,
+        mde=0.1,
+        bootstrap_samples=50,
+    )
+
+    assert rep.candidate_surface == "retrieval-v1"
+    assert rep.smallest_relevant_effect == 0.2
+    assert rep.target_power == 0.8
+    assert rep.rank_correlation_ci95 is not None
+    assert rep.readiness_decision in {
+        "auto_harness_not_ready",
+        "eligible_for_supervised_artifact_campaign",
+    }
+
+
 def test_build_scorecard_threads_live_probe_flag(monkeypatch):
     seen = []
     scn = goad_scenarios()[0]

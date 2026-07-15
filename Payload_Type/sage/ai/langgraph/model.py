@@ -5,7 +5,7 @@ import os
 import re
 import asyncio
 import aiosqlite
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from langgraph.graph import StateGraph, START, MessagesState, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -29,7 +29,7 @@ from mythic_container.MythicRPC import (
 )
 from typing import Any, Awaitable, Callable, Literal
 from typing_extensions import NotRequired
-from uuid import UUID
+from uuid import UUID, uuid4
 from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
 from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
@@ -718,7 +718,7 @@ class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(self, state, runtime):
-        connected = any("bloodhound" in s.lower() for s in MCPManager.get_connected_servers())
+        connected = any(MCPManager.is_bloodhound_server(s) for s in MCPManager.get_connected_servers())
         if connected:
             return None
         await self._model._notify_bloodhound_not_connected()
@@ -731,6 +731,18 @@ class _BloodHoundConnectionGuardMiddleware(AgentMiddleware):
         self._model._pending_guard_message = guard_msg
         logger.info("🩸 [bloodhound-guard] BloodHound MCP not connected → EventFeed notice + returning steps to user")
         return {"jump_to": "end", "messages": [guard_msg]}
+
+
+def _runtime_engagement_scope(mythic_client) -> tuple[str, bool]:
+    """Return strict runtime proof scope only for a real MythicTools-like client."""
+    try:
+        resolver = getattr(mythic_client, "_eng_key", None)
+        if not callable(resolver):
+            return "", False
+        engagement_id = str(resolver() or "").strip()
+        return (engagement_id, bool(engagement_id))
+    except Exception:
+        return "", False
 
 
 # Imperative directive paired with the observed-state block. A bare status LIST is informational; the
@@ -1693,7 +1705,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, policy_mode: str = "llm", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -1734,10 +1746,16 @@ class Model:
         self.mode = mode if mode in ("auto", "supervised") else "supervised"
         self._autonomous_solve = bool(autonomous_solve)
         try:
-            from .policy import normalize_policy_mode
+            from .policy import resolve_policy_mode
         except ImportError:
-            from policy import normalize_policy_mode
-        self.policy_mode = normalize_policy_mode(policy_mode)
+            from policy import resolve_policy_mode
+        self.policy_mode, inferred_resolution = resolve_policy_mode(policy_mode)
+        self._policy_mode_requested = str(policy_mode_requested or policy_mode or "")
+        self._policy_mode_resolution = str(policy_mode_resolution or inferred_resolution)
+        # Eval-only per-session override. Native chat executes inside the already-running Sage process,
+        # so post-reset exact-target fixtures cannot rely on the gauge subprocess environment reaching the
+        # controller. None preserves the legacy process-env behavior for headless and task-backed paths.
+        self._eval_force_capability_prefix_json = eval_force_capability_prefix_json
         self._policy_model_calls = 0
         self._policy_episode_id = ""
         self._controller_runtime_telemetry: dict[str, Any] = {}
@@ -2086,6 +2104,7 @@ class Model:
         """Render one boundary-owned Mythic or MCP lifecycle event."""
         if not isinstance(event, dict):
             return
+        self._controller_update_transaction_task_lineage(event)
         event_id = str(event.get("event_id") or "").strip()
         source = str(event.get("source") or "").strip().casefold()
         tool_name = str(event.get("tool_name") or event.get("command") or "").strip()
@@ -3427,11 +3446,14 @@ class Model:
                 objective = mythic_client._engagement_objective()
             except Exception:
                 objective = "sage-engagement"
+            engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
 
             return engagement_state.EngagementState(
                 objective=objective,
                 footholds=footholds,
                 hops=hops,
+                engagement_id=engagement_id,
+                runtime_scope=runtime_scope,
             )
         except Exception:
             return None
@@ -3459,10 +3481,12 @@ class Model:
                 objective = mythic_client._engagement_objective()
             except Exception:
                 objective = "sage-engagement"
+            engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
             # Include cached graph facts so durable-hop corroboration markers can be computed.
             graph_facts = list(getattr(mythic_client, "_engagement_graph_facts", []) or [])
             state = _es.EngagementState(
-                objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts
+                objective=objective, footholds=footholds, hops=hops, graph_facts=graph_facts,
+                engagement_id=engagement_id, runtime_scope=runtime_scope,
             )
             rendered = _es.render_engagement_state(state)
             if not rendered:
@@ -3498,11 +3522,14 @@ class Model:
                 objective = mythic_client._engagement_objective()
             except Exception:
                 objective = "sage-engagement"
+            engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
             return _es.EngagementState(
                 objective=objective,
                 footholds=footholds,
                 hops=hops,
                 graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+                engagement_id=engagement_id,
+                runtime_scope=runtime_scope,
             )
         except Exception:
             return None
@@ -3745,7 +3772,8 @@ class Model:
             return False
         if re.search(
             r"\b(?:do not|don't|never|avoid|stop|without)\b.{0,48}"
-            r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue)\b",
+            r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue|"
+            r"prov(?:e|ing)|demonstrat(?:e|ing)|establish(?:ing)?|remote[- ]exec(?:ution)?)\b",
             text,
         ):
             return False
@@ -3762,6 +3790,24 @@ class Model:
         # default-deny safety gate, over-declining a negated instruction is the safe direction.
         if re.match(r"^(?:do not|don'?t|never|no)\b", candidate):
             return False
+
+        # Effect-backed bounded remote-execution objectives are explicit objectives too. Reuse the same generic
+        # parser that completion uses instead of widening the gate with a host/topology regex. This keeps vague
+        # "prove" requests denied while allowing the sealed form "prove bounded remote execution on HOST".
+        try:
+            try:
+                from . import engagement_state as _es
+            except ImportError:
+                import engagement_state as _es
+            if _es._objective_remote_exec_targets(candidate) and re.search(
+                r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue|"
+                r"prove|demonstrate|establish)\b",
+                candidate,
+            ):
+                return True
+        except Exception:
+            pass
+
         if not re.search(
             r"\b(?:compromise|pwn|own|take over|achieve|obtain|gain|reach|escalate|continue)\b",
             candidate,
@@ -4266,11 +4312,11 @@ class Model:
         if self.llm is None:
             raise RuntimeError("configured LLM is unavailable")
         self._policy_model_calls = int(getattr(self, "_policy_model_calls", 0) or 0) + 1
-        if str(request.get("selection_contract") or "") == "admissible_frontier":
+        if str(request.get("selection_contract") or "") == "hybrid-full-frontier-v2":
             instruction = (
-                "Rank the supplied deterministic admissible frontier for the stated objective. Return JSON only. "
-                "Use disposition=select with candidate_index, or stop/ask. Do not invent candidates, commands, "
-                "or additional steps."
+                "Choose exactly one candidate from the supplied complete deterministic admissible frontier for "
+                "the stated objective. Return JSON only. Use disposition=select with candidate_id, or stop/ask. "
+                "Do not invent candidates, commands, or additional steps."
             )
         else:
             instruction = (
@@ -4358,12 +4404,23 @@ class Model:
         capability: str,
         target: str,
         decision: Any | None,
+        callback_id: str = "",
+        parent_transaction_id: str = "",
     ) -> dict[str, Any]:
         """Record only authorized semantic moves, before the side-effecting seam starts."""
         data = {
+            "transaction_id": f"transaction-{uuid4().hex}",
+            "parent_transaction_id": str(parent_transaction_id or ""),
             "kind": str(kind or ""),
             "capability": str(capability or ""),
             "target": str(target or ""),
+            "callback_id": str(callback_id or ""),
+            "child_tasks": [],
+            "verifier_ids": [],
+            "proof_envelope_ids": [],
+            "proof_lineage": [],
+            "wait_count": 0,
+            "retry_count": 0,
             **self._controller_decision_dict(decision),
         }
         observed = list(getattr(self, "_controller_observed_transactions", []) or [])
@@ -4371,6 +4428,160 @@ class Model:
         self._controller_observed_transactions = observed
         self._controller_refresh_runtime_policy_telemetry()
         return data
+
+    def _controller_update_transaction_task_lineage(self, event: dict[str, Any]) -> None:
+        """Join one observed Mythic task lifecycle event onto its semantic transaction."""
+        if not isinstance(event, dict):
+            return
+        transaction_id = str(event.get("transaction_id") or "").strip()
+        task_id = str(event.get("task_id") or "").strip()
+        if not transaction_id or not task_id:
+            return
+        status = str(event.get("status") or "").strip().casefold()
+        terminal_status = str(event.get("terminal_status") or "").strip().casefold()
+        if not terminal_status and status not in {"", "started"}:
+            terminal_status = "completed" if status == "completed" else "failed"
+        command = str(event.get("tool_name") or event.get("command") or "").strip()
+        callback_id = str(event.get("callback_id") or "").strip()
+        observed = list(getattr(self, "_controller_observed_transactions", []) or [])
+        changed = False
+        for transaction in observed:
+            if str(transaction.get("transaction_id") or "") != transaction_id:
+                continue
+            if callback_id and not str(transaction.get("callback_id") or ""):
+                transaction["callback_id"] = callback_id
+                changed = True
+            child_tasks = list(transaction.get("child_tasks") or [])
+            existing = next(
+                (item for item in child_tasks if str(item.get("task_id") or "") == task_id),
+                None,
+            )
+            if existing is None:
+                existing = {
+                    "task_id": task_id,
+                    "command": command,
+                    "terminal_status": terminal_status,
+                    "artifact_ids": [],
+                }
+                child_tasks.append(existing)
+                changed = True
+            else:
+                if command and str(existing.get("command") or "") != command:
+                    existing["command"] = command
+                    changed = True
+                if terminal_status and str(existing.get("terminal_status") or "") != terminal_status:
+                    existing["terminal_status"] = terminal_status
+                    changed = True
+            transaction["child_tasks"] = child_tasks
+            break
+        if changed:
+            self._controller_observed_transactions = observed
+            self._controller_refresh_runtime_policy_telemetry()
+
+    @staticmethod
+    def _controller_proof_lineage_row(proof: dict[str, Any], evidence: dict[str, Any], engagement_id: str) -> dict[str, Any]:
+        """Return one exact proof join row from a persisted hop/fact proof envelope."""
+        if not isinstance(proof, dict) or not proof:
+            return {}
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+        envelope = proof_boundary.ProofEnvelope.from_dict(proof)
+        if envelope is None or not envelope.transaction_id:
+            return {}
+        admission = proof_boundary.admit_runtime_envelope(
+            envelope,
+            current_engagement_id=str(engagement_id or ""),
+        )
+        proof_id = str(evidence.get("proof_hash") or "").strip() if isinstance(evidence, dict) else ""
+        if not proof_id:
+            proof_id = envelope.hash
+        return {
+            "proof_envelope_id": proof_id,
+            "transaction_id": envelope.transaction_id,
+            "task_id": envelope.task_id,
+            "verifier_id": envelope.verifier_id,
+            "verifier_hash": envelope.verifier_hash,
+            "scope": envelope.scope,
+            "origin": envelope.origin,
+            "admissible_for_runtime_achievement": admission.admitted,
+        }
+
+    def _controller_refresh_transaction_proof_lineage(self, transaction_id: str = "") -> None:
+        """Join persisted verifier/proof rows back onto their semantic transactions."""
+        observed = list(getattr(self, "_controller_observed_transactions", []) or [])
+        if not observed:
+            return
+        client = getattr(self, "mythic_client", None)
+        if client is None:
+            return
+        engagement_id = ""
+        try:
+            engagement_id = str(client._eng_key() or "")
+        except Exception:
+            engagement_id = ""
+        sources = [
+            *list(getattr(client, "_engagement_hops", []) or []),
+            *list(getattr(client, "_engagement_graph_facts", []) or []),
+        ]
+        changed = False
+        for source in sources:
+            evidence = getattr(source, "evidence", {}) if isinstance(getattr(source, "evidence", {}), dict) else {}
+            proof = getattr(source, "proof_envelope", {}) or evidence.get("proof_envelope") or {}
+            row = self._controller_proof_lineage_row(proof, evidence, engagement_id)
+            if not row:
+                continue
+            if transaction_id and row["transaction_id"] != transaction_id:
+                continue
+            for transaction in observed:
+                if str(transaction.get("transaction_id") or "") != row["transaction_id"]:
+                    continue
+                child_tasks = list(transaction.get("child_tasks") or [])
+                child_task = next(
+                    (item for item in child_tasks if str(item.get("task_id") or "") == row["task_id"]),
+                    None,
+                )
+                if row["task_id"] and child_task is None:
+                    child_task = {
+                        "task_id": row["task_id"],
+                        "command": str(proof.get("command") or ""),
+                        "terminal_status": str(proof.get("terminal_status") or ""),
+                        "artifact_ids": [str(proof.get("artifact_id"))] if proof.get("artifact_id") else [],
+                    }
+                    child_tasks.append(child_task)
+                    transaction["child_tasks"] = child_tasks
+                    changed = True
+                elif child_task is not None and proof.get("artifact_id"):
+                    artifact_ids = list(child_task.get("artifact_ids") or [])
+                    artifact_id = str(proof.get("artifact_id") or "")
+                    if artifact_id and artifact_id not in artifact_ids:
+                        artifact_ids.append(artifact_id)
+                        child_task["artifact_ids"] = artifact_ids
+                        transaction["child_tasks"] = child_tasks
+                        changed = True
+                verifier_ids = list(transaction.get("verifier_ids") or [])
+                if row["verifier_id"] and row["verifier_id"] not in verifier_ids:
+                    verifier_ids.append(row["verifier_id"])
+                    transaction["verifier_ids"] = verifier_ids
+                    changed = True
+                proof_ids = list(transaction.get("proof_envelope_ids") or [])
+                if row["proof_envelope_id"] and row["proof_envelope_id"] not in proof_ids:
+                    proof_ids.append(row["proof_envelope_id"])
+                    transaction["proof_envelope_ids"] = proof_ids
+                    changed = True
+                proof_lineage = list(transaction.get("proof_lineage") or [])
+                if row["proof_envelope_id"] and not any(
+                    str(item.get("proof_envelope_id") or "") == row["proof_envelope_id"]
+                    for item in proof_lineage
+                ):
+                    proof_lineage.append(row)
+                    transaction["proof_lineage"] = proof_lineage
+                    changed = True
+                break
+        if changed:
+            self._controller_observed_transactions = observed
+            self._controller_refresh_runtime_policy_telemetry()
 
     @staticmethod
     def _controller_policy_switches(
@@ -4404,6 +4615,12 @@ class Model:
             return {}
         decisions = list(getattr(self, "_controller_observed_decisions", []) or [])
         transactions = list(getattr(self, "_controller_observed_transactions", []) or [])
+        proof_lineage = [
+            dict(item)
+            for transaction in transactions
+            for item in list(transaction.get("proof_lineage") or [])
+            if isinstance(item, dict)
+        ]
         policy_mode = str(telemetry.get("configured_policy_mode") or getattr(self, "policy_mode", "") or "")
         effective_backend_requests = self._controller_effective_backend_requests(decisions)
         effective_backends = sorted({
@@ -4413,6 +4630,24 @@ class Model:
         })
         model_calls = int(getattr(self, "_policy_model_calls", 0) or 0)
         policy_switches = self._controller_policy_switches(policy_mode, decisions, transactions)
+        branch_opportunity_count = sum(int(item.get("branch_opportunity_count") or 0) for item in decisions)
+        model_owned_decision_count = sum(int(item.get("model_owned_decision_count") or 0) for item in decisions)
+        model_owned_branch_count = sum(
+            1
+            for item in decisions
+            if str(item.get("decision_owner") or "") == "model_branch"
+            and int(item.get("branch_opportunity_count") or 0) > 0
+        )
+        kernel_singleton_count = sum(int(item.get("kernel_singleton_count") or 0) for item in decisions)
+        causally_decisive_decision_count = sum(
+            int(item.get("causally_decisive_decision_count") or 0)
+            for item in decisions
+        )
+        decision_owner_counts: dict[str, int] = {}
+        for item in decisions:
+            owner = str(item.get("decision_owner") or "")
+            if owner:
+                decision_owner_counts[owner] = decision_owner_counts.get(owner, 0) + 1
         authorized = sum(
             1
             for item in transactions
@@ -4435,8 +4670,19 @@ class Model:
             "semantic_transaction_count": len(transactions),
             "authorized_transaction_count": authorized,
             "semantic_policy_coverage": authorized / len(transactions) if transactions else 1.0,
+            "branch_opportunity_count": branch_opportunity_count,
+            "model_owned_decision_count": model_owned_decision_count,
+            "kernel_singleton_count": kernel_singleton_count,
+            "model_branch_coverage": (
+                model_owned_branch_count / branch_opportunity_count
+                if branch_opportunity_count
+                else 0.0
+            ),
+            "causally_decisive_decision_count": causally_decisive_decision_count,
+            "decision_owner_counts": decision_owner_counts,
             "decisions": decisions,
             "transactions": transactions,
+            "proof_lineage": proof_lineage,
         })
         if status is not None:
             telemetry["controller_status"] = status
@@ -4543,12 +4789,16 @@ class Model:
                     operator_message=self._controller_selected_action_progress(payload, inputs),
                 )
             await self._require_controller_hitl_approval(pending)
-            self._controller_record_semantic_transaction(
+            transaction = self._controller_record_semantic_transaction(
                 kind="capability",
                 capability=str(payload.get("name") or ""),
                 target=str(payload.get("target") or ""),
                 decision=decision_context,
+                callback_id=str(inputs.get("callback_id") or ""),
             )
+            inputs["transaction_id"] = transaction["transaction_id"]
+            payload["intent"] = dict(payload.get("intent") or {})
+            payload["intent"]["transaction_id"] = transaction["transaction_id"]
             capability_name = str(payload.get("name") or "capability")
             target = str(payload.get("target") or "").strip()
             activity = await self._open_execution_activity(
@@ -4572,6 +4822,7 @@ class Model:
                     ),
                 )
                 result = await self.mythic_client.execute_capability(payload, inputs)
+                self._controller_refresh_transaction_proof_lineage(transaction["transaction_id"])
                 kind = type(result).__name__
                 size = len(result) if isinstance(result, str) else "n/a"
                 fire(
@@ -4597,9 +4848,10 @@ class Model:
                 )
 
         def policy_frontier(state):
-            return _eval_forced_capability_prefix_candidates(
+            return _eval_forced_capability_prefix_frontier(
                 _autonomous_policy_candidates(_cap.actions_from_state(state)),
                 state,
+                raw_override=getattr(self, "_eval_force_capability_prefix_json", None),
             )
 
         def needs_collection(state):
@@ -4645,11 +4897,12 @@ class Model:
                     operator_message=self._controller_collection_selection_progress(request),
                 )
             await self._require_controller_hitl_approval(pending)
-            self._controller_record_semantic_transaction(
+            transaction = self._controller_record_semantic_transaction(
                 kind="collection",
                 capability="collect-graph",
                 target=str(getattr(request, "collection_key", "") or ""),
                 decision=decision_context,
+                callback_id=str(getattr(request, "callback_id", "") or ""),
             )
             activity = await self._open_execution_activity(
                 "Collection",
@@ -4670,8 +4923,10 @@ class Model:
                         "capability": "collect-graph",
                         "purpose": str(getattr(request, "reason", "") or ""),
                         "policy_decision": decision_context,
+                        "transaction_id": transaction["transaction_id"],
                     })
                 result = await self._controller_collect(state, request=request)
+                self._controller_refresh_transaction_proof_lineage(transaction["transaction_id"])
                 return result
             except BaseException:
                 activity_status = "error"
@@ -4724,11 +4979,15 @@ class Model:
             self._policy_model_calls = 0
             self._controller_observed_decisions = []
             self._controller_observed_transactions = []
-        policy_mode = _policy.normalize_policy_mode(
+        policy_mode, inferred_policy_mode_resolution = _policy.resolve_policy_mode(
             getattr(self, "policy_mode", _policy.POLICY_SYMBOLIC),
             default=_policy.POLICY_SYMBOLIC,
         )
         self.policy_mode = policy_mode
+        if not str(getattr(self, "_policy_mode_resolution", "") or ""):
+            self._policy_mode_resolution = inferred_policy_mode_resolution
+        if not str(getattr(self, "_policy_mode_requested", "") or ""):
+            self._policy_mode_requested = str(getattr(self, "policy_mode", "") or "")
         if policy_mode == _policy.POLICY_SYMBOLIC:
             policy_backend = _policy.SymbolicPolicy()
         else:
@@ -4742,6 +5001,7 @@ class Model:
                     kind = str(approved_pending.get("kind") or "")
                     args = approved_pending.get("args") if isinstance(approved_pending.get("args"), dict) else {}
                     match_index = None
+                    match_candidate_id = ""
                     if kind == "capability":
                         approved = args.get("capability") if isinstance(args.get("capability"), dict) else {}
                         if policy_mode == _policy.POLICY_LLM:
@@ -4765,6 +5025,7 @@ class Model:
                                 and list(candidate.get("effects") or []) == list(approved.get("effects") or [])
                             ):
                                 match_index = candidate.get("index")
+                                match_candidate_id = str(candidate.get("candidate_id") or "")
                                 break
                     elif kind == "collection":
                         collection_key = str(args.get("collection_key") or "")
@@ -4786,6 +5047,7 @@ class Model:
                                 and str(candidate.get("target") or "") == collection_key
                             ):
                                 match_index = candidate.get("index")
+                                match_candidate_id = str(candidate.get("candidate_id") or "")
                                 break
                     if isinstance(match_index, int):
                         if policy_mode == _policy.POLICY_LLM:
@@ -4802,7 +5064,17 @@ class Model:
                             }
                         return {
                             "disposition": "select",
-                            "candidate_index": match_index,
+                            "candidate_id": match_candidate_id,
+                            "rationale": "resume the exact operator-approved action after deterministic revalidation",
+                            "confidence": 1.0,
+                            "expected_evidence": "the approved capability's declared effects",
+                            "_policy_model_response_observed": False,
+                            "_policy_replay_decision": self._controller_pending_policy_decision(approved_pending),
+                        }
+                    if policy_mode == _policy.POLICY_HYBRID and match_candidate_id:
+                        return {
+                            "disposition": "select",
+                            "candidate_id": match_candidate_id,
                             "rationale": "resume the exact operator-approved action after deterministic revalidation",
                             "confidence": 1.0,
                             "expected_evidence": "the approved capability's declared effects",
@@ -4827,10 +5099,13 @@ class Model:
                 model_id=getattr(self, "model", ""),
                 catalog=_cap.capability_catalog() if policy_mode == _policy.POLICY_LLM else None,
             )
+        policy_backend = _EvalForcedInterventionPolicy(policy_backend)
         self._controller_runtime_telemetry = {
             "episode_id": self._policy_episode_id,
             "policy_mode": str(getattr(policy_backend, "mode", "") or ""),
             "configured_policy_mode": policy_mode,
+            "policy_mode_requested": str(getattr(self, "_policy_mode_requested", "") or ""),
+            "policy_mode_resolution": str(getattr(self, "_policy_mode_resolution", "") or ""),
             "policy_identity_valid": True,
             "policy_switches": [],
             "model_provider": str(getattr(self, "provider", "") or ""),
@@ -4849,6 +5124,12 @@ class Model:
             "semantic_transaction_count": 0,
             "authorized_transaction_count": 0,
             "semantic_policy_coverage": 1.0,
+            "branch_opportunity_count": 0,
+            "model_owned_decision_count": 0,
+            "kernel_singleton_count": 0,
+            "model_branch_coverage": 0.0,
+            "causally_decisive_decision_count": 0,
+            "decision_owner_counts": {},
         }
         if resumed_after_approval:
             start_progress = (
@@ -4897,6 +5178,8 @@ class Model:
             "episode_id": result.episode_id,
             "policy_mode": result.policy_mode,
             "configured_policy_mode": policy_mode,
+            "policy_mode_requested": str(getattr(self, "_policy_mode_requested", "") or ""),
+            "policy_mode_resolution": str(getattr(self, "_policy_mode_resolution", "") or ""),
             "policy_identity_valid": True,
             "policy_switches": [],
             "model_provider": str(getattr(self, "provider", "") or ""),
@@ -4915,6 +5198,12 @@ class Model:
             "semantic_transaction_count": 0,
             "authorized_transaction_count": 0,
             "semantic_policy_coverage": 1.0,
+            "branch_opportunity_count": 0,
+            "model_owned_decision_count": 0,
+            "kernel_singleton_count": 0,
+            "model_branch_coverage": 0.0,
+            "causally_decisive_decision_count": 0,
+            "decision_owner_counts": {},
         }
         self._controller_refresh_runtime_policy_telemetry(
             status=result.status,
@@ -5858,7 +6147,7 @@ class Model:
 
         # Scope to the BloodHound MCP server's tools only (file_upload, domain_info, data_quality,
         # graph_analysis, cypher_query, adcs_info, etc.) — match by name so case/registration variants work.
-        bh_servers = [s for s in MCPManager.get_connected_servers() if "bloodhound" in s.lower()]
+        bh_servers = [s for s in MCPManager.get_connected_servers() if MCPManager.is_bloodhound_server(s)]
         mcp_tools = []
         for s in bh_servers:
             mcp_tools += MCPManager.get_tools_by_server(s)
@@ -5911,7 +6200,7 @@ class Model:
             self.state["mcp_manager_messages"].append(SystemMessage(content=prompt))
 
         # All connected MCP servers EXCEPT BloodHound (owned by the dedicated BloodHound agent).
-        other_servers = [s for s in MCPManager.get_connected_servers() if "bloodhound" not in s.lower()]
+        other_servers = [s for s in MCPManager.get_connected_servers() if not MCPManager.is_bloodhound_server(s)]
         mcp_tools = []
         for s in other_servers:
             mcp_tools += MCPManager.get_tools_by_server(s)
@@ -7590,11 +7879,14 @@ def _deterministic_post_ingest_owner(mythic_client) -> _HandoffDirective | None:
         except ImportError:
             import capabilities
             import engagement_state as _es
+        engagement_id, runtime_scope = _runtime_engagement_scope(mythic_client)
         snapshot = _es.EngagementState(
             objective=mythic_client._engagement_objective(),
             footholds=list(getattr(mythic_client, "_engagement_footholds", []) or []),
             hops=list(getattr(mythic_client, "_engagement_hops", []) or []),
             graph_facts=list(getattr(mythic_client, "_engagement_graph_facts", []) or []),
+            engagement_id=engagement_id,
+            runtime_scope=runtime_scope,
         )
         if capabilities.actions_from_state(snapshot):
             return None
@@ -8281,9 +8573,18 @@ def _autonomous_policy_candidates(actions: list[Any]) -> list[Any]:
     ]
 
 
-def _eval_forced_capability_prefix_candidates(actions: list[Any], state: Any) -> list[Any]:
+def _eval_forced_capability_prefix_candidates(
+    actions: list[Any],
+    state: Any,
+    *,
+    raw_override: str | None = None,
+) -> list[Any]:
     """Restrict an eval run to one declared capability prefix until it completes or releases."""
-    raw = str(os.environ.get("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON") or "").strip()
+    raw = str(
+        raw_override
+        if raw_override is not None
+        else os.environ.get("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON") or ""
+    ).strip()
     if not raw:
         return list(actions or [])
     try:
@@ -8300,13 +8601,34 @@ def _eval_forced_capability_prefix_candidates(actions: list[Any], state: Any) ->
     def _matches(value: Any, spec: dict[str, Any]) -> bool:
         if _name(getattr(value, "name", None) or getattr(value, "technique", "")) != _name(spec.get("capability")):
             return False
+        exact_target = str(spec.get("exact_target") or spec.get("target") or "").strip()
+        target = str(getattr(value, "target", "") or "").strip()
+        if exact_target and target != exact_target:
+            return False
         target_contains = str(spec.get("target_contains") or "").strip().casefold()
-        target = str(getattr(value, "target", "") or "").strip().casefold()
-        return not target_contains or target_contains in target
+        target_cf = target.casefold()
+        return not target_contains or target_contains in target_cf
+
+    def _annotate_exact_intervention(value: Any, spec: dict[str, Any], index: int) -> Any:
+        exact_target = str(spec.get("exact_target") or spec.get("target") or "").strip()
+        if not exact_target:
+            return value
+        intent = getattr(value, "intent", {}) if isinstance(getattr(value, "intent", {}), dict) else {}
+        intervention = {
+            "forced": True,
+            "intervention_id": str(spec.get("intervention_id") or f"forced-prefix-{index}"),
+            "exact_target": exact_target,
+            "credit_policy_win": False,
+            "label_only": True,
+        }
+        try:
+            return replace(value, intent={**dict(intent), "eval_intervention": intervention})
+        except Exception:
+            return value
 
     hops = list(getattr(state, "hops", []) or [])
     candidates = list(actions or [])
-    for spec in decoded:
+    for index, spec in enumerate(decoded):
         if not isinstance(spec, dict) or not _name(spec.get("capability")):
             continue
         if any(_matches(hop, spec) and str(getattr(hop, "status", "") or "").strip().casefold() == "achieved" for hop in hops):
@@ -8317,8 +8639,137 @@ def _eval_forced_capability_prefix_candidates(actions: list[Any], state: Any) ->
             for hop in hops
         ):
             continue
-        return [action for action in candidates if _matches(action, spec)]
+        matched = [action for action in candidates if _matches(action, spec)]
+        if str(spec.get("exact_target") or spec.get("target") or "").strip() and len(matched) == 1:
+            return [_annotate_exact_intervention(matched[0], spec, index)]
+        return matched
     return candidates
+
+
+def _eval_exact_target_intervention(value: Any) -> dict[str, Any]:
+    """Return one valid exact-target eval intervention attached to a candidate, if present."""
+    intent = getattr(value, "intent", {}) if isinstance(getattr(value, "intent", {}), dict) else {}
+    intervention = intent.get("eval_intervention")
+    intervention = intervention if isinstance(intervention, dict) else {}
+    exact_target = str(intervention.get("exact_target") or "").strip()
+    if (
+        intervention.get("forced") is not True
+        or intervention.get("credit_policy_win") is not False
+        or not exact_target
+        or exact_target != str(getattr(value, "target", "") or "").strip()
+    ):
+        return {}
+    return intervention
+
+
+def _eval_same_capability_action(left: Any, right: Any) -> bool:
+    """Return whether two action objects name the same executable semantic action."""
+    return (
+        str(getattr(left, "name", "") or "") == str(getattr(right, "name", "") or "")
+        and str(getattr(left, "target", "") or "") == str(getattr(right, "target", "") or "")
+        and list(getattr(left, "preconditions", None) or []) == list(getattr(right, "preconditions", None) or [])
+        and list(getattr(left, "effects", None) or []) == list(getattr(right, "effects", None) or [])
+    )
+
+
+def _eval_forced_capability_prefix_frontier(
+    actions: list[Any],
+    state: Any,
+    *,
+    raw_override: str | None = None,
+) -> list[Any]:
+    """Preserve the pre-intervention frontier for exact-target forced eval rows.
+
+    Legacy prefix fixtures use `target_contains` to narrow the actual frontier and keep
+    their historical behavior. Phase 6 exact-target rows need a different contract:
+    the policy packet must still contain the real admissible frontier, while the
+    executed action is a label-only forced intervention. The existing prefix helper
+    already identifies and annotates that one exact action; this function only
+    re-inserts the annotation into the original frontier before policy capture.
+    """
+    candidates = list(actions or [])
+    filtered = _eval_forced_capability_prefix_candidates(
+        candidates,
+        state,
+        raw_override=raw_override,
+    )
+    if len(filtered) != 1 or not _eval_exact_target_intervention(filtered[0]):
+        return filtered
+    forced = filtered[0]
+    replaced = False
+    frontier: list[Any] = []
+    for candidate in candidates:
+        if not replaced and _eval_same_capability_action(candidate, forced):
+            frontier.append(forced)
+            replaced = True
+        else:
+            frontier.append(candidate)
+    return frontier if replaced else filtered
+
+
+def _eval_forced_intervention_index(candidates: list[Any]) -> int | None:
+    """Return the unique exact-target intervention index in one policy frontier."""
+    matches = [
+        index
+        for index, candidate in enumerate(candidates or [])
+        if _eval_exact_target_intervention(candidate)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _eval_apply_forced_intervention_decision(decision: Any, candidates: list[Any]) -> Any:
+    """Override only execution selection for an exact-target eval intervention.
+
+    The delegated policy still builds the packet/hash from the full pre-intervention
+    frontier. This replacement updates only the selected action lineage and marks it
+    as non-creditable forced execution.
+    """
+    forced_index = _eval_forced_intervention_index(candidates)
+    if decision is None or forced_index is None:
+        return decision
+    try:
+        from . import policy as _policy
+    except ImportError:
+        import policy as _policy
+    selected = candidates[forced_index]
+    identity_fields = _policy._decision_identity_fields(
+        mode=str(getattr(decision, "policy_mode", "") or ""),
+        selection_contract=str(getattr(decision, "selection_contract", "") or ""),
+        candidates=list(candidates or []),
+        selected_index=forced_index,
+        decision_owner="forced_intervention",
+    )
+    return replace(
+        decision,
+        disposition="select",
+        selected_index=forced_index,
+        selected_capability=str(getattr(selected, "name", "") or ""),
+        selected_target=str(getattr(selected, "target", "") or ""),
+        rationale="exact-target eval intervention overrides policy selection; no policy-win credit",
+        candidate_count=len(candidates or []),
+        selected_family=_policy.capability_family(getattr(selected, "name", "")),
+        selected_is_first_admissible=forced_index == 0,
+        **identity_fields,
+    )
+
+
+class _EvalForcedInterventionPolicy:
+    """Eval-only policy wrapper that separates packet capture from forced execution."""
+
+    def __init__(self, delegate: Any):
+        self._delegate = delegate
+        self.mode = str(getattr(delegate, "mode", "") or "")
+        self.selection_contract = str(getattr(delegate, "selection_contract", "") or "")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def select(self, **kwargs: Any) -> Any:
+        decision = await self._delegate.select(**kwargs)
+        return _eval_apply_forced_intervention_decision(
+            decision,
+            list(kwargs.get("candidates") or []),
+        )
 
 
 def _autonomous_capability_inputs(action: Any, engagement_snapshot: Any) -> dict[str, Any]:

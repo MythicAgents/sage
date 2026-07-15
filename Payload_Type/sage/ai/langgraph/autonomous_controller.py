@@ -33,6 +33,7 @@ import inspect
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from uuid import uuid4
 
 try:
     from . import capabilities as cap
@@ -218,8 +219,38 @@ def _decision_transaction_fields(decision: Any | None) -> dict[str, Any]:
         "effective_model_provider",
         "effective_model_id",
         "backend_provenance_source",
+        "policy_version",
+        "selection_contract",
+        "selection_contract_hash",
+        "decision_owner",
+        "semantic_candidate_ids",
+        "candidate_set_hash",
+        "ordered_frontier_hash",
+        "selected_candidate_id",
+        "symbolic_counterfactual_candidate_id",
+        "forced_intervention",
+        "intervention_id",
+        "forced_policy_win_credit",
     )
     return {key: data.get(key) for key in keys if key in data}
+
+
+def _transaction_record(kind: str, capability: str, target: str, decision: Any | None) -> dict[str, Any]:
+    return {
+        "transaction_id": f"transaction-{uuid4().hex}",
+        "parent_transaction_id": "",
+        "kind": kind,
+        "capability": capability,
+        "target": target,
+        "callback_id": "",
+        "child_tasks": [],
+        "verifier_ids": [],
+        "proof_envelope_ids": [],
+        "proof_lineage": [],
+        "wait_count": 0,
+        "retry_count": 0,
+        **_decision_transaction_fields(decision),
+    }
 
 
 class AutonomousController:
@@ -501,12 +532,7 @@ class AutonomousController:
                             note=f"configured global collection emergency cap exhausted at {self._collections}",
                         ))
                         return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
-                    transactions.append({
-                        "kind": "collection",
-                        "capability": "collect-graph",
-                        "target": request_key,
-                        **_decision_transaction_fields(decision),
-                    })
+                    transactions.append(_transaction_record("collection", "collect-graph", request_key, decision))
                     cst, cres = await self._collect_seam(state, decision)
                     self._collections += 1
                     self._collection_attempts[request_key] = attempts + 1
@@ -588,12 +614,7 @@ class AutonomousController:
             expected = _action_effects(action)
 
             # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
-            transactions.append({
-                "kind": "capability",
-                "capability": name,
-                "target": target,
-                **_decision_transaction_fields(decision),
-            })
+            transactions.append(_transaction_record("capability", name, target, decision))
             est, eres = await self._execute_seam(action, decision)
             result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
 

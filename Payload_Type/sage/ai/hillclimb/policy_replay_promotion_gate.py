@@ -1,9 +1,8 @@
-"""Held-out transfer and promotion gate for the first replay hill-climb candidate.
+"""Synthetic-consistency and promotion gate for the first replay hill-climb candidate.
 
-The kept candidate from the first iteration is still development-surface evidence only.
-This module evaluates it on one structurally different census surface outside the packet
-training corpus, tracks that held-out budget, and records the live ground-truth checks
-that would still be required before runtime promotion.
+The old report mislabeled a known census surface as held-out transfer.  Phase 3 keeps
+the row for diagnostic consistency only: every exercised family counts as exposure,
+and a modeled census row cannot become transfer evidence or authorize promotion.
 """
 from __future__ import annotations
 
@@ -13,6 +12,7 @@ import sys
 from typing import Any
 
 try:  # package import
+    from .experiment_contracts import TrainingExposure, TypedVerdict
     from . import policy_replay_hillclimb_iteration as iteration
     from . import policy_replay_selector_experiment as selector_experiment
     from . import target_value_census
@@ -20,6 +20,7 @@ try:  # package import
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+    from experiment_contracts import TrainingExposure, TypedVerdict  # type: ignore
     import policy_replay_hillclimb_iteration as iteration  # type: ignore
     import policy_replay_selector_experiment as selector_experiment  # type: ignore
     import target_value_census  # type: ignore
@@ -46,7 +47,7 @@ def _training_families(iteration_report: dict[str, Any]) -> list[str]:
     families = {
         policy.capability_family((case.get("candidate") or {}).get("selected_capability"))
         for case in list(iteration_report.get("paired_cases") or [])
-        if isinstance(case, dict) and case.get("relation") == "improved"
+        if isinstance(case, dict)
     }
     return sorted(family for family in families if family)
 
@@ -81,9 +82,14 @@ def _select_held_out_surface(
         for surface in surfaces
         if str((surface.get("spec") or {}).get("family") or "") not in set(training_families)
     ]
-    if not eligible:
-        raise PromotionGateError("no structurally different naturally asymmetric held-out surface is available")
-    return sorted(eligible, key=lambda surface: str(surface.get("id") or ""))[0]
+    if eligible:
+        return sorted(eligible, key=lambda surface: str(surface.get("id") or ""))[0]
+    if not surfaces:
+        raise PromotionGateError("no naturally asymmetric diagnostic surface is available")
+    # Once ties/losses count as exposure, the historical DCSync row is no longer
+    # structurally held out.  Keep emitting it as an explicit synthetic-consistency
+    # diagnostic instead of silently dropping the report or relabeling it transfer.
+    return sorted(surfaces, key=lambda surface: str(surface.get("id") or ""))[0]
 
 
 def _held_out_report(surface: dict[str, Any], training_families: list[str], training_case_ids: list[str]) -> dict[str, Any]:
@@ -141,6 +147,7 @@ def _held_out_report(surface: dict[str, Any], training_families: list[str], trai
         "candidate_selects_modeled_best_target": candidate_index in best_indices,
         "candidate_does_not_regress_vs_baseline": relation in {"improved", "tie"},
     }
+    diagnostic_consistency_passes = all(checks.values())
     return {
         "id": surface_id,
         "family": family,
@@ -161,7 +168,10 @@ def _held_out_report(surface: dict[str, Any], training_families: list[str], trai
         },
         "relation": relation,
         "checks": checks,
-        "transfer_passes": all(checks.values()),
+        "evidence_classification": "known_synthetic_model_consistency",
+        "structurally_different_from_training": checks["held_out_family_differs_from_training_family"],
+        "diagnostic_consistency_passes": diagnostic_consistency_passes,
+        "transfer_passes": False,
     }
 
 
@@ -183,18 +193,40 @@ def run_promotion_gate(
         held_out_surface_id=held_out_surface_id,
     )
     held_out = _held_out_report(held_out_surface, training_families, training_case_ids)
+    exposure = TrainingExposure()
+    for case in list(replay_iteration.get("paired_cases") or []):
+        if not isinstance(case, dict):
+            continue
+        family = policy.capability_family((case.get("candidate") or {}).get("selected_capability"))
+        exposure.record(
+            case_id=str(case.get("id") or ""),
+            family_id=family,
+            topology_family=str(case.get("scenario") or ""),
+            relation=str(case.get("relation") or ""),
+        )
     held_out_budget = {
-        "kind": "structurally_different_known_holdout",
+        "kind": "known_synthetic_model_consistency",
         "sealed_before_iteration": False,
         "total_cases": 1,
         "consumed_cases": 1,
         "remaining_cases": 0,
         "case_ids": [held_out["id"]],
         "note": (
-            "This holdout was predeclared by the target-value census and is structurally different from the "
-            "packet training corpus; it is not a secret sealed benchmark."
+            "This census row is predeclared and useful for diagnostic model consistency only. "
+            "It is not a secret sealed benchmark or independently observed transfer evidence."
         ),
     }
+    typed_verdict = TypedVerdict(
+        artifact_integrity_passed=True,
+        boundary_passed=True,
+        policy_identity_passed=True,
+        causal_model_contribution_passed=False,
+        backend_provenance_passed=None,
+        candidate_efficacy_passed=False,
+        non_regression_passed=False,
+        transfer_passed=False,
+        reason_codes=("known_synthetic_model_consistency", "transfer_not_independently_observed"),
+    )
     live_promotion_gate = {
         "runtime_promotion_authorized": False,
         "held_out_transfer_passes": held_out["transfer_passes"],
@@ -204,15 +236,20 @@ def run_promotion_gate(
             for check in LIVE_PROMOTION_REQUIRED_CHECKS
         },
         "reason": (
-            "Synthetic held-out transfer passes, but runtime promotion still requires a live ground-truth gate."
-            if held_out["transfer_passes"]
-            else "Held-out transfer did not pass; runtime promotion remains blocked before any live spend."
+            "The held-out row is known synthetic model consistency only, not transfer evidence; "
+            "runtime promotion remains blocked before any live spend."
         ),
+        "typed_verdict": typed_verdict.to_dict(),
+    }
+    observations = {
+        "diagnostic_surface_is_structurally_different": held_out["checks"]["held_out_family_differs_from_training_family"],
+        "diagnostic_surface_is_outside_training_corpus": held_out["checks"]["held_out_surface_is_outside_packet_training_cases"],
+        "diagnostic_surface_is_not_a_renamed_training_copy": held_out["checks"]["held_out_surface_is_not_a_renamed_training_copy"],
     }
     checks = {
-        "iteration_passes_and_keeps_candidate": (
+        "iteration_is_retained_as_t0_record": (
             replay_iteration.get("passes_gate") is True
-            and (replay_iteration.get("decision") or {}).get("keep_candidate") is True
+            and (replay_iteration.get("decision") or {}).get("runtime_promotion_authorized") is False
         ),
         "census_passes": census.get("passes_gate") is True,
         "training_family_is_known": bool(training_families),
@@ -220,9 +257,11 @@ def run_promotion_gate(
             held_out_budget["consumed_cases"] == 1
             and held_out_budget["remaining_cases"] == 0
         ),
-        "held_out_surface_is_structurally_different": held_out["checks"]["held_out_family_differs_from_training_family"],
-        "held_out_surface_is_outside_training_corpus": held_out["checks"]["held_out_surface_is_outside_packet_training_cases"],
-        "renamed_copy_is_not_counted_as_transfer": held_out["checks"]["held_out_surface_is_not_a_renamed_training_copy"],
+        "synthetic_consistency_surface_is_reported": bool(held_out["id"]),
+        "synthetic_holdout_is_not_transfer_evidence": (
+            held_out["evidence_classification"] == "known_synthetic_model_consistency"
+            and held_out["transfer_passes"] is False
+        ),
         "transfer_and_non_regression_are_reported": (
             held_out["relation"] in {"improved", "tie", "regressed"}
             and "candidate_does_not_regress_vs_baseline" in held_out["checks"]
@@ -230,6 +269,10 @@ def run_promotion_gate(
         "live_promotion_gate_declares_ground_truth_checks": set(LIVE_PROMOTION_REQUIRED_CHECKS)
         == set(live_promotion_gate["required_ground_truth_checks"]),
         "runtime_promotion_not_claimed_without_live_ground_truth": live_promotion_gate["runtime_promotion_authorized"] is False,
+        "outer_promotion_fails_without_transfer_and_non_regression": typed_verdict.promotion_evidence_passed is False,
+        "training_exposure_counts_ties_and_losses": (
+            set(exposure.exercised_case_ids) == set(training_case_ids)
+        ),
     }
     return {
         "kind": "policy_replay_promotion_gate",
@@ -240,10 +283,13 @@ def run_promotion_gate(
             "verifier_hash": (replay_iteration.get("iteration") or {}).get("verifier_hash"),
             "candidate_kept": (replay_iteration.get("decision") or {}).get("keep_candidate"),
             "training_non_regression": (replay_iteration.get("aggregate") or {}).get("regressed_case_ids") == [],
+            "training_exposure": exposure.to_dict(),
         },
         "held_out_budget": held_out_budget,
         "held_out": held_out,
         "live_promotion_gate": live_promotion_gate,
+        "typed_verdict": typed_verdict.to_dict(),
+        "observations": observations,
         "checks": checks,
         "passes_gate": all(checks.values()),
     }
@@ -276,4 +322,3 @@ def _cmd_policy_replay_promotion_gate(args: Any) -> int:
         flush=True,
     )
     return 0 if report["passes_gate"] else 1
-

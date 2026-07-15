@@ -61,7 +61,13 @@ def ledger_path(engagement_id: str | None = None) -> str:
 
 
 def load(engagement_id: str | None = None) -> dict:
-    """Return the ledger dict for an engagement; an empty skeleton if missing/corrupt. Never raises."""
+    """Return the raw ledger dict for an engagement; an empty skeleton if missing/corrupt. Never raises.
+
+    This is intentionally a neutral serializer. Runtime consumers that can influence autonomous state must use
+    :func:`load_runtime`, which quarantines historical ``achieved`` rows that lack an admissible proof envelope.
+    Eval readers and migration tooling need raw historical rows so they can apply their own verifier policy
+    without mutating the source ledger as a side effect of reading it.
+    """
     path = ledger_path(engagement_id)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -75,7 +81,12 @@ def load(engagement_id: str | None = None) -> dict:
 
 
 def save(data: dict, engagement_id: str | None = None) -> str:
-    """Write the ledger dict (atomic replace). Creates the directory if needed. Returns the path."""
+    """Write the raw ledger dict (atomic replace). Creates the directory if needed. Returns the path.
+
+    Runtime callers should use :func:`save_runtime` so unbound achievements cannot be re-persisted as active
+    runtime proof. Raw save exists for evaluator fixtures, archival/migration tooling, and other consumers whose
+    own verifier policy is separate from the live autonomous ledger.
+    """
     path = ledger_path(engagement_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp"
@@ -83,6 +94,19 @@ def save(data: dict, engagement_id: str | None = None) -> str:
         json.dump(data, f, indent=2, sort_keys=True)
     os.replace(tmp, path)
     return path
+
+
+def load_runtime(engagement_id: str | None = None) -> dict:
+    """Load a ledger for live runtime use and quarantine unbound historical achievements in memory."""
+    data = load(engagement_id)
+    _quarantine_unproven_achievements(data, engagement_id or data.get("engagement_id") or default_engagement_id())
+    return data
+
+
+def save_runtime(data: dict, engagement_id: str | None = None) -> str:
+    """Persist a live runtime ledger after quarantining unbound historical achievements."""
+    _quarantine_unproven_achievements(data, engagement_id or data.get("engagement_id") or default_engagement_id())
+    return save(data, engagement_id)
 
 
 def wipe(engagement_id: str | None = None) -> bool:
@@ -176,6 +200,8 @@ def set_hop_status(data: dict, selector: str, status: str) -> tuple[dict, int]:
     Returns (data, changed_count)."""
     hops = data.get("hops") or []
     new_status = (status or "").strip()
+    if new_status.casefold() == "achieved":
+        return data, 0
     idx = _resolve_index(selector, hops)
     if idx is not None:
         hops[idx]["status"] = new_status
@@ -187,3 +213,43 @@ def set_hop_status(data: dict, selector: str, status: str) -> tuple[dict, int]:
             hop["status"] = new_status
             changed += 1
     return data, changed
+
+
+def _quarantine_unproven_achievements(data: dict, engagement_id: str) -> None:
+    """Keep legacy ledger rows visible without letting them represent runtime proof.
+
+    Old ledgers predate proof envelopes. They remain useful operator context, but an
+    unbound ``achieved`` row must not survive a load as runtime achievement.
+    """
+    try:
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+    except Exception:
+        proof_boundary = None
+    for hop in data.get("hops") or []:
+        if not isinstance(hop, dict) or str(hop.get("status") or "").casefold() != "achieved":
+            continue
+        evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+        proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) else evidence.get("proof_envelope")
+        admitted = False
+        reason = "missing proof envelope"
+        if proof_boundary is not None:
+            try:
+                admission = proof_boundary.admit_runtime_envelope(
+                    proof_boundary.ProofEnvelope.from_dict(proof),
+                    current_engagement_id=str(engagement_id or ""),
+                )
+                admitted = admission.admitted
+                reason = admission.reason
+            except Exception:
+                admitted = False
+                reason = "proof admission failed closed"
+        if admitted:
+            continue
+        hop["status"] = "legacy_unverified"
+        evidence = dict(evidence)
+        evidence["proof_persistence_state"] = "legacy_unverified"
+        evidence["proof_admission_reason"] = reason
+        hop["evidence"] = evidence

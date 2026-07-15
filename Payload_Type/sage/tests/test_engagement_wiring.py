@@ -24,13 +24,64 @@ import intent_classifier  # noqa: E402
 import mythic_capability_adapter  # noqa: E402
 import mythic_tools  # noqa: E402
 import prompt_loader  # noqa: E402
+import proof_boundary  # noqa: E402
 from mythic_tools import MythicTools  # noqa: E402
 
 
 def _make_tools() -> MythicTools:
     mt = MythicTools(agent_task_id="test")
     mt.client = object()
+    _arm_runtime_lineage(mt)
     return mt
+
+
+def _arm_runtime_lineage(mt, task_id="4242", callback_id="50", command="test-command"):
+    mt._last_issued_task_display_id = task_id
+    mt._last_issued_callback_id = callback_id
+    mt._last_issued_task_terminal_status = "completed"
+    mt._last_issued_command = command
+
+
+def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-command", verifier_id="test:fixture"):
+    return proof_boundary.make_runtime_task_envelope(
+        engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
+        callback_id=callback_id or "13",
+        task_id=task_id,
+        terminal_status="completed",
+        command=command,
+        verifier_id=verifier_id,
+        captured_at="2026-06-12T12:00:00Z",
+    ).to_dict()
+
+
+def _artifact_proof(path: Path, *, engagement_id="test-op", callback_id="13", task_id="9000", artifact_id="artifact-ca-1"):
+    return proof_boundary.make_runtime_artifact_envelope(
+        engagement_id=engagement_id,
+        callback_id=callback_id,
+        task_id=task_id,
+        terminal_status="completed",
+        command="download",
+        artifact_id=artifact_id,
+        artifact_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        verifier_id="test:ca-artifact",
+        captured_at="2026-06-12T12:00:00Z",
+    ).to_dict()
+
+
+def _bloodhound_proof(task_id, callback_id="13", *, engagement_id=None):
+    return proof_boundary.make_runtime_bloodhound_envelope(
+        engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
+        callback_id=callback_id or "13",
+        task_id=task_id,
+        terminal_status="completed",
+        command="download",
+        ingest_job_id=f"bh-job-{task_id}",
+        ingest_status="complete",
+        source_artifact_id=f"artifact-{task_id}",
+        source_artifact_sha256="a" * 64,
+        verifier_id="test:bloodhound-ingest",
+        captured_at="2026-06-12T12:00:00Z",
+    ).to_dict()
 
 
 @contextmanager
@@ -89,9 +140,13 @@ def _seeded_reconcile(mt: MythicTools):
 
 
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed"):
-    evidence = {"mythic_task_id": task_id, "source": "test"}
-    if callback_id:
-        evidence["callback_id"] = callback_id
+    proof = _task_proof(task_id, callback_id or "13")
+    evidence, admission = proof_boundary.attach_proof(
+        {"source": "test"},
+        proof_boundary.ProofEnvelope.from_dict(proof),
+        current_engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+    )
+    assert admission.admitted
     return engagement_state.Hop(
         id=f"{technique}:{target}",
         technique=technique,
@@ -103,7 +158,37 @@ def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", tar
         satisfied_effects=[effect],
         source="test",
         timestamp="2026-06-12T12:00:00Z",
+        proof_envelope=proof,
     )
+
+
+def _ca_artifact_hop(path: Path, *, engagement_id="test-op", callback_id="13", task_id="9000"):
+    proof = _artifact_proof(
+        path,
+        engagement_id=engagement_id,
+        callback_id=callback_id,
+        task_id=task_id,
+    )
+    evidence, admission = proof_boundary.attach_proof(
+        {
+            "artifact_present": True,
+            "verify_verdict": "achieved",
+            "pfx_artifact_path": str(path),
+            "pfx_artifact_id": proof["artifact_id"],
+            "pfx_artifact_sha256": proof["artifact_sha256"],
+        },
+        proof_boundary.ProofEnvelope.from_dict(proof),
+        current_engagement_id=engagement_id,
+    )
+    assert admission.admitted
+    return {
+        "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
+        "effect": "adcs-ca-private-key:ca01@lab.local",
+        "status": "achieved",
+        "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
+        "evidence": evidence,
+        "proof_envelope": proof,
+    }
 
 
 def _bloodhound_zip_bytes() -> bytes:
@@ -680,13 +765,19 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     async def fake_tasks(*args, **kwargs):
         return []
 
+    proof = _bloodhound_proof(779, callback_id="50")
     achieved = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="test"),
+        engagement_state.EngagementState(
+            objective="test",
+            engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+            runtime_scope=True,
+        ),
         "collect-graph",
         access_key,
         "achieved",
         {"source": "ingest_collection", "graph_verified": True},
         "2026-06-17T00:00:00Z",
+        proof_envelope=proof,
     )
 
     mt = _make_tools()
@@ -717,6 +808,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
+            proof_envelope=proof,
         )
     ]
     calls2 = {"issue": 0}
@@ -747,8 +839,13 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
     async def fake_tasks(*args, **kwargs):
         return []
 
+    proof = _bloodhound_proof(779, callback_id="50")
     achieved = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="test"),
+        engagement_state.EngagementState(
+            objective="test",
+            engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+            runtime_scope=True,
+        ),
         "collect-graph",
         access_key,
         "achieved",
@@ -758,6 +855,7 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
             "covered_domains": ["north.sevenkingdoms.local"],
         },
         "2026-06-17T00:00:00Z",
+        proof_envelope=proof,
     )
 
     mt = _make_tools()
@@ -1012,7 +1110,7 @@ def test_ticket_gate_allows_builder_emitted_managed_kerberos_forge_command():
     assert hop.technique == "sid-history-escalation"
     assert hop.status == "achieved"
     assert hop.evidence["verified_on_record"] is True
-    assert hop.evidence["mythic_task_id"] == 5150
+    assert hop.evidence["mythic_task_id"] == "5150"
 
 
 def test_ensure_kerberos_context_forge_is_not_skipped_by_durable_da():
@@ -1153,8 +1251,8 @@ def test_deterministic_ensure_context_service_proof_records_callback_effect():
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:ensure-kerberos-context"
-    assert hop.evidence["mythic_task_id"] == 6161
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "6161"
+    assert hop.evidence["callback_id"] == "13"
 
 
 def test_ticket_gate_blocks_builder_shaped_command_not_emitted_by_builder():
@@ -1223,7 +1321,7 @@ def test_gate_proceed_records_gpo_setup_as_pending_until_system_proof():
     assert hop.status == "pending"
     assert hop.evidence["verify_verdict"] == "partial"
     # The hop must capture the Mythic task display_id that created the setup artifact.
-    assert hop.evidence.get("mythic_task_id") == 2712
+    assert hop.evidence.get("mythic_task_id") == "2712"
 
 
 def test_gate_proceed_annotates_gpo_guid_only_noop():
@@ -1256,7 +1354,7 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
     assert hop.target == "starkwallpaper"
     assert hop.status == "failed"
     assert hop.evidence["verify_verdict"] == "failed"
-    assert hop.evidence.get("mythic_task_id") == 2713
+    assert hop.evidence.get("mythic_task_id") == "2713"
 
 
 def test_record_engagement_success_records_domain_admin_membership_probe():
@@ -1289,7 +1387,7 @@ The command completed successfully.
     assert hop.status == "achieved"
     assert hop.evidence["verified_on_record"] is True
     assert hop.evidence["artifact_present"] is True
-    assert hop.evidence["mythic_task_id"] == 282
+    assert hop.evidence["mythic_task_id"] == "282"
 
 
 def test_extract_domain_admin_membership_probe_accepts_net_user_global_group_membership():
@@ -1324,6 +1422,7 @@ The command completed successfully.
 
 def test_record_capability_result_bridge_records_and_persists():
     mt = _make_tools()
+    _arm_runtime_lineage(mt, task_id=31337)
     action = capabilities.CapabilityAction(
         name="grant-directory-rights",
         target="domain=lab.local;source=gpo-system-exec:workstation-policy",
@@ -1350,7 +1449,7 @@ def test_record_capability_result_bridge_records_and_persists():
     assert hop.status == "achieved"
     assert hop.effect == "ds-replication-rights:lab.local"
     assert hop.evidence["verify_verdict"] == "achieved"
-    assert hop.evidence["mythic_task_id"] == 31337
+    assert hop.evidence["mythic_task_id"] == "31337"
 
 
 def test_record_graph_built_persists_policy_decision_provenance():
@@ -3047,8 +3146,8 @@ def test_deterministic_account_context_records_only_after_logon_ticket_and_servi
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:ensure-account-kerberos-context"
-    assert hop.evidence["mythic_task_id"] == 7002
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7002"
+    assert hop.evidence["callback_id"] == "13"
 
 
 def test_rubeus_klist_output_marks_expected_account_ticket_context():
@@ -3421,8 +3520,8 @@ def test_deterministic_managed_secret_read_records_redacted_effect():
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:read-managed-local-admin-secret"
-    assert hop.evidence["mythic_task_id"] == 7101
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7101"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -4220,8 +4319,8 @@ def test_deterministic_local_admin_secret_use_records_admin_effects_without_secr
     assert "system-or-admin:ws01" in satisfied
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:use-managed-local-admin-secret"
-    assert hop.evidence["mythic_task_id"] == 7201
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7201"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -4447,8 +4546,8 @@ def test_deterministic_remote_execution_records_effect_without_secret():
     assert "host-exec:ws01" in satisfied
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:execute-as-local-admin"
-    assert hop.evidence["mythic_task_id"] == 7301
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7301"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -4608,6 +4707,61 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     ]
 
 
+def test_execute_capability_apollo_remote_exec_refreshes_replaced_local_admin_context(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("local-admin:oak-ops01@oak.ridge.local", 7299, callback_id="13"),
+    ]
+    mt._kerberos_logon_context_keys.add((13, "pine-ops01", "administrator", True))
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": target_host,
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+    outputs = iter([
+        "Successfully impersonated remote identity.",
+        "Command spawned PID (1372) successfully",
+        "\n".join([
+            "SAGE_REMOTE_EXEC_PROOF_oak_ops01_13",
+            "oak-ops01\\administrator",
+            "OAK-OPS01",
+        ]),
+        "Reverted to original token",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7304):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "execute-as-local-admin",
+                "target_host": "oak-ops01",
+                "target_domain": "oak.ridge.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert [item["command_name"] for item in calls["issued"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert calls["issued"][0]["parameters"]["Credential"]["realm"] == "oak-ops01"
+    assert result["recorded_effects"] == [
+        "host-exec:oak-ops01",
+        "remote-exec:oak-ops01@oak.ridge.local",
+    ]
+
+
 def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypatch, tmp_path):
     mt = _make_tools()
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
@@ -4634,11 +4788,12 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
         "b'SAGE_CA_EXPORT_PROOF_ca01_13\\r\\n"
         "CA_HOST=CA01\\r\\n"
         "CA_EXPORT_STATUS=OK\\r\\n"
-        "CA_SUBJECT=CN=LAB-CA\\r\\n"
-        "CA_ISSUER=CN=LAB-CA\\r\\n"
-        "CA_THUMBPRINT=ABCDEF1234\\r\\n"
-        "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
-        f"PFX_SHA256={pfx_sha256}\\r\\n"
+            "CA_SUBJECT=CN=LAB-CA\\r\\n"
+            "CA_ISSUER=CN=LAB-CA\\r\\n"
+            "CA_THUMBPRINT=ABCDEF1234\\r\\n"
+            "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
+            "PFX_ARTIFACT_ID=artifact-ca-7401\\r\\n"
+            f"PFX_SHA256={pfx_sha256}\\r\\n"
         f"PFX_BASE64={pfx}\\r\\n'\n\n"
         "[SAGE OPSEC] footprint total=3"
     )
@@ -6054,19 +6209,7 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
@@ -6149,19 +6292,7 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
@@ -6229,19 +6360,7 @@ def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issue
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
@@ -6309,19 +6428,7 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
@@ -7314,7 +7421,7 @@ def test_forge_golden_ticket_service_proof_records_da_effect():
     assert "da:sevenkingdoms.local" in {
         effect for hop in mt._engagement_hops for effect in hop.satisfied_effects
     }
-    assert mt._engagement_hops[-1].evidence["mythic_task_id"] == 8181
+    assert mt._engagement_hops[-1].evidence["mythic_task_id"] == "8181"
 
 
 def test_gate_failure_fails_open_and_issues_normally():
@@ -8293,6 +8400,7 @@ def test_bound_credential_contexts_keep_distinct_make_token_identities(monkeypat
     assert calls["issued"][0]["parameters"]["Credential"] == "@cred:88"
     assert calls["issued"][1]["parameters"]["Credential"] == "@cred:91"
     assert calls["issued"][2]["parameters"]["Credential"] == "@cred:92"
+    assert mt._kerberos_logon_context_keys == {(1, "essos.local", "administrator", True)}
     assert "matching NetOnly Kerberos logon context" in duplicate
     assert "administrator@essos.local" in duplicate.casefold()
 

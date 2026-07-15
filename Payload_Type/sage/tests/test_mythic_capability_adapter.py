@@ -1989,6 +1989,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_merlin_powershell_wmi(
     assert "Export-PfxCertificate" not in ps
     assert "SAGE_CA_EXPORT_PROOF_ca01_8" in ps
     assert "CA_EXPORT_STATUS=OK" in ps
+    assert "PFX_ARTIFACT_ID=" in ps
     assert "PFX_BASE64=" in ps
 
 
@@ -2070,6 +2071,7 @@ def test_adapter_translates_adcs_ca_export_to_current_context_powerpick():
     assert "New-Object System.Management.Automation.PSCredential" not in command.parameters
     assert "certutil.exe -f -p" in command.parameters
     assert "Export-PfxCertificate" not in command.parameters
+    assert "PFX_ARTIFACT_ID=" in command.parameters
 
 
 def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
@@ -2120,6 +2122,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
     assert "SAGE_CA_EXPORT_PROOF_ca01_8" in ps
     assert "CA_EXPORT_STATUS=OK" in ps
     assert "PFX_SHA256=" in ps
+    assert "PFX_ARTIFACT_ID=" in ps
     assert "PFX_BASE64=" in ps
     assert "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2" in ps
     assert "('CA_SUBJECT='+$exportedCert.Subject)" in ps

@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import adcs_certificate_materializer as materializer  # noqa: E402
+import proof_boundary  # noqa: E402
 
 
 def _write_ca_artifact(path: Path) -> Path:
@@ -85,6 +86,18 @@ def _write_ca_pfx(path: Path, password: str = "") -> Path:
 
 
 def _ledger(path: Path) -> dict:
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "a" * 64
+    envelope = proof_boundary.make_runtime_artifact_envelope(
+        engagement_id="test-op",
+        callback_id="13",
+        task_id="450",
+        terminal_status="completed",
+        command="execute_assembly",
+        artifact_id="artifact-ca-1",
+        artifact_sha256=sha256,
+        verifier_id="capability:adcs-ca-private-key-export",
+        captured_at="2026-07-14T00:00:00+00:00",
+    ).to_dict()
     return {
         "hops": [
             {
@@ -96,7 +109,11 @@ def _ledger(path: Path) -> dict:
                     "artifact_present": True,
                     "verify_verdict": "achieved",
                     "pfx_artifact_path": str(path),
+                    "pfx_artifact_id": "artifact-ca-1",
+                    "pfx_artifact_sha256": sha256,
+                    "proof_envelope": envelope,
                 },
+                "proof_envelope": envelope,
             }
         ]
     }
@@ -184,7 +201,7 @@ def test_materializer_requires_verified_ca_private_key_effect(tmp_path):
     assert result.missing == ["adcs_ca_private_key_artifact"]
 
 
-def test_materializer_can_resolve_artifact_dir_after_verified_effect(tmp_path):
+def test_materializer_does_not_search_artifact_dir_after_verified_effect(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     ca_artifact = _write_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
     ledger = _ledger(Path("/missing/adcs-ca.pem.txt"))
@@ -200,11 +217,11 @@ def test_materializer_can_resolve_artifact_dir_after_verified_effect(tmp_path):
         callback_id="13",
     )
 
-    assert result.ok is True
-    assert result.evidence["ca_artifact_path"] == str(ca_artifact)
+    assert result.ok is False
+    assert result.missing == ["adcs_ca_private_key_artifact"]
 
 
-def test_materializer_skips_newer_unusable_pfx_and_uses_valid_pfx_fallback(tmp_path):
+def test_materializer_does_not_fallback_to_another_pfx(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     ca_artifact = _write_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
     bad_pfx = artifact_dir / "adcs_ca_signing_test_ca01_lab.local.pfx"
@@ -224,9 +241,8 @@ def test_materializer_skips_newer_unusable_pfx_and_uses_valid_pfx_fallback(tmp_p
         callback_id="13",
     )
 
-    assert result.ok is True
-    assert result.evidence["ca_artifact_path"] == str(ca_artifact)
-    assert result.evidence["ca_artifact_path"] != str(bad_pfx)
+    assert result.ok is False
+    assert result.missing == ["adcs_ca_private_key_artifact"]
 
 
 def test_persist_verified_ca_pfx_artifact_writes_only_sha_bound_provenance(tmp_path):
@@ -236,6 +252,7 @@ def test_persist_verified_ca_pfx_artifact_writes_only_sha_bound_provenance(tmp_p
     sha256 = hashlib.sha256(pfx).hexdigest()
     output = "\n".join([
         "CA_EXPORT_STATUS=OK",
+        "PFX_ARTIFACT_ID=artifact-ca-1",
         f"PFX_SHA256={sha256}",
         f"PFX_BASE64={base64.b64encode(pfx).decode()}",
     ])
@@ -252,48 +269,20 @@ def test_persist_verified_ca_pfx_artifact_writes_only_sha_bound_provenance(tmp_p
     assert path.is_file()
     assert path.parent == artifact_dir
     assert evidence["pfx_artifact_sha256"] == sha256
+    assert evidence["pfx_artifact_id"] == "artifact-ca-1"
     assert evidence["pfx_sha256"] == sha256
     assert hashlib.sha256(path.read_bytes()).hexdigest() == sha256
     assert "pfx_base64" not in evidence
 
 
-def test_materializer_uses_current_hop_sha_instead_of_newer_stale_artifact(tmp_path):
+def test_materializer_requires_explicit_current_hop_path(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     fresh = _write_ca_pfx(artifact_dir / "adcs_ca_signing_test_ca01_lab.local_fresh.pfx")
     stale = _write_ca_pfx(artifact_dir / "adcs_ca_signing_test_ca01_lab.local_stale.pfx")
     os.utime(fresh, (1, 1))
     os.utime(stale, (2, 2))
     ledger = _ledger(Path("/missing/adcs-ca.pfx"))
-    ledger["hops"][0]["evidence"] = {
-        "artifact_present": True,
-        "verify_verdict": "achieved",
-        "pfx_sha256": hashlib.sha256(fresh.read_bytes()).hexdigest(),
-    }
-
-    result = materializer.materialize_adcs_certificate_auth(
-        ledger=ledger,
-        artifact_dir=artifact_dir,
-        engagement_key="test-op",
-        domain="lab.local",
-        account="administrator",
-        ca_host="ca01",
-        callback_id="13",
-    )
-
-    assert result.ok is True
-    assert result.evidence["ca_artifact_path"] == str(fresh)
-    assert result.evidence["ca_artifact_path"] != str(stale)
-
-
-def test_materializer_fails_closed_when_current_hop_sha_has_no_matching_artifact(tmp_path):
-    artifact_dir = tmp_path / "artifacts"
-    _write_ca_pfx(artifact_dir / "adcs_ca_signing_test_ca01_lab.local_stale.pfx")
-    ledger = _ledger(Path("/missing/adcs-ca.pfx"))
-    ledger["hops"][0]["evidence"] = {
-        "artifact_present": True,
-        "verify_verdict": "achieved",
-        "pfx_sha256": "a" * 64,
-    }
+    ledger["hops"][0]["evidence"].pop("pfx_artifact_path")
 
     result = materializer.materialize_adcs_certificate_auth(
         ledger=ledger,
@@ -309,7 +298,27 @@ def test_materializer_fails_closed_when_current_hop_sha_has_no_matching_artifact
     assert result.missing == ["adcs_ca_private_key_artifact"]
 
 
-def test_materializer_can_use_verified_probe_pfx_base64(tmp_path):
+def test_materializer_fails_closed_when_current_hop_sha_has_no_matching_artifact(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    _write_ca_pfx(artifact_dir / "adcs_ca_signing_test_ca01_lab.local_stale.pfx")
+    ledger = _ledger(Path("/missing/adcs-ca.pfx"))
+    ledger["hops"][0]["evidence"]["pfx_artifact_sha256"] = "a" * 64
+
+    result = materializer.materialize_adcs_certificate_auth(
+        ledger=ledger,
+        artifact_dir=artifact_dir,
+        engagement_key="test-op",
+        domain="lab.local",
+        account="administrator",
+        ca_host="ca01",
+        callback_id="13",
+    )
+
+    assert result.ok is False
+    assert result.missing == ["adcs_ca_private_key_artifact"]
+
+
+def test_materializer_rejects_embedded_probe_pfx_base64_without_artifact_lineage(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     source_ca = _write_ca_artifact(tmp_path / "source" / "adcs_ca_source_ca01_lab.local.pem.txt")
     password = "CA Secret!"
@@ -346,9 +355,5 @@ def test_materializer_can_use_verified_probe_pfx_base64(tmp_path):
         ca_pfx_password=password,
     )
 
-    assert result.ok is True
-    selected = Path(result.evidence["ca_artifact_path"])
-    assert selected.is_file()
-    assert selected.parent == artifact_dir
-    assert selected.name.startswith("adcs_ca_signing_")
-    assert hashlib.sha256(selected.read_bytes()).hexdigest() == pfx_sha256
+    assert result.ok is False
+    assert result.missing == ["adcs_ca_private_key_artifact"]

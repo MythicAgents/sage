@@ -372,6 +372,7 @@ def make_harness_solver(client: Any, sage_cb: int, *, timeout: int = 1800, max_s
 def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int = 0,
                          timeout: int = 1800, max_steps: int = 0, policy_mode: str = "llm",
                          provider: str | None = None, model: str | None = None,
+                         api_endpoint: str | None = None, api_key: str | None = None,
                          null_model: bool = False):
     """Option-A counterpart to make_harness_solver: run a full autonomous Sage solve IN-PROCESS via the
     chat Model (no PayloadType `query` task, no virtual callback). Same ``solve(objective) -> status_str``
@@ -387,7 +388,8 @@ def make_headless_solver(client: Any, *, engagement_id: str, operation_id: int =
         result = asyncio.run(run_headless_solve(
             objective, client=client, operation_id=operation_id, engagement_id=engagement_id,
             timeout=timeout, max_steps=max_steps, policy_mode=policy_mode,
-            provider=provider, model=model, null_model=null_model, return_details=True,
+            provider=provider, model=model, api_endpoint=api_endpoint, api_key=api_key,
+            null_model=null_model, return_details=True,
         ))
         solve.last_result = result
         if not isinstance(result, dict):
@@ -407,6 +409,7 @@ def make_native_chat_solver(
     model: str | None = None,
     api_endpoint: str | None = None,
     api_key: str | None = None,
+    eval_force_capability_prefix_json: str | None = None,
 ):
     """Run one autonomous objective through a fresh locked Mythic v4 Sage chat channel."""
     scripts = Path(__file__).resolve().parents[4] / "skills" / "sage-live-runner" / "scripts"
@@ -416,7 +419,7 @@ def make_native_chat_solver(
 
     treatment_metadata = None
     use_prepared_channel = True
-    if provider or model:
+    if provider or model or eval_force_capability_prefix_json:
         treatment_metadata = native_chat.default_ai_metadata()
         treatment_config = treatment_metadata.setdefault("config", {})
         if provider:
@@ -427,6 +430,10 @@ def make_native_chat_solver(
             treatment_config["API_ENDPOINT"] = str(api_endpoint).strip()
         if api_key:
             treatment_config["API_KEY"] = str(api_key).strip()
+        if eval_force_capability_prefix_json:
+            treatment_config["SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"] = str(
+                eval_force_capability_prefix_json
+            ).strip()
         use_prepared_channel = False
 
     def solve(objective: str) -> str:
@@ -617,8 +624,8 @@ def _certificate_auth_anchor_matches(output: str, account: str, realm: str) -> b
     )
 
 
-def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
-    """Read completed Mythic task outputs used by the independent certificate-auth referee."""
+def _fetch_completed_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
+    """Read completed Mythic task outputs used by independent task-derived referees."""
     from mythic import mythic  # type: ignore
 
     async def _q():
@@ -645,6 +652,11 @@ def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300)
         }
         for row in rows
     ]
+
+
+def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
+    """Backward-compatible alias for the certificate/ticket referee seams."""
+    return _fetch_completed_task_outputs(timeout=timeout, limit=limit)
 
 
 def certificate_admin_control_probe(
@@ -692,6 +704,56 @@ def certificate_admin_control_probe(
                 structured["callback_id"] = str(callback_id or "")
                 if capabilities.verify_capability(
                     "adcs-certificate-auth",
+                    structured,
+                ).verdict == "achieved":
+                    return True
+        except Exception:
+            return False
+        return False
+
+    return probe
+
+
+def remote_execution_probe(
+    target_host: str,
+    *,
+    realm: str,
+    timeout: int = 60,
+) -> DirectProbe:
+    """True iff completed Mythic task output proves bounded execution on one target host.
+
+    The probe reuses the runtime's existing `execute-as-local-admin` verifier, but adds
+    one evaluator-side target-binding guard: the proof output must name the requested
+    host. This prevents a valid proof for another host in the same reset from satisfying
+    a host-specific holdout objective.
+    """
+    wanted_host = str(target_host or "").strip()
+    wanted_realm = str(realm or "").strip()
+
+    def probe() -> bool:
+        try:
+            try:
+                from ..langgraph import capabilities
+            except Exception:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+                import capabilities  # type: ignore
+
+            for row in _fetch_completed_task_outputs(timeout=timeout):
+                callback_id = str(row.get("callback_display_id") or "").strip()
+                if not callback_id:
+                    continue
+                structured = dict(
+                    capabilities.extract_remote_execution_probe(
+                        str(row.get("output") or ""),
+                        wanted_host,
+                        wanted_realm,
+                    )
+                )
+                structured["callback_id"] = callback_id
+                if structured.get("target_host_seen") is not True:
+                    continue
+                if capabilities.verify_capability(
+                    "execute-as-local-admin",
                     structured,
                 ).verdict == "achieved":
                     return True

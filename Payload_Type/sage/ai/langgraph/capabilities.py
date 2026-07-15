@@ -1351,6 +1351,8 @@ def record_capability_result(
     probe_result: dict[str, Any],
     now: str,
     evidence: dict[str, Any] | None = None,
+    *,
+    proof_envelope: dict[str, Any] | None = None,
 ) -> tuple[Any, CapabilityVerification]:
     """Record a capability verifier result into an EngagementState-shaped ledger.
 
@@ -1367,7 +1369,7 @@ def record_capability_result(
     verification = verify_capability(action.name, verification_probe)
     status = _record_status_from_verdict(verification.verdict)
     effect = action.effects[0] if action.effects else f"{action.name}:{action.target}"
-    evidence_dict: dict[str, Any] = {
+    base_evidence: dict[str, Any] = {
         "source": "capability_verifier",
         "provenance": "run",
         "capability": action.name,
@@ -1377,8 +1379,45 @@ def record_capability_result(
         "artifact_present": verification.verdict == "achieved",
         "probe": dict(verification.evidence),
     }
-    if isinstance(evidence, dict):
-        evidence_dict.update(evidence)
+    try:
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+        evidence_dict = proof_boundary.merge_untrusted_evidence(base_evidence, evidence)
+    except Exception:
+        evidence_dict = dict(base_evidence)
+        if isinstance(evidence, dict):
+            for key, value in evidence.items():
+                if key not in {
+                    "proof_envelope",
+                    "proof_persistence_state",
+                    "proof_admission_reason",
+                    "proof_hash",
+                    "origin",
+                    "scope",
+                    "engagement_id",
+                    "callback_id",
+                    "transaction_id",
+                    "mythic_task_id",
+                    "task_id",
+                    "terminal_task_status",
+                    "terminal_status",
+                    "command",
+                    "artifact_id",
+                    "artifact_sha256",
+                    "bloodhound_job_id",
+                    "ingest_job_id",
+                    "ingest_status",
+                    "source_artifact_id",
+                    "source_artifact_sha256",
+                    "verifier_id",
+                    "verifier_version",
+                    "verifier_hash",
+                    "captured_at",
+                    "persistence_state",
+                }:
+                    evidence_dict[key] = value
 
     satisfied_effects = list(action.effects)
     if status == "achieved":
@@ -1424,6 +1463,7 @@ def record_capability_result(
             now,
             preconditions=list(action.preconditions),
             satisfied_effects=satisfied_effects,
+            proof_envelope=proof_envelope,
         )
     except Exception:
         updated = state

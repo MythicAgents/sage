@@ -130,6 +130,127 @@ def test_dry_run_accepts_distinct_ludus_and_callback_hosts():
     assert "--foothold-user-match user1" in output
 
 
+def test_dry_run_carries_isolated_ludus_profile_through_reset_and_launch():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "laps-family-transfer-ash-remote-exec",
+            "--side",
+            "harness",
+            "--ludus-range-id",
+            "SAGELAPSR520260715",
+            "--ludus-mcp-server",
+            "ludus_sagerepl",
+            "--foothold-host",
+            "CINDER-WS01",
+            "--foothold-ip",
+            "10.8.10.31",
+            "--foothold-user",
+            r"CINDER\user1",
+            "--foothold-callback-user",
+            "user1",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert "--mcp-server ludus_sagerepl --range-id SAGELAPSR520260715 rollback" in output
+    assert "--mcp-server ludus_sagerepl --range-id SAGELAPSR520260715 status" in output
+    assert "--mcp-server ludus_sagerepl --range-id SAGELAPSR520260715 sync --yes" in output
+    assert "# poll until every range guest reports an IP" in output
+    assert "--mcp-server ludus_sagerepl --range-id SAGELAPSR520260715 check" in output
+    assert "# poll until WinRM clock probes authenticate" in output
+    assert "--ludus-range-id SAGELAPSR520260715 --ludus-mcp-server ludus_sagerepl" in output
+    assert "--callback-settle-seconds 90 --require-unique-callback" in output
+
+
+def test_range_guest_ip_gate_requires_every_reported_vm_on_with_ip():
+    assert orchestrate._range_guests_have_ips(
+        "  ON  range-router  ip=10.11.10.254  pmx=1\n"
+        "  ON  range-dc01    ip=10.11.10.10   pmx=2\n"
+        "  ON  range-ws01    ip=10.11.10.31   pmx=3\n"
+    ) is True
+    assert orchestrate._range_guests_have_ips(
+        "  ON  range-router  ip=10.11.10.254  pmx=1\n"
+        "  ON  range-dc01    ip=null          pmx=2\n"
+    ) is False
+    assert orchestrate._range_guests_have_ips(
+        "  ON   range-router  ip=10.11.10.254  pmx=1\n"
+        "  off  range-dc01    ip=null          pmx=2\n"
+    ) is False
+
+
+def test_range_clock_probe_gate_ignores_expected_skew_but_requires_no_errors():
+    assert orchestrate._range_clock_probes_reachable(
+        '{"ready":false,"hosts":[{"inventory_hostname":"range-dc01"}],"errors":[],"over_limit":["range-dc01"]}'
+    ) is True
+    assert orchestrate._range_clock_probes_reachable(
+        '{"ready":false,"hosts":[],"errors":[{"inventory_hostname":"range-dc01","error":"401"}]}'
+    ) is False
+    assert orchestrate._range_clock_probes_reachable("not-json") is False
+
+
+def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
+    events = []
+
+    def fake_run(name, argv, _cwd, _timeout, env=None):
+        del env
+        events.append(("run", name, list(argv)))
+
+    def fake_poll(name, argv, _cwd, _predicate, *, timeout, interval=20, env=None):
+        del timeout, interval, env
+        events.append(("poll", name, list(argv)))
+        return ""
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "_poll", fake_poll)
+    monkeypatch.setattr(orchestrate, "discover_callbacks", lambda _foothold: 7)
+
+    foothold = orchestrate.FootholdSpec(
+        host="CINDER-WS01",
+        ip="10.11.10.31",
+        user=r"CINDER\user1",
+        callback_user="user1",
+        ludus_range_id="SAGELAPSR520260715",
+        ludus_mcp_server="ludus_sagerepl",
+    )
+    assert orchestrate.full_reset_and_ready(
+        foothold=foothold,
+        ludus_range_id="SAGELAPSR520260715",
+        ludus_mcp_server="ludus_sagerepl",
+    ) == (None, 7)
+
+    poweron_index = next(index for index, event in enumerate(events) if event[:2] == ("run", "ludus poweron"))
+    guest_poll_index = next(index for index, event in enumerate(events) if event[:2] == ("poll", "range guests report IPs"))
+    winrm_poll_index = next(index for index, event in enumerate(events) if event[:2] == ("poll", "range WinRM clock probes respond"))
+    sync_index = next(index for index, event in enumerate(events) if event[:2] == ("run", "sync range time"))
+    assert poweron_index < guest_poll_index < winrm_poll_index < sync_index
+    assert events[winrm_poll_index][2] == [
+        str(orchestrate.PY),
+        "skills/sage-goad-reset/scripts/sync_range_time.py",
+        "--mcp-server",
+        "ludus_sagerepl",
+        "--range-id",
+        "SAGELAPSR520260715",
+        "check",
+    ]
+    assert events[sync_index][2] == [
+        str(orchestrate.PY),
+        "skills/sage-goad-reset/scripts/sync_range_time.py",
+        "--mcp-server",
+        "ludus_sagerepl",
+        "--range-id",
+        "SAGELAPSR520260715",
+        "sync",
+        "--yes",
+    ]
+
+
 def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
     monkeypatch.setenv("SAGE_RUN_AS_PASSWORD", "samwell-password")
     monkeypatch.setenv("SAGE_MEEREEN_JORAH_PASSWORD", "jorah-password")
@@ -235,6 +356,145 @@ def test_run_side_uses_replication_range_map_and_gpo_proof_env(monkeypatch):
     assert seen["restart_env"]["SAGE_GPO_PROOF_LOCAL_ROOT"] == r"C:\SageProof"
     assert seen["restart_env"]["SAGE_GPO_WAIT_SECONDS"] == "120"
     assert "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON" not in seen["restart_env"]
+
+
+def test_run_side_uses_laps_family_transfer_map_without_purpose_range_env(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del snapshot, retained_callback_config, foothold
+        seen["restart_env"] = dict(restart_env)
+        seen["range_id"] = ludus_range_id
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "laps-family-transfer-ash-remote-exec",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="hybrid",
+        ludus_range_id="SAGELAPSR520260715",
+    )
+
+    assert seen["range_id"] == "SAGELAPSR520260715"
+    assert (
+        seen["restart_env"]["SAGE_ENGAGEMENT_NETBIOS_MAP"]
+        == orchestrate.DEFAULT_LAPS_FAMILY_TRANSFER_NETBIOS_MAP
+    )
+    assert "SAGE_GPO_PROOF_SHARE_NAME" not in seen["restart_env"]
+    assert "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON" not in seen["restart_env"]
+
+
+def test_run_side_enables_phase6_callback_uniqueness_gate(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(orchestrate, "_run", lambda *args, **kwargs: None)
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del restart_env, snapshot, retained_callback_config, ludus_range_id
+        seen["foothold"] = foothold
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "laps-family-transfer-ash-remote-exec",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="symbolic",
+    )
+
+    foothold = seen["foothold"]
+    assert foothold.callback_settle_seconds == orchestrate.PHASE6_CALLBACK_SETTLE_SECONDS
+    assert foothold.require_unique_callback is True
+    assert foothold.launch_argv()[-3:] == [
+        "--callback-settle-seconds",
+        str(orchestrate.PHASE6_CALLBACK_SETTLE_SECONDS),
+        "--require-unique-callback",
+    ]
+
+
+def test_run_side_passes_runtime_and_scenario_env_to_gauge_subprocess(monkeypatch):
+    """Headless gauge runs must see the same BloodHound/frontier env as the restarted Sage service."""
+    seen = {}
+
+    def fake_run(name, _argv, _cwd, _timeout, env=None):
+        if name.startswith("gauge "):
+            seen["gauge_env"] = dict(env or {})
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del snapshot, retained_callback_config, foothold, ludus_range_id
+        seen["restart_env"] = dict(restart_env)
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "laps-family-transfer-ash-remote-exec",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="hybrid",
+    )
+
+    gauge_env = seen["gauge_env"]
+    assert gauge_env["SAGE_ENGAGEMENT_GATE"] == "1"
+    assert gauge_env["SAGE_BLOODHOUND_MCP_DIR"] == orchestrate.BH
+    assert gauge_env["SAGE_AUTONOMOUS_CONTROLLER"] == "1"
+    assert gauge_env["SAGE_POLICY_MODE"] == "hybrid"
+    assert (
+        gauge_env["SAGE_ENGAGEMENT_NETBIOS_MAP"]
+        == orchestrate.DEFAULT_LAPS_FAMILY_TRANSFER_NETBIOS_MAP
+    )
+    assert gauge_env["SAGE_ENGAGEMENT_NETBIOS_MAP"] == seen["restart_env"]["SAGE_ENGAGEMENT_NETBIOS_MAP"]
+
+
+def test_run_side_builds_exact_phase6_forced_prefix_after_callback_discovery(monkeypatch):
+    seen = {}
+
+    def fake_run(name, _argv, _cwd, _timeout, env=None):
+        if name.startswith("gauge "):
+            seen["gauge_env"] = dict(env or {})
+
+    def fake_full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold, ludus_range_id):
+        del restart_env, snapshot, retained_callback_config, foothold, ludus_range_id
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "laps-family-transfer-ember-remote-exec",
+        "harness",
+        go=False,
+        solve_timeout=1,
+        policy_mode="symbolic",
+        laps_forced_path="ash-first",
+        phase6_planned_row_id="forced-ember-ash-r1",
+        phase6_attempt_index=2,
+    )
+
+    gauge_env = seen["gauge_env"]
+    prefix = json.loads(gauge_env["SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"])
+    assert gauge_env["SAGE_EVAL_PHASE6_FORCED_PATH"] == "ash-first"
+    assert gauge_env["SAGE_EVAL_PHASE6_PLANNED_ROW_ID"] == "forced-ember-ash-r1"
+    assert gauge_env["SAGE_EVAL_PHASE6_ATTEMPT_INDEX"] == "2"
+    assert gauge_env["SAGE_EVAL_PHASE6_MAX_PRE_FRONTIER_DIAGNOSTIC_RETRIES"] == "1"
+    assert gauge_env["SAGE_EVAL_PHASE6_MANIFEST_HASH"].startswith("sha256:")
+    assert gauge_env["SAGE_EVAL_PHASE6_TOPOLOGY_HASH"].startswith("sha256:")
+    assert [item["capability"] for item in prefix] == [
+        "read-managed-local-admin-secret",
+        "use-managed-local-admin-secret",
+        "execute-as-local-admin",
+    ]
+    assert prefix[0]["exact_target"].endswith("target=ash-ops01;target_domain=ash.cinder.local;callback=7")
+    assert all(item["intervention_id"].startswith("phase6-laps-family-transfer-ember-remote-exec-ash-first-") for item in prefix)
 
 
 def test_purpose_range_recovery_adds_explicit_gpo_blocker_only_for_recovery_variant():

@@ -110,7 +110,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     rounds = _runtime_rounds(model)
 
     try:
-        bh_connected = any("bloodhound" in s.lower() for s in MCPManager.get_connected_servers())
+        bh_connected = any(MCPManager.is_bloodhound_server(s) for s in MCPManager.get_connected_servers())
     except Exception:
         bh_connected = False
 

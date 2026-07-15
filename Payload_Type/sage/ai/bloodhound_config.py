@@ -13,7 +13,12 @@ Used by:
 import os
 from typing import Optional
 
-from ai.mcp import MCPManager, MCPConnectionConfig, create_stdio_config
+from ai.mcp import (
+    MCPManager,
+    MCPConnectionConfig,
+    MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+    create_stdio_config,
+)
 
 BLOODHOUND_SERVER_NAME = "BloodHound"
 
@@ -45,13 +50,14 @@ def bloodhound_mcp_config(directory: Optional[str] = None) -> Optional[MCPConnec
         encoding=None,
         encoding_error_handler=None,
         session_kwargs=None,
+        sage_execution_class=MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
     )
 
 
 def bloodhound_connected() -> bool:
     """True if a BloodHound MCP server is currently connected."""
     try:
-        return any("bloodhound" in s.lower() for s in MCPManager.get_connected_servers())
+        return any(MCPManager.is_bloodhound_server(s) for s in MCPManager.get_connected_servers())
     except Exception:
         return False
 

@@ -128,6 +128,25 @@ def test_explicit_objective_still_initiates_in_auto_mode():
     _with_default_flags(_case)
 
 
+def test_explicit_remote_exec_proof_objective_initiates_in_auto_mode():
+    """Effect-backed host-scoped objectives use the same controller route as admin-control objectives."""
+    def _case():
+        m = _auto_model()
+        assert m._should_use_controller(
+            is_interactive=False,
+            prompt="From the current foothold, prove bounded remote execution on EAST-OPS01.",
+        ) is True
+        assert m._should_use_controller(
+            is_interactive=False,
+            prompt="How would you prove bounded remote execution on EAST-OPS01?",
+        ) is False
+        assert m._should_use_controller(
+            is_interactive=False,
+            prompt="Avoid proving bounded remote execution on EAST-OPS01.",
+        ) is False
+    _with_default_flags(_case)
+
+
 def test_interactive_followups_never_initiate_a_fresh_solve():
     def _case():
         m = _auto_model()

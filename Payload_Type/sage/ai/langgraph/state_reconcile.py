@@ -303,6 +303,8 @@ async def reconcile_task_history(client, data: dict, task_id: str, callback_id: 
     state = _es.EngagementState(
         objective=str(data.get("objective") or data.get("engagement_id") or ""),
         hops=_es.hops_from_dicts(data.get("hops") or []),
+        engagement_id=str(data.get("engagement_id") or ""),
+        runtime_scope=True,
     )
     notes: list[str] = []
     imported = 0
@@ -316,7 +318,12 @@ async def reconcile_task_history(client, data: dict, task_id: str, callback_id: 
         inspected += 1
         output = await _fetch_task_output_text(client, int(display_id))
         task_for_reconcile = _task_with_foothold_context(task, foothold_by_callback)
-        record = _task_reconciler.reconcile_task(task_for_reconcile, output, now)
+        record = _task_reconciler.reconcile_task(
+            task_for_reconcile,
+            output,
+            now,
+            engagement_id=str(data.get("engagement_id") or ""),
+        )
         if record is None:
             notes.append(
                 f"- skipped task {display_id}: no achieved modeled effect "
@@ -343,6 +350,9 @@ async def reconcile_task_history(client, data: dict, task_id: str, callback_id: 
             record.status,
             evidence,
             now,
+            proof_envelope=evidence.get("proof_envelope") if isinstance(evidence.get("proof_envelope"), dict) else None,
+            require_admissible_proof=True,
+            engagement_id=str(data.get("engagement_id") or ""),
         )
         after = {(hop.technique, hop.target, hop.status) for hop in state.hops}
         imported += 1

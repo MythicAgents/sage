@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from .corpus import build_manifest
+from .dataset import build_dataset_manifest
 from .exporter import export_transitions
 from .replay import replay_score
 from .schema import load_jsonl, write_jsonl
@@ -30,6 +31,19 @@ def main() -> int:
     replay.add_argument("--train", required=True, help="Training transition JSONL")
     replay.add_argument("--eval", required=True, help="Evaluation transition JSONL")
     replay.add_argument("--output", help="Optional JSON output path")
+    replay.add_argument(
+        "--include-diagnostic",
+        action="store_true",
+        help="Include v1/proposed-only records for advisory diagnostics; never use for promotion evidence",
+    )
+
+    dataset = sub.add_parser("dataset", help="Build a content-addressed trajectory-v2 dataset manifest")
+    dataset.add_argument("--transitions", required=True, help="Transition JSONL input")
+    dataset.add_argument("--output", required=True, help="Dataset manifest JSON output path")
+    dataset.add_argument(
+        "--topology-commitments",
+        help="Optional JSON object mapping topology family to train/dev/sealed",
+    )
 
     args = parser.parse_args()
     if args.command == "manifest":
@@ -46,18 +60,38 @@ def main() -> int:
         print(f"transition records={len(records)} output={args.output}")
         return 0
     if args.command == "replay":
-        result = replay_score(load_jsonl(args.train), load_jsonl(args.eval))
+        result = replay_score(
+            load_jsonl(args.train),
+            load_jsonl(args.eval),
+            include_diagnostic=bool(args.include_diagnostic),
+        )
         payload = {
             "total": result.total,
             "exact_repair_matches": result.exact_repair_matches,
             "label_matches": result.label_matches,
             "exact_repair_rate": result.exact_repair_rate,
             "label_match_rate": result.label_match_rate,
+            "diagnostic_records_skipped": result.diagnostic_records_skipped,
+            "proposed_only_records_skipped": result.proposed_only_records_skipped,
+            "include_diagnostic": bool(args.include_diagnostic),
         }
         if args.output:
             Path(args.output).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(json.dumps(payload, sort_keys=True))
         return 0
+    if args.command == "dataset":
+        commitments = {}
+        if args.topology_commitments:
+            commitments = json.loads(Path(args.topology_commitments).read_text(encoding="utf-8"))
+            if not isinstance(commitments, dict):
+                raise ValueError("topology commitments must be a JSON object")
+        manifest = build_dataset_manifest(
+            load_jsonl(args.transitions),
+            topology_commitments=commitments,
+        )
+        Path(args.output).write_text(json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"dataset valid={manifest.valid} hash={manifest.dataset_hash} output={args.output}")
+        return 0 if manifest.valid else 1
     return 2
 
 

@@ -23,14 +23,20 @@ def test_null_model_factorial_passes_all_policy_and_telemetry_invariants():
     assert rows["symbolic"]["scorecard"]["objective_proven"] is True
     assert rows["symbolic"]["scorecard"]["objective_clean_stop"] is True
 
-    for mode in ("llm", "hybrid"):
-        row = rows[mode]
-        assert row["executed_capabilities"] == []
-        assert row["telemetry"]["semantic_transaction_count"] == 0
-        assert row["telemetry"]["policy_switches"] == []
-        assert row["scorecard"]["objective_proven"] is False
-        assert row["scorecard"]["clean_stop"] is True
-        assert row["scorecard"]["objective_clean_stop"] is False
+    hybrid = rows["hybrid"]
+    assert hybrid["executed_capabilities"] == ["test-capability"]
+    assert hybrid["telemetry"]["semantic_transaction_count"] == 1
+    assert hybrid["telemetry"]["decisions"][0]["decision_owner"] == "kernel_singleton"
+    assert hybrid["scorecard"]["objective_proven"] is True
+    assert hybrid["scorecard"]["objective_clean_stop"] is True
+
+    llm = rows["llm"]
+    assert llm["executed_capabilities"] == []
+    assert llm["telemetry"]["semantic_transaction_count"] == 0
+    assert llm["telemetry"]["policy_switches"] == []
+    assert llm["scorecard"]["objective_proven"] is False
+    assert llm["scorecard"]["clean_stop"] is True
+    assert llm["scorecard"]["objective_clean_stop"] is False
 
 
 def test_null_model_factorial_cli_is_reproducible_and_offline():

@@ -78,32 +78,37 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
 
     if sub == "wipe":
         engagement_ledger.wipe(engagement_id)
-        return _render_ledger_markdown(engagement_ledger.load(engagement_id), engagement_id, model, request,
+        return _render_ledger_markdown(engagement_ledger.load_runtime(engagement_id), engagement_id, model, request,
                                        notice="🧹 Wiped the ledger.")
     if sub == "objective":
         if not rest:
             return "Usage: `/state objective <text>` — set the engagement objective."
-        data = engagement_ledger.load(engagement_id)
+        data = engagement_ledger.load_runtime(engagement_id)
         data["objective"] = rest
         data["objective_source"] = "operator"
-        engagement_ledger.save(data, engagement_id)
+        engagement_ledger.save_runtime(data, engagement_id)
         return _render_ledger_markdown(data, engagement_id, model, request, notice="🎯 Objective updated.")
     if sub == "remove":
         if not rest:
             return "Usage: `/state remove <row|id[,…]>` — remove hop(s) by row number (the # column) or id/effect/technique."
-        data = engagement_ledger.load(engagement_id)
+        data = engagement_ledger.load_runtime(engagement_id)
         selectors = [s.strip() for s in rest.split(",") if s.strip()]
         data, removed = engagement_ledger.remove_hops(data, selectors)
-        engagement_ledger.save(data, engagement_id)
+        engagement_ledger.save_runtime(data, engagement_id)
         return _render_ledger_markdown(data, engagement_id, model, request, notice=f"🗑️ Removed {removed} hop(s).")
     if sub == "set":
         bits = rest.split(maxsplit=1)
         if len(bits) < 2:
             return "Usage: `/state set <row|id> <status>` — change a hop's status (e.g. `/state set 9 pending`)."
         selector, status = bits[0].strip(), bits[1].strip()
-        data = engagement_ledger.load(engagement_id)
+        if status.casefold() == "achieved":
+            return (
+                "`/state set` cannot promote a hop to `achieved`. Runtime achievements require an "
+                "admissible Mythic/BloodHound proof envelope; use `/state reconcile` for verified task history."
+            )
+        data = engagement_ledger.load_runtime(engagement_id)
         data, changed = engagement_ledger.set_hop_status(data, selector, status)
-        engagement_ledger.save(data, engagement_id)
+        engagement_ledger.save_runtime(data, engagement_id)
         return _render_ledger_markdown(data, engagement_id, model, request, notice=f"✏️ Set status on {changed} hop(s) → `{status}`.")
     if sub == "reconcile":
         # Re-homed operator action: inspect completed Mythic task history, record achieved effects into
@@ -121,12 +126,12 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
         tokens = rest.split()
         apply = any(t.lower() == "apply" for t in tokens)
         task_id = next((t for t in tokens if t.isdigit()), "")
-        data = engagement_ledger.load(engagement_id)
+        data = engagement_ledger.load_runtime(engagement_id)
         now = datetime.now(timezone.utc).isoformat()
         data, notes = await state_reconcile.reconcile_task_history(
             client, data, task_id, "", 25, now, apply=apply,
         )
-        engagement_ledger.save(data, engagement_id)
+        engagement_ledger.save_runtime(data, engagement_id)
         return _render_ledger_markdown(data, engagement_id, model, request, notice="\n".join(notes))
     if sub and sub != "show":
         return ("Unknown `/state` subcommand. Usage:\n"
@@ -137,7 +142,7 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
                 "- `/state objective <text>`\n"
                 "- `/state wipe`")
 
-    return _render_ledger_markdown(engagement_ledger.load(engagement_id), engagement_id, model, request)
+    return _render_ledger_markdown(engagement_ledger.load_runtime(engagement_id), engagement_id, model, request)
 
 
 async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
@@ -285,11 +290,22 @@ async def _mcp_connect(spec: str) -> str:
                 name=name, command=cfg.get("command", ""), args=cfg.get("args") or [],
                 env=cfg.get("env"), cwd=cfg.get("cwd"), encoding=None,
                 encoding_error_handler=None, session_kwargs=None,
+                sage_execution_class=cfg.get("sage_execution_class"),
             )
         elif ctype == "sse":
-            conf = create_sse_config(name=name, url=cfg.get("url", ""), headers=cfg.get("headers"))
+            conf = create_sse_config(
+                name=name,
+                url=cfg.get("url", ""),
+                headers=cfg.get("headers"),
+                sage_execution_class=cfg.get("sage_execution_class"),
+            )
         elif ctype in ("http", "streamable_http", "streamable-http"):
-            conf = create_streamable_http_config(name=name, url=cfg.get("url", ""), headers=cfg.get("headers"))
+            conf = create_streamable_http_config(
+                name=name,
+                url=cfg.get("url", ""),
+                headers=cfg.get("headers"),
+                sage_execution_class=cfg.get("sage_execution_class"),
+            )
         else:
             return f"Unknown MCP type `{ctype}` — use `stdio`, `sse`, or `http`."
         ok, err = await MCPManager.connect_server(conf)

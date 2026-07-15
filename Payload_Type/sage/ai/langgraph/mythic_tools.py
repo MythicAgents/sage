@@ -34,6 +34,27 @@ _POLICY_EVIDENCE_FIELDS = (
     "effective_model_provider",
     "effective_model_id",
     "backend_provenance_source",
+    "policy_version",
+    "selection_contract",
+    "selection_contract_hash",
+    "decision_owner",
+    "raw_candidate_count",
+    "admissible_candidate_count",
+    "semantic_candidate_ids",
+    "candidate_set_hash",
+    "ordered_frontier_hash",
+    "selected_candidate_id",
+    "symbolic_counterfactual_candidate_id",
+    "branch_opportunity_count",
+    "model_owned_decision_count",
+    "kernel_singleton_count",
+    "model_branch_coverage",
+    "causally_decisive_decision_count",
+    "forced_intervention",
+    "intervention_id",
+    "forced_policy_win_credit",
+    "request_schema_hash",
+    "prompt_hash",
 )
 
 
@@ -92,7 +113,7 @@ async def _bloodhound_collected_domains(info_tool=None) -> list[str]:
         if info_tool is None:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 info_tool = next(
                     (
@@ -1112,6 +1133,8 @@ class MythicTools:
         # task AND the callback that proved it.
         self._last_issued_task_display_id = None
         self._last_issued_callback_id = None
+        self._last_issued_task_terminal_status = ""
+        self._last_issued_command = ""
         # Presentation-only observer for deterministic capability child commands. The capability executor
         # remains the only execution boundary; this reports real callback tasks to the chat surface.
         self._capability_command_observer = None
@@ -1211,6 +1234,7 @@ class MythicTools:
         # re-uploading + re-ingesting the identical SharpHound zip (observed 4x in one window) even when
         # supervisor control loops. Per-process; a lab reset + Sage restart clears it. (control-state P0)
         self._ingested_collection_hashes: dict[str, str] = {}
+        self._last_bloodhound_ingest_proof_envelope: dict = {}
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
@@ -2612,15 +2636,28 @@ class MythicTools:
             ):
                 self._authentication_contexts.pop(str(callback_display_id), None)
                 callback_key = int(callback_display_id)
-                context_changed = callback_key not in self._kerberos_logon_context_callbacks
+                previous_keys = {
+                    existing_key
+                    for existing_key in self._kerberos_logon_context_keys
+                    if existing_key[0] == callback_key
+                }
+                next_keys = {key} if key else set()
+                context_changed = (
+                    callback_key not in self._kerberos_logon_context_callbacks
+                    or previous_keys != next_keys
+                )
                 self._kerberos_logon_context_callbacks.add(callback_key)
+                self._kerberos_logon_context_keys = {
+                    existing_key
+                    for existing_key in self._kerberos_logon_context_keys
+                    if existing_key[0] != callback_key
+                }
                 self._kerberos_logon_account_context_keys = {
                     account_key for account_key in self._kerberos_logon_account_context_keys
                     if account_key[0] != str(callback_display_id)
                 }
-                if key and key not in self._kerberos_logon_context_keys:
+                if key:
                     self._kerberos_logon_context_keys.add(key)
-                    context_changed = True
                 if context_changed:
                     self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
@@ -3145,6 +3182,8 @@ class MythicTools:
                 # asyncio hard ceiling so the poller-hang protection is unchanged.
                 self._last_issued_callback_id = callback_display_id
                 self._last_issued_task_display_id = None
+                self._last_issued_task_terminal_status = ""
+                self._last_issued_command = command
 
                 async def _issue_and_wait():
                     nonlocal parameters
@@ -3197,6 +3236,7 @@ class MythicTools:
                         "episode_id": self._capability_text(policy_decision.get("episode_id")),
                         "decision_id": self._capability_text(policy_decision.get("decision_id")),
                         "policy_mode": self._capability_text(policy_decision.get("policy_mode")),
+                        "transaction_id": self._capability_text(context.get("transaction_id")),
                     }
                     await self._notify_execution_observer({**base_event, "status": "started"})
                     try:
@@ -3208,6 +3248,7 @@ class MythicTools:
                             {
                                 **base_event,
                                 "status": "error",
+                                "terminal_status": "failed",
                                 "result_preview": f"{type(exc).__name__}: {exc}",
                                 "output": f"{type(exc).__name__}: {exc}",
                             }
@@ -3215,6 +3256,11 @@ class MythicTools:
                         raise
                     result_text = _task_output_text(result)
                     result_class = command_builder.classify_result(command, result_text)
+                    self._last_issued_task_terminal_status = (
+                        "completed"
+                        if result_class == command_builder.ResultClass.SUCCESS.value
+                        else "failed"
+                    )
                     await self._notify_execution_observer({
                         **base_event,
                         "status": (
@@ -3222,6 +3268,7 @@ class MythicTools:
                             if result_class == command_builder.ResultClass.SUCCESS.value
                             else "error"
                         ),
+                        "terminal_status": self._last_issued_task_terminal_status,
                         "result_preview": result_text,
                         "output": result_text,
                     })
@@ -3437,6 +3484,8 @@ class MythicTools:
                 footholds=footholds,
                 hops=list(self._engagement_hops),
                 graph_facts=graph_facts,
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             fh = next(
                 (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
@@ -3539,6 +3588,8 @@ class MythicTools:
             hops=list(self._engagement_hops),
             graph_facts=corroboration,
             probed_effect_prefixes={"creds", "krbtgt-hash"},  # the cred-store probe definitively read these
+            engagement_id=self._eng_key(),
+            runtime_scope=True,
         )
         dom = self._dcsync_target_domain(technique, target_key)
         rights_missing = (
@@ -3639,7 +3690,7 @@ class MythicTools:
             except ImportError:
                 import engagement_ledger
             key = self._eng_key()
-            data = engagement_ledger.load(key)
+            data = engagement_ledger.load_runtime(key)
             existing = self._human_engagement_objective(data.get("objective"))
             existing_source = str(data.get("objective_source") or "")
             # Operator/legacy objective on disk -> never clobber. None or prior autonomous_seed -> (re)write.
@@ -3647,7 +3698,7 @@ class MythicTools:
                 data["objective"] = text
                 data["objective_source"] = "autonomous_seed"
                 data["updated"] = datetime.now(timezone.utc).isoformat()
-                engagement_ledger.save(data, key)
+                engagement_ledger.save_runtime(data, key)
                 self._engagement_objective_text = text
                 self._engagement_objective_source = "autonomous_seed"
             self._autonomous_objective_persisted = True
@@ -3691,6 +3742,36 @@ class MythicTools:
 
     _CRED_CACHE_TTL_SECONDS = 60
 
+    @staticmethod
+    def _credential_task_terminal_success_status(task: dict | None) -> str:
+        """Return an admissible terminal-success label for a credential's source task, else empty."""
+        task = task if isinstance(task, dict) else {}
+        status = str(task.get("status") or "").strip().casefold()
+        if any(marker in status for marker in ("error", "fail", "cancel")):
+            return ""
+        if status in {"completed", "complete", "success", "succeeded"}:
+            return status
+        if task.get("completed") is True:
+            return "completed"
+        return ""
+
+    def _credential_store_proof_envelope(self, credential: dict, now: str) -> dict:
+        """Build proof for a Mythic credential row only when its source task lineage is complete."""
+        if not isinstance(credential, dict):
+            return {}
+        task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        return self._runtime_credential_proof_envelope(
+            "mythic_credential_store:observed",
+            now,
+            credential_id=credential.get("id"),
+            callback_id=callback.get("display_id") or callback.get("id"),
+            task_id=task.get("display_id") or task.get("id"),
+            terminal_status=self._credential_task_terminal_success_status(task),
+            command=str(task.get("command_name") or task.get("command") or ""),
+            metadata={"credential_type": str(credential.get("type") or "")},
+        )
+
     async def _fetch_credentials_cached(self, now: str) -> list:
         """Read the Mythic credential store (read-only) with a short-TTL cache, shared by read_credentials
         and the gate's corroboration probe so neither re-queries Mythic repeatedly. Returns raw cred rows.
@@ -3717,11 +3798,13 @@ class MythicTools:
             if op_id is not None:
                 query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
                          "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
-                         "{ id account realm type credential_text comment timestamp } }")
+                         "{ id account realm type credential_text comment timestamp "
+                         "task { display_id status completed command_name callback { display_id } } } }")
                 variables = {"op": op_id}
             else:
                 query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
-                         "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp } }")
+                         "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp "
+                         "task { display_id status completed command_name callback { display_id } } } }")
                 variables = None
             resp = await mythic.execute_custom_query(self.client, query, variables=variables)
             creds = (resp or {}).get("credential") or []
@@ -3741,15 +3824,25 @@ class MythicTools:
             from . import engagement_state
         except ImportError:
             import engagement_state
-        facts: list = []
-        seen: set = set()
+        facts_by_predicate: dict[str, object] = {}
 
-        def add(pred: str) -> None:
+        def add(pred: str, *, proof_envelope: dict | None = None) -> None:
             p = engagement_state._normalize_predicate(pred)
-            if p and p not in seen:
-                seen.add(p)
-                facts.append(engagement_state.GraphFact(
-                    predicate=p, source="live-probe", timestamp=now, ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS))
+            if not p:
+                return
+            proof = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
+            existing = facts_by_predicate.get(p)
+            if existing is not None and (
+                getattr(existing, "proof_envelope", {}) or not proof
+            ):
+                return
+            facts_by_predicate[p] = engagement_state.GraphFact(
+                predicate=p,
+                source="live-probe",
+                timestamp=now,
+                ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS,
+                proof_envelope=proof,
+            )
 
         # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm} (the dcsync/lsass artifacts).
         try:
@@ -3758,33 +3851,40 @@ class MythicTools:
                 realm = str(c.get("realm") or "").strip().casefold()
                 if not str(c.get("credential_text") or "").strip():
                     continue
+                credential_proof = self._credential_store_proof_envelope(c, now)
                 if acct and realm:
-                    add(f"creds:{acct}@{realm}")
+                    add(f"creds:{acct}@{realm}", proof_envelope=credential_proof)
                 if acct == "krbtgt" and realm:
-                    add(f"krbtgt-hash:{realm}")
+                    add(f"krbtgt-hash:{realm}", proof_envelope=credential_proof)
         except Exception:
             pass
         # 2. Cached graph ACLs -> gpo-abuse corroboration (you still CONTROL the GPO) + replication passthrough.
         try:
             for gf in (getattr(self, "_engagement_graph_facts", []) or []):
                 p = engagement_state._normalize_predicate(getattr(gf, "predicate", ""))
+                graph_proof = dict(getattr(gf, "proof_envelope", {}) or {})
                 if p.startswith("generic-write:gpo:"):
-                    add("system:" + p[len("generic-write:gpo:"):])
+                    add("system:" + p[len("generic-write:gpo:"):], proof_envelope=graph_proof)
                 elif p.startswith("ds-replication-rights:"):
-                    add(p)
+                    add(p, proof_envelope=graph_proof)
                 elif p.startswith("gpo-domain:"):
                     # Pass the GPO->domain link through so the gate's _expand_implications can chain
                     # gpo-abuse (system:{gpo}) -> ds-replication-rights:{domain} -> dcsync. Without it the
                     # planner names dcsync but the gate DEFERs it (missing ds-replication-rights) -> churn.
-                    add(p)
+                    add(p, proof_envelope=graph_proof)
         except Exception:
             pass
-        return facts
+        return list(facts_by_predicate.values())
 
     _GRAPH_FACTS_TTL_SECONDS = 600                 # facts stay live in the engagement state for 10 min
     _GRAPH_FACTS_REFRESH_INTERVAL_SECONDS = 120    # don't re-run the read-only cypher more than ~every 2 min
 
-    async def _refresh_graph_facts_if_stale(self, now: str, force: bool = False) -> None:
+    async def _refresh_graph_facts_if_stale(
+        self,
+        now: str,
+        force: bool = False,
+        proof_envelope: dict | None = None,
+    ) -> None:
         """Refresh the cached BloodHound graph facts (ACL edges → engagement predicates) that feed the
         forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
         unless forced — e.g. right after a verified ingest). SUGGESTION-ONLY: these are NOT fed into the
@@ -3795,6 +3895,11 @@ class MythicTools:
         if force:
             self._domain_controller_cache = {}
             self._domain_sid_cache = {}
+        proof_envelope = (
+            dict(proof_envelope)
+            if isinstance(proof_envelope, dict)
+            else dict(getattr(self, "_last_bloodhound_ingest_proof_envelope", {}) or {})
+        )
         try:
             try:
                 from . import access_reconciler, engagement_state, graph_reconciler
@@ -3819,6 +3924,8 @@ class MythicTools:
                 footholds=footholds,
                 hops=list(self._engagement_hops),
                 graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             principals = graph_reconciler.controlled_principals_from_state(state)
             credential_domains = graph_reconciler.credential_target_domains_from_state(state)
@@ -3848,7 +3955,7 @@ class MythicTools:
             try:
                 from ai.mcp import MCPManager
                 for server in MCPManager.get_connected_servers():
-                    if "bloodhound" not in server.lower():
+                    if not MCPManager.is_bloodhound_server(server):
                         continue
                     for tool in MCPManager.get_tools_by_server(server):
                         if getattr(tool, "name", "") == "cypher_query":
@@ -3875,6 +3982,7 @@ class MythicTools:
                 _SingleToolMCP(cypher_tool), principals, state.objective, now,
                 self._GRAPH_FACTS_TTL_SECONDS,
                 credential_domains=credential_domains,
+                proof_envelope=proof_envelope,
             ) or [])
             facts = list(reconciled_facts)
             if reconciled_facts:
@@ -3892,6 +4000,7 @@ class MythicTools:
                             source="bloodhound:domain_info",
                             timestamp=now,
                             ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS,
+                            proof_envelope=dict(proof_envelope),
                         ))
             # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
             # from a prior refresh. Only overwrite when this reconcile actually returned edges.
@@ -4063,6 +4172,7 @@ class MythicTools:
         verified: bool,
         covered_domains: list[str] | None = None,
         collection_scope_domain: str = "",
+        proof_envelope: dict | None = None,
     ) -> None:
         """Record the collect-graph effect for the resolving callback auth-context plus requested scope.
 
@@ -4070,6 +4180,11 @@ class MythicTools:
         the scope domain so the same auth context can collect a trusted external domain exactly once without
         clobbering the current-forest collection record. Best-effort, fail-open."""
         try:
+            proof_envelope = (
+                dict(proof_envelope)
+                if isinstance(proof_envelope, dict)
+                else dict(getattr(self, "_last_bloodhound_ingest_proof_envelope", {}) or {})
+            )
             if callback_display_id is None:
                 return
             try:
@@ -4092,6 +4207,7 @@ class MythicTools:
                 return
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
+                engagement_id=self._eng_key(), runtime_scope=True,
             )
             collection_key = engagement_state.collection_target_key(state, fh, collection_scope_domain)
             if not collection_key:
@@ -4121,6 +4237,9 @@ class MythicTools:
                 state, "collect-graph", collection_key, "achieved",
                 evidence,
                 now,
+                proof_envelope=proof_envelope,
+                require_admissible_proof=True,
+                engagement_id=self._eng_key(),
             )
             self._engagement_hops = updated.hops
             try:
@@ -4129,6 +4248,164 @@ class MythicTools:
                 pass
         except Exception:
             pass
+
+    def _runtime_task_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_task_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
+                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
+                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
+                command=command or getattr(self, "_last_issued_command", ""),
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id or self._current_transaction_id(),
+                metadata=metadata or {},
+            )
+            return envelope.to_dict()
+        except Exception:
+            return {}
+
+    def _runtime_artifact_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        artifact_id: str,
+        artifact_sha256: str,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_artifact_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
+                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
+                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
+                command=command or getattr(self, "_last_issued_command", ""),
+                artifact_id=artifact_id,
+                artifact_sha256=artifact_sha256,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id or self._current_transaction_id(),
+                metadata=metadata or {},
+            )
+            return envelope.to_dict()
+        except Exception:
+            return {}
+
+    def _runtime_credential_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        credential_id,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_credential_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                credential_id=credential_id,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id or self._current_transaction_id(),
+                metadata=metadata or {},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    def _runtime_bloodhound_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        ingest_job_id,
+        ingest_status: str,
+        source_artifact_id: str,
+        source_artifact_sha256: str,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        metadata: dict | None = None,
+    ) -> dict:
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_bloodhound_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
+                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
+                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
+                command=command or getattr(self, "_last_issued_command", ""),
+                ingest_job_id=ingest_job_id,
+                ingest_status=ingest_status,
+                source_artifact_id=source_artifact_id,
+                source_artifact_sha256=source_artifact_sha256,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id or self._current_transaction_id(),
+                metadata=metadata or {},
+            )
+            return envelope.to_dict()
+        except Exception:
+            return {}
+
+    def _current_transaction_id(self) -> str:
+        context = _task_visibility_context.get() or {}
+        if not isinstance(context, dict):
+            return ""
+        value = context.get("transaction_id")
+        if value not in (None, ""):
+            return self._capability_text(value)
+        decision = context.get("policy_decision")
+        if isinstance(decision, dict):
+            return self._capability_text(decision.get("transaction_id"))
+        return ""
 
     def _record_engagement_success(self, results_str) -> None:
         pending = self._pending_engagement_hop
@@ -4337,6 +4614,8 @@ class MythicTools:
                 objective=self._engagement_objective(),
                 footholds=[],
                 hops=list(self._engagement_hops),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             evidence = {
                 "source": "issue_task",
@@ -4346,6 +4625,11 @@ class MythicTools:
                 "callback_id": getattr(self, "_last_issued_callback_id", None),
                 **extra,
             }
+            proof_envelope = self._runtime_task_proof_envelope(
+                f"engagement_state:{technique}",
+                now,
+                metadata={"technique": technique, "target": target_key},
+            )
             context_effect = ""
             if status == "achieved" and technique in {
                 "golden-ticket",
@@ -4369,6 +4653,9 @@ class MythicTools:
                     now,
                     preconditions=engagement_state._technique_preconditions(technique, target_key),
                     satisfied_effects=[primary_effect, context_effect],
+                    proof_envelope=proof_envelope,
+                    require_admissible_proof=True,
+                    engagement_id=self._eng_key(),
                 )
             else:
                 updated = engagement_state.record_hop_result(
@@ -4378,6 +4665,9 @@ class MythicTools:
                     status,
                     evidence,
                     now,
+                    proof_envelope=proof_envelope,
+                    require_admissible_proof=True,
+                    engagement_id=self._eng_key(),
                 )
             self._engagement_hops = updated.hops
             # Write-through to the durable per-engagement ledger so the hop survives runs/restarts.
@@ -4473,6 +4763,7 @@ class MythicTools:
         now = datetime.now(timezone.utc).isoformat()
         state = engagement_state.EngagementState(
             objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
+            engagement_id=self._eng_key(), runtime_scope=True,
         )
         downgraded: list[str] = []
         for hop in list(self._engagement_hops):
@@ -4969,7 +5260,7 @@ class MythicTools:
             return {}
         return {
             key: str(probe[key])
-            for key in ("pfx_artifact_path", "pfx_artifact_sha256")
+            for key in ("pfx_artifact_path", "pfx_artifact_id", "pfx_artifact_sha256")
             if probe.get(key)
         }
 
@@ -5044,6 +5335,8 @@ class MythicTools:
                 footholds=list(getattr(self, "_engagement_footholds", []) or []),
                 hops=list(getattr(self, "_engagement_hops", []) or []),
                 graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             evidence = dict(evidence or {})
             action_intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
@@ -5051,12 +5344,48 @@ class MythicTools:
             if isinstance(policy_decision, dict):
                 for key, value in _policy_decision_evidence(policy_decision).items():
                     evidence.setdefault(key, value)
+            action_name = str(getattr(action, "name", "") or "")
+            transaction_id = str(
+                action_intent.get("transaction_id")
+                or evidence.get("transaction_id")
+                or self._current_transaction_id()
+                or ""
+            )
+            if transaction_id:
+                evidence.setdefault("transaction_id", transaction_id)
+            artifact_id = str(
+                evidence.get("pfx_artifact_id")
+                or (probe_result.get("pfx_artifact_id") if isinstance(probe_result, dict) else "")
+                or ""
+            )
+            artifact_sha256 = str(
+                evidence.get("pfx_artifact_sha256")
+                or (probe_result.get("pfx_artifact_sha256") if isinstance(probe_result, dict) else "")
+                or ""
+            )
+            if action_name.casefold() == "adcs-ca-private-key-export" and artifact_id and artifact_sha256:
+                proof_envelope = self._runtime_artifact_proof_envelope(
+                    f"capability:{action_name}",
+                    now,
+                    artifact_id=artifact_id,
+                    artifact_sha256=artifact_sha256,
+                    transaction_id=transaction_id,
+                    metadata={"capability_target": getattr(action, "target", "")},
+                )
+            else:
+                proof_envelope = self._runtime_task_proof_envelope(
+                    f"capability:{action_name}",
+                    now,
+                    transaction_id=transaction_id,
+                    metadata={"capability_target": getattr(action, "target", "")},
+                )
             updated, verification = capabilities.record_capability_result(
                 state,
                 action,
                 probe_result,
                 now,
                 evidence=evidence,
+                proof_envelope=proof_envelope,
             )
             self._engagement_hops = updated.hops
             try:
@@ -5761,6 +6090,10 @@ class MythicTools:
                         dict(input_values.get("policy_decision"))
                         if isinstance(input_values.get("policy_decision"), dict)
                         else dict((getattr(action_obj, "intent", {}) or {}).get("policy_decision") or {})
+                    ),
+                    "transaction_id": self._capability_text(
+                        input_values.get("transaction_id")
+                        or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
                     ),
                 }
                 self._deterministic_capability_command_contexts[
@@ -6789,7 +7122,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._ensure_engagement_key()
-            ledger = engagement_ledger.load(self._eng_key())
+            ledger = engagement_ledger.load_runtime(self._eng_key())
             artifact_dir = Path(_engagement_state_dir()) / "artifacts"
             ca_password = self._capability_text(
                 input_values.get("ca_pfx_password")
@@ -7709,6 +8042,7 @@ class MythicTools:
                 "capability": capability_name,
                 "purpose": command_obj.get("purpose"),
                 "policy_decision": dict(command_context.get("policy_decision") or {}),
+                "transaction_id": self._capability_text(command_context.get("transaction_id")),
             })
             try:
                 output = await self.issue_task_and_waitfor_task_output(
@@ -9671,6 +10005,15 @@ class MythicTools:
                 verifier_status=self._capability_text(payload.get("verdict") or "failed"),
                 source="execute_capability",
                 build_payload=build_payload,
+                policy_decision=(
+                    dict((inputs or {}).get("policy_decision") or {})
+                    if isinstance((inputs or {}).get("policy_decision"), dict)
+                    else {}
+                ),
+                transaction_id=self._capability_text(
+                    (inputs or {}).get("transaction_id")
+                    or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                ),
             )
         except Exception as exc:
             payload["trajectory_repair"] = {
@@ -11510,7 +11853,7 @@ class MythicTools:
         try:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 for tool in MCPManager.get_tools_by_server(server):
                     if getattr(tool, "name", "") == "cypher_query":
@@ -12663,11 +13006,25 @@ class MythicTools:
             from . import engagement_state
         except ImportError:
             import engagement_state
+        try:
+            try:
+                from . import engagement_ledger
+            except ImportError:
+                import engagement_ledger
+            if isinstance(payload, dict):
+                engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
+        except Exception:
+            pass
         loaded = engagement_state.hops_from_dicts(items)
         graph_facts = (
             engagement_state.graph_facts_from_dicts(payload.get("graph_facts"))
             if isinstance(payload, dict) else []
         )
+        for graph_fact in reversed(graph_facts):
+            proof = getattr(graph_fact, "proof_envelope", {}) or {}
+            if isinstance(proof, dict) and proof:
+                self._last_bloodhound_ingest_proof_envelope = dict(proof)
+                break
         # Tag every loaded hop with 'durable' provenance: the gate will NOT silently hard-SKIP a durable
         # hop unless live footholds corroborate it (run-provenance hops keep the trustworthy hard-SKIP).
         for _h in loaded:
@@ -12729,6 +13086,14 @@ class MythicTools:
             ),
             "graph_facts_updated": getattr(self, "_engagement_graph_facts_ts", None),
         }
+        try:
+            try:
+                from . import engagement_ledger
+            except ImportError:
+                import engagement_ledger
+            engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
+        except Exception:
+            pass
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, default=str)
@@ -12902,6 +13267,8 @@ class MythicTools:
                     chunks_received
                     total_chunks
                     task {
+                        display_id
+                        command_name
                         callback {
                             display_id
                         }
@@ -12939,6 +13306,13 @@ class MythicTools:
                 agent_file_id
                 filename_utf8
                 timestamp
+                task {
+                    display_id
+                    command_name
+                    callback {
+                        display_id
+                    }
+                }
             }
         }
     """
@@ -13069,6 +13443,8 @@ class MythicTools:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ingest_collection (file_uuid={file_uuid!r}, callback={callback_display_id})")
         source_filename = ""
+        source_task_id = None
+        source_command = ""
         blocker = self._operator_collection_ingest_blocker(
             callback_display_id=callback_display_id,
             source_filename=source_filename,
@@ -13086,6 +13462,8 @@ class MythicTools:
                 source_callback = (
                     ((meta or {}).get("task") or {}).get("callback") or {}
                 ).get("display_id")
+                source_task_id = ((meta or {}).get("task") or {}).get("display_id")
+                source_command = str(((meta or {}).get("task") or {}).get("command_name") or "")
                 if callback_display_id is None and source_callback is not None:
                     callback_display_id = int(source_callback)
                     resolved_by = f"uuid:callback:{callback_display_id}"
@@ -13118,6 +13496,8 @@ class MythicTools:
                 }, sort_keys=True)
             file_uuid = row["agent_file_id"]
             source_filename = row.get("filename_utf8") or ""
+            source_task_id = (row.get("task") or {}).get("display_id") if isinstance(row.get("task"), dict) else None
+            source_command = str((row.get("task") or {}).get("command_name") or "") if isinstance(row.get("task"), dict) else ""
             if not file_name:
                 file_name = os.path.basename(source_filename)
             resolved_by = "callback:" + str(callback_display_id)
@@ -13159,6 +13539,21 @@ class MythicTools:
         # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
         content_hash, prior_job = self._collection_already_ingested(file_content)
         if prior_job is not None:
+            collection_proof = self._runtime_bloodhound_proof_envelope(
+                "bloodhound_ingest:idempotent",
+                datetime.now(timezone.utc).isoformat(),
+                ingest_job_id=prior_job,
+                ingest_status="complete",
+                source_artifact_id=file_uuid,
+                source_artifact_sha256=content_hash,
+                callback_id=callback_display_id,
+                task_id=source_task_id,
+                terminal_status="completed",
+                command=source_command,
+                metadata={"idempotent_skip": True},
+            )
+            if collection_proof:
+                self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
             # Record graph-built at the CURRENT access key before short-circuiting. The bytes were ingested+
             # verified earlier, but if this is a NEW access key (e.g. host re-collected after a privilege
             # change, identical graph bytes), the graph-built hop for THIS key may not exist yet — without
@@ -13171,6 +13566,7 @@ class MythicTools:
                     True,
                     covered_domains=covered_domains,
                     collection_scope_domain=collection_scope_domain,
+                    proof_envelope=collection_proof,
                 )
             except Exception:
                 pass
@@ -13191,7 +13587,7 @@ class MythicTools:
         try:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 for tool in MCPManager.get_tools_by_server(server):
                     n = getattr(tool, "name", "")
@@ -13243,13 +13639,36 @@ class MythicTools:
             if verified
             else []
         )
+        collection_proof = (
+            self._runtime_bloodhound_proof_envelope(
+                "bloodhound_ingest:completed",
+                datetime.now(timezone.utc).isoformat(),
+                ingest_job_id=job_id_bh,
+                ingest_status=status_msg or "",
+                source_artifact_id=file_uuid,
+                source_artifact_sha256=content_hash,
+                callback_id=callback_display_id,
+                task_id=source_task_id,
+                terminal_status="completed",
+                command=source_command,
+                metadata={"filename": safe_name},
+            )
+            if verified
+            else {}
+        )
+        if collection_proof:
+            self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
         # Loop-breaker: once the graph is populated the forward planner can name the next hop. Refresh the
         # cached graph facts so the per-turn injection surfaces NEXT GROUNDED ACTIONS (graph ACL edges →
         # available hops) and the operator advances instead of re-collecting. Fire on EVERY ingest (not
         # just verified): ingest is async, so a collection that reads "pending" here is often Complete
         # seconds later — the refresh is non-clobbering (keeps prior facts if this cypher returns empty).
         try:
-            await self._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat(), force=True)
+            await self._refresh_graph_facts_if_stale(
+                datetime.now(timezone.utc).isoformat(),
+                force=True,
+                proof_envelope=collection_proof,
+            )
         except Exception:
             pass
         # Record the collect-graph effect (graph-built at this access level) so re-collection is gated, and
@@ -13260,6 +13679,7 @@ class MythicTools:
                 verified,
                 covered_domains=covered_domains,
                 collection_scope_domain=collection_scope_domain,
+                proof_envelope=collection_proof,
             )
         except Exception:
             pass

@@ -631,6 +631,16 @@ def test_mode_auto_sets_autonomous_solve():
     assert kwargs["autonomous_solve"] is True
 
 
+def test_build_model_kwargs_threads_eval_force_prefix_from_channel_config(monkeypatch):
+    monkeypatch.setenv("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON", '[{"capability":"env"}]')
+    raw = '[{"capability":"read-managed-local-admin-secret","exact_target":"target=blue-ops01"}]'
+    req = build_chat_request("hi", config={"SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON": raw})
+
+    kwargs = build_model_kwargs(req)
+
+    assert kwargs["eval_force_capability_prefix_json"] == raw
+
+
 def test_channel_session_key_is_channel_id():
     req = build_chat_request("hi", channel_id=77)
     assert channel_session_key(req) == "77"
@@ -1169,17 +1179,22 @@ def test_autonomous_solve_toggle_independent_of_mode():
     assert kwargs["mode"] == "supervised" and kwargs["autonomous_solve"] is True
 
 
-def test_policy_mode_defaults_llm_and_accepts_hybrid_and_symbolic():
-    assert build_model_kwargs(build_chat_request("hi"))["policy_mode"] == "llm"
+def test_policy_mode_defaults_symbolic_and_accepts_hybrid_and_symbolic():
+    defaults = build_model_kwargs(build_chat_request("hi"))
+    assert defaults["policy_mode"] == "symbolic"
+    assert defaults["policy_mode_resolution"] == "default_missing"
     kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "hybrid"}))
     assert kwargs["policy_mode"] == "hybrid"
+    assert kwargs["policy_mode_resolution"] == "explicit_valid"
     kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "symbolic"}))
     assert kwargs["policy_mode"] == "symbolic"
 
 
-def test_invalid_explicit_policy_mode_is_rejected():
-    with pytest.raises(ValueError, match="unsupported policy mode"):
-        build_model_kwargs(build_chat_request("hi", config={"policy_mode": "automatic"}))
+def test_invalid_explicit_policy_mode_resolves_symbolic_and_records_resolution():
+    kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "automatic"}))
+    assert kwargs["policy_mode"] == "symbolic"
+    assert kwargs["policy_mode_requested"] == "automatic"
+    assert kwargs["policy_mode_resolution"] == "default_invalid"
 
 
 def test_policy_configuration_exposes_all_three_policy_backends():
@@ -1574,6 +1589,21 @@ def test_handle_state_set_status_mutates_and_saves(monkeypatch):
     assert "pending" in text
 
 
+def test_handle_state_set_cannot_promote_to_achieved(monkeypatch):
+    from sage_chat import slash
+    from ai.langgraph import engagement_ledger
+
+    saved = {}
+    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    monkeypatch.setattr(engagement_ledger, "load",
+                        lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "pending"}]})
+    monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
+
+    text = _run(slash._handle_state(None, build_chat_request("x"), "set 1 achieved"))
+    assert "cannot promote" in text
+    assert saved == {}
+
+
 # --------------------------------------------------------------------------------------
 # HITL Respond/Select steering (Phase 3)
 # --------------------------------------------------------------------------------------
@@ -1646,7 +1676,8 @@ def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
     monkeypatch.setattr(headless_solver, "run_headless_solve", _fake_run)
     solve = live_seams.make_headless_solver("CLIENT", engagement_id="Operation_Chimera_1",
                                             operation_id=7, timeout=99, max_steps=0, policy_mode="symbolic",
-                                            provider="openai", model="test-model")
+                                            provider="openai", model="test-model",
+                                            api_endpoint="http://127.0.0.1:8100/v1", api_key="route-key")
     assert solve("compromise CORP") == "completed"
     assert calls["objective"] == "compromise CORP"
     assert calls["client"] == "CLIENT"
@@ -1655,7 +1686,91 @@ def test_make_headless_solver_routes_to_in_process_solve(monkeypatch):
     assert calls["policy_mode"] == "symbolic"
     assert calls["provider"] == "openai"
     assert calls["model"] == "test-model"
+    assert calls["api_endpoint"] == "http://127.0.0.1:8100/v1"
+    assert calls["api_key"] == "route-key"
     assert calls["return_details"] is True
+
+
+def test_headless_solver_builds_model_config_from_explicit_route(monkeypatch):
+    """Headless runs bypass chat metadata, so they must still carry the selected route into Model config."""
+    from ai.hillclimb import headless_solver
+
+    captured = {}
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.llm = object()
+
+        async def initialize(self):
+            return None
+
+        async def invoke(self, _objective):
+            return None
+
+        def controller_runtime_telemetry(self):
+            return {}
+
+    monkeypatch.setattr("ai.langgraph.model.Model", FakeModel)
+    result = _run(headless_solver.run_headless_solve(
+        "objective",
+        client=object(),
+        operation_id=1,
+        engagement_id="headless-route",
+        provider="openai",
+        model="test-model",
+        api_endpoint="http://127.0.0.1:8100/v1",
+        api_key="route-key",
+        return_details=True,
+    ))
+
+    assert result["status"] == "completed"
+    assert captured["config"] == {
+        "configurable": {
+            "api_key": "route-key",
+            "base_url": "http://127.0.0.1:8100/v1",
+        },
+    }
+
+
+def test_headless_solver_connects_bloodhound_before_model_initialize(monkeypatch):
+    """Headless runs must mirror native chat's BloodHound-before-graph-construction ordering."""
+    from ai import bloodhound_config
+    from ai.hillclimb import headless_solver
+
+    events = []
+
+    async def _ensure():
+        events.append("bloodhound")
+        return True, "connected"
+
+    class FakeModel:
+        def __init__(self, **_kwargs):
+            self.llm = object()
+
+        async def initialize(self):
+            events.append("initialize")
+
+        async def invoke(self, _objective):
+            return None
+
+        def controller_runtime_telemetry(self):
+            return {}
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr("ai.langgraph.model.Model", FakeModel)
+    result = _run(headless_solver.run_headless_solve(
+        "objective",
+        client=object(),
+        operation_id=1,
+        engagement_id="headless-bloodhound",
+        provider="openai",
+        model="test-model",
+        return_details=True,
+    ))
+
+    assert result["status"] == "completed"
+    assert events == ["bloodhound", "initialize"]
 
 
 def test_make_native_chat_solver_creates_treatment_channel(monkeypatch):
@@ -1697,6 +1812,45 @@ def test_make_native_chat_solver_creates_treatment_channel(monkeypatch):
     assert calls["metadata"]["config"]["API_ENDPOINT"] == "http://proxy/v1"
 
 
+def test_make_native_chat_solver_creates_eval_override_channel_without_model_treatment(monkeypatch):
+    """A post-reset exact-target fixture must travel in fresh channel metadata, not child-process env only."""
+    import sys
+    import types
+
+    from ai.hillclimb import live_seams
+
+    calls = {}
+
+    async def _fake_run(client, objective, **kwargs):
+        calls.update(client=client, objective=objective, **kwargs)
+        return {"status": "completed"}
+
+    fake_native_chat = types.SimpleNamespace(
+        default_ai_metadata=lambda: {
+            "config": {
+                "provider": "openai",
+                "model": "default-model",
+                "API_ENDPOINT": "http://proxy/v1",
+                "API_KEY": "secret",
+            },
+        },
+        run_native_chat_turn=_fake_run,
+    )
+    monkeypatch.setitem(sys.modules, "native_chat", fake_native_chat)
+    raw = '[{"capability":"read-managed-local-admin-secret","exact_target":"target=blue-ops01"}]'
+
+    solve = live_seams.make_native_chat_solver(
+        "CLIENT",
+        eval_force_capability_prefix_json=raw,
+    )
+
+    assert solve("objective") == "completed"
+    assert calls["use_prepared_channel"] is False
+    assert calls["metadata"]["config"]["provider"] == "openai"
+    assert calls["metadata"]["config"]["model"] == "default-model"
+    assert calls["metadata"]["config"]["SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"] == raw
+
+
 def test_build_channel_metadata_live_counts(monkeypatch):
     """The live header chips reflect MCP tool/server counts, session rounds, and BloodHound state."""
     from sage_chat.metadata import build_channel_metadata
@@ -1705,6 +1859,7 @@ def test_build_channel_metadata_live_counts(monkeypatch):
     monkeypatch.setattr(mcp.MCPManager, "get_tools_summary",
                         lambda: {"total_tools": 13, "connected_servers": 1}, raising=False)
     monkeypatch.setattr(mcp.MCPManager, "get_connected_servers", lambda: ["BloodHound"], raising=False)
+    monkeypatch.setattr(mcp.MCPManager, "is_bloodhound_server", lambda name: name == "BloodHound", raising=False)
 
     class _M:
         _global_step_count = 7

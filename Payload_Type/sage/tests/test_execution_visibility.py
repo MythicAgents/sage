@@ -7,6 +7,7 @@ from langchain_core.tools import StructuredTool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ai import mcp as mcpmod  # noqa: E402
 from ai.mcp import MCPServerManager  # noqa: E402
 
 
@@ -72,3 +73,76 @@ def test_mcp_registry_wrapper_is_fail_open_when_observer_raises():
         manager.reset_execution_observer(token)
 
     assert result == {"rows": ["MATCH (n) RETURN n"]}
+
+
+def test_unclassified_mcp_server_is_denied_before_session_side_effect(monkeypatch):
+    manager = MCPServerManager()
+    called = []
+
+    def _should_not_connect(_connection):
+        called.append(True)
+        raise AssertionError("session creation must not happen")
+
+    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    config = mcpmod.create_stdio_config(
+        name="unknown",
+        command="python",
+        args=[],
+        env=None,
+        cwd=None,
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+    )
+
+    ok, error = asyncio.run(manager.connect_server(config))
+
+    assert ok is False
+    assert "unclassified" in str(error)
+    assert called == []
+
+
+def test_target_facing_mcp_server_is_denied_before_session_side_effect(monkeypatch):
+    manager = MCPServerManager()
+    called = []
+
+    def _should_not_connect(_connection):
+        called.append(True)
+        raise AssertionError("session creation must not happen")
+
+    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    config = mcpmod.create_stdio_config(
+        name="ldap-sidecar",
+        command="python",
+        args=[],
+        env=None,
+        cwd=None,
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_TARGET_FACING,
+    )
+
+    ok, error = asyncio.run(manager.connect_server(config))
+
+    assert ok is False
+    assert "target_facing" in str(error)
+    assert called == []
+
+
+def test_non_target_control_plane_is_the_canonical_allowed_mcp_class():
+    config = mcpmod.create_stdio_config(
+        name="control-plane",
+        command="python",
+        args=[],
+        env=None,
+        cwd=None,
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+        sage_execution_class="control_plane",
+    )
+
+    assert mcpmod.MCP_EXECUTION_CLASS_CONTROL_PLANE == "non_target_control_plane"
+    assert config.sage_execution_class == mcpmod.MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE
+    assert mcpmod.execution_class_allowed(config.sage_execution_class) is True

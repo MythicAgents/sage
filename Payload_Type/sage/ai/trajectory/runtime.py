@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Iterable
@@ -10,6 +12,9 @@ from typing import Any, Iterable
 from .labeler import classify_observation, repair_for_label
 from .replay import FrequencyRepairPolicy, RepairDecision
 from .schema import (
+    EVIDENCE_ROLE_DIAGNOSTIC_ONLY,
+    LABEL_SOURCE_CLASSIFIER,
+    OUTCOME_DIAGNOSTIC_ONLY,
     TransitionCommand,
     TransitionObservation,
     TransitionRecord,
@@ -86,6 +91,9 @@ class TrajectoryRepairBridge:
         verifier_status: str = "failed",
         source: str = "execute_capability",
         build_payload: dict[str, Any] | None = None,
+        policy_decision: dict[str, Any] | None = None,
+        transaction_id: str = "",
+        proof_envelope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             return {"enabled": False, "recorded": False}
@@ -100,10 +108,15 @@ class TrajectoryRepairBridge:
             issued=issued_rows,
             verifier_status=verifier_status,
             source=source,
+            policy_decision=policy_decision or {},
+            transaction_id=transaction_id,
+            proof_envelope=proof_envelope or {},
         )
         prior = self._load_prior()
         self.record_transition(record)
-        decision = FrequencyRepairPolicy([*prior, record]).choose(record)
+        # Runtime recall stays advisory. Diagnostic proposed repairs may be surfaced to the
+        # operator, but replay/training defaults never count them as verified positive labels.
+        decision = FrequencyRepairPolicy([*prior, record], include_diagnostic=True).choose(record)
         return self._result_payload(record, decision)
 
     def build_failure_record(
@@ -116,6 +129,9 @@ class TrajectoryRepairBridge:
         issued: list[dict[str, Any]],
         verifier_status: str,
         source: str,
+        policy_decision: dict[str, Any] | None = None,
+        transaction_id: str = "",
+        proof_envelope: dict[str, Any] | None = None,
     ) -> TransitionRecord:
         classification = classify_observation(observation)
         repair_data = repair_for_label(classification.label)
@@ -126,6 +142,9 @@ class TrajectoryRepairBridge:
         )
         capability = self._capability_name(action, inputs, observation)
         action_map = self._action_dict(action)
+        policy_decision = policy_decision if isinstance(policy_decision, dict) else {}
+        proof_envelope = proof_envelope if isinstance(proof_envelope, dict) else {}
+        proof_id = self._proof_hash(proof_envelope)
         command_records = tuple(self._command_record(item) for item in issued if self._command_record(item))
         return TransitionRecord(
             run_id=(
@@ -152,6 +171,10 @@ class TrajectoryRepairBridge:
                     "classification": classification.label,
                     "callback_id": str(callback_id or ""),
                 },
+                verifier_id=str(proof_envelope.get("verifier_id") or ""),
+                verifier_version=str(proof_envelope.get("verifier_version") or "v1"),
+                proof_ids=((proof_id,) if proof_id else ()),
+                admissible_proof=False,
             ),
             failure_label=classification.label,
             repair=repair,
@@ -166,6 +189,39 @@ class TrajectoryRepairBridge:
             },
             commands=command_records,
             state_after={"effects_added": [], "effects_failed": [capability] if capability else []},
+            episode_id=str(policy_decision.get("episode_id") or ""),
+            engagement_id=str(os.environ.get("SAGE_ENGAGEMENT_ID") or ""),
+            decision_id=str(policy_decision.get("decision_id") or ""),
+            transaction_id=str(transaction_id or policy_decision.get("transaction_id") or ""),
+            callback_id=str(callback_id or ""),
+            task_ids=tuple(
+                str(item.get("task_id"))
+                for item in issued
+                if isinstance(item, dict) and item.get("task_id") not in (None, "")
+            ),
+            proof_ids=((proof_id,) if proof_id else ()),
+            proof_envelope=dict(proof_envelope),
+            policy_version=str(policy_decision.get("policy_version") or ""),
+            effective_backend=str(policy_decision.get("effective_backend") or ""),
+            effective_request_id=str(
+                (policy_decision.get("response_metadata") or {}).get("request_id")
+                if isinstance(policy_decision.get("response_metadata"), dict)
+                else ""
+            ),
+            raw_frontier_hash=str(policy_decision.get("candidate_set_hash") or ""),
+            admissible_frontier_hash=str(policy_decision.get("ordered_frontier_hash") or ""),
+            semantic_candidate_ids=tuple(policy_decision.get("semantic_candidate_ids") or ()),
+            normalized_state_before={
+                "target": str(action_map.get("target") or ""),
+                "effects_requested": list(action_map.get("effects") or []),
+                "features": self._features_for_label(classification.label),
+            },
+            normalized_state_after={"effects_added": [], "effects_failed": [capability] if capability else []},
+            label_source=LABEL_SOURCE_CLASSIFIER,
+            evidence_role=EVIDENCE_ROLE_DIAGNOSTIC_ONLY,
+            outcome_source=OUTCOME_DIAGNOSTIC_ONLY,
+            transition_outcome=(verifier_status or "failed").casefold(),
+            proof_envelope_ref=proof_id,
         )
 
     def record_transition(self, record: TransitionRecord) -> None:
@@ -173,7 +229,7 @@ class TrajectoryRepairBridge:
         write_jsonl(str(self.store_path), [record], append=True)
 
     def rank_repairs(self, record: TransitionRecord) -> RepairDecision | None:
-        return FrequencyRepairPolicy(self._load_prior()).choose(record)
+        return FrequencyRepairPolicy(self._load_prior(), include_diagnostic=True).choose(record)
 
     def _load_prior(self) -> list[TransitionRecord]:
         if not self.store_path.exists():
@@ -299,3 +355,12 @@ class TrajectoryRepairBridge:
             "directory_bind_error": ["directory_write", "writable_dc_bind_required"],
             "schema_or_argument_mismatch": ["payload_schema_required"],
         }.get(label, [label])
+
+    @staticmethod
+    def _proof_hash(proof: dict[str, Any]) -> str:
+        if not isinstance(proof, dict) or not proof:
+            return ""
+        payload = dict(proof)
+        payload.pop("persistence_state", None)
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return "sha256:" + hashlib.sha256(blob).hexdigest()

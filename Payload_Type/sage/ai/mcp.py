@@ -19,6 +19,30 @@ from langchain_core.tools import BaseTool
 from mythic_container.logging import logger
 
 
+MCP_EXECUTION_CLASS_UNCLASSIFIED = "unclassified"
+MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE = "non_target_control_plane"
+# Compatibility symbol for callers that imported the older name before the boundary contract was finalized.
+MCP_EXECUTION_CLASS_CONTROL_PLANE = MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE
+MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE = "bloodhound_control_plane"
+MCP_EXECUTION_CLASS_TARGET_FACING = "target_facing"
+ALLOWED_MCP_EXECUTION_CLASSES = frozenset({
+    MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+    MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+})
+_LEGACY_MCP_EXECUTION_CLASS_ALIASES = {
+    "control_plane": MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+}
+
+
+def normalize_execution_class(value: Any) -> str:
+    normalized = str(value or "").strip().casefold() or MCP_EXECUTION_CLASS_UNCLASSIFIED
+    return _LEGACY_MCP_EXECUTION_CLASS_ALIASES.get(normalized, normalized)
+
+
+def execution_class_allowed(value: Any) -> bool:
+    return normalize_execution_class(value) in ALLOWED_MCP_EXECUTION_CLASSES
+
+
 _execution_observer: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "sage_execution_observer",
     default=None,
@@ -106,6 +130,11 @@ class MCPConnectionConfig:
     # Additional connection parameters
     session_kwargs: Optional[Dict[str, Any]] = None
     extra_params: Optional[Dict[str, Any]] = None
+    # Sage boundary classification. Unclassified and target-facing servers are denied before connect.
+    sage_execution_class: str = MCP_EXECUTION_CLASS_UNCLASSIFIED
+
+    def __post_init__(self) -> None:
+        self.sage_execution_class = normalize_execution_class(self.sage_execution_class)
 
 
 class MCPServerManager:
@@ -148,12 +177,16 @@ class MCPServerManager:
         except Exception as exc:
             logger.debug(f"MCP execution observer failed (non-fatal): {exc}")
 
-    def _wrap_tool_for_visibility(self, server_name: str, tool: BaseTool) -> BaseTool:
-        """Clone one MCP tool with fail-open lifecycle observation around its outbound call."""
+    def _wrap_tool_for_visibility(self, server_name: str, tool: BaseTool) -> Optional[BaseTool]:
+        """Clone one MCP tool with lifecycle observation around its outbound call.
+
+        The wrapper is part of the execution boundary. If it cannot be installed,
+        the tool is not registered.
+        """
         original = getattr(tool, "coroutine", None)
         if not callable(original):
-            logger.debug(f"MCP tool {server_name}.{tool.name} has no async coroutine; visibility wrapper skipped")
-            return tool
+            logger.warning(f"MCP tool {server_name}.{tool.name} has no async coroutine; tool denied")
+            return None
 
         self._execution_seq += 1
         wrapper_version = self._execution_seq
@@ -202,9 +235,17 @@ class MCPServerManager:
             return wrapped
         except Exception as exc:
             logger.warning(
-                f"Could not wrap MCP tool {server_name}.{tool.name} for visibility; using original: {exc}"
+                f"Could not wrap MCP tool {server_name}.{tool.name} for visibility; tool denied: {exc}"
             )
-            return tool
+            return None
+
+    def is_bloodhound_server(self, server_name: str) -> bool:
+        config = self.configs.get(server_name)
+        return bool(
+            config is not None
+            and normalize_execution_class(config.sage_execution_class)
+            == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
+        )
     
     async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
@@ -216,6 +257,13 @@ class MCPServerManager:
         Returns:
             tuple: (success: bool, error_message: Optional[str])
         """
+        if not execution_class_allowed(getattr(config, "sage_execution_class", None)):
+            execution_class = normalize_execution_class(getattr(config, "sage_execution_class", None))
+            return (
+                False,
+                f"MCP server '{config.name}' denied before connect: execution class '{execution_class}' is not allowed",
+            )
+
         # Set up a temporary exception handler to capture background task errors
         captured_exceptions: List[str] = []
         loop = asyncio.get_event_loop()
@@ -419,6 +467,11 @@ class MCPServerManager:
     async def _load_tools_for_server(self, server_name: str):
         """Load and convert MCP tools for a specific server"""
         try:
+            config = self.configs.get(server_name)
+            if config is None or not execution_class_allowed(config.sage_execution_class):
+                logger.warning(f"MCP server '{server_name}' tool load denied: missing allowed execution class")
+                self.tools[server_name] = []
+                return
             session = self.sessions[server_name]
             connection = self.connections[server_name]
 
@@ -436,10 +489,11 @@ class MCPServerManager:
 
             # Store ALL tools for this server (including ones with conflicting names).
             # Observation is installed here so every Sage caller shares the same outbound boundary.
-            self.tools[server_name] = [
+            wrapped_tools = [
                 self._wrap_tool_for_visibility(server_name, tool)
                 for tool in langchain_tools
             ]
+            self.tools[server_name] = [tool for tool in wrapped_tools if tool is not None]
 
             if conflicts_found > 0:
                 logger.warning(f"Loaded {len(langchain_tools)} tools from server '{server_name}' ({conflicts_found} tools have name conflicts with other servers)")
@@ -609,6 +663,7 @@ def create_stdio_config(name: str, command: str, args: List[str] | None,
                        encoding: str | None, encoding_error_handler: str | None,
                        session_kwargs: Dict[str, Any] | None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for STDIO MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.STDIO,
@@ -619,7 +674,8 @@ def create_stdio_config(name: str, command: str, args: List[str] | None,
         encoding=encoding,
         encoding_error_handler=encoding_error_handler,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )
 
 
@@ -628,6 +684,7 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
                      ssl_verify: bool | None = True,
                      session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for SSE MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.SSE,
@@ -637,7 +694,8 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
         sse_read_timeout=sse_read_timeout,
         ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )
 
 
@@ -647,6 +705,7 @@ def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] |
                                  ssl_verify: bool | None = True,
                                  session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for Streamable HTTP MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.STREAMABLE_HTTP,
@@ -657,5 +716,6 @@ def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] |
         terminate_on_close=terminate_on_close,
         ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )

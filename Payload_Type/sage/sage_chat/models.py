@@ -96,11 +96,11 @@ _CONFIG_OPTIONS = [
         DisplayName="Policy",
         Type=OptType.Choice,
         Description=(
-            "LLM makes each semantic capability decision. Hybrid has the model select from the deterministic "
-            "admissible frontier. Symbolic preserves the deterministic priority baseline."
+            "Symbolic is the temporary safe default. Hybrid has the model select from the complete deterministic "
+            "admissible frontier only at real branches. LLM calls the model on every nonempty frontier."
         ),
         Required=False,
-        DefaultValue="llm",
+        DefaultValue="symbolic",
         Choices=[
             ChatModelConfigurationOptionChoice(Label="LLM", Value="llm"),
             ChatModelConfigurationOptionChoice(Label="Hybrid", Value="hybrid"),

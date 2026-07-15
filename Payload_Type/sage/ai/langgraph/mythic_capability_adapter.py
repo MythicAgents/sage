@@ -3472,9 +3472,10 @@ def _adcs_ca_certutil_backup_remote_powershell(
             "$bytes=[IO.File]::ReadAllBytes($pfx.FullName);"
             "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx.FullName,$pfxSecret);"
             "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant();"
+            "$artifactId=[guid]::NewGuid().ToString();"
             "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),"
             "('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfx.FullName),('PFX_SHA256='+$sha),"
-            "('PFX_BASE64='+[Convert]::ToBase64String($bytes)));"
+            "('PFX_ARTIFACT_ID='+$artifactId),('PFX_BASE64='+[Convert]::ToBase64String($bytes)));"
             "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII;"
             "}catch{"
             "$msg=$_.Exception.Message -replace \"`r|`n\",' ';"
@@ -3508,7 +3509,8 @@ def _adcs_ca_export_remote_powershell(
         "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath,$pfxSecret)",
         "$bytes=[IO.File]::ReadAllBytes($pfxPath)",
         "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant()",
-        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
+        "$artifactId=[guid]::NewGuid().ToString()",
+        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_ARTIFACT_ID='+$artifactId),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
         "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII",
         "}catch{",
         "$msg=$_.Exception.Message -replace \"`r|`n\",' '",

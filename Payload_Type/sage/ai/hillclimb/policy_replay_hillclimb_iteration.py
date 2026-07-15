@@ -1,9 +1,11 @@
 """First bounded hill-climb iteration over the cheap replay evaluator.
 
-This is an eval-only propose -> evaluate -> keep/revert cycle. The baseline is the
-current blocked-effect-aware visible-cost selector. The candidate changes exactly one
-ranking variable: it adds hermetic modeled downstream transactions after blocked-effect
-avoidance and before visible wait. No runtime policy, scorer, source artifact, or safety
+This is an eval-only propose -> evaluate -> keep/revert-or-halt cycle. The baseline is
+the current blocked-effect-aware visible-cost selector. The candidate changes exactly
+one ranking variable: it adds hermetic modeled downstream transactions after
+blocked-effect avoidance and before visible wait. If that mechanism needs a branch
+without an independently observed outcome, T0 halts at the live boundary instead of
+retaining a synthetic win. No runtime policy, scorer, source artifact, or safety
 boundary is mutated.
 """
 from __future__ import annotations
@@ -15,15 +17,23 @@ import sys
 from typing import Any, Callable
 
 try:  # package import
+    from .experiment_contracts import (
+        OUTCOME_UNSCORABLE_NEW_BEHAVIOR,
+        TrainingExposure,
+        TypedVerdict,
+    )
     from . import policy_replay_corpus as corpus
     from . import policy_replay_selector_experiment as selector_experiment
     from . import policy_replay_unseen_candidate_evaluator as evaluator
+    from ..langgraph import policy
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+    from experiment_contracts import OUTCOME_UNSCORABLE_NEW_BEHAVIOR, TrainingExposure, TypedVerdict  # type: ignore
     import policy_replay_corpus as corpus  # type: ignore
     import policy_replay_selector_experiment as selector_experiment  # type: ignore
     import policy_replay_unseen_candidate_evaluator as evaluator  # type: ignore
+    import policy  # type: ignore
 
 
 DEFAULT_CORPUS_PATH = corpus.DEFAULT_CORPUS_PATH
@@ -229,12 +239,41 @@ def run_hillclimb_iteration(
     changed_case_ids = [case["id"] for case in paired_cases if case["choice_changed"]]
     improved_case_ids = [case["id"] for case in paired_cases if case["relation"] == "improved"]
     candidate_clears_threshold = total_delta is not None and total_delta >= float(acceptance_threshold)
+    claimed_mechanism_requires_unobserved_behavior = bool(
+        (evaluator_report.get("aggregate") or {}).get("unscorable_new_behavior_count")
+        and "modeled_transactions" in CANDIDATE_RANKING
+    )
     keep_candidate = bool(
         all_scored
         and changed_case_ids
         and improved_case_ids
         and no_case_regressions
         and candidate_clears_threshold
+        and not claimed_mechanism_requires_unobserved_behavior
+    )
+    exposure = TrainingExposure()
+    for case in paired_cases:
+        family = policy.capability_family((case.get("candidate") or {}).get("selected_capability"))
+        exposure.record(
+            case_id=str(case.get("id") or ""),
+            family_id=family,
+            topology_family=str(case.get("scenario") or ""),
+            relation=str(case.get("relation") or ""),
+        )
+    typed_verdict = TypedVerdict(
+        artifact_integrity_passed=True,
+        boundary_passed=True,
+        policy_identity_passed=True,
+        causal_model_contribution_passed=False,
+        backend_provenance_passed=True,
+        candidate_efficacy_passed=False if claimed_mechanism_requires_unobserved_behavior else keep_candidate,
+        non_regression_passed=no_case_regressions,
+        transfer_passed=False,
+        reason_codes=(
+            ("unscorable_new_behavior",)
+            if claimed_mechanism_requires_unobserved_behavior
+            else ()
+        ),
     )
     verifier_contract = {
         "corpus_hash": evaluator_report["corpus_hash"],
@@ -258,8 +297,16 @@ def run_hillclimb_iteration(
         "candidate_changes_at_least_one_choice": bool(changed_case_ids),
         "candidate_improves_at_least_one_case": bool(improved_case_ids),
         "candidate_has_no_case_regressions": no_case_regressions,
+        "t0_never_retains_unscorable_new_behavior": (
+            not claimed_mechanism_requires_unobserved_behavior or keep_candidate is False
+        ),
         "keep_decision_matches_threshold": keep_candidate == bool(
-            candidate_clears_threshold and all_scored and changed_case_ids and improved_case_ids and no_case_regressions
+            candidate_clears_threshold
+            and all_scored
+            and changed_case_ids
+            and improved_case_ids
+            and no_case_regressions
+            and not claimed_mechanism_requires_unobserved_behavior
         ),
         "scorer_and_safety_boundaries_unchanged": True,
     }
@@ -285,18 +332,42 @@ def run_hillclimb_iteration(
             "changed_case_ids": changed_case_ids,
             "improved_case_ids": improved_case_ids,
             "regressed_case_ids": [case["id"] for case in paired_cases if case["relation"] == "regressed"],
+            "unscorable_new_behavior_count": (evaluator_report.get("aggregate") or {}).get("unscorable_new_behavior_count", 0),
+            "t0_disposition": (
+                OUTCOME_UNSCORABLE_NEW_BEHAVIOR
+                if claimed_mechanism_requires_unobserved_behavior
+                else "survived_triage"
+            ),
+            "training_exposure": exposure.to_dict(),
         },
         "decision": {
             "keep_candidate": keep_candidate,
-            "action": "keep" if keep_candidate else "revert",
+            "action": (
+                "keep"
+                if keep_candidate
+                else "halt_at_live_boundary"
+                if claimed_mechanism_requires_unobserved_behavior
+                else "revert"
+            ),
             "reason": (
                 "Candidate clears the acceptance threshold without a paired-case regression."
                 if keep_candidate
+                else "Candidate mechanism requires unseen branch behavior; T0 cannot retain or rank it."
+                if claimed_mechanism_requires_unobserved_behavior
                 else "Candidate does not clear the acceptance threshold without regression."
             ),
+            "disposition": (
+                OUTCOME_UNSCORABLE_NEW_BEHAVIOR
+                if claimed_mechanism_requires_unobserved_behavior
+                else "survived_triage"
+                if keep_candidate
+                else "rejected_offline"
+            ),
             "runtime_promotion_authorized": False,
+            "retain_artifact_for_review": False,
+            "typed_verdict": typed_verdict.to_dict(),
             "promotion_note": (
-                "This keep decision is eval-only. Runtime promotion still requires held-out and live gates."
+                "T0 is triage only. It cannot retain an artifact, satisfy promotion evidence, or authorize live work."
             ),
         },
         "checks": checks,

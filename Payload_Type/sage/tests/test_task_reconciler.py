@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import engagement_state  # noqa: E402
 import task_reconciler  # noqa: E402
+import proof_boundary  # noqa: E402
 
 
 DOM = "sevenkingdoms.local"
@@ -110,6 +111,17 @@ def test_reconcile_manual_krbtgt_dcsync_records_verified_effect():
         TS,
     )
     assert state.achieved_effects() == {f"krbtgt-hash:{DOM}"}
+
+
+def test_reconcile_task_can_emit_admissible_runtime_proof():
+    record = task_reconciler.reconcile_task(_task(), _dcsync_output(), TS, engagement_id="op-1")
+
+    assert record is not None
+    envelope = proof_boundary.ProofEnvelope.from_dict(record.evidence["proof_envelope"])
+    admission = proof_boundary.admit_runtime_envelope(envelope, current_engagement_id="op-1")
+    assert admission.admitted is True
+    assert envelope.task_id == "450"
+    assert envelope.callback_id == "13"
 
 
 def test_reconcile_manual_domain_admin_membership_records_callback_principal_da():

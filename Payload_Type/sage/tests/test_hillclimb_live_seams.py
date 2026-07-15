@@ -211,6 +211,40 @@ def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
     )() is False
 
 
+def test_remote_execution_probe_replays_target_bound_task_proof(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_completed_task_outputs", lambda **kw: [{
+        "display_id": 61,
+        "callback_display_id": 7,
+        "output": (
+            "SAGE_REMOTE_EXEC_PROOF_east_ops01_7\n"
+            "nt authority\\system\n"
+            "EAST-OPS01\n"
+        ),
+    }])
+
+    assert ls.remote_execution_probe(
+        "east-ops01",
+        realm="east.hub.local",
+    )() is True
+
+
+def test_remote_execution_probe_rejects_other_target_proof(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_completed_task_outputs", lambda **kw: [{
+        "display_id": 61,
+        "callback_display_id": 7,
+        "output": (
+            "SAGE_REMOTE_EXEC_PROOF_west_ops01_7\n"
+            "nt authority\\system\n"
+            "WEST-OPS01\n"
+        ),
+    }])
+
+    assert ls.remote_execution_probe(
+        "east-ops01",
+        realm="east.hub.local",
+    )() is False
+
+
 def _golden_ticket_admin_task_rows():
     return [
         {

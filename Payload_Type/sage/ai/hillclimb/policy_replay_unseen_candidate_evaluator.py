@@ -1,12 +1,9 @@
-"""Hermetic unseen-candidate scoring over packet-backed replay cases.
+"""Hermetic T0 triage over packet-backed replay cases.
 
-The packet corpus is authoritative for live-observed branch outcomes. This module
-keeps those scores untouched and adds one bounded eval-only extension: for frontier
-branches that were never selected live, it reconstructs the packet state and uses the
-existing declared-effect reachability search to produce a synthetic downstream score.
-
-Synthetic scores are always labeled as such. They are not live ground truth and cannot
-replace the packet/source calibration gate.
+The packet corpus is authoritative for live-observed branch outcomes.  A branch that
+was never selected live is explicitly unscorable: modeled reachability may be reported
+as a diagnostic, but it is never promoted to an effective outcome, retention signal,
+or policy win.
 """
 from __future__ import annotations
 
@@ -18,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 try:  # package import
+    from .experiment_contracts import OUTCOME_UNSCORABLE_NEW_BEHAVIOR
     from . import frontier_census
     from . import policy_replay_calibration as calibration
     from . import policy_replay_corpus as corpus
@@ -25,6 +23,7 @@ try:  # package import
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+    from experiment_contracts import OUTCOME_UNSCORABLE_NEW_BEHAVIOR  # type: ignore
     import frontier_census  # type: ignore
     import policy_replay_calibration as calibration  # type: ignore
     import policy_replay_corpus as corpus  # type: ignore
@@ -36,6 +35,7 @@ DEFAULT_MAX_DEPTH = 8
 DEFAULT_MAX_NODES = 120
 SYNTHETIC_SCORE_SOURCE = "synthetic_modeled_reachability"
 LIVE_SCORE_SOURCE = "live_observed"
+UNSCORABLE_SCORE_SOURCE = OUTCOME_UNSCORABLE_NEW_BEHAVIOR
 SUPPORTED_SYNTHETIC_METRIC_KINDS = {"transactions_from_frontier"}
 
 
@@ -193,12 +193,9 @@ def _case_report(stored_case: dict[str, Any]) -> dict[str, Any]:
         if live_observed:
             effective_score = observed_metrics[index]
             score_source = LIVE_SCORE_SOURCE
-        elif synthetic_supported and modeled.get("reachable") is True:
-            effective_score = modeled.get("modeled_transactions")
-            score_source = SYNTHETIC_SCORE_SOURCE
         else:
             effective_score = None
-            score_source = "unscored"
+            score_source = UNSCORABLE_SCORE_SOURCE
         branch_reports.append({
             "frontier_index": index,
             "selected_capability": item.get("name"),
@@ -208,6 +205,7 @@ def _case_report(stored_case: dict[str, Any]) -> dict[str, Any]:
             "effective_score": effective_score,
             "score_source": score_source,
             "synthetic_score_is_ground_truth": False,
+            "modeled_diagnostic_only": not live_observed,
             "synthetic_metric_supported": synthetic_supported,
             "modeled_reachability": {
                 "reachable": modeled.get("reachable"),
@@ -218,9 +216,9 @@ def _case_report(stored_case: dict[str, Any]) -> dict[str, Any]:
             },
         })
     unseen_reports = [branch for branch in branch_reports if not branch["live_observed"]]
-    synthetic_unseen_reports = [
+    unscorable_unseen_reports = [
         branch for branch in unseen_reports
-        if branch["score_source"] == SYNTHETIC_SCORE_SOURCE
+        if branch["score_source"] == UNSCORABLE_SCORE_SOURCE
     ]
     checks = {
         "packet_frontier_present": bool(frontier),
@@ -229,15 +227,12 @@ def _case_report(stored_case: dict[str, Any]) -> dict[str, Any]:
             for branch in branch_reports
             if branch["live_observed"]
         ),
-        "synthetic_scores_apply_only_to_unseen_branches": all(
-            branch["live_observed"] is False
+        "unseen_branches_are_unscorable": all(
+            branch["effective_score"] is None
+            and branch["score_source"] == UNSCORABLE_SCORE_SOURCE
+            and branch["synthetic_score_is_ground_truth"] is False
             for branch in branch_reports
-            if branch["score_source"] == SYNTHETIC_SCORE_SOURCE
-        ),
-        "synthetic_scores_are_labeled_not_ground_truth": all(
-            branch["synthetic_score_is_ground_truth"] is False
-            for branch in branch_reports
-            if branch["score_source"] == SYNTHETIC_SCORE_SOURCE
+            if branch["live_observed"] is False
         ),
     }
     return {
@@ -247,9 +242,12 @@ def _case_report(stored_case: dict[str, Any]) -> dict[str, Any]:
         "decision_packet_hash": stored_case.get("decision_packet_hash"),
         "branch_reports": branch_reports,
         "unseen_frontier_indices": [branch["frontier_index"] for branch in unseen_reports],
-        "synthetically_scored_unseen_frontier_indices": [
-            branch["frontier_index"] for branch in synthetic_unseen_reports
+        "unscorable_unseen_frontier_indices": [
+            branch["frontier_index"] for branch in unscorable_unseen_reports
         ],
+        # Kept as an explicit empty compatibility field so old consumers cannot
+        # mistake removed synthetic outcomes for a silently missing report.
+        "synthetically_scored_unseen_frontier_indices": [],
         "checks": checks,
         "passes_gate": all(checks.values()),
     }
@@ -281,28 +279,28 @@ def run_unseen_candidate_evaluator(
     case_reports = [_case_report(case) for case in stored_cases if isinstance(case, dict)]
     if len(case_reports) != len(stored_cases):
         raise UnseenCandidateEvaluatorError("packet corpus cases must be objects")
-    synthetic_unseen_branches = [
+    unscorable_unseen_branches = [
         {
             "case_id": case["id"],
             "frontier_index": branch["frontier_index"],
             "selected_capability": branch["selected_capability"],
             "selected_target": branch["selected_target"],
-            "effective_score": branch["effective_score"],
+            "modeled_transactions": (branch.get("modeled_reachability") or {}).get("modeled_transactions"),
         }
         for case in case_reports
         for branch in case["branch_reports"]
-        if branch["score_source"] == SYNTHETIC_SCORE_SOURCE
+        if branch["score_source"] == UNSCORABLE_SCORE_SOURCE
     ]
     checks = {
         "corpus_validation_passes": validation["passes_gate"],
         "cases_pass": bool(case_reports) and all(case["passes_gate"] for case in case_reports),
-        "scores_at_least_one_unseen_candidate": bool(synthetic_unseen_branches),
+        "reports_at_least_one_unscorable_unseen_candidate": bool(unscorable_unseen_branches),
         "preserves_live_observed_score_sources": all(
             case["checks"]["live_observed_scores_are_not_overwritten"]
             for case in case_reports
         ),
-        "synthetic_scores_are_not_ground_truth": all(
-            case["checks"]["synthetic_scores_are_labeled_not_ground_truth"]
+        "unseen_branches_are_not_synthetic_outcomes": all(
+            case["checks"]["unseen_branches_are_unscorable"]
             for case in case_reports
         ),
         "hermetic_no_live_target_io": True,
@@ -316,19 +314,30 @@ def run_unseen_candidate_evaluator(
             "max_depth": DEFAULT_MAX_DEPTH,
             "max_nodes": DEFAULT_MAX_NODES,
             "synthetic_score_source": SYNTHETIC_SCORE_SOURCE,
+            "unscorable_score_source": UNSCORABLE_SCORE_SOURCE,
             "supported_synthetic_metric_kinds": sorted(SUPPORTED_SYNTHETIC_METRIC_KINDS),
             "score_contract": (
-                "Live-observed branch metrics remain authoritative; modeled reachability scores are attached "
-                "only to previously unobserved frontier branches and are never ground truth."
+                "Live-observed branch metrics remain authoritative; modeled reachability on previously "
+                "unobserved frontier branches is diagnostic only and returns unscorable_new_behavior."
             ),
         },
         "cases": case_reports,
         "aggregate": {
             "case_count": len(case_reports),
-            "synthetically_scored_unseen_branch_count": len(synthetic_unseen_branches),
-            "synthetically_scored_unseen_branches": synthetic_unseen_branches,
+            "synthetically_scored_unseen_branch_count": 0,
+            "synthetically_scored_unseen_branches": [],
+            "unscorable_new_behavior_count": len(unscorable_unseen_branches),
+            "unscorable_new_behavior_branches": unscorable_unseen_branches,
+            "unscorable_new_behavior_rate": (
+                len(unscorable_unseen_branches)
+                / sum(len(case["branch_reports"]) for case in case_reports)
+                if case_reports else 0.0
+            ),
+            "t0_disposition": "triage_only",
+            "retain_artifact_for_review": False,
+            "promotion_evidence_passed": False,
             "promotion_gate_required_before_live_claim": True,
-            "claim_scope": "hermetic_declared_effect_scoring_only",
+            "claim_scope": "policy_outcome_reconstruction_only",
         },
         "checks": checks,
         "passes_gate": all(checks.values()),
@@ -338,7 +347,7 @@ def run_unseen_candidate_evaluator(
 def add_cli(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "policy-replay-unseen-candidate-evaluate",
-        help="score packet-corpus unseen branches with hermetic declared-effect reachability",
+        help="triage packet-corpus unseen branches without synthesizing outcomes",
     )
     parser.add_argument("--corpus", default=None, help="optional packet corpus JSON path")
     parser.add_argument("--source-manifest", default=None, help="optional packet source manifest JSON path")
@@ -370,4 +379,3 @@ def _cmd_policy_replay_unseen_candidate_evaluate(args: Any) -> int:
         flush=True,
     )
     return 0 if report["passes_gate"] else 1
-

@@ -16,17 +16,30 @@ POLICY_LLM = "llm"
 POLICY_SYMBOLIC = "symbolic"
 POLICY_HYBRID = "hybrid"
 POLICY_MODES = frozenset((POLICY_LLM, POLICY_SYMBOLIC, POLICY_HYBRID))
+POLICY_VERSION_LLM = "llm-v1"
+POLICY_VERSION_SYMBOLIC = "symbolic-v1"
+POLICY_VERSION_HYBRID = "hybrid-full-frontier-v2"
+SELECTION_CONTRACT_LLM = "semantic_catalog"
+SELECTION_CONTRACT_SYMBOLIC = "symbolic_frontier"
+SELECTION_CONTRACT_HYBRID = POLICY_VERSION_HYBRID
 _MAX_OPERATIONAL_WAIT_SECONDS = 600
 _CAPTURE_DECISION_PACKETS_ENV = "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS"
 
 
-def normalize_policy_mode(value: Any, default: str = POLICY_LLM) -> str:
+def resolve_policy_mode(value: Any, default: str = POLICY_SYMBOLIC) -> tuple[str, str]:
     mode = str(value or "").strip().casefold()
+    fallback = str(default or "").strip().casefold()
+    if fallback not in POLICY_MODES:
+        fallback = POLICY_SYMBOLIC
+    if mode in POLICY_MODES:
+        return mode, "explicit_valid"
     if not mode:
-        mode = str(default or "").strip().casefold()
-    if mode not in POLICY_MODES:
-        raise ValueError(f"unsupported policy mode: {mode or value!r}")
-    return mode
+        return fallback, "default_missing"
+    return fallback, "default_invalid"
+
+
+def normalize_policy_mode(value: Any, default: str = POLICY_SYMBOLIC) -> str:
+    return resolve_policy_mode(value, default=default)[0]
 
 
 def new_episode_id() -> str:
@@ -87,7 +100,45 @@ def _candidate_payload(candidate: Any) -> dict[str, Any]:
     }
 
 
+def _semantic_candidate_payload(candidate: Any) -> dict[str, Any]:
+    """Return the stable action identity payload used by Phase 1 policy evidence.
+
+    `reason` is intentionally excluded: it is explanatory text, not part of the
+    selected action semantics. Preconditions and effects are sets semantically, so
+    identity must not change when their source order changes.
+    """
+    return {
+        "name": str(getattr(candidate, "name", "") or ""),
+        "target": str(getattr(candidate, "target", "") or ""),
+        "preconditions": sorted(str(v) for v in (getattr(candidate, "preconditions", None) or [])),
+        "effects": sorted(str(v) for v in (getattr(candidate, "effects", None) or [])),
+        "operational_cost": _candidate_operational_cost(candidate),
+    }
+
+
+def _sha256_json(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def semantic_candidate_id(candidate: Any) -> str:
+    return f"candidate:sha256:{_sha256_json(_semantic_candidate_payload(candidate))}"
+
+
+def candidate_set_hash(candidates: list[Any]) -> str:
+    return f"sha256:{_sha256_json(sorted(semantic_candidate_id(candidate) for candidate in candidates))}"
+
+
+def ordered_frontier_hash(candidates: list[Any]) -> str:
+    return f"sha256:{_sha256_json([semantic_candidate_id(candidate) for candidate in candidates])}"
+
+
+def selection_contract_hash(selection_contract: str) -> str:
+    return f"sha256:{_sha256_json({'selection_contract': str(selection_contract or '')})}"
+
+
 def candidate_hash(candidates: list[Any]) -> str:
+    """Legacy ordered payload hash retained for v1 replay packet compatibility."""
     raw = json.dumps(
         [_candidate_payload(candidate) for candidate in candidates],
         sort_keys=True,
@@ -190,10 +241,19 @@ def _decision_packet(
         "objective": str(objective or ""),
         "normalized_state": _normalized_state_payload(state),
         "admissible_frontier": [_candidate_payload(candidate) for candidate in candidates],
+        "semantic_candidate_ids": [semantic_candidate_id(candidate) for candidate in candidates],
         "prior_decisions": _prior_decisions_payload(history),
         "budgets": dict(budgets or {}),
+        "policy_version": {
+            SELECTION_CONTRACT_SYMBOLIC: POLICY_VERSION_SYMBOLIC,
+            SELECTION_CONTRACT_LLM: POLICY_VERSION_LLM,
+            SELECTION_CONTRACT_HYBRID: POLICY_VERSION_HYBRID,
+        }.get(str(selection_contract or ""), ""),
         "selection_contract": str(selection_contract or ""),
+        "selection_contract_hash": selection_contract_hash(selection_contract),
         "candidate_hash": candidate_hash(candidates),
+        "candidate_set_hash": candidate_set_hash(candidates),
+        "ordered_frontier_hash": ordered_frontier_hash(candidates),
     })
 
 
@@ -335,6 +395,79 @@ def _response_backend_provenance(value: Any) -> dict[str, Any]:
     }
 
 
+def _policy_version(mode: str) -> str:
+    return {
+        POLICY_SYMBOLIC: POLICY_VERSION_SYMBOLIC,
+        POLICY_LLM: POLICY_VERSION_LLM,
+        POLICY_HYBRID: POLICY_VERSION_HYBRID,
+    }.get(str(mode or ""), "")
+
+
+def _forced_intervention_metadata(candidate: Any | None) -> dict[str, Any]:
+    intent = getattr(candidate, "intent", {}) if candidate is not None else {}
+    intent = intent if isinstance(intent, dict) else {}
+    value = intent.get("eval_intervention")
+    value = value if isinstance(value, dict) else {}
+    if value.get("forced") is not True or value.get("credit_policy_win") is not False:
+        return {}
+    exact_target = str(value.get("exact_target") or "")
+    if not exact_target or exact_target != str(getattr(candidate, "target", "") or ""):
+        return {}
+    return {
+        "forced_intervention": True,
+        "intervention_id": str(value.get("intervention_id") or ""),
+        "forced_policy_win_credit": False,
+    }
+
+
+def _decision_identity_fields(
+    *,
+    mode: str,
+    selection_contract: str,
+    candidates: list[Any],
+    selected_index: int | None,
+    decision_owner: str,
+) -> dict[str, Any]:
+    ids = [semantic_candidate_id(candidate) for candidate in candidates]
+    selected_id = ids[selected_index] if isinstance(selected_index, int) and 0 <= selected_index < len(ids) else ""
+    selected_candidate = candidates[selected_index] if isinstance(selected_index, int) and 0 <= selected_index < len(candidates) else None
+    intervention = _forced_intervention_metadata(selected_candidate)
+    if intervention:
+        decision_owner = "forced_intervention"
+    branch_opportunities = 1 if len(candidates) > 1 else 0
+    model_owned = 1 if decision_owner == "model_branch" else 0
+    return {
+        "policy_version": _policy_version(mode),
+        "selection_contract": str(selection_contract or ""),
+        "selection_contract_hash": selection_contract_hash(selection_contract),
+        "decision_owner": str(decision_owner or ""),
+        # `actions_from_state()` is the current safe/admissible policy seam. Until Phase 2 adds
+        # rejection-reason instrumentation, raw and admissible counts are identical at this seam.
+        "raw_candidate_count": len(candidates),
+        "admissible_candidate_count": len(candidates),
+        "semantic_candidate_ids": ids,
+        "candidate_set_hash": candidate_set_hash(candidates),
+        "ordered_frontier_hash": ordered_frontier_hash(candidates),
+        "selected_candidate_id": selected_id,
+        "symbolic_counterfactual_candidate_id": ids[0] if ids else "",
+        "branch_opportunity_count": branch_opportunities,
+        "model_owned_decision_count": model_owned,
+        "kernel_singleton_count": 1 if decision_owner == "kernel_singleton" else 0,
+        "model_branch_coverage": (model_owned / branch_opportunities) if branch_opportunities else 0.0,
+        "causally_decisive_decision_count": 0,
+        "forced_intervention": bool(intervention),
+        "intervention_id": str(intervention.get("intervention_id") or ""),
+        "forced_policy_win_credit": intervention.get("forced_policy_win_credit"),
+    }
+
+
+def _request_schema_hash(request: dict[str, Any]) -> str:
+    return f"sha256:{_sha256_json({
+        'selection_contract': str(request.get('selection_contract') or ''),
+        'response_schema': request.get('response_schema') if isinstance(request.get('response_schema'), dict) else {},
+    })}"
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
     episode_id: str
@@ -364,6 +497,27 @@ class PolicyDecision:
     response_metadata: dict[str, str] = field(default_factory=dict)
     decision_packet: dict[str, Any] = field(default_factory=dict)
     decision_packet_hash: str = ""
+    policy_version: str = ""
+    selection_contract: str = ""
+    selection_contract_hash: str = ""
+    decision_owner: str = ""
+    raw_candidate_count: int = 0
+    admissible_candidate_count: int = 0
+    semantic_candidate_ids: list[str] = field(default_factory=list)
+    candidate_set_hash: str = ""
+    ordered_frontier_hash: str = ""
+    selected_candidate_id: str = ""
+    symbolic_counterfactual_candidate_id: str = ""
+    branch_opportunity_count: int = 0
+    model_owned_decision_count: int = 0
+    kernel_singleton_count: int = 0
+    model_branch_coverage: float = 0.0
+    causally_decisive_decision_count: int = 0
+    forced_intervention: bool = False
+    intervention_id: str = ""
+    forced_policy_win_credit: bool | None = None
+    request_schema_hash: str = ""
+    prompt_hash: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict[str, Any]:
@@ -374,7 +528,7 @@ class SymbolicPolicy:
     """Behavior-preserving baseline: choose the first admissible candidate."""
 
     mode = POLICY_SYMBOLIC
-    selection_contract = "symbolic_frontier"
+    selection_contract = SELECTION_CONTRACT_SYMBOLIC
 
     async def select(
         self,
@@ -411,6 +565,13 @@ class SymbolicPolicy:
             backend_provenance_source="symbolic",
             decision_packet=decision_packet,
             decision_packet_hash=decision_packet_hash,
+            **_decision_identity_fields(
+                mode=self.mode,
+                selection_contract=self.selection_contract,
+                candidates=candidates,
+                selected_index=0 if selected is not None else None,
+                decision_owner="symbolic_control",
+            ),
         )
 
 
@@ -418,7 +579,7 @@ class LLMPolicy:
     """Model-mediated capability selector with no symbolic fallback."""
 
     mode = POLICY_LLM
-    selection_contract = "semantic_catalog"
+    selection_contract = SELECTION_CONTRACT_LLM
 
     def __init__(
         self,
@@ -451,7 +612,12 @@ class LLMPolicy:
             ],
             "prior_decisions": _prior_decisions_payload(history),
             "budgets": dict(budgets or {}),
-            "selection_contract": "semantic_catalog",
+            "policy_version": _policy_version(self.mode),
+            "selection_contract": self.selection_contract,
+            "selection_contract_hash": selection_contract_hash(self.selection_contract),
+            "semantic_candidate_ids": [semantic_candidate_id(candidate) for candidate in candidates],
+            "candidate_set_hash": candidate_set_hash(candidates),
+            "ordered_frontier_hash": ordered_frontier_hash(candidates),
             "response_schema": {
                 "disposition": "select|stop|ask",
                 "capability": "catalog capability name required for select; must also appear in current_admissible_actions",
@@ -502,6 +668,7 @@ class LLMPolicy:
         budgets: dict[str, Any] | None = None,
     ) -> PolicyDecision:
         c_hash = candidate_hash(candidates)
+        decision_owner = "model_branch" if candidates else ""
         decision_packet, decision_packet_hash = _captured_decision_packet(
             objective=objective,
             state=state,
@@ -515,6 +682,8 @@ class LLMPolicy:
                 episode_id,
                 c_hash,
                 "no admissible candidates",
+                candidates=candidates,
+                decision_owner=decision_owner,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -524,6 +693,8 @@ class LLMPolicy:
                 c_hash,
                 f"{self.mode} policy has no model decision seam",
                 candidate_count=len(candidates),
+                candidates=candidates,
+                decision_owner=decision_owner,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -533,11 +704,14 @@ class LLMPolicy:
                 c_hash,
                 "LLM policy has no capability catalog",
                 candidate_count=len(candidates),
+                candidates=candidates,
+                decision_owner=decision_owner,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
 
         request = self.request_payload(objective, state, candidates, history, budgets)
+        request_schema_hash = _request_schema_hash(request)
         try:
             response = self._decide(request)
             if inspect.isawaitable(response):
@@ -548,6 +722,9 @@ class LLMPolicy:
                 c_hash,
                 f"{self.mode} policy call failed: {type(exc).__name__}: {exc}",
                 candidate_count=len(candidates),
+                candidates=candidates,
+                decision_owner=decision_owner,
+                request_schema_hash=request_schema_hash,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -575,6 +752,14 @@ class LLMPolicy:
                 model_response_observed=model_response_observed,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
+                request_schema_hash=request_schema_hash,
+                **_decision_identity_fields(
+                    mode=self.mode,
+                    selection_contract=self.selection_contract,
+                    candidates=candidates,
+                    selected_index=None,
+                    decision_owner=decision_owner,
+                ),
                 **provenance,
             )
         if disposition != "select":
@@ -588,6 +773,9 @@ class LLMPolicy:
                 raw_rationale=rationale,
                 model_response_observed=model_response_observed,
                 provenance=provenance,
+                candidates=candidates,
+                decision_owner=decision_owner,
+                request_schema_hash=request_schema_hash,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -603,6 +791,9 @@ class LLMPolicy:
                 raw_rationale=rationale,
                 model_response_observed=model_response_observed,
                 provenance=provenance,
+                candidates=candidates,
+                decision_owner=decision_owner,
+                request_schema_hash=request_schema_hash,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -616,6 +807,8 @@ class LLMPolicy:
                 c_hash=c_hash,
                 candidates=candidates,
                 index=index,
+                decision_owner=decision_owner,
+                request_schema_hash=request_schema_hash,
                 decision_packet=decision_packet,
                 decision_packet_hash=decision_packet_hash,
             )
@@ -647,6 +840,14 @@ class LLMPolicy:
             model_response_observed=model_response_observed,
             decision_packet=decision_packet,
             decision_packet_hash=decision_packet_hash,
+            request_schema_hash=request_schema_hash,
+            **_decision_identity_fields(
+                mode=self.mode,
+                selection_contract=self.selection_contract,
+                candidates=candidates,
+                selected_index=index,
+                decision_owner=decision_owner,
+            ),
             **provenance,
         )
 
@@ -658,6 +859,8 @@ class LLMPolicy:
         c_hash: str,
         candidates: list[Any],
         index: int,
+        decision_owner: str,
+        request_schema_hash: str,
         decision_packet: dict[str, Any],
         decision_packet_hash: str,
     ) -> PolicyDecision:
@@ -698,11 +901,19 @@ class LLMPolicy:
             backend_provenance_source=str(replay.get("backend_provenance_source") or ""),
             decision_packet=decision_packet,
             decision_packet_hash=decision_packet_hash,
+            request_schema_hash=request_schema_hash,
             response_metadata={
                 str(key): str(value)
                 for key, value in response_metadata.items()
                 if isinstance(value, (str, int, float, bool)) and str(value).strip()
             },
+            **_decision_identity_fields(
+                mode=self.mode,
+                selection_contract=self.selection_contract,
+                candidates=candidates,
+                selected_index=index,
+                decision_owner=decision_owner,
+            ),
         )
 
     def _resolve_selection(
@@ -745,6 +956,9 @@ class LLMPolicy:
         raw_rationale: str = "",
         model_response_observed: bool = False,
         provenance: dict[str, Any] | None = None,
+        candidates: list[Any] | None = None,
+        decision_owner: str = "",
+        request_schema_hash: str = "",
         decision_packet: dict[str, Any] | None = None,
         decision_packet_hash: str = "",
     ) -> PolicyDecision:
@@ -764,6 +978,14 @@ class LLMPolicy:
             model_response_observed=model_response_observed,
             decision_packet=dict(decision_packet or {}),
             decision_packet_hash=str(decision_packet_hash or ""),
+            request_schema_hash=str(request_schema_hash or ""),
+            **_decision_identity_fields(
+                mode=self.mode,
+                selection_contract=self.selection_contract,
+                candidates=list(candidates or []),
+                selected_index=None,
+                decision_owner=decision_owner,
+            ),
             **dict(provenance or {}),
         )
 
@@ -776,7 +998,63 @@ class HybridPolicy(LLMPolicy):
     """
 
     mode = POLICY_HYBRID
-    selection_contract = "admissible_frontier"
+    selection_contract = SELECTION_CONTRACT_HYBRID
+
+    async def select(
+        self,
+        *,
+        episode_id: str,
+        objective: str,
+        state: Any,
+        candidates: list[Any],
+        history: list[PolicyDecision],
+        budgets: dict[str, Any] | None = None,
+    ) -> PolicyDecision:
+        if len(candidates) != 1:
+            return await super().select(
+                episode_id=episode_id,
+                objective=objective,
+                state=state,
+                candidates=candidates,
+                history=history,
+                budgets=budgets,
+            )
+        decision_packet, decision_packet_hash = _captured_decision_packet(
+            objective=objective,
+            state=state,
+            candidates=candidates,
+            history=history,
+            budgets=budgets,
+            selection_contract=self.selection_contract,
+        )
+        selected = candidates[0]
+        return PolicyDecision(
+            episode_id=episode_id,
+            decision_id=f"decision-{uuid4().hex}",
+            policy_mode=self.mode,
+            candidate_hash=candidate_hash(candidates),
+            disposition="select",
+            selected_index=0,
+            selected_capability=str(getattr(selected, "name", "") or ""),
+            selected_target=str(getattr(selected, "target", "") or ""),
+            rationale="only admissible candidate; kernel-owned singleton selection",
+            candidate_count=1,
+            selected_family=capability_family(getattr(selected, "name", "")),
+            selected_is_first_admissible=True,
+            model_provider=self.provider,
+            model_id=self.model_id,
+            model_response_observed=False,
+            backend_provenance_source="kernel_singleton",
+            decision_packet=decision_packet,
+            decision_packet_hash=decision_packet_hash,
+            **_decision_identity_fields(
+                mode=self.mode,
+                selection_contract=self.selection_contract,
+                candidates=candidates,
+                selected_index=0,
+                decision_owner="kernel_singleton",
+            ),
+        )
 
     def request_payload(
         self,
@@ -790,15 +1068,20 @@ class HybridPolicy(LLMPolicy):
             "objective": str(objective or ""),
             "normalized_state": _normalized_state_payload(state),
             "candidates": [
-                {"index": index, **_candidate_payload(candidate)}
-                for index, candidate in enumerate(candidates)
+                {"candidate_id": semantic_candidate_id(candidate), **_candidate_payload(candidate)}
+                for candidate in candidates
             ],
             "prior_decisions": _prior_decisions_payload(history),
             "budgets": dict(budgets or {}),
-            "selection_contract": "admissible_frontier",
+            "policy_version": _policy_version(self.mode),
+            "selection_contract": self.selection_contract,
+            "selection_contract_hash": selection_contract_hash(self.selection_contract),
+            "semantic_candidate_ids": [semantic_candidate_id(candidate) for candidate in candidates],
+            "candidate_set_hash": candidate_set_hash(candidates),
+            "ordered_frontier_hash": ordered_frontier_hash(candidates),
             "response_schema": {
                 "disposition": "select|stop|ask",
-                "candidate_index": "integer required for select",
+                "candidate_id": "stable semantic candidate ID required for select",
                 "rationale": "short string",
                 "confidence": "number 0..1",
                 "expected_evidence": "short string",
@@ -810,10 +1093,14 @@ class HybridPolicy(LLMPolicy):
         parsed: dict[str, Any],
         candidates: list[Any],
     ) -> tuple[int | None, str]:
-        try:
-            index = int(parsed.get("candidate_index"))
-        except (TypeError, ValueError):
-            return None, "hybrid policy returned no valid candidate index"
-        if index < 0 or index >= len(candidates):
-            return None, "hybrid policy returned an invalid frontier selection"
-        return index, ""
+        candidate_id = str(parsed.get("candidate_id") or "").strip()
+        if not candidate_id:
+            return None, "hybrid policy returned no valid candidate ID"
+        matches = [
+            index
+            for index, candidate in enumerate(candidates)
+            if semantic_candidate_id(candidate) == candidate_id
+        ]
+        if len(matches) == 1:
+            return matches[0], ""
+        return None, "hybrid policy returned an invalid frontier selection"

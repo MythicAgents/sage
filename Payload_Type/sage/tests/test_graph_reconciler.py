@@ -8,10 +8,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 import access_reconciler  # noqa: E402
 import engagement_state  # noqa: E402
 import graph_reconciler  # noqa: E402
+import proof_boundary  # noqa: E402
 
 
 NOW = "2026-06-06T12:00:00Z"
 TTL_SECONDS = 300
+
+
+def _bh_proof():
+    return proof_boundary.make_runtime_bloodhound_envelope(
+        engagement_id="op-1",
+        callback_id="10",
+        task_id="99",
+        terminal_status="completed",
+        command="execute_assembly",
+        ingest_job_id="job-1",
+        ingest_status="complete",
+        source_artifact_id="file-1",
+        source_artifact_sha256="a" * 64,
+        verifier_id="bloodhound_ingest:completed",
+        captured_at=NOW,
+    ).to_dict()
 
 
 def _north_foothold(alive=True):
@@ -134,6 +151,45 @@ def test_reconcile_graph_position_projects_gpo_domain_facts_from_mcp_shape():
     preds = [f.predicate for f in facts]
     assert "generic-write:gpo:starkwallpaper" in preds
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
+
+
+def test_reconcile_graph_position_carries_ingest_proof_envelope():
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCP(_FakeTool()),
+        ["samwell.tarly@north.sevenkingdoms.local"],
+        "reach essos DA",
+        NOW,
+        TTL_SECONDS,
+        proof_envelope=_bh_proof(),
+    ))
+
+    assert facts
+    assert all(fact.proof_envelope == _bh_proof() for fact in facts)
+
+
+def test_runtime_state_ignores_graph_fact_without_completed_ingest_lineage():
+    unbound = engagement_state.GraphFact(
+        predicate="ds-replication-rights:lab.local",
+        source="bloodhound:cypher",
+        timestamp=NOW,
+        ttl_seconds=TTL_SECONDS,
+    )
+    bound = engagement_state.GraphFact(
+        predicate="ds-replication-rights:good.local",
+        source="bloodhound:cypher",
+        timestamp=NOW,
+        ttl_seconds=TTL_SECONDS,
+        proof_envelope=_bh_proof(),
+    )
+    state = engagement_state.EngagementState(
+        objective="x",
+        graph_facts=[unbound, bound],
+        engagement_id="op-1",
+        runtime_scope=True,
+    )
+
+    assert "ds-replication-rights:lab.local" not in state.satisfied_predicates()
+    assert "ds-replication-rights:good.local" in state.satisfied_predicates()
 
 
 def test_reconcile_graph_position_projects_trust_reachability_fact():

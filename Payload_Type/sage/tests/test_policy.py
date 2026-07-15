@@ -45,13 +45,11 @@ class State:
         return set(self.effects)
 
 
-def test_explicit_invalid_policy_mode_is_rejected():
-    try:
-        policy.normalize_policy_mode("automatic")
-    except ValueError as exc:
-        assert "unsupported policy mode" in str(exc)
-    else:
-        raise AssertionError("invalid policy mode silently normalized")
+def test_missing_and_invalid_policy_mode_resolve_symbolic_and_valid_modes_remain_stable():
+    assert policy.resolve_policy_mode("", default=policy.POLICY_SYMBOLIC) == ("symbolic", "default_missing")
+    assert policy.resolve_policy_mode("automatic", default=policy.POLICY_SYMBOLIC) == ("symbolic", "default_invalid")
+    assert policy.normalize_policy_mode("automatic") == "symbolic"
+    assert policy.normalize_policy_mode("hybrid") == "hybrid"
 
 
 def test_symbolic_policy_preserves_first_admissible_selection():
@@ -211,6 +209,7 @@ def test_eval_decision_packet_capture_is_opt_in_and_hashes_common_frontier(monke
     ))
 
     assert with_capture.decision_packet["selection_contract"] == "symbolic_frontier"
+    assert with_capture.decision_packet["policy_version"] == "symbolic-v1"
     assert with_capture.decision_packet["candidate_hash"] == with_capture.candidate_hash
     assert [item["name"] for item in with_capture.decision_packet["admissible_frontier"]] == ["first", "second"]
     assert with_capture.decision_packet["budgets"] == {"max_cycles": 7, "wall_clock_budget_s": 2700}
@@ -319,7 +318,7 @@ def test_hybrid_policy_selects_from_frontier_and_labels_decision():
         requests.append(request)
         return {
             "disposition": "select",
-            "candidate_index": 1,
+            "candidate_id": request["candidates"][1]["candidate_id"],
             "rationale": "model-ranked admissible candidate",
         }
 
@@ -335,8 +334,18 @@ def test_hybrid_policy_selects_from_frontier_and_labels_decision():
     assert decision.policy_mode == "hybrid"
     assert decision.selected_index == 1
     assert decision.selected_capability == "second"
-    assert requests[0]["selection_contract"] == "admissible_frontier"
+    assert decision.policy_version == "hybrid-full-frontier-v2"
+    assert decision.decision_owner == "model_branch"
+    assert decision.branch_opportunity_count == 1
+    assert decision.model_owned_decision_count == 1
+    assert decision.model_branch_coverage == 1.0
+    assert decision.selected_candidate_id == requests[0]["candidates"][1]["candidate_id"]
+    assert requests[0]["policy_version"] == "hybrid-full-frontier-v2"
+    assert requests[0]["selection_contract"] == "hybrid-full-frontier-v2"
     assert [item["name"] for item in requests[0]["candidates"]] == ["first", "second"]
+    assert all("candidate_id" in item for item in requests[0]["candidates"])
+    assert all("index" not in item for item in requests[0]["candidates"])
+    assert "candidate_id" in requests[0]["response_schema"]
     assert "capability_catalog" not in requests[0]
 
 
@@ -393,11 +402,11 @@ def test_llm_policy_rejects_frontier_capability_outside_catalog():
     assert "outside the catalog" in decision.rationale
 
 
-def test_hybrid_policy_rejects_invalid_frontier_index_without_fallback():
+def test_hybrid_policy_rejects_invalid_frontier_id_without_fallback():
     async def decide(_request):
         return {
             "disposition": "select",
-            "candidate_index": 99,
+            "candidate_id": "candidate:sha256:not-admissible",
             "rationale": "invalid model output",
         }
 
@@ -405,7 +414,7 @@ def test_hybrid_policy_rejects_invalid_frontier_index_without_fallback():
         episode_id="episode-hybrid-veto",
         objective="test",
         state=State(),
-        candidates=[Action("first", "a", "effect:a")],
+        candidates=[Action("first", "a", "effect:a"), Action("second", "b", "effect:b")],
         history=[],
     ))
 
@@ -416,7 +425,7 @@ def test_hybrid_policy_rejects_invalid_frontier_index_without_fallback():
 
 
 def test_null_hybrid_policy_fails_closed_without_symbolic_selection():
-    candidates = [Action("first", "a", "effect:a")]
+    candidates = [Action("first", "a", "effect:a"), Action("second", "b", "effect:b")]
     decision = asyncio.run(policy.HybridPolicy(None).select(
         episode_id="episode-hybrid",
         objective="test",
@@ -429,6 +438,47 @@ def test_null_hybrid_policy_fails_closed_without_symbolic_selection():
     assert decision.disposition == "stop"
     assert decision.selected_index is None
     assert "no model decision seam" in decision.rationale
+
+
+def test_hybrid_singleton_is_kernel_owned_without_model_call():
+    requests = []
+
+    async def decide(request):
+        requests.append(request)
+        return {"disposition": "stop"}
+
+    decision = asyncio.run(policy.HybridPolicy(decide).select(
+        episode_id="episode-hybrid-singleton",
+        objective="test",
+        state=State(),
+        candidates=[Action("only", "a", "effect:a")],
+        history=[],
+    ))
+
+    assert requests == []
+    assert decision.disposition == "select"
+    assert decision.selected_index == 0
+    assert decision.decision_owner == "kernel_singleton"
+    assert decision.kernel_singleton_count == 1
+    assert decision.model_owned_decision_count == 0
+    assert decision.model_response_observed is False
+
+
+def test_semantic_candidate_identity_is_permutation_stable_but_ordered_frontier_hash_is_not():
+    first = Action("first", "a", "effect:a")
+    first.preconditions = ["b", "a"]
+    first.effects = ["effect:b", "effect:a"]
+    first.reason = "first wording"
+    same_first = Action("first", "a", "effect:a")
+    same_first.preconditions = ["a", "b"]
+    same_first.effects = ["effect:a", "effect:b"]
+    same_first.reason = "different wording"
+    second = Action("second", "b", "effect:b")
+    second.preconditions = ["x"]
+
+    assert policy.semantic_candidate_id(first) == policy.semantic_candidate_id(same_first)
+    assert policy.candidate_set_hash([first, second]) == policy.candidate_set_hash([second, first])
+    assert policy.ordered_frontier_hash([first, second]) != policy.ordered_frontier_hash([second, first])
 
 
 def test_null_llm_policy_fails_closed_without_execution():
@@ -474,11 +524,14 @@ def test_learned_policy_call_failures_do_not_execute_or_fallback():
     ):
         state = State()
         action = Action("offensive-action", "target", "effect:target")
+        candidates = [action]
+        if backend.mode == "hybrid":
+            candidates.append(Action("alternate-action", "other", "effect:other"))
         calls = []
         controller = ac.AutonomousController(
             observe=lambda: state,
             execute=lambda *_args: calls.append(True) or {"ok": True},
-            frontier_fn=lambda _state: [action],
+            frontier_fn=lambda _state: candidates,
             policy_backend=backend,
             objective="test",
             episode_id=f"episode-{backend.mode}-failure",

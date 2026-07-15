@@ -160,7 +160,16 @@ def test_verify_lsass_with_key_achieved():
 def mt(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-vor")
-    return mythic_tools.MythicTools(agent_task_id="vor")
+    tools = mythic_tools.MythicTools(agent_task_id="vor")
+    _arm_runtime_lineage(tools)
+    return tools
+
+
+def _arm_runtime_lineage(mt, task_id="450", callback_id="13", command="test-command"):
+    mt._last_issued_task_display_id = task_id
+    mt._last_issued_callback_id = callback_id
+    mt._last_issued_task_terminal_status = "completed"
+    mt._last_issued_command = command
 
 
 def _last(mt):
@@ -307,10 +316,12 @@ def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-vor-reload")
     a = mythic_tools.MythicTools(agent_task_id="run1")
+    _arm_runtime_lineage(a)
     a._pending_engagement_hop = ("dcsync-user", USER, TS)
     a._record_engagement_success(MIMIKATZ_OK)
     # Fresh instance loads the durable ledger; the no-key re-probe must keep the achieved hop.
     b = mythic_tools.MythicTools(agent_task_id="run2")
+    _arm_runtime_lineage(b, task_id="451")
     assert any(h.technique == "dcsync-user" and h.status == "achieved" for h in b._engagement_hops)
     b._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T02:00:00+00:00")
     b._record_engagement_success(DCSYNC_8439)

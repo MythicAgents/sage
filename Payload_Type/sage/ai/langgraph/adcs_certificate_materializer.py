@@ -61,7 +61,8 @@ def persist_verified_ca_pfx_artifact(
     """
 
     pfx_base64 = _output_field(output, "PFX_BASE64")
-    if not pfx_base64:
+    artifact_id = _output_field(output, "PFX_ARTIFACT_ID") or _output_field(output, "ARTIFACT_ID")
+    if not pfx_base64 or not artifact_id:
         return {}
     try:
         blob = base64.b64decode(re.sub(r"\s+", "", pfx_base64), validate=True)
@@ -84,6 +85,7 @@ def persist_verified_ca_pfx_artifact(
         path.write_bytes(blob)
     return {
         "pfx_artifact_path": str(path),
+        "pfx_artifact_id": artifact_id,
         "pfx_artifact_sha256": sha256,
         "pfx_sha256": sha256,
     }
@@ -262,19 +264,15 @@ def resolve_verified_ca_pfx_artifact(
         if effect not in effects:
             continue
         evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-        candidates, expected_sha256, provenance_present = _verified_artifact_candidates(
-            evidence,
-            artifact_dir,
-            engagement_key,
-            ca_host,
-            domain,
-        )
-        if provenance_present and expected_sha256 is None:
+        proof = _admitted_ca_artifact_proof(hop, engagement_key)
+        if proof is None:
             return None, hop, ""
+        candidates = _verified_artifact_candidates(evidence, artifact_dir)
+        expected_sha256 = proof.artifact_sha256
         for path in _dedupe_paths(candidates):
-            if not path.is_file() or path.suffix.casefold() != ".pfx":
+            if not _safe_artifact_path(path, artifact_dir) or path.suffix.casefold() != ".pfx":
                 continue
-            if expected_sha256 and _file_sha256(path) != expected_sha256:
+            if _file_sha256(path) != expected_sha256:
                 continue
             usable, selected_password = _usable_ca_pfx_password(path, ca_pfx_password, subject_hint)
             if usable:
@@ -305,19 +303,15 @@ def resolve_verified_ca_artifact(
         if effect not in effects:
             continue
         evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
-        candidates, expected_sha256, provenance_present = _verified_artifact_candidates(
-            evidence,
-            artifact_dir,
-            engagement_key,
-            ca_host,
-            domain,
-        )
-        if provenance_present and expected_sha256 is None:
+        proof = _admitted_ca_artifact_proof(hop, engagement_key)
+        if proof is None:
             return None, hop
+        candidates = _verified_artifact_candidates(evidence, artifact_dir)
+        expected_sha256 = proof.artifact_sha256
         for path in _dedupe_paths(candidates):
-            if not path.is_file():
+            if not _safe_artifact_path(path, artifact_dir):
                 continue
-            if expected_sha256 and _file_sha256(path) != expected_sha256:
+            if _file_sha256(path) != expected_sha256:
                 continue
             if subject_hint:
                 try:
@@ -327,39 +321,6 @@ def resolve_verified_ca_artifact(
             return path, hop
         return None, hop
     return None, {}
-
-
-def latest_ca_artifact(artifact_dir: Path, ca_host: str, domain: str) -> Path | None:
-    candidates = ca_artifact_candidates(artifact_dir, ca_host, domain)
-    return candidates[0] if candidates else None
-
-
-def ca_artifact_candidates(
-    artifact_dir: Path,
-    ca_host: str,
-    domain: str,
-    *,
-    engagement_key: str = "",
-) -> list[Path]:
-    ca_host = _host_short(ca_host)
-    domain = _normalize(domain)
-    if not artifact_dir.is_dir():
-        return []
-    engagement_slug = _slug(engagement_key) if engagement_key else ""
-    candidates = [
-        path for path in artifact_dir.glob("adcs_ca_*")
-        if ca_host in path.name.casefold()
-        and domain in path.name.casefold()
-        and path.suffix.casefold() in {".pfx", ".txt", ".pem", ".cer", ".crt"}
-    ]
-    candidates.sort(
-        key=lambda path: (
-            bool(engagement_slug and engagement_slug in path.name.casefold()),
-            path.stat().st_mtime,
-        ),
-        reverse=True,
-    )
-    return candidates
 
 
 def load_ca_key_cert_from_artifact(
@@ -437,75 +398,57 @@ def _candidate_paths(evidence: dict[str, Any]) -> list[Path]:
     return paths
 
 
-def _verified_artifact_candidates(
-    evidence: dict[str, Any],
-    artifact_dir: Path,
-    engagement_key: str,
-    ca_host: str,
-    domain: str,
-) -> tuple[list[Path], str | None, bool]:
-    """Return candidates scoped to the achieved hop's own artifact provenance.
-
-    New export hops carry an artifact path plus SHA256. Once a SHA is present,
-    directory search is allowed only as a SHA-bound lookup; an unrelated older
-    run's PFX cannot satisfy the hop. Path-only current provenance fails closed if
-    the path is missing. Legacy hops with no artifact provenance at all retain the
-    old directory fallback so retained historical ledgers remain usable where
-    possible.
-    """
-
-    candidates = []
-    candidates.extend(_candidate_paths(evidence))
-    candidates.extend(_embedded_pfx_candidate_paths(evidence, artifact_dir, engagement_key, ca_host, domain))
-    expected_sha256, sha_field_present = _expected_pfx_sha256(evidence)
-    provenance_present = bool(candidates or sha_field_present)
-    if expected_sha256 or not provenance_present:
-        candidates.extend(ca_artifact_candidates(artifact_dir, ca_host, domain, engagement_key=engagement_key))
-    return candidates, expected_sha256, provenance_present
-
-
-def _expected_pfx_sha256(evidence: dict[str, Any]) -> tuple[str | None, bool]:
-    for source in _evidence_sources(evidence):
-        for key in ("pfx_artifact_sha256", "pfx_sha256", "ca_pfx_sha256", "PFX_SHA256"):
-            value = source.get(key) if isinstance(source, dict) else None
-            if value is None:
-                continue
-            text = str(value).strip().casefold()
-            if re.fullmatch(r"[0-9a-f]{64}", text):
-                return text, True
-            return None, True
-    return "", False
-
-
-def _embedded_pfx_candidate_paths(
-    evidence: dict[str, Any],
-    artifact_dir: Path,
-    engagement_key: str,
-    ca_host: str,
-    domain: str,
-) -> list[Path]:
-    paths = []
-    for source in _evidence_sources(evidence):
-        b64 = _first_text(source, "pfx_base64", "ca_pfx_base64", "PFX_BASE64")
-        if not b64:
-            continue
+def _admitted_ca_artifact_proof(hop: dict[str, Any], engagement_key: str):
+    try:
         try:
-            blob = base64.b64decode(re.sub(r"\s+", "", b64), validate=True)
-        except Exception:
-            continue
-        if len(blob) < 256 or blob[:1] != b"0":
-            continue
-        expected_sha = _first_text(source, "pfx_sha256", "ca_pfx_sha256", "PFX_SHA256").casefold()
-        sha = hashlib.sha256(blob).hexdigest()
-        if expected_sha and expected_sha != sha:
-            continue
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        slug = _slug("_".join(part for part in (engagement_key, ca_host, domain, sha[:16]) if part))
-        path = artifact_dir / f"adcs_ca_signing_{slug}.pfx"
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha:
-            path.write_bytes(blob)
-        paths.append(path)
-    return paths
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+    except Exception:
+        return None
+    evidence = hop.get("evidence") if isinstance(hop.get("evidence"), dict) else {}
+    proof = hop.get("proof_envelope") if isinstance(hop.get("proof_envelope"), dict) else evidence.get("proof_envelope")
+    admission = proof_boundary.admit_runtime_envelope(
+        proof_boundary.ProofEnvelope.from_dict(proof),
+        current_engagement_id=engagement_key,
+    )
+    if not admission.admitted or admission.envelope is None:
+        return None
+    if admission.envelope.origin != proof_boundary.ORIGIN_MYTHIC_ARTIFACT:
+        return None
+    evidence_artifact_id = ""
+    evidence_sha256 = ""
+    for source in _evidence_sources(evidence):
+        evidence_artifact_id = evidence_artifact_id or str(source.get("pfx_artifact_id") or "").strip()
+        evidence_sha256 = evidence_sha256 or str(source.get("pfx_artifact_sha256") or source.get("pfx_sha256") or "").strip().casefold()
+    if evidence_artifact_id != admission.envelope.artifact_id:
+        return None
+    if evidence_sha256 and evidence_sha256 != admission.envelope.artifact_sha256:
+        return None
+    return admission.envelope
+
+
+def _safe_artifact_path(path: Path, artifact_dir: Path) -> bool:
+    try:
+        root = artifact_dir.resolve(strict=True)
+        candidate = path.resolve(strict=True)
+        candidate.relative_to(root)
+        if not candidate.is_file() or path.is_symlink():
+            return False
+        current = path.parent
+        while current != artifact_dir and current != current.parent:
+            if current.is_symlink():
+                return False
+            current = current.parent
+        return True
+    except Exception:
+        return False
+
+
+def _verified_artifact_candidates(evidence: dict[str, Any], artifact_dir: Path) -> list[Path]:
+    """Return only explicit hop-bound artifact paths inside the configured artifact root."""
+    del artifact_dir
+    return _candidate_paths(evidence)
 
 
 def _output_field(output: Any, field: str) -> str:
@@ -535,17 +478,6 @@ def _evidence_sources(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(value, dict):
             sources.append(value)
     return sources
-
-
-def _first_text(source: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = source.get(key) if isinstance(source, dict) else None
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return ""
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:

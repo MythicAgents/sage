@@ -19,7 +19,7 @@ import os
 from typing import Any
 
 from mythic_container.ChatBase import ChatConfigView, ChatRequest, ChatSecretView
-from ai.langgraph.policy import normalize_policy_mode
+from ai.langgraph.policy import POLICY_SYMBOLIC, resolve_policy_mode
 
 
 def _resolve(
@@ -96,13 +96,24 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     autonomous_solve = mode == "auto" or _resolve_bool(
         config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False
     )
-    policy_mode = normalize_policy_mode(_resolve(
+    policy_mode_requested = _resolve(
         config,
         secrets,
         "policy_mode",
         env_key="SAGE_POLICY_MODE",
-        default="llm",
-    ))
+        default="",
+    )
+    policy_mode, policy_mode_resolution = resolve_policy_mode(
+        policy_mode_requested,
+        default=POLICY_SYMBOLIC,
+    )
+    eval_force_capability_prefix_json = _resolve(
+        config,
+        secrets,
+        "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        env_key="SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        default="",
+    ) or None
 
     max_steps_raw = _resolve(config, secrets, "max_steps", env_key="max_steps", default="")
     try:
@@ -145,6 +156,9 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
         "mode": mode,
         "autonomous_solve": autonomous_solve,
         "policy_mode": policy_mode,
+        "policy_mode_requested": policy_mode_requested,
+        "policy_mode_resolution": policy_mode_resolution,
+        "eval_force_capability_prefix_json": eval_force_capability_prefix_json,
         "max_steps": max_steps,
         "operation_id": request.OperationID,
         # Chat auth context (Section 8A P0): MythicTools mints a channel-scoped bot token from these.

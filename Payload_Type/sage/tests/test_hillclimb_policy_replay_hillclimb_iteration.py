@@ -6,7 +6,7 @@ from pathlib import Path
 from ai.hillclimb import policy_replay_hillclimb_iteration as iteration
 
 
-def test_hillclimb_iteration_keeps_single_variable_objective_effect_candidate():
+def test_hillclimb_iteration_halts_when_claimed_mechanism_needs_unscorable_behavior():
     report = iteration.run_hillclimb_iteration()
 
     assert report["passes_gate"] is True
@@ -16,7 +16,17 @@ def test_hillclimb_iteration_keeps_single_variable_objective_effect_candidate():
     assert report["aggregate"]["score_delta"] == 1.0
     assert report["aggregate"]["changed_case_ids"] == ["gpo-dc-scope-late-blocker"]
     assert report["aggregate"]["improved_case_ids"] == ["gpo-dc-scope-late-blocker"]
-    assert report["decision"]["keep_candidate"] is True
+    assert report["decision"]["keep_candidate"] is False
+    assert report["decision"]["action"] == "halt_at_live_boundary"
+    assert report["decision"]["disposition"] == "unscorable_new_behavior"
+    assert report["decision"]["retain_artifact_for_review"] is False
+    assert report["decision"]["typed_verdict"]["promotion_evidence_passed"] is False
+    assert report["aggregate"]["training_exposure"]["exercised_family_ids"] == [
+        "gpo-directory",
+        "managed-local-admin",
+        "replication-kerberos",
+    ]
+    assert report["aggregate"]["training_exposure"]["ties_counted"] is True
     assert report["decision"]["runtime_promotion_authorized"] is False
     assert report["iteration"]["verifier_hash"].startswith("sha256:")
 
@@ -27,7 +37,7 @@ def test_hillclimb_iteration_reverts_when_threshold_is_not_cleared():
     assert report["passes_gate"] is True
     assert report["aggregate"]["score_delta"] == 1.0
     assert report["decision"]["keep_candidate"] is False
-    assert report["decision"]["action"] == "revert"
+    assert report["decision"]["action"] == "halt_at_live_boundary"
 
 
 def test_hillclimb_candidate_source_has_no_current_corpus_case_literals():

@@ -8,6 +8,8 @@
   python -m ai.hillclimb policy-replay-unseen-candidate-evaluate # no lab or model calls
   python -m ai.hillclimb policy-replay-hillclimb-iteration # no lab or model calls
   python -m ai.hillclimb policy-replay-promotion-gate # no lab or model calls
+  python -m ai.hillclimb phase4-readiness-report      # no lab or model calls
+  python -m ai.hillclimb phase5-full-frontier-t3      # no lab; add --run-model-matrix for weak/strong calls
   python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
   python -m ai.hillclimb target-value-census             # no lab or model calls
   python -m ai.hillclimb target-value-proofability-screen # no lab or model calls
@@ -17,6 +19,10 @@
   python -m ai.hillclimb gpo-dc-scope-live-surface-validate --evidence <json> # no model calls
   python -m ai.hillclimb gpo-dc-scope-canary-validate --results <jsonl> # no model calls
   python -m ai.hillclimb gpo-dc-scope-matrix-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb laps-family-transfer-holdout-validate # no lab or model calls
+  python -m ai.hillclimb laps-family-transfer-live-surface-validate --evidence <json> # no model calls
+  python -m ai.hillclimb laps-family-transfer-canary-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb laps-family-transfer-matrix-validate --forced-results <jsonl> --policy-results <jsonl> # no model calls
   python ai/hillclimb/__main__.py gate-experiment --dry-run
 
 A LIVE gate-experiment needs the GOAD lab (each config run through evals/harness.py, scored by
@@ -42,6 +48,7 @@ try:  # package import
     from . import policy_replay_unseen_candidate_evaluator
     from . import policy_replay_hillclimb_iteration
     from . import policy_replay_promotion_gate
+    from . import full_frontier_t3
     from . import target_disambiguation_contract
     from . import target_value_census
     from . import target_value_proofability
@@ -51,9 +58,14 @@ try:  # package import
     from . import gpo_dc_scope_live_surface
     from . import gpo_dc_scope_canary
     from . import gpo_dc_scope_matrix
+    from . import evaluation_foundation
     from . import frontier_census
     from . import purpose_range
     from . import replication_purpose_range
+    from . import laps_family_transfer_holdout
+    from . import laps_family_transfer_live_surface
+    from . import laps_family_transfer_canary
+    from . import laps_family_transfer_matrix
     from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
@@ -71,6 +83,7 @@ except Exception:  # script / sys.path import
     import policy_replay_unseen_candidate_evaluator  # type: ignore
     import policy_replay_hillclimb_iteration  # type: ignore
     import policy_replay_promotion_gate  # type: ignore
+    import full_frontier_t3  # type: ignore
     import target_disambiguation_contract  # type: ignore
     import target_value_census  # type: ignore
     import target_value_proofability  # type: ignore
@@ -80,9 +93,14 @@ except Exception:  # script / sys.path import
     import gpo_dc_scope_live_surface  # type: ignore
     import gpo_dc_scope_canary  # type: ignore
     import gpo_dc_scope_matrix  # type: ignore
+    import evaluation_foundation  # type: ignore
     import frontier_census  # type: ignore
     import purpose_range  # type: ignore
     import replication_purpose_range  # type: ignore
+    import laps_family_transfer_holdout  # type: ignore
+    import laps_family_transfer_live_surface  # type: ignore
+    import laps_family_transfer_canary  # type: ignore
+    import laps_family_transfer_matrix  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
@@ -260,6 +278,20 @@ def _cmd_replication_purpose_range_validate(args: argparse.Namespace) -> int:
     return 0 if report["passes_gate"] else 1
 
 
+def _cmd_laps_family_transfer_holdout_validate(args: argparse.Namespace) -> int:
+    report = laps_family_transfer_holdout.validate_laps_family_transfer_holdout()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(manifest_hash={report['manifest']['manifest_hash']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
 def _cmd_replanning_benchmark_validate(args: argparse.Namespace) -> int:
     report = replanning_benchmark.validate_replanning_benchmark()
     rendered = json.dumps(report, indent=2, default=str)
@@ -272,6 +304,17 @@ def _cmd_replanning_benchmark_validate(args: argparse.Namespace) -> int:
         flush=True,
     )
     return 0 if report["passes_gate"] else 1
+
+
+def _cmd_phase4_readiness_report(args: argparse.Namespace) -> int:
+    report = evaluation_foundation.build_phase4_provisional_report()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+    decision = ((report.get("readiness") or {}).get("readiness_decision") or "")
+    print(f"\nREADINESS: {decision}", flush=True)
+    return 0 if decision in {"auto_harness_not_ready", "eligible_for_supervised_artifact_campaign"} else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,12 +375,26 @@ def main(argv: list[str] | None = None) -> int:
     rpr.add_argument("--output", default=None, help="optional JSON report path")
     rpr.set_defaults(func=_cmd_replication_purpose_range_validate)
 
+    lft = sub.add_parser(
+        "laps-family-transfer-holdout-validate",
+        help="validate the sealed Phase 6 cross-domain LAPS family-transfer holdout contract",
+    )
+    lft.add_argument("--output", default=None, help="optional JSON report path")
+    lft.set_defaults(func=_cmd_laps_family_transfer_holdout_validate)
+
     rb = sub.add_parser(
         "replanning-benchmark-validate",
         help="validate the shared-lane late-blocker recovery benchmark contract",
     )
     rb.add_argument("--output", default=None, help="optional JSON report path")
     rb.set_defaults(func=_cmd_replanning_benchmark_validate)
+
+    p4 = sub.add_parser(
+        "phase4-readiness-report",
+        help="emit the current fail-closed Phase 4 auto-harness-improvement readiness report",
+    )
+    p4.add_argument("--output", default=None, help="optional JSON report path")
+    p4.set_defaults(func=_cmd_phase4_readiness_report)
 
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)
@@ -347,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     policy_replay_unseen_candidate_evaluator.add_cli(sub)
     policy_replay_hillclimb_iteration.add_cli(sub)
     policy_replay_promotion_gate.add_cli(sub)
+    full_frontier_t3.add_cli(sub)
     target_disambiguation_contract.add_cli(sub)
     target_value_census.add_cli(sub)
     target_value_proofability.add_cli(sub)
@@ -356,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
     gpo_dc_scope_live_surface.add_cli(sub)
     gpo_dc_scope_canary.add_cli(sub)
     gpo_dc_scope_matrix.add_cli(sub)
+    laps_family_transfer_live_surface.add_cli(sub)
+    laps_family_transfer_canary.add_cli(sub)
+    laps_family_transfer_matrix.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

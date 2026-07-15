@@ -7,6 +7,7 @@ is operator-configurable per lab.
 """
 try:  # package import
     from . import live_seams
+    from . import laps_family_transfer_holdout as laps_contract
     from .range_state import Scenario, MilestoneSpec, Milestone
 except Exception:  # script / sys.path import
     import sys
@@ -14,6 +15,7 @@ except Exception:  # script / sys.path import
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import live_seams  # type: ignore
+    import laps_family_transfer_holdout as laps_contract  # type: ignore
     from range_state import Scenario, MilestoneSpec, Milestone  # type: ignore
 
 CHILD = "north.sevenkingdoms.local"
@@ -185,10 +187,34 @@ def replication_purpose_range_scenarios(
     ]
 
 
+def laps_family_transfer_holdout_scenarios(
+    engagement_id: str = "Operation_SAGE_LAPS_HOLDOUT",
+) -> list[Scenario]:
+    """Phase 6 host-specific remote-exec objectives over the sealed LAPS holdout."""
+    return [
+        Scenario(
+            name=f"laps-family-transfer-{variant.name}",
+            engagement_id=engagement_id,
+            objective=variant.objective,
+            domains={
+                "child": variant.target_domain,
+                "parent": laps_contract.ROOT_DOMAIN,
+                "objective": variant.target_domain,
+            },
+            spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("remote-exec:",), domain_role="objective")},
+            milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
+            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
+        )
+        for variant in laps_contract.LAPS_FAMILY_TRANSFER_HOLDOUT.objective_variants
+    ]
+
+
 def all_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
     """Return the GOAD suite plus provisionable purpose-range discriminator scenarios."""
     return [
         *goad_scenarios(engagement_id),
         *purpose_range_scenarios(engagement_id),
         *replication_purpose_range_scenarios(engagement_id),
+        *laps_family_transfer_holdout_scenarios(engagement_id),
     ]
