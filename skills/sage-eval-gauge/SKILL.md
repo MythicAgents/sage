@@ -91,6 +91,28 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 - BloodHound cypher: `uv --directory /home/john/dev/bloodhound_mcp run python skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher>'`
 - Mythic tasking: `skills/sage-live-runner/scripts/sage_task.py task-callback <id> <cmd>`
 
+## Live Holdout Discipline
+
+Before the first countable live holdout row, require all of the following:
+
+- the authorized live surface/canary contract has passed for the matrix being run
+- clean reset and snapshot expectations are satisfied, clocks are synchronized, and BloodHound reset/ingest state
+  is settled for the row
+- the expected foothold callback is live, uniquely settled when using a retained/purpose-range lane, and bootstrap
+  readiness is true
+- the effective model backend/route and behavior-changing Sage restart env are captured from the running Sage
+  process, not assumed from the caller shell
+- the result path, row identity, policy arm, seed, and validator inputs are fixed before execution starts
+
+A holdout row is `countable` only after those gates pass. If an attempt starts before they pass, or later exposes a
+duplicate callback, clock skew, backend mismatch, setup contamination, or measurement defect, mark it `burned`,
+preserve the artifacts, fix the gate, and replace it with a fresh attempt. Do not retroactively convert a burned row
+into evidence.
+
+For repeated matrices, status updates should report `row X/Y`, policy arm/seed, last accepted row, current
+operation, retry count, current blocker if any, and separate engineering/debug ETA from remaining live-lab ETA.
+Power down retired or burned purpose ranges once their artifacts are preserved.
+
 ## Gotchas
 - **No `--model`:** the bare model reads Sage's own model from `skills/sage-callback-bootstrap/.env` (provider=OpenAI, gpt-5.5-cyber-preview) for a fair same-model comparison.
 - **Operator replay is offline only:** `operator-replay run` calls models only when `--dry-run` is omitted; it never touches GOAD, Mythic, BloodHound, or Sage callbacks. The live canary remains `run_gauge_live.py` / `orchestrate.py`.

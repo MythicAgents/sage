@@ -11,6 +11,22 @@ Use the bundled script for deterministic payload redeploys from Mythic into the 
 
 After rolling back the disk-only Apollo-staged snapshot and importing the retained callback config, open an RDP session as Samwell and run `launch-existing`. It starts the preserved `SageApolloBootstrap` task, waits for the retained callback check-in to advance, and disconnects the RDP session.
 
+## Canonical Apollo Bootstrap
+
+Use `deploy` only when a new payload must be transferred to a clean baseline. Use `launch-existing` when the
+snapshot already contains the staged Apollo file and `SageApolloBootstrap` task; rebuilding or restaging in that
+case adds noise and can create duplicate callback lanes.
+
+For retained or purpose-range footholds, use the one-command launcher with the uniqueness gate instead of rebuilding
+the RDP/Apollo sequence manually:
+
+```bash
+skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh <target-ip> '<DOMAIN\user>' -- --ludus-range-id <range-id> --target-host <host> --callback-host <host> --callback-user <user> --callback-settle-seconds 90 --require-unique-callback
+```
+
+The settle window is part of the evidence gate: if another matching callback appears during it, treat the attempt as
+non-countable and fix the foothold state before continuing.
+
 ## Workflow
 
 1. Confirm Mythic has the payload:
@@ -104,6 +120,7 @@ single-operator lab host; `/from-stdin` is unreliable under `pty.fork` due to pr
 without an operator export.
 
 3. Rediscover callbacks with the live-runner skill or Sage task helper after launch. Do not trust historical callback IDs.
+   If the helper path fails, diagnose or patch the helper before inventing a second manual deployment procedure.
 
 ## Script Notes
 

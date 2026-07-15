@@ -40,6 +40,20 @@ After Apollo is launched as `NORTH\samwell.tarly` on CASTELBLACK, run:
 Readiness is true only when the Sage chat container is running, the expected foothold is live, and runtime DB
 cleanup was confirmed. `selected_sage_cb` is intentionally null.
 
+## Canonical Apollo Bootstrap Path
+
+Do not re-derive Apollo bootstrap manually when these helpers cover the case.
+
+- Fresh clean-baseline foothold: `bootstrap-reset` → payload deploy skill `deploy` with the interactive Apollo
+  launch path → `post-callback-preflight` → `readiness --runtime-dbs-archived`.
+- Retained or purpose-range foothold: `bootstrap-reset --use-retained-callback ...` → payload deploy skill
+  `launch-existing` or `launch_apollo_foothold.sh` with a settle window and unique-callback gate →
+  `post-callback-preflight` → `readiness --runtime-dbs-archived`.
+
+For retained or purpose-range launches, do not call the foothold ready until the callback lane is unique after the
+settle window. Always rediscover the active callback ID after launch; imported callback rows are historical metadata,
+not tasking targets.
+
 ## Retained Foothold
 
 Export before reset:

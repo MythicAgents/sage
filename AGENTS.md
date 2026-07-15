@@ -72,6 +72,11 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Preserve user changes; do not reset, checkout, or revert unrelated files.
 - Do not start expensive live GOAD/inference runs without clear user intent. A full autonomous solve can take ~25 minutes and depends on external lab state.
 - Always re-discover live payload callback IDs after lab resets. Sage itself uses a fresh chat channel, not a callback.
+- When reporting long live work, separate engineering/debug time from live-lab execution time. Include the current
+  row or attempt, last accepted row, current operation, retry count, and best ETA instead of reporting only elapsed
+  wall time.
+- End every goal/tranche completion or handoff with an `ACTION ITEMS FOR RUSSEL` section. Write `None` when no
+  operator action is required.
 - Prefer single-line shell commands in operator instructions. Avoid backslash-continued commands when one line is practical.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
 - If touching autonomous execution, run focused tests plus the full offline suite.
@@ -131,6 +136,31 @@ Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
 Do not store lab passwords in skills or copied helper scripts. Prefer session environment variables, local gitignored
 `.env` files owned by each tool, or an OS keychain/secret manager. Current Mythic-facing reset helpers should resolve
 `MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, and the legacy v3 `.env`.
+
+### Range Source, Runtime, and Evidence States
+
+- For reusable AD ranges intended for publication or transfer, prefer a DreadGOAD-format source definition and use
+  Ludus as the Sage execution/reset substrate. A Sage-only benchmark fixture may remain Ludus-first in
+  `ludus/sage-purpose-ranges/` when portability is not a goal. A source definition is not evidence that a Ludus
+  range exists, is provisioned, or is ready.
+- Use precise range state words in updates and handoffs instead of the ambiguous word `deployed`:
+  - `defined`: the source/profile exists, but no runtime claim is made.
+  - `provisioned`: the Ludus VMs exist.
+  - `snapshotted`: the intended clean baseline snapshot exists.
+  - `callback-ready`: the expected foothold is live and readiness/preflight passed.
+  - `countable`: all gates for a live row passed and the attempt may be used as evidence.
+  - `burned`: the attempt cannot be used as evidence because setup, measurement, or isolation failed.
+  - `complete`: the required evidence was accepted and artifacts were captured.
+- A holdout attempt is `countable` only after the relevant clean-reset, clock-sync, BloodHound, callback uniqueness,
+  backend/route, and validator gates pass. If a duplicate callback lane, clock skew, route mismatch, setup defect, or
+  measurement defect is discovered after an attempt starts, mark that attempt `burned`, preserve its artifacts, fix
+  the gate, and use a fresh attempt for evidence. Do not retroactively promote a burned attempt.
+- Power down ranges that are not needed for the next active operation after a stop-loss, burned attempt, or completed
+  tranche. The Ludus host is resource constrained; leaving old purpose ranges running is not a neutral default.
+- For each live eval row, record the effective model provider/route, Sage startup env overrides that change behavior,
+  range/snapshot identity, foothold callback identity, chat channel/request IDs, and validator artifact path. State
+  explicitly whether a run used Bedrock, a local `127.0.0.1` API route, or another backend; do not infer it from the
+  model name alone.
 
 Use this order for clean GOAD/BloodHound/Mythic rehearsal setup. Mythic is Docker-backed, but Sage runs locally
 in tmux throughout current development.

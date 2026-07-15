@@ -21,6 +21,24 @@ Treat `full reset`, `reset everything`, or an equivalent request as the entire w
 chat verification, fresh Apollo creation, and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
 must be requested explicitly as a range-only or GOAD-only reset.
 
+## Range Source and Lifecycle
+
+For reusable AD ranges intended for publication or transfer, keep the portable definition in DreadGOAD format and
+use Ludus as the runtime/reset substrate. A Sage-only benchmark fixture may be Ludus-first in
+`ludus/sage-purpose-ranges/` when portability is not a goal. This skill operates on runtime state; it does not
+prove that a source definition is publishable or that a range is ready for evidence.
+
+- If the range should be reusable outside Sage, author the portable source in DreadGOAD format and keep a verified
+  Ludus execution path.
+- If the range exists only as a Sage-specific benchmark fixture, prefer the standalone
+  `ludus/sage-purpose-ranges/` pattern.
+- In both cases, use Ludus state for reset/readiness claims and report source format separately from runtime state.
+
+Use these state labels in updates: `defined`, `provisioned`, `snapshotted`, `callback-ready`, `countable`,
+`burned`, and `complete`. Do not say a range is ready or deployed when only the source exists or provisioning has
+started. After a burned attempt, stop-loss, or completed tranche, power down any range not needed for the next
+operation before leaving the lab idle.
+
 ## Order
 
 1. Stop local Sage before moving its databases:
@@ -123,6 +141,9 @@ from the Ludus ansible inventory, sets all three DCs before member servers, and 
 start cannot restore stale snapshot CMOS time during the rehearsal. The next rollback restores service state. The
 helper fails closed when any host remains more than 60 seconds from the controller or Windows Time is not stopped
 and disabled.
+
+A range is not `callback-ready` or `countable` after rollback alone. Clock sync, BloodHound reset/settling, Sage
+restart env, foothold uniqueness, and callback readiness still have to pass before any live row can count.
 
 Optional MEEREEN PKINIT readiness check before launching Apollo:
 
