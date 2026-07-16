@@ -4,7 +4,9 @@ This module is intentionally narrower than a production authorization system. It
 exists only to make prospective evaluation rows countable: a frozen manifest, a
 trusted cell binding, one post-normalization action envelope, and one deterministic
 allow/deny/unknown decision. It does not call models, inspect outcomes, or mediate
-runtime effects by itself.
+runtime effects by itself. A frozen manifest selector binds exact host/domain/identity
+fields; Phase 17 later binds the fresh runtime callback ID inside the trusted cell
+binding and action envelope.
 """
 
 from __future__ import annotations
@@ -17,11 +19,11 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-MANIFEST_SCHEMA = "evaluation-authorization-manifest-v1"
+MANIFEST_SCHEMA = "evaluation-authorization-manifest-v2"
 CELL_BINDING_SCHEMA = "evaluation-authorization-cell-binding-v1"
 ACTION_ENVELOPE_SCHEMA = "evaluation-action-envelope-v1"
 DECISION_SCHEMA = "evaluation-authorization-decision-v1"
-GATE_VERSION = "evaluation-authorization-gate-v1"
+GATE_VERSION = "evaluation-authorization-gate-v2"
 
 ALLOW = "allow"
 DENY = "deny"
@@ -112,6 +114,33 @@ class CallbackSelector:
             "identity": self.identity,
         }
 
+    @property
+    def has_exact_identity_selector(self) -> bool:
+        return bool(self.host and self.domain and self.identity)
+
+    @property
+    def is_runtime_bound(self) -> bool:
+        return bool(self.callback_id and self.has_exact_identity_selector)
+
+    def matches_runtime_callback(self, callback: "CallbackSelector") -> bool:
+        """Match a frozen manifest selector to one freshly bound runtime callback.
+
+        A Phase 16 manifest can freeze exact host/domain/identity selectors before
+        Phase 17 rediscovers the live callback ID. The trusted cell binding and
+        action envelope still require and compare the exact runtime callback ID.
+        """
+        if not isinstance(callback, CallbackSelector) or not callback.is_runtime_bound:
+            return False
+        if not self.has_exact_identity_selector:
+            return False
+        if (
+            self.host != callback.host
+            or self.domain != callback.domain
+            or self.identity != callback.identity
+        ):
+            return False
+        return not self.callback_id or self.callback_id == callback.callback_id
+
     @classmethod
     def from_dict(cls, value: Any) -> "CallbackSelector | None":
         if not isinstance(value, Mapping):
@@ -122,7 +151,7 @@ class CallbackSelector:
             domain=value.get("domain") or "",
             identity=value.get("identity") or "",
         )
-        return selector if all(selector.to_dict().values()) else None
+        return selector if selector.has_exact_identity_selector else None
 
 
 @dataclass(frozen=True)
@@ -443,7 +472,7 @@ def build_action_envelope(
         not isinstance(manifest, EvaluationAuthorizationManifest)
         or not isinstance(cell_binding, TrustedCellBinding)
         or not isinstance(callback, CallbackSelector)
-        or not all(callback.to_dict().values())
+        or not callback.is_runtime_bound
         or not normalized_targets
         or not _text(capability)
         or not _tuple_text(effects, lower=True)
@@ -561,7 +590,11 @@ def authorize_action(
         or envelope.cell_id not in manifest.allowed_cells
     ):
         return _decision(DENY, "cell_binding_mismatch", manifest, cell_binding, envelope)
-    if envelope.callback != cell_binding.callback or envelope.callback not in manifest.callbacks:
+    if (
+        envelope.callback != cell_binding.callback
+        or not envelope.callback.is_runtime_bound
+        or not any(selector.matches_runtime_callback(envelope.callback) for selector in manifest.callbacks)
+    ):
         return _decision(DENY, "callback_binding_mismatch", manifest, cell_binding, envelope)
     if envelope.enforcement_projection_sha256 in set(seen_enforcement_digests):
         return _decision(DENY, "replay_detected", manifest, cell_binding, envelope)
@@ -616,4 +649,3 @@ def authorization_join_matches(
     ):
         return False, "authorization_lineage_mismatch"
     return True, "authorization_join_valid"
-

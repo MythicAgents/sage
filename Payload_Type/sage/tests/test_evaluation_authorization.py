@@ -159,6 +159,27 @@ def test_exact_fields_suffix_collision_and_deny_precedence_fail_closed():
     assert decision.reason_code == "explicit_deny"
 
 
+def test_manifest_selector_can_freeze_exact_identity_before_phase17_runtime_callback_id_binding():
+    manifest = replace(
+        _manifest(),
+        callbacks=(_callback(callback_id=""),),
+    )
+    runtime_callback = _callback(callback_id="42")
+    binding = _binding(manifest, callback=runtime_callback)
+    envelope = _envelope(manifest=manifest, binding=binding, callback=runtime_callback)
+    suffix_collision = _envelope(
+        manifest=manifest,
+        binding=binding,
+        callback=_callback(callback_id="42", domain="evilcinder.local"),
+    )
+
+    assert manifest.callbacks[0].has_exact_identity_selector is True
+    assert manifest.callbacks[0].is_runtime_bound is False
+    assert runtime_callback.is_runtime_bound is True
+    assert ea.authorize_action(manifest, binding, envelope, now=NOW).decision == ea.ALLOW
+    assert ea.authorize_action(manifest, binding, suffix_collision, now=NOW).reason_code == "callback_binding_mismatch"
+
+
 def test_stale_replay_cross_cell_cross_callback_and_argument_mutation_reject():
     manifest = _manifest()
     binding = _binding(manifest)
