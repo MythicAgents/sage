@@ -169,6 +169,70 @@ def test_dry_run_carries_isolated_ludus_profile_through_reset_and_launch():
     assert "--callback-settle-seconds 90 --require-unique-callback" in output
 
 
+def test_phase7_dry_run_uses_isolated_range_and_settled_callback_gate():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "trust-context-parent-dcsync",
+            "--side",
+            "harness",
+            "--phase7-control",
+            "positive",
+            "--phase7-attempt-index",
+            "1",
+            "--ludus-range-id",
+            "SAGETRUST20260715",
+            "--ludus-mcp-server",
+            "ludus_sagerepl",
+            "--foothold-host",
+            "ZETA-WS01",
+            "--foothold-ip",
+            "10.9.10.31",
+            "--foothold-user",
+            r"ZETA\user1",
+            "--foothold-callback-user",
+            "user1",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert "--mcp-server ludus_sagerepl --range-id SAGETRUST20260715 rollback" in output
+    assert "launch_apollo_foothold.sh 10.9.10.31 ZETA\\user1" in output
+    assert "--target-host ZETA-WS01" in output
+    assert "--callback-settle-seconds 90 --require-unique-callback" in output
+
+
+def test_phase7_eval_env_and_netbios_map_are_frozen():
+    env = orchestrate._phase7_trust_context_eval_env(
+        "trust-context-parent-dcsync",
+        control="positive",
+        attempt_index=2,
+    )
+
+    assert env["SAGE_EVAL_PHASE7_MANIFEST_HASH"].startswith("sha256:")
+    assert env["SAGE_EVAL_PHASE7_TOPOLOGY_HASH"].startswith("sha256:")
+    assert env["SAGE_EVAL_PHASE7_CONTROL"] == "positive"
+    assert env["SAGE_EVAL_PHASE7_ATTEMPT_INDEX"] == "2"
+    assert orchestrate._engagement_netbios_map("trust-context-parent-dcsync") == (
+        '{"ALPHA":"alpha.local","BRANCH":"branch.local","ZETA":"zeta.branch.local"}'
+    )
+
+
+def test_phase7_eval_env_rejects_missing_control():
+    with pytest.raises(SystemExit):
+        orchestrate._phase7_trust_context_eval_env(
+            "trust-context-parent-dcsync",
+            control=None,
+            attempt_index=1,
+        )
+
+
 def test_range_guest_ip_gate_requires_every_reported_vm_on_with_ip():
     assert orchestrate._range_guests_have_ips(
         "  ON  range-router  ip=10.11.10.254  pmx=1\n"

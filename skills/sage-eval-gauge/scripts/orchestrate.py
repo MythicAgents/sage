@@ -51,6 +51,13 @@ def _active_laps_contract():
     return laps_contract
 
 
+def _active_trust_context_contract():
+    sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import trust_context_corroboration as trust_contract  # type: ignore
+
+    return trust_contract
+
+
 def _laps_family_transfer_netbios_map() -> str:
     laps_contract = _active_laps_contract()
     mapping = {laps_contract.ROOT_NETBIOS: laps_contract.ROOT_DOMAIN}
@@ -66,7 +73,18 @@ def _laps_family_transfer_forced_path_names() -> list[str]:
     return [item.name for item in laps_contract.LAPS_FAMILY_TRANSFER_HOLDOUT.forced_paths]
 
 
+def _trust_context_netbios_map() -> str:
+    trust_contract = _active_trust_context_contract()
+    mapping = {
+        trust_contract.ROOT_NETBIOS: trust_contract.ROOT_DOMAIN,
+        trust_contract.CHILD_NETBIOS: trust_contract.CHILD_DOMAIN,
+        trust_contract.TRUSTED_NETBIOS: trust_contract.TRUSTED_DOMAIN,
+    }
+    return json.dumps(mapping, separators=(",", ":"), sort_keys=True)
+
+
 DEFAULT_LAPS_FAMILY_TRANSFER_NETBIOS_MAP = _laps_family_transfer_netbios_map()
+DEFAULT_TRUST_CONTEXT_NETBIOS_MAP = _trust_context_netbios_map()
 DEFAULT_PURPOSE_RANGE_GPO_PROOF_ENV = {
     "SAGE_GPO_PROOF_SHARE_NAME": "SageProof",
     "SAGE_GPO_PROOF_LOCAL_ROOT": r"C:\SageProof",
@@ -223,6 +241,7 @@ DEFAULT_FOOTHOLD_CALLBACK_USER = "samwell.tarly"
 DEFAULT_FOOTHOLD_PASSWORD_ENV = "SAGE_RUN_AS_PASSWORD"
 PHASE6_CALLBACK_SETTLE_SECONDS = 90
 PHASE6_MAX_PRE_FRONTIER_DIAGNOSTIC_RETRIES = 1
+PHASE7_CALLBACK_SETTLE_SECONDS = 90
 
 
 class FootholdSpec:
@@ -303,7 +322,10 @@ class FootholdSpec:
 
 def _configure_foothold_for_scenario(scenario: str, foothold: FootholdSpec | None = None) -> FootholdSpec:
     foothold = foothold or FootholdSpec()
-    if not scenario.startswith("laps-family-transfer-"):
+    if not (
+        scenario.startswith("laps-family-transfer-")
+        or scenario == _active_trust_context_contract().SCENARIO_NAME
+    ):
         return foothold
     return FootholdSpec(
         host=foothold.host,
@@ -314,7 +336,12 @@ def _configure_foothold_for_scenario(scenario: str, foothold: FootholdSpec | Non
         password_env=foothold.password_env,
         ludus_range_id=foothold.ludus_range_id,
         ludus_mcp_server=foothold.ludus_mcp_server,
-        callback_settle_seconds=max(foothold.callback_settle_seconds, PHASE6_CALLBACK_SETTLE_SECONDS),
+        callback_settle_seconds=max(
+            foothold.callback_settle_seconds,
+            PHASE6_CALLBACK_SETTLE_SECONDS
+            if scenario.startswith("laps-family-transfer-")
+            else PHASE7_CALLBACK_SETTLE_SECONDS,
+        ),
         require_unique_callback=True,
     )
 
@@ -393,6 +420,8 @@ def _range_env(
 def _engagement_netbios_map(scenario: str, explicit: str | None = None) -> str:
     if explicit:
         return explicit
+    if scenario == _active_trust_context_contract().SCENARIO_NAME:
+        return DEFAULT_TRUST_CONTEXT_NETBIOS_MAP
     if scenario.startswith("laps-family-transfer-"):
         return DEFAULT_LAPS_FAMILY_TRANSFER_NETBIOS_MAP
     if scenario.startswith("replication-purpose-range-"):
@@ -501,6 +530,41 @@ def _phase6_laps_eval_env(
         separators=(",", ":"),
         sort_keys=True,
     )
+    return env
+
+
+def _phase7_trust_context_eval_env(
+    scenario: str,
+    *,
+    control: str | None,
+    attempt_index: int | None,
+) -> dict[str, str]:
+    trust_contract = _active_trust_context_contract()
+    if scenario != trust_contract.SCENARIO_NAME:
+        if control or attempt_index is not None:
+            raise SystemExit(
+                "ABORT: --phase7-control/--phase7-attempt-index are only valid for "
+                f"{trust_contract.SCENARIO_NAME}"
+            )
+        return {}
+    if not control:
+        raise SystemExit(
+            f"ABORT: {trust_contract.SCENARIO_NAME} requires --phase7-control"
+        )
+    allowed_controls = set(trust_contract.LIVE_ROW_CONTROLS)
+    if control not in allowed_controls:
+        raise SystemExit(
+            f"ABORT: Phase 7 gauge rows are positive-only; {control!r} is not allowed. "
+            "Run trust-context-corroboration-control-validate for graph-only/missing/stale controls."
+        )
+    if attempt_index is None or int(attempt_index) < 1:
+        raise SystemExit("ABORT: Phase 7 positive rows require --phase7-attempt-index >= 1")
+    env = {
+        "SAGE_EVAL_PHASE7_MANIFEST_HASH": trust_contract.sealed_manifest()["manifest_hash"],
+        "SAGE_EVAL_PHASE7_TOPOLOGY_HASH": trust_contract.topology_hash(),
+        "SAGE_EVAL_PHASE7_CONTROL": control,
+    }
+    env["SAGE_EVAL_PHASE7_ATTEMPT_INDEX"] = str(int(attempt_index))
     return env
 
 
@@ -805,7 +869,9 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              engagement_netbios_map: str | None = None,
              laps_forced_path: str | None = None,
              phase6_planned_row_id: str | None = None,
-             phase6_attempt_index: int | None = None) -> None:
+             phase6_attempt_index: int | None = None,
+             phase7_control: str | None = None,
+             phase7_attempt_index: int | None = None) -> None:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
@@ -873,6 +939,13 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
                 attempt_index=phase6_attempt_index,
             )
         )
+    child_env.update(
+        _phase7_trust_context_eval_env(
+            scenario,
+            control=phase7_control,
+            attempt_index=phase7_attempt_index,
+        )
+    )
     if route_env:
         child_env.update(route_env)
     _run(f"gauge {side}/{scenario}", argv, PAYLOAD, step_timeout, env=child_env)
@@ -1025,6 +1098,18 @@ def main(argv=None) -> int:
         help="Phase 6 only: 1-based attempt index for --phase6-planned-row-id.",
     )
     ap.add_argument(
+        "--phase7-control",
+        choices=["positive"],
+        default=None,
+        help="Phase 7 only: label a countable live positive trust/context row.",
+    )
+    ap.add_argument(
+        "--phase7-attempt-index",
+        type=int,
+        default=None,
+        help="Phase 7 only: required 1-based repetition index for the live positive row.",
+    )
+    ap.add_argument(
         "--retained-callback-config",
         type=Path,
         default=DEFAULT_RETAINED_CALLBACK_CONFIG,
@@ -1065,6 +1150,11 @@ def main(argv=None) -> int:
         ludus_mcp_server=args.ludus_mcp_server,
     )
     foothold = _configure_foothold_for_scenario(args.scenario, foothold)
+    _phase7_trust_context_eval_env(
+        args.scenario,
+        control=args.phase7_control,
+        attempt_index=args.phase7_attempt_index,
+    )
     policy_mode = "symbolic" if args.controller else args.policy_mode
     if args.null_model_factorial and args.side not in (None, "harness"):
         ap.error("--null-model-factorial only supports the harness side")
@@ -1116,7 +1206,9 @@ def main(argv=None) -> int:
                          engagement_netbios_map=args.engagement_netbios_map,
                          laps_forced_path=args.laps_forced_path,
                          phase6_planned_row_id=args.phase6_planned_row_id,
-                         phase6_attempt_index=args.phase6_attempt_index)
+                         phase6_attempt_index=args.phase6_attempt_index,
+                         phase7_control=args.phase7_control,
+                         phase7_attempt_index=args.phase7_attempt_index)
     if not args.side and not args.null_model_factorial:
         compare(args.scenario)
     return 0

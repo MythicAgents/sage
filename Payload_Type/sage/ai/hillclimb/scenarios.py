@@ -8,6 +8,7 @@ is operator-configurable per lab.
 try:  # package import
     from . import live_seams
     from . import laps_family_transfer_holdout as laps_contract
+    from . import trust_context_corroboration as trust_contract
     from .range_state import Scenario, MilestoneSpec, Milestone
 except Exception:  # script / sys.path import
     import sys
@@ -16,6 +17,7 @@ except Exception:  # script / sys.path import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import live_seams  # type: ignore
     import laps_family_transfer_holdout as laps_contract  # type: ignore
+    import trust_context_corroboration as trust_contract  # type: ignore
     from range_state import Scenario, MilestoneSpec, Milestone  # type: ignore
 
 CHILD = "north.sevenkingdoms.local"
@@ -210,6 +212,33 @@ def laps_family_transfer_holdout_scenarios(
     ]
 
 
+def trust_context_corroboration_scenarios(
+    engagement_id: str = "Operation_SAGE_TRUST_CONTEXT",
+) -> list[Scenario]:
+    """Phase 7 parent-DCSync objective over the frozen trust/context topology."""
+    return [
+        Scenario(
+            name=trust_contract.SCENARIO_NAME,
+            engagement_id=engagement_id,
+            objective=trust_contract.OBJECTIVE,
+            domains={
+                # The scored krbtgt witness is the parent-domain credential proof.
+                "child": trust_contract.ROOT_DOMAIN,
+                "parent": trust_contract.ROOT_DOMAIN,
+                "objective": trust_contract.ROOT_DOMAIN,
+            },
+            milestone_subset=(
+                Milestone.FOOTHOLD,
+                Milestone.GRAPH_COLLECTED,
+                Milestone.KRBTGT_DUMPED,
+                Milestone.OBJECTIVE,
+            ),
+            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            recorded_probe_milestones=frozenset({Milestone.KRBTGT_DUMPED, Milestone.OBJECTIVE}),
+        ),
+    ]
+
+
 def all_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
     """Return the GOAD suite plus provisionable purpose-range discriminator scenarios."""
     return [
@@ -217,4 +246,5 @@ def all_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
         *purpose_range_scenarios(engagement_id),
         *replication_purpose_range_scenarios(engagement_id),
         *laps_family_transfer_holdout_scenarios(engagement_id),
+        *trust_context_corroboration_scenarios(engagement_id),
     ]

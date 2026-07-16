@@ -484,12 +484,20 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
             "SAGE_EVAL_PHASE6_MAX_PRE_FRONTIER_DIAGNOSTIC_RETRIES",
             "phase6_max_pre_frontier_diagnostic_retries",
         ),
+        ("SAGE_EVAL_PHASE7_MANIFEST_HASH", "phase7_manifest_hash"),
+        ("SAGE_EVAL_PHASE7_TOPOLOGY_HASH", "phase7_topology_hash"),
+        ("SAGE_EVAL_PHASE7_CONTROL", "phase7_control"),
+        ("SAGE_EVAL_PHASE7_ATTEMPT_INDEX", "phase7_attempt_index"),
     ):
         value = str(os.environ.get(env_key) or "").strip()
         if value:
             rec[row_key] = (
                 int(value)
-                if row_key in {"phase6_attempt_index", "phase6_max_pre_frontier_diagnostic_retries"}
+                if row_key in {
+                    "phase6_attempt_index",
+                    "phase6_max_pre_frontier_diagnostic_retries",
+                    "phase7_attempt_index",
+                }
                 else value
             )
     rec.update(runtime_evidence_fields(runtime_telemetry))

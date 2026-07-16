@@ -155,6 +155,9 @@ Do not store lab passwords in skills or copied helper scripts. Prefer session en
   backend/route, and validator gates pass. If a duplicate callback lane, clock skew, route mismatch, setup defect, or
   measurement defect is discovered after an attempt starts, mark that attempt `burned`, preserve its artifacts, fix
   the gate, and use a fresh attempt for evidence. Do not retroactively promote a burned attempt.
+- For sealed evaluators and live-row validators, do not use substring membership for structured capability targets,
+  domains, or callback-scoped effect keys. Parse exact fields and keep a regression for suffix-collision cases such
+  as `zeta.branch.local` versus `branch.local`.
 - Power down ranges that are not needed for the next active operation after a stop-loss, burned attempt, or completed
   tranche. The Ludus host is resource constrained; leaving old purpose ranges running is not a neutral default.
 - For each live eval row, record the effective model provider/route, Sage startup env overrides that change behavior,

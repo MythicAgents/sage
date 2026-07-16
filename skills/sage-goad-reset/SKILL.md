@@ -39,6 +39,23 @@ Use these state labels in updates: `defined`, `provisioned`, `snapshotted`, `cal
 started. After a burned attempt, stop-loss, or completed tranche, power down any range not needed for the next
 operation before leaving the lab idle.
 
+### Custom DreadGOAD Purpose-Range Workflow
+
+For a custom DreadGOAD-format purpose range, keep source validation and runtime targeting separate:
+
+- `dreadgoad config show` is not sufficient proof that the custom lab's playbook sequence is the one provisioning
+  will resolve. Validate through the actual provision resolver with a deliberate sentinel such as
+  `dreadgoad provision --from __not_a_playbook__` before the long run, then require the returned playbook list to
+  be the intended custom sequence.
+- DreadGOAD acts against the current Ludus default range for the API-key user. Before `dreadgoad infra apply` or
+  `dreadgoad provision`, create the isolated Ludus range object for the purpose range, set it as that user's
+  default, verify the selected range identity, and keep unrelated ranges powered off.
+- DreadGOAD does not consume Sage's `.mcp.json` automatically. Pass the intended `LUDUS_URL` and `LUDUS_API_KEY`
+  explicitly from the correct local credential source for every infra/provision command.
+- For cross-forest ACL/bootstrap scripts, do not assume ambient `NTAccount.Translate()` or one forest's AD cmdlets
+  can resolve a foreign principal. Validate the exact auth context before the long playbook; when needed, perform an
+  explicit least-privileged SID lookup in the principal's home domain and apply the ACL locally with that SID.
+
 ## Order
 
 1. Stop local Sage before moving its databases:
