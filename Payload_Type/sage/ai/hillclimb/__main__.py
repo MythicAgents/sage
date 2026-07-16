@@ -9,6 +9,8 @@
   python -m ai.hillclimb policy-replay-hillclimb-iteration # no lab or model calls
   python -m ai.hillclimb policy-replay-promotion-gate # no lab or model calls
   python -m ai.hillclimb phase4-readiness-report      # no lab or model calls
+  python -m ai.hillclimb phase9-auto-harness-readiness # no lab or model calls
+  python -m ai.hillclimb phase10-evidence-bundle      # no lab or model calls
   python -m ai.hillclimb phase5-full-frontier-t3      # no lab; add --run-model-matrix for weak/strong calls
   python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
   python -m ai.hillclimb target-value-census             # no lab or model calls
@@ -72,6 +74,8 @@ try:  # package import
     from . import laps_family_transfer_matrix
     from . import trust_context_corroboration
     from . import phase8_goad_regression
+    from . import phase9_auto_harness_readiness
+    from . import phase10_evidence_bundle
     from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
@@ -109,6 +113,8 @@ except Exception:  # script / sys.path import
     import laps_family_transfer_matrix  # type: ignore
     import trust_context_corroboration  # type: ignore
     import phase8_goad_regression  # type: ignore
+    import phase9_auto_harness_readiness  # type: ignore
+    import phase10_evidence_bundle  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
@@ -325,6 +331,20 @@ def _cmd_phase4_readiness_report(args: argparse.Namespace) -> int:
     return 0 if decision in {"auto_harness_not_ready", "eligible_for_supervised_artifact_campaign"} else 1
 
 
+def _cmd_phase9_auto_harness_readiness(args: argparse.Namespace) -> int:
+    report = phase9_auto_harness_readiness.build_phase9_readiness_report()
+    rendered = phase9_auto_harness_readiness.render_report(report)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+    decision = ((report.get("readiness") or {}).get("readiness_decision") or "")
+    print(f"\nREADINESS: {decision}", flush=True)
+    return 0 if report.get("passes_gate") is True and decision in {
+        "auto_harness_not_ready",
+        "eligible_for_supervised_artifact_campaign",
+    } else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai.hillclimb", description="Sage eval gauge (Phase 0)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -404,6 +424,13 @@ def main(argv: list[str] | None = None) -> int:
     p4.add_argument("--output", default=None, help="optional JSON report path")
     p4.set_defaults(func=_cmd_phase4_readiness_report)
 
+    p9 = sub.add_parser(
+        "phase9-auto-harness-readiness",
+        help="emit the Phase 9 typed auto-harness-improvement readiness verdict",
+    )
+    p9.add_argument("--output", default=None, help="optional JSON report path")
+    p9.set_defaults(func=_cmd_phase9_auto_harness_readiness)
+
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)
     policy_replay_calibration.add_cli(sub)
@@ -427,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
     laps_family_transfer_matrix.add_cli(sub)
     trust_context_corroboration.add_cli(sub)
     phase8_goad_regression.add_cli(sub)
+    phase10_evidence_bundle.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)
