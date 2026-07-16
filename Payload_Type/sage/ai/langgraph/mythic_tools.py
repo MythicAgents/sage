@@ -6,6 +6,10 @@ try:
     from . import auth_context
 except ImportError:
     import auth_context
+try:
+    from . import evaluation_authorization_runtime
+except ImportError:
+    import evaluation_authorization_runtime
 # Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
@@ -1140,6 +1144,10 @@ class MythicTools:
         # remains the only execution boundary; this reports real callback tasks to the chat surface.
         self._capability_command_observer = None
         self._capability_command_trace_seq = 0
+        # Phase 17/18 evaluation-only authorization mediation. The runtime wrapper
+        # is lazy-loaded from private env/file context and remains disabled for
+        # ordinary Sage sessions.
+        self._evaluation_authorization_runtime_state = None
         self._engagement_hops: list = []
         self._engagement_objective_text: str = ""
         # Provenance of the cached ledger objective: "operator" (set via `state objective`), "autonomous_seed"
@@ -3196,6 +3204,11 @@ class MythicTools:
                     except Exception as exc:
                         if not self._is_mythic_credential_reference_rejection(exc):
                             raise
+                        if isinstance((_task_visibility_context.get() or {}).get("authorization"), dict) and (_task_visibility_context.get() or {}).get("authorization"):
+                            # In countable eval mode the exact normalized arguments were already
+                            # authorized at the final adapter boundary. Mutating them inside the
+                            # issue path would violate the envelope join; fail closed instead.
+                            raise
                         repaired = await self._bind_mythic_credential_parameters(
                             command,
                             parameters,
@@ -4286,6 +4299,8 @@ class MythicTools:
         authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
         try:
             try:
                 from . import proof_boundary
@@ -4338,6 +4353,8 @@ class MythicTools:
         authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
         try:
             try:
                 from . import proof_boundary
@@ -4392,6 +4409,8 @@ class MythicTools:
         authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
         try:
             try:
                 from . import proof_boundary
@@ -4447,6 +4466,8 @@ class MythicTools:
         authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
         try:
             try:
                 from . import proof_boundary
@@ -4542,6 +4563,10 @@ class MythicTools:
     ) -> dict:
         item = issued_item if isinstance(issued_item, dict) else {}
         command_obj = command_obj if isinstance(command_obj, dict) else {}
+        if authorization is None and isinstance(item.get("_authorization"), dict):
+            authorization = dict(item.get("_authorization") or {})
+        if authorization is None and isinstance(item.get("authorization"), dict):
+            authorization = dict(item.get("authorization") or {})
         return self._proof_reference(
             task_id=item.get("task_id"),
             callback_id=item.get("callback_id"),
@@ -4593,6 +4618,267 @@ class MythicTools:
         elif isinstance(intent, dict):
             intent["transaction_id"] = transaction_id
         return action, transaction_id
+
+    def _evaluation_authorization_runtime(self):
+        runtime = getattr(self, "_evaluation_authorization_runtime_state", None)
+        if runtime is None:
+            runtime = evaluation_authorization_runtime.EvaluationAuthorizationRuntime.from_env()
+            self._evaluation_authorization_runtime_state = runtime
+        return runtime
+
+    def set_evaluation_authorization_context(self, value) -> None:
+        """Inject one private eval authorization context for tests or an eval driver.
+
+        This is intentionally not a model-facing tool.  Production sessions leave
+        the runtime disabled; Phase 17/18 drivers may inject a frozen manifest and
+        trusted callback-bound cell after their preflight completes.
+        """
+        if isinstance(value, evaluation_authorization_runtime.EvaluationAuthorizationRuntime):
+            self._evaluation_authorization_runtime_state = value
+            return
+        self._evaluation_authorization_runtime_state = (
+            evaluation_authorization_runtime.EvaluationAuthorizationRuntime.from_dict(
+                value if isinstance(value, dict) else None,
+                enabled=True,
+                source="injected",
+            )
+        )
+
+    def evaluation_authorization_audit_snapshot(self) -> dict:
+        return self._evaluation_authorization_runtime().audit_snapshot()
+
+    def _evaluation_authorization_enabled(self) -> bool:
+        return bool(self._evaluation_authorization_runtime().enabled)
+
+    def _evaluation_authorization_proof_lineage_missing(self, authorization) -> bool:
+        """Require one exact allow join on every eval-mode runtime proof envelope."""
+        return bool(
+            self._evaluation_authorization_enabled()
+            and (not isinstance(authorization, dict) or not authorization)
+        )
+
+    def _evaluation_authorization_callback_selector(self, callback_id):
+        runtime = self._evaluation_authorization_runtime()
+        binding = getattr(runtime, "cell_binding", None)
+        callback = getattr(binding, "callback", None)
+        if callback is None:
+            return None
+        try:
+            try:
+                from . import evaluation_authorization
+            except ImportError:
+                import evaluation_authorization
+            return evaluation_authorization.CallbackSelector(
+                callback_id=self._capability_text(callback_id),
+                host=getattr(callback, "host", ""),
+                domain=getattr(callback, "domain", ""),
+                identity=getattr(callback, "identity", ""),
+            )
+        except Exception:
+            return None
+
+    def _evaluation_authorization_target_fields(
+        self,
+        capability_name: str,
+        command_context: dict | None,
+        callback_id,
+        *,
+        collection_scope_domain: str = "",
+    ) -> dict[str, str]:
+        """Project post-normalization command context into exact target dimensions.
+
+        The projection deliberately uses only concrete action/adapter fields, not
+        prompts, policy rationale, or outcomes.  It is conservative: if a covered
+        action cannot provide a concrete target, the frozen gate returns unknown.
+        """
+        context = command_context if isinstance(command_context, dict) else {}
+        action = context.get("action") if isinstance(context.get("action"), dict) else {}
+        intent = context.get("intent") if isinstance(context.get("intent"), dict) else {}
+        if not intent and isinstance(action.get("intent"), dict):
+            intent = dict(action.get("intent") or {})
+        runtime_inputs = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+        target_parts: dict[str, str] = {}
+        for part in self._capability_text(context.get("target") or action.get("target")).split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            if self._capability_text(key) and self._capability_text(value):
+                target_parts[self._capability_text(key).casefold()] = self._capability_text(value)
+
+        def first(*keys):
+            for key in keys:
+                for source in (runtime_inputs, intent, target_parts, action):
+                    if not isinstance(source, dict):
+                        continue
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        return value
+            return ""
+
+        capability = self._capability_text(capability_name).casefold()
+        runtime = self._evaluation_authorization_runtime()
+        binding_callback = getattr(getattr(runtime, "cell_binding", None), "callback", None)
+        if capability == "collect-graph":
+            host = self._capability_text(getattr(binding_callback, "host", "")).casefold()
+            fields = {"hosts": host} if host else {}
+            if collection_scope_domain:
+                fields["domains"] = self._capability_text(collection_scope_domain).casefold()
+            return fields
+
+        source_domain = self._capability_text(first("source_domain", "domain")).casefold()
+        target_domain = self._capability_text(first("target_domain", "effect_domain", "domain")).casefold()
+        domain = target_domain or source_domain
+        host = self._capability_host_short(first("target_host", "host", "computer", "ca_host"))
+        account_raw = self._capability_text(first("account", "user", "principal"))
+        account = self._canonical_credential_account(account_raw)
+        account_domain = self._capability_text(
+            first("account_domain", "reader_domain", "principal_domain")
+        ).casefold() or domain
+        directory_object = self._capability_text(
+            first("gpo", "gpo_name", "gponame", "gpo_display_name", "template", "template_name", "certificate_template")
+        ).casefold()
+
+        fields: dict[str, str] = {}
+        if domain:
+            fields["domains"] = domain
+        if host:
+            fields["hosts"] = host
+        if directory_object:
+            fields["directory_objects"] = directory_object
+        if account and account_domain and account_raw:
+            fields["principals"] = f"{account}@{account_domain}"
+        if source_domain and target_domain and source_domain != target_domain:
+            fields["trust_edges"] = f"{source_domain}->{target_domain}"
+        if not fields:
+            host = self._capability_text(getattr(binding_callback, "host", "")).casefold()
+            if host:
+                fields["hosts"] = host
+        return fields
+
+    def _evaluation_authorization_decision_origin(self, command_context: dict | None) -> tuple[str, str]:
+        context = command_context if isinstance(command_context, dict) else {}
+        policy_decision = context.get("policy_decision") if isinstance(context.get("policy_decision"), dict) else {}
+        origin = self._capability_text(
+            policy_decision.get("decision_origin")
+            or policy_decision.get("decision_owner")
+            or policy_decision.get("policy_mode")
+            or "runtime_evaluation"
+        )
+        decision_id = self._capability_text(policy_decision.get("decision_id"))
+        return origin, decision_id
+
+    def _evaluation_authorize_callback_mutation(
+        self,
+        *,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id,
+        capability_name: str,
+    ):
+        runtime = self._evaluation_authorization_runtime()
+        if not runtime.enabled:
+            return runtime.authorize(
+                callback=None,
+                target_fields={},
+                capability="",
+                effects=(),
+                concrete_arguments=None,
+                transaction_id="",
+                decision_origin="",
+                boundary="MythicTools._issue_capability_callback_command",
+            )
+        command_context = self._deterministic_capability_command_context(command_name, parameters)
+        if not command_context:
+            command_context = {
+                "capability": capability_name,
+                "effects": list(command_obj.get("effects") or []),
+                "target": command_obj.get("target"),
+                "intent": command_obj.get("intent") if isinstance(command_obj.get("intent"), dict) else {},
+                "runtime_inputs": {},
+                "policy_decision": {},
+                "transaction_id": self._current_transaction_id(),
+            }
+        capability = self._capability_text(command_context.get("capability") or capability_name)
+        effects = list(command_context.get("effects") or [])
+        transaction_id = self._capability_text(
+            command_context.get("transaction_id") or self._current_transaction_id()
+        )
+        decision_origin, policy_decision_id = self._evaluation_authorization_decision_origin(command_context)
+        return runtime.authorize(
+            callback=self._evaluation_authorization_callback_selector(callback_id),
+            target_fields=self._evaluation_authorization_target_fields(capability, command_context, callback_id),
+            capability=capability,
+            effects=effects,
+            concrete_arguments={"command": command_name, "parameters": parameters},
+            transaction_id=transaction_id,
+            decision_origin=decision_origin,
+            policy_decision_id=policy_decision_id,
+            boundary="MythicTools._issue_capability_callback_command",
+        )
+
+    def _evaluation_authorize_bloodhound_ingest(
+        self,
+        *,
+        callback_id,
+        file_uuid: str,
+        safe_name: str,
+        content_hash: str,
+        collection_scope_domain: str,
+        transaction_id: str,
+    ):
+        runtime = self._evaluation_authorization_runtime()
+        decision_origin, policy_decision_id = self._evaluation_authorization_decision_origin(
+            _task_visibility_context.get() or {}
+        )
+        return runtime.authorize(
+            callback=self._evaluation_authorization_callback_selector(callback_id),
+            target_fields=self._evaluation_authorization_target_fields(
+                "collect-graph",
+                {},
+                callback_id,
+                collection_scope_domain=collection_scope_domain,
+            ),
+            capability="collect-graph",
+            effects=("graph-collected",),
+            concrete_arguments={
+                "file_uuid": self._capability_text(file_uuid),
+                "file_name": self._capability_text(safe_name),
+                "content_sha256": self._capability_text(content_hash).casefold(),
+                "collection_scope_domain": self._capability_text(collection_scope_domain).casefold(),
+            },
+            transaction_id=transaction_id,
+            decision_origin=decision_origin,
+            policy_decision_id=policy_decision_id,
+            boundary="MythicTools.ingest_collection",
+        )
+
+    def _evaluation_authorization_terminal_payload(
+        self,
+        outcome,
+        *,
+        capability: str = "",
+        action=None,
+        issued: list[dict] | None = None,
+    ) -> dict:
+        return {
+            "ok": False,
+            "verdict": "authorization_safe_terminal",
+            "capability": self._capability_text(capability or getattr(action, "name", "")),
+            "reason": self._capability_text(getattr(outcome, "reason_code", "") or "authorization_gate_unavailable"),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "issued": self._capability_executor_public_issued(list(issued or [])),
+            "recorded_effects": [],
+            "objective_proven": False,
+            "policy_success": False,
+            "authorization_safe_terminal": True,
+            "retryable": False,
+            "retry_permitted": False,
+            "tactical_hitl_permitted": False,
+            "human_override_permitted": False,
+            "authorization": outcome.to_dict() if hasattr(outcome, "to_dict") else {},
+            "stopped_after": "evaluation_authorization",
+        }
 
     def _record_engagement_success(
         self,
@@ -5696,6 +5982,13 @@ class MythicTools:
             or intent.get("transaction_id")
             or f"capability-command:{task_id}"
         )
+        visibility_context = _task_visibility_context.get() or {}
+        authorization = (
+            dict(visibility_context.get("authorization") or {})
+            if isinstance(visibility_context, dict)
+            and isinstance(visibility_context.get("authorization"), dict)
+            else {}
+        )
         return {
             "source": "deterministic_capability_command",
             "provenance": "run",
@@ -5715,6 +6008,7 @@ class MythicTools:
                     "probe": dict(probe) if isinstance(probe, dict) else probe,
                 },
                 verifier_result=self._verification_commitment_payload(verification),
+                authorization=authorization,
             ),
         }
 
@@ -7347,6 +7641,16 @@ class MythicTools:
                     failure_probe=accumulated_probe or {},
                 )
             return json.dumps(final_payload, sort_keys=True)
+        except evaluation_authorization_runtime.EvaluationAuthorizationTerminal as exc:
+            return json.dumps(
+                self._evaluation_authorization_terminal_payload(
+                    exc.outcome,
+                    capability=self._capability_text(getattr(locals().get("action_obj"), "name", "")),
+                    action=locals().get("action_obj"),
+                    issued=locals().get("all_issued", []),
+                ),
+                sort_keys=True,
+            )
         except Exception as exc:
             return self._capability_executor_failure_json({
                 "ok": False,
@@ -8410,8 +8714,18 @@ class MythicTools:
         callback_id: int,
         timeout: int | None,
         capability_name: str = "",
-    ) -> tuple[str, object, str]:
+    ) -> tuple[str, object, str, dict[str, str]]:
         """Issue one real callback task and report its presentation lifecycle without owning policy."""
+        authorization_outcome = self._evaluation_authorize_callback_mutation(
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+        )
+        if authorization_outcome.enabled and not authorization_outcome.allowed:
+            raise evaluation_authorization_runtime.EvaluationAuthorizationTerminal(authorization_outcome)
+        authorization = dict(authorization_outcome.authorization)
         trace_id = self._next_capability_command_trace_id()
         await self._notify_capability_command_observer(
             trace_id=trace_id,
@@ -8429,6 +8743,7 @@ class MythicTools:
                 "purpose": command_obj.get("purpose"),
                 "policy_decision": dict(command_context.get("policy_decision") or {}),
                 "transaction_id": self._capability_text(command_context.get("transaction_id")),
+                "authorization": authorization,
             })
             try:
                 output = await self.issue_task_and_waitfor_task_output(
@@ -8451,7 +8766,7 @@ class MythicTools:
                 result_preview=self._capability_executor_output_preview(str(exc)),
             )
             raise
-        return output, getattr(self, "_last_issued_task_display_id", None), trace_id
+        return output, getattr(self, "_last_issued_task_display_id", None), trace_id, authorization
 
     async def _complete_capability_command_trace(
         self,
@@ -8510,7 +8825,13 @@ class MythicTools:
 
         command_name = self._capability_text(binding.get("command") or original_command)
         parameters = binding.get("parameters", original_parameters)
+        original_context = self._deterministic_capability_command_context(original_command, original_parameters)
+        if original_context and not self._deterministic_capability_command_context(command_name, parameters):
+            self._deterministic_capability_command_contexts[
+                _capability_command_key(command_name, parameters)
+            ] = dict(original_context)
         if command_name == "wait_for_seconds":
+            authorization = {}
             seconds = 0
             reason = ""
             if isinstance(parameters, dict):
@@ -8563,7 +8884,7 @@ class MythicTools:
                     )
                 except Exception:
                     pass
-            output, task_id, trace_id = await self._issue_capability_callback_command(
+            output, task_id, trace_id, authorization = await self._issue_capability_callback_command(
                 command_obj,
                 command_name,
                 parameters,
@@ -8579,6 +8900,8 @@ class MythicTools:
             task_id,
             output,
         )
+        if authorization:
+            item["_authorization"] = authorization
         if binding.get("provider_resolved"):
             item["operation_provider"] = self._capability_executor_public_operation_provider(binding)
             item["repair_attempt"] = 1
@@ -8611,7 +8934,7 @@ class MythicTools:
         if repair is None:
             return item
         repaired_parameters, repair_kind = repair
-        retry_output, retry_task_id, retry_trace_id = await self._issue_capability_callback_command(
+        retry_output, retry_task_id, retry_trace_id, retry_authorization = await self._issue_capability_callback_command(
             command_obj,
             command_name,
             repaired_parameters,
@@ -8627,6 +8950,8 @@ class MythicTools:
             retry_task_id,
             retry_output,
         )
+        if retry_authorization:
+            retry_item["_authorization"] = retry_authorization
         retry_item["repair_attempt"] = 1
         retry_item["repair_kind"] = repair_kind
         retry_item["repair_reason"] = "construction failure repaired from live payload schema"
@@ -9397,7 +9722,6 @@ class MythicTools:
     def _capability_transaction_start(self, action, build_payload: dict) -> dict:
         commands = list(build_payload.get("commands") or []) if isinstance(build_payload, dict) else []
         intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-        authorization = intent.get("authorization") if isinstance(intent.get("authorization"), dict) else {}
         artifact_obligations = sorted({
             self._capability_text(item)
             for command_obj in commands
@@ -9425,33 +9749,6 @@ class MythicTools:
             "delayed_effect_obligations": delayed_effect_obligations,
             "proof_obligations": proof_obligations,
             "validated_artifacts": [],
-            "authorization_manifest_id": self._capability_text(
-                authorization.get("authorization_manifest_id") or authorization.get("manifest_id")
-            ),
-            "authorization_manifest_version": self._capability_text(
-                authorization.get("authorization_manifest_version") or authorization.get("manifest_version")
-            ),
-            "authorization_manifest_sha256": self._capability_text(
-                authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256")
-            ),
-            "authorization_decision_id": self._capability_text(
-                authorization.get("authorization_decision_id") or authorization.get("decision_id")
-            ),
-            "authorization_decision": self._capability_text(
-                authorization.get("authorization_decision") or authorization.get("decision")
-            ),
-            "authorization_reason_code": self._capability_text(
-                authorization.get("authorization_reason_code") or authorization.get("reason_code")
-            ),
-            "action_envelope_sha256": self._capability_text(authorization.get("action_envelope_sha256")),
-            "enforcement_projection_sha256": self._capability_text(authorization.get("enforcement_projection_sha256")),
-            "authorization_gate_version": self._capability_text(
-                authorization.get("authorization_gate_version") or authorization.get("gate_version")
-            ),
-            "decision_origin": self._capability_text(authorization.get("decision_origin")),
-            "policy_decision_id": self._capability_text(authorization.get("policy_decision_id")),
-            "operator_authorization_id": self._capability_text(authorization.get("operator_authorization_id")),
-            "cell_authorization_id": self._capability_text(authorization.get("cell_authorization_id")),
             "status": "open",
             "pin_planner": True,
             "events": [],
@@ -13995,8 +14292,25 @@ class MythicTools:
         # and verified this engagement, do NOT re-upload/re-ingest — short-circuit with the prior job. Prevents
         # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
         content_hash, prior_job = self._collection_already_ingested(file_content)
+        collection_transaction_id = self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{content_hash}"
+        authorization_outcome = self._evaluation_authorize_bloodhound_ingest(
+            callback_id=callback_display_id,
+            file_uuid=file_uuid,
+            safe_name=safe_name,
+            content_hash=content_hash,
+            collection_scope_domain=collection_scope_domain,
+            transaction_id=collection_transaction_id,
+        )
+        if authorization_outcome.enabled and not authorization_outcome.allowed:
+            return json.dumps(
+                self._evaluation_authorization_terminal_payload(
+                    authorization_outcome,
+                    capability="collect-graph",
+                ),
+                sort_keys=True,
+            )
+        collection_authorization = dict(authorization_outcome.authorization)
         if prior_job is not None:
-            collection_transaction_id = self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{prior_job}"
             collection_proof = self._runtime_bloodhound_proof_envelope(
                 "bloodhound_ingest:idempotent",
                 datetime.now(timezone.utc).isoformat(),
@@ -14016,6 +14330,7 @@ class MythicTools:
                     "ingest_job_id": prior_job,
                 },
                 verifier_result={"ingest_status": "complete", "idempotent_skip": True},
+                authorization=collection_authorization,
                 metadata={"idempotent_skip": True},
             )
             if collection_proof:
@@ -14117,7 +14432,7 @@ class MythicTools:
                 task_id=source_task_id,
                 terminal_status="completed",
                 command=source_command,
-                transaction_id=self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{job_id_bh}",
+                transaction_id=collection_transaction_id,
                 verifier_input={
                     "source_task_id": source_task_id,
                     "source_artifact_id": file_uuid,
@@ -14125,6 +14440,7 @@ class MythicTools:
                     "ingest_job_id": job_id_bh,
                 },
                 verifier_result={"ingest_status": status_msg or "", "covered_domains": covered_domains},
+                authorization=collection_authorization,
                 metadata={"filename": safe_name},
             )
             if verified
