@@ -34,7 +34,6 @@ def test_phase17_report_names_the_real_remaining_blockers_instead_of_overclaimin
     blockers = set(report["countability_attestation"]["blockers"])
 
     assert {
-        "sealed_family_physical_realization_proves_frozen_vm_budget_feasible",
         "sealed_family_source_patterns_exist",
         "sealed_family_ranges_deployment_ready",
         "forced_branch_mechanics_live_evidence_present",
@@ -46,16 +45,18 @@ def test_phase17_report_names_the_real_remaining_blockers_instead_of_overclaimin
         "every_frozen_path_exercised_live",
         "zero_mutation_after_deny_unknown_live",
     } <= blockers
+    assert "sealed_family_physical_realization_proves_frozen_vm_budget_feasible" not in blockers
     assert report["range_source_readiness"]["all_source_patterns_exist"] is False
     assert report["range_source_readiness"]["all_ranges_deployment_ready"] is False
-    assert report["topology_resource_feasibility"]["passes"] is False
-    assert report["topology_resource_feasibility"]["repair_requires_new_seal"] is True
+    assert report["topology_resource_feasibility"]["passes"] is True
+    assert report["topology_resource_feasibility"]["repair_requires_new_seal"] is False
     assert report["topology_resource_feasibility"]["hard_logical_topology_impossibility_claimed"] is False
-    assert all(row["physical_realization_contract_present"] is False for row in report["topology_resource_feasibility"]["rows"])
-    assert all(row["physical_realization_covers_logical_nodes"] is False for row in report["topology_resource_feasibility"]["rows"])
+    assert all(row["physical_realization_contract_present"] is True for row in report["topology_resource_feasibility"]["rows"])
+    assert all(row["physical_realization_covers_logical_nodes"] is True for row in report["topology_resource_feasibility"]["rows"])
     assert all(row["convention_based_minimum_powered_vms"] == 5 for row in report["topology_resource_feasibility"]["rows"])
-    assert all(row["max_powered_vms_per_active_range"] == 4 for row in report["topology_resource_feasibility"]["rows"])
-    assert all(row["physical_realization_proves_budget_feasible"] is False for row in report["topology_resource_feasibility"]["rows"])
+    assert all(row["mapped_powered_vm_count"] == 7 for row in report["topology_resource_feasibility"]["rows"])
+    assert all(row["max_powered_vms_per_active_range"] == 7 for row in report["topology_resource_feasibility"]["rows"])
+    assert all(row["physical_realization_proves_budget_feasible"] is True for row in report["topology_resource_feasibility"]["rows"])
     assert report["isc_status"]["R-ISC-54"] is True
     assert report["isc_status"]["R-ISC-72"] is True
     assert report["isc_status"]["R-ISC-31"] is False

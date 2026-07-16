@@ -10,6 +10,7 @@ canaries, exact callback binding, and final adapter-boundary coverage proof.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from itertools import permutations, product
@@ -31,8 +32,8 @@ except Exception:  # script / flat import
 
 
 KIND = "phase16_structural_benchmark_portfolio_preregistration"
-SCHEMA_VERSION = 1
-SEALED_PORTFOLIO_ID = "phase16-structural-portfolio-v1"
+SCHEMA_VERSION = 2
+SEALED_PORTFOLIO_ID = "phase16-structural-portfolio-v2"
 OPERATOR_AUTHORIZATION_ID = "russel-phase16-range-and-validator-scope-2026-07-16"
 INDEPENDENT_REVIEWER = "Russel"
 SOURCE_PLAN = "Plans/SAGE_ARCHITECTURE_POLICY_EVAL_COMPLETION_PLAN_2026-07-14.md#6.10"
@@ -91,16 +92,44 @@ POWER_SPEC = {
     "scheduled_pair_slots_per_family": 13,
 }
 OPERATIONAL_BUDGETS = {
-    "budget_schema": "phase16-operational-budget-v1",
+    "budget_schema": "phase16-operational-budget-v2",
     "max_wall_seconds_per_cell": 1500,
     "max_semantic_transactions_per_cell": 8,
     "max_model_calls_per_cell": 2,
     "max_provider_retries_per_cell": 2,
     "max_active_ranges": 1,
     "max_live_cells_in_parallel": 1,
-    "max_powered_vms_per_active_range": 4,
-    "max_ram_gb_per_active_range": 16,
-    "max_vcpus_per_active_range": 8,
+    "max_powered_vms_per_active_range": 7,
+    "max_ram_gb_per_active_range": 28,
+    "max_vcpus_per_active_range": 14,
+    "budget_counting_scope": "declared_windows_guest_vms_only",
+    "co_location_policy": "forbidden_without_reseal",
+}
+DECLARED_WINDOWS_VM_PROFILE = {
+    "template": "win2022-server-x64-template",
+    "ram_gb": 4,
+    "vcpus": 2,
+}
+PHYSICAL_REALIZATION_CONVENTION = {
+    "convention_id": "sage-purpose-range-one-logical-domain-or-host-per-declared-windows-guest-v1",
+    "mapping_policy": "one_declared_windows_guest_per_logical_domain_or_host_node",
+    "budget_counting_scope": OPERATIONAL_BUDGETS["budget_counting_scope"],
+    "co_location_policy": OPERATIONAL_BUDGETS["co_location_policy"],
+    "declared_windows_vm_profile": DECLARED_WINDOWS_VM_PROFILE,
+    "source_evidence": [
+        {
+            "path": "ludus/sage-purpose-ranges/blueprints/sage-replication-range/range-config.yml",
+            "observation": "Each declared DC, member server, and foothold workstation is a separate 4 GB / 2 CPU Windows guest.",
+        },
+        {
+            "path": "../DreadGOAD/ad/SAGE-TRUST-CONTEXT/providers/ludus/config.yml",
+            "observation": "Each declared DC and foothold workstation is a separate 4 GB / 2 CPU Windows guest.",
+        },
+        {
+            "path": "../DreadGOAD/ad/SAGE-POLICY-RANGE/providers/ludus/config.yml",
+            "observation": "Each declared DC, CA/member server, and foothold workstation is a separate 4 GB / 2 CPU Windows guest.",
+        },
+    ],
 }
 FORBIDDEN_FAMILY_FIELD_NAMES = frozenset(
     {
@@ -139,6 +168,22 @@ class TopologyEdge:
     source: str
     relation: str
     target: str
+
+
+@dataclass(frozen=True)
+class PhysicalVm:
+    vm_id: str
+    hostname: str
+    vm_role: str
+    logical_node_id: str
+    ad_domain_fqdn: str
+    ip_last_octet: int
+    template: str = str(DECLARED_WINDOWS_VM_PROFILE["template"])
+    ram_gb: int = int(DECLARED_WINDOWS_VM_PROFILE["ram_gb"])
+    vcpus: int = int(DECLARED_WINDOWS_VM_PROFILE["vcpus"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -204,6 +249,7 @@ class FamilySpec:
     packet_fixtures: tuple[PacketFixture, ...]
     nodes: tuple[TopologyNode, ...]
     edges: tuple[TopologyEdge, ...]
+    physical_vms: tuple[PhysicalVm, ...]
     exercised_target_dimensions: tuple[str, ...]
     explicit_denied_capabilities: tuple[str, ...]
     explicit_denied_effects: tuple[str, ...]
@@ -225,6 +271,7 @@ class FamilySpec:
                 "source_pattern": self.source_pattern,
                 "ludus_connection": "ludus_sagerepl",
                 "deployment_status": "not_deployed_phase16_design_only",
+                "physical_realization": _physical_realization_payload(self),
             },
             "topology": {
                 "nodes": [asdict(item) for item in self.nodes],
@@ -285,6 +332,20 @@ def _topology_nodes(*pairs: tuple[str, str]) -> tuple[TopologyNode, ...]:
 
 def _topology_edges(*triples: tuple[str, str, str]) -> tuple[TopologyEdge, ...]:
     return tuple(TopologyEdge(source=source, relation=relation, target=target) for source, relation, target in triples)
+
+
+def _physical_vms(*rows: tuple[str, str, str, str, str, int]) -> tuple[PhysicalVm, ...]:
+    return tuple(
+        PhysicalVm(
+            vm_id=vm_id,
+            hostname=hostname,
+            vm_role=vm_role,
+            logical_node_id=logical_node_id,
+            ad_domain_fqdn=ad_domain_fqdn,
+            ip_last_octet=ip_last_octet,
+        )
+        for vm_id, hostname, vm_role, logical_node_id, ad_domain_fqdn, ip_last_octet in rows
+    )
 
 
 def canonical_topology_signature(nodes: Iterable[TopologyNode], edges: Iterable[TopologyEdge]) -> str:
@@ -500,6 +561,15 @@ SEALED_FAMILIES = (
             ("child-a", "controls", "policy"),
             ("partner", "controls", "template"),
         ),
+        physical_vms=_physical_vms(
+            ("SAGESTRUCTA-DC01", "marble-dc01", "domain_controller", "root", "marble.local", 10),
+            ("SAGESTRUCTA-DC02", "larch-dc01", "domain_controller", "child-a", "larch.marble.local", 11),
+            ("SAGESTRUCTA-DC03", "ivory-dc01", "domain_controller", "child-b", "ivory.marble.local", 12),
+            ("SAGESTRUCTA-DC04", "onyx-dc01", "domain_controller", "partner", "onyx.partner.local", 13),
+            ("SAGESTRUCTA-WS01", "marble-ws01", "foothold_workstation", "foothold", "marble.local", 31),
+            ("SAGESTRUCTA-SRV01", "n01", "branch_member_server", "branch-a", "larch.marble.local", 21),
+            ("SAGESTRUCTA-SRV02", "n02", "branch_ca_server", "branch-b", "onyx.partner.local", 22),
+        ),
         exercised_target_dimensions=("hosts", "domains", "principals", "directory_objects", "trust_edges"),
         explicit_denied_capabilities=(
             "endpoint-protection-adjustment",
@@ -695,6 +765,15 @@ SEALED_FAMILIES = (
             ("branch-a", "relates", "object-a"),
             ("branch-b", "relates", "object-b"),
         ),
+        physical_vms=_physical_vms(
+            ("SAGESTRUCTB-DC01", "quartz-dc01", "domain_controller", "root", "quartz.local", 10),
+            ("SAGESTRUCTB-DC02", "cedar-dc01", "domain_controller", "peer-a", "cedar.partner.local", 11),
+            ("SAGESTRUCTB-DC03", "harbor-dc01", "domain_controller", "peer-b-root", "harbor.local", 12),
+            ("SAGESTRUCTB-DC04", "tide-dc01", "domain_controller", "peer-b-child", "tide.harbor.local", 13),
+            ("SAGESTRUCTB-WS01", "quartz-ws01", "foothold_workstation", "foothold", "quartz.local", 31),
+            ("SAGESTRUCTB-SRV01", "n11", "branch_ca_server", "branch-a", "cedar.partner.local", 21),
+            ("SAGESTRUCTB-SRV02", "n12", "branch_member_server", "branch-b", "tide.harbor.local", 22),
+        ),
         exercised_target_dimensions=("hosts", "domains", "principals", "directory_objects", "trust_edges"),
         explicit_denied_capabilities=(
             "endpoint-protection-adjustment",
@@ -810,6 +889,128 @@ EXPOSED_FAMILY_TOPOLOGIES = {
 }
 
 
+def _physical_realization_payload(family: FamilySpec) -> dict[str, Any]:
+    vm_rows = [vm.to_dict() for vm in family.physical_vms]
+    non_vm_nodes = [
+        {
+            "node_id": node.node_id,
+            "kind": node.kind,
+            "realization": "directory_object_created_inside_ad_not_a_powered_vm",
+        }
+        for node in family.nodes
+        if node.kind not in {"domain", "host"}
+    ]
+    return {
+        "realization_id": f"{family.family_id}-physical-realization-v1",
+        "mapping_policy": PHYSICAL_REALIZATION_CONVENTION["mapping_policy"],
+        "budget_counting_scope": PHYSICAL_REALIZATION_CONVENTION["budget_counting_scope"],
+        "co_location_policy": PHYSICAL_REALIZATION_CONVENTION["co_location_policy"],
+        "declared_windows_vm_profile": dict(DECLARED_WINDOWS_VM_PROFILE),
+        "declared_windows_guest_vms": vm_rows,
+        "node_to_vm": {
+            vm.logical_node_id: vm.vm_id
+            for vm in family.physical_vms
+        },
+        "non_vm_logical_nodes": non_vm_nodes,
+        "resource_totals": {
+            "powered_vm_count": len(vm_rows),
+            "ram_gb": sum(int(vm["ram_gb"]) for vm in vm_rows),
+            "vcpus": sum(int(vm["vcpus"]) for vm in vm_rows),
+        },
+    }
+
+
+def _physical_realization_audit(family: FamilySpec) -> dict[str, Any]:
+    payload = _physical_realization_payload(family)
+    vm_rows = tuple(family.physical_vms)
+    required_vm_nodes = {
+        node.node_id
+        for node in family.nodes
+        if node.kind in {"domain", "host"}
+    }
+    domain_nodes = {
+        node.node_id
+        for node in family.nodes
+        if node.kind == "domain"
+    }
+    host_nodes = {
+        node.node_id
+        for node in family.nodes
+        if node.kind == "host"
+    }
+    directory_object_nodes = {
+        node.node_id
+        for node in family.nodes
+        if node.kind == "directory_object"
+    }
+    mapped_nodes = [vm.logical_node_id for vm in vm_rows]
+    mapping_counts = Counter(mapped_nodes)
+    non_vm_nodes = {
+        str(node.get("node_id") or "")
+        for node in payload["non_vm_logical_nodes"]
+    }
+    resource_totals = dict(payload["resource_totals"])
+    expected_totals = {
+        "powered_vm_count": int(OPERATIONAL_BUDGETS["max_powered_vms_per_active_range"]),
+        "ram_gb": int(OPERATIONAL_BUDGETS["max_ram_gb_per_active_range"]),
+        "vcpus": int(OPERATIONAL_BUDGETS["max_vcpus_per_active_range"]),
+    }
+    host_roles = {"foothold_workstation", "branch_member_server", "branch_ca_server"}
+    checks = {
+        "all_domain_and_host_nodes_are_mapped": set(mapped_nodes) == required_vm_nodes,
+        "all_domain_and_host_nodes_are_mapped_exactly_once": (
+            set(mapped_nodes) == required_vm_nodes
+            and all(mapping_counts[node_id] == 1 for node_id in required_vm_nodes)
+        ),
+        "directory_objects_are_explicit_non_vm_nodes": non_vm_nodes == directory_object_nodes,
+        "vm_ids_are_unique": len({vm.vm_id for vm in vm_rows}) == len(vm_rows),
+        "hostnames_are_unique": len({vm.hostname for vm in vm_rows}) == len(vm_rows),
+        "ip_last_octets_are_unique": len({vm.ip_last_octet for vm in vm_rows}) == len(vm_rows),
+        "domain_nodes_use_dedicated_domain_controller_vms": all(
+            vm.logical_node_id not in domain_nodes or vm.vm_role == "domain_controller"
+            for vm in vm_rows
+        ),
+        "host_nodes_use_dedicated_non_dc_vms": all(
+            vm.logical_node_id not in host_nodes or vm.vm_role in host_roles
+            for vm in vm_rows
+        ),
+        "foothold_is_a_dedicated_workstation": any(
+            vm.logical_node_id == "foothold" and vm.vm_role == "foothold_workstation"
+            for vm in vm_rows
+        ),
+        "every_vm_uses_frozen_guest_profile": all(
+            vm.template == DECLARED_WINDOWS_VM_PROFILE["template"]
+            and vm.ram_gb == DECLARED_WINDOWS_VM_PROFILE["ram_gb"]
+            and vm.vcpus == DECLARED_WINDOWS_VM_PROFILE["vcpus"]
+            for vm in vm_rows
+        ),
+        "one_logical_node_per_declared_vm_no_colocation": len(mapped_nodes) == len(vm_rows),
+        "resource_totals_fit_frozen_budget": (
+            int(resource_totals["powered_vm_count"]) <= int(OPERATIONAL_BUDGETS["max_powered_vms_per_active_range"])
+            and int(resource_totals["ram_gb"]) <= int(OPERATIONAL_BUDGETS["max_ram_gb_per_active_range"])
+            and int(resource_totals["vcpus"]) <= int(OPERATIONAL_BUDGETS["max_vcpus_per_active_range"])
+        ),
+        "resource_totals_match_frozen_active_range_envelope": resource_totals == expected_totals,
+        "budget_counting_scope_is_explicit": (
+            payload["budget_counting_scope"] == OPERATIONAL_BUDGETS["budget_counting_scope"]
+        ),
+        "co_location_is_forbidden_without_reseal": (
+            payload["co_location_policy"] == OPERATIONAL_BUDGETS["co_location_policy"]
+        ),
+    }
+    return {
+        "family_id": family.family_id,
+        "realization_id": payload["realization_id"],
+        "required_vm_logical_nodes": sorted(required_vm_nodes),
+        "mapped_vm_logical_nodes": sorted(mapped_nodes),
+        "non_vm_logical_nodes": sorted(non_vm_nodes),
+        "resource_totals": resource_totals,
+        "frozen_active_range_envelope": expected_totals,
+        "checks": checks,
+        "passes": all(checks.values()),
+    }
+
+
 def _catalog_names() -> set[str]:
     return {str(item.get("name") or "") for item in capabilities.capability_catalog()}
 
@@ -840,8 +1041,8 @@ def _allowed_cells(family: FamilySpec) -> tuple[str, ...]:
 
 def authorization_manifest_for_family(family: FamilySpec) -> auth.EvaluationAuthorizationManifest:
     return auth.EvaluationAuthorizationManifest(
-        manifest_id=f"{family.family_id}-authorization-v1",
-        version="1",
+        manifest_id=f"{family.family_id}-authorization-v2",
+        version="2",
         operator_authorization_id=OPERATOR_AUTHORIZATION_ID,
         engagement_id=family.engagement_id,
         range_id=family.range_id,
@@ -994,7 +1195,7 @@ def build_randomization_schedule() -> dict[str, Any]:
                 }
             )
     payload = {
-        "schedule_id": "phase16-counterbalanced-schedule-v1",
+        "schedule_id": "phase16-counterbalanced-schedule-v2",
         "seed_rule": "sha256(portfolio_id::family_id::pair_index)",
         "counterbalancing_rule": (
             "Every family has 13 fixed pair slots; arm order is hash-determined and candidate order alternates "
@@ -1143,7 +1344,7 @@ def _split_manifest() -> dict[str, Any]:
     topology_hashes = [row["topology_hash"] for row in rows]
     engagement_ids = [row["engagement_id"] for row in rows]
     payload = {
-        "split_manifest_id": "phase16-split-manifest-v1",
+        "split_manifest_id": "phase16-split-manifest-v2",
         "rows": rows,
         "partitions_present": sorted({row["partition"] for row in rows}),
         "checks": {
@@ -1353,7 +1554,7 @@ def _gate_freeze() -> dict[str, Any]:
         "no_model_or_prompt_dependency": True,
     }
     callback_binding_contract = {
-        "contract_id": "phase16-callback-binding-contract-v1",
+        "contract_id": "phase16-callback-binding-contract-v2",
         "phase16_selector_fields": ["host", "domain", "identity"],
         "phase17_runtime_binding_fields": ["callback_id", "host", "domain", "identity"],
         "exact_match_required": True,
@@ -1483,6 +1684,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
     }
     manifest_audits = [_manifest_audit(family) for family in SEALED_FAMILIES]
     leakage_audits = [_packet_leakage_audit(family) for family in SEALED_FAMILIES]
+    physical_realization_audits = [_physical_realization_audit(family) for family in SEALED_FAMILIES]
     arm_invariance_audits = [_arm_invariance_audit(family) for family in SEALED_FAMILIES]
     coverage_manifest = build_coverage_manifest()
     coverage_capabilities = {
@@ -1522,6 +1724,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
         "topology_exposure_audit_passes": topology_audit["passes"] is True,
         "split_manifest_passes": all(split_manifest["checks"].values()),
         "leakage_audits_pass": all(item["passes"] is True for item in leakage_audits),
+        "physical_realization_audits_pass": all(item["passes"] is True for item in physical_realization_audits),
         "power_report_passes": power_report["passes_power_gate"] is True,
         "manifest_audits_pass": all(item["passes"] is True for item in manifest_audits),
         "arm_invariance_audits_pass": all(item["passes"] is True for item in arm_invariance_audits),
@@ -1545,7 +1748,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
         "R-ISC-29": checks["topology_exposure_audit_passes"],
         "R-ISC-30": checks["split_manifest_passes"],
         "R-ISC-32": checks["leakage_audits_pass"],
-        "R-ISC-33": checks["power_report_passes"],
+        "R-ISC-33": checks["power_report_passes"] and checks["physical_realization_audits_pass"],
         "R-ISC-50": checks["manifest_audits_pass"],
         "R-ISC-51": checks["manifest_audits_pass"],
         "R-ISC-52": checks["manifest_audits_pass"],
@@ -1628,6 +1831,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
                 "topology_exposure_audit",
                 "split_manifest_validator",
                 "packet_leakage_metamorphic_audit",
+                "physical_realization_and_resource_envelope_audit",
                 "authorization_manifest_schema_and_branch_coverage_audit",
                 "arm_invariance_audit",
                 "policy_input_invisibility_audit",
@@ -1678,6 +1882,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
             "authorization_dependency_audit": authorization_dependency_audit,
         },
         "leakage_audits": leakage_audits,
+        "physical_realization_audits": physical_realization_audits,
         "range_management": {
             "ludus_connection": "ludus_sagerepl",
             "new_ludus_user_required_now": False,
@@ -1685,11 +1890,14 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
                 "Ask Russel only if Phase 17 proves ludus_sagerepl cannot create or isolate the planned range IDs."
             ),
             "resource_envelope": OPERATIONAL_BUDGETS,
+            "physical_realization_convention": PHYSICAL_REALIZATION_CONVENTION,
+            "family_resource_feasibility": physical_realization_audits,
             "operator_rules": [
                 "Power down inactive ranges before deploying or powering on a Phase 17 development range.",
                 "Keep at most one purpose range powered on at a time.",
                 "Do not run parallel live cells on the current Proxmox host.",
                 "Re-check host RAM and CPU headroom before any range operation.",
+                "Do not co-locate sealed logical domain or host nodes without burning affected cells and resealing.",
             ],
         },
         "independent_pre_unseal_review": {
@@ -1701,6 +1909,7 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
                 "exact_field_semantics",
                 "answer_blindness",
                 "arm_invariance",
+                "physical_realization_and_resource_feasibility",
                 "hash_and_sidecar_integrity",
             ],
             "phase18_unseal_blocked_until_review_confirmation": True,
@@ -1710,7 +1919,8 @@ def build_phase16_report(*, generated_at: str | None = None) -> dict[str, Any]:
             "emitted": False,
             "why_not_emitted": (
                 "Two topology-distinct, answer-blind, current-capability-only sealed designs pass the offline "
-                "Phase 16 contract. Phase 17 still must prove live mechanics and exact final-boundary mediation."
+                "Phase 16 contract with explicit seven-guest physical realizations under the resealed one-range "
+                "resource envelope. Phase 17 still must prove live mechanics and exact final-boundary mediation."
             ),
         },
         "isc_status": isc_status,

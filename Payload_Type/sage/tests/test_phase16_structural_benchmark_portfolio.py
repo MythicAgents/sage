@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -93,6 +94,7 @@ def test_phase16_power_and_resource_envelope_are_frozen_and_feasible():
     power = report["preregistration"]["power_report"]
     budgets = report["preregistration"]["operational_budgets"]
     range_management = report["range_management"]
+    physical_audits = report["physical_realization_audits"]
 
     assert power["required_informative_pairs_per_family"] == 13
     assert power["critical_wins_for_rejection"] == 10
@@ -100,8 +102,64 @@ def test_phase16_power_and_resource_envelope_are_frozen_and_feasible():
     assert power["max_primary_schedule_wall_hours_at_cell_ceiling"] <= 60.0
     assert budgets["max_active_ranges"] == 1
     assert budgets["max_live_cells_in_parallel"] == 1
+    assert budgets["max_powered_vms_per_active_range"] == 7
+    assert budgets["max_ram_gb_per_active_range"] == 28
+    assert budgets["max_vcpus_per_active_range"] == 14
+    assert budgets["budget_counting_scope"] == "declared_windows_guest_vms_only"
+    assert budgets["co_location_policy"] == "forbidden_without_reseal"
     assert range_management["ludus_connection"] == "ludus_sagerepl"
     assert range_management["new_ludus_user_required_now"] is False
+    assert all(item["passes"] is True for item in physical_audits)
+    assert all(
+        item["resource_totals"] == {
+            "powered_vm_count": 7,
+            "ram_gb": 28,
+            "vcpus": 14,
+        }
+        for item in physical_audits
+    )
+
+
+def test_phase16_physical_realizations_map_every_domain_and_host_without_colocation():
+    report = phase16.build_phase16_report(generated_at=GENERATED_AT)
+
+    for family_id, manifest in report["sealed_family_manifests"].items():
+        realization = manifest["range_plan"]["physical_realization"]
+        rows = realization["declared_windows_guest_vms"]
+        node_to_vm = realization["node_to_vm"]
+
+        assert family_id in {"sealed-family-s1", "sealed-family-s2"}
+        assert len(rows) == 7
+        assert len(node_to_vm) == 7
+        assert len({row["logical_node_id"] for row in rows}) == 7
+        assert len({row["vm_id"] for row in rows}) == 7
+        assert {row["logical_node_id"] for row in rows} == {
+            "root",
+            "foothold",
+            "branch-a",
+            "branch-b",
+            *({"child-a", "child-b", "partner"} if family_id == "sealed-family-s1" else {"peer-a", "peer-b-root", "peer-b-child"}),
+        }
+        assert realization["co_location_policy"] == "forbidden_without_reseal"
+        assert realization["budget_counting_scope"] == "declared_windows_guest_vms_only"
+        assert realization["resource_totals"] == {
+            "powered_vm_count": 7,
+            "ram_gb": 28,
+            "vcpus": 14,
+        }
+        assert {item["node_id"] for item in realization["non_vm_logical_nodes"]} == (
+            {"policy", "template"} if family_id == "sealed-family-s1" else {"object-a", "object-b"}
+        )
+
+
+def test_phase16_physical_realization_audit_fails_if_a_required_vm_mapping_is_removed():
+    family = phase16.SEALED_FAMILIES[0]
+    broken_family = replace(family, physical_vms=family.physical_vms[:-1])
+    audit = phase16._physical_realization_audit(broken_family)
+
+    assert audit["passes"] is False
+    assert audit["checks"]["all_domain_and_host_nodes_are_mapped"] is False
+    assert audit["checks"]["resource_totals_match_frozen_active_range_envelope"] is False
 
 
 def test_phase16_authorization_manifests_are_exact_arm_blind_and_prebind_safe():
