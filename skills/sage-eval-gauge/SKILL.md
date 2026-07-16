@@ -115,9 +115,11 @@ duplicate callback, clock skew, backend mismatch, setup contamination, or measur
 preserve the artifacts, fix the gate, and replace it with a fresh attempt. Do not retroactively convert a burned row
 into evidence.
 
-For repeated matrices or repetitions, run the row-level validator immediately after the first accepted row before
-launching the remaining rows. If that first accepted row exposes a measurement defect, burn the row or seal as
-required, fix the validator/gate, reseal when the contract requires it, and only then spend more live-run budget.
+For repeated matrices or repetitions, run the row-level validator immediately after the first accepted row for each
+materially distinct policy arm or attribution mode before bulk-filling the remaining rows. If the sealed contract
+requires block ordering, cover other permitted telemetry shapes with offline fixtures or a non-countable canary
+before spending the full arm budget. If a representative row exposes a measurement defect, mark it burned, fix the
+validator/gate, reseal when the contract requires it, and only then spend more live-run budget.
 
 For repeated matrices, status updates should report `row X/Y`, policy arm/seed, last accepted row, current
 operation, retry count, current blocker if any, and separate engineering/debug ETA from remaining live-lab ETA.

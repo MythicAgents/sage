@@ -158,6 +158,10 @@ Do not store lab passwords in skills or copied helper scripts. Prefer session en
 - For sealed evaluators and live-row validators, do not use substring membership for structured capability targets,
   domains, or callback-scoped effect keys. Parse exact fields and keep a regression for suffix-collision cases such
   as `zeta.branch.local` versus `branch.local`.
+- Before any countable live spend, sealed evaluators and live-row validators must have fixture coverage for every
+  plan-permitted evidence mode and terminal interpretation, including valid no-branch/kernel-only evidence and
+  fail-closed negative cases when the plan allows them. Do not derive the validator contract from only the typical
+  success row.
 - Power down ranges that are not needed for the next active operation after a stop-loss, burned attempt, or completed
   tranche. The Ludus host is resource constrained; leaving old purpose ranges running is not a neutral default.
 - For each live eval row, record the effective model provider/route, Sage startup env overrides that change behavior,
