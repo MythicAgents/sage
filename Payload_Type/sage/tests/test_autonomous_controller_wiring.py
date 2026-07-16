@@ -97,6 +97,29 @@ def test_observe_none_halts_cleanly_without_crash():
     assert calls == []  # never executed anything without a state
 
 
+def test_controller_missing_policy_mode_uses_hybrid_product_default_without_model_call():
+    calls = []
+    m = _bare_model(
+        json.dumps({
+            "ok": False,
+            "verdict": "blocked",
+            "capability": "adcs-ca-private-key-export",
+            "reason": "stop after default-policy probe",
+        }),
+        _state_with_remote_exec(),
+        calls,
+    )
+
+    asyncio.run(m._run_autonomous_controller("obtain administrative control of essos.local"))
+
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["configured_policy_mode"] == "hybrid"
+    assert telemetry["policy_mode"] == "hybrid"
+    assert telemetry["policy_mode_resolution"] == "default_missing"
+    assert telemetry["kernel_singleton_count"] >= 1
+    assert telemetry["model_calls"] == 0
+
+
 def test_llm_policy_decision_is_attached_to_capability_inputs():
     calls = []
     blocked_string = json.dumps({

@@ -26,6 +26,7 @@
   python -m ai.hillclimb trust-context-corroboration-validate # no lab or model calls
   python -m ai.hillclimb trust-context-corroboration-control-validate --evidence <json> # no model calls
   python -m ai.hillclimb trust-context-corroboration-live-validate --results <jsonl> --control-report <json> # no model calls
+  python -m ai.hillclimb phase8-goad-regression-validate --results <jsonl> # no lab or model calls
   python ai/hillclimb/__main__.py gate-experiment --dry-run
 
 A LIVE gate-experiment needs the GOAD lab (each config run through evals/harness.py, scored by
@@ -70,6 +71,7 @@ try:  # package import
     from . import laps_family_transfer_canary
     from . import laps_family_transfer_matrix
     from . import trust_context_corroboration
+    from . import phase8_goad_regression
     from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
@@ -106,6 +108,7 @@ except Exception:  # script / sys.path import
     import laps_family_transfer_canary  # type: ignore
     import laps_family_transfer_matrix  # type: ignore
     import trust_context_corroboration  # type: ignore
+    import phase8_goad_regression  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
@@ -423,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     laps_family_transfer_canary.add_cli(sub)
     laps_family_transfer_matrix.add_cli(sub)
     trust_context_corroboration.add_cli(sub)
+    phase8_goad_regression.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

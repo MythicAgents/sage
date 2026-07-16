@@ -96,11 +96,12 @@ _CONFIG_OPTIONS = [
         DisplayName="Policy",
         Type=OptType.Choice,
         Description=(
-            "Symbolic is the temporary safe default. Hybrid has the model select from the complete deterministic "
-            "admissible frontier only at real branches. LLM calls the model on every nonempty frontier."
+            "Hybrid is the default and has the model select from the complete deterministic admissible frontier "
+            "only at real branches. Symbolic keeps deterministic first-admissible selection. LLM calls the model "
+            "on every nonempty frontier."
         ),
         Required=False,
-        DefaultValue="symbolic",
+        DefaultValue="hybrid",
         Choices=[
             ChatModelConfigurationOptionChoice(Label="LLM", Value="llm"),
             ChatModelConfigurationOptionChoice(Label="Hybrid", Value="hybrid"),

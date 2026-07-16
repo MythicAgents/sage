@@ -45,11 +45,14 @@ class State:
         return set(self.effects)
 
 
-def test_missing_and_invalid_policy_mode_resolve_symbolic_and_valid_modes_remain_stable():
-    assert policy.resolve_policy_mode("", default=policy.POLICY_SYMBOLIC) == ("symbolic", "default_missing")
-    assert policy.resolve_policy_mode("automatic", default=policy.POLICY_SYMBOLIC) == ("symbolic", "default_invalid")
-    assert policy.normalize_policy_mode("automatic") == "symbolic"
+def test_missing_and_invalid_policy_mode_resolve_hybrid_and_valid_modes_remain_stable():
+    assert policy.POLICY_DEFAULT == policy.POLICY_HYBRID
+    assert policy.resolve_policy_mode("", default=policy.POLICY_DEFAULT) == ("hybrid", "default_missing")
+    assert policy.resolve_policy_mode("automatic", default=policy.POLICY_DEFAULT) == ("hybrid", "default_invalid")
+    assert policy.normalize_policy_mode("automatic") == "hybrid"
+    assert policy.normalize_policy_mode("symbolic") == "symbolic"
     assert policy.normalize_policy_mode("hybrid") == "hybrid"
+    assert policy.normalize_policy_mode("llm") == "llm"
 
 
 def test_symbolic_policy_preserves_first_admissible_selection():

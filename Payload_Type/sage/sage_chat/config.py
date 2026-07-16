@@ -19,7 +19,7 @@ import os
 from typing import Any
 
 from mythic_container.ChatBase import ChatConfigView, ChatRequest, ChatSecretView
-from ai.langgraph.policy import POLICY_SYMBOLIC, resolve_policy_mode
+from ai.langgraph.policy import POLICY_DEFAULT, resolve_policy_mode
 
 
 def _resolve(
@@ -105,7 +105,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     )
     policy_mode, policy_mode_resolution = resolve_policy_mode(
         policy_mode_requested,
-        default=POLICY_SYMBOLIC,
+        default=POLICY_DEFAULT,
     )
     eval_force_capability_prefix_json = _resolve(
         config,

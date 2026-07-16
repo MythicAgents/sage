@@ -197,6 +197,10 @@ def test_native_harness_threads_eval_force_prefix_into_channel_solver(tmp_path, 
     monkeypatch.setenv("SAGE_EVAL_PHASE6_PLANNED_ROW_ID", "forced-maple-willow-r1")
     monkeypatch.setenv("SAGE_EVAL_PHASE6_ATTEMPT_INDEX", "2")
     monkeypatch.setenv("SAGE_EVAL_PHASE6_MAX_PRE_FRONTIER_DIAGNOSTIC_RETRIES", "1")
+    monkeypatch.setenv("SAGE_EVAL_PHASE8_CONTRACT_HASH", "sha256:phase8-contract")
+    monkeypatch.setenv("SAGE_EVAL_PHASE8_POLICY_ARM", "symbolic")
+    monkeypatch.setenv("SAGE_EVAL_PHASE8_PLANNED_ROW_ID", "phase8-symbolic-seed-1")
+    monkeypatch.setenv("SAGE_EVAL_PHASE8_ATTEMPT_INDEX", "1")
     monkeypatch.delenv("SAGE_EVAL_HEADLESS", raising=False)
     results_path = tmp_path / "native-prefix.jsonl"
     monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(results_path))
@@ -262,6 +266,10 @@ def test_native_harness_threads_eval_force_prefix_into_channel_solver(tmp_path, 
     assert row["phase6_planned_row_id"] == "forced-maple-willow-r1"
     assert row["phase6_attempt_index"] == 2
     assert row["phase6_max_pre_frontier_diagnostic_retries"] == 1
+    assert row["phase8_contract_hash"] == "sha256:phase8-contract"
+    assert row["phase8_policy_arm"] == "symbolic"
+    assert row["phase8_planned_row_id"] == "phase8-symbolic-seed-1"
+    assert row["phase8_attempt_index"] == 1
 
 
 def test_runtime_evidence_fields_persists_branch_and_cycle_provenance():

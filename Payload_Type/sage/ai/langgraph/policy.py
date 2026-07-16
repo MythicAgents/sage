@@ -15,6 +15,7 @@ from uuid import uuid4
 POLICY_LLM = "llm"
 POLICY_SYMBOLIC = "symbolic"
 POLICY_HYBRID = "hybrid"
+POLICY_DEFAULT = POLICY_HYBRID
 POLICY_MODES = frozenset((POLICY_LLM, POLICY_SYMBOLIC, POLICY_HYBRID))
 POLICY_VERSION_LLM = "llm-v1"
 POLICY_VERSION_SYMBOLIC = "symbolic-v1"
@@ -26,11 +27,11 @@ _MAX_OPERATIONAL_WAIT_SECONDS = 600
 _CAPTURE_DECISION_PACKETS_ENV = "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS"
 
 
-def resolve_policy_mode(value: Any, default: str = POLICY_SYMBOLIC) -> tuple[str, str]:
+def resolve_policy_mode(value: Any, default: str = POLICY_DEFAULT) -> tuple[str, str]:
     mode = str(value or "").strip().casefold()
     fallback = str(default or "").strip().casefold()
     if fallback not in POLICY_MODES:
-        fallback = POLICY_SYMBOLIC
+        fallback = POLICY_DEFAULT
     if mode in POLICY_MODES:
         return mode, "explicit_valid"
     if not mode:
@@ -38,7 +39,7 @@ def resolve_policy_mode(value: Any, default: str = POLICY_SYMBOLIC) -> tuple[str
     return fallback, "default_invalid"
 
 
-def normalize_policy_mode(value: Any, default: str = POLICY_SYMBOLIC) -> str:
+def normalize_policy_mode(value: Any, default: str = POLICY_DEFAULT) -> str:
     return resolve_policy_mode(value, default=default)[0]
 
 

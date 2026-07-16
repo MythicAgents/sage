@@ -1179,9 +1179,9 @@ def test_autonomous_solve_toggle_independent_of_mode():
     assert kwargs["mode"] == "supervised" and kwargs["autonomous_solve"] is True
 
 
-def test_policy_mode_defaults_symbolic_and_accepts_hybrid_and_symbolic():
+def test_policy_mode_defaults_hybrid_and_accepts_hybrid_and_symbolic():
     defaults = build_model_kwargs(build_chat_request("hi"))
-    assert defaults["policy_mode"] == "symbolic"
+    assert defaults["policy_mode"] == "hybrid"
     assert defaults["policy_mode_resolution"] == "default_missing"
     kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "hybrid"}))
     assert kwargs["policy_mode"] == "hybrid"
@@ -1190,9 +1190,9 @@ def test_policy_mode_defaults_symbolic_and_accepts_hybrid_and_symbolic():
     assert kwargs["policy_mode"] == "symbolic"
 
 
-def test_invalid_explicit_policy_mode_resolves_symbolic_and_records_resolution():
+def test_invalid_explicit_policy_mode_resolves_hybrid_and_records_resolution():
     kwargs = build_model_kwargs(build_chat_request("hi", config={"policy_mode": "automatic"}))
-    assert kwargs["policy_mode"] == "symbolic"
+    assert kwargs["policy_mode"] == "hybrid"
     assert kwargs["policy_mode_requested"] == "automatic"
     assert kwargs["policy_mode_resolution"] == "default_invalid"
 
@@ -1204,6 +1204,7 @@ def test_policy_configuration_exposes_all_three_policy_backends():
         if item.Name == "policy_mode"
     )
 
+    assert option.DefaultValue == "hybrid"
     assert {choice.Value for choice in option.Choices} == {"llm", "hybrid", "symbolic"}
 
 

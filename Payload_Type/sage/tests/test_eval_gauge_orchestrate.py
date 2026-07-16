@@ -233,6 +233,32 @@ def test_phase7_eval_env_rejects_missing_control():
         )
 
 
+def test_phase8_eval_env_is_frozen_and_matches_configured_policy():
+    env = orchestrate._phase8_goad_regression_eval_env(
+        "cross-forest-objective",
+        policy_mode="hybrid",
+        policy_arm="hybrid",
+        planned_row_id="phase8-hybrid-seed-1",
+        attempt_index=1,
+    )
+
+    assert env["SAGE_EVAL_PHASE8_CONTRACT_HASH"].startswith("sha256:")
+    assert env["SAGE_EVAL_PHASE8_POLICY_ARM"] == "hybrid"
+    assert env["SAGE_EVAL_PHASE8_PLANNED_ROW_ID"] == "phase8-hybrid-seed-1"
+    assert env["SAGE_EVAL_PHASE8_ATTEMPT_INDEX"] == "1"
+
+
+def test_phase8_eval_env_rejects_policy_arm_mismatch():
+    with pytest.raises(SystemExit):
+        orchestrate._phase8_goad_regression_eval_env(
+            "cross-forest-objective",
+            policy_mode="symbolic",
+            policy_arm="hybrid",
+            planned_row_id="phase8-hybrid-seed-1",
+            attempt_index=1,
+        )
+
+
 def test_range_guest_ip_gate_requires_every_reported_vm_on_with_ip():
     assert orchestrate._range_guests_have_ips(
         "  ON  range-router  ip=10.11.10.254  pmx=1\n"

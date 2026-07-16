@@ -58,6 +58,13 @@ def _active_trust_context_contract():
     return trust_contract
 
 
+def _active_phase8_goad_regression_contract():
+    sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import phase8_goad_regression as phase8_contract  # type: ignore
+
+    return phase8_contract
+
+
 def _laps_family_transfer_netbios_map() -> str:
     laps_contract = _active_laps_contract()
     mapping = {laps_contract.ROOT_NETBIOS: laps_contract.ROOT_DOMAIN}
@@ -568,6 +575,50 @@ def _phase7_trust_context_eval_env(
     return env
 
 
+def _phase8_goad_regression_eval_env(
+    scenario: str,
+    *,
+    policy_mode: str,
+    policy_arm: str | None,
+    planned_row_id: str | None,
+    attempt_index: int | None,
+) -> dict[str, str]:
+    supplied = bool(policy_arm or planned_row_id or attempt_index is not None)
+    if not supplied:
+        return {}
+    phase8_contract = _active_phase8_goad_regression_contract()
+    if scenario != phase8_contract.SCENARIO_NAME:
+        raise SystemExit(
+            "ABORT: --phase8-policy-arm/--phase8-planned-row-id/--phase8-attempt-index "
+            f"are only valid for {phase8_contract.SCENARIO_NAME}"
+        )
+    if not policy_arm or not planned_row_id or attempt_index is None:
+        raise SystemExit(
+            "ABORT: Phase 8 tagged rows require --phase8-policy-arm, "
+            "--phase8-planned-row-id, and --phase8-attempt-index together"
+        )
+    arm = str(policy_arm).strip().casefold()
+    mode = str(policy_mode).strip().casefold()
+    if arm not in {*phase8_contract.EXPECTED_POLICY_ARMS, *phase8_contract.OPTIONAL_POLICY_ARMS}:
+        raise SystemExit(f"ABORT: unsupported Phase 8 policy arm: {policy_arm!r}")
+    if arm != mode:
+        raise SystemExit(
+            f"ABORT: Phase 8 policy arm {arm!r} must match configured --policy-mode {mode!r}"
+        )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", planned_row_id):
+        raise SystemExit("ABORT: --phase8-planned-row-id must be a stable token without whitespace")
+    if planned_row_id not in phase8_contract.allowed_planned_row_ids():
+        raise SystemExit(f"ABORT: unknown Phase 8 planned row id: {planned_row_id!r}")
+    if int(attempt_index) < 1:
+        raise SystemExit("ABORT: --phase8-attempt-index must be >= 1")
+    return {
+        "SAGE_EVAL_PHASE8_CONTRACT_HASH": phase8_contract.sealed_manifest()["manifest_hash"],
+        "SAGE_EVAL_PHASE8_POLICY_ARM": arm,
+        "SAGE_EVAL_PHASE8_PLANNED_ROW_ID": planned_row_id,
+        "SAGE_EVAL_PHASE8_ATTEMPT_INDEX": str(int(attempt_index)),
+    }
+
+
 def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
     print(f"\n=== {name} ===\n$ (cd {cwd}) {' '.join(argv)}", flush=True)
     proc = subprocess.run(argv, cwd=str(cwd), timeout=timeout, text=True, env=env)
@@ -871,7 +922,10 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              phase6_planned_row_id: str | None = None,
              phase6_attempt_index: int | None = None,
              phase7_control: str | None = None,
-             phase7_attempt_index: int | None = None) -> None:
+             phase7_attempt_index: int | None = None,
+             phase8_policy_arm: str | None = None,
+             phase8_planned_row_id: str | None = None,
+             phase8_attempt_index: int | None = None) -> None:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
@@ -944,6 +998,15 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
             scenario,
             control=phase7_control,
             attempt_index=phase7_attempt_index,
+        )
+    )
+    child_env.update(
+        _phase8_goad_regression_eval_env(
+            scenario,
+            policy_mode=policy_mode,
+            policy_arm=phase8_policy_arm,
+            planned_row_id=phase8_planned_row_id,
+            attempt_index=phase8_attempt_index,
         )
     )
     if route_env:
@@ -1110,6 +1173,23 @@ def main(argv=None) -> int:
         help="Phase 7 only: required 1-based repetition index for the live positive row.",
     )
     ap.add_argument(
+        "--phase8-policy-arm",
+        choices=["symbolic", "hybrid", "llm"],
+        default=None,
+        help="Phase 8 only: label the frozen GOAD regression policy arm for this append-only attempt.",
+    )
+    ap.add_argument(
+        "--phase8-planned-row-id",
+        default=None,
+        help="Phase 8 only: stable preregistered GOAD row identifier.",
+    )
+    ap.add_argument(
+        "--phase8-attempt-index",
+        type=int,
+        default=None,
+        help="Phase 8 only: 1-based append-only attempt index for --phase8-planned-row-id.",
+    )
+    ap.add_argument(
         "--retained-callback-config",
         type=Path,
         default=DEFAULT_RETAINED_CALLBACK_CONFIG,
@@ -1156,6 +1236,13 @@ def main(argv=None) -> int:
         attempt_index=args.phase7_attempt_index,
     )
     policy_mode = "symbolic" if args.controller else args.policy_mode
+    _phase8_goad_regression_eval_env(
+        args.scenario,
+        policy_mode=policy_mode,
+        policy_arm=args.phase8_policy_arm,
+        planned_row_id=args.phase8_planned_row_id,
+        attempt_index=args.phase8_attempt_index,
+    )
     if args.null_model_factorial and args.side not in (None, "harness"):
         ap.error("--null-model-factorial only supports the harness side")
     if args.null_model_factorial and args.treatment:
@@ -1208,7 +1295,10 @@ def main(argv=None) -> int:
                          phase6_planned_row_id=args.phase6_planned_row_id,
                          phase6_attempt_index=args.phase6_attempt_index,
                          phase7_control=args.phase7_control,
-                         phase7_attempt_index=args.phase7_attempt_index)
+                         phase7_attempt_index=args.phase7_attempt_index,
+                         phase8_policy_arm=args.phase8_policy_arm,
+                         phase8_planned_row_id=args.phase8_planned_row_id,
+                         phase8_attempt_index=args.phase8_attempt_index)
     if not args.side and not args.null_model_factorial:
         compare(args.scenario)
     return 0

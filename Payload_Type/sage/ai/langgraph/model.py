@@ -4980,8 +4980,8 @@ class Model:
             self._controller_observed_decisions = []
             self._controller_observed_transactions = []
         policy_mode, inferred_policy_mode_resolution = _policy.resolve_policy_mode(
-            getattr(self, "policy_mode", _policy.POLICY_SYMBOLIC),
-            default=_policy.POLICY_SYMBOLIC,
+            getattr(self, "policy_mode", ""),
+            default=_policy.POLICY_DEFAULT,
         )
         self.policy_mode = policy_mode
         if not str(getattr(self, "_policy_mode_resolution", "") or ""):
