@@ -11,6 +11,11 @@
   python -m ai.hillclimb phase4-readiness-report      # no lab or model calls
   python -m ai.hillclimb phase9-auto-harness-readiness # no lab or model calls
   python -m ai.hillclimb phase10-evidence-bundle      # no lab or model calls
+  python -m ai.hillclimb phase12-proof-binding-audit  # no lab or model calls
+  python -m ai.hillclimb phase13-canonical-promotion-replay # no lab or model calls
+  python -m ai.hillclimb phase14-superseding-bundle   # no lab or model calls
+  python -m ai.hillclimb phase14-superseding-bundle-validate # no lab or model calls
+  python -m ai.hillclimb phase15-r5-retrospective-falsifiers # no lab or model calls
   python -m ai.hillclimb phase5-full-frontier-t3      # no lab; add --run-model-matrix for weak/strong calls
   python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
   python -m ai.hillclimb target-value-census             # no lab or model calls
@@ -76,6 +81,11 @@ try:  # package import
     from . import phase8_goad_regression
     from . import phase9_auto_harness_readiness
     from . import phase10_evidence_bundle
+    from . import phase12_proof_binding_audit
+    from . import phase13_canonical_promotion
+    from . import phase14_superseding_bundle
+    from . import phase14_bundle_validator
+    from . import phase15_r5_retrospective_falsifiers
     from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
@@ -115,6 +125,11 @@ except Exception:  # script / sys.path import
     import phase8_goad_regression  # type: ignore
     import phase9_auto_harness_readiness  # type: ignore
     import phase10_evidence_bundle  # type: ignore
+    import phase12_proof_binding_audit  # type: ignore
+    import phase13_canonical_promotion  # type: ignore
+    import phase14_superseding_bundle  # type: ignore
+    import phase14_bundle_validator  # type: ignore
+    import phase15_r5_retrospective_falsifiers  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
@@ -132,7 +147,7 @@ _DEMO_PROFILES = {
 
 
 def _print_report(report: gx.GateExperimentReport) -> None:
-    print(json.dumps({"kind": "gate_experiment", **report.__dict__}, indent=2, default=str))
+    print(json.dumps({"kind": "gate_experiment", **report.to_dict()}, indent=2, default=str))
     rho = "n/a" if report.spearman_rho is None else f"{report.spearman_rho:.3f}"
     print(
         f"\nVERDICT: {report.verdict}  (rho={rho}, "
@@ -455,6 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     trust_context_corroboration.add_cli(sub)
     phase8_goad_regression.add_cli(sub)
     phase10_evidence_bundle.add_cli(sub)
+    phase12_proof_binding_audit.add_cli(sub)
+    phase13_canonical_promotion.add_cli(sub)
+    phase14_superseding_bundle.add_cli(sub)
+    phase14_bundle_validator.add_cli(sub)
+    phase15_r5_retrospective_falsifiers.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -42,6 +42,16 @@ def _arm_runtime_lineage(mt, task_id="4242", callback_id="50", command="test-com
     mt._last_issued_command = command
 
 
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
 def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-command", verifier_id="test:fixture"):
     return proof_boundary.make_runtime_task_envelope(
         engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
@@ -51,6 +61,9 @@ def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-
         command=command,
         verifier_id=verifier_id,
         captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": verifier_id, "task_id": str(task_id)},
+        verifier_result={"verified": True},
     ).to_dict()
 
 
@@ -65,6 +78,9 @@ def _artifact_proof(path: Path, *, engagement_id="test-op", callback_id="13", ta
         artifact_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         verifier_id="test:ca-artifact",
         captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": "test:ca-artifact", "task_id": str(task_id)},
+        verifier_result={"verified": True},
     ).to_dict()
 
 
@@ -81,6 +97,9 @@ def _bloodhound_proof(task_id, callback_id="13", *, engagement_id=None):
         source_artifact_sha256="a" * 64,
         verifier_id="test:bloodhound-ingest",
         captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": "test:bloodhound-ingest", "task_id": str(task_id)},
+        verifier_result={"verified": True},
     ).to_dict()
 
 
@@ -1376,7 +1395,7 @@ The command completed successfully.
 """
 
     with patch.object(mt, "_persist_engagement_ledger") as persist:
-        mt._record_engagement_success(output)
+        _record_success(mt, output)
 
     persist.assert_called_once()
     assert len(mt._engagement_hops) == 1
@@ -1438,7 +1457,13 @@ def test_record_capability_result_bridge_records_and_persists():
             action,
             {"ds_replication_rights": True},
             now="2026-06-10T13:00:00Z",
-            evidence={"mythic_task_id": 31337},
+            evidence={
+                "mythic_task_id": 31337,
+                "callback_id": "50",
+                "transaction_id": "fixture:31337",
+                "terminal_task_status": "completed",
+                "command": "test-command",
+            },
         )
 
     assert verification.verdict == "achieved"
@@ -3169,9 +3194,9 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     record_command_result = mt._record_deterministic_capability_command_result
 
-    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output):
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output, **kwargs):
         if command != "make_token":
-            record_command_result(command, parameters, callback_display_id, output)
+            record_command_result(command, parameters, callback_display_id, output, **kwargs)
 
     monkeypatch.setattr(
         mt,
@@ -3673,9 +3698,9 @@ def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_co
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
     record_command_result = mt._record_deterministic_capability_command_result
 
-    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output):
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output, **kwargs):
         if command != "make_token":
-            record_command_result(command, parameters, callback_display_id, output)
+            record_command_result(command, parameters, callback_display_id, output, **kwargs)
 
     monkeypatch.setattr(
         mt,

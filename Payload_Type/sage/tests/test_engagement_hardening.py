@@ -26,6 +26,16 @@ def _arm_runtime_lineage(mt, task_id="450", callback_id="50", command="test-comm
     mt._last_issued_command = command
 
 
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
 def _state(provenance, footholds=None, target="winterfell"):
     s = es.EngagementState(objective="t", footholds=footholds or [])
     return es.record_hop_result(
@@ -115,7 +125,7 @@ def test_loaded_hop_becomes_durable_and_is_not_silently_skipped(monkeypatch):
     mt1 = mythic_tools.MythicTools(agent_task_id="run-1")
     _arm_runtime_lineage(mt1)
     mt1._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
-    mt1._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt1, "whoami\r\nnt authority\\system\r\n")
     # run hop on disk
     assert mt1._engagement_hops[0].evidence.get("provenance") == "run"
 
@@ -136,7 +146,7 @@ def test_footholds_are_never_persisted_so_corroboration_is_live_only(monkeypatch
     _arm_runtime_lineage(mt)
     mt._engagement_footholds = [_foothold("winterfell", "system")]  # live cache — must NOT be persisted
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
-    mt._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt, "whoami\r\nnt authority\\system\r\n")
     payload = json.loads(Path(mt._engagement_ledger_path()).read_text())
     assert "footholds" not in payload
     assert all("footholds" not in h for h in payload["hops"])
@@ -178,7 +188,7 @@ def test_record_attaches_mythic_task_id(monkeypatch, tmp_path):
     mt = mythic_tools.MythicTools(agent_task_id="r1")
     _arm_runtime_lineage(mt, task_id=2712)
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell", "2026-06-07T00:00:00+00:00")
-    mt._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt, "whoami\r\nnt authority\\system\r\n")
     assert mt._engagement_hops[0].evidence.get("mythic_task_id") == "2712"
     assert mt._engagement_hops[0].evidence.get("callback_id") == "50"
 
@@ -190,7 +200,7 @@ def test_ttl_drops_at_load(monkeypatch):
     mt1 = mythic_tools.MythicTools(agent_task_id="ttl-1")
     _arm_runtime_lineage(mt1)
     mt1._pending_engagement_hop = ("gpo-abuse", "winterfell", "2020-01-01T00:00:00+00:00")
-    mt1._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt1, "whoami\r\nnt authority\\system\r\n")
     # The persisted hop carries the old timestamp; a tiny TTL expires it at load.
     mt2 = mythic_tools.MythicTools(agent_task_id="ttl-2")
     assert mt2._engagement_hops == []  # dropped as stale

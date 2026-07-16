@@ -96,6 +96,9 @@ def _ledger(path: Path) -> dict:
         artifact_id="artifact-ca-1",
         artifact_sha256=sha256,
         verifier_id="capability:adcs-ca-private-key-export",
+        transaction_id="fixture:450",
+        verifier_input={"artifact_id": "artifact-ca-1", "task_id": "450"},
+        verifier_result={"verdict": "achieved", "artifact_present": True},
         captured_at="2026-07-14T00:00:00+00:00",
     ).to_dict()
     return {

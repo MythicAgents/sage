@@ -240,6 +240,15 @@ def _quarantine_unproven_achievements(data: dict, engagement_id: str) -> None:
                 admission = proof_boundary.admit_runtime_envelope(
                     proof_boundary.ProofEnvelope.from_dict(proof),
                     current_engagement_id=str(engagement_id or ""),
+                    expected_callback_id=evidence.get("callback_id") or evidence.get("callback_display_id") or "",
+                    expected_transaction_id=evidence.get("transaction_id") or "",
+                    expected_task_id=evidence.get("mythic_task_id") or evidence.get("task_id") or "",
+                    expected_terminal_status=evidence.get("terminal_task_status") or evidence.get("terminal_status") or "",
+                    expected_verifier_id=evidence.get("verifier_id") or "",
+                    expected_verifier_input_sha256=evidence.get("verifier_input_sha256") or "",
+                    expected_verifier_result_sha256=evidence.get("verifier_result_sha256") or "",
+                    expected_artifact_id=evidence.get("artifact_id") or "",
+                    expected_authorization=evidence,
                 )
                 admitted = admission.admitted
                 reason = admission.reason

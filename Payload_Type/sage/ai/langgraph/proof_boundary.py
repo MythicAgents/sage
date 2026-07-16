@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-PROOF_SCHEMA = "proof-envelope-v1"
+PROOF_SCHEMA = "proof-envelope-v2"
 RUNTIME_SCOPE = "runtime"
 SYNTHETIC_EVAL_SCOPE = "synthetic_eval"
 
@@ -77,6 +77,21 @@ RESERVED_EVIDENCE_KEYS = frozenset({
     "verifier_id",
     "verifier_version",
     "verifier_hash",
+    "verifier_input_sha256",
+    "verifier_result_sha256",
+    "authorization_manifest_id",
+    "authorization_manifest_version",
+    "authorization_manifest_sha256",
+    "authorization_decision_id",
+    "authorization_decision",
+    "authorization_reason_code",
+    "action_envelope_sha256",
+    "authorization_gate_version",
+    "decision_origin",
+    "policy_decision_id",
+    "operator_authorization_id",
+    "cell_authorization_id",
+    "enforcement_projection_sha256",
     "captured_at",
     "persistence_state",
 })
@@ -127,6 +142,21 @@ class ProofEnvelope:
     verifier_id: str = ""
     verifier_version: str = "v1"
     verifier_hash: str = ""
+    verifier_input_sha256: str = ""
+    verifier_result_sha256: str = ""
+    authorization_manifest_id: str = ""
+    authorization_manifest_version: str = ""
+    authorization_manifest_sha256: str = ""
+    authorization_decision_id: str = ""
+    authorization_decision: str = ""
+    authorization_reason_code: str = ""
+    action_envelope_sha256: str = ""
+    authorization_gate_version: str = ""
+    decision_origin: str = ""
+    policy_decision_id: str = ""
+    operator_authorization_id: str = ""
+    cell_authorization_id: str = ""
+    enforcement_projection_sha256: str = ""
     captured_at: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
     persistence_state: str = ADMITTED
@@ -151,6 +181,21 @@ class ProofEnvelope:
         object.__setattr__(self, "verifier_id", _text(self.verifier_id))
         object.__setattr__(self, "verifier_version", _text(self.verifier_version) or "v1")
         object.__setattr__(self, "verifier_hash", _lower(self.verifier_hash))
+        object.__setattr__(self, "verifier_input_sha256", _lower(self.verifier_input_sha256))
+        object.__setattr__(self, "verifier_result_sha256", _lower(self.verifier_result_sha256))
+        object.__setattr__(self, "authorization_manifest_id", _text(self.authorization_manifest_id))
+        object.__setattr__(self, "authorization_manifest_version", _text(self.authorization_manifest_version))
+        object.__setattr__(self, "authorization_manifest_sha256", _lower(self.authorization_manifest_sha256))
+        object.__setattr__(self, "authorization_decision_id", _text(self.authorization_decision_id))
+        object.__setattr__(self, "authorization_decision", _lower(self.authorization_decision))
+        object.__setattr__(self, "authorization_reason_code", _text(self.authorization_reason_code))
+        object.__setattr__(self, "action_envelope_sha256", _lower(self.action_envelope_sha256))
+        object.__setattr__(self, "authorization_gate_version", _text(self.authorization_gate_version))
+        object.__setattr__(self, "decision_origin", _text(self.decision_origin))
+        object.__setattr__(self, "policy_decision_id", _text(self.policy_decision_id))
+        object.__setattr__(self, "operator_authorization_id", _text(self.operator_authorization_id))
+        object.__setattr__(self, "cell_authorization_id", _text(self.cell_authorization_id))
+        object.__setattr__(self, "enforcement_projection_sha256", _lower(self.enforcement_projection_sha256))
         object.__setattr__(self, "captured_at", _text(self.captured_at))
         object.__setattr__(self, "persistence_state", _lower(self.persistence_state) or ADMITTED)
         object.__setattr__(self, "metadata", MappingProxyType(_clean_metadata(self.metadata)))
@@ -176,6 +221,21 @@ class ProofEnvelope:
             "verifier_id": self.verifier_id,
             "verifier_version": self.verifier_version,
             "verifier_hash": self.verifier_hash,
+            "verifier_input_sha256": self.verifier_input_sha256,
+            "verifier_result_sha256": self.verifier_result_sha256,
+            "authorization_manifest_id": self.authorization_manifest_id,
+            "authorization_manifest_version": self.authorization_manifest_version,
+            "authorization_manifest_sha256": self.authorization_manifest_sha256,
+            "authorization_decision_id": self.authorization_decision_id,
+            "authorization_decision": self.authorization_decision,
+            "authorization_reason_code": self.authorization_reason_code,
+            "action_envelope_sha256": self.action_envelope_sha256,
+            "authorization_gate_version": self.authorization_gate_version,
+            "decision_origin": self.decision_origin,
+            "policy_decision_id": self.policy_decision_id,
+            "operator_authorization_id": self.operator_authorization_id,
+            "cell_authorization_id": self.cell_authorization_id,
+            "enforcement_projection_sha256": self.enforcement_projection_sha256,
             "captured_at": self.captured_at,
             "metadata": dict(self.metadata),
             "persistence_state": self.persistence_state,
@@ -206,6 +266,21 @@ class ProofEnvelope:
                 verifier_id=value.get("verifier_id") or "",
                 verifier_version=value.get("verifier_version") or "v1",
                 verifier_hash=value.get("verifier_hash") or "",
+                verifier_input_sha256=value.get("verifier_input_sha256") or "",
+                verifier_result_sha256=value.get("verifier_result_sha256") or "",
+                authorization_manifest_id=value.get("authorization_manifest_id") or "",
+                authorization_manifest_version=value.get("authorization_manifest_version") or "",
+                authorization_manifest_sha256=value.get("authorization_manifest_sha256") or "",
+                authorization_decision_id=value.get("authorization_decision_id") or "",
+                authorization_decision=value.get("authorization_decision") or "",
+                authorization_reason_code=value.get("authorization_reason_code") or "",
+                action_envelope_sha256=value.get("action_envelope_sha256") or "",
+                authorization_gate_version=value.get("authorization_gate_version") or "",
+                decision_origin=value.get("decision_origin") or "",
+                policy_decision_id=value.get("policy_decision_id") or "",
+                operator_authorization_id=value.get("operator_authorization_id") or "",
+                cell_authorization_id=value.get("cell_authorization_id") or "",
+                enforcement_projection_sha256=value.get("enforcement_projection_sha256") or "",
                 captured_at=value.get("captured_at") or "",
                 metadata=value.get("metadata") if isinstance(value.get("metadata"), dict) else {},
                 persistence_state=value.get("persistence_state") or ADMITTED,
@@ -234,6 +309,14 @@ def stable_verifier_hash(verifier_id: str, verifier_version: str = "v1") -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def canonical_commitment_sha256(value: Any) -> str:
+    """Return a stable commitment to a verifier input or result without persisting the value itself."""
+    if value is None:
+        return ""
+    blob = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def _valid_sha256(value: str) -> bool:
     return bool(_HEX64_RE.fullmatch(_lower(value)))
 
@@ -242,6 +325,15 @@ def admit_runtime_envelope(
     envelope: ProofEnvelope | None,
     *,
     current_engagement_id: str,
+    expected_callback_id: Any = "",
+    expected_transaction_id: Any = "",
+    expected_task_id: Any = "",
+    expected_terminal_status: str = "",
+    expected_verifier_id: str = "",
+    expected_verifier_input_sha256: str = "",
+    expected_verifier_result_sha256: str = "",
+    expected_artifact_id: str = "",
+    expected_authorization: Mapping[str, Any] | None = None,
 ) -> ProofAdmission:
     if envelope is None:
         return ProofAdmission(False, None, "missing proof envelope", LEGACY_UNVERIFIED)
@@ -256,19 +348,41 @@ def admit_runtime_envelope(
         return ProofAdmission(False, envelope, "proof engagement does not match current engagement", REJECTED)
     if not envelope.callback_id:
         return ProofAdmission(False, envelope, "missing callback lineage", REJECTED)
+    if _text(expected_callback_id) and envelope.callback_id != _text(expected_callback_id):
+        return ProofAdmission(False, envelope, "proof callback does not match claimed effect", REJECTED)
+    if not envelope.transaction_id:
+        return ProofAdmission(False, envelope, "missing semantic transaction lineage", REJECTED)
+    if _text(expected_transaction_id) and envelope.transaction_id != _text(expected_transaction_id):
+        return ProofAdmission(False, envelope, "proof transaction does not match claimed effect", REJECTED)
     if not envelope.task_id:
         return ProofAdmission(False, envelope, "missing Mythic task lineage", REJECTED)
+    if _text(expected_task_id) and envelope.task_id != _text(expected_task_id):
+        return ProofAdmission(False, envelope, "proof task does not match verifier observation", REJECTED)
     if envelope.terminal_status not in _TERMINAL_SUCCESS:
         return ProofAdmission(False, envelope, "task is not terminal-success", REJECTED)
+    if _lower(expected_terminal_status) and envelope.terminal_status != _lower(expected_terminal_status):
+        return ProofAdmission(False, envelope, "proof terminal status does not match verifier observation", REJECTED)
     if not envelope.command:
         return ProofAdmission(False, envelope, "missing Mythic command lineage", REJECTED)
     if not envelope.verifier_id or not envelope.verifier_version or not _valid_sha256(envelope.verifier_hash):
         return ProofAdmission(False, envelope, "missing verifier lineage", REJECTED)
+    if _text(expected_verifier_id) and envelope.verifier_id != _text(expected_verifier_id):
+        return ProofAdmission(False, envelope, "proof verifier does not match claimed effect", REJECTED)
+    if not _valid_sha256(envelope.verifier_input_sha256):
+        return ProofAdmission(False, envelope, "missing canonical verifier input commitment", REJECTED)
+    if _lower(expected_verifier_input_sha256) and envelope.verifier_input_sha256 != _lower(expected_verifier_input_sha256):
+        return ProofAdmission(False, envelope, "verifier input commitment mismatch", REJECTED)
+    if not _valid_sha256(envelope.verifier_result_sha256):
+        return ProofAdmission(False, envelope, "missing canonical verifier result commitment", REJECTED)
+    if _lower(expected_verifier_result_sha256) and envelope.verifier_result_sha256 != _lower(expected_verifier_result_sha256):
+        return ProofAdmission(False, envelope, "verifier result commitment mismatch", REJECTED)
     if not envelope.captured_at:
         return ProofAdmission(False, envelope, "missing capture time", REJECTED)
     if envelope.origin == ORIGIN_MYTHIC_ARTIFACT:
         if not envelope.artifact_id or not _valid_sha256(envelope.artifact_sha256):
             return ProofAdmission(False, envelope, "artifact proof requires artifact id and sha256", REJECTED)
+        if _text(expected_artifact_id) and envelope.artifact_id != _text(expected_artifact_id):
+            return ProofAdmission(False, envelope, "artifact proof does not match claimed artifact", REJECTED)
     elif envelope.origin == ORIGIN_MYTHIC_CREDENTIAL:
         if not envelope.credential_id:
             return ProofAdmission(False, envelope, "credential proof requires credential id", REJECTED)
@@ -277,6 +391,56 @@ def admit_runtime_envelope(
             return ProofAdmission(False, envelope, "BloodHound proof requires completed ingest job", REJECTED)
         if not envelope.source_artifact_id or not _valid_sha256(envelope.source_artifact_sha256):
             return ProofAdmission(False, envelope, "BloodHound proof requires source artifact lineage", REJECTED)
+    authorization_fields = (
+        envelope.authorization_manifest_id,
+        envelope.authorization_manifest_version,
+        envelope.authorization_manifest_sha256,
+        envelope.authorization_decision_id,
+        envelope.authorization_decision,
+        envelope.authorization_reason_code,
+        envelope.action_envelope_sha256,
+        envelope.authorization_gate_version,
+        envelope.decision_origin,
+        envelope.operator_authorization_id,
+        envelope.cell_authorization_id,
+        envelope.enforcement_projection_sha256,
+    )
+    if any(authorization_fields):
+        if (
+            not envelope.authorization_manifest_id
+            or not envelope.authorization_manifest_version
+            or not _valid_sha256(envelope.authorization_manifest_sha256)
+            or not envelope.authorization_decision_id
+            or envelope.authorization_decision != "allow"
+            or not envelope.authorization_reason_code
+            or not _valid_sha256(envelope.action_envelope_sha256)
+            or not envelope.authorization_gate_version
+            or not envelope.decision_origin
+            or not envelope.operator_authorization_id
+            or not envelope.cell_authorization_id
+            or not _valid_sha256(envelope.enforcement_projection_sha256)
+        ):
+            return ProofAdmission(False, envelope, "incomplete authorization lineage", REJECTED)
+        expected = expected_authorization if isinstance(expected_authorization, Mapping) else {}
+        joins = {
+            "authorization_manifest_id": envelope.authorization_manifest_id,
+            "authorization_manifest_version": envelope.authorization_manifest_version,
+            "authorization_manifest_sha256": envelope.authorization_manifest_sha256,
+            "authorization_decision_id": envelope.authorization_decision_id,
+            "authorization_decision": envelope.authorization_decision,
+            "authorization_reason_code": envelope.authorization_reason_code,
+            "action_envelope_sha256": envelope.action_envelope_sha256,
+            "authorization_gate_version": envelope.authorization_gate_version,
+            "decision_origin": envelope.decision_origin,
+            "policy_decision_id": envelope.policy_decision_id,
+            "operator_authorization_id": envelope.operator_authorization_id,
+            "cell_authorization_id": envelope.cell_authorization_id,
+            "enforcement_projection_sha256": envelope.enforcement_projection_sha256,
+        }
+        for key, actual in joins.items():
+            wanted = _text(expected.get(key))
+            if wanted and actual != wanted:
+                return ProofAdmission(False, envelope, f"authorization join mismatch: {key}", REJECTED)
     return ProofAdmission(True, envelope, "admitted runtime proof", ADMITTED)
 
 
@@ -300,9 +464,30 @@ def attach_proof(
     envelope: ProofEnvelope | None,
     *,
     current_engagement_id: str,
+    expected_callback_id: Any = "",
+    expected_transaction_id: Any = "",
+    expected_task_id: Any = "",
+    expected_terminal_status: str = "",
+    expected_verifier_id: str = "",
+    expected_verifier_input_sha256: str = "",
+    expected_verifier_result_sha256: str = "",
+    expected_artifact_id: str = "",
+    expected_authorization: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], ProofAdmission]:
     out = merge_untrusted_evidence({}, evidence or {})
-    admission = admit_runtime_envelope(envelope, current_engagement_id=current_engagement_id)
+    admission = admit_runtime_envelope(
+        envelope,
+        current_engagement_id=current_engagement_id,
+        expected_callback_id=expected_callback_id,
+        expected_transaction_id=expected_transaction_id,
+        expected_task_id=expected_task_id,
+        expected_terminal_status=expected_terminal_status,
+        expected_verifier_id=expected_verifier_id,
+        expected_verifier_input_sha256=expected_verifier_input_sha256,
+        expected_verifier_result_sha256=expected_verifier_result_sha256,
+        expected_artifact_id=expected_artifact_id,
+        expected_authorization=expected_authorization,
+    )
     if envelope is not None:
         out["proof_envelope"] = envelope.to_dict()
         out["proof_hash"] = envelope.hash
@@ -330,6 +515,22 @@ def attach_proof(
         out["verifier_id"] = envelope.verifier_id
         out["verifier_version"] = envelope.verifier_version
         out["verifier_hash"] = envelope.verifier_hash
+        out["verifier_input_sha256"] = envelope.verifier_input_sha256
+        out["verifier_result_sha256"] = envelope.verifier_result_sha256
+        if envelope.authorization_manifest_id:
+            out["authorization_manifest_id"] = envelope.authorization_manifest_id
+            out["authorization_manifest_version"] = envelope.authorization_manifest_version
+            out["authorization_manifest_sha256"] = envelope.authorization_manifest_sha256
+            out["authorization_decision_id"] = envelope.authorization_decision_id
+            out["authorization_decision"] = envelope.authorization_decision
+            out["authorization_reason_code"] = envelope.authorization_reason_code
+            out["action_envelope_sha256"] = envelope.action_envelope_sha256
+            out["authorization_gate_version"] = envelope.authorization_gate_version
+            out["decision_origin"] = envelope.decision_origin
+            out["policy_decision_id"] = envelope.policy_decision_id
+            out["operator_authorization_id"] = envelope.operator_authorization_id
+            out["cell_authorization_id"] = envelope.cell_authorization_id
+            out["enforcement_projection_sha256"] = envelope.enforcement_projection_sha256
         out["captured_at"] = envelope.captured_at
     out["proof_persistence_state"] = admission.persistence_state
     out["proof_admission_reason"] = admission.reason
@@ -347,8 +548,12 @@ def make_runtime_task_envelope(
     captured_at: str,
     transaction_id: str = "",
     verifier_version: str = "v1",
+    verifier_input: Any = None,
+    verifier_result: Any = None,
+    authorization: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ProofEnvelope:
+    authorization = authorization if isinstance(authorization, Mapping) else {}
     return ProofEnvelope(
         scope=RUNTIME_SCOPE,
         origin=ORIGIN_MYTHIC_TASK,
@@ -361,6 +566,21 @@ def make_runtime_task_envelope(
         verifier_id=verifier_id,
         verifier_version=verifier_version,
         verifier_hash=stable_verifier_hash(verifier_id, verifier_version),
+        verifier_input_sha256=canonical_commitment_sha256(verifier_input),
+        verifier_result_sha256=canonical_commitment_sha256(verifier_result),
+        authorization_manifest_id=authorization.get("authorization_manifest_id") or authorization.get("manifest_id") or "",
+        authorization_manifest_version=authorization.get("authorization_manifest_version") or authorization.get("manifest_version") or "",
+        authorization_manifest_sha256=authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256") or "",
+        authorization_decision_id=authorization.get("authorization_decision_id") or authorization.get("decision_id") or "",
+        authorization_decision=authorization.get("authorization_decision") or authorization.get("decision") or "",
+        authorization_reason_code=authorization.get("authorization_reason_code") or authorization.get("reason_code") or "",
+        action_envelope_sha256=authorization.get("action_envelope_sha256") or "",
+        authorization_gate_version=authorization.get("authorization_gate_version") or authorization.get("gate_version") or "",
+        decision_origin=authorization.get("decision_origin") or "",
+        policy_decision_id=authorization.get("policy_decision_id") or "",
+        operator_authorization_id=authorization.get("operator_authorization_id") or "",
+        cell_authorization_id=authorization.get("cell_authorization_id") or "",
+        enforcement_projection_sha256=authorization.get("enforcement_projection_sha256") or "",
         captured_at=captured_at,
         metadata=metadata or {},
     )
@@ -379,8 +599,12 @@ def make_runtime_artifact_envelope(
     captured_at: str,
     transaction_id: str = "",
     verifier_version: str = "v1",
+    verifier_input: Any = None,
+    verifier_result: Any = None,
+    authorization: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ProofEnvelope:
+    authorization = authorization if isinstance(authorization, Mapping) else {}
     return ProofEnvelope(
         scope=RUNTIME_SCOPE,
         origin=ORIGIN_MYTHIC_ARTIFACT,
@@ -395,6 +619,21 @@ def make_runtime_artifact_envelope(
         verifier_id=verifier_id,
         verifier_version=verifier_version,
         verifier_hash=stable_verifier_hash(verifier_id, verifier_version),
+        verifier_input_sha256=canonical_commitment_sha256(verifier_input),
+        verifier_result_sha256=canonical_commitment_sha256(verifier_result),
+        authorization_manifest_id=authorization.get("authorization_manifest_id") or authorization.get("manifest_id") or "",
+        authorization_manifest_version=authorization.get("authorization_manifest_version") or authorization.get("manifest_version") or "",
+        authorization_manifest_sha256=authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256") or "",
+        authorization_decision_id=authorization.get("authorization_decision_id") or authorization.get("decision_id") or "",
+        authorization_decision=authorization.get("authorization_decision") or authorization.get("decision") or "",
+        authorization_reason_code=authorization.get("authorization_reason_code") or authorization.get("reason_code") or "",
+        action_envelope_sha256=authorization.get("action_envelope_sha256") or "",
+        authorization_gate_version=authorization.get("authorization_gate_version") or authorization.get("gate_version") or "",
+        decision_origin=authorization.get("decision_origin") or "",
+        policy_decision_id=authorization.get("policy_decision_id") or "",
+        operator_authorization_id=authorization.get("operator_authorization_id") or "",
+        cell_authorization_id=authorization.get("cell_authorization_id") or "",
+        enforcement_projection_sha256=authorization.get("enforcement_projection_sha256") or "",
         captured_at=captured_at,
         metadata=metadata or {},
     )
@@ -412,8 +651,12 @@ def make_runtime_credential_envelope(
     captured_at: str,
     transaction_id: str = "",
     verifier_version: str = "v1",
+    verifier_input: Any = None,
+    verifier_result: Any = None,
+    authorization: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ProofEnvelope:
+    authorization = authorization if isinstance(authorization, Mapping) else {}
     return ProofEnvelope(
         scope=RUNTIME_SCOPE,
         origin=ORIGIN_MYTHIC_CREDENTIAL,
@@ -427,6 +670,21 @@ def make_runtime_credential_envelope(
         verifier_id=verifier_id,
         verifier_version=verifier_version,
         verifier_hash=stable_verifier_hash(verifier_id, verifier_version),
+        verifier_input_sha256=canonical_commitment_sha256(verifier_input),
+        verifier_result_sha256=canonical_commitment_sha256(verifier_result),
+        authorization_manifest_id=authorization.get("authorization_manifest_id") or authorization.get("manifest_id") or "",
+        authorization_manifest_version=authorization.get("authorization_manifest_version") or authorization.get("manifest_version") or "",
+        authorization_manifest_sha256=authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256") or "",
+        authorization_decision_id=authorization.get("authorization_decision_id") or authorization.get("decision_id") or "",
+        authorization_decision=authorization.get("authorization_decision") or authorization.get("decision") or "",
+        authorization_reason_code=authorization.get("authorization_reason_code") or authorization.get("reason_code") or "",
+        action_envelope_sha256=authorization.get("action_envelope_sha256") or "",
+        authorization_gate_version=authorization.get("authorization_gate_version") or authorization.get("gate_version") or "",
+        decision_origin=authorization.get("decision_origin") or "",
+        policy_decision_id=authorization.get("policy_decision_id") or "",
+        operator_authorization_id=authorization.get("operator_authorization_id") or "",
+        cell_authorization_id=authorization.get("cell_authorization_id") or "",
+        enforcement_projection_sha256=authorization.get("enforcement_projection_sha256") or "",
         captured_at=captured_at,
         metadata=metadata or {},
     )
@@ -447,8 +705,12 @@ def make_runtime_bloodhound_envelope(
     captured_at: str,
     transaction_id: str = "",
     verifier_version: str = "v1",
+    verifier_input: Any = None,
+    verifier_result: Any = None,
+    authorization: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> ProofEnvelope:
+    authorization = authorization if isinstance(authorization, Mapping) else {}
     return ProofEnvelope(
         scope=RUNTIME_SCOPE,
         origin=ORIGIN_BLOODHOUND_INGEST,
@@ -465,6 +727,21 @@ def make_runtime_bloodhound_envelope(
         verifier_id=verifier_id,
         verifier_version=verifier_version,
         verifier_hash=stable_verifier_hash(verifier_id, verifier_version),
+        verifier_input_sha256=canonical_commitment_sha256(verifier_input),
+        verifier_result_sha256=canonical_commitment_sha256(verifier_result),
+        authorization_manifest_id=authorization.get("authorization_manifest_id") or authorization.get("manifest_id") or "",
+        authorization_manifest_version=authorization.get("authorization_manifest_version") or authorization.get("manifest_version") or "",
+        authorization_manifest_sha256=authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256") or "",
+        authorization_decision_id=authorization.get("authorization_decision_id") or authorization.get("decision_id") or "",
+        authorization_decision=authorization.get("authorization_decision") or authorization.get("decision") or "",
+        authorization_reason_code=authorization.get("authorization_reason_code") or authorization.get("reason_code") or "",
+        action_envelope_sha256=authorization.get("action_envelope_sha256") or "",
+        authorization_gate_version=authorization.get("authorization_gate_version") or authorization.get("gate_version") or "",
+        decision_origin=authorization.get("decision_origin") or "",
+        policy_decision_id=authorization.get("policy_decision_id") or "",
+        operator_authorization_id=authorization.get("operator_authorization_id") or "",
+        cell_authorization_id=authorization.get("cell_authorization_id") or "",
+        enforcement_projection_sha256=authorization.get("enforcement_projection_sha256") or "",
         captured_at=captured_at,
         metadata=metadata or {},
     )

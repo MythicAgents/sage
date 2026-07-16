@@ -25,9 +25,9 @@ from statistics import NormalDist
 from typing import Callable, Sequence
 
 try:
-    from .experiment_contracts import READINESS_ELIGIBLE, READINESS_NOT_READY
+    from .experiment_contracts import NOT_ESTIMABLE, READINESS_ELIGIBLE, READINESS_NOT_READY
 except Exception:  # script / sys.path import
-    from experiment_contracts import READINESS_ELIGIBLE, READINESS_NOT_READY  # type: ignore
+    from experiment_contracts import NOT_ESTIMABLE, READINESS_ELIGIBLE, READINESS_NOT_READY  # type: ignore
 
 try:  # package import
     from .fitness import ScoreCard, GAUGE_VERSION, score as _score
@@ -110,6 +110,13 @@ class GateExperimentReport:
     reset_automation_passed: bool | None = None
     authorization_boundary_passed: bool | None = None
 
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        for field_name in ("spearman_rho", "achieved_power", "mde"):
+            if payload[field_name] is None:
+                payload[field_name] = NOT_ESTIMABLE
+        return payload
+
 
 @dataclass(frozen=True)
 class CalibrationProtocolReport:
@@ -141,7 +148,11 @@ class CalibrationProtocolReport:
     authorization_boundary_passed: bool | None = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        for field_name in ("spearman_rho", "achieved_power", "mde"):
+            if payload[field_name] is None:
+                payload[field_name] = NOT_ESTIMABLE
+        return payload
 
 
 @dataclass(frozen=True)
@@ -376,14 +387,15 @@ def run_calibration_protocol(
         failed.append(str(t1_substrate_status or "t1_substrate_unavailable"))
     if not t2_anchor_present:
         failed.append("t2_anchor_missing")
-    if (
+    power_not_estimable = (
         smallest_relevant_effect is None
         or target_power is None
         or achieved_power is None
         or measured_noise is None
         or mde is None
-    ):
-        failed.append("insufficient_statistical_power")
+    )
+    if power_not_estimable:
+        failed.append("statistical_power_not_estimable")
     else:
         if (
             float(target_power) < 0.8
@@ -393,9 +405,13 @@ def run_calibration_protocol(
             failed.append("insufficient_statistical_power")
     if sensitivity is not None and sensitivity.reason_codes:
         failed.append("insufficient_statistical_power")
-    if rho is None or rho < float(rho_threshold):
+    if rho is None:
+        failed.append("rank_correlation_not_estimable")
+    elif rho < float(rho_threshold):
         failed.append("rank_correlation_below_threshold")
-    if ci is None or float(ci["lower"]) <= 0.0:
+    if ci is None:
+        failed.append("rank_correlation_interval_not_estimable")
+    elif float(ci["lower"]) <= 0.0:
         failed.append("rank_correlation_lower_bound_not_positive")
     if inversions:
         failed.append("high_cheap_low_live_inversion")
@@ -591,7 +607,7 @@ def write_gate_record(report: GateExperimentReport, *, results_dir: str | os.Pat
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "gate_experiment.jsonl"
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "gate_experiment", **asdict(report)}, sort_keys=True) + "\n")
+        handle.write(json.dumps({"kind": "gate_experiment", **report.to_dict()}, sort_keys=True) + "\n")
     return str(path)
 
 

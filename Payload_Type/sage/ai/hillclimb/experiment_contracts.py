@@ -34,6 +34,17 @@ OUTCOME_UNSCORABLE_NEW_BEHAVIOR = "unscorable_new_behavior"
 READINESS_NOT_READY = "auto_harness_not_ready"
 READINESS_ELIGIBLE = "eligible_for_supervised_artifact_campaign"
 
+NOT_ESTIMABLE = "not_estimable"
+STATUS_NOT_EVALUATED = "not_evaluated"
+STATUS_NOT_ESTABLISHED = "not_established"
+STATUS_NOT_APPROVED = "not_approved"
+STATUS_NOT_APPLIED = "not_applied"
+POLICY_DEFAULT_RECOMMENDATION_INVALIDATED = "hybrid_default_recommendation_invalidated_pending_fresh_evidence"
+POLICY_DEFAULT_RECOMMENDATION_PENDING_APPROVAL = "hybrid_default_recommended_pending_operator_approval"
+POLICY_EVIDENCE_SCOPE_AUTHORIZED_LAB_HARNESS = "authorized_lab_harness"
+POLICY_APPLICATION_SCOPE_EXPLICIT_AUTHORIZED_HARNESS = "explicit_authorized_harness_sessions_only"
+SCOPE_GOVERNANCE_NOT_EVALUATED = "not_evaluated_governance_program_not_authorized"
+
 DECISION_OWNER_KERNEL_SINGLETON = "kernel_singleton"
 DECISION_OWNER_MODEL_BRANCH = "model_branch"
 DECISION_OWNER_SYMBOLIC_CONTROL = "symbolic_control"
@@ -94,11 +105,34 @@ class TypedVerdict:
     transfer_passed: bool | None = None
     operator_approved: bool | None = False
     promotion_applied: bool | None = False
+    descriptive_status: str = STATUS_NOT_EVALUATED
+    within_family_causal_status: str = STATUS_NOT_EVALUATED
+    transfer_status: str = STATUS_NOT_EVALUATED
+    research_claim_status: str = STATUS_NOT_EVALUATED
+    product_policy_status: str = STATUS_NOT_EVALUATED
+    approval_status: str = STATUS_NOT_APPROVED
+    implementation_status: str = STATUS_NOT_APPLIED
+    scope_governance_status: str = SCOPE_GOVERNANCE_NOT_EVALUATED
+    policy_evidence_scope: str = STATUS_NOT_EVALUATED
+    policy_application_scope: str = STATUS_NOT_EVALUATED
     reason_codes: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.promotion_applied is True and self.operator_approved is not True:
             raise ValueError("promotion_applied requires separate operator approval")
+        for field_name in (
+            "descriptive_status",
+            "within_family_causal_status",
+            "transfer_status",
+            "research_claim_status",
+            "product_policy_status",
+            "approval_status",
+            "implementation_status",
+            "scope_governance_status",
+            "policy_evidence_scope",
+            "policy_application_scope",
+        ):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name)))
         object.__setattr__(
             self,
             "reason_codes",
@@ -134,6 +168,16 @@ class TypedVerdict:
             "promotion_evidence_passed": self.promotion_evidence_passed,
             "operator_approved": self.operator_approved,
             "promotion_applied": self.promotion_applied,
+            "descriptive_status": self.descriptive_status,
+            "within_family_causal_status": self.within_family_causal_status,
+            "transfer_status": self.transfer_status,
+            "research_claim_status": self.research_claim_status,
+            "product_policy_status": self.product_policy_status,
+            "approval_status": self.approval_status,
+            "implementation_status": self.implementation_status,
+            "scope_governance_status": self.scope_governance_status,
+            "policy_evidence_scope": self.policy_evidence_scope,
+            "policy_application_scope": self.policy_application_scope,
             "reason_codes": list(self.reason_codes),
         }
 
@@ -155,6 +199,16 @@ class TypedVerdict:
             transfer_passed=_optional_bool(value.get("transfer_passed")),
             operator_approved=_optional_bool(value.get("operator_approved")),
             promotion_applied=_optional_bool(value.get("promotion_applied")),
+            descriptive_status=_text(value.get("descriptive_status")) or STATUS_NOT_EVALUATED,
+            within_family_causal_status=_text(value.get("within_family_causal_status")) or STATUS_NOT_EVALUATED,
+            transfer_status=_text(value.get("transfer_status")) or STATUS_NOT_EVALUATED,
+            research_claim_status=_text(value.get("research_claim_status")) or STATUS_NOT_EVALUATED,
+            product_policy_status=_text(value.get("product_policy_status")) or STATUS_NOT_EVALUATED,
+            approval_status=_text(value.get("approval_status")) or STATUS_NOT_APPROVED,
+            implementation_status=_text(value.get("implementation_status")) or STATUS_NOT_APPLIED,
+            scope_governance_status=_text(value.get("scope_governance_status")) or SCOPE_GOVERNANCE_NOT_EVALUATED,
+            policy_evidence_scope=_text(value.get("policy_evidence_scope")) or STATUS_NOT_EVALUATED,
+            policy_application_scope=_text(value.get("policy_application_scope")) or STATUS_NOT_EVALUATED,
             reason_codes=tuple(value.get("reason_codes") or ()),
         )
 

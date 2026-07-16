@@ -39,6 +39,9 @@ def test_runtime_roundtrip_preserves_admitted_proof_envelope(monkeypatch, tmp_pa
         terminal_status="completed",
         command="dcsync",
         verifier_id="test:ledger-roundtrip",
+        transaction_id="transaction-ledger",
+        verifier_input={"probe": {"krbtgt_hash_present": True}},
+        verifier_result={"verdict": "achieved"},
         captured_at="2026-07-14T00:00:00+00:00",
     ).to_dict()
     data = {"engagement_id": "e", "hops": [{

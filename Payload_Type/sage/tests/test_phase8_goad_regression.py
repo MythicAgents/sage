@@ -165,26 +165,33 @@ def test_phase8_contract_freezes_goals_budgets_and_recommendation():
     assert manifest["manifest_hash"].startswith("sha256:")
 
 
-def test_phase8_validator_recommends_hybrid_after_full_regression_and_prerequisites():
+def test_phase8_validator_invalidates_legacy_recommendation_without_canonical_row_proof_and_transfer():
     report = _validate(_valid_rows())
 
-    assert report["passes_gate"] is True
-    assert report["authorization"]["phase8_complete"] is True
+    assert report["passes_gate"] is False
+    assert report["authorization"]["phase8_complete"] is False
     assert report["authorization"]["product_default_changed"] is False
-    assert report["recommendation"]["decision"] == phase8.RECOMMENDATION
-    assert report["typed_verdict"]["promotion_evidence_passed"] is True
+    assert report["recommendation"]["decision"] == phase8.SUPERSEDING_INVALIDATION
+    assert report["typed_verdict"]["promotion_evidence_passed"] is False
+    assert report["typed_verdict"]["transfer_passed"] is False
+    assert report["canonical_promotion"]["row_aggregate_disagreement"] is True
+    assert all(
+        row["canonical_row_verdict"]["row_status"] == "unscorable"
+        for row in report["row_reports"]
+    )
     assert report["checks"]["exact_five_symbolic_rows"] is True
     assert report["checks"]["exact_five_hybrid_rows"] is True
     assert report["checks"]["conference_visible_hybrid_decision_attribution"] is True
     assert report["checks"]["hybrid_cost_not_worse_than_symbolic"] is True
 
 
-def test_phase8_validator_accepts_kernel_only_goad_reliability_when_phase6_supplies_causal_vignette():
+def test_phase8_validator_retains_kernel_only_goad_reliability_without_promoting_it():
     report = _validate(_valid_rows(hybrid_branch=False))
 
-    assert report["passes_gate"] is True
+    assert report["passes_gate"] is False
     assert report["checks"]["hybrid_backend_identity_is_stable"] is True
     assert report["checks"]["conference_visible_hybrid_decision_attribution"] is True
+    assert report["typed_verdict"]["promotion_evidence_passed"] is False
     assert report["policy_summaries"]["hybrid"]["model_branch_decision_count"] == 0
     assert report["policy_summaries"]["hybrid"]["branch_opportunity_count"] == 0
     assert (
@@ -222,7 +229,7 @@ def test_phase8_validator_retains_prefrontier_diagnostic_without_counting_it_as_
 
     report = _validate(rows)
 
-    assert report["passes_gate"] is True
+    assert report["passes_gate"] is False
     assert report["attempt_accounting"]["matched_attempt_row_count"] == 11
     assert report["attempt_accounting"]["countable_row_count"] == 10
     assert report["attempt_accounting"]["diagnostic_row_count"] == 1
@@ -254,4 +261,4 @@ def test_phase8_validator_rejects_hybrid_cost_regression():
     assert report["passes_gate"] is False
     assert report["checks"]["hybrid_cost_not_worse_than_symbolic"] is False
     assert report["typed_verdict"]["non_regression_passed"] is False
-    assert report["recommendation"]["decision"] == phase8.REJECTION
+    assert report["recommendation"]["decision"] == phase8.SUPERSEDING_INVALIDATION

@@ -122,6 +122,9 @@ def test_reconcile_task_can_emit_admissible_runtime_proof():
     assert admission.admitted is True
     assert envelope.task_id == "450"
     assert envelope.callback_id == "13"
+    assert envelope.transaction_id == "operator-task:450"
+    assert envelope.verifier_input_sha256
+    assert envelope.verifier_result_sha256
 
 
 def test_reconcile_manual_domain_admin_membership_records_callback_principal_da():

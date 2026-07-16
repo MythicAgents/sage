@@ -33,6 +33,16 @@ def _arm_runtime_lineage(mt, task_id="450", callback_id="50", command="test-comm
     mt._last_issued_command = command
 
 
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
 def _gpo_hop():
     state = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
@@ -112,7 +122,7 @@ def test_cross_run_resume(tmp_path, monkeypatch):
     mt1._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
-    mt1._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt1, "whoami\r\nnt authority\\system\r\n")
     ledger = mt1._engagement_ledger_path()
     assert Path(ledger).exists()
     # File holds the hop under the per-engagement key.
@@ -253,7 +263,7 @@ def test_fresh_instance_loads_durable_ledger_unconditionally(tmp_path, monkeypat
     seed._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
-    seed._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(seed, "whoami\r\nnt authority\\system\r\n")
     assert Path(seed._engagement_ledger_path()).exists()
 
     fresh = mythic_tools.MythicTools(agent_task_id="fresh")

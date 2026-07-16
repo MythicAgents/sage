@@ -1141,6 +1141,15 @@ def record_effect_result(
                 evidence_dict,
                 proof_boundary.ProofEnvelope.from_dict(proof_dict),
                 current_engagement_id=engagement_id,
+                expected_callback_id=evidence_dict.get("callback_id") or evidence_dict.get("callback_display_id") or "",
+                expected_transaction_id=evidence_dict.get("transaction_id") or "",
+                expected_task_id=evidence_dict.get("mythic_task_id") or evidence_dict.get("task_id") or "",
+                expected_terminal_status=evidence_dict.get("terminal_task_status") or evidence_dict.get("terminal_status") or "",
+                expected_verifier_id=evidence_dict.get("verifier_id") or "",
+                expected_verifier_input_sha256=evidence_dict.get("verifier_input_sha256") or "",
+                expected_verifier_result_sha256=evidence_dict.get("verifier_result_sha256") or "",
+                expected_artifact_id=evidence_dict.get("artifact_id") or "",
+                expected_authorization=evidence_dict,
             )
             evidence_dict = attached
             proof_dict = dict(attached.get("proof_envelope") or {})

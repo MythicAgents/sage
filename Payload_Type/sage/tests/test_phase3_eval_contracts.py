@@ -53,6 +53,7 @@ def _full_verdict(**overrides) -> TypedVerdict:
 
 def _proof(transaction_id: str = "tx-1") -> dict:
     return {
+        "schema": "proof-envelope-v2",
         "scope": "runtime",
         "origin": "mythic_task",
         "engagement_id": "eng-1",
@@ -64,6 +65,8 @@ def _proof(transaction_id: str = "tx-1") -> dict:
         "verifier_id": "capability:dcsync-account",
         "verifier_version": "v1",
         "verifier_hash": "a" * 64,
+        "verifier_input_sha256": "b" * 64,
+        "verifier_result_sha256": "c" * 64,
         "captured_at": "2026-07-14T00:00:00+00:00",
         "persistence_state": "admitted",
     }

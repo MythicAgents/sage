@@ -1740,6 +1740,8 @@ def test_controller_runtime_lineage_joins_task_event_and_persisted_proof():
         terminal_status="completed",
         command="dcsync",
         verifier_id="capability:dcsync-account",
+        verifier_input={"probe": {"credentials_dumped": True}},
+        verifier_result={"verdict": "achieved"},
         captured_at="2026-07-14T00:00:00+00:00",
     )
     evidence, admission = pb.attach_proof({}, envelope, current_engagement_id="eng-1")

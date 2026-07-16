@@ -81,7 +81,15 @@ def _fixture_bundle(tmp_path: Path, *, extra_result_payload: dict | None = None)
                 "clean_stop": True,
                 "backend_provenance_complete": True,
                 "decisions": [{"decision_id": "decision-1", "admissible_frontier": [{"name": "collect-graph"}]}],
-                "transactions": [{"transaction_id": "transaction-1", "task_ids": ["task-1"], "proof_ids": ["proof-1"]}],
+                "transactions": [
+                    {
+                        "transaction_id": "transaction-1",
+                        "task_ids": ["task-1"],
+                        "proof_ids": ["proof-1"],
+                        "child_tasks": [{"task_id": "task-1", "terminal_status": "completed"}],
+                        "proof_lineage": [{"task_id": "task-1", "proof_envelope_id": "proof-1", "verifier_id": "fixture"}],
+                    }
+                ],
             },
             extra_result_payload or {"controller_status": "failed", "status": "provider_error"},
         ],
@@ -140,6 +148,9 @@ def test_phase10_bundle_preserves_negative_readiness_and_campaign_stop(tmp_path)
     assert bundle["final_dispositions"]["program"]["status"] == "eligible_pending_review_and_commit"
     assert bundle["trajectory_provenance"]["schema_v2_record_count"] == 1
     assert bundle["attempt_coverage"]["row_count"] == 2
+    assert bundle["lineage_summary"]["nested_objects_with_child_tasks"] == 1
+    assert bundle["lineage_summary"]["nested_objects_with_task_id"] == 2
+    assert bundle["lineage_summary"]["nested_objects_with_proof_envelope_id"] == 1
     assert bundle["validation"]["passes_gate"] is True
 
 

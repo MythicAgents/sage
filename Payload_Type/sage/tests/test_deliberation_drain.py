@@ -202,6 +202,9 @@ def test_corroboration_preserves_bloodhound_lineage_for_graph_derived_facts():
         source_artifact_id="file-1",
         source_artifact_sha256="a" * 64,
         verifier_id="test:bloodhound",
+        transaction_id="fixture:451",
+        verifier_input={"ingest_job_id": "job-1", "task_id": "451"},
+        verifier_result={"ingest_status": "complete"},
         captured_at=NOW,
     ).to_dict()
     mt._cred_cache = []

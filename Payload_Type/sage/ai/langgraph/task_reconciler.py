@@ -34,6 +34,7 @@ def reconcile_task(
     now: str,
     *,
     engagement_id: str = "",
+    transaction_id: str = "",
 ) -> ReconciledTask | None:
     """Return a verified ledger record for a completed Mythic task, or None.
 
@@ -92,6 +93,9 @@ def reconcile_task(
         "result_preview": _preview(output),
     }
     if engagement_id:
+        transaction_id = _text(transaction_id) or f"operator-task:{task_id}"
+        evidence["transaction_id"] = transaction_id
+        evidence["terminal_task_status"] = _terminal_status(task)
         envelope = proof_boundary.make_runtime_task_envelope(
             engagement_id=engagement_id,
             callback_id=evidence["callback_id"],
@@ -100,6 +104,17 @@ def reconcile_task(
             command=command,
             verifier_id=f"task_reconciler:{technique}",
             captured_at=now,
+            transaction_id=transaction_id,
+            verifier_input={
+                "technique": technique,
+                "target": target,
+                "probe": probe,
+            },
+            verifier_result={
+                "verdict": verdict,
+                "technique": technique,
+                "target": target,
+            },
             metadata={"reconciled": True},
         )
         evidence["proof_envelope"] = envelope.to_dict()

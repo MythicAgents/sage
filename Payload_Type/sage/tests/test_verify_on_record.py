@@ -172,13 +172,23 @@ def _arm_runtime_lineage(mt, task_id="450", callback_id="13", command="test-comm
     mt._last_issued_command = command
 
 
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
 def _last(mt):
     return mt._engagement_hops[-1]
 
 
 def test_record_dcsync_user_with_key_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
-    mt._record_engagement_success(MIMIKATZ_OK)
+    _record_success(mt, MIMIKATZ_OK)
     hop = _last(mt)
     assert hop.technique == "dcsync-user" and hop.status == "achieved"
     assert hop.evidence.get("verify_verdict") == "achieved"
@@ -189,7 +199,7 @@ def test_record_dcsync_user_with_key_achieved(mt):
 def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
     assert not hasattr(mythic_tools, "ENGAGEMENT_GATE_ENABLED")
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
-    mt._record_engagement_success(MIMIKATZ_OK)
+    _record_success(mt, MIMIKATZ_OK)
 
     hop = _last(mt)
     assert hop.technique == "dcsync-user"
@@ -202,7 +212,7 @@ def test_stage_b_dcsync_key_records_verified_credential_without_gate_flag(mt):
 
 def test_record_dcsync_user_no_key_failed_not_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
-    mt._record_engagement_success(DCSYNC_8439)
+    _record_success(mt, DCSYNC_8439)
     hop = _last(mt)
     assert hop.status == "failed"                       # the false-achieved lie is dead (ISC-21)
     assert hop.evidence.get("verify_verdict") != "achieved"   # "partial" (ran, no key) or "failed"
@@ -211,14 +221,14 @@ def test_record_dcsync_user_no_key_failed_not_achieved(mt):
 
 def test_failed_credential_hop_persists(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
-    mt._record_engagement_success(DCSYNC_8439)
+    _record_success(mt, DCSYNC_8439)
     # Durable trail so `state show` surfaces the honest failure (ISC-23).
     assert Path(mt._engagement_ledger_path()).exists()
 
 
 def test_record_dcsync_krbtgt_no_key_failed(mt):
     mt._pending_engagement_hop = ("dcsync", DOM, TS)
-    mt._record_engagement_success(TRUNCATED)
+    _record_success(mt, TRUNCATED)
     hop = _last(mt)
     assert hop.status == "failed"
 
@@ -226,7 +236,7 @@ def test_record_dcsync_krbtgt_no_key_failed(mt):
 def test_gpo_abuse_system_proof_achieved(mt):
     # GPO abuse records achieved only when the output proves execution, not merely setup.
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell.north.sevenkingdoms.local", TS)
-    mt._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt, "whoami\r\nnt authority\\system\r\n")
     hop = _last(mt)
     assert hop.technique == "gpo-abuse" and hop.status == "achieved"
     assert hop.evidence.get("verify_verdict") == "achieved"
@@ -236,7 +246,7 @@ def test_gpo_abuse_system_proof_achieved(mt):
 def test_non_credential_failure_signature_records_nothing(mt):
     # Legacy early-return on a known failure signature for non-credential techniques.
     mt._pending_engagement_hop = ("gpo-abuse", "winterfell.north.sevenkingdoms.local", TS)
-    mt._record_engagement_success("Failed to create task")
+    _record_success(mt, "Failed to create task")
     assert mt._engagement_hops == []
     assert mt._pending_engagement_hop is None
 
@@ -303,11 +313,11 @@ def test_all_zero_aes_rejected():
 
 def test_verified_achieved_not_downgraded_same_run(mt):
     mt._pending_engagement_hop = ("dcsync-user", USER, TS)
-    mt._record_engagement_success(MIMIKATZ_OK)
+    _record_success(mt, MIMIKATZ_OK)
     assert _last(mt).status == "achieved"
     # Transient 8439 re-probe in the same instance must keep the verified achieved.
     mt._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T01:00:00+00:00")
-    mt._record_engagement_success(DCSYNC_8439)
+    _record_success(mt, DCSYNC_8439)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
     assert len(hops) == 1 and hops[0].status == "achieved"
 
@@ -318,13 +328,13 @@ def test_verified_achieved_sticky_across_reload(tmp_path, monkeypatch):
     a = mythic_tools.MythicTools(agent_task_id="run1")
     _arm_runtime_lineage(a)
     a._pending_engagement_hop = ("dcsync-user", USER, TS)
-    a._record_engagement_success(MIMIKATZ_OK)
+    _record_success(a, MIMIKATZ_OK)
     # Fresh instance loads the durable ledger; the no-key re-probe must keep the achieved hop.
     b = mythic_tools.MythicTools(agent_task_id="run2")
     _arm_runtime_lineage(b, task_id="451")
     assert any(h.technique == "dcsync-user" and h.status == "achieved" for h in b._engagement_hops)
     b._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T02:00:00+00:00")
-    b._record_engagement_success(DCSYNC_8439)
+    _record_success(b, DCSYNC_8439)
     hops = [h for h in b._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
     assert len(hops) == 1 and hops[0].status == "achieved"
 
@@ -337,7 +347,7 @@ def test_legacy_false_achieved_overwritten_by_verified_failed(mt):
         {"source": "legacy", "provenance": "run"}, TS,
     ).hops
     mt._pending_engagement_hop = ("dcsync-user", USER, "2026-06-08T03:00:00+00:00")
-    mt._record_engagement_success(DCSYNC_8439)
+    _record_success(mt, DCSYNC_8439)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-user" and h.target == USER]
     assert len(hops) == 1 and hops[0].status == "failed"
 
@@ -412,7 +422,7 @@ def test_verify_grant_denied_failed():
 
 def test_record_grant_success_achieved(mt):
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
-    mt._record_engagement_success(GRANT_OK)
+    _record_success(mt, GRANT_OK)
     hop = _last(mt)
     assert hop.technique == "dcsync-rights-grant" and hop.status == "achieved"
     assert hop.evidence.get("verify_verdict") == "achieved"
@@ -422,7 +432,7 @@ def test_record_grant_success_achieved(mt):
 def test_record_grant_denied_failed_not_achieved(mt):
     # The false-achieved-grant lie is dead: Access-denied records FAILED, never achieved.
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
-    mt._record_engagement_success(GRANT_DENIED)
+    _record_success(mt, GRANT_DENIED)
     hop = _last(mt)
     assert hop.status == "failed"
     assert hop.evidence.get("artifact_present") is False
@@ -430,17 +440,17 @@ def test_record_grant_denied_failed_not_achieved(mt):
 
 def test_record_grant_empty_failed(mt):
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
-    mt._record_engagement_success(GRANT_EMPTY)
+    _record_success(mt, GRANT_EMPTY)
     assert _last(mt).status == "failed"
 
 
 def test_verified_achieved_grant_not_downgraded(mt):
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, TS)
-    mt._record_engagement_success(GRANT_OK)
+    _record_success(mt, GRANT_OK)
     assert _last(mt).status == "achieved"
     # A later denied/empty re-probe in the same instance must keep the verified achieved grant.
     mt._pending_engagement_hop = ("dcsync-rights-grant", GRANT_DOM, "2026-06-08T01:00:00+00:00")
-    mt._record_engagement_success(GRANT_DENIED)
+    _record_success(mt, GRANT_DENIED)
     hops = [h for h in mt._engagement_hops if h.technique == "dcsync-rights-grant" and h.target == GRANT_DOM]
     assert len(hops) == 1 and hops[0].status == "achieved"
 
@@ -519,7 +529,7 @@ def test_ticket_probe_group_proof_achieved():
 
 def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
     mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
-    mt._record_engagement_success(RUBEUS_SDDL_EXCEPTION)
+    _record_success(mt, RUBEUS_SDDL_EXCEPTION)
     hop = _last(mt)
     assert hop.technique == "sid-history-escalation"
     assert hop.status == "failed"
@@ -531,7 +541,7 @@ def test_record_sid_history_rubeus_exception_failed_not_achieved(mt):
 
 def test_record_sid_history_forge_only_failed_with_partial_verdict(mt):
     mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
-    mt._record_engagement_success(MIMIKATZ_GOLDEN_FORGE_ONLY)
+    _record_success(mt, MIMIKATZ_GOLDEN_FORGE_ONLY)
     hop = _last(mt)
     assert hop.status == "failed"
     assert hop.evidence["verify_verdict"] == "partial"
@@ -542,7 +552,7 @@ def test_record_sid_history_forge_only_failed_with_partial_verdict(mt):
 def test_record_sid_history_group_proof_achieved(mt):
     mt._last_issued_callback_id = 13
     mt._pending_engagement_hop = ("sid-history-escalation", CHILD_DOM, TS)
-    mt._record_engagement_success(TICKET_GROUP_PROOF)
+    _record_success(mt, TICKET_GROUP_PROOF)
     hop = _last(mt)
     assert hop.status == "achieved"
     assert hop.effect == f"da:{ROOT_DOM}"
@@ -706,7 +716,7 @@ GPO_ABUSE_GUID_ONLY = (
 def test_record_gpo_abuse_creation_error_not_achieved(mt):
     mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
     before = len(mt._engagement_hops)
-    mt._record_engagement_success(GPO_ABUSE_CREATION_ERROR)
+    _record_success(mt, GPO_ABUSE_CREATION_ERROR)
     assert len(mt._engagement_hops) == before  # nothing recorded — the task never ran
     assert not any(h.technique == "gpo-abuse" for h in mt._engagement_hops)
 
@@ -714,14 +724,14 @@ def test_record_gpo_abuse_creation_error_not_achieved(mt):
 def test_record_gpo_abuse_empty_output_not_achieved(mt):
     mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
     before = len(mt._engagement_hops)
-    mt._record_engagement_success("   ")
+    _record_success(mt, "   ")
     assert len(mt._engagement_hops) == before
 
 
 def test_record_gpo_abuse_setup_only_records_pending_not_achieved(mt):
     # A clean SharpGPOAbuse setup output is not enough: the GPO still needs refresh and effect proof.
     mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
-    mt._record_engagement_success(GPO_ABUSE_SUCCESS)
+    _record_success(mt, GPO_ABUSE_SUCCESS)
     hop = _last(mt)
     assert hop is not None and hop.technique == "gpo-abuse" and hop.status == "pending"
     assert hop.evidence.get("verify_verdict") == "partial"
@@ -730,7 +740,7 @@ def test_record_gpo_abuse_setup_only_records_pending_not_achieved(mt):
 
 def test_record_gpo_abuse_guid_only_records_failed_not_waitable(mt):
     mt._pending_engagement_hop = ("gpo-abuse", "starkwallpaper", TS)
-    mt._record_engagement_success(GPO_ABUSE_GUID_ONLY)
+    _record_success(mt, GPO_ABUSE_GUID_ONLY)
     hop = _last(mt)
     assert hop is not None and hop.technique == "gpo-abuse" and hop.status == "failed"
     assert hop.evidence.get("verify_verdict") == "failed"

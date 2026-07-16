@@ -27,6 +27,9 @@ def _bh_proof():
         source_artifact_id="file-1",
         source_artifact_sha256="a" * 64,
         verifier_id="bloodhound_ingest:completed",
+        transaction_id="fixture:99",
+        verifier_input={"ingest_job_id": "job-1", "task_id": "99"},
+        verifier_result={"ingest_status": "complete"},
         captured_at=NOW,
     ).to_dict()
 

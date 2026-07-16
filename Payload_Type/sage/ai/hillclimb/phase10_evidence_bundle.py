@@ -442,6 +442,34 @@ def _lineage_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if isinstance(payload, list):
             result_rows.extend(row for row in payload if isinstance(row, Mapping))
     nested = [item for row in result_rows for item in _iter_nested_dicts(row)]
+    task_ids: set[str] = set()
+    proof_ids: set[str] = set()
+    verifier_ids: set[str] = set()
+    child_task_entry_count = 0
+    proof_lineage_entry_count = 0
+    for item in nested:
+        if isinstance(item.get("child_tasks"), list):
+            child_task_entry_count += sum(isinstance(child, Mapping) for child in item["child_tasks"])
+        if isinstance(item.get("proof_lineage"), list):
+            proof_lineage_entry_count += sum(isinstance(proof, Mapping) for proof in item["proof_lineage"])
+        for key in ("task_id", "evidence_task_id", "proof_task_id"):
+            if str(item.get(key) or "").strip():
+                task_ids.add(str(item.get(key) or "").strip())
+        for value in list(item.get("task_ids") or []):
+            if str(value or "").strip():
+                task_ids.add(str(value or "").strip())
+        for key in ("proof_envelope_id", "proof_id", "proof_envelope_ref"):
+            if str(item.get(key) or "").strip():
+                proof_ids.add(str(item.get(key) or "").strip())
+        for key in ("proof_ids", "proof_envelope_ids"):
+            for value in list(item.get(key) or []):
+                if str(value or "").strip():
+                    proof_ids.add(str(value or "").strip())
+        if str(item.get("verifier_id") or "").strip():
+            verifier_ids.add(str(item.get("verifier_id") or "").strip())
+        for value in list(item.get("verifier_ids") or []):
+            if str(value or "").strip():
+                verifier_ids.add(str(value or "").strip())
     return {
         "result_jsonl_row_count": len(result_rows),
         "rows_with_decisions": sum(bool(row.get("decisions")) for row in result_rows),
@@ -451,12 +479,26 @@ def _lineage_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "rows_with_clean_stop": sum(row.get("clean_stop") is True for row in result_rows),
         "nested_objects_with_raw_frontier": sum("raw_frontier" in item for item in nested),
         "nested_objects_with_admissible_frontier": sum("admissible_frontier" in item for item in nested),
+        "nested_objects_with_child_tasks": sum(isinstance(item.get("child_tasks"), list) for item in nested),
+        "nested_child_task_entry_count": child_task_entry_count,
+        "nested_objects_with_task_id": sum(bool(str(item.get("task_id") or "").strip()) for item in nested),
         "nested_objects_with_task_ids": sum(bool(item.get("task_ids")) for item in nested),
+        "nested_objects_with_proof_lineage": sum(isinstance(item.get("proof_lineage"), list) for item in nested),
+        "nested_proof_lineage_entry_count": proof_lineage_entry_count,
+        "nested_objects_with_proof_envelope_id": sum(
+            bool(str(item.get("proof_envelope_id") or "").strip()) for item in nested
+        ),
+        "nested_objects_with_proof_envelope_ids": sum(bool(item.get("proof_envelope_ids")) for item in nested),
         "nested_objects_with_proof_ids": sum(bool(item.get("proof_ids")) for item in nested),
         "nested_objects_with_verifier_id": sum(bool(item.get("verifier_id")) for item in nested),
+        "nested_objects_with_verifier_ids": sum(bool(item.get("verifier_ids")) for item in nested),
+        "unique_task_id_count": len(task_ids),
+        "unique_proof_id_count": len(proof_ids),
+        "unique_verifier_id_count": len(verifier_ids),
         "notes": [
             "The legacy packet corpus can lack raw-frontier and rejection-reason evidence; missing fields remain missing rather than being reconstructed.",
             "Embedded JSONL rows preserve decision, transaction, task, verifier, artifact, and proof fields when the source artifact retained them.",
+            "The recursive summary recognizes singular task/proof fields, nested child_tasks/proof_lineage arrays, and legacy plural ID fields.",
         ],
     }
 

@@ -17,11 +17,13 @@ from typing import Any
 
 try:  # package import
     from . import policy_replay_calibration as calibration
+    from . import fitness
     from .experiment_contracts import TypedVerdict
     from ..langgraph import proof_boundary
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import policy_replay_calibration as calibration  # type: ignore
+    import fitness  # type: ignore
     from experiment_contracts import TypedVerdict  # type: ignore
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
     import proof_boundary  # type: ignore
@@ -38,6 +40,9 @@ MAX_PREFRONTIER_DIAGNOSTIC_RETRIES = 2
 COLLECTION_CAPABILITY = "collect-graph"
 RECOMMENDATION = "hybrid_default_recommended_pending_operator_approval"
 REJECTION = "symbolic_temporary_default_hybrid_explicit_experimental"
+SUPERSEDING_INVALIDATION = "hybrid_default_recommendation_invalidated_pending_fresh_evidence"
+PHASE8_SURFACE_ID = "phase8-goad-regression"
+PHASE8_FAMILY_ID = "goad-cross-forest-objective"
 DEFAULT_RESULTS_PATH = calibration.DEFAULT_RESULTS_ROOT / "phase8_goad_regression_rows_v2_20260715.jsonl"
 DEFAULT_PHASE6_REPORT_PATH = (
     calibration.DEFAULT_RESULTS_ROOT / "laps_family_transfer_matrix_validation_r5_20260715.json"
@@ -472,6 +477,17 @@ def _row_report(row: dict[str, Any]) -> dict[str, Any]:
         "complete_runtime_lineage": lineage["passes_gate"] is True,
         "backend_identity_complete": backend["passes_gate"] is True,
     }
+    canonical_row_verdict = fitness.canonical_row_verdict(
+        row,
+        row_id=str(row.get("phase8_planned_row_id") or ""),
+        policy_arm=policy_arm,
+        surface_id=PHASE8_SURFACE_ID,
+        family_id=PHASE8_FAMILY_ID,
+        derived_outcome=(row.get("derived_outcome") if isinstance(row.get("derived_outcome"), dict) else None),
+        proof_envelopes=(row.get("proof_envelopes") or ()),
+        semantic_transaction_count=_safe_int(row.get("semantic_transaction_count")),
+        model_owned_branch_observed=lineage["model_branch_decision_count"] > 0,
+    )
     return {
         "policy_arm": policy_arm,
         "planned_row_id": row.get("phase8_planned_row_id"),
@@ -486,6 +502,7 @@ def _row_report(row: dict[str, Any]) -> dict[str, Any]:
         "invariant_failures": invariant_failures,
         "lineage": lineage,
         "backend": backend,
+        "canonical_row_verdict": canonical_row_verdict,
         "checks": checks,
         "passes_gate": all(checks.values()),
     }
@@ -545,6 +562,21 @@ def _artifact_record(path: Path | None, sha256: str | None) -> dict[str, Any] | 
     }
 
 
+def _phase7_symbolic_surrogate_transfer_evidence(phase7_report: dict[str, Any]) -> dict[str, Any]:
+    """Retain the historical Phase 7 relationship without misclassifying it as Hybrid transfer."""
+
+    return {
+        "evaluated_policy": "symbolic",
+        "surface_id": "phase7-trust-context-corroboration",
+        "held_out_family_id": "phase7-trust-context-corroboration",
+        "source_family_ids": [PHASE8_FAMILY_ID],
+        "row_verdict_hashes": [],
+        "separately_held_out": True,
+        "source_report_kind": phase7_report.get("kind"),
+        "historical_scope": "symbolic_only_mechanics_context_corroboration",
+    }
+
+
 def validate_goad_regression_rows(
     rows: list[dict[str, Any]],
     phase6_report: dict[str, Any],
@@ -556,6 +588,8 @@ def validate_goad_regression_rows(
     results_artifact_sha256: str | None = None,
     phase6_artifact_sha256: str | None = None,
     phase7_artifact_sha256: str | None = None,
+    transfer_evidence: dict[str, Any] | None = None,
+    claimed_hard_gates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     results_sha = results_artifact_sha256 or (_sha256_file(results_source_path) if results_source_path is not None else "")
     phase6_sha = phase6_artifact_sha256 or (_sha256_file(phase6_source_path) if phase6_source_path is not None else "")
@@ -687,7 +721,7 @@ def validate_goad_regression_rows(
             and sum(hybrid_costs) <= sum(symbolic_costs)
         ),
     }
-    typed_verdict = TypedVerdict(
+    legacy_typed_verdict = TypedVerdict(
         artifact_integrity_passed=(
             checks["dedicated_results_artifact_has_only_phase8_rows"]
             and checks["results_artifact_hash_present"]
@@ -712,6 +746,38 @@ def validate_goad_regression_rows(
         transfer_passed=checks["phase7_transfer_and_context_corroboration_passes"],
         reason_codes=tuple(name for name, passed in checks.items() if passed is not True),
     )
+    explicit_transfer = dict(transfer_evidence or _phase7_symbolic_surrogate_transfer_evidence(phase7_report))
+    transfer_rows = [
+        dict(item)
+        for item in list(explicit_transfer.pop("row_verdicts", []) or [])
+        if isinstance(item, dict)
+    ]
+    canonical_aggregate = fitness.canonical_aggregate_verdict(
+        [report["canonical_row_verdict"] for report in row_reports],
+        evaluated_policy="hybrid",
+        baseline_policy="symbolic",
+        causal_row_verdicts=phase6_report.get("canonical_row_verdicts") or (),
+        transfer_row_verdicts=transfer_rows,
+        transfer_evidence=explicit_transfer,
+        claimed_hard_gates=(
+            claimed_hard_gates
+            if claimed_hard_gates is not None
+            else {
+                "artifact_integrity": legacy_typed_verdict.artifact_integrity_passed,
+                "boundary": legacy_typed_verdict.boundary_passed,
+                "policy_identity": legacy_typed_verdict.policy_identity_passed,
+                "backend_provenance": legacy_typed_verdict.backend_provenance_passed,
+            }
+        ),
+        implementation_status="historical_phase8_replay_no_source_change",
+    )
+    typed_verdict = TypedVerdict.from_dict(canonical_aggregate["typed_verdict"])
+    checks["canonical_row_verdicts_present"] = bool(row_reports)
+    checks["canonical_aggregate_consumes_row_verdicts"] = (
+        canonical_aggregate["row_verdict_hashes"]
+        == [report["canonical_row_verdict"]["row_verdict_hash"] for report in row_reports]
+    )
+    checks["canonical_aggregate_promotion_passes"] = canonical_aggregate["promotion_evidence_passed"] is True
     passes_gate = all(checks.values()) and typed_verdict.promotion_evidence_passed
     return {
         "kind": "phase8_goad_regression_validation",
@@ -765,6 +831,7 @@ def validate_goad_regression_rows(
             "phase7": phase7,
         },
         "checks": checks,
+        "canonical_promotion": canonical_aggregate,
         "typed_verdict": typed_verdict.to_dict(),
         "passes_gate": passes_gate,
         "authorization": {
@@ -773,13 +840,13 @@ def validate_goad_regression_rows(
             "product_default_changed": False,
         },
         "recommendation": {
-            "disposition": RECOMMENDATION if passes_gate else "rejected_live",
-            "decision": RECOMMENDATION if passes_gate else REJECTION,
+            "disposition": RECOMMENDATION if passes_gate else "invalidated_pending_fresh_evidence",
+            "decision": RECOMMENDATION if passes_gate else SUPERSEDING_INVALIDATION,
             "operator_approval_required": passes_gate,
             "reason": (
-                "All Phase 8 GOAD regression, prerequisite, lineage, provenance, and non-regression gates passed."
+                "All Phase 8 GOAD regression, canonical row, transfer, provenance, and non-regression gates passed."
                 if passes_gate
-                else "At least one Phase 8 GOAD regression, prerequisite, lineage, provenance, or non-regression gate failed."
+                else "The historical Phase 8 recommendation is invalidated because canonical row, transfer, proof, or promotion gates do not all pass."
             ),
             "limitations": list(LIMITATIONS),
             "rollback_path": ROLLBACK_PATH,

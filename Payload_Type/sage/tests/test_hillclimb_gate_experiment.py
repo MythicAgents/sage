@@ -92,6 +92,30 @@ def test_gate_report_carries_candidate_surface_calibration_fields():
     }
 
 
+def test_missing_calibration_metrics_render_as_not_estimable():
+    report = gx.run_calibration_protocol(
+        candidate_surface="retrieval-v1",
+        cheap_scores=(),
+        t2_scores=(),
+        t0_disposition="triage_only",
+        t1_substrate_status="unavailable",
+        t2_anchor_present=False,
+        smallest_relevant_effect=None,
+        target_power=None,
+        achieved_power=None,
+        measured_noise=None,
+        mde=None,
+    )
+
+    payload = report.to_dict()
+    assert payload["spearman_rho"] == "not_estimable"
+    assert payload["achieved_power"] == "not_estimable"
+    assert payload["mde"] == "not_estimable"
+    assert "statistical_power_not_estimable" in report.failed_gates
+    assert "rank_correlation_not_estimable" in report.failed_gates
+    assert "rank_correlation_below_threshold" not in report.failed_gates
+
+
 def test_build_scorecard_threads_live_probe_flag(monkeypatch):
     seen = []
     scn = goad_scenarios()[0]

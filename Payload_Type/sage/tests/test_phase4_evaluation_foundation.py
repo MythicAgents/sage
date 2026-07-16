@@ -79,13 +79,17 @@ def _full_verdict() -> TypedVerdict:
 
 def _proof() -> dict:
     return {
+        "schema": "proof-envelope-v2",
         "scope": "runtime",
         "origin": "mythic_task",
+        "engagement_id": "eng-1",
         "callback_id": "7",
         "transaction_id": "tx-1",
         "task_id": "42",
         "terminal_status": "completed",
         "verifier_id": "capability:test",
+        "verifier_input_sha256": "a" * 64,
+        "verifier_result_sha256": "b" * 64,
         "persistence_state": "admitted",
     }
 

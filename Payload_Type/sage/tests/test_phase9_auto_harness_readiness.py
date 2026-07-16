@@ -99,7 +99,7 @@ def test_phase9_report_enumerates_decisive_missing_prerequisites_and_renders_jso
     assert "t1_structural_substrate_unavailable_or_underpowered" in failures
     assert "missing_operator_returned_paired_t1_evidence" in failures
     assert "t2_anchor_missing" in failures
-    assert "insufficient_statistical_power" in failures
+    assert "statistical_power_not_estimable" in failures
     assert "effective_provider_proposer_canary_not_completed" in failures
     assert "matching_unattended_reset_attestation_not_returned" in failures
     assert "ahi22_reset_not_unattended_ready" in failures

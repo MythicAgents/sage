@@ -298,6 +298,7 @@ from datetime import datetime, timezone
 import hashlib
 import inspect
 import re
+import uuid
 from typing import Annotated, Any, List, Dict, TypedDict
 import aiohttp
 from mythic import mythic, mythic_classes
@@ -3337,7 +3338,14 @@ class MythicTools:
             self._cache_kerberos_ticket_artifact(command, parameters, results_str)
             self._record_kerberos_logon_context(command, callback_display_id, parameters, results_str)
             self._record_kerberos_ticket_store_context(command, callback_display_id, results_str)
-            self._record_deterministic_capability_command_result(command, parameters, callback_display_id, results_str)
+            self._record_deterministic_capability_command_result(
+                command,
+                parameters,
+                callback_display_id,
+                results_str,
+                task_id=self._last_issued_task_display_id,
+                terminal_status=self._last_issued_task_terminal_status,
+            )
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
             result_class = command_builder.classify_result(command, results_str)
@@ -3405,7 +3413,13 @@ class MythicTools:
             except Exception:
                 pass
             try:
-                self._record_engagement_success(results_str)
+                self._record_engagement_success(
+                    results_str,
+                    task_id=self._last_issued_task_display_id,
+                    callback_id=callback_display_id,
+                    terminal_status=self._last_issued_task_terminal_status,
+                    command=command,
+                )
             except Exception:
                 pass  # fail-open: recording must never break the issue path
             try:
@@ -3761,14 +3775,22 @@ class MythicTools:
             return {}
         task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
         callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        task_id = task.get("display_id") or task.get("id")
         return self._runtime_credential_proof_envelope(
             "mythic_credential_store:observed",
             now,
             credential_id=credential.get("id"),
             callback_id=callback.get("display_id") or callback.get("id"),
-            task_id=task.get("display_id") or task.get("id"),
+            task_id=task_id,
             terminal_status=self._credential_task_terminal_success_status(task),
             command=str(task.get("command_name") or task.get("command") or ""),
+            transaction_id=f"credential-observation:{task_id}",
+            verifier_input={
+                "credential_id": credential.get("id"),
+                "credential_type": str(credential.get("type") or ""),
+                "task_id": task_id,
+            },
+            verifier_result={"observed": True, "source": "mythic_credential_store"},
             metadata={"credential_type": str(credential.get("type") or "")},
         )
 
@@ -4259,6 +4281,9 @@ class MythicTools:
         terminal_status: str = "",
         command: str = "",
         transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
         try:
@@ -4268,16 +4293,31 @@ class MythicTools:
                 import proof_boundary
             envelope = proof_boundary.make_runtime_task_envelope(
                 engagement_id=self._eng_key(),
-                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
-                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
-                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
-                command=command or getattr(self, "_last_issued_command", ""),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
                 verifier_id=verifier_id,
                 captured_at=now,
-                transaction_id=transaction_id or self._current_transaction_id(),
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
                 metadata=metadata or {},
             )
-            return envelope.to_dict()
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
         except Exception:
             return {}
 
@@ -4293,6 +4333,9 @@ class MythicTools:
         terminal_status: str = "",
         command: str = "",
         transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
         try:
@@ -4302,18 +4345,34 @@ class MythicTools:
                 import proof_boundary
             envelope = proof_boundary.make_runtime_artifact_envelope(
                 engagement_id=self._eng_key(),
-                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
-                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
-                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
-                command=command or getattr(self, "_last_issued_command", ""),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
                 artifact_id=artifact_id,
                 artifact_sha256=artifact_sha256,
                 verifier_id=verifier_id,
                 captured_at=now,
-                transaction_id=transaction_id or self._current_transaction_id(),
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
                 metadata=metadata or {},
             )
-            return envelope.to_dict()
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_artifact_id=artifact_id,
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
         except Exception:
             return {}
 
@@ -4328,6 +4387,9 @@ class MythicTools:
         terminal_status: str = "",
         command: str = "",
         transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
         try:
@@ -4344,12 +4406,23 @@ class MythicTools:
                 credential_id=credential_id,
                 verifier_id=verifier_id,
                 captured_at=now,
-                transaction_id=transaction_id or self._current_transaction_id(),
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
                 metadata=metadata or {},
             )
             admission = proof_boundary.admit_runtime_envelope(
                 envelope,
                 current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
             )
             return envelope.to_dict() if admission.admitted else {}
         except Exception:
@@ -4369,6 +4442,9 @@ class MythicTools:
         terminal_status: str = "",
         command: str = "",
         transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
         try:
@@ -4378,22 +4454,107 @@ class MythicTools:
                 import proof_boundary
             envelope = proof_boundary.make_runtime_bloodhound_envelope(
                 engagement_id=self._eng_key(),
-                callback_id=callback_id if callback_id is not None else getattr(self, "_last_issued_callback_id", None),
-                task_id=task_id if task_id is not None else getattr(self, "_last_issued_task_display_id", None),
-                terminal_status=terminal_status or getattr(self, "_last_issued_task_terminal_status", ""),
-                command=command or getattr(self, "_last_issued_command", ""),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
                 ingest_job_id=ingest_job_id,
                 ingest_status=ingest_status,
                 source_artifact_id=source_artifact_id,
                 source_artifact_sha256=source_artifact_sha256,
                 verifier_id=verifier_id,
                 captured_at=now,
-                transaction_id=transaction_id or self._current_transaction_id(),
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
                 metadata=metadata or {},
             )
-            return envelope.to_dict()
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
         except Exception:
             return {}
+
+    @staticmethod
+    def _verification_commitment_payload(verification) -> dict:
+        if verification is None:
+            return {}
+        evidence = getattr(verification, "evidence", {})
+        return {
+            "verdict": str(getattr(verification, "verdict", "") or ""),
+            "reason": str(getattr(verification, "reason", "") or ""),
+            "evidence": dict(evidence) if isinstance(evidence, dict) else {},
+        }
+
+    def _proof_reference(
+        self,
+        *,
+        task_id,
+        callback_id,
+        terminal_status: str,
+        command: str,
+        transaction_id: str,
+        verifier_input,
+        verifier_result,
+        authorization: dict | None = None,
+    ) -> dict:
+        reference = {
+            "task_id": task_id,
+            "callback_id": callback_id,
+            "terminal_status": terminal_status,
+            "command": command,
+            "transaction_id": transaction_id,
+            "verifier_input": verifier_input,
+            "verifier_result": verifier_result,
+            "authorization": dict(authorization or {}),
+        }
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            reference["verifier_input_sha256"] = proof_boundary.canonical_commitment_sha256(verifier_input)
+            reference["verifier_result_sha256"] = proof_boundary.canonical_commitment_sha256(verifier_result)
+        except Exception:
+            pass
+        return reference
+
+    def _capability_proof_reference(
+        self,
+        issued_item: dict | None,
+        command_obj: dict | None,
+        probe,
+        verification,
+        *,
+        transaction_id: str,
+        authorization: dict | None = None,
+    ) -> dict:
+        item = issued_item if isinstance(issued_item, dict) else {}
+        command_obj = command_obj if isinstance(command_obj, dict) else {}
+        return self._proof_reference(
+            task_id=item.get("task_id"),
+            callback_id=item.get("callback_id"),
+            terminal_status=self._capability_text(item.get("terminal_status")),
+            command=self._capability_text(item.get("command")),
+            transaction_id=self._capability_text(transaction_id),
+            verifier_input={
+                "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+                "probe": dict(probe) if isinstance(probe, dict) else probe,
+            },
+            verifier_result=self._verification_commitment_payload(verification),
+            authorization=authorization,
+        )
 
     def _current_transaction_id(self) -> str:
         context = _task_visibility_context.get() or {}
@@ -4407,7 +4568,41 @@ class MythicTools:
             return self._capability_text(decision.get("transaction_id"))
         return ""
 
-    def _record_engagement_success(self, results_str) -> None:
+    def _ensure_capability_transaction_context(self, action, inputs: dict) -> tuple[object, str]:
+        """Return one exact semantic transaction id for a capability attempt.
+
+        Callers may provide a transaction id from a higher-level evaluator/policy
+        transaction. Otherwise the executor mints one before command construction
+        so every child task, verifier reference, and durable proof can join back to
+        the same attempt without relying on mutable last-issued task state.
+        """
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        transaction_id = self._capability_text(
+            (inputs or {}).get("transaction_id")
+            or intent.get("transaction_id")
+        )
+        if not transaction_id:
+            transaction_id = f"capability-exec:{uuid.uuid4().hex}"
+        if isinstance(inputs, dict):
+            inputs["transaction_id"] = transaction_id
+        if is_dataclass(action):
+            try:
+                action = replace(action, intent={**intent, "transaction_id": transaction_id})
+            except Exception:
+                pass
+        elif isinstance(intent, dict):
+            intent["transaction_id"] = transaction_id
+        return action, transaction_id
+
+    def _record_engagement_success(
+        self,
+        results_str,
+        *,
+        task_id=None,
+        callback_id=None,
+        terminal_status: str = "",
+        command: str = "",
+    ) -> None:
         pending = self._pending_engagement_hop
         try:
             if pending is None:
@@ -4617,17 +4812,49 @@ class MythicTools:
                 engagement_id=self._eng_key(),
                 runtime_scope=True,
             )
+            transaction_id = self._current_transaction_id() or f"issue-task:{task_id}"
+            verifier_input = {
+                "technique": technique,
+                "target": target_key,
+                "result": str(results_str),
+            }
+            verifier_result = {
+                "status": status,
+                "verify_verdict": extra.get("verify_verdict") or status,
+                "artifact_present": bool(extra.get("artifact_present")),
+            }
+            proof_reference = self._proof_reference(
+                task_id=task_id,
+                callback_id=callback_id,
+                terminal_status=terminal_status,
+                command=command,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+            )
             evidence = {
                 "source": "issue_task",
                 "provenance": "run",
                 "result_preview": str(results_str)[:200],
-                "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                "callback_id": getattr(self, "_last_issued_callback_id", None),
+                "mythic_task_id": task_id,
+                "callback_id": callback_id,
+                "transaction_id": transaction_id,
+                "terminal_task_status": terminal_status,
+                "command": command,
+                "verifier_input_sha256": proof_reference.get("verifier_input_sha256"),
+                "verifier_result_sha256": proof_reference.get("verifier_result_sha256"),
                 **extra,
             }
             proof_envelope = self._runtime_task_proof_envelope(
                 f"engagement_state:{technique}",
                 now,
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
                 metadata={"technique": technique, "target": target_key},
             )
             context_effect = ""
@@ -4637,9 +4864,9 @@ class MythicTools:
             }:
                 primary_effect = engagement_state._technique_effect(technique, target_key)
                 prefix, _, effect_domain = primary_effect.partition(":")
-                callback_id = str(getattr(self, "_last_issued_callback_id", "") or "").strip().casefold()
-                if prefix in {"da", "ea"} and effect_domain and callback_id:
-                    context_effect = f"kerberos-context:{effect_domain}@callback:{callback_id}"
+                callback_text = str(callback_id or "").strip().casefold()
+                if prefix in {"da", "ea"} and effect_domain and callback_text:
+                    context_effect = f"kerberos-context:{effect_domain}@callback:{callback_text}"
 
             if context_effect:
                 primary_effect = engagement_state._technique_effect(technique, target_key)
@@ -5339,20 +5566,59 @@ class MythicTools:
                 runtime_scope=True,
             )
             evidence = dict(evidence or {})
+            proof_reference = evidence.pop("_proof_reference", {}) if isinstance(evidence.get("_proof_reference"), dict) else {}
             action_intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
             policy_decision = action_intent.get("policy_decision")
             if isinstance(policy_decision, dict):
                 for key, value in _policy_decision_evidence(policy_decision).items():
                     evidence.setdefault(key, value)
             action_name = str(getattr(action, "name", "") or "")
+            proof_transaction_id = self._capability_text(proof_reference.get("transaction_id"))
             transaction_id = str(
                 action_intent.get("transaction_id")
                 or evidence.get("transaction_id")
+                or proof_transaction_id
                 or self._current_transaction_id()
                 or ""
             )
             if transaction_id:
                 evidence.setdefault("transaction_id", transaction_id)
+            verification_probe = dict(probe_result) if isinstance(probe_result, dict) else probe_result
+            if isinstance(verification_probe, dict):
+                callback_value = evidence.get("callback_id") or proof_reference.get("callback_id")
+                if callback_value and not any(
+                    verification_probe.get(key)
+                    for key in ("callback_id", "callback", "callback_display_id")
+                ):
+                    verification_probe["callback_id"] = callback_value
+            preliminary_verification = capabilities.verify_capability(action_name, verification_probe)
+            if not proof_reference:
+                proof_reference = self._proof_reference(
+                    task_id=evidence.get("mythic_task_id") or evidence.get("task_id"),
+                    callback_id=evidence.get("callback_id") or evidence.get("callback_display_id"),
+                    terminal_status=self._capability_text(
+                        evidence.get("terminal_task_status") or evidence.get("terminal_status")
+                    ),
+                    command=self._capability_text(evidence.get("command")),
+                    transaction_id=transaction_id,
+                    verifier_input={
+                        "probe": dict(verification_probe) if isinstance(verification_probe, dict) else verification_probe,
+                    },
+                    verifier_result=self._verification_commitment_payload(preliminary_verification),
+                    authorization=(
+                        evidence.get("authorization")
+                        if isinstance(evidence.get("authorization"), dict)
+                        else {}
+                    ),
+                )
+            evidence.setdefault("mythic_task_id", proof_reference.get("task_id"))
+            evidence.setdefault("callback_id", proof_reference.get("callback_id"))
+            evidence.setdefault("transaction_id", transaction_id)
+            evidence.setdefault("terminal_task_status", proof_reference.get("terminal_status"))
+            evidence.setdefault("command", proof_reference.get("command"))
+            evidence.setdefault("verifier_input_sha256", proof_reference.get("verifier_input_sha256"))
+            evidence.setdefault("verifier_result_sha256", proof_reference.get("verifier_result_sha256"))
+            proof_envelope_transaction_id = proof_transaction_id or transaction_id
             artifact_id = str(
                 evidence.get("pfx_artifact_id")
                 or (probe_result.get("pfx_artifact_id") if isinstance(probe_result, dict) else "")
@@ -5369,14 +5635,28 @@ class MythicTools:
                     now,
                     artifact_id=artifact_id,
                     artifact_sha256=artifact_sha256,
-                    transaction_id=transaction_id,
+                    callback_id=proof_reference.get("callback_id"),
+                    task_id=proof_reference.get("task_id"),
+                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    command=self._capability_text(proof_reference.get("command")),
+                    transaction_id=proof_envelope_transaction_id,
+                    verifier_input=proof_reference.get("verifier_input"),
+                    verifier_result=proof_reference.get("verifier_result"),
+                    authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
                     metadata={"capability_target": getattr(action, "target", "")},
                 )
             else:
                 proof_envelope = self._runtime_task_proof_envelope(
                     f"capability:{action_name}",
                     now,
-                    transaction_id=transaction_id,
+                    callback_id=proof_reference.get("callback_id"),
+                    task_id=proof_reference.get("task_id"),
+                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    command=self._capability_text(proof_reference.get("command")),
+                    transaction_id=proof_envelope_transaction_id,
+                    verifier_input=proof_reference.get("verifier_input"),
+                    verifier_result=proof_reference.get("verifier_result"),
+                    authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
                     metadata={"capability_target": getattr(action, "target", "")},
                 )
             updated, verification = capabilities.record_capability_result(
@@ -5400,12 +5680,53 @@ class MythicTools:
                 import capabilities
             return capabilities.CapabilityVerification("failed", f"capability record failed: {exc}")
 
+    def _deterministic_capability_proof_evidence(
+        self,
+        context: dict,
+        command: str,
+        callback_display_id,
+        task_id,
+        terminal_status: str,
+        probe,
+        verification,
+    ) -> dict:
+        intent = context.get("intent") if isinstance(context, dict) and isinstance(context.get("intent"), dict) else {}
+        transaction_id = self._capability_text(
+            (context.get("transaction_id") if isinstance(context, dict) else "")
+            or intent.get("transaction_id")
+            or f"capability-command:{task_id}"
+        )
+        return {
+            "source": "deterministic_capability_command",
+            "provenance": "run",
+            "mythic_task_id": task_id,
+            "callback_id": callback_display_id,
+            "terminal_task_status": terminal_status,
+            "command": self._capability_text(command),
+            "transaction_id": transaction_id,
+            "_proof_reference": self._proof_reference(
+                task_id=task_id,
+                callback_id=callback_display_id,
+                terminal_status=terminal_status,
+                command=self._capability_text(command),
+                transaction_id=transaction_id,
+                verifier_input={
+                    "expected_probe": self._capability_text(context.get("expected_probe")) if isinstance(context, dict) else "",
+                    "probe": dict(probe) if isinstance(probe, dict) else probe,
+                },
+                verifier_result=self._verification_commitment_payload(verification),
+            ),
+        }
+
     def _record_deterministic_capability_command_result(
         self,
         command: str,
         parameters,
         callback_display_id,
         output: str,
+        *,
+        task_id=None,
+        terminal_status: str = "",
     ) -> None:
         try:
             context = getattr(self, "_deterministic_capability_command_contexts", {}).get(
@@ -5489,13 +5810,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "read-managed-local-admin-secret":
@@ -5539,13 +5862,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "use-managed-local-admin-secret":
@@ -5581,13 +5906,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "execute-as-local-admin":
@@ -5638,13 +5965,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "endpoint-protection-adjustment":
@@ -5700,13 +6029,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "adcs-ca-private-key-export":
@@ -5760,13 +6091,15 @@ class MythicTools:
                     reason=self._capability_text(action_data.get("reason")),
                     source_facts=self._capability_list(action_data.get("source_facts")),
                 )
-                evidence = {
-                    "source": "deterministic_capability_command",
-                    "provenance": "run",
-                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                    "callback_id": callback_display_id,
-                    "command": self._capability_text(command),
-                }
+                evidence = self._deterministic_capability_proof_evidence(
+                    context,
+                    command,
+                    callback_display_id,
+                    task_id,
+                    terminal_status,
+                    probe,
+                    verification,
+                )
                 evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                 self.record_capability_result(
                     action,
@@ -5827,13 +6160,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "adcs-certificate-auth":
@@ -5889,13 +6224,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability not in {
@@ -5953,13 +6290,15 @@ class MythicTools:
             self.record_capability_result(
                 action,
                 probe,
-                evidence={
-                    "source": "deterministic_capability_command",
-                    "provenance": "run",
-                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                    "callback_id": callback_display_id,
-                    "command": self._capability_text(command),
-                },
+                evidence=self._deterministic_capability_proof_evidence(
+                    context,
+                    command,
+                    callback_display_id,
+                    task_id,
+                    terminal_status,
+                    probe,
+                    verification,
+                ),
             )
         except Exception as exc:
             try:
@@ -6053,6 +6392,7 @@ class MythicTools:
                     "commands": [],
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             await self._augment_capability_runtime_inputs(action_obj, input_values)
             await self._bind_capability_mythic_adapter(action_obj, input_values)
             self._validate_capability_ticket_sid_sources(action_obj, input_values)
@@ -6372,6 +6712,7 @@ class MythicTools:
                     "issued": [],
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             before_effects = self._capability_achieved_effects()
             force_current_refresh = (
                 self._capability_input_bool(input_values, "refresh_current_context")
@@ -6683,7 +7024,22 @@ class MythicTools:
                         probe = dict(accumulated_probe)
                     issued_item["verify_verdict"] = verification.verdict
                     issued_item["verify_reason"] = verification.reason
-                    self._capability_transaction_update_verification(transaction, command_obj, verification)
+                    proof_reference = self._capability_proof_reference(
+                        issued_item,
+                        command_obj,
+                        probe or accumulated_probe or {},
+                        verification,
+                        transaction_id=self._capability_text(
+                            input_values.get("transaction_id")
+                            or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                        ),
+                    )
+                    self._capability_transaction_update_verification(
+                        transaction,
+                        command_obj,
+                        verification,
+                        proof_reference=proof_reference,
+                    )
                     final_probe = self._capability_executor_is_final_probe(command_obj)
                     if verification.verdict == "achieved" and final_probe:
                         cleanup_issued = await self._capability_executor_run_trailing_cleanup_commands(
@@ -6711,7 +7067,9 @@ class MythicTools:
                                 "provenance": "run",
                                 "mythic_task_id": issued_item.get("task_id"),
                                 "callback_id": callback_id,
+                                "terminal_task_status": issued_item.get("terminal_status"),
                                 "command": issued_item.get("command"),
+                                "_proof_reference": proof_reference,
                             }
                             evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                             if credential_refs:
@@ -6795,7 +7153,22 @@ class MythicTools:
                                 retry_probe = dict(accumulated_probe)
                             retry_item["verify_verdict"] = retry_verification.verdict
                             retry_item["verify_reason"] = retry_verification.reason
-                            self._capability_transaction_update_verification(transaction, command_obj, retry_verification)
+                            retry_proof_reference = self._capability_proof_reference(
+                                retry_item,
+                                command_obj,
+                                retry_probe or accumulated_probe or {},
+                                retry_verification,
+                                transaction_id=self._capability_text(
+                                    input_values.get("transaction_id")
+                                    or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                                ),
+                            )
+                            self._capability_transaction_update_verification(
+                                transaction,
+                                command_obj,
+                                retry_verification,
+                                proof_reference=retry_proof_reference,
+                            )
                             issued_item = retry_item
                             output = retry_output
                             probe = retry_probe
@@ -6826,7 +7199,9 @@ class MythicTools:
                                         "provenance": "run",
                                         "mythic_task_id": retry_item.get("task_id"),
                                         "callback_id": callback_id,
+                                        "terminal_task_status": retry_item.get("terminal_status"),
                                         "command": retry_item.get("command"),
+                                        "_proof_reference": retry_proof_reference,
                                     }
                                     evidence.update(self._adcs_ca_export_artifact_evidence(retry_probe))
                                     if credential_refs:
@@ -7990,7 +8365,18 @@ class MythicTools:
                                     "provenance": "run",
                                     "mythic_task_id": item.get("task_id"),
                                     "callback_id": callback_id,
+                                    "terminal_task_status": item.get("terminal_status"),
                                     "command": item.get("command"),
+                                    "_proof_reference": self._capability_proof_reference(
+                                        item,
+                                        command_obj,
+                                        probe or accumulated_probe or {},
+                                        verification,
+                                        transaction_id=self._capability_text(
+                                            preflight_inputs.get("transaction_id")
+                                            or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                                        ),
+                                    ),
                                 },
                             )
                         return {"status": "achieved", "issued": issued, "ran": ran}
@@ -8657,6 +9043,11 @@ class MythicTools:
             "parameters": self._capability_executor_safe_parameters(parameters),
             "task_id": task_id,
             "callback_id": callback_id,
+            "terminal_status": (
+                "completed"
+                if result_class == command_builder.ResultClass.SUCCESS.value
+                else "failed"
+            ),
             "result_class": result_class,
             "output_preview": self._capability_executor_output_preview(output),
             "_output": self._capability_text(output),
@@ -9005,6 +9396,8 @@ class MythicTools:
 
     def _capability_transaction_start(self, action, build_payload: dict) -> dict:
         commands = list(build_payload.get("commands") or []) if isinstance(build_payload, dict) else []
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        authorization = intent.get("authorization") if isinstance(intent.get("authorization"), dict) else {}
         artifact_obligations = sorted({
             self._capability_text(item)
             for command_obj in commands
@@ -9024,6 +9417,7 @@ class MythicTools:
             and self._capability_text(command_obj.get("expected_probe"))
         })
         return {
+            "transaction_id": self._capability_text(intent.get("transaction_id")),
             "capability": self._capability_text(getattr(action, "name", "")),
             "target": self._capability_text(getattr(action, "target", "")),
             "required_effects": list(getattr(action, "effects", []) or []),
@@ -9031,6 +9425,33 @@ class MythicTools:
             "delayed_effect_obligations": delayed_effect_obligations,
             "proof_obligations": proof_obligations,
             "validated_artifacts": [],
+            "authorization_manifest_id": self._capability_text(
+                authorization.get("authorization_manifest_id") or authorization.get("manifest_id")
+            ),
+            "authorization_manifest_version": self._capability_text(
+                authorization.get("authorization_manifest_version") or authorization.get("manifest_version")
+            ),
+            "authorization_manifest_sha256": self._capability_text(
+                authorization.get("authorization_manifest_sha256") or authorization.get("manifest_sha256")
+            ),
+            "authorization_decision_id": self._capability_text(
+                authorization.get("authorization_decision_id") or authorization.get("decision_id")
+            ),
+            "authorization_decision": self._capability_text(
+                authorization.get("authorization_decision") or authorization.get("decision")
+            ),
+            "authorization_reason_code": self._capability_text(
+                authorization.get("authorization_reason_code") or authorization.get("reason_code")
+            ),
+            "action_envelope_sha256": self._capability_text(authorization.get("action_envelope_sha256")),
+            "enforcement_projection_sha256": self._capability_text(authorization.get("enforcement_projection_sha256")),
+            "authorization_gate_version": self._capability_text(
+                authorization.get("authorization_gate_version") or authorization.get("gate_version")
+            ),
+            "decision_origin": self._capability_text(authorization.get("decision_origin")),
+            "policy_decision_id": self._capability_text(authorization.get("policy_decision_id")),
+            "operator_authorization_id": self._capability_text(authorization.get("operator_authorization_id")),
+            "cell_authorization_id": self._capability_text(authorization.get("cell_authorization_id")),
             "status": "open",
             "pin_planner": True,
             "events": [],
@@ -9108,7 +9529,14 @@ class MythicTools:
             "reason": event["reason"],
         }
 
-    def _capability_transaction_update_verification(self, transaction: dict, command_obj: dict, verification) -> None:
+    def _capability_transaction_update_verification(
+        self,
+        transaction: dict,
+        command_obj: dict,
+        verification,
+        *,
+        proof_reference: dict | None = None,
+    ) -> None:
         if not isinstance(transaction, dict) or verification is None:
             return
         verdict = self._capability_text(getattr(verification, "verdict", ""))
@@ -9121,6 +9549,22 @@ class MythicTools:
             "verdict": verdict,
             "reason": self._capability_text(getattr(verification, "reason", "")),
         }
+        reference = proof_reference if isinstance(proof_reference, dict) else {}
+        if reference:
+            event["evidence_task_id"] = self._capability_text(reference.get("task_id"))
+            event["evidence_callback_id"] = self._capability_text(reference.get("callback_id"))
+            event["evidence_terminal_status"] = self._capability_text(reference.get("terminal_status"))
+            event["evidence_command"] = self._capability_text(reference.get("command"))
+            event["transaction_id"] = self._capability_text(reference.get("transaction_id"))
+            try:
+                try:
+                    from . import proof_boundary
+                except ImportError:
+                    import proof_boundary
+                event["verifier_input_sha256"] = proof_boundary.canonical_commitment_sha256(reference.get("verifier_input"))
+                event["verifier_result_sha256"] = proof_boundary.canonical_commitment_sha256(reference.get("verifier_result"))
+            except Exception:
+                pass
         transaction.setdefault("events", []).append(event)
         if verdict == "achieved" and final_probe:
             transaction["status"] = "effect_achieved"
@@ -9644,10 +10088,21 @@ class MythicTools:
                     probe = dict(accumulated_probe)
                 fallback_item["verify_verdict"] = verification.verdict
                 fallback_item["verify_reason"] = verification.reason
+                fallback_proof_reference = self._capability_proof_reference(
+                    fallback_item,
+                    fallback_command,
+                    probe or accumulated_probe or {},
+                    verification,
+                    transaction_id=self._capability_text(
+                        fallback_inputs.get("transaction_id")
+                        or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                    ),
+                )
                 self._capability_transaction_update_verification(
                     fallback_transaction,
                     fallback_command,
                     verification,
+                    proof_reference=fallback_proof_reference,
                 )
                 if verification.verdict == "achieved":
                     if not self._capability_action_effects_achieved(action):
@@ -9659,8 +10114,10 @@ class MythicTools:
                                 "provenance": "run",
                                 "mythic_task_id": fallback_item.get("task_id"),
                                 "callback_id": callback_id,
+                                "terminal_task_status": fallback_item.get("terminal_status"),
                                 "command": fallback_item.get("command"),
                                 "fallback": "schannel-ldap",
+                                "_proof_reference": fallback_proof_reference,
                             },
                         )
                     after_effects = self._capability_achieved_effects()
@@ -13539,6 +13996,7 @@ class MythicTools:
         # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
         content_hash, prior_job = self._collection_already_ingested(file_content)
         if prior_job is not None:
+            collection_transaction_id = self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{prior_job}"
             collection_proof = self._runtime_bloodhound_proof_envelope(
                 "bloodhound_ingest:idempotent",
                 datetime.now(timezone.utc).isoformat(),
@@ -13550,6 +14008,14 @@ class MythicTools:
                 task_id=source_task_id,
                 terminal_status="completed",
                 command=source_command,
+                transaction_id=collection_transaction_id,
+                verifier_input={
+                    "source_task_id": source_task_id,
+                    "source_artifact_id": file_uuid,
+                    "source_artifact_sha256": content_hash,
+                    "ingest_job_id": prior_job,
+                },
+                verifier_result={"ingest_status": "complete", "idempotent_skip": True},
                 metadata={"idempotent_skip": True},
             )
             if collection_proof:
@@ -13651,6 +14117,14 @@ class MythicTools:
                 task_id=source_task_id,
                 terminal_status="completed",
                 command=source_command,
+                transaction_id=self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{job_id_bh}",
+                verifier_input={
+                    "source_task_id": source_task_id,
+                    "source_artifact_id": file_uuid,
+                    "source_artifact_sha256": content_hash,
+                    "ingest_job_id": job_id_bh,
+                },
+                verifier_result={"ingest_status": status_msg or "", "covered_domains": covered_domains},
                 metadata={"filename": safe_name},
             )
             if verified
