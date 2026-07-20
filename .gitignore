@@ -37,3 +37,4 @@ Payload_Type/sage/evals/results/
 .hillclimb/
 **/.trajectory/
 Payload_Type/sage/MEMORY/audit.jsonl
+.r5_preflight/
