@@ -3881,10 +3881,13 @@ def test_build_adcs_ca_private_key_export_plan_is_payload_agnostic_and_requires_
     )
 
     missing = capabilities.build_capability_execution_plan(action, {})
-    plan = capabilities.build_capability_execution_plan(action, {"password": "CorrectHorseBatteryStaple!"})
+    plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
+    })
 
     assert missing.ok is False
-    assert missing.missing == ["password"]
+    assert missing.missing == ["password", "pfx_password"]
     assert plan.ok is True
     assert [step.operation for step in plan.steps] == ["adcs-ca-private-key-export"]
     step = plan.steps[0]
@@ -3892,6 +3895,7 @@ def test_build_adcs_ca_private_key_export_plan_is_payload_agnostic_and_requires_
     assert step.parameters["proof_marker"] == "SAGE_CA_EXPORT_PROOF_ca01_13"
     assert step.parameters["pfx_path"] == r"C:\Windows\Temp\sage_ca_export_ca01_13.pfx"
     assert step.parameters["metadata_path"] == r"C:\Windows\Temp\sage_ca_export_ca01_13.txt"
+    assert step.parameters["pfx_password"] == "DurablePfxSecret!"
     assert step.parameters["adcs_ca_export_method"] == "certutil-backupkey"
     assert step.parameters["wait_seconds"] == "45"
     assert step.expected_probe == "extract_adcs_ca_private_key_probe"
@@ -3910,10 +3914,23 @@ def test_post_laps_adcs_export_default_is_ca_backup_not_native_pfx():
     )
 
     action = next(action for action in capabilities.actions_from_state(state) if action.name == "adcs-ca-private-key-export")
-    plan = capabilities.build_capability_execution_plan(action, {"password": "CorrectHorseBatteryStaple!"})
+    plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
+    })
 
     assert plan.ok is True
     assert plan.steps[0].parameters["adcs_ca_export_method"] == "certutil-backupkey"
+
+
+def test_canonical_host_for_domain_accepts_short_or_exact_fqdn_only():
+    assert capabilities.canonical_host_for_domain("CA01", "LAB.LOCAL") == "ca01"
+    assert capabilities.canonical_host_for_domain("ca01.lab.local", "lab.local") == "ca01"
+    assert capabilities.canonical_host_for_domain("ca01.other.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01.zeta.lab.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01.lab.local.evil", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01..lab.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01", "") == ""
 
 
 def test_build_adcs_ca_private_key_export_plan_supports_sharpdpapi_fallback():
@@ -3939,6 +3956,7 @@ def test_build_adcs_ca_private_key_export_plan_supports_sharpdpapi_fallback():
 
     plan = capabilities.build_capability_execution_plan(action, {
         "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
         "adcs_ca_export_method": "sharpdpapi",
     })
 

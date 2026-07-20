@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
@@ -61,6 +62,7 @@ except Exception:  # script / sys.path import
 try:  # package import
     from .range_state import Milestone, GroundTruth, DEFAULT_SPEC
     from .process_state import ProcessSignals
+    from . import evaluator_evidence
 except Exception:  # script / sys.path import
     import sys
     from pathlib import Path
@@ -68,13 +70,14 @@ except Exception:  # script / sys.path import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from range_state import Milestone, GroundTruth, DEFAULT_SPEC  # type: ignore
     from process_state import ProcessSignals  # type: ignore
+    import evaluator_evidence  # type: ignore
 
 
-GAUGE_VERSION = "phase0-1"
+GAUGE_VERSION = "phase0-3"
 DENSE_REWARD_VERSION = "dense-reward-v1"
-CANONICAL_PROMOTION_AUTHORITY_VERSION = "canonical-promotion-authority-v1"
-CANONICAL_ROW_VERDICT_SCHEMA = "canonical-row-verdict-v1"
-CANONICAL_AGGREGATE_VERDICT_SCHEMA = "canonical-aggregate-verdict-v1"
+CANONICAL_PROMOTION_AUTHORITY_VERSION = "canonical-promotion-authority-v3"
+CANONICAL_ROW_VERDICT_SCHEMA = "canonical-row-verdict-v2"
+CANONICAL_AGGREGATE_VERDICT_SCHEMA = "canonical-aggregate-verdict-v3"
 _MAX_MILESTONE = max(m.value for m in Milestone)  # OBJECTIVE = 9
 _CANONICAL_HARD_GATE_NAMES = (
     "artifact_integrity",
@@ -113,6 +116,7 @@ def verifier_hash(scenario=None, gauge_version: str = GAUGE_VERSION) -> str:
     payload = {
         "gauge_version": gauge_version,
         "dense_reward_version": DENSE_REWARD_VERSION,
+        "evaluator_evidence_schema": evaluator_evidence.EVALUATOR_EVIDENCE_SCHEMA,
         "milestones": [m.name for m in Milestone],
         "default_spec": {
             m.name: [list(s.effect_prefixes), (s.domain_role or "")]
@@ -124,7 +128,9 @@ def verifier_hash(scenario=None, gauge_version: str = GAUGE_VERSION) -> str:
 
 
 def _valid_sha256(value: Any) -> bool:
-    text = str(value or "").strip().casefold()
+    if not isinstance(value, str):
+        return False
+    text = value.strip().casefold()
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
@@ -233,7 +239,7 @@ def _proof_is_admissible(value: Mapping[str, Any]) -> bool:
     return (
         str(value.get("schema") or "").strip() == "proof-envelope-v2"
         and str(value.get("scope") or "").casefold() == "runtime"
-        and str(value.get("persistence_state") or "admitted").casefold() == "admitted"
+        and str(value.get("persistence_state") or "").casefold() == "admitted"
         and str(value.get("origin") or "").casefold()
         in {"mythic_task", "mythic_artifact", "mythic_credential", "bloodhound_ingest"}
         and bool(str(value.get("engagement_id") or "").strip())
@@ -415,6 +421,8 @@ def _row_verdict_payload(
     dense_reward: DenseRewardVector | None,
     semantic_transaction_count: int | None,
     model_owned_branch_observed: bool | None,
+    evidence_projection: Mapping[str, Any],
+    evaluator_evidence_hash: str,
     reason_codes: Iterable[str],
 ) -> dict[str, Any]:
     payload = {
@@ -430,6 +438,9 @@ def _row_verdict_payload(
         "dense_reward": dense_reward.to_dict() if dense_reward is not None else None,
         "semantic_transaction_count": semantic_transaction_count,
         "model_owned_branch_observed": model_owned_branch_observed,
+        "evaluator_evidence": dict(evidence_projection),
+        "evaluator_evidence_schema": evaluator_evidence.EVALUATOR_EVIDENCE_SCHEMA,
+        "evaluator_evidence_hash": evaluator_evidence_hash,
         "promotion_row_passed": bool(
             dense_reward is not None
             and dense_reward.hard_gates_passed
@@ -460,32 +471,46 @@ def canonical_row_verdict(
     are not silently treated as derived evidence.
     """
 
-    trace = dict(row or {})
-    derived = dict(derived_outcome or {})
-    proofs = [dict(item) for item in proof_envelopes if isinstance(item, Mapping)]
+    projection = evaluator_evidence.project_canonical_evidence(
+        row,
+        row_id=row_id,
+        policy_arm=policy_arm,
+        surface_id=surface_id,
+        family_id=family_id,
+        derived_outcome=derived_outcome,
+        proof_envelopes=proof_envelopes,
+        semantic_transaction_count=semantic_transaction_count,
+        model_owned_branch_observed=model_owned_branch_observed,
+    )
+    identity = projection["identity"]
+    trace = projection["trace"]
+    derived = projection["derived_outcome"]
+    proofs = projection["proof_envelopes"]
+    semantic_transaction_count = projection["semantic_transaction_count"]
+    model_owned_branch_observed = projection["model_owned_branch_observed"]
+    evidence_hash = projection["projection_sha256"]
     reasons: list[str] = []
     missing_fields = [
         name for name in _REQUIRED_DERIVED_OUTCOME_BOOL_FIELDS
         if _strict_bool(derived.get(name)) is None
     ]
+    missing_fields.extend(name for name, value in identity.items() if not value)
     if str(derived.get("outcome_source") or "").strip() != OUTCOME_INDEPENDENTLY_OBSERVED:
         missing_fields.append("outcome_source")
     for name in _REQUIRED_CANONICAL_RISK_FIELDS:
         if _strict_nonnegative_int(trace.get(name)) is None:
             missing_fields.append(name)
     if semantic_transaction_count is None:
-        semantic_transaction_count = _strict_nonnegative_int(trace.get("semantic_transaction_count"))
-    elif _strict_nonnegative_int(semantic_transaction_count) is None:
-        semantic_transaction_count = None
-    if semantic_transaction_count is None:
         missing_fields.append("semantic_transaction_count")
+    if model_owned_branch_observed is None:
+        missing_fields.append("model_owned_branch_observed")
     if missing_fields:
         reasons.append("missing_derived_row_fields:" + ",".join(sorted(dict.fromkeys(missing_fields))))
         return _row_verdict_payload(
-            row_id=row_id,
-            policy_arm=policy_arm,
-            surface_id=surface_id,
-            family_id=family_id,
+            row_id=identity["row_id"],
+            policy_arm=identity["policy_arm"],
+            surface_id=identity["surface_id"],
+            family_id=identity["family_id"],
             row_status="unscorable",
             derived_outcome=derived,
             typed_verdict=TypedVerdict(
@@ -496,6 +521,8 @@ def canonical_row_verdict(
             dense_reward=None,
             semantic_transaction_count=semantic_transaction_count,
             model_owned_branch_observed=model_owned_branch_observed,
+            evidence_projection=projection,
+            evaluator_evidence_hash=evidence_hash,
             reason_codes=reasons,
         )
 
@@ -529,7 +556,6 @@ def canonical_row_verdict(
         reward_trace,
         typed_verdict=row_typed_verdict,
         proof_envelopes=proofs,
-        prm_diagnostic=prm_diagnostic,
     )
     if not dense_reward.hard_gates_passed:
         reasons.extend(
@@ -540,10 +566,10 @@ def canonical_row_verdict(
     if row_typed_verdict.candidate_efficacy_passed is not True:
         reasons.append("candidate_efficacy_failed")
     return _row_verdict_payload(
-        row_id=row_id,
-        policy_arm=policy_arm,
-        surface_id=surface_id,
-        family_id=family_id,
+        row_id=identity["row_id"],
+        policy_arm=identity["policy_arm"],
+        surface_id=identity["surface_id"],
+        family_id=identity["family_id"],
         row_status="scored",
         derived_outcome=derived,
         typed_verdict=TypedVerdict(
@@ -559,14 +585,27 @@ def canonical_row_verdict(
         dense_reward=dense_reward,
         semantic_transaction_count=semantic_transaction_count,
         model_owned_branch_observed=model_owned_branch_observed,
+        evidence_projection=projection,
+        evaluator_evidence_hash=evidence_hash,
         reason_codes=reasons,
     )
 
 
 def _row_verdict_hash_matches(row_verdict: Mapping[str, Any]) -> bool:
-    expected = str(row_verdict.get("row_verdict_hash") or "").strip()
-    payload = {key: value for key, value in row_verdict.items() if key != "row_verdict_hash"}
-    return bool(expected) and expected == _canonical_sha256(payload)
+    try:
+        evidence = row_verdict["evaluator_evidence"]
+        identity = evidence["identity"]
+        if not isinstance(evidence, Mapping) or not isinstance(identity, Mapping):
+            return False
+        replay = canonical_row_verdict(
+            evidence.get("trace"), row_id=identity.get("row_id"), policy_arm=identity.get("policy_arm"),
+            surface_id=identity.get("surface_id"), family_id=identity.get("family_id"),
+            derived_outcome=evidence.get("derived_outcome"), proof_envelopes=evidence.get("proof_envelopes") or (),
+            semantic_transaction_count=evidence.get("semantic_transaction_count"), model_owned_branch_observed=evidence.get("model_owned_branch_observed"),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return dict(row_verdict) == replay
 
 
 def _promotion_row_passes(row_verdict: Mapping[str, Any]) -> bool:
@@ -586,6 +625,68 @@ def _aggregate_hard_gates(row_verdicts: list[dict[str, Any]]) -> dict[str, bool]
         )
         for name in _CANONICAL_HARD_GATE_NAMES
     }
+
+
+def _aggregate_admission_failures(
+    raw_collections: Mapping[str, list[Any]],
+    rows_by_role: Mapping[str, list[dict[str, Any]]],
+    *,
+    evaluated_policy: Any,
+    baseline_policy: Any,
+) -> tuple[str, str, tuple[str, ...]]:
+    failures: list[str] = []
+    if type(evaluated_policy) is not str or not evaluated_policy.strip():
+        failures.append("invalid_evaluated_policy")
+    if type(baseline_policy) is not str or not baseline_policy.strip():
+        failures.append("invalid_baseline_policy")
+    evaluated = evaluated_policy.strip().casefold() if type(evaluated_policy) is str else ""
+    baseline = baseline_policy.strip().casefold() if type(baseline_policy) is str else ""
+    if evaluated == baseline:
+        failures.append("policy_arms_not_distinct")
+
+    for role, raw_rows in raw_collections.items():
+        rows = rows_by_role[role]
+        if len(rows) != len(raw_rows):
+            failures.append(f"{role}_contains_non_mapping_row")
+        if any(not _row_verdict_hash_matches(item) for item in rows):
+            failures.append(f"{role}_contains_noncanonical_row")
+        if any(item.get("row_status") != "scored" for item in rows):
+            failures.append(f"{role}_contains_unscorable_row")
+        row_ids = [item.get("row_id") for item in rows]
+        row_hashes = [item.get("row_verdict_hash") for item in rows]
+        if all(isinstance(item, str) for item in row_ids) and len(row_ids) != len(set(row_ids)):
+            failures.append(f"{role}_contains_duplicate_row_id")
+        if all(isinstance(item, str) for item in row_hashes) and len(row_hashes) != len(set(row_hashes)):
+            failures.append(f"{role}_contains_duplicate_row_hash")
+
+    all_rows_valid = not any(
+        "non_mapping" in item or "noncanonical" in item or "unscorable" in item
+        for item in failures
+    )
+    primary_rows = rows_by_role["primary"]
+    causal_rows = rows_by_role["causal"]
+    transfer_rows = rows_by_role["transfer"]
+    if all_rows_valid and evaluated and baseline:
+        if any(item.get("policy_arm") not in {evaluated, baseline} for item in primary_rows):
+            failures.append("primary_contains_unknown_policy_arm")
+        if any(item.get("policy_arm") != evaluated for item in causal_rows):
+            failures.append("causal_contains_wrong_policy_arm")
+        if any(item.get("policy_arm") != evaluated for item in transfer_rows):
+            failures.append("transfer_contains_wrong_policy_arm")
+        strata = lambda arm: Counter(
+            (item.get("surface_id"), item.get("family_id"))
+            for item in primary_rows if item.get("policy_arm") == arm
+        )
+        if strata(evaluated) != strata(baseline):
+            failures.append("primary_policy_strata_imbalanced")
+        identity_hashes: dict[str, str] = {}
+        for item in [*primary_rows, *causal_rows, *transfer_rows]:
+            row_id = item["row_id"]
+            row_hash = item["row_verdict_hash"]
+            if row_id in identity_hashes and identity_hashes[row_id] != row_hash:
+                failures.append("cross_role_row_identity_conflict")
+            identity_hashes[row_id] = row_hash
+    return evaluated, baseline, tuple(dict.fromkeys(failures))
 
 
 def _transfer_passes(
@@ -650,26 +751,26 @@ def canonical_aggregate_verdict(
 ) -> dict[str, Any]:
     """Compute the one aggregate promotion verdict from immutable row verdicts only."""
 
-    rows = [dict(item) for item in row_verdicts if isinstance(item, Mapping)]
-    causal_rows = [dict(item) for item in causal_row_verdicts if isinstance(item, Mapping)]
-    transfer_rows = [dict(item) for item in transfer_row_verdicts if isinstance(item, Mapping)]
-    evaluated = str(evaluated_policy or "").strip().casefold()
-    baseline = str(baseline_policy or "").strip().casefold()
-    reasons: list[str] = []
-    invalid_hash_rows = [
-        str(item.get("row_id") or "<missing>")
-        for item in [*rows, *causal_rows, *transfer_rows]
-        if not _row_verdict_hash_matches(item)
-    ]
-    if invalid_hash_rows:
-        reasons.append("row_verdict_hash_mismatch:" + ",".join(invalid_hash_rows))
-    unscorable_rows = [
-        str(item.get("row_id") or "<missing>")
-        for item in [*rows, *causal_rows, *transfer_rows]
-        if item.get("row_status") != "scored"
-    ]
-    if unscorable_rows:
-        reasons.append("unscorable_rows:" + ",".join(unscorable_rows))
+    raw_collections = {
+        "primary": list(row_verdicts),
+        "causal": list(causal_row_verdicts),
+        "transfer": list(transfer_row_verdicts),
+    }
+    rows_by_role = {
+        role: [dict(item) for item in items if isinstance(item, Mapping)]
+        for role, items in raw_collections.items()
+    }
+    rows = rows_by_role["primary"]
+    causal_rows = rows_by_role["causal"]
+    transfer_rows = rows_by_role["transfer"]
+    evaluated, baseline, admission_failures = _aggregate_admission_failures(
+        raw_collections,
+        rows_by_role,
+        evaluated_policy=evaluated_policy,
+        baseline_policy=baseline_policy,
+    )
+    aggregate_admission_passed = not admission_failures
+    reasons: list[str] = list(admission_failures)
 
     aggregate_hard_gates = _aggregate_hard_gates(rows)
     claimed = {
@@ -685,29 +786,34 @@ def canonical_aggregate_verdict(
     if row_aggregate_disagreement:
         reasons.append("row_aggregate_hard_gate_disagreement")
 
-    evaluated_rows = [item for item in rows if str(item.get("policy_arm") or "").strip().casefold() == evaluated]
-    baseline_rows = [item for item in rows if str(item.get("policy_arm") or "").strip().casefold() == baseline]
-    candidate_efficacy_passed = bool(evaluated_rows) and all(_promotion_row_passes(item) for item in evaluated_rows)
-    baseline_passed = bool(baseline_rows) and all(_promotion_row_passes(item) for item in baseline_rows)
-    evaluated_costs = [
-        item.get("semantic_transaction_count")
-        for item in evaluated_rows
-        if _strict_nonnegative_int(item.get("semantic_transaction_count")) is not None
-    ]
-    baseline_costs = [
-        item.get("semantic_transaction_count")
-        for item in baseline_rows
-        if _strict_nonnegative_int(item.get("semantic_transaction_count")) is not None
-    ]
+    admitted_rows = rows if aggregate_admission_passed else []
+    evaluated_rows = [item for item in admitted_rows if item.get("policy_arm") == evaluated]
+    baseline_rows = [item for item in admitted_rows if item.get("policy_arm") == baseline]
+    candidate_efficacy_passed = bool(
+        aggregate_admission_passed
+        and evaluated_rows
+        and all(_promotion_row_passes(item) for item in evaluated_rows)
+    )
+    baseline_passed = bool(
+        aggregate_admission_passed
+        and baseline_rows
+        and all(_promotion_row_passes(item) for item in baseline_rows)
+    )
+    evaluated_costs = Counter()
+    baseline_costs = Counter()
+    for item in evaluated_rows:
+        evaluated_costs[(item["surface_id"], item["family_id"])] += item["semantic_transaction_count"]
+    for item in baseline_rows:
+        baseline_costs[(item["surface_id"], item["family_id"])] += item["semantic_transaction_count"]
     non_regression_passed = bool(
         candidate_efficacy_passed
         and baseline_passed
-        and len(evaluated_costs) == len(evaluated_rows)
-        and len(baseline_costs) == len(baseline_rows)
-        and sum(evaluated_costs) <= sum(baseline_costs)
+        and evaluated_costs.keys() == baseline_costs.keys()
+        and all(evaluated_costs[key] <= baseline_costs[key] for key in evaluated_costs)
     )
     causal_model_contribution_passed = bool(
-        causal_rows
+        aggregate_admission_passed
+        and causal_rows
         and all(
             _promotion_row_passes(item)
             and str(item.get("policy_arm") or "").strip().casefold() == evaluated
@@ -715,11 +821,14 @@ def canonical_aggregate_verdict(
             for item in causal_rows
         )
     )
-    transfer_passed = _transfer_passes(
-        evaluated_policy=evaluated,
-        primary_rows=rows,
-        transfer_rows=transfer_rows,
-        transfer_evidence=transfer_evidence,
+    transfer_passed = bool(
+        aggregate_admission_passed
+        and _transfer_passes(
+            evaluated_policy=evaluated,
+            primary_rows=rows,
+            transfer_rows=transfer_rows,
+            transfer_evidence=transfer_evidence,
+        )
     )
     if not candidate_efficacy_passed:
         reasons.append("candidate_efficacy_not_established")
@@ -732,7 +841,8 @@ def canonical_aggregate_verdict(
 
     all_row_hard_gates_passed = all(aggregate_hard_gates.values())
     positive_product_disposition = bool(
-        all_row_hard_gates_passed
+        aggregate_admission_passed
+        and all_row_hard_gates_passed
         and not row_aggregate_disagreement
         and causal_model_contribution_passed
         and candidate_efficacy_passed
@@ -740,15 +850,25 @@ def canonical_aggregate_verdict(
         and transfer_passed
     )
     typed_verdict = TypedVerdict(
-        artifact_integrity_passed=all_row_hard_gates_passed and not row_aggregate_disagreement,
-        boundary_passed=aggregate_hard_gates["boundary"] and aggregate_hard_gates["proof_provenance"],
-        policy_identity_passed=aggregate_hard_gates["policy_identity"],
+        artifact_integrity_passed=(
+            aggregate_admission_passed and all_row_hard_gates_passed and not row_aggregate_disagreement
+        ),
+        boundary_passed=(
+            aggregate_admission_passed
+            and aggregate_hard_gates["boundary"]
+            and aggregate_hard_gates["proof_provenance"]
+        ),
+        policy_identity_passed=aggregate_admission_passed and aggregate_hard_gates["policy_identity"],
         causal_model_contribution_passed=causal_model_contribution_passed,
-        backend_provenance_passed=aggregate_hard_gates["backend_provenance"],
+        backend_provenance_passed=aggregate_admission_passed and aggregate_hard_gates["backend_provenance"],
         candidate_efficacy_passed=candidate_efficacy_passed,
         non_regression_passed=non_regression_passed,
         transfer_passed=transfer_passed,
-        descriptive_status="retained_descriptive_evidence" if rows else STATUS_NOT_EVALUATED,
+        descriptive_status=(
+            "retained_descriptive_evidence"
+            if aggregate_admission_passed and rows
+            else "invalid_aggregate_input" if rows else STATUS_NOT_EVALUATED
+        ),
         within_family_causal_status="supported" if causal_model_contribution_passed else STATUS_NOT_ESTABLISHED,
         transfer_status="supported" if transfer_passed else STATUS_NOT_ESTABLISHED,
         research_claim_status=(
@@ -775,6 +895,7 @@ def canonical_aggregate_verdict(
         "authority_version": CANONICAL_PROMOTION_AUTHORITY_VERSION,
         "evaluated_policy": evaluated,
         "baseline_policy": baseline,
+        "aggregate_admission_passed": aggregate_admission_passed,
         "row_verdict_hashes": [str(item.get("row_verdict_hash") or "") for item in rows],
         "causal_row_verdict_hashes": [str(item.get("row_verdict_hash") or "") for item in causal_rows],
         "transfer_row_verdict_hashes": [str(item.get("row_verdict_hash") or "") for item in transfer_rows],

@@ -140,6 +140,7 @@ def test_runtime_allow_is_arm_blind_and_same_envelope_replay_is_denied():
 
 
 def test_callback_issue_boundary_allows_once_then_blocks_replay_without_second_task(monkeypatch):
+    monkeypatch.setattr(ear, "_utc_now", lambda: NOW)
     mt = _tools()
     params = {"command": "cat", "path": r"C:\proof.txt"}
     command_obj = {
@@ -187,6 +188,7 @@ def test_callback_issue_boundary_allows_once_then_blocks_replay_without_second_t
 
 
 def test_callback_mismatch_and_ingest_deny_produce_zero_covered_mutation(monkeypatch):
+    monkeypatch.setattr(ear, "_utc_now", lambda: NOW)
     mt = _tools()
     params = {"command": "cat", "path": r"C:\proof.txt"}
     command_obj = {"command": "run", "parameters": params, "purpose": "proof"}

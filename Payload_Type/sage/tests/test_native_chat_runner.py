@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -155,6 +156,44 @@ def test_extract_runtime_telemetry_reads_error_wrapped_metadata():
     }]
 
     assert native_chat.extract_runtime_telemetry(messages) == telemetry
+
+
+def test_native_chat_full_output_mode_remains_default():
+    args = native_chat.build_parser().parse_args(["run"])
+
+    assert args.output_mode == "full"
+
+
+def test_native_chat_eval_view_omits_messages_and_raw_metadata():
+    marker = "SAGE_TEST_SECRET_DO_NOT_USE"
+    result = {
+        "chat_channel_id": 10,
+        "chat_channel_name": marker,
+        "chat_request_id": 20,
+        "status": "complete",
+        "error": marker,
+        "messages": [{"message": marker, "metadata": {"tool_use": {"arguments": marker}}}],
+        "runtime_telemetry": {
+            "policy_mode": "symbolic",
+            "configured_policy_mode": "symbolic",
+            "policy_identity_valid": True,
+            "model_calls": 0,
+            "semantic_transaction_count": 14,
+            "authorized_transaction_count": 14,
+            "kernel_singleton_count": 14,
+            "decisions": [{"raw_response": marker}],
+        },
+    }
+
+    view = native_chat.evaluator_result_view(result)
+
+    assert view["schema"] == "native-chat-evaluator-result-v1"
+    assert view["chat_channel_id"] == "10"
+    assert view["chat_request_id"] == "20"
+    assert view["error_present"] is True
+    assert view["evaluator_evidence"]["runtime_telemetry"]["kernel_singleton_count"] == 14
+    assert "messages" not in view
+    assert marker not in json.dumps(view, sort_keys=True)
 
 
 def test_prepare_locked_channel_reuses_empty_prepared_channel(monkeypatch):

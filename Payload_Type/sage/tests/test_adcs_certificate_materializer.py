@@ -2,13 +2,17 @@ import sys
 import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
+import pytest
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import adcs_certificate_materializer as materializer  # noqa: E402
+import artifact_secrets  # noqa: E402
+import capabilities  # noqa: E402
 import proof_boundary  # noqa: E402
 
 
@@ -50,6 +54,7 @@ def _write_ca_artifact(path: Path) -> Path:
         .sign(key, hashes.SHA256())
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     path.write_bytes(
         key.private_bytes(
             serialization.Encoding.PEM,
@@ -58,6 +63,7 @@ def _write_ca_artifact(path: Path) -> Path:
         )
         + cert.public_bytes(serialization.Encoding.PEM)
     )
+    path.chmod(0o600)
     return path
 
 
@@ -81,7 +87,9 @@ def _pfx_from_ca_artifact(path: Path, password: str) -> bytes:
 
 def _write_ca_pfx(path: Path, password: str = "") -> Path:
     source = _write_ca_artifact(path.parent / f"{path.stem}.pem.txt")
+    path.parent.chmod(0o700)
     path.write_bytes(_pfx_from_ca_artifact(source, password))
+    path.chmod(0o600)
     return path
 
 
@@ -250,8 +258,10 @@ def test_materializer_does_not_fallback_to_another_pfx(tmp_path):
 
 def test_persist_verified_ca_pfx_artifact_writes_only_sha_bound_provenance(tmp_path):
     artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir(mode=0o755)
     source_ca = _write_ca_artifact(tmp_path / "source" / "adcs_ca_source_ca01_lab.local.pem.txt")
-    pfx = _pfx_from_ca_artifact(source_ca, "CA Secret!")
+    password = artifact_secrets.derive_password(tmp_path, engagement_id="test-op", purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE, canonical_host="ca01", domain="lab.local")
+    pfx = _pfx_from_ca_artifact(source_ca, password)
     sha256 = hashlib.sha256(pfx).hexdigest()
     output = "\n".join([
         "CA_EXPORT_STATUS=OK",
@@ -275,7 +285,112 @@ def test_persist_verified_ca_pfx_artifact_writes_only_sha_bound_provenance(tmp_p
     assert evidence["pfx_artifact_id"] == "artifact-ca-1"
     assert evidence["pfx_sha256"] == sha256
     assert hashlib.sha256(path.read_bytes()).hexdigest() == sha256
+    assert oct(path.parent.stat().st_mode & 0o777) == "0o700"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert "pfx_base64" not in evidence
+    os.chmod(path, 0o644)
+    assert materializer.persist_verified_ca_pfx_artifact(output, artifact_dir, engagement_key="test-op", ca_host="ca01", domain="lab.local")["pfx_artifact_path"] == str(path)
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    serialized = json.dumps({"evidence": evidence, "ledger": _ledger(path)}, sort_keys=True)
+    key = next((tmp_path / "secrets").glob("artifact_master_*.key")).read_bytes()
+    assert password not in serialized
+    assert key.hex() not in serialized
+    assert base64.b64encode(key).decode() not in serialized
+
+
+def test_persist_verified_ca_pfx_artifact_rejects_symlink_artifact_dir(tmp_path):
+    source = _write_ca_artifact(tmp_path / "source" / "ca.pem.txt")
+    pfx = _pfx_from_ca_artifact(source, "CA Secret!")
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "artifacts").symlink_to(real, target_is_directory=True)
+    output = f"PFX_ARTIFACT_ID=artifact-ca-1\nPFX_BASE64={base64.b64encode(pfx).decode()}"
+    with pytest.raises(ValueError):
+        materializer.persist_verified_ca_pfx_artifact(output, tmp_path / "artifacts", engagement_key="test-op", ca_host="ca01", domain="lab.local")
+
+
+def test_materializer_reopens_durable_exported_pfx_in_independent_process_context(tmp_path):
+    state_dir = tmp_path / "state"
+    artifact_dir = state_dir / "artifacts"
+    canonical_host = capabilities.canonical_host_for_domain("CA01.lab.local", "lab.local")
+    password = artifact_secrets.derive_password(
+        state_dir,
+        engagement_id="test-op",
+        purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE,
+        canonical_host=canonical_host,
+        domain="lab.local",
+    )
+    source_ca = _write_ca_artifact(tmp_path / "source" / "ca.pem.txt")
+    pfx = _pfx_from_ca_artifact(source_ca, password)
+    output = "\n".join([
+        "CA_EXPORT_STATUS=OK",
+        "PFX_ARTIFACT_ID=artifact-ca-1",
+        f"PFX_SHA256={hashlib.sha256(pfx).hexdigest()}",
+        f"PFX_BASE64={base64.b64encode(pfx).decode()}",
+    ])
+    evidence = materializer.persist_verified_ca_pfx_artifact(
+        output,
+        artifact_dir,
+        engagement_key="test-op",
+        ca_host="ca01.lab.local",
+        domain="lab.local",
+    )
+    ledger = _ledger(Path(evidence["pfx_artifact_path"]))
+
+    result = materializer.materialize_adcs_certificate_auth(
+        ledger=ledger,
+        artifact_dir=artifact_dir,
+        engagement_key="test-op",
+        domain="lab.local",
+        account="administrator",
+        ca_host="ca01",
+        callback_id="13",
+        ca_pfx_password_resolver=lambda host, domain: artifact_secrets.derive_password(
+            state_dir,
+            engagement_id="test-op",
+            purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE,
+            canonical_host=host,
+            domain=domain,
+        ),
+    )
+
+    assert result.ok is True
+    assert result.inputs["ca_pfx_password"] == password
+
+
+def test_materializer_rejects_wrong_domain_or_multilabel_ca_host(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    ca_artifact = _write_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
+
+    for ca_host in ("ca01.other.local", "x.ca01.lab.local", "ca01..lab.local"):
+        result = materializer.materialize_adcs_certificate_auth(
+            ledger=_ledger(ca_artifact),
+            artifact_dir=artifact_dir,
+            engagement_key="test-op",
+            domain="lab.local",
+            account="administrator",
+            ca_host=ca_host,
+            callback_id="13",
+        )
+        assert result.ok is False
+        assert "ca_host" in result.missing
+
+
+@pytest.mark.parametrize("mutator", ["root_mode", "file_mode", "root_symlink"])
+def test_materializer_rejects_unsafe_artifact_path_state(tmp_path, mutator):
+    root = tmp_path / "artifacts"
+    path = _write_ca_pfx(root / "adcs_ca_test_ca01_lab.local.pfx")
+    if mutator == "root_mode":
+        root.chmod(0o755)
+    elif mutator == "file_mode":
+        path.chmod(0o644)
+    else:
+        alias = tmp_path / "alias"
+        alias.symlink_to(root, target_is_directory=True)
+        root, path = alias, alias / path.name
+    result = materializer.materialize_adcs_certificate_auth(ledger=_ledger(path), artifact_dir=root, engagement_key="test-op", domain="lab.local", account="administrator", ca_host="ca01", callback_id="13")
+    assert result.ok is False
+    assert result.missing == ["adcs_ca_private_key_artifact"]
 
 
 def test_materializer_requires_explicit_current_hop_path(tmp_path):

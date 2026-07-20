@@ -1784,6 +1784,37 @@ def test_controller_runtime_lineage_joins_task_event_and_persisted_proof():
     assert transaction["proof_lineage"][0]["admissible_for_runtime_achievement"] is True
 
 
+def test_controller_runtime_lineage_dedupes_auxiliary_task_lifecycle_events():
+    m = object.__new__(model.Model)
+    m._controller_runtime_telemetry = {}
+    m._controller_observed_transactions = [
+        {"transaction_id": "tx-a", "callback_id": "7", "child_tasks": [], "verifier_ids": [], "proof_envelope_ids": [], "proof_lineage": []},
+        {"transaction_id": "tx-b", "callback_id": "7", "child_tasks": [], "verifier_ids": [], "proof_envelope_ids": [], "proof_lineage": []},
+    ]
+    for event in [
+        {"transaction_id": "tx-a", "task_id": "41", "callback_id": "7", "tool_name": "shell", "status": "started"},
+        {"transaction_id": "tx-a", "task_id": "41", "callback_id": "7", "tool_name": "shell", "status": "completed", "terminal_status": "completed"},
+        {"transaction_id": "tx-b", "task_id": "42", "callback_id": "7", "tool_name": "upload", "status": "started"},
+        {"transaction_id": "tx-b", "task_id": "42", "callback_id": "7", "tool_name": "upload", "status": "completed", "terminal_status": "completed"},
+        {"transaction_id": "", "task_id": "99", "callback_id": "7", "tool_name": "shell", "status": "completed"},
+        {"transaction_id": "tx-c", "task_id": "100", "callback_id": "7", "tool_name": "shell", "status": "completed"},
+    ]:
+        m._controller_update_transaction_task_lineage(event)
+
+    assert m._controller_observed_transactions[0]["child_tasks"] == [{
+        "task_id": "41",
+        "command": "shell",
+        "terminal_status": "completed",
+        "artifact_ids": [],
+    }]
+    assert m._controller_observed_transactions[1]["child_tasks"] == [{
+        "task_id": "42",
+        "command": "upload",
+        "terminal_status": "completed",
+        "artifact_ids": [],
+    }]
+
+
 def test_capability_inputs_ignore_dead_callback_scoped_context_fallback():
     """A stale achieved Kerberos context must not retarget a fresh capability to a dead callback."""
     from ai.langgraph import capabilities as cap
@@ -1932,3 +1963,120 @@ def test_controller_flag_on_by_default_with_explicit_rollback():
         os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
         if saved is not None:
             os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved
+
+
+def test_controller_runs_inside_offensive_mcp_context_and_resets_it():
+    from ai import mcp as mcpmod
+
+    m = object.__new__(model.Model)
+    observed = []
+
+    async def _kernel(_prompt):
+        observed.append(mcpmod.MCPManager.current_execution_context())
+        return "done"
+
+    m._run_autonomous_controller_kernel = _kernel
+
+    assert mcpmod.MCPManager.current_execution_context() == mcpmod.MCP_EXECUTION_CONTEXT_GENERAL
+    assert asyncio.run(m._run_autonomous_controller("objective")) == "done"
+    assert observed == [mcpmod.MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME]
+    assert mcpmod.MCPManager.current_execution_context() == mcpmod.MCP_EXECUTION_CONTEXT_GENERAL
+
+
+def test_legacy_autonomous_executor_runs_inside_offensive_mcp_context_and_resets_it():
+    from ai import mcp as mcpmod
+
+    observed = []
+
+    class FakeMythic:
+        async def execute_capability(self, action, _inputs):
+            observed.append(mcpmod.MCPManager.current_execution_context())
+            return json.dumps({
+                "ok": True,
+                "verdict": "achieved",
+                "capability": action["name"],
+                "issued": [],
+                "recorded_effects": [],
+            })
+
+    m = object.__new__(model.Model)
+    m.mythic_client = FakeMythic()
+    m._message_seq = 0
+    m.state = {"_message_seq": 0}
+
+    async def _open(*_args, **_kwargs):
+        return None
+
+    async def _close(*_args, **_kwargs):
+        return None
+
+    m._open_execution_activity = _open
+    m._close_execution_activity = _close
+    action = {
+        "name": "test-capability",
+        "target": "test-target",
+        "preconditions": [],
+        "effects": [],
+        "intent": {"capability": "test-capability"},
+        "verifier": {},
+        "reason": "boundary test",
+        "source_facts": [],
+    }
+    instruction = (
+        "AUTONOMOUS STEP DRIVER: boundary test\n"
+        f"`action={json.dumps(action, sort_keys=True)}`\n"
+        '`inputs={"callback_id": "3"}`'
+    )
+    state = {
+        "messages": [],
+        "supervisor_messages": [],
+        "mythic_operator_messages": [],
+        "bloodhound_messages": [],
+        "autonomous_executor_messages": [model.HumanMessage(content=instruction)],
+    }
+
+    assert mcpmod.MCPManager.current_execution_context() == mcpmod.MCP_EXECUTION_CONTEXT_GENERAL
+    asyncio.run(m._autonomous_executor_node(state))
+    assert observed == [mcpmod.MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME]
+    assert mcpmod.MCPManager.current_execution_context() == mcpmod.MCP_EXECUTION_CONTEXT_GENERAL
+
+
+def test_autonomous_agent_topology_excludes_generic_mcp_handoff_and_tools(monkeypatch):
+    captured = {}
+
+    class FakeRunnable:
+        async def ainvoke(self, _state, _config=None):
+            return {"messages": []}
+
+    def fake_create_agent(**kwargs):
+        captured[kwargs["name"]] = [getattr(tool, "name", "") for tool in kwargs["tools"]]
+        return FakeRunnable()
+
+    generic_tool = type("GenericMCPTool", (), {"name": "generic_external_probe"})()
+    monkeypatch.setattr(model, "create_agent", fake_create_agent)
+    monkeypatch.setattr(model, "load_prompt", lambda *_args, **_kwargs: "prompt")
+    monkeypatch.setattr(model, "filter_tools_by_frontmatter", lambda _agent, tools: list(tools))
+    monkeypatch.setattr(model.prompt_context, "servers_text", lambda _model: "")
+    monkeypatch.setattr(model.MCPManager, "get_connected_servers", lambda: ["generic-control-plane"])
+    monkeypatch.setattr(model.MCPManager, "is_bloodhound_server", lambda _name: False)
+    monkeypatch.setattr(model.MCPManager, "get_tools_by_server", lambda _name: [generic_tool])
+
+    def build(autonomous):
+        captured.clear()
+        m = object.__new__(model.Model)
+        m._autonomous_solve = autonomous
+        m.state = {"mcp_manager_messages": [], "supervisor_messages": []}
+        m._get_base_chat_model = lambda: object()
+        m._context_middleware = lambda: []
+        m._autonomous_handoff_step_redirect = lambda *_args, **_kwargs: None
+        m._mcp_manager_agent()
+        m._supervisor_agent()
+        return {name: list(tools) for name, tools in captured.items()}
+
+    autonomous = build(True)
+    conversational = build(False)
+
+    assert "generic_external_probe" not in autonomous["MCP_Manager"]
+    assert "transfer_to_MCP_Manager" not in autonomous["Supervisor"]
+    assert "generic_external_probe" in conversational["MCP_Manager"]
+    assert "transfer_to_MCP_Manager" in conversational["Supervisor"]

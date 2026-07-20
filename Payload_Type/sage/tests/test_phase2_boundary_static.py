@@ -3,16 +3,11 @@ from pathlib import Path
 
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_FILES = [
-    SAGE_ROOT / "ai" / "langgraph" / "model.py",
-    SAGE_ROOT / "ai" / "langgraph" / "mythic_tools.py",
-    SAGE_ROOT / "ai" / "langgraph" / "engagement_state.py",
-    SAGE_ROOT / "ai" / "langgraph" / "capabilities.py",
-    SAGE_ROOT / "ai" / "langgraph" / "graph_reconciler.py",
-    SAGE_ROOT / "ai" / "langgraph" / "state_reconcile.py",
-    SAGE_ROOT / "ai" / "langgraph" / "task_reconciler.py",
-    SAGE_ROOT / "ai" / "langgraph" / "adcs_certificate_materializer.py",
-]
+RUNTIME_FILES = sorted((SAGE_ROOT / "ai").glob("*.py")) + sorted(
+    (SAGE_ROOT / "ai" / "langgraph").rglob("*.py")
+) + sorted((SAGE_ROOT / "ai" / "trajectory").rglob("*.py")) + sorted(
+    (SAGE_ROOT / "sage_chat").rglob("*.py")
+)
 
 
 def _imports(path: Path) -> set[str]:
@@ -40,7 +35,7 @@ def test_runtime_modules_do_not_import_target_protocol_clients():
     for path in RUNTIME_FILES:
         hits = sorted(name for name in _imports(path) if name.split(".", 1)[0] in forbidden)
         if hits:
-            violations[path.name] = hits
+            violations[str(path.relative_to(SAGE_ROOT))] = hits
     assert violations == {}
 
 
@@ -54,7 +49,7 @@ def test_runtime_modules_do_not_import_evaluator_or_referee_packages():
             if any(fragment in name.casefold() for fragment in forbidden_fragments)
         )
         if hits:
-            violations[path.name] = hits
+            violations[str(path.relative_to(SAGE_ROOT))] = hits
     assert violations == {}
 
 

@@ -16,7 +16,8 @@ import hashlib
 import os
 from pathlib import Path
 import re
-from typing import Any
+import stat
+from typing import Any, Callable
 
 
 @dataclass
@@ -75,14 +76,26 @@ def persist_verified_ca_pfx_artifact(
     if declared_sha256 and declared_sha256 != sha256:
         return {}
 
+    ca_host = _canonical_ca_host(ca_host, domain)
+    domain = _normalize(domain)
+    if not ca_host or not domain:
+        return {}
     artifact_root = Path(artifact_dir)
-    artifact_root.mkdir(parents=True, exist_ok=True)
+    _ensure_private_artifact_dir(artifact_root)
     slug = _slug("_".join(
-        part for part in (engagement_key, _host_short(ca_host), _normalize(domain), sha256[:16]) if part
+        part for part in (engagement_key, ca_host, domain, sha256[:16]) if part
     ))
     path = artifact_root / f"adcs_ca_signing_{slug}.pfx"
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
-        path.write_bytes(blob)
+    if path.exists():
+        info = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+            return {}
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            path.chmod(0o600)
+    else:
+        _write_private_file(path, blob)
+    if not _safe_owned_path(path, directory=False, mode=0o600) or _file_sha256(path) != sha256:
+        return {}
     return {
         "pfx_artifact_path": str(path),
         "pfx_artifact_id": artifact_id,
@@ -103,6 +116,7 @@ def materialize_adcs_certificate_auth(
     account_sid: str = "",
     sid_extension_encoding: str = "utf8",
     ca_pfx_password: str = "",
+    ca_pfx_password_resolver: Callable[[str, str], str] | None = None,
     forged_pfx_password: str = "",
     remote_ca_pfx_path: str = "",
     remote_forged_pfx_path: str = "",
@@ -117,7 +131,7 @@ def materialize_adcs_certificate_auth(
 
     domain = _normalize(domain)
     account = _normalize(account) or "administrator"
-    ca_host = _host_short(ca_host)
+    ca_host = _canonical_ca_host(ca_host, domain)
     callback_id = _normalize_callback(callback_id)
     missing = []
     if not domain:
@@ -146,6 +160,7 @@ def materialize_adcs_certificate_auth(
         current_callback_id=callback_id,
         certificate_slug=slug,
         explicit_password=ca_pfx_password,
+        password_resolver=ca_pfx_password_resolver,
         caps_module=_caps,
     )
     forged_pfx_password = forged_pfx_password or _caps.artifact_secret("SageCert", slug)
@@ -251,8 +266,10 @@ def resolve_verified_ca_pfx_artifact(
     engagement_key: str = "",
 ) -> tuple[Path | None, dict[str, Any], str]:
     """Return a verified CA PFX plus the exact password required by payload tooling."""
-    ca_host = _host_short(ca_host)
     domain = _normalize(domain)
+    ca_host = _canonical_ca_host(ca_host, domain)
+    if not ca_host or not domain:
+        return None, {}, ""
     effect = _ca_effect(ca_host, domain)
     for hop in reversed(list(ledger.get("hops") or [])):
         if not isinstance(hop, dict):
@@ -290,8 +307,10 @@ def resolve_verified_ca_artifact(
     subject_hint: str = "",
     engagement_key: str = "",
 ) -> tuple[Path | None, dict[str, Any]]:
-    ca_host = _host_short(ca_host)
     domain = _normalize(domain)
+    ca_host = _canonical_ca_host(ca_host, domain)
+    if not ca_host or not domain:
+        return None, {}
     effect = _ca_effect(ca_host, domain)
     for hop in reversed(list(ledger.get("hops") or [])):
         if not isinstance(hop, dict):
@@ -430,19 +449,25 @@ def _admitted_ca_artifact_proof(hop: dict[str, Any], engagement_key: str):
 
 def _safe_artifact_path(path: Path, artifact_dir: Path) -> bool:
     try:
-        root = artifact_dir.resolve(strict=True)
-        candidate = path.resolve(strict=True)
-        candidate.relative_to(root)
-        if not candidate.is_file() or path.is_symlink():
+        root = artifact_dir.absolute()
+        candidate = path.absolute()
+        if not _safe_owned_path(root, directory=True, mode=0o700) or not _safe_owned_path(candidate, directory=False, mode=0o600):
             return False
-        current = path.parent
-        while current != artifact_dir and current != current.parent:
-            if current.is_symlink():
+        candidate.resolve(strict=True).relative_to(root.resolve(strict=True))
+        current = candidate.parent
+        while current != root and current != current.parent:
+            if not _safe_owned_path(current, directory=True, mode=0o700):
                 return False
             current = current.parent
         return True
     except Exception:
         return False
+
+
+def _safe_owned_path(path: Path, *, directory: bool, mode: int) -> bool:
+    info = path.lstat()
+    kind_ok = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    return kind_ok and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == mode
 
 
 def _verified_artifact_candidates(evidence: dict[str, Any], artifact_dir: Path) -> list[Path]:
@@ -534,6 +559,7 @@ def _ca_pfx_password_values(
     current_callback_id: str,
     certificate_slug: str,
     explicit_password: str,
+    password_resolver: Callable[[str, str], str] | None,
     caps_module: Any,
 ) -> list[str]:
     values: list[str] = []
@@ -545,22 +571,9 @@ def _ca_pfx_password_values(
 
     add(explicit_password)
     add(os.environ.get("SAGE_ADCS_CA_PFX_PASSWORD"))
-    effect = _ca_effect(ca_host, domain)
-    for hop in reversed(list(ledger.get("hops") or [])):
-        if not isinstance(hop, dict):
-            continue
-        effects = {str(hop.get("effect") or "").casefold()}
-        effects.update(str(item or "").casefold() for item in hop.get("satisfied_effects") or [])
-        if effect not in effects:
-            continue
-        for callback_id in _hop_callback_ids(hop):
-            add(caps_module.artifact_secret("SagePfx", _slug("_".join(part for part in (ca_host, callback_id) if part))))
-        break
-    add(caps_module.artifact_secret("SagePfx", _slug("_".join(part for part in (ca_host, current_callback_id) if part))))
-    add(caps_module.artifact_secret("SagePfx", _slug(ca_host)))
-    # Backward-compatible candidates for older exported artifacts and prior materializer defaults.
-    add(caps_module.artifact_secret("SageCA", certificate_slug))
-    add(caps_module.artifact_secret("SageCA"))
+    del ledger, current_callback_id, certificate_slug, caps_module
+    if callable(password_resolver):
+        add(password_resolver(ca_host, domain))
     return values
 
 
@@ -609,7 +622,9 @@ def _pfx_password_text_candidates(value: str | list[str] | tuple[str, ...] | set
 
 
 def _ca_effect(ca_host: str, domain: str) -> str:
-    return f"adcs-ca-private-key:{_host_short(ca_host)}@{_normalize(domain)}"
+    canonical_host = _canonical_ca_host(ca_host, domain)
+    target_domain = _normalize(domain)
+    return f"adcs-ca-private-key:{canonical_host}@{target_domain}" if canonical_host and target_domain else ""
 
 
 def _host_short(value: Any) -> str:
@@ -621,6 +636,41 @@ def _host_short(value: Any) -> str:
     if text.endswith("$"):
         text = text[:-1]
     return text.split(".", 1)[0].strip()
+
+
+def _canonical_ca_host(value: Any, domain: Any) -> str:
+    try:
+        try:
+            from . import capabilities
+        except ImportError:
+            import capabilities
+        return capabilities.canonical_host_for_domain(value, domain)
+    except Exception:
+        return ""
+
+
+def _ensure_private_artifact_dir(path: Path) -> None:
+    if not path.exists():
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("artifact directory is unsafe")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        path.chmod(0o700)
+
+
+def _write_private_file(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("artifact write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _normalize_callback(value: Any) -> str:

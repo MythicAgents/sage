@@ -4250,7 +4250,7 @@ def _build_adcs_ca_private_key_export_execution_plan(
         or fields.get("target_domain")
         or fields.get("domain")
     )
-    target_host, inferred_domain = _host_domain_from_target(
+    raw_target_host = (
         _input_text(inputs, "target_host", "host", "computer", "target")
         or action.intent.get("target_host")
         or action.intent.get("host")
@@ -4260,8 +4260,10 @@ def _build_adcs_ca_private_key_export_execution_plan(
         or fields.get("host")
         or fields.get("computer")
     )
+    target_host, inferred_domain = _host_domain_from_target(raw_target_host)
     if not target_domain:
         target_domain = inferred_domain
+    target_host = canonical_host_for_domain(raw_target_host or target_host, target_domain)
     callback_id = _normalize_callback_id(
         _input_text(inputs, "callback_id", "callback", "callback_display_id")
         or action.intent.get("callback_id")
@@ -4290,6 +4292,8 @@ def _build_adcs_ca_private_key_export_execution_plan(
         missing.append("callback_id")
     if not password:
         missing.append("password")
+    if not _input_text(inputs, "pfx_password", "certificate_password"):
+        missing.append("pfx_password")
     if missing:
         return CapabilityExecutionPlan(
             False,
@@ -4302,7 +4306,7 @@ def _build_adcs_ca_private_key_export_execution_plan(
     pfx_path = _input_text(inputs, "pfx_path", "remote_pfx_path") or f"C:\\Windows\\Temp\\sage_ca_export_{slug}.pfx"
     metadata_path = _input_text(inputs, "metadata_path", "meta_path", "remote_metadata_path") or \
         f"C:\\Windows\\Temp\\sage_ca_export_{slug}.txt"
-    pfx_password = _input_text(inputs, "pfx_password", "certificate_password") or artifact_secret("SagePfx", slug)
+    pfx_password = _input_text(inputs, "pfx_password", "certificate_password")
     method = _normalize(_input_text(inputs, "adcs_ca_export_method", "ca_export_method", "export_method") or "certutil-backupkey")
     dpapi_methods = {"sharpdpapi", "dpapi", "machine-dpapi", "machine_dpapi"}
     certutil_methods = {"certutil", "certutil-backupkey", "certutil_backupkey", "ca-backup", "ca_backup"}
@@ -5302,7 +5306,7 @@ def _adcs_ca_private_key_export_action(
     callback_id: str,
 ) -> CapabilityAction:
     target_domain = _normalize(target_domain)
-    target_host = _normalize(_host_short(target_host))
+    target_host = canonical_host_for_domain(target_host, target_domain)
     callback_id = _normalize_callback_id(callback_id)
     remote_exec_effect = _remote_exec_effect(target_host, target_domain)
     local_admin_effect = _local_admin_effect(target_host, target_domain)
@@ -5361,7 +5365,7 @@ def _adcs_esc_certificate_enroll_action(
     callback_id: str,
 ) -> CapabilityAction:
     target_domain = _normalize(target_domain)
-    ca_host = _normalize(_host_short(ca_host))
+    ca_host = canonical_host_for_domain(ca_host, target_domain)
     account = _normalize(account) or "administrator"
     callback_id = _normalize_callback_id(callback_id)
     effect = _adcs_enrolled_certificate_effect(account, target_domain)
@@ -5417,7 +5421,7 @@ def _adcs_certificate_auth_action(
     callback_id: str,
 ) -> CapabilityAction:
     target_domain = _normalize(target_domain)
-    ca_host = _normalize(_host_short(ca_host))
+    ca_host = canonical_host_for_domain(ca_host, target_domain)
     account = _normalize(account) or "administrator"
     callback_id = _normalize_callback_id(callback_id)
     ca_key_effect = _adcs_ca_private_key_effect(ca_host, target_domain)
@@ -6216,8 +6220,8 @@ def _adcs_ca_private_key_effect_targets(predicates: set[str]) -> list[tuple[str,
             continue
         tail = predicate[len(prefix):]
         target, sep, domain = tail.partition("@")
-        host = _normalize(_host_short(target))
         domain = _normalize(domain)
+        host = canonical_host_for_domain(target, domain)
         if sep and host and domain:
             targets.add((domain, host))
     return sorted(targets)
@@ -6327,7 +6331,7 @@ def _adcs_ca_private_key_blocked_targets(state: Any) -> set[tuple[str, str]]:
             effect,
         ):
             fields = _target_fields(candidate)
-            host = _host_short(
+            raw_host = (
                 evidence.get("target_host")
                 or evidence.get("host")
                 or fields.get("target")
@@ -6335,6 +6339,7 @@ def _adcs_ca_private_key_blocked_targets(state: Any) -> set[tuple[str, str]]:
                 or fields.get("host")
                 or fields.get("computer")
             )
+            host = _host_short(raw_host)
             domain = _normalize(
                 evidence.get("target_domain")
                 or evidence.get("domain")
@@ -6346,10 +6351,12 @@ def _adcs_ca_private_key_blocked_targets(state: Any) -> set[tuple[str, str]]:
             if (not host or not domain) and "@" in _text(candidate):
                 tail = _normalize(_text(candidate)).rsplit(":", 1)[-1]
                 effect_host, _, effect_domain = tail.partition("@")
+                raw_host = raw_host or effect_host
                 host = host or _host_short(effect_host)
                 domain = domain or _normalize(effect_domain)
-            if host and domain:
-                out.add((domain, _normalize(_host_short(host))))
+            canonical_host = canonical_host_for_domain(raw_host or host, domain)
+            if canonical_host and domain:
+                out.add((domain, canonical_host))
     return out
 
 
@@ -6700,7 +6707,9 @@ def _endpoint_protection_adjusted_effect(target_host: str, target_domain: str) -
 
 
 def _adcs_ca_private_key_effect(target_host: str, target_domain: str) -> str:
-    return f"adcs-ca-private-key:{_normalize(_host_short(target_host))}@{_normalize(target_domain)}"
+    host = canonical_host_for_domain(target_host, target_domain)
+    domain = _normalize(target_domain)
+    return f"adcs-ca-private-key:{host}@{domain}" if host and domain else ""
 
 
 def _adcs_enrolled_certificate_effect(account: str, target_domain: str) -> str:
@@ -7487,6 +7496,36 @@ def _host_fqdn(host: Any, domain: Any) -> str:
     if "." in host_text or not domain_text:
         return host_text
     return f"{host_text}.{domain_text}"
+
+
+def canonical_host_for_domain(host: Any, domain: Any) -> str:
+    """Return a single-label host when ``host`` is valid for ``domain``; else ``""``."""
+    host_text = _normalize_dns_name(host)
+    domain_text = _normalize_dns_name(domain)
+    if not host_text or not domain_text:
+        return ""
+    host_parts = host_text.split(".")
+    domain_parts = domain_text.split(".")
+    if len(host_parts) == 1:
+        return host_parts[0]
+    if len(host_parts) != len(domain_parts) + 1:
+        return ""
+    if host_parts[1:] != domain_parts:
+        return ""
+    return host_parts[0]
+
+
+def _normalize_dns_name(value: Any) -> str:
+    text = str(value or "").strip().casefold()
+    if not text or text.startswith(".") or text.endswith(".") or ".." in text or any(ch.isspace() for ch in text):
+        return ""
+    labels = text.split(".")
+    if not labels:
+        return ""
+    for label in labels:
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            return ""
+    return ".".join(labels)
 
 
 def _unc_from_windows_path(host: Any, domain: Any, path: Any) -> str:

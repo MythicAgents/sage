@@ -507,6 +507,25 @@ def extract_runtime_telemetry(messages: list[dict[str, Any]]) -> dict[str, Any]:
     return {}
 
 
+def evaluator_result_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the allowlisted evaluator view; the normal full result remains untouched."""
+    import sys
+
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai.hillclimb.evaluator_evidence import project_identifier, project_runtime_telemetry
+
+    return {
+        "schema": "native-chat-evaluator-result-v1",
+        "chat_channel_id": project_identifier(result.get("chat_channel_id")),
+        "chat_request_id": project_identifier(result.get("chat_request_id")),
+        "status": project_identifier(result.get("status"), casefold=True),
+        "error_present": bool(result.get("error")),
+        "evaluator_evidence": project_runtime_telemetry(result.get("runtime_telemetry")),
+    }
+
+
 async def run_native_chat_turn(
     client: Any,
     prompt: str,
@@ -578,6 +597,8 @@ async def _run(args: argparse.Namespace) -> int:
             api_token_id=args.api_token_id,
             use_prepared_channel=not args.new_channel,
         )
+        if args.output_mode == "eval":
+            result = evaluator_result_view(result)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0
 
@@ -601,6 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=int, default=1800)
     run.add_argument("--poll-interval", type=float, default=5.0)
     run.add_argument("--channel-name")
+    run.add_argument(
+        "--output-mode",
+        choices=("full", "eval"),
+        default="full",
+        help="Return full operator-visible messages (default) or only allowlisted evaluator evidence.",
+    )
     run.add_argument(
         "--new-channel",
         action="store_true",

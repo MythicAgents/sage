@@ -5748,6 +5748,37 @@ class MythicTools:
             import capabilities as _caps
         return _caps.artifact_secret(prefix, slug)
 
+    def _canonical_adcs_host(self, host, domain) -> str:
+        try:
+            try:
+                from . import capabilities as _caps
+            except ImportError:
+                import capabilities as _caps
+            return _caps.canonical_host_for_domain(host, domain)
+        except Exception:
+            return ""
+
+    def _resolve_adcs_ca_pfx_password(self, ca_host: str, domain: str) -> str:
+        """Return the durable engagement-scoped CA export password for one canonical CA host."""
+        try:
+            try:
+                from . import artifact_secrets
+            except ImportError:
+                import artifact_secrets
+            canonical_host = self._canonical_adcs_host(ca_host, domain)
+            target_domain = self._capability_text(domain).casefold()
+            if not canonical_host or not target_domain:
+                return ""
+            return artifact_secrets.derive_password(
+                _engagement_state_dir(),
+                engagement_id=self._eng_key(),
+                purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE,
+                canonical_host=canonical_host,
+                domain=target_domain,
+            )
+        except Exception:
+            return ""
+
     def _persist_adcs_ca_export_artifact(self, output: str, target_host: str, target_domain: str) -> dict[str, str]:
         """Persist raw CA PFX output before the durable probe drops its base64 bytes."""
         if not target_host or not target_domain:
@@ -6600,6 +6631,39 @@ class MythicTools:
             except Exception:
                 pass
 
+    def _register_capability_command_context(self, action, inputs: dict, command_obj) -> None:
+        command_name = self._capability_text(getattr(command_obj, "command", ""))
+        command_params = getattr(command_obj, "parameters", {})
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        context = {
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "target": self._capability_text(getattr(action, "target", "")),
+            "effects": list(getattr(action, "effects", []) or []),
+            "intent": dict(intent),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "runtime_inputs": self._safe_capability_runtime_context(inputs),
+            "operation": self._capability_text(getattr(command_obj, "operation", "")),
+            "purpose": self._capability_text(getattr(command_obj, "purpose", "")),
+            "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
+            "produces": list(getattr(command_obj, "produces", []) or []),
+            "consumes": list(getattr(command_obj, "consumes", []) or []),
+            "policy_decision": (
+                dict(inputs.get("policy_decision"))
+                if isinstance(inputs.get("policy_decision"), dict)
+                else dict(intent.get("policy_decision") or {})
+            ),
+            "transaction_id": self._capability_text(
+                inputs.get("transaction_id") or intent.get("transaction_id")
+            ),
+        }
+        self._deterministic_capability_command_contexts[
+            _capability_command_key(command_name, command_params)
+        ] = context
+        key = _ticket_command_key(command_name, command_params)
+        if key:
+            self._deterministic_ticket_command_keys.add(key)
+            self._deterministic_ticket_command_contexts[key] = context
+
     def build_capability_execution_plan(self, action, inputs: dict | None = None):
         """Build deterministic, payload-agnostic execution steps for a capability action."""
         try:
@@ -6706,40 +6770,7 @@ class MythicTools:
             adapter_config = input_values.get("mythic_adapter") if isinstance(input_values.get("mythic_adapter"), dict) else input_values
             command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
             for command_obj in list(getattr(command_plan, "commands", []) or []):
-                command_name = self._capability_text(getattr(command_obj, "command", ""))
-                command_params = getattr(command_obj, "parameters", {})
-                command_context = {
-                    "capability": self._capability_text(getattr(action_obj, "name", "")),
-                    "target": self._capability_text(getattr(action_obj, "target", "")),
-                    "effects": list(getattr(action_obj, "effects", []) or []),
-                    "intent": dict(getattr(action_obj, "intent", {}) or {}),
-                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
-                    "runtime_inputs": self._safe_capability_runtime_context(input_values),
-                    "operation": self._capability_text(getattr(command_obj, "operation", "")),
-                    "purpose": self._capability_text(getattr(command_obj, "purpose", "")),
-                    "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
-                    "produces": list(getattr(command_obj, "produces", []) or []),
-                    "consumes": list(getattr(command_obj, "consumes", []) or []),
-                    "policy_decision": (
-                        dict(input_values.get("policy_decision"))
-                        if isinstance(input_values.get("policy_decision"), dict)
-                        else dict((getattr(action_obj, "intent", {}) or {}).get("policy_decision") or {})
-                    ),
-                    "transaction_id": self._capability_text(
-                        input_values.get("transaction_id")
-                        or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
-                    ),
-                }
-                self._deterministic_capability_command_contexts[
-                    _capability_command_key(command_name, command_params)
-                ] = command_context
-                key = _ticket_command_key(
-                    command_name,
-                    command_params,
-                )
-                if key:
-                    self._deterministic_ticket_command_keys.add(key)
-                    self._deterministic_ticket_command_contexts[key] = command_context
+                self._register_capability_command_context(action_obj, input_values, command_obj)
             return json.dumps(
                 self._capability_command_plan_payload(action_obj, execution_plan, command_plan),
                 sort_keys=True,
@@ -7760,6 +7791,16 @@ class MythicTools:
                 import engagement_ledger
 
             input_values = self._capability_tool_inputs(inputs)
+            ambient_visibility = _task_visibility_context.get() or {}
+            if not self._capability_text(input_values.get("transaction_id")):
+                ambient_transaction_id = self._capability_text(ambient_visibility.get("transaction_id"))
+                if ambient_transaction_id:
+                    input_values["transaction_id"] = ambient_transaction_id
+            if (
+                not isinstance(input_values.get("policy_decision"), dict)
+                and isinstance(ambient_visibility.get("policy_decision"), dict)
+            ):
+                input_values["policy_decision"] = dict(ambient_visibility.get("policy_decision") or {})
             action_obj = self._capability_tool_action(action, input_values, capabilities)
             if action_obj is None:
                 return json.dumps({
@@ -7768,6 +7809,7 @@ class MythicTools:
                     "reason": "materialize_capability_inputs needs a capability action",
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             capability = self._capability_text(getattr(action_obj, "name", "")).casefold()
             if capability != "adcs-certificate-auth":
                 return json.dumps({
@@ -7863,6 +7905,7 @@ class MythicTools:
                 account_sid=account_sid,
                 sid_extension_encoding=sid_extension_encoding,
                 ca_pfx_password=ca_password,
+                ca_pfx_password_resolver=self._resolve_adcs_ca_pfx_password,
                 forged_pfx_password=forged_password,
                 remote_ca_pfx_path=remote_ca_path,
                 remote_forged_pfx_path=remote_path,
@@ -7936,6 +7979,26 @@ class MythicTools:
             except (TypeError, ValueError):
                 timeout = None
             self._last_issued_task_display_id = None
+            upload_visibility_context = dict(_task_visibility_context.get() or {})
+            upload_visibility_context.update({
+                "capability": capability,
+                "purpose": "stage verified CA PFX for certificate authentication",
+                "policy_decision": (
+                    dict(merged_inputs.get("policy_decision"))
+                    if isinstance(merged_inputs.get("policy_decision"), dict)
+                    else dict(
+                        (getattr(action_obj, "intent", {}) or {}).get("policy_decision")
+                        or upload_visibility_context.get("policy_decision")
+                        or {}
+                    )
+                ),
+                "transaction_id": self._capability_text(
+                    merged_inputs.get("transaction_id")
+                    or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                    or upload_visibility_context.get("transaction_id")
+                ),
+            })
+            upload_visibility_token = _task_visibility_context.set(upload_visibility_context)
             try:
                 upload_output = await self.upload_file_by_file_uuid(
                     upload_command,
@@ -7951,6 +8014,8 @@ class MythicTools:
                     "reason": f"CA PFX staging upload failed before task issue: {exc}",
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                 }, sort_keys=True)
+            finally:
+                _task_visibility_context.reset(upload_visibility_token)
             upload_task_id = self._last_issued_task_display_id
             upload_output_text = self._capability_text(upload_output)
             upload_result_class = command_builder.classify_result(upload_command, upload_output_text)
@@ -8115,6 +8180,8 @@ class MythicTools:
             )
             adapter_config = inputs.get("mythic_adapter") if isinstance(inputs.get("mythic_adapter"), dict) else inputs
             command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
+            for command_obj in list(getattr(command_plan, "commands", []) or []):
+                self._register_capability_command_context(action, inputs, command_obj)
             return self._capability_command_plan_payload(action, execution_plan, command_plan)
         except Exception as exc:
             return {
@@ -10291,6 +10358,8 @@ class MythicTools:
         fallback_inputs["_schannel_fallback_attempted"] = True
         fallback_inputs["certificate_auth_method"] = "schannel-ldap"
         fallback_inputs["preflight_existing_context"] = False
+        fallback_inputs["certificate_already_forged"] = True
+        fallback_inputs["skip_certificate_forge"] = True
         domain = (
             self._capability_target_domain(action, fallback_inputs)
             or self._capability_domain(action, fallback_inputs)
@@ -10885,24 +10954,22 @@ class MythicTools:
             "forged_certificate_password",
             "new_cert_password",
         }
-        redacted_text_keys = {
-            "commands",
-            "assembly_arguments",
-        }
         if isinstance(parameters, dict):
             out = {}
             for key, value in parameters.items():
                 key_text = self._capability_text(key)
                 if key_text.casefold() in opaque_secret_keys:
                     out[key] = "<secret>"
-                elif key_text.casefold() in redacted_text_keys:
-                    out[key] = self._capability_executor_redact_text(value)
-                elif isinstance(value, dict):
-                    out[key] = self._capability_executor_safe_parameters(value)
                 else:
-                    out[key] = value
+                    out[key] = self._capability_executor_safe_parameters(value)
             return out
-        return self._capability_executor_redact_text(parameters)
+        if isinstance(parameters, list):
+            return [self._capability_executor_safe_parameters(value) for value in parameters]
+        if isinstance(parameters, tuple):
+            return tuple(self._capability_executor_safe_parameters(value) for value in parameters)
+        if isinstance(parameters, str):
+            return self._capability_executor_redact_text(parameters)
+        return parameters
 
     def _capability_executor_output_preview(self, output, limit: int = 1000) -> str:
         text = self._capability_executor_redact_text(output)
@@ -10934,6 +11001,8 @@ class MythicTools:
             r"\1<secret>",
             text,
         )
+        text = re.sub(r"(?i)(\$pfxsecret\s*=\s*')((?:''|[^'])*)(')", r"\1<secret>\3", text)
+        text = re.sub(r"(?i)\bsagepfx-v1-[a-z0-9_-]+\b", "<secret>", text)
         text = re.sub(r"(?i)\b[0-9a-f]{64}\b", "<hex64_secret>", text)
         text = re.sub(r"(?i)\b[0-9a-f]{32}\b", "<hex32_secret>", text)
         return text
@@ -10954,6 +11023,16 @@ class MythicTools:
 
     def _canonical_capability_effect(self, effect) -> str:
         text = self._capability_text(effect).strip().casefold()
+        for prefix in ("adcs-ca-private-key:", "adcs-ca:", "adcs-ca-key-export-blocked:"):
+            if text.startswith(prefix):
+                tail = text[len(prefix):]
+                host, sep, domain = tail.partition("@")
+                if not sep:
+                    return text
+                canonical_host = self._canonical_adcs_host(host, domain)
+                if canonical_host and domain:
+                    return f"{prefix}{canonical_host}@{domain}"
+                return text
         if not text.startswith("creds:"):
             return text
         tail = text[len("creds:"):]
@@ -11012,7 +11091,7 @@ class MythicTools:
         }:
             return {}
 
-        target_host = self._capability_target_host(action, inputs)
+        target_host = self._capability_text(inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or getattr(action, "intent", {}).get("target_host") or getattr(action, "intent", {}).get("host") or getattr(action, "intent", {}).get("computer") or self._capability_target_host(action, inputs)).casefold()
         target_domain = (
             self._capability_managed_secret_target_domain(action, inputs)
             or self._capability_target_domain(action, inputs)
@@ -11020,6 +11099,8 @@ class MythicTools:
         )
         host = self._capability_host_short(target_host)
         domain = self._capability_text(target_domain).casefold()
+        if capability == "adcs-ca-private-key-export":
+            host = self._canonical_adcs_host(target_host, domain)
         if not host or not domain:
             return {}
 
@@ -11091,11 +11172,13 @@ class MythicTools:
             or self._capability_account_domain(action, inputs)
         )
         account = self._capability_account(action, inputs) or "administrator"
-        ca_host = self._capability_text(
+        raw_ca_host = self._capability_text(
             inputs.get("ca_host")
             or getattr(action, "intent", {}).get("ca_host")
             or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
         ).casefold()
+        explicit_ca_host = bool(raw_ca_host)
+        ca_host = self._canonical_adcs_host(raw_ca_host, domain)
         achieved = {self._canonical_capability_effect(item) for item in achieved_effects}
 
         enrolled_effect = f"adcs-enrolled-certificate:{account}@{domain}" if account and domain else ""
@@ -11103,7 +11186,7 @@ class MythicTools:
             inputs.setdefault("certificate_already_forged", True)
             return {}
 
-        if not ca_host and domain:
+        if not ca_host and domain and not explicit_ca_host:
             ca_hosts = sorted(self._capability_verified_ca_key_hosts(domain, achieved))
             if len(ca_hosts) == 1:
                 ca_host = ca_hosts[0]
@@ -11144,8 +11227,9 @@ class MythicTools:
             if not text.startswith(prefix) or not text.endswith(suffix):
                 continue
             host = text[len(prefix):-len(suffix)]
-            if host:
-                hosts.add(self._capability_host_short(host))
+            canonical_host = self._canonical_adcs_host(host, target_domain)
+            if canonical_host:
+                hosts.add(canonical_host)
         return hosts
 
     def _capability_input_bool(self, inputs: dict, key: str) -> bool:
@@ -11405,11 +11489,12 @@ class MythicTools:
             domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
             account = self._capability_account(action, inputs) or "administrator"
             callback_id = self._capability_callback_id(action, inputs)
-            ca_host = self._capability_text(
+            raw_ca_host = self._capability_text(
                 inputs.get("ca_host")
                 or getattr(action, "intent", {}).get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
             ).casefold()
+            ca_host = self._canonical_adcs_host(raw_ca_host, domain)
             if domain:
                 inputs["domain"] = domain
                 inputs["target_domain"] = domain
@@ -11448,11 +11533,12 @@ class MythicTools:
             account = self._capability_account(action, inputs) or "administrator"
             callback_id = self._capability_callback_id(action, inputs)
             intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-            ca_host = self._capability_text(
+            raw_ca_host = self._capability_text(
                 inputs.get("ca_host")
                 or intent.get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
             ).casefold()
+            ca_host = self._canonical_adcs_host(raw_ca_host, domain)
             if domain:
                 inputs["domain"] = domain
                 inputs["target_domain"] = domain
@@ -11559,10 +11645,11 @@ class MythicTools:
                     inputs["credential_account"] = credential.get("account")
             return
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_target_host(action, inputs)
+            target_host = self._capability_text(inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or getattr(action, "intent", {}).get("target_host") or getattr(action, "intent", {}).get("host") or getattr(action, "intent", {}).get("computer") or self._capability_target_host(action, inputs)).casefold()
             target_domain = self._capability_managed_secret_target_domain(action, inputs)
             callback_id = self._capability_callback_id(action, inputs)
             local_account = self._capability_local_account(action, inputs)
+            target_host = self._canonical_adcs_host(target_host, target_domain)
             if target_host:
                 inputs["target_host"] = target_host
             if target_domain:
@@ -11581,7 +11668,13 @@ class MythicTools:
             ):
                 inputs["metadata_path"] = f"C:\\Windows\\Temp\\sage_ca_export_{slug}.txt"
             if not self._capability_text(inputs.get("pfx_password") or inputs.get("certificate_password")):
-                inputs["pfx_password"] = self._artifact_secret("SagePfx", slug)
+                await self._ensure_engagement_key()
+                password = (
+                    self._capability_text(os.environ.get("SAGE_ADCS_CA_PFX_PASSWORD"))
+                    or self._resolve_adcs_ca_pfx_password(target_host, target_domain)
+                )
+                if password:
+                    inputs["pfx_password"] = password
             export_method = self._capability_text(
                 inputs.get("adcs_ca_export_method")
                 or inputs.get("ca_export_method")
@@ -12813,18 +12906,19 @@ class MythicTools:
                     target += f";callback={callback_id}"
                 return target
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_host_short(
+            raw_target_host = (
                 inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
                 or intent.get("target_host") or intent.get("host") or intent.get("computer")
             )
+            target_host = self._capability_host_short(raw_target_host)
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
             ).casefold()
             if not target_domain and target_host:
                 _, target_domain = self._capability_host_domain(
-                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
-                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                    raw_target_host
                 )
+            target_host = self._canonical_adcs_host(raw_target_host or target_host, target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -12841,7 +12935,8 @@ class MythicTools:
                 inputs.get("account") or inputs.get("user") or inputs.get("principal")
                 or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
             ).casefold()
-            ca_host = self._capability_host_short(inputs.get("ca_host") or inputs.get("target_host") or intent.get("ca_host") or intent.get("target_host"))
+            raw_ca_host = inputs.get("ca_host") or inputs.get("target_host") or intent.get("ca_host") or intent.get("target_host")
+            ca_host = self._canonical_adcs_host(raw_ca_host, target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -12860,7 +12955,7 @@ class MythicTools:
                 inputs.get("account") or inputs.get("user") or inputs.get("principal")
                 or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
             ).casefold()
-            ca_host = self._capability_host_short(inputs.get("ca_host") or intent.get("ca_host"))
+            ca_host = self._canonical_adcs_host(inputs.get("ca_host") or intent.get("ca_host"), target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -13014,18 +13109,19 @@ class MythicTools:
                     f"host-exec:{target_host}",
                 ]
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_host_short(
+            raw_target_host = (
                 inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
                 or intent.get("target_host") or intent.get("host") or intent.get("computer")
             )
+            target_host = self._capability_host_short(raw_target_host)
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
             ).casefold()
             if not target_domain and target_host:
                 _, target_domain = self._capability_host_domain(
-                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
-                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                    raw_target_host
                 )
+            target_host = self._canonical_adcs_host(raw_target_host or target_host, target_domain)
             if target_host and target_domain:
                 return [
                     f"adcs-ca-private-key:{target_host}@{target_domain}",

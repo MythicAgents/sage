@@ -28,6 +28,10 @@ Run the stock strict one-shot objective through a fresh locked AI channel:
 .venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400
 ```
 
+`--output-mode full` is the default and returns the complete operator-visible message record. Automated
+evaluation consumers may select `--output-mode eval` to receive only the versioned, positive-allowlist runtime
+evidence projection. Eval mode does not alter what Sage sees or what Mythic stores and displays.
+
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
 and messages. Use `--new-channel` to bypass a prepared channel. The helper configures autonomous mode explicitly.

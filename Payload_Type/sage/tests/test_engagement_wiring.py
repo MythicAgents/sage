@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import access_reconciler  # noqa: E402
 import adcs_certificate_materializer  # noqa: E402
+import artifact_secrets  # noqa: E402
 import capabilities  # noqa: E402
 import engagement_state  # noqa: E402
 import engagement_ledger  # noqa: E402
@@ -256,6 +257,7 @@ def _write_test_ca_artifact(path: Path) -> Path:
         .sign(key, hashes.SHA256())
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     path.write_bytes(
         key.private_bytes(
             serialization.Encoding.PEM,
@@ -264,6 +266,7 @@ def _write_test_ca_artifact(path: Path) -> Path:
         )
         + cert.public_bytes(serialization.Encoding.PEM)
     )
+    path.chmod(0o600)
     return path
 
 
@@ -288,6 +291,7 @@ def _write_test_ca_pfx(path: Path, password: str = "") -> Path:
             serialization.NoEncryption()
         ),
     ))
+    path.chmod(0o600)
     return path
 
 
@@ -5805,6 +5809,49 @@ def test_execute_capability_ensure_kerberos_context_preflights_without_key_or_si
     assert result["recorded_effects"] == ["kerberos-context:essos.local@callback:14"]
 
 
+def test_current_context_preflight_rebinds_identical_klist_to_active_transaction():
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    events = []
+    mt.set_execution_observer(events.append)
+    action = capabilities.CapabilityAction(
+        name="ensure-kerberos-context",
+        target="domain=lab.local;callback=14",
+        intent={"capability": "ensure-kerberos-context", "domain": "lab.local", "callback_id": "14"},
+    )
+    outputs = iter(["No tickets in current context.", "Access is denied."] * 2)
+
+    with _split_issue(lambda: next(outputs), display_id=9908):
+        first = asyncio.run(mt._execute_capability_current_context_preflight(
+            action,
+            {"domain": "lab.local", "callback_id": "14", "proof_resource": r"\\dc01.lab.local\C$", "transaction_id": "tx-a"},
+            14,
+            5,
+            capabilities,
+        ))
+        second = asyncio.run(mt._execute_capability_current_context_preflight(
+            action,
+            {"domain": "lab.local", "callback_id": "14", "proof_resource": r"\\dc02.lab.local\C$", "transaction_id": "tx-b"},
+            14,
+            5,
+            capabilities,
+        ))
+
+    started = [event for event in events if event["status"] == "started"]
+    terminal = [event for event in events if event["status"] in {"completed", "error"}]
+    assert first["status"] == second["status"] == "not_achieved"
+    assert [(event["parameters"], event["transaction_id"]) for event in started] == [
+        ("klist", "tx-a"),
+        (r"dir \\dc01.lab.local\C$", "tx-a"),
+        ("klist", "tx-b"),
+        (r"dir \\dc02.lab.local\C$", "tx-b"),
+    ]
+    assert [event["event_id"] for event in started] == [event["event_id"] for event in terminal]
+    assert [event["terminal_status"] for event in terminal] == ["completed", "failed", "completed", "failed"]
+    assert mt._engagement_hops == []
+
+
 def test_execute_capability_failure_includes_trajectory_repair(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_TRAJECTORY_STORE", str(tmp_path / "trajectory" / "runtime.jsonl"))
     mt = _make_tools()
@@ -6370,6 +6417,64 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     assert len(forge["parameters"]["arguments"].encode("utf-8")) <= 255
 
 
+def test_materialize_capability_inputs_upload_emits_active_transaction_lineage(monkeypatch):
+    state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
+    ca_artifact = _write_test_ca_pfx(state_dir / "artifacts" / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
+    engagement_ledger.save({"engagement_id": "test-op", "hops": [_ca_artifact_hop(ca_artifact)]}, "test-op")
+    mt = _make_tools()
+    mt._engagement_key = "test-op"
+    events = []
+    mt.set_execution_observer(events.append)
+
+    async def fake_register_file(filename, contents):
+        return "file-uuid-1"
+
+    async def fake_get_file_metadata(file_uuid):
+        return {
+            "agent_file_id": file_uuid,
+            "filename_utf8": ca_artifact.name,
+            "deleted": False,
+            "complete": True,
+            "chunks_received": 1,
+            "total_chunks": 1,
+        }
+
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_get_file_metadata", fake_get_file_metadata)
+    token = mythic_tools._task_visibility_context.set({
+        "transaction_id": "tx-adcs",
+        "policy_decision": {"decision_id": "decision-adcs"},
+    })
+    try:
+        with _split_issue("Uploaded forged PFX", display_id=9001):
+            materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
+                {
+                    "capability": "adcs-certificate-auth",
+                    "domain": "lab.local",
+                    "account": "administrator",
+                    "ca_host": "ca01",
+                    "callback_id": "13",
+                },
+                {"proof_host": "dc01.lab.local", "ca_pfx_password": "CA Secret!"},
+            )))
+    finally:
+        mythic_tools._task_visibility_context.reset(token)
+
+    assert materialized["ok"] is True
+    assert materialized["action"]["intent"]["transaction_id"] == "tx-adcs"
+    assert [event["transaction_id"] for event in events] == ["tx-adcs", "tx-adcs"]
+    assert [event["capability"] for event in events] == ["adcs-certificate-auth", "adcs-certificate-auth"]
+    assert [event["callback_id"] for event in events] == [13, 13]
+    assert events[0]["event_id"] == events[1]["event_id"] == "mythic-task:13:9001"
+    assert events[1]["terminal_status"] == "completed"
+    assert events[0]["parameters"] == {
+        "File": "file-uuid-1",
+        "Path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+    }
+    assert events[1]["output"] == "Uploaded forged PFX"
+    assert mt._engagement_hops == []
+
+
 def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issues_task(monkeypatch):
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
@@ -6516,6 +6621,105 @@ def test_execute_capability_adcs_certificate_auth_requires_verified_ca_key_befor
     assert calls["issue"] == 0
 
 
+@pytest.mark.parametrize(("ca_host", "missing"), [("ca01.lab.local", False), ("ca01.other.local", True), ("ca01.evil-lab.local", True), ("ca010.lab.local", True)])
+def test_adcs_ca_host_boundary_matches_only_exact_target_domain(ca_host, missing):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target=f"domain=lab.local;account=administrator;ca_host={ca_host};callback=13",
+        intent={"capability": "adcs-certificate-auth", "domain": "lab.local", "account": "administrator"},
+    )
+    failure = mt._capability_artifact_scoped_precondition_failure(
+        action, {"ca_host": ca_host}, {"adcs-ca-private-key:ca01@lab.local"}
+    )
+    assert (failure == {}) is (not missing)
+    assert ("ca_host" in failure.get("missing", [])) is (missing and ca_host != "ca010.lab.local")
+    assert ("adcs-ca-private-key:ca010@lab.local" in failure.get("missing", [])) is (ca_host == "ca010.lab.local")
+    assert ("adcs-ca-private-key:ca01@lab.local" in failure.get("missing", [])) is False
+
+
+def test_public_capability_summaries_redact_durable_ca_password(tmp_path):
+    secret = artifact_secrets.derive_password(tmp_path, engagement_id="test-op", purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE, canonical_host="ca01", domain="lab.local")
+    mt = _make_tools()
+    public = {"safe": mt._safe_capability_runtime_context({"ca_pfx_password": secret, "proof_host": "dc01.lab.local"}), "summary": mt._capability_executor_materialized_summary({"ok": True, "capability": "adcs-certificate-auth", "inputs": {"ca_pfx_password": secret}})}
+    assert secret not in json.dumps(public)
+    assert next((tmp_path / "secrets").glob("artifact_master_*.key")).read_bytes().hex() not in json.dumps(public)
+    issued = mt._capability_executor_public_issued([mt._capability_executor_command_item({}, "powerpick", {"commands": f"$pfxSecret='{secret}''x'; Write-Output $pfxSecret"}, 13, 1, "ok")])
+    assert secret not in json.dumps(issued)
+
+
+def test_public_executor_summary_redacts_encoded_adcs_commands_for_current_adapters():
+    mt = _make_tools()
+    secret = "SagePfx-v1-synthetic-secret"
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=lab.local;callback=8",
+        preconditions=["remote-exec:ca01@lab.local", "local-admin:ca01@lab.local", "live-callback:8"],
+        effects=["adcs-ca-private-key:ca01@lab.local", "adcs-ca:ca01@lab.local"],
+        intent={
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "Correct Horse Battery Staple!",
+        "pfx_password": secret,
+    })
+    apollo_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, mythic_capability_adapter.APOLLO_MYTHIC_ADAPTER)
+    merlin_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, mythic_capability_adapter.MERLIN_MYTHIC_ADAPTER)
+    powerpick_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, {
+        "adcs_ca_export_command": "powerpick",
+        "adcs_ca_export_use_current_context": True,
+    })
+    apollo, merlin, powerpick = apollo_plan.commands[1], merlin_plan.commands[1], powerpick_plan.commands[0]
+    encoded = [
+        apollo.parameters["command"].split("-EncodedCommand ", 1)[1],
+        merlin.parameters["arguments"].rsplit(" ", 1)[1],
+    ]
+    assert all(secret in base64.b64decode(value).decode("utf-16le") for value in encoded)
+    issued = [
+        mt._capability_executor_command_item(asdict(apollo), apollo.command, apollo.parameters, 13, 1, f"raw output {secret}"),
+        mt._capability_executor_command_item(asdict(merlin), merlin.command, merlin.parameters, 13, 2, "ok"),
+        mt._capability_executor_command_item(asdict(powerpick), powerpick.command, powerpick.parameters, 13, 3, "ok"),
+        mt._capability_executor_command_item({}, "shell", {"metadata": {"history": [("near_match", "SagePfx-v2-benign"), ("encoded", f"powershell.exe -EncodedCommand {encoded[0]}")], "short_blob": "YWJjZA==", "credential_text": secret}}, 13, 4, "ok"),
+    ]
+
+    public = mt._capability_executor_public_issued(issued)
+    rendered = json.dumps(public, sort_keys=True)
+    assert all(value not in rendered for value in encoded)
+    assert secret not in rendered
+    assert "<base64_blob>" in rendered
+    assert "<secret>" in rendered
+    assert public[2]["parameters"].count("<secret>") >= 1
+    assert public[3]["parameters"]["metadata"]["history"][0][1] == "SagePfx-v2-benign"
+    assert public[3]["parameters"]["metadata"]["short_blob"] == "YWJjZA=="
+    assert public[3]["parameters"]["metadata"]["credential_text"] == "<secret>"
+    assert all("_output" not in row for row in public)
+    assert issued[0]["_output"] == f"raw output {secret}"
+
+
+def test_mythic_execution_observer_preserves_raw_adcs_encoded_parameters_and_output():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+    secret = "SagePfx-v1-synthetic-secret"
+    script = "$pfxSecret='" + secret + "';" + ("Write-Output $pfxSecret;" * 8)
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    parameters = {"command": f"powershell.exe -EncodedCommand {encoded}"}
+    output = f"raw output {secret}"
+
+    with _split_issue(output, display_id=4242):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", parameters, 11))
+
+    assert result == output
+    assert events[0]["parameters"] == parameters
+    assert encoded in events[0]["parameters"]["command"]
+    assert events[1]["output"] == output
+    assert secret in events[1]["output"]
+
+
 def test_execute_capability_adcs_certificate_auth_materializes_and_records(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
@@ -6660,7 +6864,8 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
                 "target_domain": "lab.local",
                 "account": "administrator",
                 "callback_id": "13",
-                "certificate_already_forged": True,
+                "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+                "ca_pfx_password": "SagePfx!administrator_lab_local_13",
                 "forged_pfx_path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
                 "forged_pfx_password": "SageCert!administrator_lab_local_13",
                 "proof_host": "dc01.lab.local",
@@ -6670,6 +6875,7 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         }, sort_keys=True)
 
     monkeypatch.setattr(mt, "materialize_capability_inputs", fake_materialize)
+    forge_output = "Certify\nSaved forged certificate to 'C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx'.\n"
     schannel_output = "\n".join([
         "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
         "CERT_AUTH_METHOD=schannel-ldap",
@@ -6680,15 +6886,23 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
         "CERT_AUTH_STATUS=OK",
     ])
-    outputs = iter([
-        "No tickets in current context.",
-        "Access is denied.",
-        pkinit_failure,
-        schannel_output,
-    ])
     calls = {"issue": 0}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=9494):
+    def next_output():
+        issued = calls["issued"][-1]
+        command = issued["command_name"]
+        parameters = issued["parameters"]
+        if command == "shell":
+            return "No tickets in current context." if calls["issue"] == 1 else "Access is denied."
+        if command == "execute_assembly" and "forge --ca-cert" in parameters["assembly_arguments"]:
+            return forge_output
+        if command == "execute_assembly" and "asktgt " in parameters["assembly_arguments"]:
+            return pkinit_failure
+        if command == "powerpick":
+            return schannel_output
+        raise AssertionError(f"unexpected command during Schannel fallback: {command}")
+
+    with _split_issue(next_output, calls, display_id=9494):
         result = json.loads(asyncio.run(mt.execute_capability(
             {
                 "capability": "adcs-certificate-auth",
@@ -6703,7 +6917,13 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
     assert result["ok"] is True, result
     assert result["fallback"] == "schannel-ldap"
     assert result["stopped_after"] == "schannel_ldap_fallback_verified_proof"
-    assert calls["issue"] == 4
+    assert calls["issue"] == 5
+    assert sum(
+        1
+        for item in calls["issued"]
+        if item["command_name"] == "execute_assembly"
+        and "forge --ca-cert" in item["parameters"]["assembly_arguments"]
+    ) == 1
     assert result["issued"][-1]["command"] == "powerpick"
     assert result["issued"][-1]["fallback"] == "schannel-ldap"
     assert "$server='dc01.lab.local'" in result["issued"][-1]["parameters"]

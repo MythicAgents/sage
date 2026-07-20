@@ -2235,6 +2235,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_sharpdpapi_fallback():
     )
     execution_plan = capabilities.build_capability_execution_plan(action, {
         "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
         "adcs_ca_export_method": "sharpdpapi",
         "tool_file_uuid": "sharpdpapi-file-uuid",
     })

@@ -2,6 +2,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import pytest
 from langchain_core.tools import StructuredTool
 
 
@@ -146,3 +147,102 @@ def test_non_target_control_plane_is_the_canonical_allowed_mcp_class():
     assert mcpmod.MCP_EXECUTION_CLASS_CONTROL_PLANE == "non_target_control_plane"
     assert config.sage_execution_class == mcpmod.MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE
     assert mcpmod.execution_class_allowed(config.sage_execution_class) is True
+
+
+def test_offensive_runtime_denies_generic_mcp_before_outbound_coroutine():
+    manager = MCPServerManager()
+    calls = []
+
+    async def fetch_external(resource: str):
+        calls.append(resource)
+        return {"resource": resource}
+
+    manager.configs["control-plane"] = mcpmod.create_stdio_config(
+        name="control-plane",
+        command="python",
+        args=[],
+        env=None,
+        cwd=None,
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+    )
+    tool = StructuredTool.from_function(
+        coroutine=fetch_external,
+        name="fetch_external",
+        description="Fetch from a non-target control plane.",
+    )
+    wrapped = manager._wrap_tool_for_visibility("control-plane", tool)
+    token = manager.set_execution_context(mcpmod.MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME)
+    try:
+        with pytest.raises(PermissionError, match="permits only the canonical BloodHound"):
+            asyncio.run(wrapped.ainvoke({"resource": "status"}))
+    finally:
+        manager.reset_execution_context(token)
+
+    assert calls == []
+
+
+def test_offensive_runtime_allows_canonical_bloodhound_control_plane():
+    manager = MCPServerManager()
+    calls = []
+    directory = "/srv/bloodhound-mcp"
+    manager.configs["BloodHound"] = mcpmod.create_stdio_config(
+        name="BloodHound",
+        command="uv",
+        args=["--directory", directory, "run", "main.py"],
+        env={},
+        cwd=directory,
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+    )
+
+    async def cypher_query(query: str):
+        calls.append(query)
+        return {"rows": []}
+
+    tool = StructuredTool.from_function(
+        coroutine=cypher_query,
+        name="cypher_query",
+        description="Query the BloodHound graph.",
+    )
+    wrapped = manager._wrap_tool_for_visibility("BloodHound", tool)
+    token = manager.set_execution_context(mcpmod.MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME)
+    try:
+        result = asyncio.run(wrapped.ainvoke({"query": "MATCH (n) RETURN n LIMIT 1"}))
+    finally:
+        manager.reset_execution_context(token)
+
+    assert result == {"rows": []}
+    assert calls == ["MATCH (n) RETURN n LIMIT 1"]
+
+
+def test_caller_mislabeled_bloodhound_server_is_denied_before_session_side_effect(monkeypatch):
+    manager = MCPServerManager()
+    called = []
+
+    def _should_not_connect(_connection):
+        called.append(True)
+        raise AssertionError("session creation must not happen")
+
+    monkeypatch.setattr(mcpmod, "create_session", _should_not_connect)
+    config = mcpmod.create_stdio_config(
+        name="ldap-sidecar",
+        command="uv",
+        args=["--directory", "/srv/not-bloodhound", "run", "main.py"],
+        env={},
+        cwd="/srv/not-bloodhound",
+        encoding=None,
+        encoding_error_handler=None,
+        session_kwargs=None,
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+    )
+
+    ok, error = asyncio.run(manager.connect_server(config))
+
+    assert ok is False
+    assert "canonical BloodHound stdio configuration" in str(error)
+    assert called == []

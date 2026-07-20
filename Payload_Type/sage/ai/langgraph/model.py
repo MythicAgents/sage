@@ -34,7 +34,7 @@ from .mythic_tools import MythicTools, GUARDED_TOOLS
 from .tool_cache import ToolCache
 from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
 from . import prompt_context
-from ai.mcp import MCPManager
+from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -3069,9 +3069,16 @@ class Model:
                         "id": delegation_id,
                         "name": node_name,
                     })
+                execution_context_token = None
+                if bool(getattr(self, "_autonomous_solve", False)):
+                    execution_context_token = MCPManager.set_execution_context(
+                        MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+                    )
                 try:
                     result = await agent_runnable.ainvoke({"messages": _agent_input}, invoke_config)
                 finally:
+                    if execution_context_token is not None:
+                        MCPManager.reset_execution_context(execution_context_token)
                     if activity_token is not None:
                         MCPManager.reset_execution_activity(activity_token)
                 updated_channel = result.get("messages", channel)
@@ -4699,6 +4706,16 @@ class Model:
         return dict(getattr(self, "_controller_runtime_telemetry", {}) or {})
 
     async def _run_autonomous_controller(self, prompt: str) -> str:
+        """Run the controller under the fail-closed offensive MCP execution boundary."""
+        execution_context_token = MCPManager.set_execution_context(
+            MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+        )
+        try:
+            return await self._run_autonomous_controller_kernel(prompt)
+        finally:
+            MCPManager.reset_execution_context(execution_context_token)
+
+    async def _run_autonomous_controller_kernel(self, prompt: str) -> str:
         """Run the policy-selected AutonomousController execution kernel.
 
         The selected policy owns semantic capability choice. Deterministic code owns observe, execute, verify,
@@ -5766,6 +5783,9 @@ class Model:
                 instruction=f"Execute `{capability_name}` through the autonomous executor.",
             )
             activity_token = MCPManager.set_execution_activity(activity) if activity is not None else None
+            execution_context_token = MCPManager.set_execution_context(
+                MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+            )
             activity_status = "finished"
             activity_content = f"`{capability_name}` execution completed."
             try:
@@ -5775,6 +5795,7 @@ class Model:
                 activity_content = f"`{capability_name}` execution did not complete."
                 raise
             finally:
+                MCPManager.reset_execution_context(execution_context_token)
                 if activity_token is not None:
                     MCPManager.reset_execution_activity(activity_token)
                 await self._close_execution_activity(
@@ -6200,7 +6221,9 @@ class Model:
             self.state["mcp_manager_messages"].append(SystemMessage(content=prompt))
 
         # All connected MCP servers EXCEPT BloodHound (owned by the dedicated BloodHound agent).
-        other_servers = [s for s in MCPManager.get_connected_servers() if not MCPManager.is_bloodhound_server(s)]
+        other_servers = [] if self._autonomous_solve else [
+            s for s in MCPManager.get_connected_servers() if not MCPManager.is_bloodhound_server(s)
+        ]
         mcp_tools = []
         for s in other_servers:
             mcp_tools += MCPManager.get_tools_by_server(s)
@@ -6272,10 +6295,11 @@ class Model:
             assign_to_mythic_operator_agent,
             assign_to_mythic_payload_agent,
             assign_to_bloodhound_agent,
-            assign_to_mcp_manager_agent,
             respond_to_user_tool,
             request_continuation_tool,
         ]
+        if not self._autonomous_solve:
+            tools.insert(4, assign_to_mcp_manager_agent)
         tools = filter_tools_by_frontmatter("supervisor", tools)
 
         llm = self._get_base_chat_model()

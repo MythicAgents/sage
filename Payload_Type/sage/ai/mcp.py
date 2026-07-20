@@ -25,6 +25,8 @@ MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE = "non_target_control_plane"
 MCP_EXECUTION_CLASS_CONTROL_PLANE = MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE
 MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE = "bloodhound_control_plane"
 MCP_EXECUTION_CLASS_TARGET_FACING = "target_facing"
+MCP_EXECUTION_CONTEXT_GENERAL = "general"
+MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME = "offensive_runtime"
 ALLOWED_MCP_EXECUTION_CLASSES = frozenset({
     MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
     MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
@@ -50,6 +52,10 @@ _execution_observer: contextvars.ContextVar[Any] = contextvars.ContextVar(
 _execution_activity: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "sage_execution_activity",
     default=None,
+)
+_execution_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "sage_mcp_execution_context",
+    default=MCP_EXECUTION_CONTEXT_GENERAL,
 )
 
 
@@ -166,6 +172,21 @@ class MCPServerManager:
         activity = _execution_activity.get()
         return dict(activity) if isinstance(activity, dict) else None
 
+    def set_execution_context(self, execution_context: str):
+        """Bind the request-local MCP authorization context and return its reset token."""
+        if execution_context not in {
+            MCP_EXECUTION_CONTEXT_GENERAL,
+            MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME,
+        }:
+            raise ValueError(f"unsupported MCP execution context: {execution_context!r}")
+        return _execution_context.set(execution_context)
+
+    def reset_execution_context(self, token) -> None:
+        _execution_context.reset(token)
+
+    def current_execution_context(self) -> str:
+        return _execution_context.get()
+
     async def _notify_execution_observer(self, event: dict[str, Any]) -> None:
         observer = _execution_observer.get()
         if observer is None:
@@ -193,6 +214,14 @@ class MCPServerManager:
         manager = self
 
         async def _observed_coroutine(*args, **kwargs):
+            if (
+                manager.current_execution_context() == MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+                and not manager.is_bloodhound_server(server_name)
+            ):
+                raise PermissionError(
+                    f"MCP tool '{server_name}.{tool.name}' denied: offensive runtime permits only "
+                    "the canonical BloodHound control-plane server"
+                )
             manager._execution_seq += 1
             call_id = f"mcp:{server_name}:{tool.name}:{manager._execution_seq}"
             arguments = kwargs if kwargs else {"args": list(args)}
@@ -239,13 +268,23 @@ class MCPServerManager:
             )
             return None
 
-    def is_bloodhound_server(self, server_name: str) -> bool:
-        config = self.configs.get(server_name)
+    @staticmethod
+    def _is_canonical_bloodhound_config(config: MCPConnectionConfig | None) -> bool:
+        """Recognize the one BloodHound launch shape admitted to offensive runtime."""
+        args = list(config.args or []) if config is not None else []
         return bool(
             config is not None
+            and config.name == "BloodHound"
             and normalize_execution_class(config.sage_execution_class)
             == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
+            and config.connection_type == ConnectionType.STDIO
+            and bool(config.cwd)
+            and args == ["--directory", config.cwd, "run", "main.py"]
         )
+
+    def is_bloodhound_server(self, server_name: str) -> bool:
+        config = self.configs.get(server_name)
+        return bool(server_name == "BloodHound" and self._is_canonical_bloodhound_config(config))
     
     async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
@@ -262,6 +301,16 @@ class MCPServerManager:
             return (
                 False,
                 f"MCP server '{config.name}' denied before connect: execution class '{execution_class}' is not allowed",
+            )
+        if (
+            normalize_execution_class(getattr(config, "sage_execution_class", None))
+            == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
+            and not self._is_canonical_bloodhound_config(config)
+        ):
+            return (
+                False,
+                f"MCP server '{config.name}' denied before connect: bloodhound_control_plane requires "
+                "the canonical BloodHound stdio configuration",
             )
 
         # Set up a temporary exception handler to capture background task errors
