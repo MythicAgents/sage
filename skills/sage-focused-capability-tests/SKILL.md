@@ -16,8 +16,12 @@ only when the relevant callback/lab state exists.
 4. Run focused unit tests and then:
 
 ```bash
-.venv/bin/python -m pytest Payload_Type/sage/tests -q
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py supported
 ```
+
+The `supported` tier runs every maintained offline test and names the four append-only retired successor suites it
+excludes. Use `run_offline_suite.py retired` only when inspecting that historical lifecycle; it is intentionally
+not the default green product-development signal. See `docs/development/TEST_TIERS.md`.
 
 ## Bundled Scripts
 
@@ -36,4 +40,5 @@ only when the relevant callback/lab state exists.
 - `run_focused_parent_dcsync.py`
 - `run_focused_sid_history.py`
 - `run_focused_ticket_context_proof.py`
+- `run_offline_suite.py`
 - `test_validator.py`

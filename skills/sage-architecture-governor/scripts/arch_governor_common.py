@@ -55,6 +55,12 @@ GOAD_ALLOWED_PATTERNS = (
     "skills/sage-live-runner/scripts/run_essos_da.py",
 )
 
+# Cross-skill references are architecture wiring, not benchmark strategy. Remove only these exact canonical
+# package names before scanning added lines; all other GOAD identities and free-standing mentions remain gated.
+GOAD_LITERAL_REFERENCE_EXEMPTIONS = (
+    "sage-goad-reset",
+)
+
 TOKEN_VERSION = 1
 TOKEN_DIR = Path(os.environ.get("SAGE_ARCH_GATE_DIR", "/tmp/sage_arch_gate"))
 

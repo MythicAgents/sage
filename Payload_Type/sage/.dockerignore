@@ -1,6 +1,29 @@
+# Source-control and local development metadata
+.git
+.agents
+.codex
+.pytest_cache
 __pycache__
-.phoenix
+**/__pycache__
+*.py[cod]
+
+# Secrets and machine-local configuration
 .env
-sage.d*
-sage.log
+.env.*
 certs/bundle.pem
+certs/combined-bundle.pem
+
+# Runtime state and retained evidence. These are archived data, never image input.
+.phoenix
+.sage_engagement
+.trajectory
+.hillclimb
+sage*.db*
+sage.log
+
+# Development-only code retained in the monorepo but not shipped in the Mythic image.
+ai/hillclimb
+evals
+tests
+Payload_Type
+MEMORY

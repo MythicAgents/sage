@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from arch_governor_common import (
+    GOAD_LITERAL_REFERENCE_EXEMPTIONS,
     GOAD_LITERALS,
     added_lines_from_diff,
     approval_status,
@@ -99,8 +100,11 @@ def addition_budget_errors(additions: list[tuple[str, str]]) -> list[str]:
         if not path or is_goad_allowed(path):
             continue
         lowered = line.casefold()
+        screened = lowered
+        for reference in GOAD_LITERAL_REFERENCE_EXEMPTIONS:
+            screened = screened.replace(reference.casefold(), "")
         for literal in GOAD_LITERALS:
-            if literal.casefold() in lowered:
+            if literal.casefold() in screened:
                 errors.append(f"new GOAD literal in live high-risk file {path}: {literal}")
                 break
         if re.search(r"\b20\d\d-\d\d-\d\d\b", line):
@@ -123,6 +127,24 @@ def self_test() -> int:
         return 1
     if not any("dated run-specific" in error for error in errors):
         print("self-test failed: dated comment not detected", file=sys.stderr)
+        return 1
+    skill_reference = [
+        (
+            "skills/sage-live-runner/scripts/native_chat.py",
+            'READINESS = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts"',
+        )
+    ]
+    if addition_budget_errors(skill_reference):
+        print("self-test failed: canonical sage-goad-reset reference was rejected", file=sys.stderr)
+        return 1
+    mixed_reference = [
+        (
+            "skills/sage-live-runner/scripts/native_chat.py",
+            'READINESS = "sage-goad-reset"  # special case CASTELBLACK',
+        )
+    ]
+    if not any("CASTELBLACK" in error for error in addition_budget_errors(mixed_reference)):
+        print("self-test failed: benchmark literal escaped beside canonical skill reference", file=sys.stderr)
         return 1
     print("check_arch_budget self-test passed")
     return 0
