@@ -243,6 +243,105 @@ def test_ok_false_but_verified_effect_counts_as_progress():
     assert r.status == ac.STATUS_COMPLETE, r.to_dict()
 
 
+def test_zero_retry_trajectory_repair_is_immediate_terminal_blocker():
+    w = World({"da:north"})
+
+    def frontier(_state):
+        return [FakeAction("dcsync-krbtgt", "north", effects=["krbtgt-hash:north"])]
+
+    def execute(_action):
+        return {
+            "ok": False,
+            "reason": "repair exhausted",
+            "trajectory_repair": {
+                "failure_label": "unsupported_mechanism",
+                "repair": {
+                    "kind": "replan_without_retry",
+                    "retry_budget": 0,
+                },
+            },
+        }
+
+    controller = ac.AutonomousController(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=frontier,
+        config=ac.ControllerConfig(max_no_effect_cycles=4),
+    )
+
+    result = run(controller)
+
+    assert result.status == ac.STATUS_BLOCKED, result.to_dict()
+    assert result.cycle_count == 1
+    assert result.blocker["trajectory_repair"]["retry_budget"] == 0
+    assert result.blocker["trajectory_repair"]["repair_kind"] == "replan_without_retry"
+
+
+def test_zero_retry_trajectory_repair_does_not_override_verified_progress():
+    w = World({"da:north"})
+
+    def frontier(state):
+        if "krbtgt-hash:north" in state.achieved_effects():
+            return []
+        return [FakeAction("dcsync-krbtgt", "north", effects=["krbtgt-hash:north"])]
+
+    def execute(action):
+        w.effects.update(action.effects)
+        return {
+            "ok": False,
+            "reason": "task output looked failed before verifier re-observed",
+            "trajectory_repair": {
+                "failure_label": "transient_output_mismatch",
+                "repair": {
+                    "kind": "replan_without_retry",
+                    "retry_budget": 0,
+                },
+            },
+        }
+
+    controller = ac.AutonomousController(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=frontier,
+        objective_met=lambda state: "krbtgt-hash:north" in state.achieved_effects(),
+    )
+
+    result = run(controller)
+
+    assert result.status == ac.STATUS_COMPLETE, result.to_dict()
+
+
+def test_malformed_zero_retry_trajectory_payload_is_advisory_only():
+    w = World({"da:north"})
+
+    def frontier(_state):
+        return [FakeAction("dcsync-krbtgt", "north", effects=["krbtgt-hash:north"])]
+
+    def execute(_action):
+        return {
+            "ok": False,
+            "reason": "still retryable",
+            "trajectory_repair": {
+                "failure_label": "",
+                "repair": {
+                    "kind": "replan_without_retry",
+                    "retry_budget": "0",
+                },
+            },
+        }
+
+    controller = ac.AutonomousController(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=frontier,
+        config=ac.ControllerConfig(max_no_effect_cycles=1),
+    )
+
+    result = run(controller)
+
+    assert result.status == ac.STATUS_NO_PROGRESS, result.to_dict()
+
+
 def test_route_discovery_candidate_must_pass_preconditions():
     """Forge #2: an LLM route-discovery candidate is precondition-checked before execute, so a bad suggestion
     cannot start a loop. Unmet precondition -> rejected -> clean halt, execute never called."""

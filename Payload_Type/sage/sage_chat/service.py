@@ -45,24 +45,48 @@ class SageChat(Chat):
     dark_mode_agent_icon_path = str(Path(__file__).resolve().parent.parent / "sage.svg")
     models = SAGE_MODELS
 
-    async def _ensure_bloodhound_connected(self) -> None:
-        """Lazily auto-connect the BloodHound MCP on the chat-request path (fail-soft, idempotent).
+    async def _ensure_bloodhound_connected(self, *, autonomous_required: bool = False) -> bool:
+        """Lazily auto-connect the BloodHound MCP on the chat-request path.
 
         Connected here rather than at container boot on purpose: the MCP stdio session is bound to the
         event loop that creates it, so it must be opened from the same serving loop that later runs the
         graph (see ``ai/bloodhound_config.ensure_bloodhound_connected``). Process-global, so only the
         first channel to reach this actually connects; all later sessions no-op. Needs
-        ``SAGE_BLOODHOUND_MCP_DIR`` (or an explicit dir) to locate the MCP server — otherwise it no-ops.
+        ``SAGE_BLOODHOUND_MCP_DIR`` (or an explicit dir) to locate the MCP server.
+
+        Supervised/non-autonomous chat remains fail-soft so operators can still inspect a degraded
+        session. Autonomous chat is different: it must fail closed before ``Model.initialize()``
+        unless the canonical BloodHound server exposes the exact required tool names.
         """
         try:
-            from ai.bloodhound_config import ensure_bloodhound_connected
+            from ai.bloodhound_config import (
+                bloodhound_tool_admission,
+                ensure_bloodhound_connected,
+            )
         except ImportError:  # pragma: no cover
-            from ..ai.bloodhound_config import ensure_bloodhound_connected  # type: ignore
+            from ..ai.bloodhound_config import (  # type: ignore
+                bloodhound_tool_admission,
+                ensure_bloodhound_connected,
+            )
         try:
-            _connected, message = await ensure_bloodhound_connected()
+            connected, message = await ensure_bloodhound_connected()
             logger.info(f"BloodHound auto-connect (chat): {message}")
-        except Exception as exc:  # never let BloodHound block a chat turn
+            admission = bloodhound_tool_admission()
+            admitted = bool(connected and admission.get("ready"))
+            if autonomous_required and not admitted:
+                raise RuntimeError(
+                    admission.get("reason")
+                    or "BloodHound MCP exact-tool admission failed for autonomous chat."
+                )
+            return admitted
+        except Exception as exc:
+            if autonomous_required:
+                raise RuntimeError(
+                    f"Autonomous native chat requires BloodHound MCP exact-tool admission before "
+                    f"Model.initialize(): {exc}"
+                ) from exc
             logger.debug(f"BloodHound auto-connect (chat) skipped: {exc}")
+            return False
 
     async def _refresh_auth_context(self, model: Any, request: ChatRequest) -> None:
         """Re-bind the per-turn Mythic auth context on a reused session (Cody, c).
@@ -96,6 +120,22 @@ class SageChat(Chat):
         existing = await get_channel_session(request)
         if existing is not None:
             await self._refresh_auth_context(existing, request)
+            autonomous_now = bool(
+                getattr(existing, "mode", "") == "auto"
+                or getattr(existing, "_autonomous_solve", False)
+                or getattr(existing, "autonomous_solve", False)
+            )
+            if autonomous_now:
+                admitted = await self._ensure_bloodhound_connected(autonomous_required=True)
+                if not getattr(existing, "_bloodhound_exact_admission_at_initialize", False):
+                    raise RuntimeError(
+                        "Autonomous native chat requires a fresh channel/session because this "
+                        "session graph initialized without BloodHound exact-tool admission."
+                    )
+                if not admitted:
+                    raise RuntimeError(
+                        "Autonomous native chat requires BloodHound MCP exact-tool admission on every turn."
+                    )
             return existing, True
 
         # Lazy import: keep the heavy LangGraph/LangChain import off the module load path so the pure
@@ -115,7 +155,10 @@ class SageChat(Chat):
         # BloodHound agent's tools from the currently-connected MCP servers, so a later connect wouldn't
         # be seen by this session's graph. Mirrors the legacy task path's ensure_bloodhound_task_preflight
         # (which sage_chat previously omitted, so chat sessions never auto-connected BloodHound at all).
-        await self._ensure_bloodhound_connected()
+        admitted_at_initialize = await self._ensure_bloodhound_connected(
+            autonomous_required=bool(kwargs.get("autonomous_solve"))
+        )
+        model._bloodhound_exact_admission_at_initialize = bool(admitted_at_initialize)
         await model.initialize()
         # The chat container always runs at full detail — the collapsible tool cards ARE the "verbose"
         # view, so there is no operator verbose toggle (removed). set_verbose(True) also enables the local

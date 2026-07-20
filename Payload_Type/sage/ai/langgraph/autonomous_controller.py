@@ -253,6 +253,38 @@ def _transaction_record(kind: str, capability: str, target: str, decision: Any |
     }
 
 
+def _trajectory_zero_retry_blocker(result: dict[str, Any], *, progressed: bool) -> dict[str, Any] | None:
+    """Return a typed terminal blocker only for an explicit zero-retry trajectory repair.
+
+    The trajectory bridge is advisory by default. We only turn one repair into an immediate
+    terminal disposition when the result is already a failed capability, the nested repair
+    payload is well formed, `retry_budget` is the exact integer zero, and re-observation did
+    not verify the action's expected effect. Malformed or near-match advisory payloads remain
+    non-terminal.
+    """
+    if progressed or result.get("ok") is not False:
+        return None
+    trajectory = result.get("trajectory_repair")
+    if not isinstance(trajectory, dict):
+        return None
+    repair = trajectory.get("repair")
+    if not isinstance(repair, dict):
+        return None
+    retry_budget = repair.get("retry_budget")
+    if not isinstance(retry_budget, int) or isinstance(retry_budget, bool) or retry_budget != 0:
+        return None
+    repair_kind = str(repair.get("kind") or "").strip()
+    failure_label = str(trajectory.get("failure_label") or "").strip()
+    if not repair_kind or not failure_label:
+        return None
+    return {
+        "reason": str(result.get("reason") or result.get("error") or ""),
+        "failure_label": failure_label,
+        "repair_kind": repair_kind,
+        "retry_budget": 0,
+    }
+
+
 class AutonomousController:
     """Owns the deterministic autonomous control loop. All boundaries are injected callables.
 
@@ -640,6 +672,18 @@ class AutonomousController:
                                       policy_mode=str(getattr(decision, "policy_mode", "") or "")))
             self._log(f"cycle {cycle}: {phase} {name}->{target} ok={result.get('ok')} "
                       f"progressed={progressed} new_effects={new_effects}")
+
+            zero_retry_blocker = _trajectory_zero_retry_blocker(result, progressed=progressed)
+            if zero_retry_blocker is not None:
+                blocker = {
+                    "capability": name,
+                    "achieved": sorted(achieved),
+                    "trajectory_repair": zero_retry_blocker,
+                }
+                return done(
+                    STATUS_BLOCKED,
+                    f"terminal trajectory blocker on {name}: retry budget exhausted",
+                )
 
             # 8) loop-breaker (worker_outcome): the EPOCH advances on VERIFIED progress (decoupled from the
             #    self-reported `ok`, Forge #3/NEW-4) while the OUTCOME is classified from the REAL result — so a

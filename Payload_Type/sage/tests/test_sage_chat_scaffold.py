@@ -105,6 +105,264 @@ def test_native_chat_marks_model_command_name_chat():
     assert model.command_name == "chat"
 
 
+def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+
+    async def _ensure():
+        return True, "connected"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {
+            "ready": False,
+            "reason": "BloodHound MCP missing exact tools: cypher_query.",
+        },
+    )
+
+    class _Model:
+        def __init__(self, **_kwargs):
+            self.initialized = False
+
+        async def initialize(self):
+            self.initialized = True
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    chat = SageChat()
+
+    with pytest.raises(RuntimeError, match="requires BloodHound MCP exact-tool admission"):
+        _run(
+            chat._get_or_create_model(
+                build_chat_request(
+                    "objective",
+                    channel_id=801,
+                    request_id=1,
+                    config={"autonomous_solve": "true"},
+                )
+            )
+        )
+
+
+def test_supervised_native_chat_keeps_bloodhound_fail_soft(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+
+    events = []
+
+    async def _ensure():
+        return False, "missing config"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {"ready": False, "reason": "not used for supervised mode"},
+    )
+
+    class _Model:
+        def __init__(self, **_kwargs):
+            self.provider = "openai"
+            self.model = "test-model"
+
+        async def initialize(self):
+            events.append("initialize")
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    chat = SageChat()
+
+    _run(
+        chat._get_or_create_model(
+            build_chat_request(
+                "inspect",
+                channel_id=802,
+                request_id=1,
+                config={"mode": "supervised", "autonomous_solve": "false"},
+            )
+        )
+    )
+
+    assert events == ["initialize"]
+
+
+def test_autonomous_native_chat_initializes_after_exact_bloodhound_admission(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+
+    events = []
+
+    async def _ensure():
+        events.append("connect")
+        return True, "connected"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {
+            "ready": True,
+            "reason": "BloodHound MCP exposes the required exact tools.",
+        },
+    )
+
+    class _Model:
+        def __init__(self, **_kwargs):
+            self.provider = "openai"
+            self.model = "test-model"
+
+        async def initialize(self):
+            events.append("initialize")
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    chat = SageChat()
+
+    _run(
+        chat._get_or_create_model(
+            build_chat_request(
+                "objective",
+                channel_id=803,
+                request_id=1,
+                config={"mode": "auto"},
+            )
+        )
+    )
+
+    assert events == ["connect", "initialize"]
+
+
+def test_bloodhound_tool_admission_requires_exact_names(monkeypatch):
+    from ai import bloodhound_config
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_connected_servers",
+        lambda: ["BloodHound"],
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "is_bloodhound_server",
+        lambda server: server == "BloodHound",
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_tools_by_server",
+        lambda _server: [_Tool("file_upload"), _Tool("domain_info"), _Tool("cypher-query")],
+    )
+
+    admission = bloodhound_config.bloodhound_tool_admission()
+
+    assert admission["ready"] is False
+    assert admission["missing_tools"] == ["cypher_query"]
+
+
+def test_bloodhound_tool_admission_rejects_multiple_matching_servers(monkeypatch):
+    from ai import bloodhound_config
+
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_connected_servers",
+        lambda: ["BloodHound", "BloodHound-Replica"],
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "is_bloodhound_server",
+        lambda _server: True,
+    )
+
+    admission = bloodhound_config.bloodhound_tool_admission()
+
+    assert admission["ready"] is False
+    assert admission["matching_server_count"] == 2
+    assert admission["server"] is None
+    assert admission["matching_servers"] == ["BloodHound", "BloodHound-Replica"]
+
+
+def test_new_model_records_exact_admission_state(monkeypatch):
+    from ai import bloodhound_config
+    from sage_chat.service import SageChat
+
+    async def _ensure():
+        return True, "connected"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {"ready": True, "reason": "ready"},
+    )
+
+    class _Model:
+        def __init__(self, **_kwargs):
+            self.provider = "openai"
+            self.model = "test-model"
+            self.mode = "supervised"
+            self._autonomous_solve = False
+
+        async def initialize(self):
+            return None
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+    chat = SageChat()
+
+    model, preexisted = _run(
+        chat._get_or_create_model(
+            build_chat_request("inspect", channel_id=804, request_id=1)
+        )
+    )
+
+    assert preexisted is False
+    assert model._bloodhound_exact_admission_at_initialize is True
+
+
+def test_reused_session_switching_to_auto_requires_fresh_channel(monkeypatch):
+    import sage_chat.service as service
+    from ai import bloodhound_config
+
+    class _Existing:
+        mode = "auto"
+        _autonomous_solve = True
+        _bloodhound_exact_admission_at_initialize = False
+        apitoken_id = 0
+
+    async def _get_existing(_request):
+        return _Existing()
+
+    async def _ensure():
+        return True, "connected"
+
+    monkeypatch.setattr(service, "get_channel_session", _get_existing)
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr(
+        bloodhound_config,
+        "bloodhound_tool_admission",
+        lambda: {"ready": True, "reason": "ready"},
+    )
+
+    with pytest.raises(RuntimeError, match="fresh channel/session"):
+        _run(
+            service.SageChat()._get_or_create_model(
+                build_chat_request("objective", channel_id=805, request_id=1)
+            )
+        )
+
+
 def test_channel_metadata_publishes_before_model_invoke():
     class _MetadataAwareModel(_FakeModel):
         async def invoke(self, prompt, is_interactive=False):
