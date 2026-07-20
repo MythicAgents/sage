@@ -139,6 +139,7 @@ class ChatStreamEmitter:
         self,
         *,
         title: str,
+        prompt: str = "",
         delegation_id: str,
         delegation_name: str,
         status: str = "running",
@@ -154,6 +155,7 @@ class ChatStreamEmitter:
             await self._chat.send_subagent_status(
                 self._request,
                 title=title,
+                prompt=prompt,
                 delegation_id=delegation_id,
                 delegation_name=delegation_name,
                 status=status,

@@ -2351,6 +2351,7 @@ class Model:
         self,
         *,
         title: str,
+        prompt: str = "",
         delegation_id: str,
         delegation_name: str,
         status: str = "running",
@@ -2367,6 +2368,7 @@ class Model:
         try:
             await emitter.emit_subagent_status(
                 title=title,
+                prompt=prompt,
                 delegation_id=delegation_id,
                 delegation_name=delegation_name,
                 status=status,
@@ -2556,6 +2558,7 @@ class Model:
             }
             await self._emit_subagent_status(
                 title=card_title,
+                prompt=instruction,
                 delegation_id=delegation_id,
                 delegation_name=agent_name,
                 status="running",
@@ -2576,6 +2579,7 @@ class Model:
             delegation["tool_count"] = tool_count
             await self._emit_subagent_status(
                 title=str(delegation.get("title", "")),
+                prompt=str(delegation.get("instruction", "")),
                 delegation_id=str(delegation.get("id", "")),
                 delegation_name=str(delegation.get("name", agent_name)),
                 status="running",
@@ -2603,6 +2607,7 @@ class Model:
                 content = ""
             await self._emit_subagent_status(
                 title=str(delegation.get("title", "")),
+                prompt=str(delegation.get("instruction", "")),
                 delegation_id=str(delegation.get("id", "")),
                 delegation_name=str(delegation.get("name", agent_name)),
                 status=status,

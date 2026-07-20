@@ -547,6 +547,7 @@ def test_emit_subagent_status_produces_subagent_card():
 
     assert _run(emitter.emit_subagent_status(
         title="List all domains",
+        prompt="List all active domains and report the source of each one.",
         delegation_id="bloodhound:1",
         delegation_name="BloodHound",
         status="running",
@@ -562,6 +563,7 @@ def test_emit_subagent_status_produces_subagent_card():
     assert emitted["metadata"]["delegation_name"] == "BloodHound"
     subagent = emitted["metadata"]["subagent"]
     assert subagent["title"] == "List all domains"
+    assert subagent["prompt"] == "List all active domains and report the source of each one."
     assert subagent["status"] == "running"
     assert subagent["tool_count"] == 0
     assert subagent["icon"] == "BH"
@@ -685,6 +687,7 @@ def test_subagent_lifecycle_reuses_key_and_tags_tool_card():
 
     assert _run(emitter.emit_subagent_status(
         title="List all domains",
+        prompt="List all active domains and report the source of each one.",
         delegation_id=delegation_id,
         delegation_name="BloodHound",
         status="running",
@@ -703,6 +706,7 @@ def test_subagent_lifecycle_reuses_key_and_tags_tool_card():
     )) is True
     assert _run(emitter.emit_subagent_status(
         title="List all domains",
+        prompt="List all active domains and report the source of each one.",
         delegation_id=delegation_id,
         delegation_name="BloodHound",
         status="running",
@@ -711,6 +715,7 @@ def test_subagent_lifecycle_reuses_key_and_tags_tool_card():
     )) is True
     assert _run(emitter.emit_subagent_status(
         title="List all domains",
+        prompt="List all active domains and report the source of each one.",
         delegation_id=delegation_id,
         delegation_name="BloodHound",
         status="finished",
@@ -733,6 +738,14 @@ def test_subagent_lifecycle_reuses_key_and_tags_tool_card():
     assert subagent_emissions[0]["metadata"]["subagent"]["tool_count"] == 0
     assert subagent_emissions[1]["metadata"]["subagent"]["tool_count"] == 1
     assert subagent_emissions[2]["metadata"]["subagent"]["status"] == "finished"
+    assert [
+        emitted["metadata"]["subagent"]["prompt"]
+        for emitted in subagent_emissions
+    ] == [
+        "List all active domains and report the source of each one.",
+        "List all active domains and report the source of each one.",
+        "List all active domains and report the source of each one.",
+    ]
     assert subagent_emissions[2]["complete"] is True
     assert subagent_emissions[2]["content"] == "Found one domain."
     assert len(tool_emissions) == 1
@@ -799,10 +812,14 @@ def test_delegation_card_uses_short_title_but_retains_full_instruction():
 
     instruction = "List all active Mythic callbacks and report each host, user, and integrity level."
     _run(model._open_delegation("Mythic_Operator", instruction, 7, title="List active callbacks"))
+    _run(model._bump_delegation_progress("Mythic_Operator"))
+    _run(model._close_delegation("Mythic_Operator"))
 
     assert emitter.calls[0]["title"] == "List active callbacks"
-    assert model._active_delegations["Mythic_Operator"]["title"] == "List active callbacks"
-    assert model._active_delegations["Mythic_Operator"]["instruction"] == instruction
+    assert emitter.calls[0]["prompt"] == instruction
+    assert emitter.calls[1]["prompt"] == instruction
+    assert emitter.calls[2]["prompt"] == instruction
+    assert emitter.calls[2]["complete"] is True
 
 
 def test_delegation_safety_close_falls_back_to_last_text():
