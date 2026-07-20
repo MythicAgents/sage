@@ -7,7 +7,10 @@ if [[ "${1:-}" != "--yes" ]]; then
   exit 2
 fi
 
-MYTHIC_CLI="${MYTHIC_CLI:-/home/john/dev/mythic_v4/mythic-cli}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
+WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
+MYTHIC_CLI="${MYTHIC_CLI:-$WORKSPACE_ROOT/mythic_v4/mythic-cli}"
 [[ -x "$MYTHIC_CLI" ]] || {
   echo "ERR: Mythic CLI not executable: $MYTHIC_CLI" >&2
   exit 1

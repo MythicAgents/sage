@@ -96,6 +96,13 @@ def test_skill_env_loader_sets_sage_defaults_without_overriding(monkeypatch, tmp
     assert os.environ["SAGE_API_KEY"] == "dummy-key"
 
 
+def test_default_mythic_env_paths_derive_from_workspace_root():
+    assert bootstrap_payloads.DEFAULT_MYTHIC_ENV_PATHS == (
+        bootstrap_payloads.WORKSPACE_ROOT / "mythic_v4" / ".env",
+        bootstrap_payloads.WORKSPACE_ROOT / "mythic" / ".env",
+    )
+
+
 def test_sage_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -795,7 +802,7 @@ def test_callback_readiness_selects_fresh_live_sage_and_castelblack_apollo():
     liveness = {
         3: {"alive": True, "reason": "old but live"},
         7: {"alive": True, "reason": "fresh"},
-        8: {"alive": True, "reason": "old but live"},
+        8: {"alive": False, "reason": "stale"},
         9: {"alive": True, "reason": "fresh"},
     }
 
@@ -810,6 +817,38 @@ def test_callback_readiness_selects_fresh_live_sage_and_castelblack_apollo():
     assert status["selected_chat_container_id"] == 1
     assert status["selected_foothold_cb"] == 9
     assert status["selected_apollo_cb"] == 9
+
+
+def test_callback_readiness_rejects_duplicate_live_footholds():
+    callbacks = [
+        {
+            "display_id": 8,
+            "host": "CASTELBLACK",
+            "user": "samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+        {
+            "display_id": 9,
+            "host": "CASTELBLACK",
+            "user": "samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+    ]
+    liveness = {
+        8: {"alive": True, "reason": "old but still live"},
+        9: {"alive": True, "reason": "fresh"},
+    }
+
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
+
+    assert status["ready"] is False
+    assert status["duplicate_live_footholds"] == [8, 9]
 
 
 def test_callback_readiness_selects_merlin_when_requested():
@@ -909,3 +948,92 @@ def test_callback_readiness_rejects_dead_or_wrong_foothold():
     assert status["ready"] is False
     assert status["selected_sage_cb"] is None
     assert status["selected_apollo_cb"] is None
+
+
+def test_readiness_delegates_to_shared_contract(monkeypatch):
+    callbacks = [{
+        "display_id": 9,
+        "host": "CASTELBLACK",
+        "user": "samwell.tarly",
+        "active": True,
+        "payload": {"payloadtype": {"name": "apollo"}},
+    }]
+    observed = {
+        "callbacks": callbacks,
+        "chat_containers": [{"id": 1, "container_running": True, "deleted": False}],
+    }
+
+    async def fake_inspect(_client):
+        return observed
+
+    async def fake_liveness(_client, _display_id):
+        return {"alive": True, "reason": "fresh"}
+
+    class _NativeChat:
+        READINESS_QUERY = "query readiness"
+
+        @staticmethod
+        def select_chat_resources(_resources, api_token_id=None):
+            return (
+                {"id": 1, "container_running": True, "deleted": False},
+                {"id": 3, "name": "token", "scopes": ["*"]},
+            )
+
+        @staticmethod
+        async def find_prepared_channel(_client):
+            return {"chat_channel_id": 4, "chat_channel_name": "Sage GOAD Ready"}
+
+    captured = {}
+
+    class _Contract:
+        @staticmethod
+        async def collect_operator_readiness(**kwargs):
+            captured.update(kwargs)
+            return {"schema": "sage-readiness-contract-v1", "ready": True, "blockers": []}
+
+    async def fake_query(_client, _query):
+        return {"consuming_container": [], "apitokens": []}
+
+    monkeypatch.setattr(bootstrap_payloads, "inspect", fake_inspect)
+    monkeypatch.setattr(bootstrap_payloads, "assess_callback_liveness", fake_liveness)
+    monkeypatch.setattr(bootstrap_payloads, "load_native_chat_module", lambda: _NativeChat)
+    monkeypatch.setattr(bootstrap_payloads, "load_readiness_contract_module", lambda: _Contract)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(
+        bootstrap_payloads.readiness(
+            object(),
+            runtime_dbs_archived=True,
+            ludus_observation={"ready": True},
+            clock_observation={"ready": True},
+            bloodhound_api_observation={"ready": True},
+            bloodhound_mcp_observation={"ready": True},
+        )
+    )
+
+    assert result["ready"] is True
+    assert captured["callback_summary"]["selected_foothold_cb"] == 9
+    assert captured["channel"]["chat_channel_id"] == 4
+
+
+def test_command_readiness_returns_nonzero_when_contract_not_ready(monkeypatch, capsys):
+    async def fake_login(_args):
+        return object()
+
+    async def fake_readiness(*_args, **_kwargs):
+        return {"ready": False, "blockers": ["not ready"]}
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
+    monkeypatch.setattr(bootstrap_payloads, "readiness", fake_readiness)
+
+    args = argparse.Namespace(
+        repo_root=str(bootstrap_payloads.REPO_ROOT),
+        runtime_dbs_archived=True,
+        foothold_payload_type="apollo",
+        foothold_host="CASTELBLACK",
+        foothold_user_match="samwell.tarly",
+    )
+    rc = asyncio.run(bootstrap_payloads.command_readiness(args))
+
+    assert rc == 1
+    assert '"ready": false' in capsys.readouterr().out

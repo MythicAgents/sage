@@ -2,16 +2,25 @@
 """Throwaway (gitignored) — verify the BloodHound MCP is connected on Sage cb15; connect if not."""
 import asyncio
 import json
+import os
+from pathlib import Path
 import sys
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
+DEFAULT_BLOODHOUND_MCP_DIR = Path(
+    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+    or (WORKSPACE_ROOT / "bloodhound_mcp")
+)
+
+sys.path.insert(0, str(REPO_ROOT / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from mythic import mythic  # noqa: E402
 
 CONNECT_PARAMS = {
     "name": "BloodHound", "connection_type": "stdio", "command": "uv",
-    "arguments": ["--directory", "/home/john/dev/bloodhound_mcp", "run", "main.py"],
-    "cwd": "/home/john/dev/bloodhound_mcp", "url": "", "headers": [],
+    "arguments": ["--directory", str(DEFAULT_BLOODHOUND_MCP_DIR), "run", "main.py"],
+    "cwd": str(DEFAULT_BLOODHOUND_MCP_DIR), "url": "", "headers": [],
     "timeout": 30, "sse_read_timeout": 300, "terminate_on_close": True, "ssl_verify": True,
 }
 

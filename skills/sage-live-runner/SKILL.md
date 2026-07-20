@@ -31,6 +31,11 @@ Run the stock strict one-shot objective through a fresh locked AI channel:
 `--output-mode full` is the default and returns the complete operator-visible message record. Automated
 evaluation consumers may select `--output-mode eval` to receive only the versioned, positive-allowlist runtime
 evidence projection. Eval mode does not alter what Sage sees or what Mythic stores and displays.
+While a request is in flight, the runner now emits JSONL request-start/progress/terminal events on stderr so
+the channel ID, request ID, and evolving status are visible immediately without waiting for the terminal JSON.
+Pass `--manifest-path <path>` to write a redacted demo manifest that binds clean/resumed status, runtime identity,
+range/snapshot context, callback/channel/request identity, tasks/proofs, and artifact hashes when those inputs are
+available.
 
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
@@ -52,11 +57,14 @@ The proof path requires:
 - archived Sage/Phoenix runtime databases followed by a clean Sage restart
 - a clean BloodHound database and reset GOAD range
 
-Use the callback bootstrap readiness command before a solve:
+Use the shared callback-bootstrap readiness command before a solve:
 
 ```bash
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived
 ```
+
+`native_chat.py inspect` delegates to that same readiness contract instead of claiming readiness from only a
+running chat container and token.
 
 ## Legacy Tools
 

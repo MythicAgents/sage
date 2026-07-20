@@ -17,13 +17,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import sys
 from typing import Any, Callable
 
 
-DEFAULT_BLOODHOUND_MCP_DIR = Path("/home/john/dev/bloodhound_mcp")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
+DEFAULT_BLOODHOUND_MCP_DIR = Path(
+    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+    or (WORKSPACE_ROOT / "bloodhound_mcp")
+)
 _DOMAIN_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
 _MANAGED_SECRET_EDGE_TYPES = ("ReadLAPSPassword", "ReadLAPS", "ReadMSLAPSPassword")
 

@@ -38,6 +38,10 @@ def test_windows_hosts_excludes_router_and_orders_dcs_first():
     assert [host["inventory_hostname"] for host in hosts] == ["dc", "srv"]
 
 
+def test_default_mcp_path_derives_from_repo_root():
+    assert MODULE.DEFAULT_MCP_PATH == MODULE.REPO_ROOT / ".mcp.json"
+
+
 def test_clock_offset_seconds_uses_absolute_utc_delta():
     controller = datetime(2026, 6, 24, 14, 0, tzinfo=timezone.utc)
 

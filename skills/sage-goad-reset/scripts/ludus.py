@@ -23,13 +23,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import ssl
 import sys
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-MCP = "/home/john/dev/sage/.mcp.json"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MCP = str(REPO_ROOT / ".mcp.json")
 EXIT_AMBIGUOUS = 3  # no name given + multiple snapshots: caller (agent) must pick and re-invoke
 RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"

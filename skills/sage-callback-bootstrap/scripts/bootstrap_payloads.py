@@ -35,6 +35,7 @@ from mythic import mythic
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
 LANGGRAPH_ROOT = REPO_ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"
 if str(LANGGRAPH_ROOT) not in sys.path:
     sys.path.insert(0, str(LANGGRAPH_ROOT))
@@ -42,20 +43,30 @@ if str(LANGGRAPH_ROOT) not in sys.path:
 from mythic_tools import assess_callback_liveness  # noqa: E402
 
 
-MYTHIC_ENV_PATH = Path(
-    os.environ.get("MYTHIC_ENV_PATH")
-    or (
-        "/home/john/dev/mythic_v4/.env"
-        if Path("/home/john/dev/mythic_v4/.env").exists()
-        else "/home/john/dev/mythic/.env"
-    )
+DEFAULT_MYTHIC_ENV_PATHS = (
+    WORKSPACE_ROOT / "mythic_v4" / ".env",
+    WORKSPACE_ROOT / "mythic" / ".env",
 )
+
+
+def _default_mythic_env_path() -> Path:
+    configured = os.environ.get("MYTHIC_ENV_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return next(
+        (path for path in DEFAULT_MYTHIC_ENV_PATHS if path.exists()),
+        DEFAULT_MYTHIC_ENV_PATHS[0],
+    )
+
+
+MYTHIC_ENV_PATH = _default_mythic_env_path()
 SKILL_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
 DEFAULT_CALLBACK_CONFIG_PATH = Path(__file__).resolve().parents[1] / "apollo_callback_config.json"
 SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py"
 NATIVE_CHAT_PATH = REPO_ROOT / "skills" / "sage-live-runner" / "scripts" / "native_chat.py"
+READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
@@ -375,32 +386,11 @@ def runtime_db_status(
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
 ) -> dict[str, Any]:
-    if operator_db_cleanup_confirmed is not None:
-        runtime_dbs_archived = operator_db_cleanup_confirmed
-    required = [repo_root / rel for rel in REQUIRED_RUNTIME_DBS]
-    sage_archives = sorted((repo_root / "Payload_Type" / "sage").glob("sage_*.db"))
-    phoenix_archives = sorted((repo_root / "Payload_Type" / "sage" / ".phoenix").glob("phoenix_*.db"))
-    existing_required = [str(path.relative_to(repo_root)) for path in required if path.exists()]
-    existing_archives = [
-        str(path.relative_to(repo_root))
-        for path in (*sage_archives, *phoenix_archives)
-        if path.exists()
-    ]
-    blocks = bool(existing_required and not runtime_dbs_archived)
-    return {
-        "ready": not blocks,
-        "runtime_dbs_archived": runtime_dbs_archived,
-        "operator_db_cleanup_confirmed": runtime_dbs_archived,
-        "existing_required": existing_required,
-        "existing_archives": existing_archives,
-        "existing_session": [
-            path for path in existing_archives if Path(path).name.startswith("sage_")
-        ],
-        "note": (
-            "Archive active DBs with sage-goad-reset before Sage restart. Recreated active DB files are expected "
-            "after restart and do not block when --runtime-dbs-archived is supplied."
-        ),
-    }
+    return load_readiness_contract_module().runtime_db_status(
+        repo_root,
+        runtime_dbs_archived=runtime_dbs_archived,
+        operator_db_cleanup_confirmed=operator_db_cleanup_confirmed,
+    )
 
 
 def summarize_callback_readiness(
@@ -447,8 +437,11 @@ def summarize_callback_readiness(
         and foothold_user_match in str(row.get("user") or "").casefold()
     ]
     selected_foothold_cb = max((row["display_id"] for row in live_foothold), default=None)
+    duplicate_live_footholds = [
+        row["display_id"] for row in live_foothold
+    ] if len(live_foothold) > 1 else []
     return {
-        "ready": bool(live_chat and live_foothold),
+        "ready": bool(live_chat and len(live_foothold) == 1),
         "callbacks": rows,
         "selected_sage_cb": None,
         "chat_containers": live_chat,
@@ -456,8 +449,9 @@ def summarize_callback_readiness(
         "foothold_payload_type": foothold_payload_type,
         "selected_foothold_cb": selected_foothold_cb,
         "selected_apollo_cb": selected_foothold_cb if foothold_payload_type == "apollo" else None,
+        "duplicate_live_footholds": duplicate_live_footholds,
         "required": (
-            "running Sage chat container plus live "
+            "running Sage chat container plus unique live "
             f"{foothold_payload_type} callback on {foothold_host.upper()} as {foothold_user_match}"
         ),
     }
@@ -553,6 +547,15 @@ def load_native_chat_module():
     return module
 
 
+def load_readiness_contract_module():
+    spec = importlib.util.spec_from_file_location("sage_readiness_contract", READINESS_CONTRACT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load readiness contract helper from {READINESS_CONTRACT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 async def prepare_sage_chat(client) -> dict[str, Any]:
     native_chat = load_native_chat_module()
     token = await native_chat.ensure_api_token(client)
@@ -575,6 +578,11 @@ async def readiness(
     foothold_payload_type: str = "apollo",
     foothold_host: str = DEFAULT_FOOTHOLD_HOST,
     foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
+    api_token_id: int | None = None,
+    ludus_observation: dict[str, Any] | None = None,
+    clock_observation: dict[str, Any] | None = None,
+    bloodhound_api_observation: dict[str, Any] | None = None,
+    bloodhound_mcp_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
@@ -594,7 +602,6 @@ async def readiness(
         except Exception as exc:
             liveness_by_display_id[display_id] = {"alive": False, "reason": f"liveness check failed: {exc}"}
 
-    runtime = runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
     callbacks = summarize_callback_readiness(
         observed.get("callbacks", []),
         liveness_by_display_id,
@@ -603,19 +610,35 @@ async def readiness(
         foothold_host=foothold_host,
         foothold_user_match=foothold_user_match,
     )
-    blockers = []
-    if not runtime["ready"]:
-        blockers.append("archive stale Sage/Phoenix runtime DBs before restarting Sage")
-    if not callbacks["ready"]:
-        blockers.append(
-            f"running Sage chat container and live {foothold_payload_type} foothold are not both present"
+    native_chat = load_native_chat_module()
+    api_token = None
+    channel = None
+    try:
+        resources = await mythic.execute_custom_query(client, native_chat.READINESS_QUERY)
+        _container, api_token = native_chat.select_chat_resources(
+            resources,
+            api_token_id=api_token_id,
         )
-    return {
-        "ready": not blockers,
-        "blockers": blockers,
-        "runtime_databases": runtime,
-        "callbacks": callbacks,
-    }
+    except Exception:
+        api_token = None
+    try:
+        channel = await native_chat.find_prepared_channel(client)
+    except Exception:
+        channel = None
+    contract = load_readiness_contract_module()
+    report = await contract.collect_operator_readiness(
+        repo_root=repo_root,
+        runtime_dbs_archived=runtime_dbs_archived,
+        callback_summary=callbacks,
+        chat_containers=observed.get("chat_containers", []),
+        api_token=api_token,
+        channel=channel,
+        ludus_observation=ludus_observation,
+        clock_observation=clock_observation,
+        bloodhound_api_observation=bloodhound_api_observation,
+        bloodhound_mcp_observation=bloodhound_mcp_observation,
+    )
+    return {**report, "callbacks": callbacks}
 
 
 def _task_output_text(value: Any) -> str:
@@ -892,20 +915,18 @@ async def command_inspect(args: argparse.Namespace) -> None:
     print(json.dumps(await inspect(client), indent=2, sort_keys=True))
 
 
-async def command_readiness(args: argparse.Namespace) -> None:
+async def command_readiness(args: argparse.Namespace) -> int:
     client = await login(args)
-    print(json.dumps(
-        await readiness(
-            client,
-            Path(args.repo_root),
-            runtime_dbs_archived=args.runtime_dbs_archived,
-            foothold_payload_type=args.foothold_payload_type,
-            foothold_host=args.foothold_host,
-            foothold_user_match=args.foothold_user_match,
-        ),
-        indent=2,
-        sort_keys=True,
-    ))
+    report = await readiness(
+        client,
+        Path(args.repo_root),
+        runtime_dbs_archived=args.runtime_dbs_archived,
+        foothold_payload_type=args.foothold_payload_type,
+        foothold_host=args.foothold_host,
+        foothold_user_match=args.foothold_user_match,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report.get("ready") else 1
 
 
 async def command_export_callback_config(args: argparse.Namespace) -> None:
@@ -1341,7 +1362,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    asyncio.run(args.func(args))
+    result = asyncio.run(args.func(args))
+    if isinstance(result, int):
+        raise SystemExit(result)
 
 
 if __name__ == "__main__":

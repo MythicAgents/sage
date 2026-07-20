@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
-# sage_restart.sh — kill + relaunch the local Sage dev process INSIDE the existing `sage` tmux session,
-# so it stays remotely reachable (`tmux attach -t sage`) and Luminara can reload code changes unattended.
+# sage_restart.sh — kill + relaunch the local Sage dev process inside the existing `sage` tmux session.
 #
-# Approach: find the Sage process as the python child of the `sage` tmux pane, PRE-FLIGHT the relaunch
-# interpreter, snapshot the running process's exact env from /proc, C-c the pane, then relaunch
-# `python -u main.py` via _sage_relaunch.py with byte-identical env parity.
-#
-# Two bugs found + fixed on the first live round-trip (2026-06-05):
-#   1) the real cmdline is `python main.py` (NOT `python3 -u main.py`) — pgrep pattern missed it.
-#      Fix: locate the PID as the main.py child of the tmux pane, not by a cmdline pattern.
-#   2) /proc/$PID/exe resolves the venv-python SYMLINK to /usr/bin/python3.13, which lacks
-#      `mythic_container` -> relaunch crashed with ModuleNotFoundError and left Sage down.
-#      Fix: relaunch with the VENV python and PROVE it imports the SDK BEFORE killing anything.
+# The launcher snapshots the current process env when Sage is already running, or builds one from the
+# repo-local env files on a fresh start, then relaunches `python -u main.py` through _sage_relaunch.py.
 set -euo pipefail
 
 SESSION="sage"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
+WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 SNAP="/tmp/sage_env.snapshot"
-VENV_PY="${SAGE_VENV_PY:-/home/john/dev/sage/.venv/bin/python}"
-DEFAULT_CWD="${SAGE_CWD:-/home/john/dev/sage/Payload_Type/sage}"
-MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-/home/john/dev/mythic_v4/.env}"
+VENV_PY="${SAGE_VENV_PY:-$REPO_ROOT/.venv/bin/python}"
+DEFAULT_CWD="${SAGE_CWD:-$REPO_ROOT/Payload_Type/sage}"
+MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-$WORKSPACE_ROOT/mythic_v4/.env}"
+SAGE_RUNTIME_ENV_PATH="${SAGE_RUNTIME_ENV_PATH:-$REPO_ROOT/Payload_Type/sage/.env}"
+DEFAULT_BLOODHOUND_MCP_DIR="${SAGE_DEFAULT_BLOODHOUND_MCP_DIR:-$WORKSPACE_ROOT/bloodhound_mcp}"
+STARTUP_DISCOVERY_SECONDS="${SAGE_STARTUP_DISCOVERY_SECONDS:-10}"
+STARTUP_STABILITY_SECONDS="${SAGE_STARTUP_STABILITY_SECONDS:-3}"
 
 snapshot_last_value() {
   local key="$1"
@@ -31,7 +28,7 @@ append_snapshot_override() {
   local key="$1"
   local value="$2"
   printf '%s=%s\0' "$key" "$value" >> "$SNAP"
-  echo "▶ env override: $key=$value" >&2
+  echo "▶ env override: $key=<set>" >&2
 }
 
 normalize_local_mythic_hosts() {
@@ -51,6 +48,14 @@ normalize_local_mythic_hosts() {
   case "$nginx_host" in
     ""|mythic_nginx) append_snapshot_override "NGINX_HOST" "127.0.0.1" ;;
   esac
+}
+
+ensure_default_bloodhound_dir() {
+  local configured
+  configured="$(snapshot_last_value SAGE_BLOODHOUND_MCP_DIR)"
+  if [[ -z "$configured" ]]; then
+    append_snapshot_override "SAGE_BLOODHOUND_MCP_DIR" "$DEFAULT_BLOODHOUND_MCP_DIR"
+  fi
 }
 
 # 1. Locate Sage as the main.py child of the `sage` tmux pane (robust to the cmdline form).
@@ -75,6 +80,12 @@ else
     source "$MYTHIC_ENV_PATH"
     set +a
   fi
+  if [[ -f "$SAGE_RUNTIME_ENV_PATH" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$SAGE_RUNTIME_ENV_PATH"
+    set +a
+  fi
   export DEBUG_LEVEL="${DEBUG_LEVEL:-debug}"
   export MYTHIC_SERVER_HOST="${MYTHIC_SERVER_HOST:-127.0.0.1}"
   export RABBITMQ_HOST="${RABBITMQ_HOST:-127.0.0.1}"
@@ -83,15 +94,21 @@ else
     exit 1
   }
   env -0 > "$SNAP"; chmod 600 "$SNAP"
-  echo "▶ no running local Sage child under pane $PANE_PID; starting fresh with env from $MYTHIC_ENV_PATH" >&2
+  echo "▶ no running local Sage child under pane $PANE_PID; starting fresh from configured env files" >&2
 fi
 
 normalize_local_mythic_hosts
+ensure_default_bloodhound_dir
 
 # Optional env overrides: pass KEY=VAL args (e.g. `sage_restart.sh SAGE_ENGAGEMENT_GATE=1`).
 # Appended after the snapshot so they WIN (dict-merge in _sage_relaunch.py = last value wins).
 for kv in "$@"; do
-  case "$kv" in *=*) printf '%s\0' "$kv" >> "$SNAP"; echo "▶ env override: $kv" >&2 ;; esac
+  case "$kv" in
+    *=*)
+      printf '%s\0' "$kv" >> "$SNAP"
+      echo "▶ env override: ${kv%%=*}=<set>" >&2
+      ;;
+  esac
 done
 echo "▶ snapshot: pid=$PID cwd=$CWD venv_py=$VENV_PY env=$(tr '\0' '\n' < "$SNAP" | grep -c =) vars" >&2
 
@@ -109,4 +126,21 @@ fi
 
 # 4. Relaunch with the VENV python + parity env.
 tmux send-keys -t "$SESSION" "$VENV_PY $HERE/_sage_relaunch.py '$CWD' '$VENV_PY' '$SNAP'" Enter
-echo "▶ relaunched into tmux '$SESSION' with $VENV_PY. Verify: ps --ppid $PANE_PID ; tmux capture-pane -t $SESSION -p | tail" >&2
+NEW_PID=""
+for _ in $(seq 1 "$STARTUP_DISCOVERY_SECONDS"); do
+  NEW_PID="$(pgrep -P "$PANE_PID" -f 'main.py' | head -1 || true)"
+  [[ -n "$NEW_PID" ]] && break
+  sleep 1
+done
+[[ -n "$NEW_PID" ]] || {
+  echo "ERR: Sage relaunch did not produce a main.py child under tmux pane $PANE_PID" >&2
+  exit 1
+}
+for _ in $(seq 1 "$STARTUP_STABILITY_SECONDS"); do
+  kill -0 "$NEW_PID" 2>/dev/null || {
+    echo "ERR: Sage relaunch exited before the positive-start window completed" >&2
+    exit 1
+  }
+  sleep 1
+done
+echo "▶ Sage relaunch verified in tmux '$SESSION'" >&2

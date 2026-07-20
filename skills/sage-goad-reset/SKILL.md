@@ -92,6 +92,9 @@ uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skil
 ```
 
 Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
+The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, defaults
+`SAGE_BLOODHOUND_MCP_DIR` when it is absent, and records a redacted startup identity under
+`/tmp/sage_startup_identity.json` for later readiness/manifest inspection.
 
 6. Run:
 
@@ -128,20 +131,33 @@ Any extra `KEY=VAL` positional args are applied as env overrides to the relaunch
 9. Rediscover the Apollo callback ID. Never trust historical IDs. The Sage solve uses a fresh chat channel, not
    a callback.
 
+10. Run the shared readiness contract before a live row:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived
+```
+
+That report is the single readiness source for callback bootstrap and native chat. It aggregates sanitized
+startup identity, runtime DB archival, exact six-VM/IP state, clock readiness, BloodHound API/domains,
+BloodHound MCP checkout plus exact required tools, Mythic chat/token state, unique foothold selection, and
+prepared channel readiness.
+
 ## GOAD
 
 ```bash
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py status
+.venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshot <name> --include-ram
-.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback --yes
+.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback <snapshot-name> --yes
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all
 .venv/bin/python skills/sage-goad-reset/scripts/ludus.py status
 .venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes
 .venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py check
 ```
 
-Use `--include-ram` only when a snapshot must preserve running process state. The current clean-baseline workflow
-does not require RAM-backed snapshots.
+Use `--include-ram` only when a snapshot must preserve running process state. The logical clean-baseline workflow
+does not require RAM-backed snapshots, but `clean-baseline` is not guaranteed to be the literal Ludus snapshot
+name. Always list restore targets and record the exact selected identity.
 
 `rollback --yes` resolves the target snapshot automatically — there is no hardcoded default. If the range has
 exactly one snapshot it uses it; if several, it prompts at a TTY, otherwise it prints the snapshot names to
@@ -208,6 +224,7 @@ does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 - `liveness.py`
 - `ludus.py`
 - `mcp_check.py`
+- `readiness_contract.py`
 - `mythic_reset.sh`
 - `pkinit_padata_probe.py`
 - `sage_restart.sh`

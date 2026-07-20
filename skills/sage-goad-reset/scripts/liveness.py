@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Throwaway (gitignored) — board state before the converged run: active callbacks + liveness."""
 import asyncio
+from pathlib import Path
 import sys
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from ai.langgraph.mythic_tools import assess_callback_liveness  # noqa: E402
 from mythic import mythic  # noqa: E402

@@ -17,7 +17,8 @@ import urllib.request
 import yaml
 
 
-DEFAULT_MCP_PATH = Path("/home/john/dev/sage/.mcp.json")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_MCP_PATH = REPO_ROOT / ".mcp.json"
 DEFAULT_MAX_SKEW_SECONDS = 60.0
 RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"

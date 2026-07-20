@@ -23,6 +23,10 @@ def test_with_range_id_preserves_existing_query_and_does_not_duplicate():
     )
 
 
+def test_default_mcp_path_derives_from_repo_root():
+    assert MODULE.MCP == str(MODULE.REPO_ROOT / ".mcp.json")
+
+
 def test_parser_accepts_range_id_before_or_after_command():
     assert MODULE.build_parser().parse_args(["--range-id", "before", "status"]).range_id == "before"
     assert MODULE.build_parser().parse_args(["status", "--range-id", "after"]).range_id == "after"

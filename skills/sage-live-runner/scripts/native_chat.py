@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, datetime
+import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import sys
 import time
 from typing import Any
 from uuid import uuid4
@@ -21,12 +24,15 @@ DEFAULT_USER = "mythic_admin"
 DEFAULT_OBJECTIVE = "From the current foothold, achieve administrative control of essos.local."
 DEFAULT_PREPARED_CHANNEL_NAME = "Sage GOAD Ready"
 PREPARED_CHANNEL_MARKER = "sage-goad-one-shot"
-DEFAULT_ENV_PATHS = (
-    Path("/home/john/dev/mythic_v4/.env"),
-    Path("/home/john/dev/mythic/.env"),
-)
 REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
+DEFAULT_ENV_PATHS = (
+    WORKSPACE_ROOT / "mythic_v4" / ".env",
+    WORKSPACE_ROOT / "mythic" / ".env",
+)
 SAGE_ENV_PATH = REPO_ROOT / "Payload_Type" / "sage" / ".env"
+READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
+BOOTSTRAP_PATH = REPO_ROOT / "skills" / "sage-callback-bootstrap" / "scripts" / "bootstrap_payloads.py"
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
 AUTONOMOUS_TOKEN_SCOPES = {"*"}
@@ -194,6 +200,15 @@ def resolve_env_path(explicit: str | Path | None = None) -> Path:
     return candidates[0] if candidates else DEFAULT_ENV_PATHS[0]
 
 
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load helper module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def resolve_password(env_path: str | Path | None = None) -> str:
     value = os.environ.get("MYTHIC_ADMIN_PASSWORD")
     if value:
@@ -264,6 +279,23 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return metadata
 
 
+def _readiness_contract_module():
+    return _load_module("sage_readiness_contract_for_native_chat", READINESS_CONTRACT_PATH)
+
+
+def _chat_runtime_identity_from_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        config = {}
+    contract = _readiness_contract_module()
+    return {
+        "provider": normalize_provider(config.get("provider") or ""),
+        "model": str(config.get("model") or "").strip(),
+        "route": contract._route_summary(config.get("API_ENDPOINT") or ""),
+    }
+
+
 async def login(
     *,
     server: str = DEFAULT_SERVER,
@@ -318,21 +350,18 @@ def select_chat_resources(
     return containers[0], usable[0]
 
 
-async def inspect_readiness(client: Any, *, api_token_id: int | None = None) -> dict[str, Any]:
-    observed = await mythic.execute_custom_query(client, READINESS_QUERY)
-    container, token = select_chat_resources(observed, api_token_id=api_token_id)
-    prepared = await find_prepared_channel(client)
-    return {
-        "ready": True,
-        "chat_container": container,
-        "prepared_channel": prepared,
-        "api_token": {
-            "id": token.get("id"),
-            "name": token.get("name"),
-            "operator_id": token.get("operator_id"),
-            "scopes": sorted(_scopes(token)),
-        },
-    }
+async def inspect_readiness(
+    client: Any,
+    *,
+    api_token_id: int | None = None,
+    runtime_dbs_archived: bool = False,
+) -> dict[str, Any]:
+    bootstrap = _load_module("sage_callback_bootstrap_for_native_chat", BOOTSTRAP_PATH)
+    return await bootstrap.readiness(
+        client,
+        api_token_id=api_token_id,
+        runtime_dbs_archived=runtime_dbs_archived,
+    )
 
 
 async def ensure_api_token(client: Any, *, name: str = "Sage native chat") -> dict[str, Any]:
@@ -373,6 +402,7 @@ async def create_locked_channel(
     channel_name = name or (
         f"sage-one-shot-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
     )
+    built_metadata = default_ai_metadata(metadata)
     result = await mythic.execute_custom_query(
         client,
         CREATE_CHANNEL_MUTATION,
@@ -382,7 +412,7 @@ async def create_locked_channel(
             "containerId": int(container["id"]),
             "model": model,
             "tokenId": int(token["id"]),
-            "metadata": default_ai_metadata(metadata),
+            "metadata": built_metadata,
         },
     )
     created = _require_success("chat channel creation", result.get("chatCreateChannel") or {})
@@ -394,6 +424,7 @@ async def create_locked_channel(
         "chat_channel_name": channel_name,
         "chat_container_id": int(container["id"]),
         "api_token_id": int(token["id"]),
+        "chat_runtime_identity": _chat_runtime_identity_from_metadata(built_metadata),
     }
 
 
@@ -405,6 +436,7 @@ def _prepared_channel_result(channel: dict[str, Any], *, reused: bool) -> dict[s
         "api_token_id": int(channel["apitokens_id"]),
         "prepared": True,
         "reused": reused,
+        "chat_runtime_identity": _chat_runtime_identity_from_metadata(channel.get("ai_metadata")),
     }
 
 
@@ -460,15 +492,69 @@ async def create_message(client: Any, channel_id: int, prompt: str) -> dict[str,
     }
 
 
+_SAFE_PROGRESS_TEXT = re.compile(r"^[A-Za-z0-9_.:/ -]{1,120}$")
+
+
+def _safe_progress_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text or not _SAFE_PROGRESS_TEXT.fullmatch(text):
+        return None
+    return text
+
+
+def _extract_progress_metadata(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    operation: str | None = None
+    tool_name: str | None = None
+    retry_count: int | None = None
+    for message in reversed(messages or []):
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        containers = [metadata]
+        container_metadata = metadata.get("container_metadata")
+        if isinstance(container_metadata, dict):
+            containers.append(container_metadata)
+        for container in containers:
+            tool_use = container.get("tool_use")
+            if isinstance(tool_use, dict):
+                tool_name = tool_name or _safe_progress_text(tool_use.get("tool_name"))
+                if retry_count is None and isinstance(tool_use.get("retry_count"), int):
+                    retry_count = int(tool_use["retry_count"])
+            runtime_telemetry = container.get("runtime_telemetry")
+            if isinstance(runtime_telemetry, dict):
+                operation = operation or _safe_progress_text(
+                    runtime_telemetry.get("current_operation")
+                    or runtime_telemetry.get("operation")
+                )
+                tool_name = tool_name or _safe_progress_text(runtime_telemetry.get("tool_name"))
+                if retry_count is None and isinstance(runtime_telemetry.get("retry_count"), int):
+                    retry_count = int(runtime_telemetry["retry_count"])
+        if operation is not None and tool_name is not None and retry_count is not None:
+            break
+    progress: dict[str, Any] = {}
+    if operation is not None:
+        progress["current_operation"] = operation
+    if tool_name is not None:
+        progress["tool_name"] = tool_name
+    if retry_count is not None:
+        progress["retry_count"] = retry_count
+    return progress
+
+
 async def wait_for_request(
     client: Any,
     request_id: int,
     *,
     timeout_seconds: int = 1800,
     poll_interval_seconds: float = 5.0,
+    progress_sink: Any | None = None,
+    heartbeat_interval_seconds: float = 60.0,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    deadline = started_at + timeout_seconds
     last: dict[str, Any] | None = None
+    last_progress_signature: tuple[str, int, str | None, str | None, int | None] | None = None
+    last_progress_emit_at = started_at
     while time.monotonic() < deadline:
         result = await mythic.execute_custom_query(
             client,
@@ -479,8 +565,38 @@ async def wait_for_request(
         if rows:
             last = rows[0]
             status = str(last.get("status") or "").casefold()
+            messages = result.get("chat_message") or []
+            progress_metadata = _extract_progress_metadata(messages)
+            signature = (
+                status,
+                len(messages),
+                progress_metadata.get("current_operation"),
+                progress_metadata.get("tool_name"),
+                progress_metadata.get("retry_count"),
+            )
+            now = time.monotonic()
+            elapsed_seconds = max(0, int(now - started_at))
+            remaining_seconds = max(0, int(deadline - now))
+            emit_event = None
+            if signature != last_progress_signature:
+                emit_event = "request_progress"
+            elif progress_sink is not None and (now - last_progress_emit_at) >= heartbeat_interval_seconds:
+                emit_event = "request_heartbeat"
+            if progress_sink is not None and emit_event is not None:
+                progress_sink({
+                    "event": emit_event,
+                    "chat_request_id": int(request_id),
+                    "status": status,
+                    "message_count": len(messages),
+                    "updated_at": last.get("updated_at"),
+                    "elapsed_seconds": elapsed_seconds,
+                    "remaining_seconds": remaining_seconds,
+                    **progress_metadata,
+                })
+                last_progress_signature = signature
+                last_progress_emit_at = now
             if status in TERMINAL_STATUSES:
-                return {"request": last, "messages": result.get("chat_message") or []}
+                return {"request": last, "messages": messages}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -526,6 +642,82 @@ def evaluator_result_view(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def emit_jsonl_event(event: dict[str, Any]) -> None:
+    print(json.dumps(event, sort_keys=True, default=str), file=sys.stderr, flush=True)
+
+
+def build_demo_manifest(
+    result: dict[str, Any],
+    *,
+    run_status: str = "clean",
+    runtime_identity: dict[str, Any] | None = None,
+    startup_identity: dict[str, Any] | None = None,
+    range_state: dict[str, Any] | None = None,
+    snapshot: str | None = None,
+    callback: dict[str, Any] | None = None,
+    tasks: list[dict[str, Any]] | None = None,
+    proofs: list[dict[str, Any]] | None = None,
+    artifact_paths: list[str | Path] | None = None,
+    readiness_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = _load_module("sage_readiness_contract_for_manifest", READINESS_CONTRACT_PATH)
+    artifacts = [contract.hash_file(item) for item in artifact_paths or []]
+    telemetry = result.get("runtime_telemetry") or {}
+    semantic_transactions = telemetry.get("transactions") or []
+    flattened_tasks: list[dict[str, Any]] = []
+    for transaction in semantic_transactions:
+        if not isinstance(transaction, dict):
+            continue
+        child_tasks = transaction.get("child_tasks") or []
+        for child_task in child_tasks:
+            if isinstance(child_task, dict):
+                flattened_tasks.append(dict(child_task))
+    effective_runtime_identity = (
+        result.get("chat_runtime_identity")
+        or runtime_identity
+        or contract.startup_identity_from_env()
+    )
+    process_identity = startup_identity or contract.startup_identity_from_env()
+    readiness_snapshot = readiness_snapshot or {}
+    manifest = {
+        "schema": "sage-native-chat-demo-manifest-v1",
+        "run_status": str(run_status or "clean"),
+        "run_status_evidence": {
+            "value": str(run_status or "clean"),
+            "readiness_ready": bool(readiness_snapshot.get("ready")),
+        },
+        "runtime_identity": effective_runtime_identity,
+        "startup_identity": process_identity,
+        "range": {
+            "identity": (range_state or {}).get("identity"),
+            "state": (range_state or {}).get("state"),
+            "range_number": (range_state or {}).get("range_number"),
+            "range_state": (range_state or {}).get("range_state"),
+            "snapshot": snapshot,
+        },
+        "callback": callback or {},
+        "chat": {
+            "channel_id": result.get("chat_channel_id"),
+            "channel_name": result.get("chat_channel_name"),
+            "request_id": result.get("chat_request_id"),
+            "status": result.get("status"),
+        },
+        "semantic_transactions": semantic_transactions,
+        "tasks": tasks if tasks is not None else flattened_tasks,
+        "proofs": proofs if proofs is not None else (telemetry.get("proof_lineage") or []),
+        "artifacts": artifacts,
+        "readiness": readiness_snapshot,
+    }
+    return contract.redact_structure(manifest)
+
+
+def write_demo_manifest(path: str | Path, manifest: dict[str, Any]) -> Path:
+    resolved = Path(path).expanduser()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return resolved
+
+
 async def run_native_chat_turn(
     client: Any,
     prompt: str,
@@ -536,7 +728,24 @@ async def run_native_chat_turn(
     api_token_id: int | None = None,
     metadata: dict[str, Any] | None = None,
     use_prepared_channel: bool = True,
+    progress_sink: Any | None = None,
+    manifest_path: str | Path | None = None,
+    manifest_context: dict[str, Any] | None = None,
+    runtime_dbs_archived: bool = False,
 ) -> dict[str, Any]:
+    if manifest_path and not runtime_dbs_archived:
+        raise RuntimeError("--manifest-path requires --runtime-dbs-archived.")
+
+    readiness_snapshot: dict[str, Any] | None = None
+    if manifest_path:
+        readiness_snapshot = await inspect_readiness(
+            client,
+            api_token_id=api_token_id,
+            runtime_dbs_archived=runtime_dbs_archived,
+        )
+        if not readiness_snapshot.get("ready"):
+            raise RuntimeError("Demo manifest preflight failed: shared readiness contract is not ready.")
+
     channel = None
     if use_prepared_channel and channel_name is None:
         channel = await find_prepared_channel(client)
@@ -548,15 +757,23 @@ async def run_native_chat_turn(
             metadata=metadata,
         )
     message = await create_message(client, channel["chat_channel_id"], prompt)
+    if progress_sink is not None:
+        progress_sink({
+            "event": "request_started",
+            "chat_channel_id": int(channel["chat_channel_id"]),
+            "chat_channel_name": str(channel["chat_channel_name"]),
+            "chat_request_id": int(message["chat_request_id"]),
+        })
     completed = await wait_for_request(
         client,
         message["chat_request_id"],
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
+        progress_sink=progress_sink,
     )
     request = completed["request"]
     messages = completed["messages"]
-    return {
+    result = {
         **channel,
         **message,
         "status": request.get("status"),
@@ -564,6 +781,49 @@ async def run_native_chat_turn(
         "messages": messages,
         "runtime_telemetry": extract_runtime_telemetry(messages),
     }
+    if progress_sink is not None:
+        progress_sink({
+            "event": "request_terminal",
+            "chat_channel_id": int(channel["chat_channel_id"]),
+            "chat_request_id": int(message["chat_request_id"]),
+            "status": str(result.get("status") or ""),
+        })
+    if manifest_path:
+        context = dict(manifest_context or {})
+        if readiness_snapshot is not None:
+            contract = _readiness_contract_module()
+            context.setdefault("startup_identity", readiness_snapshot.get("runtime_identity") or {})
+            foothold = readiness_snapshot.get("foothold") or {}
+            selected_foothold_id = foothold.get("selected_foothold_cb")
+            selected_callback = next(
+                (
+                    dict(item)
+                    for item in foothold.get("callbacks") or []
+                    if isinstance(item, dict) and item.get("display_id") == selected_foothold_id
+                ),
+                {},
+            )
+            context.setdefault(
+                "range_state",
+                {
+                    "range_number": (readiness_snapshot.get("ludus") or {}).get("range_number"),
+                    "range_state": (readiness_snapshot.get("ludus") or {}).get("range_state"),
+                },
+            )
+            context.setdefault("callback", selected_callback)
+            context.setdefault(
+                "readiness_snapshot",
+                contract.redact_structure(readiness_snapshot),
+            )
+        manifest = build_demo_manifest(result, **context)
+        written = write_demo_manifest(manifest_path, manifest)
+        result["demo_manifest"] = {
+            "path": str(written),
+            "sha256": _load_module(
+                "sage_readiness_contract_for_manifest_hash", READINESS_CONTRACT_PATH
+            ).hash_file(written)["sha256"],
+        }
+    return result
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -574,7 +834,11 @@ async def _run(args: argparse.Namespace) -> int:
         env_path=args.env_path,
     )
     if args.command == "inspect":
-        result = await inspect_readiness(client, api_token_id=args.api_token_id)
+        result = await inspect_readiness(
+            client,
+            api_token_id=args.api_token_id,
+            runtime_dbs_archived=args.runtime_dbs_archived,
+        )
     elif args.command == "ensure-token":
         result = await ensure_api_token(client, name=args.name)
     elif args.command == "prepare":
@@ -596,10 +860,20 @@ async def _run(args: argparse.Namespace) -> int:
             channel_name=args.channel_name,
             api_token_id=args.api_token_id,
             use_prepared_channel=not args.new_channel,
+            progress_sink=emit_jsonl_event,
+            manifest_path=args.manifest_path,
+            runtime_dbs_archived=args.runtime_dbs_archived,
+            manifest_context={
+                "run_status": args.run_status,
+                "snapshot": args.snapshot,
+                "artifact_paths": args.artifact_path,
+            },
         )
         if args.output_mode == "eval":
             result = evaluator_result_view(result)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    if args.command == "inspect" and not result.get("ready"):
+        return 1
     return 0
 
 
@@ -611,7 +885,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-path")
     parser.add_argument("--api-token-id", type=int)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("inspect")
+    inspect = sub.add_parser("inspect")
+    inspect.add_argument(
+        "--runtime-dbs-archived",
+        "--operator-db-cleanup-confirmed",
+        dest="runtime_dbs_archived",
+        action="store_true",
+    )
     ensure_token = sub.add_parser("ensure-token")
     ensure_token.add_argument("--name", default="Sage native chat")
     prepare = sub.add_parser("prepare")
@@ -633,6 +913,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore an empty prepared Sage channel and create a new channel.",
     )
+    run.add_argument("--manifest-path")
+    run.add_argument(
+        "--runtime-dbs-archived",
+        "--operator-db-cleanup-confirmed",
+        dest="runtime_dbs_archived",
+        action="store_true",
+    )
+    run.add_argument("--artifact-path", action="append", default=[])
+    run.add_argument("--run-status", choices=("clean", "resumed"), default="clean")
+    run.add_argument("--snapshot")
     return parser
 
 

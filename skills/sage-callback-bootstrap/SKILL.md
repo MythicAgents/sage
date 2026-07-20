@@ -37,8 +37,10 @@ After Apollo is launched as `NORTH\samwell.tarly` on CASTELBLACK, run:
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived
 ```
 
-Readiness is true only when the Sage chat container is running, the expected foothold is live, and runtime DB
-cleanup was confirmed. `selected_sage_cb` is intentionally null.
+Readiness delegates to the shared `sage-goad-reset` readiness contract. It is true only when the sanitized
+startup identity, runtime DB archival, exact six-VM/IP state, clock check, BloodHound API/domains, BloodHound
+MCP checkout and exact required tool set, Mythic chat/token, unique live foothold, and prepared channel are all
+ready. `selected_sage_cb` is intentionally null.
 
 ## Canonical Apollo Bootstrap Path
 
