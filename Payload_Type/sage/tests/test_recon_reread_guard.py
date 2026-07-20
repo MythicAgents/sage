@@ -6,7 +6,10 @@ The guard returns a "stop re-reading, act" nudge after repeated identical reads 
 resets when a command is issued (epoch bump) so a legitimate post-action re-read is always allowed.
 """
 
+import asyncio
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
@@ -46,3 +49,43 @@ def test_guard_never_raises_on_bad_state():
     mt = _mt()
     mt._recon_call_log = None  # corrupt — guard must fail-open to None, never throw
     assert mt._recon_reread_guard("list_callbacks", "all") is None
+
+
+def test_list_callbacks_guard_reuses_last_successful_snapshot(monkeypatch):
+    mt = _mt()
+    mt.client = object()
+
+    async def fake_query(_client, _query):
+        return {
+            "callback": [
+                {
+                    "display_id": 7,
+                    "last_checkin": datetime.now(timezone.utc).isoformat(),
+                    "user": "alice",
+                    "host": "WS01",
+                    "integrity_level": 2,
+                    "payload": {"payloadtype": {"name": "apollo"}},
+                    "c2profileparametersinstances": [],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(mythic_tools.mythic, "execute_custom_query", fake_query)
+
+    first = json.loads(asyncio.run(mt.list_callbacks()))
+    assert len(first) == 1
+    assert first[0]["id"] == 7
+    assert first[0]["agent"] == "apollo"
+    assert first[0]["host"] == "WS01"
+    assert first[0]["user"] == "alice"
+    assert first[0]["status"] == "alive"
+
+    asyncio.run(mt.list_callbacks())
+    third = json.loads(asyncio.run(mt.list_callbacks()))
+
+    assert third["status"] == "unchanged"
+    assert third["snapshot_source"] == "last_successful_read"
+    assert len(third["callbacks"]) == 1
+    assert third["callbacks"][0]["id"] == 7
+    assert third["callbacks"][0]["agent"] == "apollo"
+    assert third["callbacks"][0]["host"] == "WS01"

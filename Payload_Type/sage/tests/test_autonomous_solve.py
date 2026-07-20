@@ -227,6 +227,53 @@ def test_worker_handoff_prefers_terminal_execute_capability_report_over_narratio
     assert "bounded one-action capability request" not in summary
 
 
+def test_scoped_worker_done_summary_ends_graph_without_supervisor_redelegation():
+    mod = _load_model_module()
+    Model = mod.Model
+
+    class FakeAgent:
+        async def ainvoke(self, args, config=None):
+            return {
+                "messages": list(args["messages"]) + [
+                    AIMessage(
+                        content=(
+                            "DONE — Current callbacks are callback 1 on CASTELBLACK and callback 2 on BRAAVOS.\n"
+                            "FAILED — none.\n"
+                            "BLOCKER — none.\n"
+                            "REMAINING — all done / no further action required."
+                        ),
+                        name="Mythic_Operator",
+                    )
+                ]
+            }
+
+    m = Model.__new__(Model)
+    m._autonomous_solve = False
+    m._message_seq = 3
+    m.state = {"_message_seq": 3}
+    m.llm = None
+    m.mythic_client = None
+
+    state = {
+        "_message_seq": 3,
+        "supervisor_messages": [],
+        "generalist_messages": [],
+        "mythic_operator_messages": [HumanMessage(content="List current callbacks")],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+    }
+
+    wrapped = m._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")
+    result = asyncio.run(wrapped(state, {}))
+
+    assert getattr(result, "goto", None) == mod.END
+    update = result.update
+    assert update["recursion_handback"] is False
+    assert update["supervisor_messages"][-1].additional_kwargs["_is_final_report"] is True
+    assert "REMAINING — all done / no further action required." in update["supervisor_messages"][-1].content
+
+
 def test_autonomous_handoff_redirects_stale_gpo_redelegation_to_bloodhound():
     mod = _load_model_module()
     state = {

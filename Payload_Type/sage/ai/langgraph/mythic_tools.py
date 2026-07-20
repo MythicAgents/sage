@@ -1122,6 +1122,9 @@ class MythicTools:
         # returns a curt "stop re-reading, act" after repeats within an epoch, and resets when a command runs.
         self._recon_epoch: int = 0
         self._recon_call_log: dict[tuple, int] = {}
+        # Last successful compact recon snapshot per tool/target. The reread guard can then return the
+        # previously observed rows alongside its warning instead of degrading into an information-free blocker.
+        self._recon_snapshot_cache: dict[tuple[str, str], object] = {}
         # Unproductive-success loop-guard: a SUCCESSFUL command RESETS the failure circuit breaker, so a command
         # that keeps succeeding while returning the SAME (volatile-normalized) output — e.g. `shell klist` 10× —
         # slips past the breaker entirely. This tracks a GLOBAL consecutive-identical-action streak (command +
@@ -1667,7 +1670,15 @@ class MythicTools:
         logger.debug("🛠️ Calling list_callbacks (slim)")
         guard = self._recon_reread_guard("list_callbacks", "all")
         if guard:
-            return json.dumps({"status": "unchanged", "note": guard}, sort_keys=True)
+            payload: dict[str, object] = {"status": "unchanged", "note": guard}
+            try:
+                cached = self._recon_snapshot_cache.get(("list_callbacks", "all"))
+            except Exception:
+                cached = None
+            if isinstance(cached, list):
+                payload["callbacks"] = [dict(item) for item in cached if isinstance(item, dict)]
+                payload["snapshot_source"] = "last_successful_read"
+            return json.dumps(payload, sort_keys=True)
         query = """
             query slimcb {
               callback(where: {active: {_eq: true}}, order_by: {display_id: asc}) {
@@ -1712,6 +1723,12 @@ class MythicTools:
                 "status": live.get("status"),
                 "secs_since_checkin": live.get("seconds_since_checkin"),
             })
+        try:
+            self._recon_snapshot_cache[("list_callbacks", "all")] = [
+                dict(item) for item in out if isinstance(item, dict)
+            ]
+        except Exception:
+            pass
         return json.dumps(out, default=str, sort_keys=True)
 
     async def get_all_payload_info(self) -> str:

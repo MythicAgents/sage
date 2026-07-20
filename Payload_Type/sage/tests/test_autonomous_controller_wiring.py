@@ -493,6 +493,62 @@ def test_supervised_explicit_objective_turn_routes_to_controller_without_autonom
             os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
 
 
+def test_scoped_callback_inventory_prompt_detection_is_narrow_and_non_objective():
+    assert model._looks_like_scoped_callback_inventory_prompt(
+        "What can you tell me about our current callbacks?"
+    ) is True
+    assert model._looks_like_scoped_callback_inventory_prompt("List active callbacks") is True
+    assert model._looks_like_scoped_callback_inventory_prompt("Show current callbacks and liveness") is True
+    assert model._looks_like_scoped_callback_inventory_prompt(
+        "What can you tell me about our current callbacks and process names?"
+    ) is False
+    assert model._looks_like_scoped_callback_inventory_prompt(
+        "Which callback should I use to execute DCSync?"
+    ) is False
+    assert model.Model._looks_like_explicit_objective_prompt(
+        "From the current foothold, achieve administrative control of essos.local."
+    ) is True
+
+
+def test_scoped_callback_inventory_turn_uses_one_slim_read_and_no_controller():
+    m = object.__new__(model.Model)
+    m._message_seq = 1
+    m.state = {"_message_seq": 1}
+    m._format_message_for_streaming = lambda msg, agent_name=None: msg.content
+    streamed = []
+
+    async def _stream(text):
+        streamed.append(text)
+        return True
+
+    m._stream_message_to_mythic = _stream
+
+    class FakeMythic:
+        def __init__(self):
+            self.calls = []
+
+        async def list_callbacks(self):
+            self.calls.append("list_callbacks")
+            return json.dumps([
+                {
+                    "id": 1,
+                    "agent": "apollo",
+                    "host": "CASTELBLACK",
+                    "user": "samwell.tarly",
+                    "integrity": 2,
+                    "status": "alive",
+                    "secs_since_checkin": 1.25,
+                }
+            ])
+
+    m.mythic_client = FakeMythic()
+
+    assert asyncio.run(m._run_scoped_callback_inventory_turn()) == ""
+    assert m.mythic_client.calls == ["list_callbacks"]
+    assert "| 1 | apollo | CASTELBLACK | samwell.tarly | 2 | alive | 1.2s |" in streamed[0]
+    assert m.state["supervisor_messages"][-1].additional_kwargs["_scoped_callback_inventory"] is True
+
+
 def test_invoke_routes_reused_supervised_objective_turn_into_controller(monkeypatch):
     """The invoke seam itself must activate the controller before it would enter LangGraph."""
     monkeypatch.delenv("SAGE_AUTONOMOUS_CONTROLLER", raising=False)

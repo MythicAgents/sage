@@ -122,6 +122,140 @@ def _coerce_prompt_text(prompt: Any) -> str:
     return str(prompt or "")
 
 
+_SCOPED_CALLBACK_INVENTORY_WORDS = frozenset({
+    "active",
+    "all",
+    "alive",
+    "and",
+    "any",
+    "are",
+    "about",
+    "can",
+    "callback",
+    "callbacks",
+    "current",
+    "describe",
+    "health",
+    "healthy",
+    "is",
+    "list",
+    "live",
+    "liveness",
+    "me",
+    "now",
+    "of",
+    "our",
+    "report",
+    "right",
+    "show",
+    "status",
+    "statuses",
+    "summarize",
+    "tell",
+    "the",
+    "there",
+    "what",
+    "which",
+    "you",
+})
+
+
+def _looks_like_scoped_callback_inventory_prompt(prompt: Any) -> bool:
+    """True only for narrow read-only callback inventory questions.
+
+    This is intentionally conservative. It accepts simple "what/list/show current callbacks" questions plus
+    liveness/status wording, but rejects anything asking for tasking, process/OS/IP detail, or a next action.
+    """
+    text = re.sub(r"\s+", " ", _coerce_prompt_text(prompt).strip().casefold()).strip(" ?!.,:;")
+    if not text:
+        return False
+    words = re.findall(r"[a-z0-9_]+", text)
+    if not words or "callback" not in words and "callbacks" not in words:
+        return False
+    if words[0] not in {"what", "which", "show", "list", "report", "summarize", "describe", "tell"}:
+        return False
+    return all(word in _SCOPED_CALLBACK_INVENTORY_WORDS for word in words)
+
+
+def _callback_inventory_rows(payload: Any) -> tuple[list[dict[str, Any]], bool, str]:
+    """Normalize a `list_callbacks` result into rows plus cached-snapshot metadata."""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = {"status": "error", "error": payload}
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, dict)], False, ""
+    if isinstance(payload, dict):
+        rows = payload.get("callbacks")
+        if isinstance(rows, list):
+            note = str(payload.get("note") or "")
+            return [dict(item) for item in rows if isinstance(item, dict)], True, note
+        return [], False, str(payload.get("error") or payload.get("note") or "")
+    return [], False, ""
+
+
+def _callback_inventory_report(payload: Any) -> str:
+    """Render one compact callback inventory table for operator-facing chat."""
+    rows, used_cached_snapshot, note = _callback_inventory_rows(payload)
+    lines = [
+        "| ID | Agent | Host | User | Integrity | Status | Last Check-in |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in sorted(rows, key=lambda item: int(item.get("id") or 0)):
+        raw_seconds = row.get("secs_since_checkin")
+        try:
+            seconds = f"{float(raw_seconds):.1f}s"
+        except (TypeError, ValueError):
+            seconds = "-"
+        values = [
+            row.get("id"),
+            row.get("agent"),
+            row.get("host"),
+            row.get("user"),
+            row.get("integrity"),
+            row.get("status"),
+            seconds,
+        ]
+        rendered = [str(value if value not in (None, "") else "-").replace("|", "\\|") for value in values]
+        lines.append("| " + " | ".join(rendered) + " |")
+    if not rows:
+        lines.append("| - | - | - | - | - | - | - |")
+        lines.append("")
+        if note:
+            lines.append(f"Callback inventory unavailable: {note}")
+        else:
+            lines.append("No active callbacks were returned.")
+    elif used_cached_snapshot:
+        lines.append("")
+        lines.append(
+            "_Reused the last successful callback snapshot because a repeated read in the same task epoch "
+            "was suppressed by the recon guard._"
+        )
+        if note:
+            lines.append("")
+            lines.append(f"_Guard note: {note}_")
+    return "\n".join(lines)
+
+
+def _worker_summary_has_no_actionable_remaining(summary: Any) -> bool:
+    """Recognize structured worker handbacks that already satisfy a scoped request."""
+    text = re.sub(r"[*_`]+", "", str(summary or ""))
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    if "done" not in text:
+        return False
+    match = re.search(r"\bremaining\b\s*(?:tasks?)?\s*(?:[:\-\u2014]|is)?\s*(.+)$", text)
+    if match is None:
+        return False
+    remainder = match.group(1).strip(" .;")
+    return bool(re.match(
+        r"(?:all done(?:\s*/\s*no further action required)?|"
+        r"none|no further action required|nothing(?: else)?(?: remains)?|"
+        r"blocked(?:,?\s+no new approach)?)\b",
+        remainder,
+    ))
+
+
 def _content_has_text(content: Any) -> bool:
     """True if a message's content carries at least one non-blank piece of text or a non-text block.
 
@@ -3395,6 +3529,32 @@ class Model:
                         update["supervisor_messages"] = [response_header, summary_ai_msg]
                         logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(summary_text)} chars)")
 
+                        if (
+                            not bool(getattr(self, "_autonomous_solve", False))
+                            and _worker_summary_has_no_actionable_remaining(summary_text)
+                        ):
+                            final_msg = AIMessage(
+                                content=summary_text,
+                                name="Supervisor",
+                                additional_kwargs={
+                                    "_is_final_report": True,
+                                    "_scoped_worker_terminal": True,
+                                },
+                            )
+                            _tag_msg(final_msg, self._next_seq())
+                            terminal_update: dict[str, Any] = {
+                                state_key: new_messages_from_agent,
+                                "messages": new_messages_from_agent + [final_msg],
+                                "supervisor_messages": [response_header, summary_ai_msg, final_msg],
+                                "_message_seq": self._message_seq,
+                                "recursion_summary_requested": False,
+                                "recursion_handback": False,
+                            }
+                            logger.info(
+                                f"✅ [{node_name}] scoped summary has no actionable REMAINING work; ending graph"
+                            )
+                            return Command(goto=END, update=terminal_update)
+
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
                         calling_agent = state.get("_last_calling_agent")
                         if calling_agent and calling_agent != "Supervisor":
@@ -3918,6 +4078,39 @@ class Model:
         formatted = self._format_message_for_streaming(final_message, agent_name="Generalist")
         if formatted:
             await self._stream_message_to_mythic(formatted)
+        return ""
+
+    async def _run_scoped_callback_inventory_turn(self) -> str:
+        """Answer a narrow callback inventory question with exactly one slim read."""
+        try:
+            payload = (
+                await self.mythic_client.list_callbacks()
+                if self.mythic_client is not None
+                else {"status": "error", "error": "Mythic client not initialized"}
+            )
+        except Exception as exc:
+            payload = {"status": "error", "error": str(exc)}
+        report = _callback_inventory_report(payload)
+        report_msg = AIMessage(
+            content=report,
+            name="Supervisor",
+            additional_kwargs={
+                "_is_final_report": True,
+                "_scoped_callback_inventory": True,
+            },
+        )
+        try:
+            _tag_msg(report_msg, self._next_seq())
+            self.state.setdefault("messages", []).append(report_msg)
+            self.state.setdefault("supervisor_messages", []).append(report_msg)
+        except Exception:
+            pass
+        try:
+            formatted = self._format_message_for_streaming(report_msg, agent_name="Supervisor")
+            if formatted:
+                await self._stream_message_to_mythic(formatted)
+        except Exception:
+            pass
         return ""
 
     def _controller_owned_solve(self) -> bool:
@@ -6986,6 +7179,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             formatted_prompt = self._format_message_for_streaming(user_msg, agent_name=None)
             if formatted_prompt:
                 await self._stream_message_to_mythic(formatted_prompt)
+
+        if _looks_like_scoped_callback_inventory_prompt(prompt):
+            logger.info("Scoped callback inventory prompt routed to one deterministic list_callbacks read")
+            return await self._run_scoped_callback_inventory_turn()
 
         if self._objective_completion_preflight_allowed(prompt) and await self._maybe_stream_objective_completion_stop(
             refresh_footholds=True,
