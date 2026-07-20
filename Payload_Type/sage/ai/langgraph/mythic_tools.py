@@ -2730,24 +2730,47 @@ class MythicTools:
         """Return the latest authentication-context observation for a callback."""
         return self._authentication_contexts.get(str(callback_display_id))
 
-    def _record_kerberos_ticket_store_context(self, command: str, callback_display_id: int, output: str) -> None:
+    def _record_kerberos_ticket_store_context(
+        self,
+        command: str,
+        callback_display_id: int,
+        parameters,
+        output: str,
+    ) -> None:
         try:
             normalized = _normalize_command_name(command)
             low = str(output or "").casefold()
             if any(token in low for token in ("error", "fail", "exception", "invalid", "denied")):
                 return
+            context_changed = False
             if normalized == "ticket_store_add" and "added ticket" in low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized == "ticket_cache_add" and low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized in {"execute_assembly", "inline_assembly", "invoke_assembly"} and "ticket successfully imported" in low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized in {
                 "ticket_store_purge",
                 "ticket_store_remove",
                 "ticket_store_delete",
                 "ticket_cache_purge",
             }:
+                context_changed = True
+            else:
+                if command_builder.classify_result(command, output) != command_builder.ResultClass.SUCCESS.value:
+                    return
+                context = self._deterministic_capability_command_context(command, parameters)
+                produces = {
+                    self._capability_text(item).casefold()
+                    for item in context.get("produces", []) or []
+                }
+                context_changed = bool(
+                    produces & {
+                        "kerberos_current_tickets_purged",
+                        "kerberos_service_ticket_acquired",
+                    }
+                )
+            if context_changed:
                 self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
@@ -3350,7 +3373,7 @@ class MythicTools:
                 )
             self._cache_kerberos_ticket_artifact(command, parameters, results_str)
             self._record_kerberos_logon_context(command, callback_display_id, parameters, results_str)
-            self._record_kerberos_ticket_store_context(command, callback_display_id, results_str)
+            self._record_kerberos_ticket_store_context(command, callback_display_id, parameters, results_str)
             self._record_deterministic_capability_command_result(
                 command,
                 parameters,

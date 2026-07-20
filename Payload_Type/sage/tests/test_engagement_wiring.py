@@ -7593,6 +7593,114 @@ def test_ensure_context_service_proof_retry_key_advances_after_ticket_import():
     }
 
 
+def test_ensure_context_service_proof_retry_key_advances_after_native_refresh():
+    mt = _make_tools()
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    proof_params = _seed_ensure_context_service_proof(mt)
+    purge_params = {"executable": "klist.exe", "arguments": "purge"}
+    acquire_params = {"executable": "klist.exe", "arguments": "get cifs/dc01.lab.local"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", purge_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-ticket-purge",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", acquire_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-service-ticket-acquire",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_service_ticket_acquired"],
+        "consumes": ["kerberos_current_tickets_purged"],
+    }
+    outputs = iter([
+        "Access is denied.",
+        "Ticket(s) purged!",
+        "A ticket to cifs/dc01.lab.local has been retrieved successfully.",
+        " Directory of \\\\dc01.lab.local\\C$\r\nWindows\r\n",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7172):
+        preflight = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+        before_epoch = mt._kerberos_context_epoch(13)
+        before_key = mt._task_failure_key("shell", 13, proof_params)
+        purged = asyncio.run(mt.issue_task_and_waitfor_task_output("run", purge_params, 13, timeout=5))
+        acquired = asyncio.run(mt.issue_task_and_waitfor_task_output("run", acquire_params, 13, timeout=5))
+        after_epoch = mt._kerberos_context_epoch(13)
+        after_key = mt._task_failure_key("shell", 13, proof_params)
+        proof = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+
+    assert preflight.startswith("genuine failure")
+    assert "purged" in purged.casefold()
+    assert "retrieved successfully" in acquired.casefold()
+    assert before_epoch == 0
+    assert after_epoch > before_epoch
+    assert before_key != after_key
+    assert before_key[-2:] == ("kerberos_context_epoch", before_epoch)
+    assert after_key[-2:] == ("kerberos_context_epoch", after_epoch)
+    assert "Directory of" in proof
+    assert calls["issue"] == 4
+
+
+def test_ensure_context_service_proof_retry_key_does_not_advance_after_failed_native_refresh():
+    mt = _make_tools()
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    proof_params = _seed_ensure_context_service_proof(mt)
+    purge_params = {"executable": "klist.exe", "arguments": "purge"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", purge_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-ticket-purge",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+    outputs = iter([
+        "Access is denied.",
+        "The system cannot find the file specified.",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7173):
+        preflight = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+        before_epoch = mt._kerberos_context_epoch(13)
+        before_key = mt._task_failure_key("shell", 13, proof_params)
+        refresh = asyncio.run(mt.issue_task_and_waitfor_task_output("run", purge_params, 13, timeout=5))
+        after_epoch = mt._kerberos_context_epoch(13)
+        after_key = mt._task_failure_key("shell", 13, proof_params)
+        proof = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+
+    assert preflight.startswith("genuine failure")
+    assert refresh.startswith("genuine failure")
+    assert before_epoch == 0
+    assert after_epoch == before_epoch
+    assert before_key == after_key
+    assert proof.startswith("STOP")
+    assert calls["issue"] == 2
+
+
 def test_default_ensure_context_effects_include_cross_domain_admin_control():
     mt = _make_tools()
 
