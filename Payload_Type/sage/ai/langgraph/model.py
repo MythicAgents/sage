@@ -2523,7 +2523,11 @@ class Model:
             if content.strip():
                 delegation = getattr(self, "_active_delegations", {}).get(delegation_name)
                 if delegation is not None:
-                    delegation["last_text"] = content.strip()
+                    emitted_text = content.strip()
+                    delegation["last_text"] = emitted_text
+                    streamed_text_chunks = delegation.setdefault("streamed_text_chunks", [])
+                    if isinstance(streamed_text_chunks, list):
+                        streamed_text_chunks.append(emitted_text)
         except Exception as e:
             logger.debug(f"_emit_agent_text failed (non-fatal): {e}")
 
@@ -2678,6 +2682,7 @@ class Model:
                 "icon_color": icon_color,
                 "source_seq": source_seq,
                 "last_text": "",
+                "streamed_text_chunks": [],
                 "final_summary": "",
             }
             await self._emit_subagent_status(
@@ -2723,11 +2728,21 @@ class Model:
             final_summary = str(delegation.get("final_summary") or "").strip()
             explicit_content = str(content or "").strip()
             last_text = str(delegation.get("last_text") or "").strip()
+            streamed_text_chunks = delegation.get("streamed_text_chunks")
             # Mythic automatically persists non-empty terminal card content as a
             # subagent_final_output drill-down message. Text already emitted through emit_agent_text
             # must therefore not be repeated as card-close content.
             content = explicit_content or final_summary
-            if content and last_text and content == last_text:
+            streamed_text_candidates = {last_text} if last_text else set()
+            if isinstance(streamed_text_chunks, list):
+                cleaned_chunks = [
+                    str(chunk).strip()
+                    for chunk in streamed_text_chunks
+                    if isinstance(chunk, str) and chunk.strip()
+                ]
+                if cleaned_chunks:
+                    streamed_text_candidates.add("\n\n".join(cleaned_chunks))
+            if content and content in streamed_text_candidates:
                 content = ""
             await self._emit_subagent_status(
                 title=str(delegation.get("title", "")),

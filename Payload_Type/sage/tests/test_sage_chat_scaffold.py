@@ -1666,6 +1666,36 @@ def test_close_delegation_suppresses_explicit_content_already_streamed():
     assert emitter.subagent_calls[0]["content"] == ""
 
 
+def test_close_delegation_suppresses_explicit_content_matching_full_streamed_transcript():
+    emitter = _RecEmitter()
+    m = _bare_model_with(emitter, {
+        "BloodHound": {"id": "bloodhound:1", "name": "BloodHound", "title": "t", "tool_count": 0,
+                       "icon": "BH", "icon_color": "#E5484D",
+                       "final_summary": "", "last_text": "", "streamed_text_chunks": []},
+    })
+
+    _run(m._emit_agent_text(
+        content="Found two active callbacks.",
+        delegation_id="bloodhound:1",
+        delegation_name="BloodHound",
+    ))
+    _run(m._emit_agent_text(
+        content="Both are on CASTELBLACK.",
+        delegation_id="bloodhound:1",
+        delegation_name="BloodHound",
+    ))
+    _run(m._close_delegation(
+        "BloodHound",
+        content="Found two active callbacks.\n\nBoth are on CASTELBLACK.",
+    ))
+
+    assert [call["content"] for call in emitter.agent_text_calls] == [
+        "Found two active callbacks.",
+        "Both are on CASTELBLACK.",
+    ]
+    assert emitter.subagent_calls[0]["content"] == ""
+
+
 def test_request_scope_prevents_delegation_id_reuse_after_restart():
     from ai.langgraph.model import Model
 
