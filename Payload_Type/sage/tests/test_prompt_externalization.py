@@ -1,6 +1,6 @@
 """Tests for ROADMAP Phase 3 — externalized agent system prompts (prompt_loader).
 
-The migration moved 5 LangGraph agent system prompts out of model.py inline
+The migration moved LangGraph agent system prompts out of model.py inline
 f-strings into editable markdown files under Payload_Type/sage/prompts/, loaded
 at agent-build time by ai/langgraph/prompt_loader.py.
 
@@ -51,6 +51,7 @@ FIXTURES = {
     "bloodhound": {
         "servers_text": "\n**Currently Connected MCP Servers:** 1\n- bloodhound: 13 tools (graph_analysis, cypher_query)\n"
     },
+    "sandbox": {},
     "supervisor": {},
 }
 
@@ -61,7 +62,8 @@ EXPECTED_META = {
     "mythic_payload": ("Mythic_Payload", 10),
     "mcp_manager": ("MCP_Manager", 1),
     "bloodhound": ("BloodHound", 4),
-    "supervisor": ("Supervisor", 7),
+    "sandbox": ("Sandbox", 2),
+    "supervisor": ("Supervisor", 8),
 }
 
 # A distinctive, post-substitution substring per agent. Its presence proves the
@@ -73,6 +75,7 @@ DISTINCTIVE_RENDERED = {
     "mythic_payload": "- apollo\n        - merlin",
     "mcp_manager": "**Currently Connected MCP Servers:** 1",
     "bloodhound": "You are the **BloodHound Agent**",
+    "sandbox": "You are the **Sandbox Agent**",
     "supervisor": "You are a Supervisor Agent",
 }
 

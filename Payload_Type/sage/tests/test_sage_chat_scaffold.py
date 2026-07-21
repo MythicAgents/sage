@@ -936,7 +936,7 @@ def _slash_req(name, argument="", channel_id=5, request_id=1):
 
 
 def test_slash_commands_declared():
-    assert {c.Name for c in SLASH_COMMANDS} == {"state", "list", "mode", "stop", "mcp", "bloodhound"}
+    assert {c.Name for c in SLASH_COMMANDS} == {"state", "list", "mode", "stop", "mcp", "bloodhound", "sandbox"}
 
 
 def test_slash_state_no_session_is_handled_with_one_terminal(monkeypatch):
@@ -974,7 +974,7 @@ def test_slash_unknown_falls_through_without_emitting():
 
 
 def test_slash_mcp_and_bloodhound_declared():
-    assert {c.Name for c in SLASH_COMMANDS} >= {"mcp", "bloodhound"}
+    assert {c.Name for c in SLASH_COMMANDS} >= {"mcp", "bloodhound", "sandbox"}
 
 
 def test_slash_mcp_list_empty():
@@ -1020,6 +1020,35 @@ def test_slash_bloodhound(monkeypatch):
     assert "BloodHound MCP connected" in chat.emissions[-1]["content"]
 
 
+def test_slash_sandbox_executes_without_model_turn(monkeypatch):
+    import sage_chat.slash as slashmod
+
+    class _Tools:
+        async def sandbox_exec(self, code_or_command, language="shell", timeout=None):
+            assert code_or_command == "print(2 + 2)"
+            assert language == "python"
+            assert timeout is None
+            return '{"exit_code": 0, "status": "ok", "stderr": "", "stdout": "4\\n", "timed_out": false, "truncated": false}'
+
+    async def _tools_for_request(model, request):
+        assert model is None
+        return _Tools()
+
+    monkeypatch.setattr(slashmod, "_sandbox_tools_for_request", _tools_for_request)
+    chat = HeadlessSageChat()
+    _run(handle_slash(chat, _slash_req("sandbox", "python print(2 + 2)"), None, "slash:1"))
+    text = chat.emissions[-1]["content"]
+    assert "**Sandbox result**" in text
+    assert "| Language | `python` |" in text
+    assert "```stdout\n4\n\n```" in text
+
+
+def test_slash_sandbox_usage_for_missing_code():
+    chat = HeadlessSageChat()
+    _run(handle_slash(chat, _slash_req("sandbox"), None, "slash:1"))
+    assert "Usage: `/sandbox [shell|python] <code>`" in chat.emissions[-1]["content"]
+
+
 def test_slash_dispatched_via_chat_without_creating_model():
     class _NoModelChat(HeadlessSageChat):
         async def _get_or_create_model(self, request):  # must not be called for a handled slash
@@ -1028,6 +1057,27 @@ def test_slash_dispatched_via_chat_without_creating_model():
     chat = _NoModelChat()
     _run(chat.chat(_slash_req("state", channel_id=9, request_id=3)))
     assert len(chat.terminal_emissions) == 1
+
+
+def test_slash_sandbox_dispatched_via_chat_without_creating_model(monkeypatch):
+    import sage_chat.slash as slashmod
+
+    class _NoModelChat(HeadlessSageChat):
+        async def _get_or_create_model(self, request):
+            raise AssertionError("slash command should not construct a Model")
+
+    class _Tools:
+        async def sandbox_exec(self, code_or_command, language="shell", timeout=None):
+            return '{"exit_code": 0, "status": "ok", "stderr": "", "stdout": "ok\\n", "timed_out": false, "truncated": false}'
+
+    async def _tools_for_request(model, request):
+        return _Tools()
+
+    monkeypatch.setattr(slashmod, "_sandbox_tools_for_request", _tools_for_request)
+    chat = _NoModelChat()
+    _run(chat.chat(_slash_req("sandbox", "shell printf ok", channel_id=9, request_id=4)))
+    assert len(chat.terminal_emissions) == 1
+    assert "**Sandbox result**" in chat.emissions[-1]["content"]
 
 
 # --------------------------------------------------------------------------------------

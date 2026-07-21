@@ -227,7 +227,7 @@ def test_worker_handoff_prefers_terminal_execute_capability_report_over_narratio
     assert "bounded one-action capability request" not in summary
 
 
-def test_scoped_worker_done_summary_ends_graph_without_supervisor_redelegation():
+def test_completed_worker_summary_hands_back_to_supervisor_without_emitting_final_report():
     mod = _load_model_module()
     Model = mod.Model
 
@@ -265,13 +265,14 @@ def test_scoped_worker_done_summary_ends_graph_without_supervisor_redelegation()
     }
 
     wrapped = m._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")
-    result = asyncio.run(wrapped(state, {}))
+    update = asyncio.run(wrapped(state, {}))
 
-    assert getattr(result, "goto", None) == mod.END
-    update = result.update
-    assert update["recursion_handback"] is False
-    assert update["supervisor_messages"][-1].additional_kwargs["_is_final_report"] is True
-    assert "REMAINING — all done / no further action required." in update["supervisor_messages"][-1].content
+    assert isinstance(update, dict)
+    assert getattr(update, "goto", None) is None
+    assert len(update["supervisor_messages"]) == 2
+    assert update["supervisor_messages"][0].additional_kwargs["_is_completion_header"] is True
+    assert "_is_final_report" not in update["supervisor_messages"][1].additional_kwargs
+    assert "REMAINING — all done / no further action required." in update["supervisor_messages"][1].content
 
 
 def test_autonomous_handoff_redirects_stale_gpo_redelegation_to_bloodhound():
@@ -1007,8 +1008,45 @@ def test_handoff_tool_schema_exposes_title_and_instruction_in_one_call():
     tool = mod._create_handoff_tool(agent_name="BloodHound")
 
     assert set(tool.args) >= {"handoff_title", "handoff_instruction"}
+    assert "input_payload" not in tool.args
+    assert "input_type" not in tool.args
     assert "short operator-facing title" in tool.args["handoff_title"]["description"]
     assert "complete, self-contained instruction" in tool.args["handoff_instruction"]["description"]
+
+
+def test_sandbox_handoff_schema_carries_inline_payload_to_worker():
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(agent_name="Sandbox")
+    runtime = SimpleNamespace(
+        state={
+            "messages": [],
+            "supervisor_messages": [],
+            "mythic_operator_messages": [],
+            "generalist_messages": [],
+            "mythic_payload_messages": [],
+            "mcp_manager_messages": [],
+            "bloodhound_messages": [],
+            "sandbox_messages": [],
+        },
+        tool_call_id="sandbox-handoff",
+    )
+    payload = '[{"id": 41, "host": "CASTELBLACK"}]'
+
+    command = tool.func(
+        runtime,
+        "Group the callbacks by host and identify duplicate IDs.",
+        "Group callback JSON",
+        payload,
+        "json",
+    )
+
+    assert set(tool.args) >= {"handoff_title", "handoff_instruction", "input_payload", "input_type"}
+    delegated = command.update["sandbox_messages"][1]
+    assert delegated.additional_kwargs["_handoff_title"] == "Group callback JSON"
+    assert delegated.content.startswith("Group the callbacks by host and identify duplicate IDs.")
+    assert "Input payload (json):" in delegated.content
+    assert "```json" in delegated.content
+    assert payload in delegated.content
 
 
 def test_handoff_redirect_replaces_stale_caller_title():

@@ -13,6 +13,7 @@ to be useful without porting the full task-bound implementations. They grow late
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from typing import Any
 
 from mythic_container.ChatBase import ChatRequest, ChatSlashCommandDefinition
@@ -31,6 +32,7 @@ SLASH_COMMANDS = [
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the baked-in BloodHound MCP: /bloodhound [directory]."),
+    ChatSlashCommandDefinition(Name="sandbox", Description="Run a local-only isolated snippet: /sandbox [shell|python] <code>."),
 ]
 
 
@@ -373,6 +375,107 @@ async def _handle_bloodhound(arg: str) -> str:
     return msg
 
 
+def _sandbox_usage() -> str:
+    return (
+        "Usage: `/sandbox [shell|python] <code>`\n\n"
+        "Examples:\n"
+        "```text\n"
+        "/sandbox shell printf 'hello\\n'\n"
+        "/sandbox python print(2 + 2)\n"
+        "```"
+    )
+
+
+def _parse_sandbox_arg(arg: str) -> tuple[str, str] | None:
+    text = (arg or "").strip()
+    if not text:
+        return None
+    first, _, rest = text.partition(" ")
+    mode = first.casefold()
+    if mode in {"shell", "sh"}:
+        return "shell", rest.strip()
+    if mode in {"python", "py"}:
+        return "python", rest.strip()
+    return "shell", text
+
+
+async def _sandbox_tools_for_request(model: Any, request: ChatRequest):
+    tools = getattr(model, "mythic_client", None) if model is not None else None
+    if tools is not None:
+        return tools
+    try:
+        from ai.langgraph.mythic_tools import MythicTools
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph.mythic_tools import MythicTools  # type: ignore
+    tools = MythicTools(
+        operation_id=getattr(request, "OperationID", None),
+        channel_id=getattr(request, "ChannelID", None),
+        apitoken_id=getattr(request, "APITokenID", 0),
+    )
+    await tools.login()
+    try:
+        tools.apply_scope_gating(await tools.whoami_scopes())
+    except Exception as e:
+        logger.debug(f"/sandbox scope preflight skipped: {e}")
+    return tools
+
+
+def _sandbox_fence(label: str, text: str) -> str:
+    body = str(text or "")
+    fence = "````" if "```" in body else "```"
+    return f"{fence}{label}\n{body}\n{fence}"
+
+
+def _render_sandbox_result(language: str, raw: str) -> str:
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {"status": "error", "error": raw}
+    if not isinstance(payload, dict):
+        payload = {"status": "error", "error": str(payload)}
+
+    status = str(payload.get("status") or "error")
+    if status != "ok":
+        return (
+            "**Sandbox result**\n\n"
+            f"| Field | Value |\n|---|---|\n| Status | `{status}` |\n| Language | `{language}` |\n\n"
+            f"{_sandbox_fence('text', str(payload.get('error') or 'sandbox execution failed'))}"
+        )
+
+    lines = [
+        "**Sandbox result**",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| Status | `{status}` |",
+        f"| Language | `{language}` |",
+        f"| Exit code | `{payload.get('exit_code')}` |",
+        f"| Timed out | `{bool(payload.get('timed_out'))}` |",
+        f"| Truncated | `{bool(payload.get('truncated'))}` |",
+    ]
+    lines.extend([
+        "",
+        _sandbox_fence("stdout", str(payload.get("stdout") or "")),
+        "",
+        _sandbox_fence("stderr", str(payload.get("stderr") or "")),
+    ])
+    return "\n".join(lines)
+
+
+async def _handle_sandbox(model: Any, request: ChatRequest, arg: str) -> str:
+    parsed = _parse_sandbox_arg(arg)
+    if parsed is None:
+        return _sandbox_usage()
+    language, code = parsed
+    if not code:
+        return _sandbox_usage()
+    tools = await _sandbox_tools_for_request(model, request)
+    if "sandbox_exec" in (getattr(tools, "disabled_tools", set()) or set()):
+        return "`/sandbox` is unavailable for this channel because the chat token lacks `callback.write` scope."
+    raw = await tools.sandbox_exec(code_or_command=code, language=language)
+    return _render_sandbox_result(language, raw)
+
+
 async def _handle_stop(request: ChatRequest) -> str:
     try:
         from ai.langgraph.model import request_stop_for_sessions
@@ -404,6 +507,8 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
         text = await _handle_mcp(arg)
     elif name == "bloodhound":
         text = await _handle_bloodhound(arg)
+    elif name == "sandbox":
+        text = await _handle_sandbox(model, request, arg)
     else:
         return False
     await chat.send_complete(request, response_key, content=text, complete_request=True)

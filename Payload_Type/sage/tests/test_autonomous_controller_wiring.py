@@ -2097,7 +2097,7 @@ def test_legacy_autonomous_executor_runs_inside_offensive_mcp_context_and_resets
     assert mcpmod.MCPManager.current_execution_context() == mcpmod.MCP_EXECUTION_CONTEXT_GENERAL
 
 
-def test_autonomous_agent_topology_excludes_generic_mcp_handoff_and_tools(monkeypatch):
+def test_autonomous_agent_topology_excludes_generic_mcp_and_sandbox_handoffs(monkeypatch):
     captured = {}
 
     class FakeRunnable:
@@ -2109,10 +2109,15 @@ def test_autonomous_agent_topology_excludes_generic_mcp_handoff_and_tools(monkey
         return FakeRunnable()
 
     generic_tool = type("GenericMCPTool", (), {"name": "generic_external_probe"})()
+    class FakeMythic:
+        def get_tools(self, names):
+            return [type("Tool", (), {"name": name})() for name in names]
+
     monkeypatch.setattr(model, "create_agent", fake_create_agent)
     monkeypatch.setattr(model, "load_prompt", lambda *_args, **_kwargs: "prompt")
     monkeypatch.setattr(model, "filter_tools_by_frontmatter", lambda _agent, tools: list(tools))
     monkeypatch.setattr(model.prompt_context, "servers_text", lambda _model: "")
+    monkeypatch.setattr(model.prompt_context, "commands_text", lambda _model: "")
     monkeypatch.setattr(model.MCPManager, "get_connected_servers", lambda: ["generic-control-plane"])
     monkeypatch.setattr(model.MCPManager, "is_bloodhound_server", lambda _name: False)
     monkeypatch.setattr(model.MCPManager, "get_tools_by_server", lambda _name: [generic_tool])
@@ -2121,11 +2126,19 @@ def test_autonomous_agent_topology_excludes_generic_mcp_handoff_and_tools(monkey
         captured.clear()
         m = object.__new__(model.Model)
         m._autonomous_solve = autonomous
-        m.state = {"mcp_manager_messages": [], "supervisor_messages": []}
+        m.mythic_client = FakeMythic()
+        m.state = {
+            "mcp_manager_messages": [],
+            "sandbox_messages": [],
+            "mythic_operator_messages": [],
+            "supervisor_messages": [],
+        }
         m._get_base_chat_model = lambda: object()
-        m._context_middleware = lambda: []
+        m._context_middleware = lambda *args, **kwargs: []
         m._autonomous_handoff_step_redirect = lambda *_args, **_kwargs: None
         m._mcp_manager_agent()
+        m._sandbox_agent()
+        m._mythic_operator_agent()
         m._supervisor_agent()
         return {name: list(tools) for name, tools in captured.items()}
 
@@ -2134,5 +2147,10 @@ def test_autonomous_agent_topology_excludes_generic_mcp_handoff_and_tools(monkey
 
     assert "generic_external_probe" not in autonomous["MCP_Manager"]
     assert "transfer_to_MCP_Manager" not in autonomous["Supervisor"]
+    assert "transfer_to_Sandbox" not in autonomous["Supervisor"]
+    assert "sandbox_exec" not in autonomous["Mythic_Operator"]
     assert "generic_external_probe" in conversational["MCP_Manager"]
     assert "transfer_to_MCP_Manager" in conversational["Supervisor"]
+    assert "transfer_to_Sandbox" in conversational["Supervisor"]
+    assert "sandbox_exec" in conversational["Sandbox"]
+    assert "sandbox_exec" not in conversational["Mythic_Operator"]

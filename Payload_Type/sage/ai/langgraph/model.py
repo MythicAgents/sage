@@ -60,6 +60,7 @@ _COMPACTION_PROTECTED_TOOLS = frozenset((
     "summarize_and_handback", "request_continuation", "respond_to_user",
     "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
     "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
+    "transfer_to_Sandbox",
 ))
 
 
@@ -238,24 +239,6 @@ def _callback_inventory_report(payload: Any) -> str:
     return "\n".join(lines)
 
 
-def _worker_summary_has_no_actionable_remaining(summary: Any) -> bool:
-    """Recognize structured worker handbacks that already satisfy a scoped request."""
-    text = re.sub(r"[*_`]+", "", str(summary or ""))
-    text = re.sub(r"\s+", " ", text).strip().casefold()
-    if "done" not in text:
-        return False
-    match = re.search(r"\bremaining\b\s*(?:tasks?)?\s*(?:[:\-\u2014]|is)?\s*(.+)$", text)
-    if match is None:
-        return False
-    remainder = match.group(1).strip(" .;")
-    return bool(re.match(
-        r"(?:all done(?:\s*/\s*no further action required)?|"
-        r"none|no further action required|nothing(?: else)?(?: remains)?|"
-        r"blocked(?:,?\s+no new approach)?)\b",
-        remainder,
-    ))
-
-
 def _content_has_text(content: Any) -> bool:
     """True if a message's content carries at least one non-blank piece of text or a non-text block.
 
@@ -405,6 +388,29 @@ def _coerce_handoff_directive(
     if isinstance(value, (tuple, list)) and len(value) >= 2:
         return _handoff_directive(value[0], value[1], "")
     return _handoff_directive(fallback_agent_name, fallback_instruction, fallback_title)
+
+
+def _render_sandbox_handoff_instruction(
+    instruction: Any,
+    input_payload: Any = "",
+    input_type: Any = "",
+) -> str:
+    """Attach exact inline data to a Sandbox task without asking the Supervisor to restate it."""
+    instruction_text = _message_content_as_text(instruction).strip()
+    payload_text = _message_content_as_text(input_payload)
+    if not payload_text.strip():
+        return instruction_text
+    payload_type = re.sub(r"[^A-Za-z0-9_.+-]", "", str(input_type or "").strip()) or "text"
+    fence = "```"
+    while fence in payload_text:
+        fence += "`"
+    return (
+        f"{instruction_text}\n\n"
+        f"Input payload ({payload_type}):\n"
+        f"{fence}{payload_type}\n"
+        f"{payload_text}\n"
+        f"{fence}"
+    )
 
 
 def _is_scalar_tool_value(value: Any) -> bool:
@@ -1280,6 +1286,7 @@ class SageState(MessagesState):
     mythic_payload_messages: Annotated[list[AnyMessage], operator.add]
     mcp_manager_messages: Annotated[list[AnyMessage], operator.add]
     bloodhound_messages: Annotated[list[AnyMessage], operator.add]
+    sandbox_messages: Annotated[list[AnyMessage], operator.add]
     autonomous_executor_messages: Annotated[list[AnyMessage], operator.add]
     _message_seq: Annotated[int, _max_seq_reducer]  # Global sequence counter with max reducer
 
@@ -1958,6 +1965,7 @@ class Model:
             "mythic_payload_messages": [],
             "mcp_manager_messages": [],
             "bloodhound_messages": [],
+            "sandbox_messages": [],
             "autonomous_executor_messages": [],
             "recursion_summary_requested": False,
             "recursion_handback": False,
@@ -2416,6 +2424,7 @@ class Model:
             "Mythic_Payload": "box-open",
             "Generalist": "robot",
             "MCP_Manager": "plug",
+            "Sandbox": "terminal",
             "Execution": "gears",
             "Collection": "database",
         }
@@ -2443,6 +2452,7 @@ class Model:
             "Mythic_Payload": "#A855F7",   # purple
             "Generalist": "#10B981",       # green
             "MCP_Manager": "#F59E0B",      # amber
+            "Sandbox": "#14B8A6",          # teal
             "Execution": "#3B82F6",
             "Collection": "#F59E0B",
         }
@@ -2771,7 +2781,7 @@ class Model:
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
-            "mcp_manager_messages", "bloodhound_messages",
+            "mcp_manager_messages", "bloodhound_messages", "sandbox_messages",
             "autonomous_executor_messages",
         ]:
             if channel_name in state_update:
@@ -2944,12 +2954,14 @@ class Model:
             .add_node("Mythic_Payload", self._mythic_payload_agent())
             .add_node("BloodHound", self._bloodhound_agent())
             .add_node("MCP_Manager", self._mcp_manager_agent())
+            .add_node("Sandbox", self._sandbox_agent())
             .add_node("Autonomous_Executor", self._autonomous_executor_node)
             .add_edge(START, "Supervisor")
             .add_edge("Generalist", "Supervisor")
             .add_edge("Mythic_Payload", "Supervisor")
             .add_edge("BloodHound", "Supervisor")
             .add_edge("MCP_Manager", "Supervisor")
+            .add_edge("Sandbox", "Supervisor")
             # The Operator ingests collections IN-PROCESS (ingest_collection → in-memory upload to BloodHound),
             # so there is no cross-agent ingest handoff to force — the Operator returns to the Supervisor as
             # normal, which then routes to the BloodHound agent for attack-path ANALYSIS.
@@ -3361,7 +3373,7 @@ class Model:
             # Tag new messages with sequence numbers for chronological ordering
             # Compute from max of existing messages to avoid collisions with handoff-created messages
             max_seq = 0
-            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
+            for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                 for existing_msg in state.get(ch_key, []):
                     seq = _get_seq(existing_msg)
                     if seq > max_seq:
@@ -3534,32 +3546,6 @@ class Model:
                         update["supervisor_messages"] = [response_header, summary_ai_msg]
                         logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(summary_text)} chars)")
 
-                        if (
-                            not bool(getattr(self, "_autonomous_solve", False))
-                            and _worker_summary_has_no_actionable_remaining(summary_text)
-                        ):
-                            final_msg = AIMessage(
-                                content=summary_text,
-                                name="Supervisor",
-                                additional_kwargs={
-                                    "_is_final_report": True,
-                                    "_scoped_worker_terminal": True,
-                                },
-                            )
-                            _tag_msg(final_msg, self._next_seq())
-                            terminal_update: dict[str, Any] = {
-                                state_key: new_messages_from_agent,
-                                "messages": new_messages_from_agent + [final_msg],
-                                "supervisor_messages": [response_header, summary_ai_msg, final_msg],
-                                "_message_seq": self._message_seq,
-                                "recursion_summary_requested": False,
-                                "recursion_handback": False,
-                            }
-                            logger.info(
-                                f"✅ [{node_name}] scoped summary has no actionable REMAINING work; ending graph"
-                            )
-                            return Command(goto=END, update=terminal_update)
-
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
                         calling_agent = state.get("_last_calling_agent")
                         if calling_agent and calling_agent != "Supervisor":
@@ -3569,6 +3555,7 @@ class Model:
                                 "Generalist": "generalist_messages",
                                 "BloodHound": "bloodhound_messages",
                                 "MCP_Manager": "mcp_manager_messages",
+                                "Sandbox": "sandbox_messages",
                             }
                             calling_agent_channel_key = channel_map.get(calling_agent)
                             if calling_agent_channel_key:
@@ -5945,6 +5932,7 @@ class Model:
             "mythic_payload_messages",
             "mcp_manager_messages",
             "bloodhound_messages",
+            "sandbox_messages",
             "autonomous_executor_messages",
             "messages",
         ]:
@@ -6133,6 +6121,7 @@ class Model:
             "summarize_and_handback", "handback_to_supervisor", "request_continuation", "respond_to_user",
             "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
             "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
+            "transfer_to_Sandbox",
         )
         # Static, run-constant schema the Mythic_Operator needs constantly — protect its tool output from the
         # DIGEST so it is fetched ONCE per payload type and kept, not elided-and-re-fetched (run 2058: 16×).
@@ -6444,6 +6433,33 @@ class Model:
         )
         return self._wrap_create_agent(agent, "mcp_manager_messages", name)
 
+    def _sandbox_agent(self):
+        """Local-only scratch execution surface kept outside Mythic_Operator and controller planning."""
+        name = "Sandbox"
+        prompt = load_prompt("sandbox")
+        sandbox_messages = self.state.setdefault("sandbox_messages", [])
+        if not sandbox_messages:
+            sandbox_messages.append(SystemMessage(content=prompt))
+
+        if self.mythic_client is None:
+            raise ValueError("Mythic client not initialized for Sandbox Agent.")
+
+        sandbox_tools = self.mythic_client.get_tools(["sandbox_exec"])
+        handback_tool = _create_summarize_handback_tool()
+        tools = filter_tools_by_frontmatter("sandbox", sandbox_tools + [handback_tool])
+
+        llm = self._get_base_chat_model()
+        if not llm:
+            raise ValueError("Failed to initialize the BaseChatModel for Sandbox Agent.")
+
+        agent = create_agent(
+            model=llm,
+            tools=tools,
+            name=name,
+            middleware=self._context_middleware(),
+        )
+        return self._wrap_create_agent(agent, "sandbox_messages", name)
+
     def _supervisor_agent(self):
         name = "Supervisor"
         prompt = load_prompt("supervisor")
@@ -6481,6 +6497,12 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
             )
 
+        assign_to_sandbox_agent = _create_handoff_tool(
+                agent_name="Sandbox",
+                description="Assign to the Sandbox agent for isolated LOCAL scratch execution only: run shell/Python snippets, parse/transform text, test regexes, or perform ad-hoc computation in a throwaway container. Do NOT use this for Mythic, BloodHound, target-facing actions, payload work, or proof.",
+                autonomous_redirect=self._autonomous_handoff_step_redirect,
+            )
+
         # Completion tool - use when task is done
         respond_to_user_tool = _create_respond_to_user_tool()
 
@@ -6497,6 +6519,7 @@ class Model:
             request_continuation_tool,
         ]
         if not self._autonomous_solve:
+            tools.insert(4, assign_to_sandbox_agent)
             tools.insert(4, assign_to_mcp_manager_agent)
         tools = filter_tools_by_frontmatter("supervisor", tools)
 
@@ -6751,7 +6774,8 @@ class Model:
             "Mythic_Payload": "mythic_payload_messages",
             "Generalist": "generalist_messages",
             "BloodHound": "bloodhound_messages",
-            "MCP_Manager": "mcp_manager_messages"
+            "MCP_Manager": "mcp_manager_messages",
+            "Sandbox": "sandbox_messages",
         }
 
         summaries = []
@@ -7137,7 +7161,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             "generalist_messages",
             "mythic_operator_messages",
             "mythic_payload_messages",
-            "mcp_manager_messages", "bloodhound_messages",
+            "mcp_manager_messages", "bloodhound_messages", "sandbox_messages",
         ]:
             if ch not in self.state:
                 self.state[ch] = []
@@ -7287,7 +7311,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         "generalist_messages",
                         "mythic_operator_messages",
                         "mythic_payload_messages",
-                        "mcp_manager_messages", "bloodhound_messages",
+                        "mcp_manager_messages", "bloodhound_messages", "sandbox_messages",
                         "autonomous_executor_messages",
                         "_message_seq"
                     ]:
@@ -7327,7 +7351,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # Merge all channels, deduplicate by message ID, and sort by sequence
             all_messages = []
             seen_ids = set()
-            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages"]:
+            for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "autonomous_executor_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"📊 Channel {ch}: {len(ch_msgs)} messages")
                 for idx, msg in enumerate(ch_msgs):
@@ -7419,7 +7443,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # DEBUG: Log what's in self.state BEFORE checkpoint recovery
             logger.info(f"DEBUG: In-memory state BEFORE checkpoint recovery:")
             for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
-                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"  {ch}: {len(ch_msgs)} messages")
 
@@ -7470,7 +7494,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         # Look for agent-specific channels
                         for channel_name in ["supervisor_messages", "mythic_operator_messages",
                                             "mythic_payload_messages", "generalist_messages",
-                                            "mcp_manager_messages", "bloodhound_messages"]:
+                                            "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             if channel_name in channel_values:
                                 current_len = len(channel_values[channel_name]) if isinstance(channel_values[channel_name], list) else 0
                                 existing_len = len(best_agent_state.get(channel_name, [])) if isinstance(best_agent_state.get(channel_name), list) else 0
@@ -7489,7 +7513,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     # If they do, DON'T rebuild from checkpoint - preserve the existing content
                     channels_need_rebuild = False
                     for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                              "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                              "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                         existing = self.state.get(ch, [])
                         substantive_count = sum(1 for msg in existing if isinstance(msg, (AIMessage, ToolMessage)))
 
@@ -7506,14 +7530,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                         # Initialize channels if not already present
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             if ch not in self.state:
                                 self.state[ch] = []
                     else:
                         logger.info("Agent channels already have content from previous run - skipping rebuild to preserve state")
                         # Still need to ensure channels exist
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             if ch not in self.state:
                                 self.state[ch] = []
                         # Skip the message sorting below
@@ -7547,10 +7571,13 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                             elif agent_name == "MCP_Manager" or delegated_to == "MCP_Manager":
                                 if msg not in self.state["mcp_manager_messages"]:
                                     self.state["mcp_manager_messages"].append(msg)
+                            elif agent_name == "Sandbox" or delegated_to == "Sandbox":
+                                if msg not in self.state["sandbox_messages"]:
+                                    self.state["sandbox_messages"].append(msg)
 
                         # Log rebuilt channel sizes
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             logger.info(f"Rebuilt {ch}: {len(self.state[ch])} messages")
 
                         # CRITICAL: Validate and fix message sequences for Bedrock compatibility
@@ -7559,7 +7586,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         # After rebuilding channels, this requirement might be violated
                         logger.info("Validating message sequences for LLM provider compatibility...")
                         for ch in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages",
-                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                                  "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                             self.state[ch] = self._fix_message_sequence_for_bedrock(self.state[ch])
 
                 if not latest_messages:
@@ -7575,7 +7602,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # DEBUG: Log what's in self.state AFTER checkpoint recovery
             logger.info(f"DEBUG: In-memory state AFTER checkpoint recovery:")
             for ch in ["messages", "supervisor_messages", "mythic_operator_messages",
-                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                      "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                 ch_msgs = self.state.get(ch, [])
                 logger.info(f"  {ch}: {len(ch_msgs)} messages")
 
@@ -7642,7 +7669,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
                     # Merge all agent channels
                     for ch in ["messages", "supervisor_messages", "generalist_messages",
-                               "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages"]:
+                               "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages"]:
                         if ch in saved_state:
                             ch_messages = saved_state[ch]
                             for msg in ch_messages:
@@ -7799,7 +7826,7 @@ Continue now.""")
                             if node_name in ["__start__", "__end__"]:
                                 continue
                             for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
-                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
+                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "_message_seq"]:
                                 if ch in state_update:
                                     if ch == "_message_seq":
                                         self._message_seq = state_update[ch]
@@ -7833,7 +7860,7 @@ Continue now.""")
                                 nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
                                 for channel_name in ["messages", "supervisor_messages", "generalist_messages",
                                                     "mythic_operator_messages", "mythic_payload_messages",
-                                                    "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
+                                                    "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "_message_seq"]:
                                     if channel_name in nested_state:
                                         self.state[channel_name] = nested_state[channel_name]
                                         if channel_name != "_message_seq":
@@ -7930,7 +7957,7 @@ Continue now.""")
                             if node_name in ["__start__", "__end__"]:
                                 continue
                             for ch in ["supervisor_messages", "generalist_messages", "mythic_operator_messages",
-                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
+                                      "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "_message_seq"]:
                                 if ch in state_update:
                                     if ch == "_message_seq":
                                         self._message_seq = state_update[ch]
@@ -7964,7 +7991,7 @@ Continue now.""")
                                 nested_state = checkpoint_tuple.checkpoint.get("channel_values", {})
                                 for channel_name in ["messages", "supervisor_messages", "generalist_messages",
                                                     "mythic_operator_messages", "mythic_payload_messages",
-                                                    "mcp_manager_messages", "bloodhound_messages", "_message_seq"]:
+                                                    "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "_message_seq"]:
                                     if channel_name in nested_state:
                                         self.state[channel_name] = nested_state[channel_name]
                                         if channel_name != "_message_seq":
@@ -8313,15 +8340,18 @@ def _create_handoff_tool(
         "Mythic_Payload": "mythic_payload_messages",
         "BloodHound": "bloodhound_messages",
         "MCP_Manager": "mcp_manager_messages",
+        "Sandbox": "sandbox_messages",
         "Autonomous_Executor": "autonomous_executor_messages",
     }
     target_channel_key = channel_map.get(agent_name)
 
-    @tool(name, description=description)
-    def handoff_tool(
+    def _build_handoff_command(
         runtime: ToolRuntime,
-        handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.'"],
-        handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
+        handoff_instruction: str,
+        handoff_title: str = "",
+        *,
+        input_payload: str = "",
+        input_type: str = "",
     ) -> Command:
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
@@ -8342,12 +8372,17 @@ def _create_handoff_tool(
         actual_agent_name = "Supervisor" if terminal_redirect else directive.agent_name
         actual_instruction = directive.instruction
         actual_title = directive.title
+        delegated_instruction = (
+            _render_sandbox_handoff_instruction(actual_instruction, input_payload, input_type)
+            if actual_agent_name == "Sandbox"
+            else actual_instruction
+        )
         actual_target_channel_key = channel_map.get(actual_agent_name)
 
         # Compute sequence from max of existing messages in all channels
         # This is more reliable than state._message_seq which may not persist across checkpoints
         max_seq = 0
-        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages", "messages"]:
+        for ch_key in ["supervisor_messages", "generalist_messages", "mythic_operator_messages", "mythic_payload_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "autonomous_executor_messages", "messages"]:
             for msg in runtime.state.get(ch_key, []):
                 seq = _get_seq(msg)
                 if seq > max_seq:
@@ -8361,7 +8396,7 @@ def _create_handoff_tool(
         else:
             ack_prefix = f"Redirected to {actual_agent_name}" if redirect else f"Delegated to {actual_agent_name}"
         acknowledgment = ToolMessage(
-            content=f"{ack_prefix} with instruction: {actual_instruction}",
+            content=f"{ack_prefix} with instruction: {delegated_instruction}",
             name=name,
             tool_call_id=runtime.tool_call_id,
         )
@@ -8370,7 +8405,7 @@ def _create_handoff_tool(
 
         # HumanMessage representing the actual task for the target agent
         # Mark as delegated so it displays differently from real user input
-        injected_human = HumanMessage(content=actual_instruction)
+        injected_human = HumanMessage(content=delegated_instruction)
         injected_human.additional_kwargs["_delegated_to"] = actual_agent_name
         injected_human.additional_kwargs["_handoff_title"] = actual_title
         _tag_msg(injected_human, current_seq)
@@ -8397,7 +8432,7 @@ def _create_handoff_tool(
             if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
                 # Check if this channel has recent activity (last message is not too old)
                 # This is a heuristic - the agent that just called a tool is the calling agent
-                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "autonomous_executor_messages"]:
+                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "autonomous_executor_messages"]:
                     # Simple approach: assume the tool was called from whichever non-target channel exists
                     if channel_name != actual_agent_name:
                         current_agent = channel_name
@@ -8412,6 +8447,31 @@ def _create_handoff_tool(
             update=update_state,
             graph=Command.PARENT,
         )
+
+    if agent_name == "Sandbox":
+        @tool(name, description=description)
+        def handoff_tool(
+            runtime: ToolRuntime,
+            handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'Parse the supplied JSON array and return a markdown table grouped by host.'"],
+            handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'Group callback JSON'."] = "",
+            input_payload: Annotated[str, "Exact inline JSON, CSV, code, or text the Sandbox task must operate on. Preserve the operator's bytes verbatim when the task depends on inline data; leave blank when there is no payload."] = "",
+            input_type: Annotated[str, "Short payload label such as `json`, `python`, `shell`, `csv`, or `text`."] = "text",
+        ) -> Command:
+            return _build_handoff_command(
+                runtime,
+                handoff_instruction,
+                handoff_title,
+                input_payload=input_payload,
+                input_type=input_type,
+            )
+    else:
+        @tool(name, description=description)
+        def handoff_tool(
+            runtime: ToolRuntime,
+            handoff_instruction: Annotated[str, "The complete, self-contained instruction for the target agent: a full sentence stating exactly what to do, with NO pronouns and NO references to 'it'/'that'/'the previous task'. Example: 'List all active Mythic callbacks and report each host, user, and integrity level.'"],
+            handoff_title: Annotated[str, "A short operator-facing title for the sub-agent card, usually 3-8 words and never the full instruction. Example: 'List active callbacks'."] = "",
+        ) -> Command:
+            return _build_handoff_command(runtime, handoff_instruction, handoff_title)
 
     return handoff_tool
 
@@ -9555,6 +9615,7 @@ def _state_messages(state: dict, channel_keys: tuple[str, ...] | None = None) ->
         "bloodhound_messages",
         "mcp_manager_messages",
         "generalist_messages",
+        "sandbox_messages",
         "autonomous_executor_messages",
     )
     messages: list[AnyMessage] = []
