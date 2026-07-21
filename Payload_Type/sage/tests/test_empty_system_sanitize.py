@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sag
 from ai.langgraph.model import (  # noqa: E402
     Model, _nonempty_system, _content_has_text, _strip_blank_text_blocks, _DEFAULT_SYSTEM_PROMPT,
 )
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # noqa: E402
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage  # noqa: E402
 
 
 def _bare() -> Model:
@@ -151,6 +151,40 @@ def test_sanitize_preserves_assistant_message_behavior_unchanged():
     out = m._sanitize_messages([SystemMessage(content="s"), HumanMessage(content="hi"), ai])
     # AIMessage content is preserved verbatim; a trailing-AI nudge is appended (provider needs a user turn)
     assert any(isinstance(x, AIMessage) and x.content == "did the thing" for x in out)
+
+
+def test_sanitize_strips_non_adjacent_tool_call_metadata():
+    m = _bare()
+    out = m._sanitize_messages([
+        SystemMessage(content="s"),
+        HumanMessage(content="hi"),
+        AIMessage(
+            content="I should call a tool.",
+            tool_calls=[{"id": "t1", "name": "run", "args": {}, "type": "tool_call"}],
+        ),
+        HumanMessage(content="not a tool result"),
+    ])
+    ai = [x for x in out if isinstance(x, AIMessage)][0]
+    assert ai.content == "I should call a tool."
+    assert ai.tool_calls == []
+
+
+def test_sanitize_keeps_adjacent_tool_call_and_result():
+    m = _bare()
+    out = m._sanitize_messages([
+        SystemMessage(content="s"),
+        HumanMessage(content="hi"),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "t1", "name": "run", "args": {}, "type": "tool_call"}],
+        ),
+        ToolMessage(content="ok", tool_call_id="t1", name="run"),
+        HumanMessage(content="continue"),
+    ])
+    ai = [x for x in out if isinstance(x, AIMessage)][0]
+    tools = [x for x in out if isinstance(x, ToolMessage)]
+    assert ai.tool_calls[0]["id"] == "t1"
+    assert [x.tool_call_id for x in tools] == ["t1"]
 
 
 if __name__ == "__main__":

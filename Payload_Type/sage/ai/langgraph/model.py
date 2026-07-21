@@ -277,18 +277,130 @@ def _strip_blank_text_blocks(content: Any) -> Any:
     return kept if kept else content
 
 
-def _sanitize_model_messages(msgs: list) -> tuple[list, bool]:
-    """Normalize a message list so NO empty/blank content block reaches any provider. Returns (messages, changed).
+def _tool_call_ids_from_ai_message(message: AIMessage) -> list[str]:
+    """Return the ordered unique tool-call IDs carried by an assistant message."""
+    ids: list[str] = []
+    seen: set[str] = set()
 
-    Scope is the empty-block class ONLY — drop empty SystemMessages, strip blank text blocks from list content,
-    and backfill an AIMessage left with no textual content (empty string, or an assistant turn carrying only a
-    tool_use block would still be valid, but an empty text block alongside it is not). It deliberately does NOT
-    reorder or drop tool_use/tool_result pairs — that is `_sanitize_messages`' job on the channel path. This is
-    the provider-agnostic core shared by `_MessageSanitizerMiddleware`, which reaches create_agent's internal
-    react loop where `_sanitize_messages` and the langchain_openai monkeypatch cannot."""
-    out: list = []
+    for tool_call in (getattr(message, "tool_calls", None) or []):
+        if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = str(tool_call.get("id") or "").strip()
+        if tool_call_id and tool_call_id not in seen:
+            ids.append(tool_call_id)
+            seen.add(tool_call_id)
+
+    additional_kwargs = getattr(message, "additional_kwargs", None) or {}
+    for tool_call in (additional_kwargs.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = str(tool_call.get("id") or "").strip()
+        if tool_call_id and tool_call_id not in seen:
+            ids.append(tool_call_id)
+            seen.add(tool_call_id)
+
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") not in {"tool_use", "tool_call"}:
+                continue
+            tool_call_id = str(block.get("id") or block.get("tool_use_id") or "").strip()
+            if tool_call_id and tool_call_id not in seen:
+                ids.append(tool_call_id)
+                seen.add(tool_call_id)
+
+    return ids
+
+
+def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
+    """Remove structured tool-call data from an assistant message, keeping only real remaining content."""
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        content = [
+            block
+            for block in content
+            if not (
+                isinstance(block, dict)
+                and block.get("type") in {"tool_use", "tool_call"}
+            )
+        ]
+
+    additional_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    additional_kwargs.pop("tool_calls", None)
+
+    repaired = message.model_copy(update={
+        "content": content,
+        "tool_calls": [],
+        "invalid_tool_calls": [],
+        "additional_kwargs": additional_kwargs,
+    })
+    return repaired if _content_has_text(repaired.content) else None
+
+
+def _repair_tool_call_adjacency(msgs: list[AnyMessage]) -> tuple[list[AnyMessage], bool]:
+    """Normalize invalid tool-call history so every kept tool call has immediate matching results.
+
+    Anthropic/Bedrock rejects a transcript when an assistant tool call is not immediately followed by
+    matching tool-result messages. OpenAI-style providers are more tolerant, but the malformed history is
+    still invalid application state, so repair it once at the shared message boundary instead of branching by
+    provider. Valid transcripts are preserved byte-for-byte at the message-object level.
+    """
+    repaired: list[AnyMessage] = []
     changed = False
-    for m in msgs:
+
+    for index, message in enumerate(msgs):
+        if isinstance(message, AIMessage):
+            tool_call_ids = _tool_call_ids_from_ai_message(message)
+            if tool_call_ids:
+                immediate_result_ids: set[str] = set()
+                lookahead = index + 1
+                while lookahead < len(msgs) and isinstance(msgs[lookahead], ToolMessage):
+                    tool_call_id = str(getattr(msgs[lookahead], "tool_call_id", "") or "").strip()
+                    if tool_call_id:
+                        immediate_result_ids.add(tool_call_id)
+                    lookahead += 1
+                if not set(tool_call_ids).issubset(immediate_result_ids):
+                    stripped = _strip_tool_call_payload(message)
+                    if stripped is not None:
+                        repaired.append(stripped)
+                    changed = True
+                    continue
+        repaired.append(message)
+
+    cleaned: list[AnyMessage] = []
+    pending_result_ids: set[str] = set()
+    for message in repaired:
+        if isinstance(message, AIMessage):
+            cleaned.append(message)
+            pending_result_ids = set(_tool_call_ids_from_ai_message(message))
+        elif isinstance(message, ToolMessage):
+            tool_call_id = str(getattr(message, "tool_call_id", "") or "").strip()
+            if tool_call_id and tool_call_id in pending_result_ids:
+                cleaned.append(message)
+                pending_result_ids.remove(tool_call_id)
+            else:
+                changed = True
+        else:
+            cleaned.append(message)
+            pending_result_ids = set()
+
+    return cleaned, changed
+
+
+def _sanitize_model_messages(msgs: list) -> tuple[list, bool]:
+    """Normalize a message list before provider invocation. Returns ``(messages, changed)``.
+
+    This shared boundary handles both malformed tool-call adjacency and blank-content cleanup: invalid historical
+    tool calls are stripped before they can reach strict providers, orphan tool results are dropped, empty system
+    blocks are removed, and empty assistant text is backfilled. It is the provider-agnostic core shared by
+    `_MessageSanitizerMiddleware`, which reaches create_agent's internal react loop where `_sanitize_messages` and
+    the langchain_openai monkeypatch cannot."""
+    normalized, sequence_changed = _repair_tool_call_adjacency(list(msgs))
+    out: list = []
+    changed = sequence_changed
+    for m in normalized:
         content = getattr(m, "content", None)
         # Drop an empty/blank top-level system block (Bedrock: "system: text content blocks must be non-empty";
         # system is optional so dropping is valid).
@@ -952,7 +1064,7 @@ class _EngagementStateMiddleware(AgentMiddleware):
 
 
 class _MessageSanitizerMiddleware(AgentMiddleware):
-    """Provider-agnostic empty/blank content-block guard on EVERY model call inside create_agent's react loop.
+    """Provider-agnostic message-integrity guard on EVERY model call inside create_agent's react loop.
 
     WHY THIS EXISTS (2026-07-10): the reported `ValidationException: system: text content blocks must be
     non-empty` fired on a native `ChatBedrock` (InvokeModel) call under the Supervisor. Two prior defenses do
@@ -963,8 +1075,10 @@ class _MessageSanitizerMiddleware(AgentMiddleware):
     (ollama, anthropic, google_genai, …). This middleware fires at `wrap_model_call`, which wraps the actual
     model invocation for ALL providers regardless of class, and normalizes the OUTGOING request so no empty
     `system` prompt, blank text block, or empty assistant turn reaches the provider. Appended INNERMOST so it
-    sees the final request after all other middleware (engagement-state injection, summarization). Fail-open: a
-    sanitizer error must never abort a model call."""
+    sees the final request after all other middleware (engagement-state injection, summarization). The same
+    boundary now also strips malformed historical tool calls whose results are not immediately adjacent, which is
+    required by Anthropic/Bedrock and harmless for valid OpenAI-style transcripts. Fail-open: a sanitizer error
+    must never abort a model call."""
     def __init__(self, model: "Model"):
         super().__init__()
         self._model = model
@@ -6636,7 +6750,7 @@ class Model:
     def _sanitize_messages(self, msgs: list[AnyMessage]) -> list[AnyMessage]:
             """
             Sanitize message list for LLM invocation:
-            1. Remove orphan ToolMessages whose tool_call_id was never introduced by a preceding AIMessage
+            1. Repair invalid tool-call adjacency and remove orphan ToolMessages
             2. Keep only the FIRST NON-EMPTY SystemMessage; drop empty/blank ones and all later ones (prevents
                both "multiple non-consecutive system messages" AND the Bedrock
                "system: text content blocks must be non-empty" ValidationException — an empty first system
@@ -6647,6 +6761,7 @@ class Model:
             langchain_openai (OpenAI-compatible / LiteLLM proxy) path and is a no-op for the native
             `init_chat_model(model_provider="bedrock")` (langchain-aws) provider — so it cannot be relied on here.
             """
+            msgs, _ = _repair_tool_call_adjacency(list(msgs))
             seen_tool_use_ids = set()
             seen_system_message = False
             cleaned = []
@@ -6700,56 +6815,11 @@ class Model:
         After rebuilding agent channels, this requirement might be violated because
         messages from different timepoints get mixed together.
 
-        Strategy: Remove tool_calls from AIMessages that don't have immediate
-        ToolMessage responses. This preserves the text content (which describes
-        what was done) while removing the structured metadata that causes validation errors.
-
-        This is provider-agnostic and safe because:
-        - Text content usually describes tool usage
-        - ToolMessages still exist in history showing results
-        - Only structured metadata is removed
+        Kept as a compatibility wrapper for the recursion-recovery path; the actual
+        provider-agnostic repair now lives in `_repair_tool_call_adjacency`, which is
+        also applied on normal model-invocation paths.
         """
-        fixed = []
-
-        for i, msg in enumerate(msgs):
-            if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
-                # Get the tool_call IDs from this message
-                tool_call_ids = set(tc.get('id') for tc in msg.tool_calls if tc.get('id'))
-
-                # Check if next message(s) are ToolMessages with matching IDs
-                has_immediate_results = False
-                if i + 1 < len(msgs):
-                    next_msg = msgs[i + 1]
-                    if isinstance(next_msg, ToolMessage):
-                        # Check if tool_call_id matches any of our tool_calls
-                        if hasattr(next_msg, 'tool_call_id') and next_msg.tool_call_id in tool_call_ids:
-                            has_immediate_results = True
-
-                if not has_immediate_results:
-                    # Strip tool_calls from this AIMessage
-                    msg_copy = msg.copy()
-                    msg_copy.tool_calls = []
-
-                    # Only include if it has text content
-                    has_content = False
-                    if isinstance(msg_copy.content, str) and msg_copy.content.strip():
-                        has_content = True
-                    elif isinstance(msg_copy.content, list) and any(
-                        block.get('type') == 'text' and block.get('text', '').strip()
-                        for block in msg_copy.content if isinstance(block, dict)
-                    ):
-                        has_content = True
-
-                    if has_content:
-                        fixed.append(msg_copy)
-                    # If no content, skip this message entirely
-                else:
-                    # Has immediate tool results, keep as-is
-                    fixed.append(msg)
-            else:
-                # Not an AIMessage with tool_calls, keep as-is
-                fixed.append(msg)
-
+        fixed, _ = _repair_tool_call_adjacency(list(msgs))
         return fixed
 
     def _render_combined(self, messages):

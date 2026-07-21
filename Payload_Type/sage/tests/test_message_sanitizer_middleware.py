@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sag
 from ai.langgraph.model import (  # noqa: E402
     Model, _MessageSanitizerMiddleware, _sanitize_model_messages, _DEFAULT_SYSTEM_PROMPT,
 )
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # noqa: E402
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage  # noqa: E402
 
 
 class _FakeReq:
@@ -85,9 +85,12 @@ def test_empty_assistant_message_is_backfilled():
 
 
 def test_assistant_with_tool_use_block_is_preserved():
-    """A tool_use block IS content — must not be clobbered."""
+    """A tool_use block with an immediate result IS content and must not be clobbered."""
     tool_block = [{"type": "tool_use", "id": "t1", "name": "run", "input": {}}]
-    req = _FakeReq(system_prompt="ok", messages=[AIMessage(content=tool_block)])
+    req = _FakeReq(
+        system_prompt="ok",
+        messages=[AIMessage(content=tool_block), ToolMessage(content="ok", tool_call_id="t1", name="run")],
+    )
     got, _ = _drive(req)
     ai = [m for m in got.messages if isinstance(m, AIMessage)][0]
     assert ai.content == tool_block
@@ -95,10 +98,74 @@ def test_assistant_with_tool_use_block_is_preserved():
 
 def test_blank_text_block_stripped_but_tool_use_kept():
     content = [{"type": "text", "text": ""}, {"type": "tool_use", "id": "t1", "name": "run", "input": {}}]
-    req = _FakeReq(system_prompt="ok", messages=[AIMessage(content=content)])
+    req = _FakeReq(
+        system_prompt="ok",
+        messages=[AIMessage(content=content), ToolMessage(content="ok", tool_call_id="t1", name="run")],
+    )
     got, _ = _drive(req)
     ai = [m for m in got.messages if isinstance(m, AIMessage)][0]
     assert ai.content == [{"type": "tool_use", "id": "t1", "name": "run", "input": {}}]
+
+
+def test_dangling_tool_call_is_stripped_before_model_invocation():
+    req = _FakeReq(
+        system_prompt="ok",
+        messages=[
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="I should call a tool.",
+                tool_calls=[{"id": "t1", "name": "run", "args": {}, "type": "tool_call"}],
+            ),
+            HumanMessage(content="intervening user message"),
+        ],
+    )
+    got, _ = _drive(req)
+    ai = [m for m in got.messages if isinstance(m, AIMessage)][0]
+    assert ai.content == "I should call a tool."
+    assert ai.tool_calls == []
+
+
+def test_valid_parallel_tool_results_are_preserved():
+    ai = AIMessage(
+        content="",
+        tool_calls=[
+            {"id": "t1", "name": "run", "args": {}, "type": "tool_call"},
+            {"id": "t2", "name": "run", "args": {}, "type": "tool_call"},
+        ],
+    )
+    req = _FakeReq(
+        system_prompt="ok",
+        messages=[
+            HumanMessage(content="hi"),
+            ai,
+            ToolMessage(content="one", tool_call_id="t1", name="run"),
+            ToolMessage(content="two", tool_call_id="t2", name="run"),
+            HumanMessage(content="continue"),
+        ],
+    )
+    got, _ = _drive(req)
+    preserved_ai = [m for m in got.messages if isinstance(m, AIMessage)][0]
+    preserved_tools = [m for m in got.messages if isinstance(m, ToolMessage)]
+    assert preserved_ai.tool_calls == ai.tool_calls
+    assert [m.tool_call_id for m in preserved_tools] == ["t1", "t2"]
+
+
+def test_orphan_tool_result_is_dropped_after_dangling_tool_call_repair():
+    req = _FakeReq(
+        system_prompt="ok",
+        messages=[
+            HumanMessage(content="hi"),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "t1", "name": "run", "args": {}, "type": "tool_call"}],
+            ),
+            HumanMessage(content="intervening user message"),
+            ToolMessage(content="late", tool_call_id="t1", name="run"),
+        ],
+    )
+    got, _ = _drive(req)
+    assert [m for m in got.messages if isinstance(m, AIMessage)] == []
+    assert [m for m in got.messages if isinstance(m, ToolMessage)] == []
 
 
 # ---- fail-open + async ---------------------------------------------------------------------------
