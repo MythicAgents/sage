@@ -996,6 +996,52 @@ def test_slash_mcp_connect_invalid_json():
     assert "Invalid JSON" in chat.emissions[-1]["content"]
 
 
+def test_slash_mcp_connect_sse_passes_tls_and_timeout_options(monkeypatch):
+    from ai import mcp as mcpmod
+
+    captured = {}
+    sentinel = object()
+
+    def _sse_config(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    async def _connect(conf):
+        assert conf is sentinel
+        return True, None
+
+    monkeypatch.setattr(mcpmod, "create_sse_config", _sse_config)
+    monkeypatch.setattr(mcpmod.MCPManager, "connect_server", _connect)
+
+    chat = HeadlessSageChat()
+    _run(
+        handle_slash(
+            chat,
+            _slash_req(
+                "mcp",
+                'connect {"type":"sse","name":"Nemesis","url":"https://nemesis.local/mcp/sse",'
+                '"headers":{"Authorization":"Basic bjpu"},"timeout":12,"sse_read_timeout":45,'
+                '"ssl_verify":false,"session_kwargs":{"read_timeout_seconds":90},'
+                '"sage_execution_class":"non_target_control_plane"}',
+            ),
+            None,
+            "slash:1",
+        )
+    )
+
+    assert captured == {
+        "name": "Nemesis",
+        "url": "https://nemesis.local/mcp/sse",
+        "headers": {"Authorization": "Basic bjpu"},
+        "timeout": 12,
+        "sse_read_timeout": 45,
+        "ssl_verify": False,
+        "session_kwargs": {"read_timeout_seconds": 90},
+        "sage_execution_class": "non_target_control_plane",
+    }
+    assert "Connected MCP server `Nemesis`" in chat.emissions[-1]["content"]
+
+
 def test_slash_mcp_disconnect(monkeypatch):
     from ai import mcp as mcpmod
 

@@ -299,6 +299,10 @@ async def _mcp_connect(spec: str) -> str:
                 name=name,
                 url=cfg.get("url", ""),
                 headers=cfg.get("headers"),
+                timeout=cfg.get("timeout"),
+                sse_read_timeout=cfg.get("sse_read_timeout"),
+                ssl_verify=cfg.get("ssl_verify", True),
+                session_kwargs=cfg.get("session_kwargs"),
                 sage_execution_class=cfg.get("sage_execution_class"),
             )
         elif ctype in ("http", "streamable_http", "streamable-http"):
@@ -306,6 +310,11 @@ async def _mcp_connect(spec: str) -> str:
                 name=name,
                 url=cfg.get("url", ""),
                 headers=cfg.get("headers"),
+                timeout=cfg.get("timeout"),
+                sse_read_timeout=cfg.get("sse_read_timeout"),
+                terminate_on_close=cfg.get("terminate_on_close"),
+                ssl_verify=cfg.get("ssl_verify", True),
+                session_kwargs=cfg.get("session_kwargs"),
                 sage_execution_class=cfg.get("sage_execution_class"),
             )
         else:
