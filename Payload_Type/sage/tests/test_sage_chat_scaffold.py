@@ -29,10 +29,14 @@ class _FakeModel:
         self.behavior = behavior
         self.stream = stream
         self.stop_called = False
+        self.closed_delegation_statuses = []
         self.invoked_with = None
 
     def request_stop(self):
         self.stop_called = True
+
+    async def _close_all_delegations(self, status="finished"):
+        self.closed_delegation_statuses.append(status)
 
     async def _hitl_interrupt_pending(self, thread_id):
         return False
@@ -425,6 +429,7 @@ def test_handler_exception_emits_one_error_terminal():
     assert len(errors) == 1
     assert errors[0]["complete_request"] is True
     assert len(chat.terminal_emissions) == 1
+    assert model.closed_delegation_statuses == ["error"]
 
 
 # --------------------------------------------------------------------------------------

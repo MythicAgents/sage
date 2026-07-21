@@ -171,6 +171,7 @@ class SageChat(Chat):
         prompt = request.Prompt or ""
 
         async def _handler(turn) -> dict[str, Any] | None:
+            model: Any | None = None
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
             # An undeclared/unhandled command falls through to normal prompt handling.
@@ -252,6 +253,17 @@ class SageChat(Chat):
                     model.request_stop()
                 except Exception:
                     logger.warning("request_stop() failed during cancel handling", exc_info=True)
+                raise
+            except Exception:
+                # A graph/runtime exception can occur after a sub-agent card was already opened.
+                # Without an explicit terminal update Mythic keeps that card on "Running" even though
+                # run_chat_turn will emit an error terminal for the request itself.
+                close_all = getattr(model, "_close_all_delegations", None)
+                if callable(close_all):
+                    try:
+                        await close_all(status="error")
+                    except Exception:
+                        logger.debug("sub-agent error cleanup failed (non-fatal)", exc_info=True)
                 raise
             finally:
                 metadata_task.cancel()

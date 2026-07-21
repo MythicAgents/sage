@@ -2,6 +2,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+import anyio
 import pytest
 from langchain_core.tools import StructuredTool
 
@@ -74,6 +75,74 @@ def test_mcp_registry_wrapper_is_fail_open_when_observer_raises():
         manager.reset_execution_observer(token)
 
     assert result == {"rows": ["MATCH (n) RETURN n"]}
+
+
+def test_mcp_registry_wrapper_evicts_server_after_closed_transport():
+    manager = MCPServerManager()
+    events = []
+    manager.sessions["Nemesis"] = object()
+    manager.connections["Nemesis"] = {"transport": "sse"}
+    manager.configs["Nemesis"] = mcpmod.create_sse_config(
+        name="Nemesis",
+        url="https://nemesis.local/mcp/sse",
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+    )
+    manager._session_contexts["Nemesis"] = object()
+    manager.tools["Nemesis"] = []
+
+    async def get_file_details(object_id: str):
+        raise anyio.ClosedResourceError()
+
+    tool = StructuredTool.from_function(
+        coroutine=get_file_details,
+        name="get_file_details",
+        description="Read a file record.",
+    )
+    wrapped = manager._wrap_tool_for_visibility("Nemesis", tool)
+    token = manager.set_execution_observer(events.append)
+    try:
+        with pytest.raises(anyio.ClosedResourceError):
+            asyncio.run(wrapped.ainvoke({"object_id": "abc"}))
+    finally:
+        manager.reset_execution_observer(token)
+
+    assert [event["status"] for event in events] == ["started", "error"]
+    assert manager.get_connected_servers() == []
+    assert manager.get_tools_by_server("Nemesis") == []
+    assert "Nemesis" not in manager.connections
+    assert "Nemesis" not in manager.configs
+    assert "Nemesis" not in manager._session_contexts
+
+
+def test_mcp_registry_wrapper_keeps_server_after_non_transport_tool_error():
+    manager = MCPServerManager()
+    manager.sessions["Nemesis"] = object()
+    manager.connections["Nemesis"] = {"transport": "sse"}
+    manager.configs["Nemesis"] = mcpmod.create_sse_config(
+        name="Nemesis",
+        url="https://nemesis.local/mcp/sse",
+        sage_execution_class=mcpmod.MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+    )
+    manager._session_contexts["Nemesis"] = object()
+    manager.tools["Nemesis"] = []
+
+    async def get_file_details(object_id: str):
+        raise RuntimeError("application-level failure")
+
+    tool = StructuredTool.from_function(
+        coroutine=get_file_details,
+        name="get_file_details",
+        description="Read a file record.",
+    )
+    wrapped = manager._wrap_tool_for_visibility("Nemesis", tool)
+
+    with pytest.raises(RuntimeError, match="application-level failure"):
+        asyncio.run(wrapped.ainvoke({"object_id": "abc"}))
+
+    assert manager.get_connected_servers() == ["Nemesis"]
+    assert "Nemesis" in manager.connections
+    assert "Nemesis" in manager.configs
+    assert "Nemesis" in manager._session_contexts
 
 
 def test_unclassified_mcp_server_is_denied_before_session_side_effect(monkeypatch):

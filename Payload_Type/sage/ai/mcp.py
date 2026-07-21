@@ -10,6 +10,7 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+import anyio
 import httpx
 from mcp import ClientSession
 from langchain_mcp_adapters.tools import load_mcp_tools, convert_mcp_tool_to_langchain_tool
@@ -106,6 +107,18 @@ def _create_insecure_httpx_client(**kwargs) -> httpx.AsyncClient:
     return httpx.AsyncClient(verify=False, **kwargs)
 
 
+def _transport_is_closed(exc: BaseException) -> bool:
+    """Return True when an MCP failure proves the underlying transport is already dead."""
+    if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_transport_is_closed(nested) for nested in exc.exceptions)
+    for nested in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(nested, BaseException) and _transport_is_closed(nested):
+            return True
+    return False
+
+
 class ConnectionType(Enum):
     STDIO = "stdio"
     SSE = "sse"
@@ -187,6 +200,14 @@ class MCPServerManager:
     def current_execution_context(self) -> str:
         return _execution_context.get()
 
+    def _forget_server(self, server_name: str) -> None:
+        """Drop one server from the in-memory registry after a proven dead transport."""
+        self.sessions.pop(server_name, None)
+        self.connections.pop(server_name, None)
+        self.configs.pop(server_name, None)
+        self._session_contexts.pop(server_name, None)
+        self.tools.pop(server_name, None)
+
     async def _notify_execution_observer(self, event: dict[str, Any]) -> None:
         observer = _execution_observer.get()
         if observer is None:
@@ -237,6 +258,12 @@ class MCPServerManager:
             try:
                 result = await original(*args, **kwargs)
             except BaseException as exc:
+                if _transport_is_closed(exc):
+                    manager._forget_server(server_name)
+                    logger.warning(
+                        f"MCP server '{server_name}' dropped from registry after closed transport: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 await manager._notify_execution_observer(
                     {
                         **base_event,
@@ -489,19 +516,8 @@ class MCPServerManager:
                         else:
                             raise
 
-                # Clean up stored references regardless of context exit success
-                if server_name in self.sessions:
-                    del self.sessions[server_name]
-                if server_name in self.connections:
-                    del self.connections[server_name]
-                if server_name in self.configs:
-                    del self.configs[server_name]
-                if server_name in self._session_contexts:
-                    del self._session_contexts[server_name]
-
-                # Remove tools for this server
-                if server_name in self.tools:
-                    del self.tools[server_name]
+                # Clean up stored references regardless of context exit success.
+                self._forget_server(server_name)
 
                 logger.info(f"Disconnected from MCP server '{server_name}'")
                 return True
