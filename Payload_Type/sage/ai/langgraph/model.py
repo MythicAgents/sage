@@ -53,6 +53,8 @@ _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic
 # (the ledger doesn't grow) — a stall detector so a dead/unsatisfiable hop (e.g. a dcsync that keeps failing)
 # halts with a report instead of looping forever and burning tokens.
 _AUTONOMOUS_STALL_LIMIT = 6
+_MCP_NO_PROGRESS_LIMIT = 6
+_MCP_EMPTY_VARIANT_LIMIT = 16
 _DEFAULT_GRAPH_RECURSION_LIMIT = 250
 _TOON_SENTINEL = "⟦TOON "
 _TRUNCATION_MARKER = "[truncated"
@@ -1132,6 +1134,70 @@ def _tool_name_from_request(request: Any) -> str:
     return ""
 
 
+def _tool_call_id_from_request(request: Any) -> str:
+    """Extract a tool-call id from a ToolCallRequest-like object. Never raises."""
+    try:
+        tool_call = getattr(request, "tool_call", None)
+        if isinstance(tool_call, dict):
+            value = tool_call.get("id")
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return "tool-call"
+
+
+def _is_empty_mcp_observation(value: Any) -> bool:
+    """True when a parsed MCP result carries no evidence."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple)):
+        return not value or all(_is_empty_mcp_observation(item) for item in value)
+    if isinstance(value, dict):
+        return not value or all(_is_empty_mcp_observation(item) for item in value.values())
+    return False
+
+
+def _normalize_mcp_observation(result: Any) -> tuple[str, bool]:
+    """Return a stable observation fingerprint plus an empty/non-empty classification."""
+    try:
+        raw = _message_content_as_text(getattr(result, "content", result)).strip()
+    except Exception:
+        raw = str(result or "").strip()
+    if not raw:
+        return ("", True)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        normalized = re.sub(r"\s+", " ", raw)
+        return (normalized, not normalized)
+    return (
+        json.dumps(parsed, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        _is_empty_mcp_observation(parsed),
+    )
+
+
+def _mcp_observation_key(request: Any, observation_fingerprint: str) -> str:
+    """Return a stable key for one concrete MCP request/result pair."""
+    tool_call = getattr(request, "tool_call", None)
+    args = tool_call.get("args") if isinstance(tool_call, dict) else None
+    payload = {
+        "tool_name": _tool_name_from_request(request),
+        "args": args,
+        "result": observation_fingerprint,
+    }
+    try:
+        return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(payload)
+
+
 class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
     """Treat execute_capability as an atomic operator boundary.
 
@@ -1161,15 +1227,7 @@ class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
 
     @staticmethod
     def _tool_call_id(request: Any) -> str:
-        try:
-            tool_call = getattr(request, "tool_call", None)
-            if isinstance(tool_call, dict):
-                value = tool_call.get("id")
-                if value:
-                    return str(value)
-        except Exception:
-            pass
-        return "bounded-execute-capability-stop"
+        return _tool_call_id_from_request(request)
 
     @staticmethod
     def _blocked_tool_message(request: Any, reason: str) -> ToolMessage:
@@ -1282,6 +1340,178 @@ class _BoundedExecuteCapabilityStopMiddleware(AgentMiddleware):
                 pass
             return self._blocked_tool_message(request, reason)
         return handler(request)
+
+
+class _MCPManagerNoProgressStopMiddleware(AgentMiddleware):
+    """Stop MCP_Manager after repeated empty or duplicate MCP observations.
+
+    The worker is allowed a bounded amount of exploratory retrieval, but once one delegation has
+    produced several consecutive empty or already-seen results there is no evidence that another
+    query variant will help. Ending the inner react loop at that point lets the wrapper synthesize
+    a handback from the evidence already collected instead of burning the whole request on search
+    variants.
+    """
+
+    def __init__(
+        self,
+        model: "Model",
+        limit: int = _MCP_NO_PROGRESS_LIMIT,
+        empty_limit: int = _MCP_EMPTY_VARIANT_LIMIT,
+    ):
+        super().__init__()
+        self._model = model
+        self._limit = max(1, int(limit))
+        self._empty_limit = max(self._limit, int(empty_limit))
+        self._delegation_key = ""
+        self._seen_observation_keys: set[str] = set()
+        self._duplicate_streak = 0
+        self._empty_streak = 0
+        self._no_progress_streak = 0
+        self._tripped = False
+        self._trip_reason = ""
+        self._trip_limit = self._limit
+
+    def _current_delegation_key(self) -> str:
+        try:
+            value = self._model.current_delegation_id("MCP_Manager")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        return "mcp_manager"
+
+    def _reset_for_delegation(self) -> None:
+        current = self._current_delegation_key()
+        if current == self._delegation_key:
+            return
+        self._delegation_key = current
+        self._seen_observation_keys = set()
+        self._duplicate_streak = 0
+        self._empty_streak = 0
+        self._no_progress_streak = 0
+        self._tripped = False
+        self._trip_reason = ""
+        self._trip_limit = self._limit
+
+    @staticmethod
+    def _blocked_tool_message(
+        request: Any,
+        *,
+        streak: int,
+        limit: int,
+        reason: str,
+    ) -> ToolMessage:
+        tool_name = _tool_name_from_request(request) or "unknown_tool"
+        payload = {
+            "ok": False,
+            "verdict": "blocked",
+            "capability": "mcp-no-progress-boundary",
+            "reason": (
+                f"{reason} {streak} times in a row (limit {limit}); stop searching and summarize the "
+                "evidence already collected."
+            ),
+            "next_action": "summarize_and_handback",
+            "tool_name": tool_name,
+        }
+        return ToolMessage(
+            content=json.dumps(payload, sort_keys=True),
+            name=tool_name,
+            tool_call_id=_tool_call_id_from_request(request),
+        )
+
+    def _observe_result(self, request: Any, result: Any) -> Any:
+        self._reset_for_delegation()
+        if not isinstance(result, ToolMessage):
+            return result
+        tool_name = _tool_name_from_request(request)
+        if tool_name in _COMPACTION_PROTECTED_TOOLS:
+            return result
+
+        fingerprint, is_empty = _normalize_mcp_observation(result)
+        if not fingerprint and not is_empty:
+            return result
+
+        observation_key = _mcp_observation_key(request, fingerprint)
+        repeated = bool(observation_key) and observation_key in self._seen_observation_keys
+        if repeated:
+            self._duplicate_streak += 1
+        else:
+            self._seen_observation_keys.add(observation_key)
+            self._duplicate_streak = 0
+
+        if is_empty:
+            self._empty_streak += 1
+        else:
+            self._empty_streak = 0
+
+        self._no_progress_streak = max(self._duplicate_streak, self._empty_streak)
+
+        if self._duplicate_streak >= self._limit:
+            trip_streak = self._duplicate_streak
+            trip_limit = self._limit
+            trip_reason = "MCP retrieval has repeated the same request/result observation"
+        elif self._empty_streak >= self._empty_limit:
+            trip_streak = self._empty_streak
+            trip_limit = self._empty_limit
+            trip_reason = "MCP retrieval has returned only empty observations across query variants"
+        else:
+            return result
+
+        self._tripped = True
+        self._trip_reason = trip_reason
+        self._trip_limit = trip_limit
+        try:
+            logger.info(
+                "🛑 [mcp-no-progress-boundary] ending MCP_Manager after "
+                f"{trip_streak} no-progress observations "
+                f"in delegation {self._delegation_key!r}"
+            )
+        except Exception:
+            pass
+        return self._blocked_tool_message(
+            request,
+            streak=trip_streak,
+            limit=trip_limit,
+            reason=trip_reason,
+        )
+
+    def _before_model_update(self) -> dict[str, str] | None:
+        self._reset_for_delegation()
+        if self._tripped:
+            return {"jump_to": "end"}
+        return None
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime):
+        return self._before_model_update()
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        return self._before_model_update()
+
+    async def awrap_tool_call(self, request, handler):
+        self._reset_for_delegation()
+        if self._tripped:
+            return self._blocked_tool_message(
+                request,
+                streak=self._no_progress_streak,
+                limit=self._trip_limit,
+                reason=self._trip_reason,
+            )
+        result = await handler(request)
+        return self._observe_result(request, result)
+
+    def wrap_tool_call(self, request, handler):
+        self._reset_for_delegation()
+        if self._tripped:
+            return self._blocked_tool_message(
+                request,
+                streak=self._no_progress_streak,
+                limit=self._trip_limit,
+                reason=self._trip_reason,
+            )
+        result = handler(request)
+        return self._observe_result(request, result)
 
 
 class _ToolResultCompactionMiddleware(AgentMiddleware):
@@ -1491,6 +1721,20 @@ def _message_content_as_text(content: Any) -> str:
                 parts.append(item)
         return "\n".join(part for part in parts if part)
     return str(content or "")
+
+
+def _tool_messages_as_text(messages: list[AnyMessage]) -> str:
+    """Serialize worker tool results for summary synthesis, including structured MCP content."""
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+        if msg.name and msg.name.startswith("transfer_to_"):
+            continue
+        text = _message_content_as_text(msg.content).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
 
 
 def _is_bounded_one_action_capability_request(messages: list[AnyMessage]) -> bool:
@@ -3635,14 +3879,7 @@ class Model:
                                         worker_text_parts.append(msg_text)
                             summary_text = "\n\n".join(worker_text_parts).strip()
 
-                        tool_contents = [
-                            msg.content
-                            for msg in new_messages_from_agent
-                            if isinstance(msg, ToolMessage)
-                            and isinstance(msg.content, str)
-                            and (not msg.name or not msg.name.startswith("transfer_to_"))
-                        ]
-                        joined_tool_contents = "\n\n".join(tool_contents)
+                        joined_tool_contents = _tool_messages_as_text(new_messages_from_agent)
 
                         if not summary_text and self.llm is not None:
                             truncated_tool_contents = joined_tool_contents[:12000]
@@ -6238,6 +6475,7 @@ class Model:
             self,
             inject_engagement_state: bool = False,
             bounded_execute_stop: bool = False,
+            mcp_no_progress_stop: bool = False,
     ) -> list:
         """Bounded-context middleware for every create_agent.
         Strategy: ClearToolUsesEdit does the cheap, routine bounding every step (no LLM call);
@@ -6289,6 +6527,12 @@ class Model:
             # _wrap_create_agent; unbounded autonomous solves return to Supervisor/state
             # reconciliation before choosing another action.
             mw.insert(1, _BoundedExecuteCapabilityStopMiddleware(self))
+        if mcp_no_progress_stop:
+            # MCP_Manager is a read-oriented bridge to arbitrary third-party servers. Once a
+            # delegation is only producing empty or duplicate observations, another query variant
+            # is not progress; stop the worker turn and synthesize a handback from the evidence
+            # already collected instead of letting retrieval churn consume the whole request.
+            mw.insert(1, _MCPManagerNoProgressStopMiddleware(self))
         summ_model = self._get_base_chat_model()
         if summ_model is not None:
             mw.append(SummarizationMiddleware(
@@ -6558,7 +6802,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(mcp_no_progress_stop=True),
         )
         return self._wrap_create_agent(agent, "mcp_manager_messages", name)
 
