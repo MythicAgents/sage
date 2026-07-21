@@ -405,6 +405,34 @@ def test_channel_metadata_heartbeat_publishes_changed_rounds(monkeypatch):
     assert rounds[-1] == 2
 
 
+def test_channel_metadata_tracks_active_agent_then_returns_idle(monkeypatch):
+    import sage_chat.service as service
+
+    class _ActivityModel(_FakeModel):
+        _global_step_count = 0
+        _policy_model_calls = 0
+
+        def set_active_agent(self, name):
+            self._active_agent_label = name
+
+        async def invoke(self, prompt, is_interactive=False):
+            self.set_active_agent("Mythic Operator")
+            await asyncio.sleep(0.03)
+            return "done"
+
+    monkeypatch.setattr(service, "_CHANNEL_METADATA_HEARTBEAT_SECONDS", 0.01)
+    chat = _DriverChat(_ActivityModel(stream=()))
+    _run(chat.chat(build_chat_request("inspect", channel_id=5, request_id=10)))
+
+    agents = [
+        next(item["value"] for item in update["items"] if item["key"] == "active_agent")
+        for update in chat.channel_metadata_updates
+    ]
+    assert agents[0] == "Supervisor"
+    assert "Mythic Operator" in agents
+    assert agents[-1] == "Idle"
+
+
 # --------------------------------------------------------------------------------------
 # Cancel + error paths
 # --------------------------------------------------------------------------------------
@@ -572,6 +600,26 @@ def test_emit_subagent_status_produces_subagent_card():
     assert subagent["status"] == "running"
     assert subagent["tool_count"] == 0
     assert subagent["icon"] == "BH"
+
+
+def test_finished_subagent_card_carries_summary_without_duplicate_content():
+    chat = HeadlessSageChat()
+    emitter = ChatStreamEmitter(chat, build_chat_request("x"))
+
+    assert _run(emitter.emit_subagent_status(
+        title="List callbacks",
+        prompt="List current callbacks.",
+        delegation_id="mythic_operator:1",
+        delegation_name="Mythic_Operator",
+        status="finished",
+        summary="Two active callbacks were found.",
+        content="",
+        complete=True,
+    )) is True
+
+    emitted = chat.emissions[0]
+    assert emitted["metadata"]["subagent"]["summary"] == "Two active callbacks were found."
+    assert emitted["content"] == ""
 
 
 def test_emit_subagent_status_forwards_icon_color():
@@ -771,6 +819,65 @@ def test_control_tools_do_not_render_operator_cards():
     assert _is_control_tool("") is False
 
 
+def test_supervisor_handoff_text_streams_once_but_tool_only_handoff_stays_silent():
+    from ai.langgraph.model import Model
+    from langchain_core.messages import AIMessage
+
+    model = Model.__new__(Model)
+    model.channel_id = 7
+    model.verbose = True
+    model._streamed_supervisor_message_keys = set()
+    streamed = []
+
+    async def _stream(content):
+        streamed.append(content)
+        return True
+
+    model._stream_message_to_mythic = _stream
+    handoff = AIMessage(
+        content="I found the callback inventory and need Mythic-specific verification.",
+        name="Supervisor",
+        tool_calls=[{
+            "id": "handoff-1",
+            "name": "transfer_to_Mythic_Operator",
+            "args": {"task_description": "Verify callbacks"},
+            "type": "tool_call",
+        }],
+    )
+    event = {"Supervisor": {"supervisor_messages": [handoff]}}
+
+    _run(model._process_stream_event(event))
+    _run(model._process_stream_event(event))
+    _run(model._process_stream_event({
+        "Supervisor": {"supervisor_messages": [AIMessage(
+            content="",
+            name="Supervisor",
+            tool_calls=[{
+                "id": "handoff-2",
+                "name": "transfer_to_BloodHound",
+                "args": {},
+                "type": "tool_call",
+            }],
+        )]},
+    }))
+
+    assert streamed == ["I found the callback inventory and need Mythic-specific verification.\n"]
+
+
+def test_message_capture_marks_real_agent_activity_not_summarization():
+    from uuid import uuid4
+    from ai.langgraph.model import MessageCaptureCallback
+
+    active = []
+    callback = MessageCaptureCallback("MCP_Manager", activity_func=active.append)
+    _run(callback.on_chat_model_start({}, [], run_id=uuid4(), metadata={}))
+    _run(callback.on_chat_model_start(
+        {}, [], run_id=uuid4(), metadata={"lc_source": "summarization"}
+    ))
+
+    assert active == ["MCP_Manager"]
+
+
 class _SubagentStatusRecorder:
     def __init__(self):
         self.calls = []
@@ -850,6 +957,7 @@ def test_delegation_safety_close_falls_back_to_last_text():
     assert len(emitter.calls) == 1
     finished = emitter.calls[0]
     assert finished["content"] == ""
+    assert finished["summary"] == "Callback 1 history shows only failed tasks."
     assert finished["status"] == "finished"
     assert finished["complete"] is True
     assert finished["tool_count"] == 2
@@ -1685,6 +1793,7 @@ def test_close_delegation_persists_handback_summary_once_via_card_close():
     _run(m._close_delegation("BloodHound"))
 
     assert emitter.subagent_calls[0]["content"] == "DONE — ingested job 228."
+    assert emitter.subagent_calls[0]["summary"] == "DONE — ingested job 228."
     assert emitter.agent_text_calls == []
 
 
@@ -1702,6 +1811,7 @@ def test_close_delegation_does_not_reecho_streamed_last_text():
 
     assert emitter.agent_text_calls == []
     assert emitter.subagent_calls[0]["content"] == ""
+    assert emitter.subagent_calls[0]["summary"] == "already streamed"
 
 
 def test_close_delegation_suppresses_explicit_content_already_streamed():
@@ -1715,6 +1825,7 @@ def test_close_delegation_suppresses_explicit_content_already_streamed():
     _run(m._close_delegation("Generalist", content="Hello! How can I help?"))
 
     assert emitter.subagent_calls[0]["content"] == ""
+    assert emitter.subagent_calls[0]["summary"] == "Hello! How can I help?"
 
 
 def test_close_delegation_suppresses_explicit_content_matching_full_streamed_transcript():
@@ -1745,6 +1856,39 @@ def test_close_delegation_suppresses_explicit_content_matching_full_streamed_tra
         "Both are on CASTELBLACK.",
     ]
     assert emitter.subagent_calls[0]["content"] == ""
+    assert emitter.subagent_calls[0]["summary"] == (
+        "Found two active callbacks.\n\nBoth are on CASTELBLACK."
+    )
+
+
+def test_agent_text_sequence_survives_per_request_emitter_replacement():
+    chat = HeadlessSageChat()
+    m = _bare_model_with(ChatStreamEmitter(chat, build_chat_request("x", request_id=1)), {
+        "BloodHound": {
+            "id": "bloodhound:request-7:1",
+            "name": "BloodHound",
+            "title": "Inspect graph",
+            "text_seq": 0,
+            "streamed_text_chunks": [],
+        },
+    })
+
+    _run(m._emit_agent_text(
+        content="Before approval.",
+        delegation_id="bloodhound:request-7:1",
+        delegation_name="BloodHound",
+    ))
+    m._response_emitter = ChatStreamEmitter(chat, build_chat_request("approve", request_id=2))
+    _run(m._emit_agent_text(
+        content="After approval.",
+        delegation_id="bloodhound:request-7:1",
+        delegation_name="BloodHound",
+    ))
+
+    assert [emission["response_key"] for emission in chat.emissions] == [
+        "agent_text:bloodhound:request-7:1:1",
+        "agent_text:bloodhound:request-7:1:2",
+    ]
 
 
 def test_request_scope_prevents_delegation_id_reuse_after_restart():
@@ -2274,11 +2418,13 @@ def test_build_channel_metadata_live_counts(monkeypatch):
         mode = "auto"
         _autonomous_solve = True
         policy_mode = "llm"
+        _active_agent_label = "Controller"
 
     items = {i["key"]: i for i in build_channel_metadata(_M())["items"]}
     assert items["mcp_tools"]["value"] == 13
     assert items["mcp_servers"]["value"] == 1
     assert items["rounds"]["value"] == 7
+    assert items["active_agent"]["value"] == "Controller"
     assert items["bloodhound"]["value"] is True
     assert items["bloodhound"]["display_value"] == "connected"
     assert "mythic_tools" in items                       # scope-usable Mythic tool count present

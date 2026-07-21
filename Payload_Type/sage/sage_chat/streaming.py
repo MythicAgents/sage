@@ -115,11 +115,14 @@ class ChatStreamEmitter:
         content: str,
         delegation_id: str,
         delegation_name: str,
+        sequence: int | None = None,
     ) -> bool:
         """Emit specialist text into its delegation drill-down without creating a card."""
         try:
-            self._agent_text_block += 1
-            response_key = f"agent_text:{delegation_id}:{self._agent_text_block}"
+            if sequence is None:
+                self._agent_text_block += 1
+                sequence = self._agent_text_block
+            response_key = f"agent_text:{delegation_id}:{sequence}"
             await self._chat.send_response(
                 self._request,
                 response_key=response_key,
@@ -147,24 +150,45 @@ class ChatStreamEmitter:
         tool_total: int | None = None,
         icon: str = "",
         icon_color: str = "",
+        summary: str = "",
         content: str = "",
         complete: bool = False,
     ) -> bool:
         """Emit or update one flat Mythic sub-agent card."""
         try:
-            await self._chat.send_subagent_status(
+            subagent: dict[str, Any] = {
+                "title": title,
+                "status": status,
+            }
+            if prompt:
+                subagent["prompt"] = prompt
+            if tool_count is not None:
+                subagent["tool_count"] = tool_count
+            if tool_total is not None:
+                subagent["tool_total"] = tool_total
+            if icon:
+                subagent["icon"] = icon
+            if icon_color:
+                subagent["icon_color"] = icon_color
+            if summary:
+                subagent["summary"] = summary
+
+            fragment = "".join(
+                char if char.isalnum() or char in ("-", "_") else "_"
+                for char in str(delegation_id or title).strip().lower()
+            ).strip("_")[:80] or "input"
+            await self._chat.send_response(
                 self._request,
-                title=title,
-                prompt=prompt,
-                delegation_id=delegation_id,
-                delegation_name=delegation_name,
-                status=status,
-                tool_count=tool_count,
-                tool_total=tool_total,
-                icon=icon,
-                icon_color=icon_color,
+                response_key=f"subagent:{fragment}",
                 content=content,
+                status="complete" if complete else "streaming",
                 complete=complete,
+                metadata={
+                    "special_type": "subagent",
+                    "subagent": subagent,
+                    "delegation_id": delegation_id,
+                    "delegation_name": delegation_name,
+                },
             )
             return True
         except Exception:

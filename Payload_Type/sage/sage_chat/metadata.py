@@ -120,6 +120,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     mode = str(getattr(model, "mode", "") or "supervised")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
     policy_mode = str(getattr(model, "policy_mode", "") or "llm")
+    active_agent = str(getattr(model, "_active_agent_label", "") or "Idle")
     policy_color = {
         "llm": "success",
         "hybrid": "info",
@@ -129,13 +130,16 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     autonomous_color = "warning" if autonomous else "neutral"
 
     items = [
-        {"key": "cfg_policy", "label": "Policy", "value": policy_mode, "color": policy_color, "order": 1,
+        {"key": "active_agent", "label": "Agent", "value": active_agent, "order": 1,
+         "color": "neutral" if active_agent == "Idle" else "info",
+         "tooltip": "Sage component currently processing this channel"},
+        {"key": "cfg_policy", "label": "Policy", "value": policy_mode, "color": policy_color, "order": 2,
          "tooltip": "Semantic capability selection backend"},
-        {"key": "cfg_mode", "label": "Mode", "value": mode, "color": mode_color, "order": 2,
+        {"key": "cfg_mode", "label": "Mode", "value": mode, "color": mode_color, "order": 3,
          "click": "/mode", "click_confirmation_text": "Run /mode to show or change Sage's mode?",
          "tooltip": "Supervised or autonomous — click to run /mode"},
         {"key": "cfg_autonomous", "label": "Autonomous", "value": autonomous,
-         "display_value": "on" if autonomous else "off", "color": autonomous_color, "order": 3,
+         "display_value": "on" if autonomous else "off", "color": autonomous_color, "order": 4,
          "tooltip": "Autonomous solve forced this session"},
         {"key": "mythic_tools", "label": "Mythic Tools", "value": scope_usable_mythic_tools(model),
          "order": 4, "tooltip": "Mythic tools the current bot token can invoke (scope-gated)"},
@@ -148,7 +152,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
          "tooltip": "Model calls observed across graph-agent and controller execution"},
         {"key": "bloodhound", "label": "BloodHound", "value": bh_connected,
          "display_value": "connected" if bh_connected else "off",
-         "status": "success" if bh_connected else "neutral", "order": 40,
+         "status": "success" if bh_connected else "neutral", "order": 5,
          "click": "/bloodhound", "click_confirmation_text": "Run /bloodhound to (re)connect or show BloodHound status?",
          "tooltip": "BloodHound MCP connection — click to run /bloodhound"},
     ]

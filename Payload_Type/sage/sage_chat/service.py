@@ -198,6 +198,9 @@ class SageChat(Chat):
             )
             model._hitl_card_pending = False
             model._thread_id_override = thread_id
+            set_active_agent = getattr(model, "set_active_agent", None)
+            if callable(set_active_agent):
+                set_active_agent("Supervisor")
             last_channel_metadata: dict[str, Any] | None = None
 
             async def publish_channel_metadata(*, force: bool = False) -> None:
@@ -270,6 +273,9 @@ class SageChat(Chat):
                 with suppress(asyncio.CancelledError):
                     await metadata_task
                 MCPManager.reset_execution_observer(observer_token)
+                if callable(set_active_agent):
+                    set_active_agent("Idle")
+                await publish_channel_metadata()
             finalize_visibility = getattr(model, "finalize_visibility_turn", None)
             if callable(finalize_visibility):
                 await finalize_visibility()

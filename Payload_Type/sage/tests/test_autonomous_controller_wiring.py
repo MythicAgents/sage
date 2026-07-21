@@ -500,10 +500,16 @@ def test_scoped_callback_inventory_prompt_detection_is_narrow_and_non_objective(
     assert model._looks_like_scoped_callback_inventory_prompt("List active callbacks") is True
     assert model._looks_like_scoped_callback_inventory_prompt("Show current callbacks and liveness") is True
     assert model._looks_like_scoped_callback_inventory_prompt(
+        "What's the situation with our callbacks for this operation?"
+    ) is True
+    assert model._looks_like_scoped_callback_inventory_prompt(
         "What can you tell me about our current callbacks and process names?"
     ) is False
     assert model._looks_like_scoped_callback_inventory_prompt(
         "Which callback should I use to execute DCSync?"
+    ) is False
+    assert model._looks_like_scoped_callback_inventory_prompt(
+        "List current callbacks and recommend the next action."
     ) is False
     assert model.Model._looks_like_explicit_objective_prompt(
         "From the current foothold, achieve administrative control of essos.local."
@@ -547,6 +553,45 @@ def test_scoped_callback_inventory_turn_uses_one_slim_read_and_no_controller():
     assert m.mythic_client.calls == ["list_callbacks"]
     assert "| 1 | apollo | CASTELBLACK | samwell.tarly | 2 | alive | 1.2s |" in streamed[0]
     assert m.state["supervisor_messages"][-1].additional_kwargs["_scoped_callback_inventory"] is True
+
+
+def test_demo_callback_prompt_terminates_before_supervisor_graph(monkeypatch):
+    """A completed scoped read cannot promote an optional recommendation into another delegation."""
+    m = object.__new__(model.Model)
+    m.mode = "supervised"
+    m.command_name = "chat"
+    m._autonomous_solve = False
+    m._supervised_objective_active = False
+    m._controller_hitl_pending = None
+    m._thread_id_override = "channel-19"
+    m._running_tasks = set()
+    m._message_seq = 1
+    m.graph = object()
+    m.state = {"messages": [], "_message_seq": 1}
+    m.mythic_client = None
+    m.provider = "test"
+    m.model = "test"
+    m.is_interactive = True
+    seen = []
+
+    async def _no_interrupt(_thread_id):
+        return False
+
+    async def _scoped_turn():
+        seen.append("scoped")
+        return "done"
+
+    m._hitl_interrupt_pending = _no_interrupt
+    m._seed_autonomous_objective = lambda _prompt: None
+    m._run_scoped_callback_inventory_turn = _scoped_turn
+
+    result = asyncio.run(m.invoke(
+        "What's the situation with our callbacks for this operation?",
+        is_interactive=True,
+    ))
+
+    assert result == "done"
+    assert seen == ["scoped"]
 
 
 def test_invoke_routes_reused_supervised_objective_turn_into_controller(monkeypatch):

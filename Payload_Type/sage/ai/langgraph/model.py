@@ -125,42 +125,10 @@ def _coerce_prompt_text(prompt: Any) -> str:
     return str(prompt or "")
 
 
-_SCOPED_CALLBACK_INVENTORY_WORDS = frozenset({
-    "active",
-    "all",
-    "alive",
-    "and",
-    "any",
-    "are",
-    "about",
-    "can",
-    "callback",
-    "callbacks",
-    "current",
-    "describe",
-    "health",
-    "healthy",
-    "is",
-    "list",
-    "live",
-    "liveness",
-    "me",
-    "now",
-    "of",
-    "our",
-    "report",
-    "right",
-    "show",
-    "status",
-    "statuses",
-    "summarize",
-    "tell",
-    "the",
-    "there",
-    "what",
-    "which",
-    "you",
-})
+_CALLBACK_SCOPE_EXPANSION_RE = re.compile(
+    r"\b(?:analy[sz]e|attack|bloodhound|collect|command|dcsync|execute|file|history|ingest|ip|"
+    r"network|next action|os|path|pivot|port|process|recommend|run|task|triage)\b"
+)
 
 
 def _looks_like_scoped_callback_inventory_prompt(prompt: Any) -> bool:
@@ -173,11 +141,14 @@ def _looks_like_scoped_callback_inventory_prompt(prompt: Any) -> bool:
     if not text:
         return False
     words = re.findall(r"[a-z0-9_]+", text)
-    if not words or "callback" not in words and "callbacks" not in words:
+    if not words or ("callback" not in words and "callbacks" not in words):
         return False
-    if words[0] not in {"what", "which", "show", "list", "report", "summarize", "describe", "tell"}:
+    if len(words) > 30 or _CALLBACK_SCOPE_EXPANSION_RE.search(text):
         return False
-    return all(word in _SCOPED_CALLBACK_INVENTORY_WORDS for word in words)
+    return bool(re.match(
+        r"^(?:what(?:'s| is| are| can| do)|which|show|list|report|summarize|describe|tell|are|is|do we have)\b",
+        text,
+    ))
 
 
 def _callback_inventory_rows(payload: Any) -> tuple[list[dict[str, Any]], bool, str]:
@@ -1921,6 +1892,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         tool_source_func=None,
         agent_text_func=None,
         handback_summary_func=None,
+        activity_func=None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
     ):
@@ -1936,6 +1908,7 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         self._tool_source_func = tool_source_func
         self._agent_text_func = agent_text_func  # Function to stream delegated specialist text to its drill-down
         self._handback_summary_func = handback_summary_func  # Function to retain control-tool handback summaries
+        self._activity_func = activity_func
         # Track run_ids for SummarizationMiddleware's internal model.invoke calls.
         # Those produce a summary AIMessage that must NOT be captured or streamed:
         # capturing it would leak the summary to Mythic as fake agent output and
@@ -1965,6 +1938,11 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         if metadata and metadata.get("lc_source") == "summarization":
             self._summarization_run_ids.add(run_id)
             logger.debug(f"📨 [Callback:{self.agent_name}] Flagging summarization run_id={run_id} (chat_model_start)")
+        elif self._activity_func is not None:
+            try:
+                self._activity_func(self.agent_name)
+            except Exception:
+                pass
 
     async def on_llm_start(
         self,
@@ -1981,6 +1959,11 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         if metadata and metadata.get("lc_source") == "summarization":
             self._summarization_run_ids.add(run_id)
             logger.debug(f"📨 [Callback:{self.agent_name}] Flagging summarization run_id={run_id} (llm_start)")
+        elif self._activity_func is not None:
+            try:
+                self._activity_func(self.agent_name)
+            except Exception:
+                pass
 
     async def on_llm_end(
         self,
@@ -2225,6 +2208,8 @@ class Model:
         self._delegation_seq: int = 0
         self._delegation_scope: str = ""
         self._execution_activity_seq: int = 0
+        self._active_agent_label: str = "Idle"
+        self._streamed_supervisor_message_keys: set[str] = set()
         self._visibility_expected: set[str] = set()
         self._visibility_rendered: set[str] = set()
         self._visibility_failed: set[str] = set()
@@ -2371,6 +2356,16 @@ class Model:
         self.state["_message_seq"] = self._message_seq
         logger.debug(f"🔢 Model._next_seq: returned seq={seq}, state now has _message_seq={self._message_seq}")
         return seq
+
+    def set_active_agent(self, agent_name: str) -> None:
+        """Publishable current owner for the Sage-managed channel metadata chip."""
+        normalized = str(agent_name or "Idle").strip().replace("_", " ") or "Idle"
+        aliases = {
+            "Autonomous Executor": "Controller",
+            "Execution": "Controller",
+            "Collection": "Controller",
+        }
+        self._active_agent_label = aliases.get(normalized, normalized)
 
     def _get_base_chat_model(self) -> BaseChatModel | None:
         """Initialize and return the BaseChatModel based on provider and model."""
@@ -2725,6 +2720,7 @@ class Model:
         tool_total: int | None = None,
         icon: str = "",
         icon_color: str = "",
+        summary: str = "",
         content: str = "",
         complete: bool = False,
     ) -> None:
@@ -2742,6 +2738,7 @@ class Model:
                 tool_total=tool_total,
                 icon=icon,
                 icon_color=icon_color,
+                summary=summary,
                 content=content,
                 complete=complete,
             )
@@ -2759,13 +2756,18 @@ class Model:
         if emitter is None or not hasattr(emitter, "emit_agent_text"):
             return
         try:
+            delegation = getattr(self, "_active_delegations", {}).get(delegation_name)
+            sequence = None
+            if delegation is not None:
+                sequence = int(delegation.get("text_seq", 0) or 0) + 1
+                delegation["text_seq"] = sequence
             await emitter.emit_agent_text(
                 content=content,
                 delegation_id=delegation_id,
                 delegation_name=delegation_name,
+                sequence=sequence,
             )
             if content.strip():
-                delegation = getattr(self, "_active_delegations", {}).get(delegation_name)
                 if delegation is not None:
                     emitted_text = content.strip()
                     delegation["last_text"] = emitted_text
@@ -2928,6 +2930,7 @@ class Model:
                 "last_text": "",
                 "streamed_text_chunks": [],
                 "final_summary": "",
+                "text_seq": 0,
             }
             await self._emit_subagent_status(
                 title=card_title,
@@ -2976,7 +2979,10 @@ class Model:
             # Mythic automatically persists non-empty terminal card content as a
             # subagent_final_output drill-down message. Text already emitted through emit_agent_text
             # must therefore not be repeated as card-close content.
-            content = explicit_content or final_summary
+            summary = explicit_content or final_summary or last_text
+            if status == "finished" and not summary:
+                summary = "Completed without a textual summary."
+            content = summary
             streamed_text_candidates = {last_text} if last_text else set()
             if isinstance(streamed_text_chunks, list):
                 cleaned_chunks = [
@@ -2997,6 +3003,7 @@ class Model:
                 tool_count=int(delegation.get("tool_count", 0)),
                 icon=str(delegation.get("icon", "")),
                 icon_color=str(delegation.get("icon_color", "")),
+                summary=summary,
                 content=content,
                 complete=True,
             )
@@ -3136,6 +3143,24 @@ class Model:
                         formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
                         if formatted:
                             await self._stream_message_to_mythic(formatted)
+                    elif _message_content_as_text(msg.content).strip():
+                        tool_calls = getattr(msg, "tool_calls", None) or []
+                        tool_names = [str(tc.get("name") or "") for tc in tool_calls]
+                        is_handoff = bool(tool_names) and all(
+                            name.startswith("transfer_to_") for name in tool_names
+                        )
+                        if is_handoff:
+                            tool_ids = ",".join(str(tc.get("id") or "") for tc in tool_calls)
+                            message_key = f"{tool_ids}|{_message_content_as_text(msg.content).strip()}"
+                            streamed = getattr(self, "_streamed_supervisor_message_keys", None)
+                            if not isinstance(streamed, set):
+                                streamed = set()
+                                self._streamed_supervisor_message_keys = streamed
+                            if message_key not in streamed:
+                                streamed.add(message_key)
+                                formatted = self._format_message_for_streaming(msg, agent_name="Supervisor")
+                                if formatted:
+                                    await self._stream_message_to_mythic(formatted)
                     else:
                         logger.debug(f"📨 [Stream] Suppressing Supervisor routing/respond_to_user message from user output")
 
@@ -3546,6 +3571,7 @@ class Model:
                 tool_source_func=self._classify_tool_source,
                 agent_text_func=self._emit_agent_text,
                 handback_summary_func=self._capture_delegation_final_summary,
+                activity_func=self.set_active_agent,
                 delegation_id=delegation_id,
                 delegation_name=node_name if delegation_id is not None else None,
             )
@@ -5258,6 +5284,7 @@ class Model:
 
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the controller under the fail-closed offensive MCP execution boundary."""
+        self.set_active_agent("Controller")
         execution_context_token = MCPManager.set_execution_context(
             MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
         )
