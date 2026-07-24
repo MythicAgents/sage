@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sage
 from ai.langgraph.model import (  # noqa: E402
@@ -20,6 +21,7 @@ from ai.langgraph.model import (  # noqa: E402
 )
 from ai.langgraph.mythic_tools import GUARDED_TOOLS  # noqa: E402
 from langchain.agents.middleware import HumanInTheLoopMiddleware  # noqa: E402
+from sage_chat.hitl import approval_action_fingerprint, build_approval_request  # noqa: E402
 
 
 def _bare_model(mode: str) -> Model:
@@ -45,6 +47,7 @@ def test_guarded_tools_are_state_changing_only():
         "execute_capability",
         "create_payload",
         "download_tool",
+        "ensure_tool_uploaded",
         "ingest_collection",
         "sandbox_exec",
         "file_upload",
@@ -53,7 +56,7 @@ def test_guarded_tools_are_state_changing_only():
     assert not any(t.startswith("get_") for t in GUARDED_TOOLS)
     assert "get_all_task_output_by_task_id" not in GUARDED_TOOLS
     assert "download_file" not in GUARDED_TOOLS
-    assert "ensure_tool_uploaded" not in GUARDED_TOOLS
+    assert "ensure_tool_uploaded" in GUARDED_TOOLS
 
 
 def test_auto_mode_adds_no_hitl_middleware():
@@ -74,6 +77,58 @@ def test_hitl_operator_text_default_deny():
 
     for text in ("", "no", "deny", "stop", "later", "nah don't", "maybe", "garbage"):
         assert _hitl_is_approved(text) is False
+
+
+@pytest.mark.parametrize(
+    "action_requests",
+    (
+        ["not-an-action"],
+        [{}],
+        [{"name": "drop_database", "args": {}}],
+        [{"name": "execute_capability", "args": "{}"}],
+        [{"name": 7, "args": {}}],
+        [{"name": " execute_capability ", "args": {}}],
+        [{"name": "execute_capability", "args": {"targets": ("a", "b")}}],
+        [{"name": "execute_capability", "args": {1: "target"}}],
+    ),
+)
+def test_approval_cards_reject_malformed_unknown_or_nonexact_actions(action_requests):
+    with pytest.raises(ValueError):
+        build_approval_request(action_requests)
+
+
+def test_action_fingerprint_is_exact_over_tool_and_json_native_args_only():
+    base = {"name": "execute_capability", "args": {"b": [1, True, None], "a": {"x": "y"}}}
+    assert approval_action_fingerprint(base) == approval_action_fingerprint({
+        **base,
+        "id": "fresh-call",
+        "display_name": "different label",
+        "args": {"a": {"x": "y"}, "b": [1, True, None]},
+    })
+    for other in (
+        {"name": "execute_capability", "args": {"b": [True, 1, None], "a": {"x": "y"}}},
+        {"name": "execute_capability", "args": {"b": [1.0, True, None], "a": {"x": "y"}}},
+        {"name": "execute_capability", "args": {"b": [1, True, "null"], "a": {"x": "y"}}},
+        {"name": "execute_capability", "args": {"b": [1, False, None], "a": {"x": "y"}}},
+        {"name": "execute_capability", "args": {"b": [1, True, None], "a": {"x": "z"}}},
+    ):
+        assert approval_action_fingerprint(base) != approval_action_fingerprint(other)
+    assert approval_action_fingerprint({
+        "name": "execute_capability",
+        "args": {"outer": {"b": 2, "a": {"y": 1, "x": [3, 4]}}},
+    }) == approval_action_fingerprint({
+        "name": "execute_capability",
+        "args": {"outer": {"a": {"x": [3, 4], "y": 1}, "b": 2}},
+    })
+    for malformed in (
+        {"name": " execute_capability ", "args": {}},
+        {"name": "Execute_Capability", "args": {}},
+        {"name": "execute_capability", "args": {"x": float("inf")}},
+        {"name": "execute_capability", "args": {"x": ("a", "b")}},
+        {"name": "execute_capability", "args": {1: "x"}},
+    ):
+        with pytest.raises(ValueError):
+            approval_action_fingerprint(malformed)
 
 
 class _FakeInterrupt:
@@ -112,6 +167,66 @@ def test_surface_hitl_interrupt_ignores_normal_event():
     m._stream_message_to_mythic = _stub
     assert _run(m._surface_hitl_interrupt({"Supervisor": {"messages": []}})) is False
     assert sent == []
+
+
+def test_continuation_loop_surfaces_hitl_interrupt_and_stops_consuming_events():
+    m = _bare_model("supervised")
+    m.state = {
+        "messages": [],
+        "supervisor_messages": [],
+        "recursion_summary_requested": True,
+        "recursion_handback": True,
+        "_message_seq": 1,
+    }
+    m._message_seq = 1
+    m._thread_id_override = "chat:generation:continuation-hitl"
+    m._stop_requested = False
+    m._hitl_card_pending = False
+    m._graph_run_config = lambda thread_id: {"configurable": {"thread_id": thread_id}}
+    m._format_message_for_streaming = lambda _message, agent_name=None: ""
+    processed = []
+    surfaced = []
+
+    async def _classify(_response):
+        return "CONTINUE"
+
+    async def _surface(event):
+        surfaced.append(event)
+        m._hitl_card_pending = True
+        return True
+
+    async def _process(event):
+        processed.append(event)
+
+    class _Events:
+        def __init__(self):
+            self._events = iter((
+                {"__interrupt__": (_FakeInterrupt({"action_requests": []}),)},
+                {"Supervisor": {"messages": [AIMessage(content="must not run")] }},
+            ))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    class _Graph:
+        def astream(self, _state, _config):
+            return _Events()
+
+    m._classify_continuation_intent = _classify
+    m._surface_hitl_interrupt = _surface
+    m._process_stream_event = _process
+    m.graph = _Graph()
+
+    assert _run(m.handle_continuation_response("continue")) == ""
+    assert len(surfaced) == 1
+    assert processed == []
+    assert m._hitl_card_pending is True
 
 
 class _FakeTask:
@@ -153,6 +268,48 @@ def test_collect_action_requests_two_distinct_calls_kept():
     itr = _itr({"action_requests": [{"name": "a", "args": {}}, {"name": "b", "args": {}}]}, "int-3")
     snap = _FakeSnapshot(interrupts=(itr,), tasks=(_FakeTask((itr,)),))
     assert len(_collect_hitl_action_requests(snap)) == 2
+
+
+def test_hitl_resume_rejects_malformed_checkpoint_before_command_resume():
+    class _Graph:
+        resumed = False
+
+        async def aget_state(self, _config):
+            itr = _itr({"action_requests": [{"name": "drop_database", "args": {}}]}, "bad")
+            return _FakeSnapshot(interrupts=(itr,))
+
+        async def astream(self, *_args, **_kwargs):
+            self.resumed = True
+            if False:
+                yield None
+
+    model = _bare_model("supervised")
+    model.graph = _Graph()
+    model._write_hitl_audit = lambda *_args: None
+
+    with pytest.raises(RuntimeError, match="exact guarded request is unavailable and the session must be replaced"):
+        _run(model.handle_hitl_resume("approve", "thread-1", expected_action_digest="attacker"))
+    assert model.graph.resumed is False
+
+
+@pytest.mark.parametrize(("response", "operator_message"), (("deny", ""), ("deny", "use a different read")))
+def test_hitl_resume_missing_checkpoint_fails_closed_before_graph_resume(response, operator_message):
+    class _Graph:
+        resumed = False
+
+        async def aget_state(self, _config):
+            return _FakeSnapshot(interrupts=())
+
+        async def astream(self, *_args, **_kwargs):
+            self.resumed = True
+            if False:
+                yield None
+
+    model = _bare_model("supervised")
+    model.graph = _Graph()
+    with pytest.raises(RuntimeError, match="exact guarded request is unavailable and the session must be replaced"):
+        _run(model.handle_hitl_resume(response, "thread-1", operator_message=operator_message))
+    assert model.graph.resumed is False
 
 
 def _controller_hitl_model():

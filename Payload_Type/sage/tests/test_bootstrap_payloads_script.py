@@ -26,6 +26,12 @@ run_essos_da = importlib.util.module_from_spec(RUN_ESSOS_SPEC)
 assert RUN_ESSOS_SPEC and RUN_ESSOS_SPEC.loader
 RUN_ESSOS_SPEC.loader.exec_module(run_essos_da)
 
+MCP_CHECK_SCRIPT = Path(__file__).resolve().parents[3] / "skills" / "sage-goad-reset" / "scripts" / "mcp_check.py"
+MCP_CHECK_SPEC = importlib.util.spec_from_file_location("mcp_check", MCP_CHECK_SCRIPT)
+mcp_check = importlib.util.module_from_spec(MCP_CHECK_SPEC)
+assert MCP_CHECK_SPEC and MCP_CHECK_SPEC.loader
+MCP_CHECK_SPEC.loader.exec_module(mcp_check)
+
 
 @pytest.fixture(autouse=True)
 def stub_prepared_sage_chat(monkeypatch):
@@ -347,7 +353,15 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
 
     async def fake_preflight(client, *, timeout_seconds, max_skew_seconds):
         calls.append(("preflight", timeout_seconds, max_skew_seconds))
-        return {"ready": True}
+        return {
+            "ready": True,
+            "preflight_scope": "control-plane-read-only",
+            "payload_tasking_performed": False,
+            "payload_tasks_issued": 0,
+        }
+
+    async def fail_issue_task(*args, **kwargs):
+        raise AssertionError("legacy baked-Apollo bootstrap must remain task-free")
 
     async def fake_query(client, query, variables=None):
         return {
@@ -363,6 +377,7 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fail_create_apollo)
     monkeypatch.setattr(bootstrap_payloads, "post_callback_preflight", fake_preflight)
     monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "issue_task", fail_issue_task)
 
     asyncio.run(
         bootstrap_payloads.command_bootstrap_reset(
@@ -382,6 +397,9 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     ]
     assert output["mode"] == "legacy-imported-baked-apollo"
     assert output["post_callback_preflight"]["ready"] is True
+    assert output["post_callback_preflight"]["preflight_scope"] == "control-plane-read-only"
+    assert output["post_callback_preflight"]["payload_tasking_performed"] is False
+    assert output["post_callback_preflight"]["payload_tasks_issued"] == 0
     assert "apollo" not in output
 
 
@@ -994,11 +1012,15 @@ def test_readiness_delegates_to_shared_contract(monkeypatch):
     async def fake_query(_client, _query):
         return {"consuming_container": [], "apitokens": []}
 
+    async def fail_issue_task(*args, **kwargs):
+        raise AssertionError("readiness must not issue Mythic payload tasks")
+
     monkeypatch.setattr(bootstrap_payloads, "inspect", fake_inspect)
     monkeypatch.setattr(bootstrap_payloads, "assess_callback_liveness", fake_liveness)
     monkeypatch.setattr(bootstrap_payloads, "load_native_chat_module", lambda: _NativeChat)
     monkeypatch.setattr(bootstrap_payloads, "load_readiness_contract_module", lambda: _Contract)
     monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "issue_task", fail_issue_task)
 
     result = asyncio.run(
         bootstrap_payloads.readiness(
@@ -1037,3 +1059,20 @@ def test_command_readiness_returns_nonzero_when_contract_not_ready(monkeypatch, 
 
     assert rc == 1
     assert '"ready": false' in capsys.readouterr().out
+
+
+def test_mcp_check_delegates_to_local_readiness_probe(monkeypatch):
+    captured = {}
+
+    class _Contract:
+        @staticmethod
+        async def probe_bloodhound_mcp_tools(directory=None):
+            captured["directory"] = directory
+            return {"ready": True, "directory": str(directory)}
+
+    monkeypatch.setattr(mcp_check, "_load_readiness_contract", lambda: _Contract)
+
+    result = asyncio.run(mcp_check.collect_status("/tmp/bloodhound_mcp"))
+
+    assert result == {"ready": True, "directory": "/tmp/bloodhound_mcp"}
+    assert captured["directory"] == "/tmp/bloodhound_mcp"

@@ -180,7 +180,7 @@ def _operator_requested_collection(prompt: str) -> bool:
 
 
 def _sharphound_zip_suffix(parameters) -> str:
-    """Return the collector-requested ZIP basename, if the task supplied one."""
+    """Return the collector-requested ZIP filename exactly, if the task supplied one."""
     try:
         if isinstance(parameters, dict):
             text = " ".join(str(value) for value in parameters.values() if value is not None)
@@ -193,9 +193,36 @@ def _sharphound_zip_suffix(parameters) -> str:
         if not match:
             return ""
         value = match.group(1).strip().strip("\"'").rstrip("]},)")
-        return value.replace("\\", "/").rsplit("/", 1)[-1].strip().casefold()
+        return value.strip().casefold()
     except Exception:
         return ""
+
+
+def _collection_zip_basename_matches_token(value: str, token: str) -> bool:
+    """Accept only the contract token's basename, with an optional existing timestamp prefix."""
+    raw = str(value or "").strip()
+    contract_token = str(token or "").strip()
+    if not raw or not contract_token or "/" in raw or "\\" in raw or raw in {".", ".."}:
+        return False
+    return bool(_re_mod.fullmatch(
+        rf"(?:\d{{8,14}}_)?bloodhound_{_re_mod.escape(contract_token)}\.zip",
+        raw,
+        _re_mod.IGNORECASE,
+    ))
+
+
+def _contract_collection_download_binding(path: str, token: str) -> tuple[str, str]:
+    """Return the canonical public path and its exact token-bound ZIP basename."""
+    raw_path = str(path or "").strip().replace("/", "\\")
+    if not raw_path or ".." in raw_path.split("\\"):
+        return "", ""
+    prefix = f"{SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY}\\"
+    if not raw_path.casefold().startswith(prefix.casefold()):
+        return "", ""
+    basename = raw_path[len(prefix):]
+    if "\\" in basename or not _collection_zip_basename_matches_token(basename, token):
+        return "", ""
+    return raw_path, basename
 
 
 def build_sharphound_arguments(
@@ -973,7 +1000,7 @@ def _is_failed_read_output(output: str) -> bool:
 
 
 # HITL: single source of truth for which MythicTools methods are state-changing/offensive and
-# therefore gated in supervised mode. Read-only get_*/list_*/download_file/ensure_tool_uploaded and
+# therefore gated in supervised mode. Read-only get_*/list_*/download_file and
 # the routing/transfer/respond tools are intentionally absent (free). model.py imports this set to
 # build the HumanInTheLoopMiddleware interrupt_on map. Note: file_upload is a BloodHound MCP tool
 # (not a MythicTools method) — included by name so supervised mode also gates it if/when connected.
@@ -982,9 +1009,11 @@ GUARDED_TOOLS: set[str] = {
     "upload_file_by_file_uuid",
     "materialize_capability_inputs",
     "execute_capability",
+    "collect_graph",
     "create_payload",
     "delete_payload",
     "download_tool",
+    "ensure_tool_uploaded",
     "ingest_collection",
     "sandbox_exec",
     "file_upload",
@@ -1005,11 +1034,13 @@ SCOPE_REQUIREMENTS: dict[str, str] = {
     "upload_file_by_file_uuid": "callback.write",
     "materialize_capability_inputs": "callback.write",
     "execute_capability": "callback.write",
+    "collect_graph": "callback.write",
     "ingest_collection": "callback.write",
     "sandbox_exec": "callback.write",
     "create_payload": "payload.write",
     "delete_payload": "payload.write",
     "download_tool": "file.write",
+    "ensure_tool_uploaded": "file.write",
     "file_upload": "file.write",
     "add_credential": "credential.write",
 }
@@ -1102,6 +1133,8 @@ class MythicTools:
         self._preauth_client = preauth_client
         self.client = None
         self._execution_observer = None
+        self._turn_authority = None
+        self._turn_authority_sink_reservation = ""
         # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
         self.disabled_tools: set[str] = set()
@@ -1294,6 +1327,100 @@ class MythicTools:
         """Install the request-scoped observer for accepted Mythic callback tasks."""
         self._execution_observer = observer if callable(observer) else None
 
+    def set_turn_authority(self, authority) -> None:
+        """Install the immutable authority contract for the current real operator turn."""
+        prior_turn_id = str(getattr(self._turn_authority, "turn_id", "") or "")
+        next_turn_id = str(getattr(authority, "turn_id", "") or "")
+        if next_turn_id != prior_turn_id:
+            self._turn_authority_sink_reservation = ""
+        self._turn_authority = authority
+
+    def _turn_authority_issue_blocker(
+        self,
+        command: str,
+        callback_display_id: Any,
+        *,
+        parameters: Any = None,
+        token_id: Any = None,
+        visibility_context: dict | None = None,
+        recheck: bool = False,
+    ) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        context = dict(visibility_context or _task_visibility_context.get() or {})
+        # The final normalized parameters are authoritative. Never let an earlier visibility
+        # context shadow them with a benign value while a different task payload is issued.
+        context["parameters"] = parameters
+        context["token_id"] = token_id
+        try:
+            allowed, reason = authority.allows_mythic_issue(
+                command=command,
+                callback_display_id=callback_display_id,
+                context=context,
+            )
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        if allowed:
+            # The middleware reserves before awaiting, but keep the final sink independently
+            # single-flight for direct callers and any future middleware bypass. Rechecks inside
+            # this same issue operation (including credential-repaired parameters) reuse the
+            # reservation; a second top-level issue in the turn is denied.
+            if (
+                not recheck
+                and getattr(authority, "bounded_family", "") == "issue_task_and_waitfor_task_output"
+                and int(getattr(authority, "attempt_limit", 0) or 0) > 0
+            ):
+                turn_id = str(getattr(authority, "turn_id", "") or "")
+                if not turn_id or self._turn_authority_sink_reservation == turn_id:
+                    return "STOP — turn authority denied Mythic task issue: bounded task issue already reserved"
+                self._turn_authority_sink_reservation = turn_id
+            return ""
+        return f"STOP — turn authority denied Mythic task issue: {reason}"
+
+    def _turn_authority_guarded_tool_blocker(self, tool_name: str, args: dict[str, Any]) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        try:
+            if getattr(authority, "enforces_objective_tool_allowlist", False):
+                allowed, reason = authority.allows_model_tool(
+                    tool_name,
+                    args,
+                    progress=self.contract_progress_snapshot(),
+                )
+            else:
+                allowed, reason = authority.allows_guarded_tool(tool_name, args)
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        return "" if allowed else f"STOP — turn authority denied guarded action: {reason}"
+
+    def _turn_authority_ingest_resolution_blocker(
+        self,
+        args: dict[str, Any],
+        *,
+        source_metadata: Any,
+    ) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        try:
+            contract = getattr(authority, "objective_contract", None)
+            if contract is not None and getattr(contract, "requires_collection_scope", False):
+                allowed = contract.allows_resolved_ingest(
+                    args,
+                    source_metadata=source_metadata,
+                )
+                reason = "" if allowed else contract.denial_reason("ingest_collection")
+            else:
+                allowed, reason = authority.allows_resolved_ingest(
+                    args,
+                    source_metadata=source_metadata,
+                )
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        return "" if allowed else f"STOP — turn authority denied collection ingest: {reason}"
+
     async def _notify_execution_observer(self, event: dict) -> None:
         observer = getattr(self, "_execution_observer", None)
         if observer is None:
@@ -1352,22 +1479,456 @@ class MythicTools:
         except Exception as exc:
             logger.debug(f"capability command observer failed (non-fatal): {exc}")
 
-    def begin_operator_turn(self, prompt: str) -> None:
+    def begin_operator_turn(self, prompt: str, *, objective_contract: Any = None) -> None:
         """Reset per-turn operator intent and arm one fresh collection transaction when explicitly requested."""
         self._operator_collection_request = None
-        if not _operator_requested_collection(prompt):
+        contract_collection = bool(
+            objective_contract is not None
+            and getattr(objective_contract, "requires_collection_scope", False)
+        )
+        if not contract_collection and not _operator_requested_collection(prompt):
             return
+        profile = getattr(objective_contract, "collection_profile", None) if contract_collection else None
+        contract_token = str(getattr(objective_contract, "collection_token", "") or "").strip()
+        contract_callback = str(getattr(objective_contract, "resolved_callback_id", "") or "").strip()
+        authority = getattr(self, "_turn_authority", None)
+        turn_id = str(getattr(authority, "turn_id", "") or "")
+        required_outcomes = tuple(getattr(objective_contract, "required_outcomes", ()) or ())
         self._operator_collection_request = {
             "requested": True,
+            "turn_id": turn_id,
             "prompt_preview": str(prompt or "")[:300],
+            "intent_source": "objective_contract" if contract_collection else "operator_prompt",
+            "contract_bound": contract_collection,
+            "contract_token": contract_token,
+            "collector_attempt_reserved": False,
+            "collector_attempt_state": "available",
+            "reserved_callback_id": "",
+            "reserved_command": "",
+            "reserved_zip_suffix": "",
             "authorized_key": "",
             "launched_key": "",
             "launched_task_id": "",
-            "callback_id": "",
-            "expected_zip_suffix": "",
+            "launched_command": "",
+            "callback_id": contract_callback,
+            "expected_zip_suffix": f"bloodhound_{contract_token}.zip" if contract_token else "",
+            "expected_runner_command": str(getattr(profile, "runner_command", "") or ""),
+            "expected_download_command": str(getattr(profile, "download_command", "") or ""),
             "completed": False,
+            "progress": {
+                "required_outcomes": required_outcomes,
+                "achieved_outcomes": [],
+            },
+            "transaction": {
+                "collector": {
+                    "reserved": False,
+                    "command": str(getattr(profile, "runner_command", "") or ""),
+                    "callback_id": contract_callback,
+                    "parameters": "",
+                    "zip_filename": "",
+                    "authorized_key": "",
+                    "task_id": "",
+                    "terminal_success": False,
+                    "terminal_status": "",
+                },
+                "download": {
+                    "reserved": False,
+                    "command": str(getattr(profile, "download_command", "") or ""),
+                    "callback_id": contract_callback,
+                    "parameters": "",
+                    "path": "",
+                    "filename": "",
+                    "task_id": "",
+                    "terminal_success": False,
+                    "terminal_status": "",
+                },
+                "ingest": {
+                    "reserved": False,
+                },
+                "credential_report": {
+                    "reserved": False,
+                },
+            },
         }
         logger.info("🧭 [operator-collection] explicit collection request armed for this user turn")
+
+    def _active_contract_collection_request(self) -> dict | None:
+        request = getattr(self, "_operator_collection_request", None)
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            isinstance(request, dict)
+            and request.get("contract_bound") is True
+            and contract is not None
+            and getattr(contract, "requires_collection_scope", False)
+            and str(request.get("turn_id") or "") == str(getattr(authority, "turn_id", "") or "")
+            and str(request.get("contract_token") or "") == str(getattr(contract, "collection_token", "") or "")
+        ):
+            return None
+        return request
+
+    @staticmethod
+    def _contract_terminal_state(kind: str, reason: str) -> dict[str, str]:
+        return {
+            "kind": str(kind or "").strip(),
+            "reason": str(reason or "").strip(),
+        }
+
+    def _contract_progress_terminal_state(
+        self,
+        request: dict | None,
+        contract: Any,
+        achieved: list[str],
+    ) -> dict[str, str] | None:
+        if (
+            contract is not None
+            and getattr(contract, "requires_collection_scope", False)
+            and not getattr(contract, "collection_scope_resolved", False)
+        ):
+            return self._contract_terminal_state(
+                "unresolved_scope",
+                str(
+                    getattr(contract, "scope_resolution_reason", "")
+                    or "collection scope could not be resolved"
+                ),
+            )
+        if request is None:
+            return None
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return None
+        for stage in ("collector", "download"):
+            record = transaction.get(stage)
+            if not isinstance(record, dict) or record.get("reserved") is not True:
+                continue
+            task_id = str(record.get("task_id") or "").strip()
+            if not task_id:
+                return self._contract_terminal_state(
+                    f"{stage}_no_task",
+                    f"{stage} attempt returned without creating a Mythic task",
+                )
+            status = str(record.get("terminal_status") or "").strip().casefold()
+            if (
+                record.get("terminal_success") is not True
+                and status
+                and status not in {"created", "completed"}
+            ):
+                return self._contract_terminal_state(
+                    f"{stage}_failed",
+                    f"{stage} task {task_id} ended with terminal status {status}",
+                )
+        ingest = transaction.get("ingest")
+        if (
+            isinstance(ingest, dict)
+            and ingest.get("reserved") is True
+            and "graph_ingested" not in achieved
+        ):
+            return self._contract_terminal_state(
+                "ingest_unresolved",
+                "ingest attempt returned without a verified graph outcome",
+            )
+        credential_report = transaction.get("credential_report")
+        if (
+            isinstance(credential_report, dict)
+            and credential_report.get("reserved") is True
+            and "credentials_reported" not in achieved
+        ):
+            return self._contract_terminal_state(
+                "credential_report_unresolved",
+                "credential report returned without a credential outcome",
+            )
+        return None
+
+    def contract_progress_snapshot(self) -> dict[str, Any]:
+        request = self._active_contract_collection_request()
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        required = list(getattr(contract, "required_outcomes", ()) or ())
+        achieved = []
+        if request is not None:
+            progress = request.get("progress") if isinstance(request.get("progress"), dict) else {}
+            achieved_set = {
+                str(item or "").strip()
+                for item in progress.get("achieved_outcomes", [])
+                if str(item or "").strip()
+            }
+            achieved = [outcome for outcome in required if outcome in achieved_set]
+        next_outcome = next((outcome for outcome in required if outcome not in achieved), "")
+        return {
+            "required_outcomes": required,
+            "achieved_outcomes": achieved,
+            "next_outcome": next_outcome,
+            "objective_complete": bool(required and len(achieved) == len(required)),
+            "terminal_state": self._contract_progress_terminal_state(
+                request,
+                contract,
+                achieved,
+            ),
+        }
+
+    def _mark_contract_outcome(self, outcome: str) -> bool:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return False
+        snapshot = self.contract_progress_snapshot()
+        normalized = str(outcome or "").strip()
+        if not normalized or snapshot.get("next_outcome") != normalized:
+            return False
+        progress = request.get("progress")
+        progress["achieved_outcomes"].append(normalized)
+        if self.contract_progress_snapshot()["objective_complete"]:
+            request["completed"] = True
+        return True
+
+    def _contract_next_action(self, default: str) -> str:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return default
+        snapshot = self.contract_progress_snapshot()
+        if snapshot["objective_complete"]:
+            return "The bounded objective is complete. Report the verified result to the operator and stop."
+        if snapshot["next_outcome"] == "credentials_reported":
+            return (
+                "Read the Mythic credential store exactly once, report the result (including an empty store), "
+                "then stop."
+            )
+        return "Report the bounded objective blocker to the operator and stop."
+
+    def _contract_ingest_preflight_blocker(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        if request is None:
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        transaction = request.get("transaction") or {}
+        collector = transaction.get("collector") or {}
+        download = transaction.get("download") or {}
+        if collector.get("terminal_success") is not True:
+            return "STOP — contract-bound collection denied: collector terminal success is required before ingest"
+        if download.get("terminal_success") is not True:
+            return "STOP — contract-bound collection denied: download terminal success is required before ingest"
+        collector_task_id = str(collector.get("task_id") or "")
+        download_task_id = str(download.get("task_id") or "")
+        if not collector_task_id or not download_task_id or collector_task_id == download_task_id:
+            return "STOP — contract-bound collection denied: collector/download task identities are invalid"
+        return ""
+
+    def _reserve_contract_ingest_attempt(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        transaction = request.get("transaction") if isinstance(request, dict) else None
+        ingest = transaction.get("ingest") if isinstance(transaction, dict) else None
+        if not isinstance(ingest, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        if self.contract_progress_snapshot().get("next_outcome") != "graph_ingested":
+            return "STOP — contract-bound collection denied: graph ingest is not the next contract outcome"
+        if ingest.get("reserved") is True:
+            return "STOP — contract-bound collection denied: ingest attempt already reserved for this operator turn"
+        ingest["reserved"] = True
+        return ""
+
+    def _reserve_contract_credential_report(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        transaction = request.get("transaction") if isinstance(request, dict) else None
+        report = transaction.get("credential_report") if isinstance(transaction, dict) else None
+        if not isinstance(report, dict):
+            return "STOP — contract-bound credential report denied: current-turn transaction is unavailable"
+        if self.contract_progress_snapshot().get("next_outcome") != "credentials_reported":
+            return "STOP — contract-bound credential report denied: credentials are not the next contract outcome"
+        if report.get("reserved") is True:
+            return "STOP — contract-bound credential report denied: credential report already reserved for this operator turn"
+        report["reserved"] = True
+        return ""
+
+    def _contract_collection_ingest_blocker(
+        self,
+        args: dict[str, Any],
+        source_metadata: Any,
+    ) -> str:
+        preflight = self._contract_ingest_preflight_blocker()
+        if preflight:
+            return preflight
+        request = self._active_contract_collection_request()
+        if request is None:
+            return ""
+        static_blocker = self._turn_authority_ingest_resolution_blocker(
+            args,
+            source_metadata=source_metadata,
+        )
+        if static_blocker:
+            return static_blocker
+        source = source_metadata if isinstance(source_metadata, dict) else {}
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        transaction = request.get("transaction") or {}
+        collector = transaction.get("collector") or {}
+        download = transaction.get("download") or {}
+        source_task_id = str(task.get("display_id") or "")
+        source_callback_id = str(callback.get("display_id") or "")
+        source_filename = str(source.get("filename_utf8") or "")
+        collector_filename = str(collector.get("zip_filename") or "").strip().casefold()
+        contract_token = str(request.get("contract_token") or "")
+        recorded_path, recorded_filename = _contract_collection_download_binding(
+            str(download.get("path") or ""),
+            contract_token,
+        )
+        bound_filename = str(download.get("filename") or "")
+        if source_task_id != str(download.get("task_id") or ""):
+            return "STOP — contract-bound collection denied: filemeta is not from the current-turn download task"
+        if source_callback_id != str(download.get("callback_id") or ""):
+            return "STOP — contract-bound collection denied: filemeta callback does not match the download"
+        if _normalize_command_name(task.get("command_name")) != _normalize_command_name(download.get("command")):
+            return "STOP — contract-bound collection denied: filemeta command does not match the download"
+        if not _collection_zip_basename_matches_token(collector_filename, contract_token):
+            return "STOP — contract-bound collection denied: recorded collector filename is invalid"
+        if (
+            not recorded_path
+            or not recorded_filename
+            or recorded_filename != bound_filename
+        ):
+            return "STOP — contract-bound collection denied: recorded download artifact binding is invalid"
+        if source_filename != bound_filename:
+            return "STOP — contract-bound collection denied: filemeta filename does not match the current-turn download"
+        caller_filename = (
+            str(args.get("file_name") or "")
+            if isinstance(args, dict)
+            else ""
+        )
+        if caller_filename.strip() and caller_filename != bound_filename:
+            return "STOP — contract-bound collection denied: caller filename alias does not match the current-turn download"
+        return ""
+
+    @staticmethod
+    def _canonical_contract_parameters(parameters: Any) -> str:
+        value = parameters
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    decoded = json.loads(stripped)
+                    if isinstance(decoded, dict):
+                        value = decoded
+                except Exception:
+                    pass
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _contract_single_parameter(parameters: Any, expected_key: str) -> str:
+        value = parameters
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return ""
+        if not isinstance(value, dict) or len(value) != 1:
+            return ""
+        key, candidate = next(iter(value.items()))
+        if str(key or "").strip().casefold().replace("-", "_") != str(expected_key).casefold().replace("-", "_"):
+            return ""
+        return str(candidate or "").strip().strip("\"'")
+
+    def _reserve_contract_collection_attempt(
+        self,
+        command,
+        callback_display_id,
+        parameters,
+        token_id,
+    ) -> str:
+        """Synchronously reserve this turn's exact contract-bound collector attempt."""
+        request = self._active_contract_collection_request()
+        if request is None:
+            authority = getattr(self, "_turn_authority", None)
+            contract = getattr(authority, "objective_contract", None)
+            if (
+                getattr(authority, "enforces_objective_tool_allowlist", False)
+                and getattr(contract, "requires_collection_scope", False)
+            ):
+                return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+            return ""
+        transaction = request.get("transaction")
+        collector = transaction.get("collector") if isinstance(transaction, dict) else None
+        download = transaction.get("download") if isinstance(transaction, dict) else None
+        if not isinstance(collector, dict) or not isinstance(download, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        expected_runner = str(request.get("expected_runner_command") or "")
+        expected_download = str(request.get("expected_download_command") or "")
+        normalized_command = _normalize_command_name(command)
+        if normalized_command not in {
+            _normalize_command_name(expected_runner),
+            _normalize_command_name(expected_download),
+            _normalize_command_name(getattr(getattr(self._turn_authority, "objective_contract", None).collection_profile, "ls_command", "")),
+        }:
+            return ""
+        callback_id = str(callback_display_id or "")
+        expected_callback = str(request.get("callback_id") or "")
+        if token_id is not None or not expected_callback or callback_id != expected_callback:
+            return "STOP — contract-bound collection denied: task does not match the bound callback/token"
+        if normalized_command != _normalize_command_name(expected_runner):
+            if collector.get("terminal_success") is not True:
+                return "STOP — contract-bound collection denied: collector has not reached terminal success"
+            if normalized_command != _normalize_command_name(expected_download):
+                return ""
+            profile = getattr(getattr(self._turn_authority, "objective_contract", None), "collection_profile", None)
+            path = self._contract_single_parameter(parameters, getattr(profile, "download_path_param", ""))
+            bound_path, bound_filename = _contract_collection_download_binding(
+                path,
+                str(request.get("contract_token") or ""),
+            )
+            if not bound_path or not bound_filename:
+                return "STOP — contract-bound collection denied: download path is not a canonical current-turn artifact"
+            if download.get("reserved") is True:
+                return "STOP — contract-bound collection denied: download attempt already reserved for this operator turn"
+            download.update({
+                "reserved": True,
+                "command": str(command or ""),
+                "callback_id": callback_id,
+                "parameters": self._canonical_contract_parameters(parameters),
+                "path": bound_path,
+                "filename": bound_filename,
+            })
+            return ""
+        suffix = _sharphound_zip_suffix(parameters)
+        contract_token = str(request.get("contract_token") or "")
+        if (
+            not _collection_zip_basename_matches_token(suffix, contract_token)
+        ):
+            return "STOP — contract-bound collection denied: collector task does not match the bound callback/token"
+        if collector.get("reserved") is True:
+            return "STOP — contract-bound collection denied: collector attempt already reserved for this operator turn"
+        collector.update({
+            "reserved": True,
+            "command": str(command or ""),
+            "callback_id": callback_id,
+            "parameters": self._canonical_contract_parameters(parameters),
+            "zip_filename": suffix,
+        })
+        request["collector_attempt_reserved"] = True
+        request["collector_attempt_state"] = "reserved"
+        request["reserved_callback_id"] = callback_id
+        request["reserved_command"] = str(command or "")
+        request["reserved_zip_suffix"] = suffix
+        request["expected_zip_suffix"] = suffix
+        return ""
 
     def _operator_collection_override_available(self) -> bool:
         request = getattr(self, "_operator_collection_request", None)
@@ -1381,23 +1942,67 @@ class MythicTools:
         request = getattr(self, "_operator_collection_request", None)
         if not self._operator_collection_override_available() or not isinstance(request, dict):
             return
+        callback_id = str(callback_display_id or "")
+        expected_callback = str(request.get("callback_id") or "")
+        suffix = _sharphound_zip_suffix(parameters)
+        expected_suffix = str(request.get("expected_zip_suffix") or "")
+        if request.get("contract_bound") is True:
+            active_request = self._active_contract_collection_request()
+            if active_request is None:
+                return
+            collector = ((active_request.get("transaction") or {}).get("collector") or {})
+            if expected_callback and callback_id != expected_callback:
+                return
+            if not _collection_zip_basename_matches_token(
+                suffix,
+                str(request.get("contract_token") or ""),
+            ):
+                return
+            reserved_suffix = str(collector.get("zip_filename") or "")
+            if reserved_suffix and suffix.casefold() != reserved_suffix.casefold():
+                return
+            collector["authorized_key"] = str(collection_key or "")
         request["authorized_key"] = str(collection_key or "")
-        request["callback_id"] = str(callback_display_id or "")
-        request["expected_zip_suffix"] = _sharphound_zip_suffix(parameters)
+        request["callback_id"] = callback_id
+        request["expected_zip_suffix"] = suffix or expected_suffix
 
-    def _mark_operator_collection_launched(self, key: str, task_display_id, callback_display_id, parameters) -> None:
+    def _mark_operator_collection_launched(
+        self,
+        key: str,
+        task_display_id,
+        callback_display_id,
+        command,
+        parameters,
+    ) -> None:
         request = getattr(self, "_operator_collection_request", None)
         if not isinstance(request, dict) or request.get("requested") is not True:
             return
         authorized_key = str(request.get("authorized_key") or "")
+        if request.get("contract_bound") is True and not authorized_key:
+            active_request = self._active_contract_collection_request()
+            collector = (((active_request or {}).get("transaction") or {}).get("collector") or {})
+            authorized_key = str(collector.get("authorized_key") or "")
+            if not authorized_key:
+                return
         if authorized_key and authorized_key != str(key or ""):
+            return
+        expected_callback = str(request.get("callback_id") or "")
+        if expected_callback and expected_callback != str(callback_display_id or ""):
+            return
+        expected_runner = str(request.get("expected_runner_command") or "")
+        if expected_runner and _normalize_command_name(expected_runner) != _normalize_command_name(command):
+            return
+        expected_suffix = str(request.get("expected_zip_suffix") or "")
+        actual_suffix = _sharphound_zip_suffix(parameters)
+        if expected_suffix and actual_suffix.casefold() != expected_suffix.casefold():
             return
         request["launched_key"] = str(key or "")
         request["launched_task_id"] = str(task_display_id or "")
+        request["launched_command"] = str(command or "")
+        request["collector_attempt_state"] = "task_backed"
         request["callback_id"] = str(callback_display_id or "")
         request["expected_zip_suffix"] = (
-            _sharphound_zip_suffix(parameters)
-            or str(request.get("expected_zip_suffix") or "")
+            actual_suffix or expected_suffix
         )
         logger.info(
             "🧭 [operator-collection] fresh collector launched key=%s task=%s callback=%s",
@@ -1409,7 +2014,10 @@ class MythicTools:
     def _complete_operator_collection_request(self) -> None:
         request = getattr(self, "_operator_collection_request", None)
         if isinstance(request, dict) and request.get("requested") is True:
-            request["completed"] = True
+            if request.get("contract_bound") is True:
+                request["completed"] = self.contract_progress_snapshot()["objective_complete"]
+            else:
+                request["completed"] = True
 
     def _operator_collection_ingest_blocker(
         self,
@@ -1420,6 +2028,8 @@ class MythicTools:
         """Require an explicit operator recollection request to consume the fresh artifact it launched."""
         request = getattr(self, "_operator_collection_request", None)
         if not self._operator_collection_override_available() or not isinstance(request, dict):
+            return None
+        if request.get("contract_bound") is True:
             return None
         task_id = str(request.get("launched_task_id") or "").strip()
         if not task_id:
@@ -3000,7 +3610,26 @@ class MythicTools:
         string using each parameter's cli_name (e.g. -path /etc/issue). token_id impersonates a tracked
         Windows token; timeout is in seconds.
         """
+        authority_blocker = self._turn_authority_issue_blocker(
+            command,
+            callback_display_id,
+            parameters=parameters,
+            token_id=token_id,
+            visibility_context=visibility_context,
+            recheck=True,
+        )
+        if authority_blocker:
+            self._pending_task_backed_transition = None
+            return authority_blocker
         self._pending_task_backed_transition = None
+        collection_reservation_blocker = self._reserve_contract_collection_attempt(
+            command,
+            callback_display_id,
+            parameters,
+            token_id,
+        )
+        if collection_reservation_blocker:
+            return collection_reservation_blocker
         # Deterministically normalize a dcsync target /user to NETBIOS\sAMAccountName (NORTH\krbtgt) no matter
         # how the agent built the command — the bare/FQDN/DN forms cause CrackNames ERROR_NOT_UNIQUE / BAD_DN.
         try:
@@ -3215,6 +3844,16 @@ class MythicTools:
             )
 
         _fp = await self._action_footprint(command, parameters, callback_display_id)
+        authority_blocker = self._turn_authority_issue_blocker(
+            command,
+            callback_display_id,
+            parameters=parameters,
+            token_id=token_id,
+            visibility_context=visibility_context,
+        )
+        if authority_blocker:
+            self._pending_task_backed_transition = None
+            return authority_blocker
         self._ledger_record(command, callback_display_id, parameters, _fp)
 
         try:
@@ -3236,6 +3875,23 @@ class MythicTools:
 
                 async def _issue_and_wait():
                     nonlocal parameters
+                    authority_blocker = self._turn_authority_issue_blocker(
+                        command,
+                        callback_display_id,
+                        parameters=parameters,
+                        token_id=token_id,
+                        visibility_context=visibility_context,
+                        recheck=True,
+                    )
+                    if authority_blocker:
+                        raise PermissionError(authority_blocker)
+                    contract_binding_blocker = self._bind_contract_task_issue_parameters(
+                        command,
+                        parameters,
+                        callback_display_id,
+                    )
+                    if contract_binding_blocker:
+                        raise PermissionError(contract_binding_blocker)
                     try:
                         task = await mythic.issue_task(
                             mythic=self.client, command_name=command, parameters=parameters,
@@ -3258,6 +3914,23 @@ class MythicTools:
                         if repaired == parameters:
                             raise
                         parameters = repaired
+                        authority_blocker = self._turn_authority_issue_blocker(
+                            command,
+                            callback_display_id,
+                            parameters=parameters,
+                            token_id=token_id,
+                            visibility_context=visibility_context,
+                            recheck=True,
+                        )
+                        if authority_blocker:
+                            raise PermissionError(authority_blocker)
+                        contract_binding_blocker = self._bind_contract_task_issue_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                        )
+                        if contract_binding_blocker:
+                            raise PermissionError(contract_binding_blocker)
                         task = await mythic.issue_task(
                             mythic=self.client, command_name=command, parameters=parameters,
                             callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
@@ -3298,6 +3971,14 @@ class MythicTools:
                             mythic=self.client, task_display_id=tdid, timeout=timeout,
                         )
                     except BaseException as exc:
+                        self._record_contract_task_terminal(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            tdid,
+                            success=False,
+                            status="wait_failed",
+                        )
                         await self._notify_execution_observer(
                             {
                                 **base_event,
@@ -3309,11 +3990,19 @@ class MythicTools:
                         )
                         raise
                     result_text = _task_output_text(result)
-                    result_class = command_builder.classify_result(command, result_text)
+                    result_class = command_builder.classify_result(command, result_text, parameters=parameters)
                     self._last_issued_task_terminal_status = (
                         "completed"
                         if result_class == command_builder.ResultClass.SUCCESS.value
                         else "failed"
+                    )
+                    self._record_contract_task_terminal(
+                        command,
+                        parameters,
+                        callback_display_id,
+                        tdid,
+                        success=result_class == command_builder.ResultClass.SUCCESS.value,
+                        status=self._last_issued_task_terminal_status,
                     )
                     await self._notify_execution_observer({
                         **base_event,
@@ -3401,7 +4090,7 @@ class MythicTools:
             )
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
-            result_class = command_builder.classify_result(command, results_str)
+            result_class = command_builder.classify_result(command, results_str, parameters=parameters)
             decision = self._apply_task_result_class(fail_key, result_class)
             # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
             # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag
@@ -3743,6 +4432,27 @@ class MythicTools:
                 self._persist_autonomous_objective_seed(seed)
             return seed
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
+
+    def operator_objective_binding(self) -> str:
+        """Return the exact current operator-set objective, or fail closed.
+
+        Stored-objective start phrases are execution-authority requests, so they must bind to the
+        operation-resolved ledger on disk rather than a cached objective or an autonomous seed. A
+        missing key, unreadable ledger, legacy provenance, or any source other than ``operator``
+        returns an empty binding and cannot start the controller.
+        """
+        if self._engagement_key is None:
+            return ""
+        try:
+            with open(self._engagement_ledger_path(), "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        if str(payload.get("objective_source") or "").strip().casefold() != "operator":
+            return ""
+        return self._human_engagement_objective(payload.get("objective"))
 
     def _persist_autonomous_objective_seed(self, text: str) -> None:
         """Write an adopted autonomous objective to the durable ledger ONCE, under the now-resolved key.
@@ -4122,15 +4832,32 @@ class MythicTools:
         The invariant is simple: classifier/gate decisions can stage intent, but operational state is committed
         only when Mythic returns a concrete task display_id for the command that will produce the effect.
         """
+        self._record_contract_task_created(
+            command,
+            parameters,
+            callback_display_id,
+            task_display_id,
+        )
         pending = getattr(self, "_pending_task_backed_transition", None)
         self._pending_task_backed_transition = None
+        callback_id = str(callback_display_id or "")
+        request = getattr(self, "_operator_collection_request", None)
+        if isinstance(request, dict) and request.get("contract_bound") is True:
+            pending = self._reserved_contract_collection_transition(
+                command,
+                parameters,
+                callback_display_id,
+            )
+        elif not (
+            isinstance(pending, dict)
+            and str(pending.get("kind") or "") == "collect-graph"
+            and str(pending.get("callback_id") or "") == callback_id
+            and str(pending.get("key") or "")
+        ):
+            return
         if not pending:
             return
-        if str(pending.get("callback_id") or "") != str(callback_display_id or ""):
-            return
         key = str(pending.get("key") or "")
-        if not key:
-            return
         if str(pending.get("kind") or "") == "collect-graph":
             self._collection_in_flight[key] = {
                 "kind": "collect-graph",
@@ -4141,13 +4868,173 @@ class MythicTools:
                 "parameters_preview": str(parameters)[:300],
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
-            self._mark_operator_collection_launched(key, task_display_id, callback_display_id, parameters)
+            self._mark_operator_collection_launched(
+                key,
+                task_display_id,
+                callback_display_id,
+                command,
+                parameters,
+            )
             logger.info(
                 "🧭 [task-backed-transition] collect-graph in-flight key=%s task=%s callback=%s",
                 key,
                 task_display_id,
                 callback_display_id,
             )
+
+    def _reserved_contract_collection_transition(
+        self,
+        command,
+        parameters,
+        callback_display_id: int | str,
+    ) -> dict | None:
+        """Recover a collector transition only from its exact authorized typed reservation."""
+        request = self._active_contract_collection_request()
+        if request is None:
+            return None
+        collector = (((request.get("transaction") or {}).get("collector") or {}))
+        callback_id = str(callback_display_id or "")
+        actual_suffix = _sharphound_zip_suffix(parameters)
+        expected_runner = str(request.get("expected_runner_command") or "")
+        reserved_command = str(collector.get("command") or "")
+        reserved_suffix = str(collector.get("zip_filename") or "")
+        authorized_key = str(collector.get("authorized_key") or "")
+        if not (
+            collector.get("reserved") is True
+            and authorized_key
+            and callback_id == str(collector.get("callback_id") or "")
+            and callback_id == str(request.get("callback_id") or "")
+            and _normalize_command_name(command) == _normalize_command_name(expected_runner)
+            and _normalize_command_name(command) == _normalize_command_name(reserved_command)
+            and actual_suffix
+            and actual_suffix.casefold() == reserved_suffix.casefold()
+            and _collection_zip_basename_matches_token(
+                actual_suffix,
+                str(request.get("contract_token") or ""),
+            )
+        ):
+            return None
+        return {
+            "kind": "collect-graph",
+            "key": authorized_key,
+            "callback_id": callback_id,
+        }
+
+    def _contract_task_record(self, command, parameters, callback_display_id) -> dict | None:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return None
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return None
+        callback_id = str(callback_display_id or "")
+        normalized = _normalize_command_name(command)
+        for name in ("collector", "download"):
+            record = transaction.get(name)
+            if not isinstance(record, dict) or record.get("reserved") is not True:
+                continue
+            if (
+                normalized == _normalize_command_name(record.get("command"))
+                and callback_id == str(record.get("callback_id") or "")
+                and self._canonical_contract_parameters(parameters) == str(record.get("parameters") or "")
+            ):
+                return record
+        return None
+
+    def _record_contract_task_created(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+        task_display_id,
+    ) -> None:
+        record = self._contract_task_record(command, parameters, callback_display_id)
+        task_id = str(task_display_id or "").strip()
+        if record is None or not task_id or record.get("task_id"):
+            return
+        record["task_id"] = task_id
+        record["terminal_success"] = False
+        record["terminal_status"] = "created"
+
+    def _bind_contract_task_issue_parameters(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+    ) -> str:
+        """Bind a reserved collection step to the final authority-checked issue bytes."""
+        request = self._active_contract_collection_request()
+        if request is None:
+            return ""
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        callback_id = str(callback_display_id or "")
+        normalized_command = _normalize_command_name(command)
+        candidates = []
+        for name in ("collector", "download"):
+            record = transaction.get(name)
+            if (
+                isinstance(record, dict)
+                and record.get("reserved") is True
+                and not record.get("task_id")
+                and normalized_command == _normalize_command_name(record.get("command"))
+                and callback_id == str(record.get("callback_id") or "")
+            ):
+                candidates.append(record)
+        if not candidates:
+            if normalized_command in {
+                _normalize_command_name(request.get("expected_runner_command")),
+                _normalize_command_name(request.get("expected_download_command")),
+            }:
+                return "STOP — contract-bound collection denied: exact reserved task step is unavailable"
+            return ""
+        if len(candidates) != 1:
+            return "STOP — contract-bound collection denied: reserved task identity is ambiguous"
+        record = candidates[0]
+        if record is transaction.get("collector"):
+            suffix = _sharphound_zip_suffix(parameters)
+            if not suffix or suffix.casefold() != str(record.get("zip_filename") or "").casefold():
+                return "STOP — contract-bound collection denied: final collector bytes changed the reserved artifact"
+        else:
+            authority = getattr(self, "_turn_authority", None)
+            profile = getattr(getattr(authority, "objective_contract", None), "collection_profile", None)
+            path = self._contract_single_parameter(
+                parameters,
+                getattr(profile, "download_path_param", ""),
+            )
+            bound_path, bound_filename = _contract_collection_download_binding(
+                path,
+                str(request.get("contract_token") or ""),
+            )
+            if (
+                not bound_path
+                or not bound_filename
+                or bound_path.casefold()
+                != str(record.get("path") or "").casefold().replace("/", "\\")
+                or bound_filename.casefold()
+                != str(record.get("filename") or "").casefold()
+            ):
+                return "STOP — contract-bound collection denied: final download bytes changed the reserved path"
+        record["parameters"] = self._canonical_contract_parameters(parameters)
+        return ""
+
+    def _record_contract_task_terminal(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+        task_display_id,
+        *,
+        success: bool,
+        status: str,
+    ) -> None:
+        record = self._contract_task_record(command, parameters, callback_display_id)
+        task_id = str(task_display_id or "").strip()
+        if record is None or not task_id or str(record.get("task_id") or "") != task_id:
+            return
+        record["terminal_success"] = success is True
+        record["terminal_status"] = str(status or ("completed" if success else "failed"))
 
     async def _collection_in_flight_blocker(self, access_key: str) -> str | None:
         """Return a collect-graph SKIP message only when the marker is backed by a real Mythic task.
@@ -14153,6 +15040,7 @@ class MythicTools:
                     complete
                     deleted
                     is_payload
+                    is_download_from_agent
                     filename_utf8
                     chunks_received
                     total_chunks
@@ -14196,6 +15084,9 @@ class MythicTools:
                 agent_file_id
                 filename_utf8
                 timestamp
+                complete
+                deleted
+                is_download_from_agent
                 task {
                     display_id
                     command_name
@@ -14332,9 +15223,45 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ingest_collection (file_uuid={file_uuid!r}, callback={callback_display_id})")
+        authority_ingest_args = {
+            "file_uuid": file_uuid,
+            "callback_display_id": callback_display_id,
+            "file_name": file_name,
+            "name_contains": name_contains,
+            "collection_scope_domain": collection_scope_domain,
+        }
+        authority_blocker = self._turn_authority_guarded_tool_blocker(
+            "ingest_collection",
+            authority_ingest_args,
+        )
+        if authority_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": authority_blocker,
+            }, sort_keys=True)
+        transaction_blocker = self._contract_ingest_preflight_blocker()
+        if transaction_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": transaction_blocker,
+            }, sort_keys=True)
+        ingest_reservation_blocker = self._reserve_contract_ingest_attempt()
+        if ingest_reservation_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": ingest_reservation_blocker,
+            }, sort_keys=True)
         source_filename = ""
+        source_metadata: dict[str, Any] = {}
+        source_callback = None
         source_task_id = None
         source_command = ""
+        source_is_download_from_agent = None
+        source_complete = None
+        source_deleted = None
         blocker = self._operator_collection_ingest_blocker(
             callback_display_id=callback_display_id,
             source_filename=source_filename,
@@ -14346,14 +15273,16 @@ class MythicTools:
             resolved_by = "uuid"
             try:
                 meta = await self._get_file_metadata(file_uuid)
+                source_metadata = dict(meta or {})
                 source_filename = str((meta or {}).get("filename_utf8") or "")
-                if not file_name and source_filename:
-                    file_name = os.path.basename(source_filename)
                 source_callback = (
                     ((meta or {}).get("task") or {}).get("callback") or {}
                 ).get("display_id")
                 source_task_id = ((meta or {}).get("task") or {}).get("display_id")
                 source_command = str(((meta or {}).get("task") or {}).get("command_name") or "")
+                source_is_download_from_agent = (meta or {}).get("is_download_from_agent")
+                source_complete = (meta or {}).get("complete")
+                source_deleted = (meta or {}).get("deleted")
                 if callback_display_id is None and source_callback is not None:
                     callback_display_id = int(source_callback)
                     resolved_by = f"uuid:callback:{callback_display_id}"
@@ -14385,14 +15314,47 @@ class MythicTools:
                     ),
                 }, sort_keys=True)
             file_uuid = row["agent_file_id"]
+            source_metadata = dict(row)
             source_filename = row.get("filename_utf8") or ""
+            source_callback = (
+                ((row.get("task") or {}).get("callback") or {}).get("display_id")
+                if isinstance(row.get("task"), dict)
+                else None
+            )
             source_task_id = (row.get("task") or {}).get("display_id") if isinstance(row.get("task"), dict) else None
             source_command = str((row.get("task") or {}).get("command_name") or "") if isinstance(row.get("task"), dict) else ""
-            if not file_name:
-                file_name = os.path.basename(source_filename)
+            source_is_download_from_agent = row.get("is_download_from_agent")
+            source_complete = row.get("complete")
+            source_deleted = row.get("deleted")
             resolved_by = "callback:" + str(callback_display_id)
         else:
             return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
+        authority_blocker = self._contract_collection_ingest_blocker(
+            authority_ingest_args,
+            source_metadata,
+        )
+        if authority_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "file_uuid": file_uuid,
+                "error": authority_blocker,
+            }, sort_keys=True)
+        contract_request = self._active_contract_collection_request()
+        if contract_request is not None:
+            safe_name = str(
+                (
+                    (contract_request.get("transaction") or {}).get("download") or {}
+                ).get("filename")
+                or ""
+            ).strip()
+        else:
+            requested_or_source_name = file_name or source_filename
+            safe_name = (
+                os.path.basename(requested_or_source_name)
+                if requested_or_source_name
+                else f"{file_uuid}.zip"
+            )
         blocker = self._operator_collection_ingest_blocker(
             callback_display_id=callback_display_id,
             source_filename=source_filename or file_name,
@@ -14407,7 +15369,6 @@ class MythicTools:
         if not file_content:
             return json.dumps({"status": "error", "file_uuid": file_uuid,
                                "error": "Mythic returned no content for this file UUID."}, sort_keys=True)
-        safe_name = os.path.basename(file_name) if file_name else f"{file_uuid}.zip"
         if not _looks_like_bloodhound_collection_zip(file_content):
             try:
                 await self._record_graph_built(callback_display_id, False, collection_scope_domain=collection_scope_domain)
@@ -14467,7 +15428,7 @@ class MythicTools:
                 },
                 verifier_result={"ingest_status": "complete", "idempotent_skip": True},
                 authorization=collection_authorization,
-                metadata={"idempotent_skip": True},
+                metadata={"filename": safe_name, "idempotent_skip": True},
             )
             if collection_proof:
                 self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
@@ -14487,6 +15448,7 @@ class MythicTools:
                 )
             except Exception:
                 pass
+            self._mark_contract_outcome("graph_ingested")
             self._complete_operator_collection_request()
             return json.dumps({
                 "status": "already_ingested", "file_uuid": file_uuid, "filename": safe_name,
@@ -14494,9 +15456,9 @@ class MythicTools:
                 "bloodhound_job_id": prior_job, "idempotent_skip": True, "graph_verified": True,
                 "source_callback_display_id": callback_display_id,
                 "covered_domains": covered_domains,
-                "next_action": ("This exact collection (by content hash) was already ingested and verified this "
-                                "engagement; the graph is populated. Do NOT re-upload or re-collect. Hand off to "
-                                "the BloodHound agent for attack-path analysis."),
+                "next_action": self._contract_next_action(
+                    "This exact collection was already ingested and verified. Do not re-upload or re-collect."
+                ),
             }, sort_keys=True)
         # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
         upload_tool = None
@@ -14611,6 +15573,7 @@ class MythicTools:
             pass
         if verified:
             self._record_collection_ingested(content_hash, job_id_bh)  # idempotency: don't re-ingest this artifact
+            self._mark_contract_outcome("graph_ingested")
             self._complete_operator_collection_request()
         return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
                            "bytes": len(file_content), "resolved_by": resolved_by,
@@ -14620,14 +15583,15 @@ class MythicTools:
                            "covered_domains": covered_domains,
                            "bloodhound_response": str(result)[:300],
                            "next_action": (
-                               f"BloodHound ingest job {job_id_bh} is COMPLETE — the graph is populated. Hand off "
-                               "to the BloodHound agent for attack-path analysis." if verified else
-                               (f"BloodHound ingest job {job_id_bh} ended '{status_msg}' — ingest FAILED. Do NOT "
-                                "re-collect; report the blocker and investigate the collection/BloodHound." if failed else
-                                f"Upload accepted (BloodHound job {job_id_bh}); status '{status_msg}' after ~120s — "
-                                "still ingesting or status unavailable. Do NOT re-collect or re-upload. Hand off to "
-                                f"the BloodHound agent to poll file_upload(info_type='status', job_id={job_id_bh}) "
-                                "until Complete, then analyze."))}, sort_keys=True)
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} is COMPLETE and the graph is populated."
+                               ) if verified else
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} ended '{status_msg}'. Report the blocker."
+                               ) if failed else
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} remains '{status_msg}'. Report the pending status."
+                               ))}, sort_keys=True)
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
@@ -14647,27 +15611,71 @@ class MythicTools:
         Returns account, realm, type, the secret value, and any comment. Read-only.
         """
         # HITL: free (read-only)
+        authority = getattr(self, "_turn_authority", None)
+        contract_bound = bool(getattr(authority, "enforces_objective_tool_allowlist", False))
+        if contract_bound:
+            blocker = self._turn_authority_guarded_tool_blocker(
+                "read_credentials",
+                {"realm": realm, "account": account},
+            )
+            if blocker:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": blocker,
+                }, sort_keys=True)
+            reservation_blocker = self._reserve_contract_credential_report()
+            if reservation_blocker:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": reservation_blocker,
+                }, sort_keys=True)
         if self.client is None:
+            if contract_bound:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": (
+                        "STOP — contract-bound credential report failed: "
+                        "MythicAPIClient is not initialized; the attempt remains consumed"
+                    ),
+                }, sort_keys=True)
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling read_credentials tool (realm={realm!r}, account={account!r})")
         # Shared short-TTL cache (read_credentials was hit 24× in one solve; also powers the gate's
         # durable-hop corroboration probe) — avoids re-querying Mythic on every call.
-        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        try:
+            creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            if contract_bound:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": (
+                        "STOP — contract-bound credential report failed: "
+                        f"{type(exc).__name__}: {exc}; the attempt remains consumed"
+                    ),
+                }, sort_keys=True)
+            raise
         r_cf, a_cf = (realm or "").strip().casefold(), (account or "").strip().casefold()
         if r_cf:
             creds = [c for c in creds if r_cf in str(c.get("realm") or "").casefold()]
         if a_cf:
             creds = [c for c in creds if a_cf in str(c.get("account") or "").casefold()]
         if not creds:
-            return "No credentials in the Mythic store (matching the given filters)."
-        lines = [f"{len(creds)} credential(s) in the Mythic store:"]
-        for c in creds:
-            line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "
-                    f"type={c.get('type') or '-'} credential={c.get('credential_text') or '-'}")
-            if c.get("comment"):
-                line += f" comment={c.get('comment')}"
-            lines.append(line)
-        return "\n".join(lines)
+            report = "No credentials in the Mythic store (matching the given filters)."
+        else:
+            lines = [f"{len(creds)} credential(s) in the Mythic store:"]
+            for c in creds:
+                line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "
+                        f"type={c.get('type') or '-'} credential={c.get('credential_text') or '-'}")
+                if c.get("comment"):
+                    line += f" comment={c.get('comment')}"
+                lines.append(line)
+            report = "\n".join(lines)
+        self._mark_contract_outcome("credentials_reported")
+        return report
 
     async def add_credential(self, credential: str, account: str = "", realm: str = "",
                              credential_type: str = "plaintext", comment: str = "") -> str:

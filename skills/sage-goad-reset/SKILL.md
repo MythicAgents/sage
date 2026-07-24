@@ -126,8 +126,10 @@ The launcher is canonical for local Sage restarts: it always uses the repo virtu
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight
 ```
 
-   This waits for the live Samwell Apollo callback, synchronizes range clocks, purges stale Kerberos tickets, and
-   verifies UTC/domain/identity output. Treat any nonzero exit as a reset failure.
+   This waits for the live Samwell Apollo callback through Mythic control-plane observation, synchronizes range
+   clocks out of band, and returns explicit zero-task metadata. It issues no Mythic payload tasks, does not purge
+   Kerberos tickets, and does not claim target-probed UTC/domain/identity output. Treat any nonzero exit as a reset
+   failure.
 9. Rediscover the Apollo callback ID. Never trust historical IDs. The Sage solve uses a fresh chat channel, not
    a callback.
 
@@ -223,7 +225,7 @@ does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 - `check_cross_forest_laps_bridge.py`
 - `liveness.py`
 - `ludus.py`
-- `mcp_check.py`
+- `mcp_check.py` (read-only local BloodHound MCP readiness wrapper; never issues payload tasks)
 - `readiness_contract.py`
 - `mythic_reset.sh`
 - `pkinit_padata_probe.py`

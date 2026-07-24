@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
-
-import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap_payloads.py"
@@ -15,33 +12,7 @@ bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 
 
-def test_parse_callback_probe_accepts_fresh_domain_identity() -> None:
-    controller = datetime(2026, 6, 24, 18, 0, 30, tzinfo=timezone.utc)
-
-    result = bootstrap.parse_callback_probe(
-        'noise\n{"Utc":"2026-06-24T18:00:00Z","Domain":"north.local","User":"NORTH\\\\samwell.tarly"}',
-        controller_utc=controller,
-    )
-
-    assert result["ready"] is True
-    assert result["domain"] == "north.local"
-    assert result["identity"] == r"NORTH\samwell.tarly"
-    assert result["skew_seconds"] == 30.0
-
-
-def test_parse_callback_probe_rejects_stale_clock() -> None:
-    controller = datetime(2026, 6, 24, 18, 2, tzinfo=timezone.utc)
-
-    with pytest.raises(RuntimeError, match="Callback clock skew"):
-        bootstrap.parse_callback_probe(
-            '{"Utc":"2026-06-24T18:00:00Z","Domain":"north.local","User":"NORTH\\\\samwell.tarly"}',
-            controller_utc=controller,
-        )
-
-
-def test_post_callback_preflight_requires_purge_and_probe(monkeypatch) -> None:
-    calls = []
-
+def test_post_callback_preflight_is_task_free(monkeypatch) -> None:
     async def fake_wait(*args, **kwargs):
         return {
             "display_id": 2,
@@ -53,30 +24,23 @@ def test_post_callback_preflight_requires_purge_and_probe(monkeypatch) -> None:
     def fake_sync(max_skew_seconds):
         return {"ready": True, "max_skew_seconds": max_skew_seconds, "hosts": [{"computer": "DC01"}]}
 
-    async def fake_task(client, callback_display_id, command_name, parameters, **kwargs):
-        calls.append((callback_display_id, command_name, parameters))
-        if parameters == "klist purge":
-            return {"task_display_id": 7, "output": "Ticket(s) purged!"}
-        return {
-            "task_display_id": 8,
-            "output": (
-                '{"Utc":"'
-                + datetime.now(timezone.utc).isoformat()
-                + '","Domain":"north.local","User":"NORTH\\\\samwell.tarly"}'
-            ),
-        }
+    async def fail_issue_task(*args, **kwargs):
+        raise AssertionError("post-callback-preflight must not issue Mythic payload tasks")
 
     monkeypatch.setattr(bootstrap, "wait_for_foothold_apollo_callback", fake_wait)
     monkeypatch.setattr(bootstrap, "synchronize_range_clocks", fake_sync)
-    monkeypatch.setattr(bootstrap, "issue_callback_task", fake_task)
+    monkeypatch.setattr(bootstrap.mythic, "issue_task", fail_issue_task)
 
     result = asyncio.run(bootstrap.post_callback_preflight(object()))
 
     assert result["ready"] is True
-    assert result["kerberos_purge_task"] == 7
-    assert result["identity_probe"]["domain"] == "north.local"
-    assert calls[0] == (2, "shell", "klist purge")
-    assert "GetCurrentDomain" in calls[1][2]
+    assert result["apollo_callback"]["display_id"] == 2
+    assert result["range_clocks"]["ready"] is True
+    assert result["preflight_scope"] == "control-plane-read-only"
+    assert result["payload_tasking_performed"] is False
+    assert result["payload_tasks_issued"] == 0
+    assert result["target_identity_probed"] is False
+    assert result["kerberos_purge_performed"] is False
 
 
 def test_import_callback_config_explicitly_hides_imported_callback(monkeypatch) -> None:

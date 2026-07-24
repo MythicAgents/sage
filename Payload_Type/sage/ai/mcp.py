@@ -3,6 +3,7 @@ import contextvars
 import inspect
 import json
 import logging
+import os
 import traceback
 import warnings
 from datetime import timedelta
@@ -165,6 +166,7 @@ class MCPServerManager:
         self.tools: Dict[str, List[BaseTool]] = {}
         self.configs: Dict[str, MCPConnectionConfig] = {}
         self._session_contexts: Dict[str, Any] = {}
+        self._server_locks: Dict[str, asyncio.Lock] = {}
         self._execution_seq = 0
 
     def set_execution_observer(self, observer):
@@ -219,7 +221,13 @@ class MCPServerManager:
         except Exception as exc:
             logger.debug(f"MCP execution observer failed (non-fatal): {exc}")
 
-    def _wrap_tool_for_visibility(self, server_name: str, tool: BaseTool) -> Optional[BaseTool]:
+    def _wrap_tool_for_visibility(
+        self,
+        server_name: str,
+        tool: BaseTool,
+        *,
+        source_identity: tuple[Any, Any, Any] | None = None,
+    ) -> Optional[BaseTool]:
         """Clone one MCP tool with lifecycle observation around its outbound call.
 
         The wrapper is part of the execution boundary. If it cannot be installed,
@@ -233,8 +241,21 @@ class MCPServerManager:
         self._execution_seq += 1
         wrapper_version = self._execution_seq
         manager = self
+        source_config, source_session, source_connection = source_identity or (
+            self.configs.get(server_name),
+            self.sessions.get(server_name),
+            self.connections.get(server_name),
+        )
 
         async def _observed_coroutine(*args, **kwargs):
+            if (
+                manager.configs.get(server_name) is not source_config
+                or manager.sessions.get(server_name) is not source_session
+                or manager.connections.get(server_name) is not source_connection
+            ):
+                raise PermissionError(
+                    f"MCP tool '{server_name}.{tool.name}' denied: its source connection is no longer active"
+                )
             if (
                 manager.current_execution_context() == MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
                 and not manager.is_bloodhound_server(server_name)
@@ -258,7 +279,12 @@ class MCPServerManager:
             try:
                 result = await original(*args, **kwargs)
             except BaseException as exc:
-                if _transport_is_closed(exc):
+                if (
+                    _transport_is_closed(exc)
+                    and manager.configs.get(server_name) is source_config
+                    and manager.sessions.get(server_name) is source_session
+                    and manager.connections.get(server_name) is source_connection
+                ):
                     manager._forget_server(server_name)
                     logger.warning(
                         f"MCP server '{server_name}' dropped from registry after closed transport: "
@@ -297,7 +323,18 @@ class MCPServerManager:
 
     @staticmethod
     def _is_canonical_bloodhound_config(config: MCPConnectionConfig | None) -> bool:
-        """Recognize the one BloodHound launch shape admitted to offensive runtime."""
+        """Recognize the operator-pinned BloodHound launcher admitted to execution.
+
+        Internal consistency (``--directory == cwd``) is not an identity check: an operator or
+        concurrent channel could otherwise replace the process with another directory while retaining
+        the canonical name and execution class. Bind the config to the process-wide trusted directory
+        and command immediately before every outbound invocation.
+        """
+        configured_dir = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
+        if not configured_dir or not os.path.isabs(configured_dir):
+            return False
+        expected_dir = os.path.realpath(configured_dir)
+        expected_command = str(os.environ.get("SAGE_BLOODHOUND_MCP_COMMAND", "uv"))
         args = list(config.args or []) if config is not None else []
         return bool(
             config is not None
@@ -305,15 +342,28 @@ class MCPServerManager:
             and normalize_execution_class(config.sage_execution_class)
             == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
             and config.connection_type == ConnectionType.STDIO
-            and bool(config.cwd)
-            and args == ["--directory", config.cwd, "run", "main.py"]
+            and str(config.command or "") == expected_command
+            and config.env == {}
+            and str(config.cwd or "") == configured_dir
+            and os.path.realpath(str(config.cwd or "")) == expected_dir
+            and len(args) == 4
+            and args[0] == "--directory"
+            and str(args[1]) == configured_dir
+            and os.path.realpath(str(args[1])) == expected_dir
+            and args[2:] == ["run", "main.py"]
         )
 
     def is_bloodhound_server(self, server_name: str) -> bool:
         config = self.configs.get(server_name)
         return bool(server_name == "BloodHound" and self._is_canonical_bloodhound_config(config))
-    
+
     async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
+        """Serialize a server-name replacement through connection, tool load, and registry commit."""
+        lock = self._server_locks.setdefault(config.name, asyncio.Lock())
+        async with lock:
+            return await self._connect_server_locked(config)
+
+    async def _connect_server_locked(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
         Connect to an MCP server based on the provided configuration
 
@@ -373,7 +423,7 @@ class MCPServerManager:
         try:
             if config.name in self.sessions:
                 logger.warning(f"Server '{config.name}' already connected. Disconnecting first.")
-                await self.disconnect_server(config.name)
+                await self._disconnect_server_locked(config.name)
             
             # Create connection config as dictionary (TypedDict)
             connection: Connection
@@ -490,6 +540,12 @@ class MCPServerManager:
             loop.set_exception_handler(original_handler)
 
     async def disconnect_server(self, server_name: str) -> bool:
+        """Serialize disconnect with same-name connects and tool registration."""
+        lock = self._server_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            return await self._disconnect_server_locked(server_name)
+
+    async def _disconnect_server_locked(self, server_name: str) -> bool:
         """
         Disconnect from an MCP server
 
@@ -531,17 +587,31 @@ class MCPServerManager:
     
     async def _load_tools_for_server(self, server_name: str):
         """Load and convert MCP tools for a specific server"""
+        config = self.configs.get(server_name)
+        session = self.sessions.get(server_name)
+        connection = self.connections.get(server_name)
+        source_identity = (config, session, connection)
         try:
-            config = self.configs.get(server_name)
             if config is None or not execution_class_allowed(config.sage_execution_class):
                 logger.warning(f"MCP server '{server_name}' tool load denied: missing allowed execution class")
                 self.tools[server_name] = []
                 return
-            session = self.sessions[server_name]
-            connection = self.connections[server_name]
+            if session is None or connection is None:
+                logger.warning(f"MCP server '{server_name}' tool load denied: connection is incomplete")
+                self.tools[server_name] = []
+                return
 
             # Use the langchain_mcp_adapters function to load and convert tools
             langchain_tools = await load_mcp_tools(session, connection=connection)
+            if (
+                self.configs.get(server_name) is not config
+                or self.sessions.get(server_name) is not session
+                or self.connections.get(server_name) is not connection
+            ):
+                logger.warning(
+                    f"Discarded stale MCP tool refresh for '{server_name}' after its source connection changed"
+                )
+                return
 
             # Check for tool name conflicts with existing tools (warn but don't exclude)
             existing_tool_names = self._get_all_existing_tool_names()
@@ -555,7 +625,11 @@ class MCPServerManager:
             # Store ALL tools for this server (including ones with conflicting names).
             # Observation is installed here so every Sage caller shares the same outbound boundary.
             wrapped_tools = [
-                self._wrap_tool_for_visibility(server_name, tool)
+                self._wrap_tool_for_visibility(
+                    server_name,
+                    tool,
+                    source_identity=source_identity,
+                )
                 for tool in langchain_tools
             ]
             self.tools[server_name] = [tool for tool in wrapped_tools if tool is not None]
@@ -567,7 +641,12 @@ class MCPServerManager:
 
         except Exception as e:
             logger.error(f"Failed to load tools for server '{server_name}': {e}")
-            self.tools[server_name] = []
+            if (
+                self.configs.get(server_name) is config
+                and self.sessions.get(server_name) is session
+                and self.connections.get(server_name) is connection
+            ):
+                self.tools[server_name] = []
 
     def _get_all_existing_tool_names(self) -> set:
         """Get a set of all existing tool names from all connected servers"""
@@ -656,13 +735,18 @@ class MCPServerManager:
             server_name: Name of server to refresh, or None for all servers
         """
         if server_name:
-            if server_name in self.sessions:
-                await self._load_tools_for_server(server_name)
-            else:
-                logger.warning(f"Server '{server_name}' not connected")
+            lock = self._server_locks.setdefault(server_name, asyncio.Lock())
+            async with lock:
+                if server_name in self.sessions:
+                    await self._load_tools_for_server(server_name)
+                else:
+                    logger.warning(f"Server '{server_name}' not connected")
         else:
-            for name in self.sessions.keys():
-                await self._load_tools_for_server(name)
+            for name in list(self.sessions):
+                lock = self._server_locks.setdefault(name, asyncio.Lock())
+                async with lock:
+                    if name in self.sessions:
+                        await self._load_tools_for_server(name)
     
     async def get_tool_by_name(self, tool_name: str, server_name: Optional[str] = None) -> Optional[BaseTool]:
         """

@@ -125,3 +125,21 @@ def test_maintained_operator_helpers_have_no_personal_absolute_paths():
             offenders.append(relative_path)
 
     assert not offenders, "personal absolute paths remain in: " + ", ".join(offenders)
+
+
+def test_reset_and_bootstrap_helpers_do_not_use_callback_task_apis():
+    helper_dirs = (
+        REPO_ROOT / "skills" / "sage-callback-bootstrap" / "scripts",
+        REPO_ROOT / "skills" / "sage-goad-reset" / "scripts",
+    )
+    forbidden = ("issue_task", "waitfor_for_task_output", "get_all_task_output_by_id")
+
+    offenders = []
+    for directory in helper_dirs:
+        for path in sorted(directory.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                if token in source:
+                    offenders.append(f"{path.relative_to(REPO_ROOT)} uses {token}")
+
+    assert not offenders, "callback task APIs remain in reset/bootstrap helpers: " + ", ".join(offenders)

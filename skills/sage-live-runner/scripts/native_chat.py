@@ -24,6 +24,8 @@ DEFAULT_USER = "mythic_admin"
 DEFAULT_OBJECTIVE = "From the current foothold, achieve administrative control of essos.local."
 DEFAULT_PREPARED_CHANNEL_NAME = "Sage GOAD Ready"
 PREPARED_CHANNEL_MARKER = "sage-goad-one-shot"
+DEFAULT_BHUSA_DEMO_CHANNEL_NAME = "BHUSA Demo"
+BHUSA_DEMO_METADATA_DISPLAY = "expanded; max=15"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE_ROOT = REPO_ROOT.parent
 DEFAULT_ENV_PATHS = (
@@ -34,6 +36,7 @@ SAGE_ENV_PATH = REPO_ROOT / "Payload_Type" / "sage" / ".env"
 READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 BOOTSTRAP_PATH = REPO_ROOT / "skills" / "sage-callback-bootstrap" / "scripts" / "bootstrap_payloads.py"
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
+APPROVABLE_INPUT_REQUEST_STATUS = "streaming"
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
 AUTONOMOUS_TOKEN_SCOPES = {"*"}
 
@@ -129,8 +132,8 @@ mutation CreateSageChannel(
 """
 
 CREATE_TOKEN_MUTATION = """
-mutation CreateSageChatToken($name: String!, $scopes: [String!]) {
-  createAPIToken(name: $name, scopes: $scopes) {
+mutation CreateSageChatToken($operatorId: Int, $name: String!, $scopes: [String!]) {
+  createAPIToken(operator_id: $operatorId, name: $name, scopes: $scopes) {
     id
     name
     scopes
@@ -138,6 +141,26 @@ mutation CreateSageChatToken($name: String!, $scopes: [String!]) {
     status
     error
     operator_id
+  }
+}
+"""
+
+OPERATION_BOT_QUERY = """
+query SageOperationBot($operationId: Int!) {
+  operator(
+    where: {
+      account_type: {_eq: "bot"}
+      current_operation_id: {_eq: $operationId}
+      active: {_eq: true}
+      deleted: {_eq: false}
+    }
+    order_by: {id: asc}
+  ) {
+    id
+    username
+    account_type
+    active
+    deleted
   }
 }
 """
@@ -150,6 +173,17 @@ mutation CreateSageMessage($channelId: Int!, $message: String!) {
     system_message: false
     all_operations: false
   ) {
+    status
+    error
+    message_id
+    request_id
+  }
+}
+"""
+
+CHAT_INPUT_RESPONSE_MUTATION = """
+mutation SageChatInputResponse($messageId: Int!, $action: String!, $response: String, $choiceId: String) {
+  chatInputResponse(message_id: $messageId, action: $action, response: $response, choice_id: $choiceId) {
     status
     error
     message_id
@@ -176,11 +210,54 @@ query SageChatRequest($requestId: Int!) {
     id
     channel_id
     chat_request_id
+    chat_response_key
     author_type
     sender_display_name
     message
     metadata
+    edited
+    deleted
     status
+    created_at
+    updated_at
+  }
+}
+"""
+
+SAGE_CHANNEL_IDS_QUERY = """
+query SageChannelIds {
+  chat_channel(
+    where: {
+      channel_type: {_eq: "ai"}
+      archived: {_eq: false}
+      chat_container: {
+        name: {_eq: "sage"}
+        type: {_eq: "chat"}
+        deleted: {_eq: false}
+      }
+    }
+    order_by: {id: desc}
+  ) {
+    id
+    name
+  }
+}
+"""
+
+LATEST_REQUEST_QUERY = """
+query LatestSageChatRequest($channelIds: [Int!]!) {
+  chat_request(
+    where: {channel_id: {_in: $channelIds}}
+    order_by: {id: desc}
+    limit: 1
+  ) {
+    id
+    channel_id
+    request_message_id
+    status
+    error
+    created_by
+    updated_at
   }
 }
 """
@@ -279,6 +356,63 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return metadata
 
 
+def canary_ai_metadata(
+    *, max_steps: int, extra: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build isolated supervised metadata without changing normal Auto defaults."""
+
+    if max_steps < 1:
+        raise ValueError("canary max_steps must be at least 1")
+    metadata = default_ai_metadata()
+    config = dict(metadata.get("config") or {})
+    config.update(
+        {
+            "mode": "supervised",
+            "autonomous_solve": False,
+            "max_steps": int(max_steps),
+        }
+    )
+    metadata["config"] = config
+    if extra:
+        extra_copy = dict(extra)
+        extra_config = extra_copy.pop("config", None)
+        metadata.update(extra_copy)
+        if isinstance(extra_config, dict):
+            config.update(extra_config)
+            config["mode"] = "supervised"
+            config["autonomous_solve"] = False
+            config["max_steps"] = int(max_steps)
+    return metadata
+
+
+def bhusa_demo_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the exact supervised BHUSA demo channel metadata."""
+    metadata = default_ai_metadata()
+    config = dict(metadata.get("config") or {})
+    config.update(
+        {
+            "mode": "supervised",
+            "autonomous_solve": False,
+            "policy_mode": "hybrid",
+            "max_steps": 200,
+        }
+    )
+    metadata["config"] = config
+    metadata["channel_metadata_display"] = {"display": BHUSA_DEMO_METADATA_DISPLAY}
+    if extra:
+        extra_copy = dict(extra)
+        extra_config = extra_copy.pop("config", None)
+        metadata.update(extra_copy)
+        if isinstance(extra_config, dict):
+            config.update(extra_config)
+        config["mode"] = "supervised"
+        config["autonomous_solve"] = False
+        config["policy_mode"] = "hybrid"
+        config["max_steps"] = 200
+        metadata["channel_metadata_display"] = {"display": BHUSA_DEMO_METADATA_DISPLAY}
+    return metadata
+
+
 def _readiness_contract_module():
     return _load_module("sage_readiness_contract_for_native_chat", READINESS_CONTRACT_PATH)
 
@@ -364,21 +498,70 @@ async def inspect_readiness(
     )
 
 
-async def ensure_api_token(client: Any, *, name: str = "Sage native chat") -> dict[str, Any]:
+def select_operation_bot(observed: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        row
+        for row in observed.get("operator", [])
+        if row.get("account_type") == "bot"
+        and row.get("active") is True
+        and row.get("deleted") is False
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("Expected exactly one active Mythic bot operator for the current operation.")
+    _require_exact_int(matches[0].get("id"), "Current operation bot operator id")
+    return matches[0]
+
+
+async def resolve_operation_bot(client: Any) -> dict[str, Any]:
+    operation_id = _require_exact_int(
+        getattr(client, "current_operation_id", None),
+        "Current Mythic operation id",
+    )
+    if operation_id <= 0:
+        raise RuntimeError("Current Mythic operation id must be positive.")
+    return select_operation_bot(
+        await mythic.execute_custom_query(
+            client,
+            OPERATION_BOT_QUERY,
+            variables={"operationId": operation_id},
+        )
+    )
+
+
+async def ensure_api_token(
+    client: Any,
+    *,
+    name: str = "Sage native chat",
+    operator_id: int | None = None,
+) -> dict[str, Any]:
+    expected_operator_id = (
+        _require_exact_int(operator_id, "Requested API token operator id")
+        if operator_id is not None
+        else None
+    )
     observed = await mythic.execute_custom_query(client, READINESS_QUERY)
     usable = [
         row
         for row in observed.get("apitokens", [])
-        if AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
+        if (
+            (expected_operator_id is None or row.get("operator_id") == expected_operator_id)
+            and AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
+        )
     ]
     if usable:
         return {"created": False, "api_token": usable[0]}
     result = await mythic.execute_custom_query(
         client,
         CREATE_TOKEN_MUTATION,
-        variables={"name": name, "scopes": sorted(AUTONOMOUS_TOKEN_SCOPES)},
+        variables={
+            "operatorId": expected_operator_id,
+            "name": name,
+            "scopes": sorted(AUTONOMOUS_TOKEN_SCOPES),
+        },
     )
     token = _require_success("API token creation", result.get("createAPIToken") or {})
+    if expected_operator_id is not None and token.get("operator_id") != expected_operator_id:
+        raise RuntimeError("Mythic API token creation returned the wrong operator_id.")
     return {"created": True, "api_token": token}
 
 
@@ -429,6 +612,10 @@ async def create_locked_channel(
 
 
 def _prepared_channel_result(channel: dict[str, Any], *, reused: bool) -> dict[str, Any]:
+    metadata = channel.get("ai_metadata")
+    config = metadata.get("config") if isinstance(metadata, dict) else {}
+    if not isinstance(config, dict):
+        config = {}
     return {
         "chat_channel_id": int(channel["id"]),
         "chat_channel_name": str(channel["name"]),
@@ -437,7 +624,23 @@ def _prepared_channel_result(channel: dict[str, Any], *, reused: bool) -> dict[s
         "prepared": True,
         "reused": reused,
         "chat_runtime_identity": _chat_runtime_identity_from_metadata(channel.get("ai_metadata")),
+        "prepared_policy": {
+            "mode": str(config.get("mode") or "").strip().casefold(),
+            "autonomous_solve": config.get("autonomous_solve"),
+        },
     }
+
+
+def _prepared_channel_matches_auto(metadata: Any) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        return False
+    return (
+        str(config.get("mode") or "").strip().casefold() == "auto"
+        and config.get("autonomous_solve") is True
+    )
 
 
 async def find_prepared_channel(client: Any) -> dict[str, Any] | None:
@@ -449,7 +652,7 @@ async def find_prepared_channel(client: Any) -> dict[str, Any] | None:
         if (
             channel.get("name") == DEFAULT_PREPARED_CHANNEL_NAME
             or metadata.get("prepared_for") == PREPARED_CHANNEL_MARKER
-        ):
+        ) and _prepared_channel_matches_auto(metadata):
             return _prepared_channel_result(channel, reused=True)
     return None
 
@@ -475,6 +678,32 @@ async def prepare_locked_channel(
         metadata=prepared_metadata,
     )
     return {**created, "prepared": True, "reused": False}
+
+
+async def prepare_bhusa_demo_channel(
+    client: Any,
+    *,
+    channel_name: str = DEFAULT_BHUSA_DEMO_CHANNEL_NAME,
+    token_name: str = "Sage BHUSA demo",
+) -> dict[str, Any]:
+    operation_bot = await resolve_operation_bot(client)
+    token = await ensure_api_token(
+        client,
+        name=token_name,
+        operator_id=int(operation_bot["id"]),
+    )
+    channel = await create_locked_channel(
+        client,
+        name=channel_name,
+        description="BHUSA demo supervised channel",
+        api_token_id=int(token["api_token"]["id"]),
+        metadata=bhusa_demo_ai_metadata(),
+    )
+    return {
+        "operation_bot": operation_bot,
+        "api_token": token,
+        "chat_channel": channel,
+    }
 
 
 async def create_message(client: Any, channel_id: int, prompt: str) -> dict[str, Any]:
@@ -541,6 +770,190 @@ def _extract_progress_metadata(messages: list[dict[str, Any]]) -> dict[str, Any]
     return progress
 
 
+def _metadata_containers(message: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    containers = [metadata]
+    nested = metadata.get("container_metadata")
+    if isinstance(nested, dict):
+        containers.append(nested)
+    return containers
+
+
+def _has_input_requested(messages: list[dict[str, Any]]) -> bool:
+    return bool(_pending_input_requested_messages(messages))
+
+
+def _pending_input_requested_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    for message in messages or []:
+        if message.get("deleted") is True:
+            continue
+        for metadata in _metadata_containers(message):
+            snapshot = metadata.get("input_requested")
+            if metadata.get("special_type") != "input_requested" or not isinstance(snapshot, dict):
+                continue
+            if snapshot.get("status") == "pending":
+                pending.append(message)
+                break
+    return pending
+
+
+def _require_exact_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise RuntimeError(f"{label} must be an exact integer.")
+    return value
+
+
+async def fetch_request_snapshot(
+    client: Any, request_id: int
+) -> dict[str, Any]:
+    expected_request_id = _require_exact_int(request_id, "Mythic chat request id")
+    result = await mythic.execute_custom_query(
+        client,
+        REQUEST_QUERY,
+        variables={"requestId": expected_request_id},
+    )
+    rows = result.get("chat_request") or []
+    if not rows:
+        raise RuntimeError(f"Mythic chat request {request_id} was not found.")
+    request = rows[0]
+    observed_request_id = _require_exact_int(
+        request.get("id"), "Returned Mythic chat request id"
+    )
+    if observed_request_id != expected_request_id:
+        raise RuntimeError(
+            "Returned Mythic chat request id does not match the requested id."
+        )
+    request_channel_id = _require_exact_int(
+        request.get("channel_id"), "Returned Mythic chat request channel id"
+    )
+    message_rows = result.get("chat_message") or []
+    for message in message_rows:
+        _require_exact_int(message.get("id"), "Mythic chat message id")
+        message_request_id = _require_exact_int(
+            message.get("chat_request_id"), "Mythic chat message request id"
+        )
+        if message_request_id != expected_request_id:
+            raise RuntimeError(
+                "Returned Mythic chat message request id does not match the requested id."
+            )
+        message_channel_id = _require_exact_int(
+            message.get("channel_id"), "Mythic chat message channel id"
+        )
+        if message_channel_id != request_channel_id:
+            raise RuntimeError(
+                "Returned Mythic chat message channel id does not match the request channel."
+            )
+    messages = sorted(
+        message_rows,
+        key=lambda row: row["id"],
+    )
+    return {"request": request, "messages": messages}
+
+
+async def approve_pending_input_card(client: Any, request_id: int) -> dict[str, Any]:
+    snapshot = await fetch_request_snapshot(client, request_id)
+    request = snapshot["request"]
+    if request.get("status") != APPROVABLE_INPUT_REQUEST_STATUS:
+        raise RuntimeError(
+            "Selected Mythic chat request is not in the exact active streaming status."
+        )
+    pending = _pending_input_requested_messages(snapshot["messages"])
+    if len(pending) != 1:
+        raise RuntimeError(
+            "Expected exactly one unresolved input_requested card for the selected request."
+        )
+    message_id = _require_exact_int(
+        pending[0].get("id"), "Pending input_requested message id"
+    )
+    result = await mythic.execute_custom_query(
+        client,
+        CHAT_INPUT_RESPONSE_MUTATION,
+        variables={
+            "messageId": message_id,
+            "action": "accept",
+            "response": None,
+            "choiceId": None,
+        },
+    )
+    submitted = _require_success(
+        "chat input approval", result.get("chatInputResponse") or {}
+    )
+    returned_message_id = _require_exact_int(
+        submitted.get("message_id"), "Approved input_requested message id"
+    )
+    if returned_message_id != message_id:
+        raise RuntimeError("Mythic chat input approval returned the wrong message_id.")
+    returned_request_id = _require_exact_int(
+        submitted.get("request_id"), "Approved Mythic chat request id"
+    )
+    selected_request_id = _require_exact_int(
+        request.get("id"), "Selected Mythic chat request id"
+    )
+    if returned_request_id != selected_request_id:
+        raise RuntimeError("Mythic chat input approval returned the wrong request_id.")
+    return {
+        "chat_request_id": selected_request_id,
+        "input_request_message_id": message_id,
+        "action": "accept",
+        "response": submitted,
+    }
+
+
+async def resolve_request_selector(
+    client: Any,
+    *,
+    request_id: int | None = None,
+    latest: bool = False,
+    channel_id: int | None = None,
+) -> int:
+    if (request_id is None) == (not latest):
+        raise ValueError("select exactly one of request_id or latest")
+    if request_id is not None:
+        if channel_id is not None:
+            raise ValueError("channel_id is valid only with latest")
+        return _require_exact_int(request_id, "Selected Mythic chat request id")
+
+    channel_result = await mythic.execute_custom_query(
+        client, SAGE_CHANNEL_IDS_QUERY
+    )
+    sage_channel_ids = [
+        _require_exact_int(
+            row.get("id"), "Active Sage chat channel id"
+        )
+        for row in channel_result.get("chat_channel") or []
+    ]
+    if channel_id is not None:
+        selected_channel_id = _require_exact_int(
+            channel_id, "Selected Sage chat channel id"
+        )
+        if selected_channel_id not in sage_channel_ids:
+            raise RuntimeError(
+                f"Mythic chat channel {channel_id} is not an active Sage AI channel."
+            )
+        sage_channel_ids = [selected_channel_id]
+    if not sage_channel_ids:
+        raise RuntimeError("No active Sage chat channels were found.")
+    request_result = await mythic.execute_custom_query(
+        client,
+        LATEST_REQUEST_QUERY,
+        variables={"channelIds": sage_channel_ids},
+    )
+    requests = request_result.get("chat_request") or []
+    if not requests:
+        scope = (
+            f"channel {channel_id}"
+            if channel_id is not None
+            else "active Sage channels"
+        )
+        raise RuntimeError(f"No Mythic chat requests were found for {scope}.")
+    return _require_exact_int(
+        requests[0].get("id"), "Latest Mythic chat request id"
+    )
+
+
 async def wait_for_request(
     client: Any,
     request_id: int,
@@ -549,6 +962,7 @@ async def wait_for_request(
     poll_interval_seconds: float = 5.0,
     progress_sink: Any | None = None,
     heartbeat_interval_seconds: float = 60.0,
+    stop_on_input_requested: bool = False,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds
@@ -556,16 +970,14 @@ async def wait_for_request(
     last_progress_signature: tuple[str, int, str | None, str | None, int | None] | None = None
     last_progress_emit_at = started_at
     while time.monotonic() < deadline:
-        result = await mythic.execute_custom_query(
-            client,
-            REQUEST_QUERY,
-            variables={"requestId": int(request_id)},
-        )
-        rows = result.get("chat_request") or []
-        if rows:
-            last = rows[0]
+        try:
+            snapshot = await fetch_request_snapshot(client, request_id)
+        except RuntimeError:
+            snapshot = None
+        if snapshot is not None:
+            last = snapshot["request"]
             status = str(last.get("status") or "").casefold()
-            messages = result.get("chat_message") or []
+            messages = snapshot["messages"]
             progress_metadata = _extract_progress_metadata(messages)
             signature = (
                 status,
@@ -597,6 +1009,12 @@ async def wait_for_request(
                 last_progress_emit_at = now
             if status in TERMINAL_STATUSES:
                 return {"request": last, "messages": messages}
+            if stop_on_input_requested and _has_input_requested(messages):
+                return {
+                    "request": last,
+                    "messages": messages,
+                    "halt_reason": "operator_input_requested",
+                }
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -605,6 +1023,99 @@ async def wait_for_request(
         f"Mythic chat request {request_id} did not finish within {timeout_seconds}s; "
         f"last status={None if last is None else last.get('status')!r}"
     )
+
+
+def request_snapshot_result(snapshot: dict[str, Any]) -> dict[str, Any]:
+    request = snapshot.get("request") or {}
+    messages = snapshot.get("messages") or []
+    result = {
+        "chat_channel_id": request.get("channel_id"),
+        "chat_request_id": request.get("id"),
+        "status": request.get("status"),
+        "error": request.get("error"),
+        "messages": messages,
+        "runtime_telemetry": extract_runtime_telemetry(messages),
+        "progress": _extract_progress_metadata(messages),
+    }
+    if snapshot.get("halt_reason"):
+        result["halt_reason"] = snapshot["halt_reason"]
+    return result
+
+
+def _validate_transcript_identity(
+    request: dict[str, Any], messages: list[dict[str, Any]]
+) -> None:
+    request_id = _require_exact_int(
+        request.get("id"), "Transcript request id"
+    )
+    channel_id = _require_exact_int(
+        request.get("channel_id"), "Transcript request channel id"
+    )
+    for message in messages:
+        _require_exact_int(message.get("id"), "Transcript message id")
+        message_request_id = _require_exact_int(
+            message.get("chat_request_id"),
+            "Transcript message chat_request_id",
+        )
+        message_channel_id = _require_exact_int(
+            message.get("channel_id"), "Transcript message channel_id"
+        )
+        if message_request_id != request_id:
+            raise RuntimeError(
+                "Transcript export message chat_request_id does not match request id."
+            )
+        if message_channel_id != channel_id:
+            raise RuntimeError(
+                "Transcript export message channel_id does not match request channel_id."
+            )
+
+
+def build_transcript_export(
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    request = dict(snapshot.get("request") or {})
+    messages = sorted(
+        [dict(row) for row in snapshot.get("messages") or []],
+        key=lambda row: (
+            row.get("id")
+            if type(row.get("id")) is int
+            else -1
+        ),
+    )
+    _validate_transcript_identity(request, messages)
+    result = request_snapshot_result(
+        {**snapshot, "request": request, "messages": messages}
+    )
+    return {
+        "schema": "sage-native-chat-transcript-v1",
+        "chat_channel_id": request.get("channel_id"),
+        "chat_request_id": request.get("id"),
+        "status": request.get("status"),
+        "error": request.get("error"),
+        "request": request,
+        "messages": messages,
+        "runtime_telemetry": result["runtime_telemetry"],
+        "progress": result["progress"],
+        **(
+            {"halt_reason": snapshot["halt_reason"]}
+            if snapshot.get("halt_reason")
+            else {}
+        ),
+    }
+
+
+def write_transcript_export(
+    path: str | Path, transcript: dict[str, Any]
+) -> Path:
+    resolved = Path(path).expanduser()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_suffix(resolved.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(transcript, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(resolved)
+    return resolved
 
 
 def extract_runtime_telemetry(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -732,6 +1243,7 @@ async def run_native_chat_turn(
     manifest_path: str | Path | None = None,
     manifest_context: dict[str, Any] | None = None,
     runtime_dbs_archived: bool = False,
+    stop_on_input_requested: bool = False,
 ) -> dict[str, Any]:
     if manifest_path and not runtime_dbs_archived:
         raise RuntimeError("--manifest-path requires --runtime-dbs-archived.")
@@ -749,6 +1261,17 @@ async def run_native_chat_turn(
     channel = None
     if use_prepared_channel and channel_name is None:
         channel = await find_prepared_channel(client)
+        identity = (
+            channel.get("prepared_policy")
+            if isinstance(channel, dict)
+            else None
+        )
+        if (
+            not isinstance(identity, dict)
+            or identity.get("mode") != "auto"
+            or identity.get("autonomous_solve") is not True
+        ):
+            channel = None
     if channel is None:
         channel = await create_locked_channel(
             client,
@@ -770,6 +1293,7 @@ async def run_native_chat_turn(
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
         progress_sink=progress_sink,
+        stop_on_input_requested=stop_on_input_requested,
     )
     request = completed["request"]
     messages = completed["messages"]
@@ -781,12 +1305,23 @@ async def run_native_chat_turn(
         "messages": messages,
         "runtime_telemetry": extract_runtime_telemetry(messages),
     }
+    if completed.get("halt_reason"):
+        result["halt_reason"] = completed["halt_reason"]
     if progress_sink is not None:
         progress_sink({
-            "event": "request_terminal",
+            "event": (
+                "request_paused"
+                if completed.get("halt_reason") == "operator_input_requested"
+                else "request_terminal"
+            ),
             "chat_channel_id": int(channel["chat_channel_id"]),
             "chat_request_id": int(message["chat_request_id"]),
             "status": str(result.get("status") or ""),
+            **(
+                {"halt_reason": completed["halt_reason"]}
+                if completed.get("halt_reason")
+                else {}
+            ),
         })
     if manifest_path:
         context = dict(manifest_context or {})
@@ -851,6 +1386,54 @@ async def _run(args: argparse.Namespace) -> int:
                 api_token_id=int(token["api_token"]["id"]),
             ),
         }
+    elif args.command == "demo-prepare":
+        result = await prepare_bhusa_demo_channel(
+            client,
+            channel_name=args.channel_name,
+            token_name=args.token_name,
+        )
+    elif args.command in {"status", "follow", "transcript"}:
+        request_id = await resolve_request_selector(
+            client,
+            request_id=args.request_id,
+            latest=args.latest,
+            channel_id=args.channel_id,
+        )
+        if args.command == "follow":
+            snapshot = await wait_for_request(
+                client,
+                request_id,
+                timeout_seconds=args.timeout,
+                poll_interval_seconds=args.poll_interval,
+                progress_sink=emit_jsonl_event,
+                stop_on_input_requested=True,
+            )
+        else:
+            snapshot = await fetch_request_snapshot(client, request_id)
+        if args.command == "transcript":
+            result = build_transcript_export(snapshot)
+            if args.output:
+                written = write_transcript_export(args.output, result)
+                result["export_path"] = str(written)
+        else:
+            result = request_snapshot_result(snapshot)
+            if args.output_mode == "eval":
+                result = evaluator_result_view(result)
+    elif args.command == "canary":
+        result = await run_native_chat_turn(
+            client,
+            args.prompt,
+            timeout_seconds=args.timeout,
+            poll_interval_seconds=args.poll_interval,
+            channel_name=args.channel_name,
+            api_token_id=args.api_token_id,
+            metadata=canary_ai_metadata(max_steps=args.max_steps),
+            use_prepared_channel=False,
+            progress_sink=emit_jsonl_event,
+            stop_on_input_requested=True,
+        )
+    elif args.command == "approve-pending":
+        result = await approve_pending_input_card(client, args.request_id)
     else:
         result = await run_native_chat_turn(
             client,
@@ -873,6 +1456,11 @@ async def _run(args: argparse.Namespace) -> int:
             result = evaluator_result_view(result)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     if args.command == "inspect" and not result.get("ready"):
+        return 1
+    if (
+        args.command == "canary"
+        and result.get("halt_reason") != "operator_input_requested"
+    ):
         return 1
     return 0
 
@@ -897,6 +1485,44 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--channel-name", default=DEFAULT_PREPARED_CHANNEL_NAME)
     prepare.add_argument("--token-name", default="Sage native chat")
+    demo_prepare = sub.add_parser("demo-prepare")
+    demo_prepare.add_argument("--channel-name", default=DEFAULT_BHUSA_DEMO_CHANNEL_NAME)
+    demo_prepare.add_argument("--token-name", default="Sage BHUSA demo")
+
+    def add_request_selector(command_parser: argparse.ArgumentParser) -> None:
+        selector = command_parser.add_mutually_exclusive_group(required=True)
+        selector.add_argument("--request-id", type=int)
+        selector.add_argument("--latest", action="store_true")
+        command_parser.add_argument(
+            "--channel-id",
+            type=int,
+            help="Limit --latest to one active Sage AI channel.",
+        )
+
+    status = sub.add_parser("status")
+    add_request_selector(status)
+    status.add_argument(
+        "--output-mode", choices=("full", "eval"), default="full"
+    )
+    follow = sub.add_parser("follow")
+    add_request_selector(follow)
+    follow.add_argument("--timeout", type=int, default=1800)
+    follow.add_argument("--poll-interval", type=float, default=5.0)
+    follow.add_argument(
+        "--output-mode", choices=("full", "eval"), default="full"
+    )
+    transcript = sub.add_parser("transcript")
+    add_request_selector(transcript)
+    transcript.add_argument("--output")
+    canary = sub.add_parser("canary")
+    canary.add_argument("--prompt", required=True)
+    canary.add_argument("--timeout", type=int, default=300)
+    canary.add_argument("--poll-interval", type=float, default=2.0)
+    canary.add_argument("--channel-name")
+    canary.add_argument("--max-steps", type=int, default=20)
+    approve_pending = sub.add_parser("approve-pending")
+    approve_pending.add_argument("--request-id", type=int, required=True)
+
     run = sub.add_parser("run")
     run.add_argument("--prompt", default=DEFAULT_OBJECTIVE)
     run.add_argument("--timeout", type=int, default=1800)

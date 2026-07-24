@@ -142,20 +142,17 @@ def test_intent_exact_continue_and_stop_no_llm():
     assert asyncio.run(m._classify_continuation_intent("quit")) == "STOP"
 
 
-def test_intent_no_llm_falls_back_to_redirect():
-    m = _bare_model()  # non-exact + llm None → REDIRECT
-    assert asyncio.run(m._classify_continuation_intent("go scan the subnet")) == "REDIRECT"
+def test_intent_no_llm_falls_back_to_stop():
+    m = _bare_model()  # unknown continuation + no classifier must not preserve or widen authority
+    assert asyncio.run(m._classify_continuation_intent("go scan the subnet")) == "STOP"
 
 
 def test_intent_llm_classifies_inhibit_as_stop():
     m = _bare_model()
 
-    class _Resp:
-        content = "STOP"
-
     class _FakeLLM:
         async def ainvoke(self, msgs):
-            return _Resp()
+            return model_mod.AIMessage(content="STOP")
 
     m.llm = _FakeLLM()
     got = asyncio.run(m._classify_continuation_intent(
@@ -166,18 +163,15 @@ def test_intent_llm_classifies_inhibit_as_stop():
 def test_intent_llm_redirect_passthrough():
     m = _bare_model()
 
-    class _Resp:
-        content = "the answer is REDIRECT"  # extra words around the label still parse
-
     class _FakeLLM:
         async def ainvoke(self, msgs):
-            return _Resp()
+            return model_mod.AIMessage(content="REDIRECT")
 
     m.llm = _FakeLLM()
     assert asyncio.run(m._classify_continuation_intent("now pivot to the DC and dump creds")) == "REDIRECT"
 
 
-def test_intent_llm_error_falls_back_to_redirect():
+def test_intent_llm_error_falls_back_to_stop():
     m = _bare_model()
 
     class _BadLLM:
@@ -185,7 +179,7 @@ def test_intent_llm_error_falls_back_to_redirect():
             raise RuntimeError("boom")
 
     m.llm = _BadLLM()
-    assert asyncio.run(m._classify_continuation_intent("some ambiguous instruction")) == "REDIRECT"
+    assert asyncio.run(m._classify_continuation_intent("some ambiguous instruction")) == "STOP"
 
 
 if __name__ == "__main__":

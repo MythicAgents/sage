@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 
 import worker_outcome as wo  # noqa: E402
 from worker_outcome import WorkerOutcome, Blocker, Outcome, Decision  # noqa: E402
+from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 
 
 def _blocked(fp="adcs-certificate-auth:needs-ca-key", rev="r1", route_cap="", owner=""):
@@ -185,3 +186,162 @@ def test_loop_breaker_progress_resets_staleness():
     assert wo.observe_capability_outcome(st, "dcsync", blk, "t1") is False
     assert wo.observe_capability_outcome(st, "dcsync", {"ok": True, "capability": "dcsync"}, "t2") is False  # progress
     assert wo.observe_capability_outcome(st, "dcsync", blk, "t3") is False   # new epoch -> not over-suppressed
+
+
+def test_handback_parser_classifies_exact_sanitized_fixtures():
+    reason = "BloodHound logon-session query is the next required step per operator steering; route to BloodHound to check for <target-user> sessions before any further credential acquisition."
+    summary = "DONE — Active footholds and prior evidence were reviewed. FAILED — A corrected read was interrupted by operator steering and produced no task output. BLOCKER — Need BloodHound query for <target-user> logon/session location using existing graph data before selecting the minimum credential-acquisition action. REMAINING — Query BloodHound for the target session and relevant host; then return to Mythic for only the necessary acquisition action."
+    legacy = wo.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=7,
+        reason=reason,
+        summary=summary,
+    )
+    assert legacy["outcome"] == "blocked"
+    assert legacy["next_owner"] == ""
+
+    handoff = wo.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=7,
+        reason=reason,
+        summary=summary,
+        next_owner="BloodHound",
+    )
+    assert handoff["schema_version"] == 2
+    assert handoff["outcome"] == "handoff"
+    assert handoff["next_owner"] == "BloodHound"
+
+    blocked = wo.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=8,
+        reason="Operator turn is observe-only; no further implant tasking is allowed, and the next necessary step is a targeted read of already-identified files to verify whether they contain credential material.",
+        summary="DONE — Existing footholds, stored credentials, files, and graph collections were reviewed.\nFAILED — Targeted reads were not executed; both returned an operator denial.\nBLOCKER — Current turn authority is observe-only, so the necessary verifier cannot be issued and no credential is present in the store.\nREMAINING — If tasking is re-enabled, issue only the targeted read and report any relevant secret found.",
+    )
+    assert blocked["outcome"] == "blocked"
+    assert blocked["next_owner"] == ""
+
+
+def test_handback_parser_rejects_ambiguous_or_nonterminal_shapes():
+    base = "DONE — x FAILED — y BLOCKER — none REMAINING — none"
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary=base)["outcome"] == "progress"
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="DONE — x FAILED — none BLOCKER — none REMAINING — none")["outcome"] == "complete"
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="DONE — none FAILED — y BLOCKER — none REMAINING — none")["outcome"] == "progress"
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="DONE — x FAILED — none BLOCKER — none REMAINING — still do y")["outcome"] == "progress"
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="DONE — x REMAINING — y FAILED — z BLOCKER — none") is None
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="DONE — x DONE — y FAILED — z BLOCKER — none REMAINING — none") is None
+    assert wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason="", summary="done — x FAILED — y BLOCKER — none REMAINING — none") is None
+    for reason in ("route to BloodHound and Mythic_Operator", "do not route to BloodHound", "route to BloodHoundExtra", "route to UnknownOwner"):
+        metadata = wo.build_handoff_metadata(source_worker="Mythic_Operator", source_turn_id="t", source_seq=1, reason=reason, summary=base)
+        assert metadata["outcome"] == "progress"
+        assert metadata["next_owner"] == ""
+
+
+def test_handback_reason_never_grants_routing_authority():
+    summary = "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph"
+    reasons = (
+        "route to BloodHound",
+        "Route to BloodHound to analyze the graph",
+        "Context is complete; hand off to MCP_Manager to query the connected service",
+        "Don’t route to BloodHound.",
+        "route to BloodHound to avoid using the graph",
+        "arbitrary explanation with no owner",
+    )
+    for reason in reasons:
+        legacy = wo.build_handoff_metadata(
+            source_worker="Mythic_Operator",
+            source_turn_id="t",
+            source_seq=1,
+            reason=reason,
+            summary=summary,
+        )
+        assert legacy["outcome"] == "blocked"
+        assert legacy["next_owner"] == ""
+        typed = wo.build_handoff_metadata(
+            source_worker="Mythic_Operator",
+            source_turn_id="t",
+            source_seq=1,
+            reason=reason,
+            summary=summary,
+            next_owner="BloodHound",
+        )
+        assert typed["outcome"] == "handoff"
+        assert typed["next_owner"] == "BloodHound"
+
+
+def test_handback_typed_owner_rejects_malformed_and_self_values():
+    summary = "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph"
+    malformed = (
+        "bloodhound",
+        "BloodHoundExtra",
+        "BloodHound,MCP_Manager",
+        ["BloodHound"],
+        ("BloodHound",),
+        {"owner": "BloodHound"},
+        7,
+        None,
+        "Mythic_Operator",
+    )
+    for next_owner in malformed:
+        assert wo.build_handoff_metadata(
+            source_worker="Mythic_Operator",
+            source_turn_id="t",
+            source_seq=1,
+            reason="reason is inert",
+            summary=summary,
+            next_owner=next_owner,
+        ) is None
+
+
+def test_handback_route_requires_structured_remaining_work_and_a_different_owner():
+    contradictory = (
+        "DONE — x FAILED — none BLOCKER — none REMAINING — none",
+        "DONE — none FAILED — failed action BLOCKER — none REMAINING — none",
+        "DONE — none FAILED — none BLOCKER — none REMAINING — none",
+    )
+    for summary in contradictory:
+        assert wo.build_handoff_metadata(
+            source_worker="Mythic_Operator",
+            source_turn_id="t",
+            source_seq=1,
+            reason="reason is inert",
+            summary=summary,
+            next_owner="BloodHound",
+        ) is None
+    assert wo.build_handoff_metadata(
+        source_worker="BloodHound",
+        source_turn_id="t",
+        source_seq=1,
+        reason="reason is inert",
+        summary="DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph",
+        next_owner="BloodHound",
+    ) is None
+
+
+def test_latest_admitted_handoff_requires_current_turn_and_no_later_worker():
+    metadata = wo.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=3,
+        reason="reason is inert",
+        summary="DONE — x FAILED — y BLOCKER — need graph REMAINING — query graph",
+        next_owner="BloodHound",
+    )
+    summary = AIMessage(content="DONE — x FAILED — y BLOCKER — need graph REMAINING — query graph", name="Mythic_Operator", additional_kwargs={"_worker_outcome": metadata})
+    messages = [HumanMessage(content="operator turn"), summary]
+    assert wo.latest_admitted_handoff(messages, "turn-1")[0]["next_owner"] == "BloodHound"
+    assert wo.latest_admitted_handoff(messages, "turn-2") is None
+    assert wo.latest_admitted_handoff(messages + [AIMessage(content="later worker", name="BloodHound")], "turn-1") is None
+    later = wo.build_handoff_metadata(
+        source_worker="BloodHound",
+        source_turn_id="turn-1",
+        source_seq=4,
+        reason="reason is inert",
+        summary="DONE — x FAILED — y BLOCKER — need Mythic REMAINING — act",
+        next_owner="Mythic_Operator",
+    )
+    assert wo.latest_admitted_handoff(messages + [AIMessage(content="DONE — x FAILED — y BLOCKER — need Mythic REMAINING — act", name="BloodHound", additional_kwargs={"_worker_outcome": later})], "turn-1")[0]["source_worker"] == "BloodHound"
+    messages.append(HumanMessage(content="fresh operator turn"))
+    assert wo.latest_admitted_handoff(messages, "turn-1") is None

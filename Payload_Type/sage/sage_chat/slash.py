@@ -12,8 +12,10 @@ to be useful without porting the full task-bound implementations. They grow late
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
+import math
 from typing import Any
 
 from mythic_container.ChatBase import ChatRequest, ChatSlashCommandDefinition
@@ -30,10 +32,12 @@ SLASH_COMMANDS = [
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(Name="mode", Description="Show or set the agent mode: /mode [supervised|auto]."),
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
-    ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp connect <json> | /mcp disconnect <name>."),
+    ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the baked-in BloodHound MCP: /bloodhound [directory]."),
     ChatSlashCommandDefinition(Name="sandbox", Description="Run a local-only isolated snippet: /sandbox [shell|python] <code>."),
 ]
+
+_MCP_CALL_TIMEOUT_SECONDS = 60
 
 
 def _handle_mode(model: Any, arg: str) -> str:
@@ -45,10 +49,25 @@ def _handle_mode(model: Any, arg: str) -> str:
         return f"Unknown mode `{choice}`. Valid: `supervised`, `auto`."
     if model is None:
         return f"No active session yet — send a message first, then `/mode {choice}`."
+    base_autonomy = getattr(model, "_chat_request_base_autonomous_solve", None)
+    if base_autonomy is None:
+        prior_bound = getattr(model, "_chat_mode_override_base_autonomous_solve", None)
+        base_autonomy = (
+            bool(prior_bound)
+            if prior_bound is not None
+            else bool(getattr(model, "_autonomous_solve", False))
+        )
+        model._chat_request_base_autonomous_solve = bool(base_autonomy)
     model.mode = choice
+    model._autonomous_solve = True if choice == "auto" else bool(base_autonomy)
+    model._chat_mode_override = choice
+    model._chat_mode_override_base_signature = str(
+        getattr(model, "_chat_request_config_signature", "") or ""
+    )
+    model._chat_mode_override_base_autonomous_solve = bool(base_autonomy)
     return (
         f"Mode set to **{choice}** for this channel. Controller-owned objective turns use the new mode "
-        "immediately; the legacy graph guarded-tool middleware is rebuilt on the next fresh session."
+        "immediately; guarded-tool middleware is rebuilt on the next turn."
     )
 
 
@@ -65,12 +84,9 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
     except ImportError:  # pragma: no cover
         from ..ai.langgraph import engagement_ledger  # type: ignore
 
-    engagement_id = engagement_ledger.active_engagement_id()
-    if not engagement_id:
-        # The live process hasn't frozen an engagement key yet (e.g. right after a reboot, before any
-        # turn). Resolve it from Mythic now so /state works WITHOUT sending a message first — the durable
-        # ledger already exists on disk; only Mythic knows which uuid is current (many historical ones).
-        engagement_id = await _resolve_chat_engagement_id(model, request)
+    # Resolve the exact current operation on every call. A process-global active key may belong to a
+    # different operation or channel, so it is never authoritative for `/state`.
+    engagement_id = await _resolve_chat_engagement_id(model, request)
     if not engagement_id:
         return ("Couldn't resolve this channel's engagement from Mythic (no operation context yet). "
                 "Send one message to start a session, then try `/state` again.")
@@ -89,6 +105,9 @@ async def _handle_state(model: Any, request: ChatRequest, arg: str = "") -> str:
         data["objective"] = rest
         data["objective_source"] = "operator"
         engagement_ledger.save_runtime(data, engagement_id)
+        state = getattr(model, "state", None)
+        if isinstance(state, dict):
+            state["_pending_objective_refinement"] = None
         return _render_ledger_markdown(data, engagement_id, model, request, notice="🎯 Objective updated.")
     if sub == "remove":
         if not rest:
@@ -153,8 +172,9 @@ async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
     The key is `<Operation>_<id>_<uuid>`; the uuid is a per-operation durable marker only Mythic holds
     (there can be many historical ledgers for one operation), so resolution needs a Mythic client.
     Prefer the live session's already-logged-in client; otherwise build a short-lived one from the chat
-    request's API token (the same MythicTools init the model uses). `_ensure_engagement_key` publishes the
-    resolved key via `set_active_engagement_id`, so later `/state` calls are instant. Returns "" on failure.
+    request's API token (the same MythicTools init the model uses). Read the resolved key back from that exact
+    client instance after `_ensure_engagement_key`; the process-global published key is not operation-scoped.
+    Returns "" on failure.
     """
     try:
         from ai.langgraph import engagement_ledger
@@ -166,7 +186,7 @@ async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
     if client is not None:
         try:
             await client._ensure_engagement_key()
-            key = engagement_ledger.active_engagement_id()
+            key = str(getattr(client, "_engagement_key", "") or "").strip()
             if key:
                 return key
         except Exception as e:
@@ -185,7 +205,7 @@ async def _resolve_chat_engagement_id(model: Any, request: ChatRequest) -> str:
         )
         await tools.login()
         await tools._ensure_engagement_key()
-        return engagement_ledger.active_engagement_id()
+        return str(getattr(tools, "_engagement_key", "") or "").strip()
     except Exception as e:
         logger.debug(f"/state: short-lived-client engagement resolution failed: {e}")
     return ""
@@ -285,6 +305,17 @@ async def _mcp_connect(spec: str) -> str:
     name = cfg.get("name")
     if not name:
         return "`/mcp connect` requires a `name` field."
+    read_only_tools = cfg.get("read_only_tools")
+    if read_only_tools is not None:
+        if not isinstance(read_only_tools, list) or not all(
+            isinstance(item, str) and item and item == item.strip()
+            for item in read_only_tools
+        ):
+            return (
+                "`read_only_tools` must be a JSON list of exact, non-empty MCP tool names "
+                "without surrounding whitespace."
+            )
+        read_only_tools = list(dict.fromkeys(read_only_tools))
     ctype = str(cfg.get("type", "stdio")).lower()
     try:
         if ctype == "stdio":
@@ -319,6 +350,9 @@ async def _mcp_connect(spec: str) -> str:
             )
         else:
             return f"Unknown MCP type `{ctype}` — use `stdio`, `sse`, or `http`."
+        if read_only_tools is not None:
+            conf.extra_params = dict(conf.extra_params or {})
+            conf.extra_params["read_only_tools"] = read_only_tools
         ok, err = await MCPManager.connect_server(conf)
         return f"Connected MCP server `{name}`." if ok else f"Failed to connect `{name}`: {err}"
     except Exception as e:
@@ -371,7 +405,206 @@ async def _handle_mcp(arg: str) -> str:
         return f"Disconnected MCP server `{rest}`." if ok else f"Failed to disconnect `{rest}` (not connected?)."
     if sub == "connect":
         return await _mcp_connect(rest)
-    return "Usage: `/mcp list` · `/mcp tools [server]` · `/mcp connect <json>` · `/mcp disconnect <name>`"
+    if sub == "call":
+        return await _mcp_call(rest)
+    return (
+        "Usage: `/mcp list` · `/mcp tools [server]` · "
+        "`/mcp call <server> <tool> <json-object>` · "
+        "`/mcp connect <json>` · `/mcp disconnect <name>`"
+    )
+
+
+def _mcp_call_usage() -> str:
+    return "Usage: `/mcp call <server> <tool> <json-object>`"
+
+
+def _mcp_result_fence(result: Any) -> str:
+    if isinstance(result, str):
+        body = result
+        language = "text"
+    else:
+        body = json.dumps(result, indent=2, sort_keys=True, default=str)
+        language = "json"
+    fence = "````" if "```" in body else "```"
+    return f"{fence}{language}\n{body}\n{fence}"
+
+
+def _mcp_tool_has_explicit_write_contradiction(tool: Any) -> bool:
+    """Return True when server-supplied hints explicitly contradict read-only use."""
+    metadata = getattr(tool, "metadata", None)
+    sources: list[dict[str, Any]] = []
+    if isinstance(metadata, dict):
+        sources.append(metadata)
+        nested = metadata.get("annotations")
+        if isinstance(nested, dict):
+            sources.append(nested)
+    annotations = getattr(tool, "annotations", None)
+    if isinstance(annotations, dict):
+        sources.append(annotations)
+    elif annotations is not None:
+        model_dump = getattr(annotations, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump()
+            if isinstance(dumped, dict):
+                sources.append(dumped)
+        attr_view = {
+            key: getattr(annotations, key)
+            for key in ("readOnlyHint", "destructiveHint")
+            if hasattr(annotations, key)
+        }
+        if attr_view:
+            sources.append(attr_view)
+    return any(
+        source.get("readOnlyHint") is False
+        or source.get("destructiveHint") is True
+        for source in sources
+    )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _validate_finite_json_numbers(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON number overflowed to a non-finite value")
+    if isinstance(value, dict):
+        for item in value.values():
+            _validate_finite_json_numbers(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_finite_json_numbers(item)
+
+
+def _strict_json_object(raw: str) -> dict[str, Any]:
+    value = json.loads(
+        raw,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+    _validate_finite_json_numbers(value)
+    if not isinstance(value, dict):
+        raise TypeError("argument payload must be a JSON object")
+    return value
+
+
+def _consume_late_mcp_task(task: asyncio.Future[Any]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _mcp_call(spec: str) -> str:
+    """Invoke exactly one locally-allowlisted non-BloodHound MCP tool."""
+    try:
+        from ai.mcp import MCPManager
+    except ImportError:  # pragma: no cover
+        from ..ai.mcp import MCPManager  # type: ignore
+
+    parts = (spec or "").strip().split(maxsplit=2)
+    if len(parts) != 3:
+        return _mcp_call_usage()
+    server_name, tool_name, raw_args = parts
+    if not server_name or server_name != server_name.strip():
+        return "MCP call denied: server name must be an exact non-empty name."
+    if not tool_name or tool_name != tool_name.strip():
+        return "MCP call denied: tool name must be an exact non-empty name."
+    try:
+        arguments = _strict_json_object(raw_args)
+    except TypeError:
+        return "`/mcp call` requires a JSON object argument payload."
+    except Exception as exc:
+        return f"Invalid JSON for `/mcp call`: {exc}"
+
+    connected = list(MCPManager.get_connected_servers() or [])
+    if server_name not in connected:
+        return f"MCP call denied: no connected server named exactly `{server_name}`."
+    if (
+        server_name.casefold() == "bloodhound"
+        or MCPManager.is_bloodhound_server(server_name)
+    ):
+        return "MCP call denied: direct `/mcp call` excludes the canonical BloodHound server."
+
+    config = getattr(MCPManager, "configs", {}).get(server_name)
+    extra = getattr(config, "extra_params", None)
+    configured = extra.get("read_only_tools") if isinstance(extra, dict) else None
+    if not isinstance(configured, (list, tuple, set, frozenset)):
+        return (
+            f"MCP call denied: server `{server_name}` has no local `read_only_tools` allowlist."
+        )
+    allowlisted = {
+        item
+        for item in configured
+        if isinstance(item, str) and item and item == item.strip()
+    }
+    if tool_name not in allowlisted:
+        return (
+            f"MCP call denied: tool `{tool_name}` is not locally allowlisted for server `{server_name}`."
+        )
+
+    tools = list(MCPManager.get_tools_by_server(server_name) or [])
+    malformed_names = [
+        getattr(tool, "name", None)
+        for tool in tools
+        if not isinstance(getattr(tool, "name", None), str)
+        or not getattr(tool, "name", None)
+        or getattr(tool, "name", None) != getattr(tool, "name", None).strip()
+    ]
+    if malformed_names:
+        return f"MCP call denied: server `{server_name}` exposes malformed tool names."
+    tool_names = [getattr(tool, "name") for tool in tools]
+    if len(tool_names) != len(set(tool_names)):
+        if tool_names.count(tool_name) > 1:
+            return (
+                f"MCP call denied: server `{server_name}` exposes duplicate tools named `{tool_name}`."
+            )
+        return f"MCP call denied: server `{server_name}` exposes duplicate tool names."
+    matches = [tool for tool in tools if getattr(tool, "name", None) == tool_name]
+    if len(matches) != 1:
+        return f"MCP call denied: server `{server_name}` has no tool named `{tool_name}`."
+    if _mcp_tool_has_explicit_write_contradiction(matches[0]):
+        return (
+            f"MCP call denied: tool `{tool_name}` on server `{server_name}` "
+            "has an explicit non-read-only annotation."
+        )
+
+    task: asyncio.Future[Any] | None = None
+    try:
+        task = asyncio.ensure_future(matches[0].ainvoke(arguments))
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=_MCP_CALL_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task not in done:
+            task.add_done_callback(_consume_late_mcp_task)
+            task.cancel()
+            return (
+                f"MCP call `{server_name}.{tool_name}` timed out after "
+                f"{_MCP_CALL_TIMEOUT_SECONDS} seconds."
+            )
+        result = task.result()
+    except asyncio.CancelledError:
+        if task is not None and not task.done():
+            task.add_done_callback(_consume_late_mcp_task)
+            task.cancel()
+        raise
+    except Exception as exc:
+        return f"MCP call `{server_name}.{tool_name}` failed: {exc}"
+    return (
+        f"**MCP result — `{server_name}.{tool_name}`**\n\n"
+        f"{_mcp_result_fence(result)}"
+    )
 
 
 async def _handle_bloodhound(arg: str) -> str:
@@ -485,12 +718,17 @@ async def _handle_sandbox(model: Any, request: ChatRequest, arg: str) -> str:
     return _render_sandbox_result(language, raw)
 
 
-async def _handle_stop(request: ChatRequest) -> str:
+async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
     try:
         from ai.langgraph.model import request_stop_for_sessions
     except ImportError:  # pragma: no cover
         from ..ai.langgraph.model import request_stop_for_sessions  # type: ignore
+    try:
+        from .session import drop_channel_session
+    except ImportError:  # pragma: no cover
+        from sage_chat.session import drop_channel_session  # type: ignore
     stopped = await request_stop_for_sessions(str(request.ChannelID))
+    await drop_channel_session(request, expected_model=model if model is not None else None)
     return f"Stop requested for {len(stopped)} session(s) on this channel." if stopped else "No running session to stop on this channel."
 
 
@@ -511,7 +749,7 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     elif name == "list":
         text = await _handle_list()
     elif name == "stop":
-        text = await _handle_stop(request)
+        text = await _handle_stop(request, model)
     elif name == "mcp":
         text = await _handle_mcp(arg)
     elif name == "bloodhound":

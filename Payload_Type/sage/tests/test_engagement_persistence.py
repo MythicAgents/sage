@@ -351,6 +351,44 @@ def test_no_seed_keeps_opaque_fallback(tmp_path, monkeypatch):
 
 # --- objective provenance: auto-adopted objectives are replaceable; operator/legacy ones are sticky ---
 
+def test_operator_objective_binding_reads_current_operator_ledger_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
+    mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
+    objective = "collect and ingest the graph, then read available credentials"
+
+    data = el.load("stored-trigger")
+    data["objective"] = objective
+    data["objective_source"] = "operator"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == objective
+
+    # The accessor rereads the current ledger rather than trusting the objective cached at construction.
+    data["objective"] = "a replacement operator objective"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == "a replacement operator objective"
+
+    data["objective_source"] = "autonomous_seed"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == ""
+
+    data.pop("objective_source")
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == ""
+
+    Path(mt._engagement_ledger_path()).write_text("not json", encoding="utf-8")
+    assert mt.operator_objective_binding() == ""
+
+
+def test_operator_objective_binding_requires_resolved_operation_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
+    mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
+    mt._engagement_key = None
+
+    assert mt.operator_objective_binding() == ""
+
+
 def test_reused_client_new_autonomous_seed_supersedes_prior_autonomous(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "seed-reuse")

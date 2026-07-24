@@ -11,7 +11,13 @@ import pytest
 
 from sage_chat.config import build_model_kwargs
 from sage_chat.models import SAGE_MODELS
-from sage_chat.session import channel_session_key
+from sage_chat.session import (
+    bind_channel_thread_id,
+    channel_session_key,
+    drop_channel_session,
+    get_channel_session,
+    put_channel_session,
+)
 from sage_chat.streaming import ChatStreamEmitter
 from sage_chat.headless import HeadlessSageChat, build_chat_request
 
@@ -23,11 +29,15 @@ def _run(coro):
 class _FakeModel:
     """Stand-in for ai.langgraph.model.Model — records invoke() and drives the emitter."""
 
-    def __init__(self, behavior="ok", stream=("🤖[Agent]> hi",)):
+    provider = "test"
+    model = "test"
+
+    def __init__(self, behavior="ok", stream=("🤖[Agent]> hi",), return_value="done"):
         self._response_emitter = None
         self._thread_id_override = None
         self.behavior = behavior
         self.stream = stream
+        self.return_value = return_value
         self.stop_called = False
         self.closed_delegation_statuses = []
         self.invoked_with = None
@@ -49,7 +59,7 @@ class _FakeModel:
             raise asyncio.CancelledError()
         if self.behavior == "error":
             raise RuntimeError("boom")
-        return "done"
+        return self.return_value
 
 
 class _DriverChat(HeadlessSageChat):
@@ -81,8 +91,40 @@ def test_happy_path_emits_exactly_one_terminal():
     assert model.invoked_with == ("do the thing", False)
 
 
+def test_same_channel_turns_are_serialized():
+    class _SerialModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=())
+            self.active = 0
+            self.max_active = 0
+            self.prompts = []
+
+        async def invoke(self, prompt, is_interactive=False):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.prompts.append(prompt)
+            try:
+                await asyncio.sleep(0.02)
+                await self._response_emitter(f"done:{prompt}")
+            finally:
+                self.active -= 1
+            return "done"
+
+    async def scenario():
+        model = _SerialModel()
+        chat = _DriverChat(model, preexisted=True)
+        first = build_chat_request("first", channel_id=105, request_id=1)
+        second = build_chat_request("second", channel_id=105, request_id=2)
+        await asyncio.gather(chat.chat(first), chat.chat(second))
+        return model
+
+    model = _run(scenario())
+    assert model.max_active == 1
+    assert model.prompts == ["first", "second"]
+
+
 def test_response_key_discipline():
-    model = _FakeModel(stream=("block-a", "block-b"))
+    model = _FakeModel(stream=("block-a", "block-b"), return_value="")
     chat = _DriverChat(model)
     req = build_chat_request("hi", channel_id=5, request_id=9)
     _run(chat.chat(req))
@@ -212,8 +254,14 @@ def test_autonomous_native_chat_initializes_after_exact_bloodhound_admission(mon
         "bloodhound_tool_admission",
         lambda: {
             "ready": True,
+            "server": "BloodHound",
             "reason": "BloodHound MCP exposes the required exact tools.",
         },
+    )
+    monkeypatch.setattr(
+        SageChat,
+        "_bloodhound_connection_locally_pinned",
+        staticmethod(lambda _server: True),
     )
 
     class _Model:
@@ -273,6 +321,108 @@ def test_bloodhound_tool_admission_requires_exact_names(monkeypatch):
     assert admission["missing_tools"] == ["cypher_query"]
 
 
+def test_bloodhound_tool_admission_rejects_whitespace_near_match(monkeypatch):
+    from ai import bloodhound_config
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_connected_servers",
+        lambda: ["BloodHound"],
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "is_bloodhound_server",
+        lambda server: server == "BloodHound",
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_tools_by_server",
+        lambda _server: [_Tool(" file_upload"), _Tool("domain_info"), _Tool("cypher_query")],
+    )
+
+    admission = bloodhound_config.bloodhound_tool_admission()
+
+    assert admission["ready"] is False
+    assert admission["missing_tools"] == ["file_upload"]
+    assert admission["invalid_tool_name_count"] == 1
+
+
+def test_bloodhound_tool_admission_rejects_duplicate_exact_name(monkeypatch):
+    from ai import bloodhound_config
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_connected_servers",
+        lambda: ["BloodHound"],
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "is_bloodhound_server",
+        lambda server: server == "BloodHound",
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_tools_by_server",
+        lambda _server: [
+            _Tool("file_upload"),
+            _Tool("file_upload"),
+            _Tool("domain_info"),
+            _Tool("cypher_query"),
+        ],
+    )
+
+    admission = bloodhound_config.bloodhound_tool_admission()
+
+    assert admission["ready"] is False
+    assert admission["missing_tools"] == []
+    assert admission["duplicate_tool_names"] == ["file_upload"]
+    assert "duplicate exact tools: file_upload" in admission["reason"]
+
+
+def test_bloodhound_tool_admission_rejects_invalid_unrelated_name(monkeypatch):
+    from ai import bloodhound_config
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_connected_servers",
+        lambda: ["BloodHound"],
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "is_bloodhound_server",
+        lambda server: server == "BloodHound",
+    )
+    monkeypatch.setattr(
+        bloodhound_config.MCPManager,
+        "get_tools_by_server",
+        lambda _server: [
+            _Tool("file_upload"),
+            _Tool("domain_info"),
+            _Tool("cypher_query"),
+            _Tool(" group_info"),
+        ],
+    )
+
+    admission = bloodhound_config.bloodhound_tool_admission()
+
+    assert admission["ready"] is False
+    assert admission["missing_tools"] == []
+    assert admission["invalid_tool_name_count"] == 1
+    assert "invalid tool names: 1" in admission["reason"]
+
+
 def test_bloodhound_tool_admission_rejects_multiple_matching_servers(monkeypatch):
     from ai import bloodhound_config
 
@@ -306,7 +456,12 @@ def test_new_model_records_exact_admission_state(monkeypatch):
     monkeypatch.setattr(
         bloodhound_config,
         "bloodhound_tool_admission",
-        lambda: {"ready": True, "reason": "ready"},
+        lambda: {"ready": True, "server": "BloodHound", "reason": "ready"},
+    )
+    monkeypatch.setattr(
+        SageChat,
+        "_bloodhound_connection_locally_pinned",
+        staticmethod(lambda _server: True),
     )
 
     class _Model:
@@ -335,36 +490,276 @@ def test_new_model_records_exact_admission_state(monkeypatch):
     assert model._bloodhound_exact_admission_at_initialize is True
 
 
-def test_reused_session_switching_to_auto_requires_fresh_channel(monkeypatch):
+def test_reused_auto_session_is_recreated_for_current_supervised_request(monkeypatch):
     import sage_chat.service as service
-    from ai import bloodhound_config
+
+    request = build_chat_request("objective", channel_id=805, request_id=1)
+    prior_request = build_chat_request(
+        "prior objective",
+        channel_id=805,
+        request_id=0,
+        config={"mode": "auto", "autonomous_solve": "true"},
+    )
+    stopped = []
+    dropped = []
+    created = []
 
     class _Existing:
         mode = "auto"
         _autonomous_solve = True
+        policy_mode = "hybrid"
+        _max_steps = 200
         _bloodhound_exact_admission_at_initialize = False
-        apitoken_id = 0
+        apitoken_id = request.APITokenID
+        operation_id = request.OperationID
 
-    async def _get_existing(_request):
-        return _Existing()
+        def request_stop(self):
+            stopped.append(True)
 
-    async def _ensure():
-        return True, "connected"
-
-    monkeypatch.setattr(service, "get_channel_session", _get_existing)
-    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
-    monkeypatch.setattr(
-        bloodhound_config,
-        "bloodhound_tool_admission",
-        lambda: {"ready": True, "reason": "ready"},
+    existing = _Existing()
+    existing._chat_request_config_signature = service._model_config_signature(
+        service.build_model_kwargs(prior_request)
     )
 
-    with pytest.raises(RuntimeError, match="fresh channel/session"):
-        _run(
-            service.SageChat()._get_or_create_model(
-                build_chat_request("objective", channel_id=805, request_id=1)
-            )
-        )
+    async def _get_existing(_request):
+        return existing
+
+    async def _drop(_request, *, expected_model=None):
+        dropped.append(expected_model)
+        return True
+
+    async def _put(_request, model):
+        created.append(model)
+
+    async def _ensure(_self, *, autonomous_required=False):
+        assert autonomous_required is False
+        return False
+
+    class _Model:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+            self.mode = kwargs["mode"]
+            self._autonomous_solve = kwargs["autonomous_solve"]
+            self.policy_mode = kwargs["policy_mode"]
+            self._max_steps = kwargs["max_steps"]
+            self.apitoken_id = kwargs["apitoken_id"]
+            self.operation_id = kwargs["operation_id"]
+
+        async def initialize(self):
+            return None
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr(service, "get_channel_session", _get_existing)
+    monkeypatch.setattr(service, "drop_channel_session", _drop)
+    monkeypatch.setattr(service, "put_channel_session", _put)
+    monkeypatch.setattr(service.SageChat, "_ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+
+    replacement, preexisted = _run(service.SageChat()._get_or_create_model(request))
+
+    assert replacement is not existing
+    assert preexisted is False
+    assert stopped == [True]
+    assert dropped == [existing]
+    assert replacement.mode == "supervised"
+    assert replacement._autonomous_solve is False
+
+
+def test_reused_session_with_identical_resolved_config_is_preserved(monkeypatch):
+    import sage_chat.service as service
+
+    request = build_chat_request("inspect", channel_id=806, request_id=1)
+    kwargs = service.build_model_kwargs(request)
+
+    class _Existing:
+        mode = kwargs["mode"]
+        _autonomous_solve = kwargs["autonomous_solve"]
+        policy_mode = kwargs["policy_mode"]
+        _max_steps = kwargs["max_steps"]
+        _bloodhound_exact_admission_at_initialize = False
+        apitoken_id = request.APITokenID
+        operation_id = request.OperationID
+        _chat_request_config_signature = service._model_config_signature(kwargs)
+
+    existing = _Existing()
+
+    async def _get_existing(_request):
+        return existing
+
+    async def _unexpected_drop(*_args, **_kwargs):
+        raise AssertionError("identical config must not rotate the session")
+
+    monkeypatch.setattr(service, "get_channel_session", _get_existing)
+    monkeypatch.setattr(service, "drop_channel_session", _unexpected_drop)
+
+    reused, preexisted = _run(service.SageChat()._get_or_create_model(request))
+
+    assert reused is existing
+    assert preexisted is True
+
+
+@pytest.mark.parametrize(
+    ("config", "override_mode", "expected_autonomy"),
+    (
+        ({"mode": "supervised", "autonomous_solve": "false"}, "auto", True),
+        ({"mode": "auto", "autonomous_solve": "true"}, "supervised", True),
+    ),
+)
+def test_slash_mode_override_reuses_unchanged_base_request_with_bound_autonomy(
+    monkeypatch,
+    config,
+    override_mode,
+    expected_autonomy,
+):
+    import sage_chat.service as service
+    from sage_chat.slash import _handle_mode
+
+    request = build_chat_request("next turn", channel_id=807, request_id=2, config=config)
+    kwargs = service.build_model_kwargs(request)
+    signature = service._model_config_signature(kwargs)
+    ensure_calls = []
+
+    class _Existing:
+        mode = kwargs["mode"]
+        _autonomous_solve = kwargs["autonomous_solve"]
+        policy_mode = kwargs["policy_mode"]
+        _max_steps = kwargs["max_steps"]
+        _bloodhound_exact_admission_at_initialize = True
+        apitoken_id = request.APITokenID
+        operation_id = request.OperationID
+        _chat_request_config_signature = signature
+        _chat_request_base_autonomous_solve = kwargs["autonomous_solve"]
+
+    existing = _Existing()
+    assert "Mode set" in _handle_mode(existing, override_mode)
+
+    async def _get_existing(_request):
+        return existing
+
+    async def _unexpected_drop(*_args, **_kwargs):
+        raise AssertionError("an override bound to unchanged base config must not rotate")
+
+    async def _ensure(_self, *, autonomous_required=False):
+        ensure_calls.append(autonomous_required)
+        return True
+
+    monkeypatch.setattr(service, "get_channel_session", _get_existing)
+    monkeypatch.setattr(service, "drop_channel_session", _unexpected_drop)
+    monkeypatch.setattr(service.SageChat, "_ensure_bloodhound_connected", _ensure)
+
+    reused, preexisted = _run(service.SageChat()._get_or_create_model(request))
+
+    assert reused is existing
+    assert preexisted is True
+    assert reused.mode == override_mode
+    assert reused._autonomous_solve is expected_autonomy
+    assert reused._chat_mode_override == override_mode
+    assert reused._chat_mode_override_base_autonomous_solve is kwargs["autonomous_solve"]
+    assert ensure_calls == ([True] if expected_autonomy else [])
+
+
+def test_slash_supervised_restores_bound_base_autonomy_after_auto_override():
+    from sage_chat.slash import _handle_mode
+
+    class _Existing:
+        mode = "supervised"
+        _autonomous_solve = False
+        _chat_request_config_signature = "base-signature"
+        _chat_request_base_autonomous_solve = False
+
+    existing = _Existing()
+    assert "Mode set" in _handle_mode(existing, "auto")
+    assert existing.mode == "auto"
+    assert existing._autonomous_solve is True
+
+    assert "Mode set" in _handle_mode(existing, "supervised")
+    assert existing.mode == "supervised"
+    assert existing._autonomous_solve is False
+    assert existing._chat_mode_override_base_signature == "base-signature"
+    assert existing._chat_mode_override_base_autonomous_solve is False
+
+
+def test_base_request_config_change_rotates_session_and_clears_slash_mode_override(monkeypatch):
+    import sage_chat.service as service
+    from sage_chat.slash import _handle_mode
+
+    prior_request = build_chat_request("prior", channel_id=808, request_id=1)
+    current_request = build_chat_request(
+        "current",
+        channel_id=808,
+        request_id=2,
+        config={"max_steps": "201"},
+    )
+    prior_kwargs = service.build_model_kwargs(prior_request)
+    stopped = []
+    dropped = []
+
+    class _Existing:
+        mode = prior_kwargs["mode"]
+        _autonomous_solve = prior_kwargs["autonomous_solve"]
+        policy_mode = prior_kwargs["policy_mode"]
+        _max_steps = prior_kwargs["max_steps"]
+        _bloodhound_exact_admission_at_initialize = False
+        apitoken_id = current_request.APITokenID
+        operation_id = current_request.OperationID
+        _chat_request_config_signature = service._model_config_signature(prior_kwargs)
+
+        def request_stop(self):
+            stopped.append(True)
+
+    existing = _Existing()
+    _handle_mode(existing, "auto")
+
+    async def _get_existing(_request):
+        return existing
+
+    async def _drop(_request, *, expected_model=None):
+        dropped.append(expected_model)
+        return True
+
+    async def _put(_request, _model):
+        return None
+
+    async def _ensure(_self, *, autonomous_required=False):
+        assert autonomous_required is False
+        return False
+
+    class _Model:
+        def __init__(self, **kwargs):
+            self.mode = kwargs["mode"]
+            self._autonomous_solve = kwargs["autonomous_solve"]
+            self.policy_mode = kwargs["policy_mode"]
+            self._max_steps = kwargs["max_steps"]
+            self.apitoken_id = kwargs["apitoken_id"]
+            self.operation_id = kwargs["operation_id"]
+
+        async def initialize(self):
+            return None
+
+        def set_verbose(self, _value):
+            return None
+
+    monkeypatch.setattr(service, "get_channel_session", _get_existing)
+    monkeypatch.setattr(service, "drop_channel_session", _drop)
+    monkeypatch.setattr(service, "put_channel_session", _put)
+    monkeypatch.setattr(service.SageChat, "_ensure_bloodhound_connected", _ensure)
+    monkeypatch.setattr("ai.langgraph.model.Model", _Model)
+
+    replacement, preexisted = _run(service.SageChat()._get_or_create_model(current_request))
+
+    assert replacement is not existing
+    assert preexisted is False
+    assert stopped == [True]
+    assert dropped == [existing]
+    assert replacement.mode == "supervised"
+    assert replacement._chat_mode_override == ""
+    assert replacement._chat_mode_override_base_signature == ""
+    assert replacement._chat_mode_override_base_autonomous_solve is None
+    assert replacement._chat_request_config_signature == service._model_config_signature(
+        service.build_model_kwargs(current_request)
+    )
 
 
 def test_channel_metadata_publishes_before_model_invoke():
@@ -440,12 +835,14 @@ def test_channel_metadata_tracks_active_agent_then_returns_idle(monkeypatch):
 def test_cancel_reraises_and_cooperatively_stops():
     model = _FakeModel(behavior="cancel")
     chat = _DriverChat(model)
-    req = build_chat_request("go", channel_id=5, request_id=11)
+    req = build_chat_request("go", channel_id=505, request_id=11)
+    _run(put_channel_session(req, model))
     with pytest.raises(asyncio.CancelledError):
         _run(chat.chat(req))
     # cooperative stop fired; the SDK (not us) emits the cancelled terminal, so we must NOT have.
     assert model.stop_called is True
     assert chat.terminal_emissions == []
+    assert _run(get_channel_session(req)) is None
 
 
 def test_handler_exception_emits_one_error_terminal():
@@ -481,13 +878,44 @@ def test_emitter_skips_empty_and_increments_blocks():
     assert emitter.last_content == "b"
 
 
-def test_no_assistant_output_uses_nonempty_terminal_fallback():
+def test_no_assistant_output_preserves_nonempty_native_return_text():
     chat = _DriverChat(_FakeModel(stream=()))
     _run(chat.chat(build_chat_request("quiet turn", channel_id=5, request_id=13)))
 
     assert chat.terminal_emissions == [{
         "kind": "complete",
         "response_key": "assistant:13:turn",
+        "content": "done",
+        "metadata": {"channel_id": 5},
+        "complete_request": True,
+    }]
+
+
+def test_native_return_replaces_last_stream_block_as_the_single_terminal():
+    chat = _DriverChat(
+        _FakeModel(
+            stream=("prompt echo", "progress update"),
+            return_value="distinct terminal report",
+        )
+    )
+    _run(chat.chat(build_chat_request("objective", channel_id=5, request_id=131)))
+
+    assert chat.terminal_emissions == [{
+        "kind": "complete",
+        "response_key": "assistant:131:2",
+        "content": "distinct terminal report",
+        "metadata": {"channel_id": 5},
+        "complete_request": True,
+    }]
+
+
+def test_no_assistant_output_uses_nonempty_terminal_fallback_when_native_return_is_blank():
+    chat = _DriverChat(_FakeModel(stream=(), return_value="   "))
+    _run(chat.chat(build_chat_request("quiet turn", channel_id=5, request_id=130)))
+
+    assert chat.terminal_emissions == [{
+        "kind": "complete",
+        "response_key": "assistant:130:turn",
         "content": "Completed.",
         "metadata": {"channel_id": 5},
         "complete_request": True,
@@ -1034,6 +1462,20 @@ def test_channel_session_key_is_channel_id():
     assert channel_session_key(req) == "77"
 
 
+def test_channel_checkpoint_generations_are_stable_per_model_and_unique_across_replacements():
+    req = build_chat_request("hi", channel_id=77)
+    first = _FakeModel()
+    second = _FakeModel()
+
+    first_id = bind_channel_thread_id(req, first)
+    assert bind_channel_thread_id(req, first) == first_id
+    second_id = bind_channel_thread_id(req, second)
+
+    assert first_id.startswith("77:generation:")
+    assert second_id.startswith("77:generation:")
+    assert first_id != second_id
+
+
 # --------------------------------------------------------------------------------------
 # Phase 3 — slash commands
 # --------------------------------------------------------------------------------------
@@ -1071,12 +1513,19 @@ def test_slash_mode_show_then_set():
 
     class _M:
         mode = "supervised"
+        _autonomous_solve = False
+        _chat_request_config_signature = "base-signature"
+        _chat_request_base_autonomous_solve = False
 
     m = _M()
     _run(handle_slash(chat, _slash_req("mode"), m, "slash:1"))
     assert "supervised" in chat.emissions[-1]["content"]
     _run(handle_slash(chat, _slash_req("mode", "auto"), m, "slash:2"))
     assert m.mode == "auto"
+    assert m._autonomous_solve is True
+    assert m._chat_mode_override == "auto"
+    assert m._chat_mode_override_base_signature == "base-signature"
+    assert m._chat_mode_override_base_autonomous_solve is False
 
 
 def test_slash_unknown_falls_through_without_emitting():
@@ -1109,11 +1558,45 @@ def test_slash_mcp_connect_invalid_json():
     assert "Invalid JSON" in chat.emissions[-1]["content"]
 
 
+def test_slash_mcp_connect_rejects_nonlist_read_only_tool_policy():
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req(
+            "mcp",
+            'connect {"type":"sse","name":"Nemesis","url":"https://nemesis.local/mcp",'
+            '"read_only_tools":"search-files"}',
+        ),
+        None,
+        "slash:1",
+    ))
+    assert "must be a JSON list" in chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_connect_rejects_whitespace_normalized_tool_authority():
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req(
+            "mcp",
+            'connect {"type":"sse","name":"Nemesis","url":"https://nemesis.local/mcp",'
+            '"read_only_tools":[" search-files"]}',
+        ),
+        None,
+        "slash:1",
+    ))
+    assert "without surrounding whitespace" in chat.emissions[-1]["content"]
+
+
 def test_slash_mcp_connect_sse_passes_tls_and_timeout_options(monkeypatch):
     from ai import mcp as mcpmod
 
     captured = {}
-    sentinel = object()
+
+    class _Config:
+        extra_params = None
+
+    sentinel = _Config()
 
     def _sse_config(**kwargs):
         captured.update(kwargs)
@@ -1135,6 +1618,7 @@ def test_slash_mcp_connect_sse_passes_tls_and_timeout_options(monkeypatch):
                 'connect {"type":"sse","name":"Nemesis","url":"https://nemesis.local/mcp/sse",'
                 '"headers":{"Authorization":"Basic bjpu"},"timeout":12,"sse_read_timeout":45,'
                 '"ssl_verify":false,"session_kwargs":{"read_timeout_seconds":90},'
+                '"read_only_tools":["search-files","count-files","search-files"],'
                 '"sage_execution_class":"non_target_control_plane"}',
             ),
             None,
@@ -1152,6 +1636,7 @@ def test_slash_mcp_connect_sse_passes_tls_and_timeout_options(monkeypatch):
         "session_kwargs": {"read_timeout_seconds": 90},
         "sage_execution_class": "non_target_control_plane",
     }
+    assert sentinel.extra_params == {"read_only_tools": ["search-files", "count-files"]}
     assert "Connected MCP server `Nemesis`" in chat.emissions[-1]["content"]
 
 
@@ -1165,6 +1650,361 @@ def test_slash_mcp_disconnect(monkeypatch):
     chat = HeadlessSageChat()
     _run(handle_slash(chat, _slash_req("mcp", "disconnect srv1"), None, "slash:1"))
     assert "Disconnected MCP server `srv1`" in chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_call_invokes_one_exact_locally_allowlisted_tool(monkeypatch):
+    from ai import mcp as mcpmod
+
+    observed = {}
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        name = "search-files"
+
+        async def ainvoke(self, arguments):
+            observed["arguments"] = arguments
+            return {"rows": [{"path": "a.txt"}]}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()] if server == "Nemesis" else [])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert observed["arguments"] == {"query": "hello"}
+    assert "MCP result — `Nemesis.search-files`" in chat.emissions[-1]["content"]
+    assert '"path": "a.txt"' in chat.emissions[-1]["content"]
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected"),
+    [
+        ('call Nemesis search-files {"query":"hello"}', "no local `read_only_tools` allowlist"),
+        ('call Other search-files {"query":"hello"}', "no connected server named exactly `Other`"),
+        ('call Nemesis search-files {not-json}', "Invalid JSON"),
+    ],
+)
+def test_slash_mcp_call_denies_without_exact_local_authority(monkeypatch, argument, expected):
+    from ai import mcp as mcpmod
+
+    class _Config:
+        extra_params = {}
+
+    class _Tool:
+        name = "search-files"
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()] if server == "Nemesis" else [])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(chat, _slash_req("mcp", argument), None, "slash:1"))
+
+    assert expected in chat.emissions[-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "raw_json",
+    [
+        '{"outer":{"key":1,"key":2}}',
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '{"value":-Infinity}',
+        '{"value":1e999}',
+    ],
+)
+def test_slash_mcp_call_rejects_ambiguous_or_nonfinite_json_without_invocation(
+    monkeypatch, raw_json
+):
+    from ai import mcp as mcpmod
+
+    invocations = []
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        name = "search-files"
+
+        async def ainvoke(self, arguments):
+            invocations.append(arguments)
+            return {}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", f"call Nemesis search-files {raw_json}"),
+        None,
+        "slash:1",
+    ))
+
+    assert "Invalid JSON for `/mcp call`" in chat.emissions[-1]["content"]
+    assert invocations == []
+
+
+def test_slash_mcp_call_denies_duplicate_or_malformed_tool_registry(monkeypatch):
+    from ai import mcp as mcpmod
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    monkeypatch.setattr(
+        mcpmod.MCPManager,
+        "get_tools_by_server",
+        lambda server: [_Tool("search-files"), _Tool("search-files")],
+    )
+    duplicate_chat = HeadlessSageChat()
+    _run(handle_slash(
+        duplicate_chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+    assert "duplicate tools named `search-files`" in duplicate_chat.emissions[-1]["content"]
+
+    monkeypatch.setattr(
+        mcpmod.MCPManager,
+        "get_tools_by_server",
+        lambda server: [_Tool(" search-files")],
+    )
+    malformed_chat = HeadlessSageChat()
+    _run(handle_slash(
+        malformed_chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+    assert "exposes malformed tool names" in malformed_chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_call_denies_duplicate_unselected_catalog_names(monkeypatch):
+    from ai import mcp as mcpmod
+
+    invocations = []
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        def __init__(self, name):
+            self.name = name
+
+        async def ainvoke(self, arguments):
+            invocations.append(arguments)
+            return {}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(
+        mcpmod.MCPManager,
+        "get_tools_by_server",
+        lambda server: [_Tool("search-files"), _Tool("other"), _Tool("other")],
+    )
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert "exposes duplicate tool names" in chat.emissions[-1]["content"]
+    assert invocations == []
+
+
+def test_slash_mcp_call_denies_canonical_bloodhound_server(monkeypatch):
+    from ai import mcp as mcpmod
+
+    class _Config:
+        extra_params = {"read_only_tools": ["cypher_query"]}
+
+    class _Tool:
+        name = "cypher_query"
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"BloodHound": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["BloodHound"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: server == "BloodHound")
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call BloodHound cypher_query {"query":"MATCH (n) RETURN n"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert "excludes the canonical BloodHound server" in chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_call_denies_casefold_bloodhound_name_without_canonical_match(monkeypatch):
+    from ai import mcp as mcpmod
+
+    class _Config:
+        extra_params = {"read_only_tools": ["read"]}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"bLoOdHoUnD": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["bLoOdHoUnD"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call bLoOdHoUnD read {"query":"x"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert "excludes the canonical BloodHound server" in chat.emissions[-1]["content"]
+
+
+@pytest.mark.parametrize(
+    "tool_factory",
+    [
+        lambda: type(
+            "_Tool",
+            (),
+            {
+                "name": "search-files",
+                "metadata": {"readOnlyHint": False},
+                "ainvoke": lambda self, arguments: (_ for _ in ()).throw(AssertionError("must not invoke")),
+            },
+        )(),
+        lambda: type(
+            "_Tool",
+            (),
+            {
+                "name": "search-files",
+                "annotations": {"destructiveHint": True},
+                "ainvoke": lambda self, arguments: (_ for _ in ()).throw(AssertionError("must not invoke")),
+            },
+        )(),
+    ],
+)
+def test_slash_mcp_call_denies_explicit_non_read_only_annotations(monkeypatch, tool_factory):
+    from ai import mcp as mcpmod
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [tool_factory()])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert "has an explicit non-read-only annotation" in chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_call_times_out_after_bounded_wait(monkeypatch):
+    from ai import mcp as mcpmod
+    import sage_chat.slash as slashmod
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        name = "search-files"
+
+        async def ainvoke(self, arguments):
+            await asyncio.sleep(0.02)
+            return {"rows": []}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+    monkeypatch.setattr(slashmod, "_MCP_CALL_TIMEOUT_SECONDS", 0.001)
+
+    chat = HeadlessSageChat()
+    _run(handle_slash(
+        chat,
+        _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+        None,
+        "slash:1",
+    ))
+
+    assert "timed out after 0.001 seconds" in chat.emissions[-1]["content"]
+
+
+def test_slash_mcp_call_deadline_survives_cancellation_resistant_tool(monkeypatch):
+    from ai import mcp as mcpmod
+    import sage_chat.slash as slashmod
+
+    invocations = 0
+
+    class _Config:
+        extra_params = {"read_only_tools": ["search-files"]}
+
+    class _Tool:
+        name = "search-files"
+
+        async def ainvoke(self, arguments):
+            nonlocal invocations
+            invocations += 1
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                return {"late": True}
+
+    monkeypatch.setattr(mcpmod.MCPManager, "configs", {"Nemesis": _Config()}, raising=False)
+    monkeypatch.setattr(mcpmod.MCPManager, "get_connected_servers", lambda: ["Nemesis"])
+    monkeypatch.setattr(mcpmod.MCPManager, "get_tools_by_server", lambda server: [_Tool()])
+    monkeypatch.setattr(mcpmod.MCPManager, "is_bloodhound_server", lambda server: False)
+    monkeypatch.setattr(slashmod, "_MCP_CALL_TIMEOUT_SECONDS", 0.005)
+
+    async def scenario():
+        chat = HeadlessSageChat()
+        started = asyncio.get_running_loop().time()
+        await handle_slash(
+            chat,
+            _slash_req("mcp", 'call Nemesis search-files {"query":"hello"}'),
+            None,
+            "slash:1",
+        )
+        slash_elapsed = asyncio.get_running_loop().time() - started
+        await asyncio.sleep(0.07)
+        return chat, slash_elapsed
+
+    chat, slash_elapsed = _run(scenario())
+
+    assert slash_elapsed < 0.04
+    assert invocations == 1
+    assert "timed out after 0.005 seconds" in chat.emissions[-1]["content"]
 
 
 def test_slash_bloodhound(monkeypatch):
@@ -1326,7 +2166,14 @@ def test_login_task_branch_unchanged(monkeypatch):
 # Phase 2 — native-card HITL (Option C)
 # --------------------------------------------------------------------------------------
 
-from sage_chat.hitl import build_approval_request, make_card_emitter, resume_decision_for_request, should_confirm
+from sage_chat.hitl import (
+    approval_action_digest,
+    approval_response_matches,
+    build_approval_request,
+    make_card_emitter,
+    resume_decision_for_request,
+    should_confirm,
+)
 from mythic_container.ChatBase import ChatInputResponse
 
 
@@ -1350,7 +2197,14 @@ class _HitlModel:
         self._hitl_card_pending = True
         self._pending = True
 
-    async def handle_hitl_resume(self, decision, thread_id, operator_message=""):
+    async def handle_hitl_resume(
+        self,
+        decision,
+        thread_id,
+        operator_message="",
+        expected_action_digest="",
+    ):
+        del expected_action_digest
         self.resumed_with = decision
         self.steered_with = operator_message
         self._pending = False
@@ -1377,11 +2231,35 @@ class _ControllerHitlModel(_HitlModel):
         super().__init__()
         self._controller_hitl_pending = {"tool": "execute_capability", "args": {"target": "DC01"}}
 
-    async def handle_controller_hitl_resume(self, decision):
+    async def handle_controller_hitl_resume(self, decision, expected_action_digest=""):
+        del expected_action_digest
         self.resumed_with = decision
         self._controller_hitl_pending = None
         await self._response_emitter(f"🤖> controller-resume:{decision}")
         return ""
+
+
+def _install_pending_approval_context(model, request, approval_id="approval-1"):
+    thread_id = bind_channel_thread_id(request, model)
+    action_requests = [{"name": "execute_capability", "args": {"target": "DC01"}}]
+    context = {
+        "approval_id": approval_id,
+        "thread_id": thread_id,
+        "turn_id": thread_id,
+        "tool_name": "execute_capability",
+        "action_digest": approval_action_digest(action_requests),
+        "operation_id": str(request.OperationID),
+        "apitoken_id": str(request.APITokenID),
+    }
+    model._pending_approval_context = context
+    return context
+
+
+def _input_response_for_context(action, context):
+    return ChatInputResponse(
+        action=action,
+        input_request={"data": {"sage_approval_context": dict(context)}},
+    )
 
 
 def test_should_confirm_policy():
@@ -1409,6 +2287,42 @@ def test_approval_request_uses_capability_display_name_without_changing_guarded_
     assert "forge-golden-ticket" in req["prompt"]
     assert req["data"]["tool_name"] == "execute_capability"
     assert req["data"]["display_name"] == "forge-golden-ticket"
+
+
+def test_approval_request_discloses_every_guarded_action_and_exact_arguments():
+    req = build_approval_request([
+        {"name": "create_payload", "args": {"os": "windows", "arch": "x64"}},
+        {"name": "execute_capability", "args": {"action": {"name": "dcsync-krbtgt"}}},
+    ])
+
+    assert req["title"] == "Approve 2 guarded actions"
+    assert "Accept approves all 2" in req["prompt"]
+    assert "Action 1: create_payload" in req["description"]
+    assert "os: windows" in req["description"]
+    assert "Action 2: dcsync-krbtgt" in req["description"]
+    assert req["data"]["guarded_action_count"] == 2
+    assert [action["tool_name"] for action in req["data"]["actions"]] == [
+        "create_payload",
+        "execute_capability",
+    ]
+
+
+def test_failed_approval_card_send_never_installs_resumable_context():
+    class _BrokenChat:
+        async def send_approval_request(self, *_args, **_kwargs):
+            raise RuntimeError("transport down")
+
+    request = build_chat_request("x", channel_id=6, request_id=1)
+    stored = []
+    emitter = make_card_emitter(
+        _BrokenChat(),
+        request,
+        approval_context_store=stored.append,
+    )
+
+    with pytest.raises(RuntimeError, match="transport down"):
+        _run(emitter([{"name": "execute_capability", "args": {"target": "DC01"}}]))
+    assert stored == []
 
 
 def test_approval_cards_use_unique_keys_and_optional_delegation_tags():
@@ -1460,7 +2374,7 @@ def test_hitl_confirm_flow_input_request_then_resume():
     # Request N+1: operator ACCEPTS → InputResponse(action="accept") → resume APPROVE, one terminal.
     chat.emissions.clear()
     reqN1 = build_chat_request("", channel_id=5, request_id=2)
-    reqN1.InputResponse = ChatInputResponse(action="accept")
+    reqN1.InputResponse = _input_response_for_context("accept", model._pending_approval_context)
     _run(chat.chat(reqN1))
     assert model.resumed_with == "approve"
     assert model._pending is False
@@ -1473,21 +2387,138 @@ def test_hitl_reject_resumes_deny():
     model._pending = True  # an interrupt is already pending on this channel
     chat = _HitlDriverChat(model)
     reqR = build_chat_request("", channel_id=5, request_id=2)
-    reqR.InputResponse = ChatInputResponse(action="reject")
+    context = _install_pending_approval_context(model, reqR)
+    reqR.InputResponse = _input_response_for_context("reject", context)
     _run(chat.chat(reqR))
     assert model.resumed_with == "deny"
     assert len(chat.terminal_emissions) == 1
+
+
+def test_replayed_approval_response_resumes_checkpoint_only_once():
+    class _SlowResumeModel(_HitlModel):
+        def __init__(self):
+            super().__init__()
+            self.resume_calls = 0
+
+        async def handle_hitl_resume(
+            self,
+            decision,
+            thread_id,
+            operator_message="",
+            expected_action_digest="",
+        ):
+            del expected_action_digest
+            self.resume_calls += 1
+            await asyncio.sleep(0.02)
+            self.resumed_with = decision
+            self._pending = False
+            return ""
+
+    async def scenario():
+        model = _SlowResumeModel()
+        model._pending = True
+        chat = _HitlDriverChat(model)
+        first = build_chat_request("", channel_id=106, request_id=1)
+        context = _install_pending_approval_context(model, first)
+        first.InputResponse = _input_response_for_context("accept", context)
+        second = build_chat_request("", channel_id=106, request_id=2)
+        second.InputResponse = _input_response_for_context("accept", context)
+        await asyncio.gather(chat.chat(first), chat.chat(second))
+        return model, chat
+
+    model, chat = _run(scenario())
+    assert model.resume_calls == 1
+    assert any("no longer active" in str(item.get("content", "")) for item in chat.emissions)
 
 
 def test_controller_hitl_card_response_resumes_controller_pending_move():
     model = _ControllerHitlModel()
     chat = _HitlDriverChat(model)
     req = build_chat_request("", channel_id=5, request_id=3)
-    req.InputResponse = ChatInputResponse(action="accept")
+    context = _install_pending_approval_context(model, req)
+    req.InputResponse = _input_response_for_context("accept", context)
     _run(chat.chat(req))
     assert model.resumed_with == "approve"
     assert model._controller_hitl_pending is None
     assert len(chat.terminal_emissions) == 1
+
+
+def test_delayed_approval_for_old_generation_cannot_approve_new_pending_action():
+    old_model = _HitlModel()
+    old_chat = _HitlDriverChat(old_model)
+    _run(old_chat.chat(build_chat_request("old guarded action", channel_id=51, request_id=1)))
+    old_context = dict(old_model._pending_approval_context)
+
+    new_model = _HitlModel()
+    new_chat = _HitlDriverChat(new_model)
+    _run(new_chat.chat(build_chat_request("new guarded action", channel_id=51, request_id=2)))
+    assert new_model._pending is True
+    assert new_model._pending_approval_context != old_context
+
+    stale = build_chat_request("", channel_id=51, request_id=3)
+    stale.InputResponse = _input_response_for_context("accept", old_context)
+    new_chat.emissions.clear()
+    _run(new_chat.chat(stale))
+
+    assert new_model.resumed_with is None
+    assert new_model._pending is True
+    assert new_model._pending_approval_context != old_context
+    assert any("no longer active" in str(item.get("content", "")) for item in new_chat.emissions)
+
+
+def test_fresh_prompt_replaces_pending_hitl_session_instead_of_resuming_it():
+    old_model = _HitlModel()
+    old_model._pending = True
+    replacement = _FakeModel(stream=("fresh answer",))
+
+    class _RotatingChat(HeadlessSageChat):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _get_or_create_model(self, request):
+            self.calls += 1
+            return (old_model, True) if self.calls == 1 else (replacement, False)
+
+    chat = _RotatingChat()
+    _run(chat.chat(build_chat_request("What callbacks do we have?", channel_id=52, request_id=1)))
+
+    assert chat.calls == 2
+    assert old_model.resumed_with is None
+    assert replacement.invoked_with == ("What callbacks do we have?", False)
+
+
+def test_fresh_prompt_rotates_session_when_hitl_probe_fails():
+    class _ProbeFailureModel(_HitlModel):
+        async def _hitl_interrupt_pending(self, thread_id):
+            raise RuntimeError("checkpoint unavailable")
+
+    old_model = _ProbeFailureModel()
+    replacement = _FakeModel(stream=("fresh answer",))
+
+    class _RotatingChat(HeadlessSageChat):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def _get_or_create_model(self, request):
+            self.calls += 1
+            return (old_model, True) if self.calls == 1 else (replacement, False)
+
+    chat = _RotatingChat()
+    _run(chat.chat(build_chat_request("What callbacks do we have?", channel_id=54, request_id=1)))
+
+    assert chat.calls == 2
+    assert replacement.invoked_with == ("What callbacks do we have?", False)
+
+
+def test_approval_response_correlation_fails_closed_without_echoed_context():
+    model = _HitlModel()
+    request = build_chat_request("", channel_id=53, request_id=1)
+    expected = _install_pending_approval_context(model, request)
+    request.InputResponse = ChatInputResponse(action="accept")
+
+    assert approval_response_matches(request, expected) is False
 
 
 # --------------------------------------------------------------------------------------
@@ -1565,30 +2596,80 @@ def test_whoami_scopes_query_failure_returns_none(monkeypatch):
     assert _run(client.whoami_scopes()) is None  # failure → gate nothing
 
 
-def test_refresh_auth_context_relogins_only_on_token_change():
+def test_refresh_auth_context_accepts_only_the_same_token_and_operation():
     chat = HeadlessSageChat()
-
-    class _Client:
-        def __init__(self):
-            self.logins = 0
-            self.apitoken_id = None
-
-        async def login(self):
-            self.logins += 1
-
-    class _M:
-        def __init__(self):
-            self.apitoken_id = 1
-            self.operation_id = 1
-            self.mythic_client = _Client()
-
-    m = _M()
     req = build_chat_request("hi", channel_id=5, operation_id=2)
     req.APITokenID = 99
+
+    class _Model:
+        apitoken_id = req.APITokenID
+        operation_id = req.OperationID
+
+    m = _Model()
     _run(chat._refresh_auth_context(m, req))
-    assert m.apitoken_id == 99 and m.mythic_client.logins == 1  # token changed → re-login
-    _run(chat._refresh_auth_context(m, req))
-    assert m.mythic_client.logins == 1  # unchanged → no re-login
+
+    req.APITokenID = 100
+    with pytest.raises(RuntimeError, match="fresh Sage session"):
+        _run(chat._refresh_auth_context(m, req))
+    req.APITokenID = m.apitoken_id
+    req.OperationID = 3
+    with pytest.raises(RuntimeError, match="fresh Sage session"):
+        _run(chat._refresh_auth_context(m, req))
+
+
+def test_token_change_rotates_the_entire_channel_session():
+    from sage_chat.session import drop_channel_session
+
+    class _Model:
+        def __init__(self):
+            self.provider = "test"
+            self.model = "test"
+            self.apitoken_id = 1
+            self.operation_id = 1
+            self.stopped = False
+
+        def request_stop(self):
+            self.stopped = True
+
+    model = _Model()
+    request = _slash_req("sandbox", "shell id", channel_id=177, request_id=1)
+    request.APITokenID = 99
+    chat = HeadlessSageChat()
+    _run(put_channel_session(request, model))
+    try:
+        assert _run(chat._rotate_auth_changed_session(request, model)) is None
+        assert _run(get_channel_session(request)) is None
+    finally:
+        _run(drop_channel_session(request, expected_model=model))
+
+    assert model.stopped is True
+
+
+def test_operation_change_cannot_reuse_old_model_state():
+    class _Model:
+        provider = "test"
+        model = "test"
+        apitoken_id = 1
+        operation_id = 1
+
+        def __init__(self):
+            self.requested_stop = False
+            self.sensitive_cache = {"credential": "old-operation"}
+
+        def request_stop(self):
+            self.requested_stop = True
+
+    request = build_chat_request("x", channel_id=178, request_id=1)
+    request.APITokenID = 1
+    request.OperationID = 2
+    model = _Model()
+    _run(put_channel_session(request, model))
+    try:
+        assert _run(HeadlessSageChat()._rotate_auth_changed_session(request, model)) is None
+        assert _run(get_channel_session(request)) is None
+    finally:
+        _run(drop_channel_session(request, expected_model=model))
+    assert model.requested_stop is True
 
 
 # --------------------------------------------------------------------------------------
@@ -1657,10 +2738,39 @@ def test_provider_and_model_are_adjacent_static_header_chips():
     assert opts[model_index].DisplayAsChip is True
 
 
-def test_autonomous_solve_toggle_independent_of_mode():
-    # the explicit toggle enables autonomy even when mode stays supervised
-    kwargs = build_model_kwargs(build_chat_request("hi", config={"autonomous_solve": "true"}))
-    assert kwargs["mode"] == "supervised" and kwargs["autonomous_solve"] is True
+@pytest.mark.parametrize(
+    ("config", "expected_mode", "expected_autonomy"),
+    (
+        ({}, "supervised", False),
+        ({"mode": "supervised", "autonomous_solve": "false"}, "supervised", False),
+        ({"mode": "supervised", "autonomous_solve": "true"}, "supervised", True),
+        ({"mode": "auto", "autonomous_solve": "false"}, "auto", True),
+        ({"mode": "auto", "autonomous_solve": "true"}, "auto", True),
+    ),
+)
+def test_chat_request_mode_and_autonomous_solve_matrix(config, expected_mode, expected_autonomy):
+    kwargs = build_model_kwargs(build_chat_request("hi", config=config))
+    assert kwargs["mode"] == expected_mode
+    assert kwargs["autonomous_solve"] is expected_autonomy
+
+
+def test_runtime_routing_drift_forces_recreation_without_mutating_provider_or_model():
+    import sage_chat.service as service
+
+    kwargs = build_model_kwargs(build_chat_request("hi"))
+    runtime = type("Runtime", (), {
+        "mode": kwargs["mode"],
+        "_autonomous_solve": kwargs["autonomous_solve"],
+        "policy_mode": kwargs["policy_mode"],
+        "_max_steps": kwargs["max_steps"],
+        "provider": "unchanged-provider",
+        "model": "unchanged-model",
+    })()
+
+    assert service._runtime_routing_matches(runtime, kwargs) is True
+    runtime.mode = "auto"
+    assert service._runtime_routing_matches(runtime, kwargs) is False
+    assert (runtime.provider, runtime.model) == ("unchanged-provider", "unchanged-model")
 
 
 def test_policy_mode_defaults_hybrid_and_accepts_hybrid_and_symbolic():
@@ -2098,7 +3208,10 @@ def test_handle_state_shows_engagement_ledger(monkeypatch):
              "evidence": {"mythic_task_id": 31, "callback_id": 1, "result_preview": "dcsync ok"}},
         ],
     }
-    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "Operation_Chimera_1")
+    async def _resolve(_model, _request):
+        return "Operation_Chimera_1"
+
+    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
     monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"objective": ledger["objective"],
                                                                      "hops": [dict(h) for h in ledger["hops"]]})
     text = _run(slash._handle_state(None, build_chat_request("x"), ""))
@@ -2115,7 +3228,10 @@ def test_handle_state_remove_mutates_and_saves(monkeypatch):
 
     hops = [{"id": "a", "effect": "e1", "status": "x"}, {"id": "b", "effect": "e2", "status": "y"}]
     saved = {}
-    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    async def _resolve(_model, _request):
+        return "op"
+
+    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
     monkeypatch.setattr(engagement_ledger, "load", lambda eid=None: {"hops": [dict(h) for h in hops]})
     monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
 
@@ -2130,7 +3246,10 @@ def test_handle_state_set_status_mutates_and_saves(monkeypatch):
     from ai.langgraph import engagement_ledger
 
     saved = {}
-    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    async def _resolve(_model, _request):
+        return "op"
+
+    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
     monkeypatch.setattr(engagement_ledger, "load",
                         lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "achieved"}]})
     monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
@@ -2145,7 +3264,10 @@ def test_handle_state_set_cannot_promote_to_achieved(monkeypatch):
     from ai.langgraph import engagement_ledger
 
     saved = {}
-    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "op")
+    async def _resolve(_model, _request):
+        return "op"
+
+    monkeypatch.setattr(slash, "_resolve_chat_engagement_id", _resolve)
     monkeypatch.setattr(engagement_ledger, "load",
                         lambda eid=None: {"hops": [{"id": "a", "effect": "e1", "status": "pending"}]})
     monkeypatch.setattr(engagement_ledger, "save", lambda d, eid=None: saved.update(data=d) or "path")
@@ -2153,6 +3275,49 @@ def test_handle_state_set_cannot_promote_to_achieved(monkeypatch):
     text = _run(slash._handle_state(None, build_chat_request("x"), "set 1 achieved"))
     assert "cannot promote" in text
     assert saved == {}
+
+
+def test_state_objective_uses_current_client_engagement_key_and_clears_pending_refinement(monkeypatch):
+    from sage_chat import slash
+    from ai.langgraph import engagement_ledger
+
+    loads = []
+    saves = []
+
+    class _Client:
+        _engagement_key = "Operation_Chimera_1_current"
+
+        async def _ensure_engagement_key(self):
+            return None
+
+    model = type(
+        "_Model",
+        (),
+        {
+            "mythic_client": _Client(),
+            "state": {"_pending_objective_refinement": {"objective_text": "stale"}},
+        },
+    )()
+
+    monkeypatch.setattr(engagement_ledger, "active_engagement_id", lambda: "Operation_Chimera_1_wrong")
+    monkeypatch.setattr(
+        engagement_ledger,
+        "load",
+        lambda eid=None: loads.append(eid) or {"engagement_id": eid, "hops": []},
+    )
+    monkeypatch.setattr(
+        engagement_ledger,
+        "save",
+        lambda data, eid=None: saves.append((eid, dict(data))) or "path",
+    )
+
+    text = _run(slash._handle_state(model, build_chat_request("x"), "objective collect graph"))
+
+    assert "Objective updated" in text
+    assert loads == ["Operation_Chimera_1_current"]
+    assert saves[0][0] == "Operation_Chimera_1_current"
+    assert saves[0][1]["objective"] == "collect graph"
+    assert model.state["_pending_objective_refinement"] is None
 
 
 # --------------------------------------------------------------------------------------

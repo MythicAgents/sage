@@ -1,59 +1,54 @@
 #!/usr/bin/env python3
-"""Throwaway (gitignored) — verify the BloodHound MCP is connected on Sage cb15; connect if not."""
+"""Read-only BloodHound MCP readiness probe for Sage reset workflows."""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
+import importlib.util
 import json
-import os
 from pathlib import Path
-import sys
+from typing import Any
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKSPACE_ROOT = REPO_ROOT.parent
-DEFAULT_BLOODHOUND_MCP_DIR = Path(
-    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
-    or (WORKSPACE_ROOT / "bloodhound_mcp")
-)
-
-sys.path.insert(0, str(REPO_ROOT / "Payload_Type" / "sage"))
-from evals.harness import resolve_password, login_to_mythic  # noqa: E402
-from mythic import mythic  # noqa: E402
-
-CONNECT_PARAMS = {
-    "name": "BloodHound", "connection_type": "stdio", "command": "uv",
-    "arguments": ["--directory", str(DEFAULT_BLOODHOUND_MCP_DIR), "run", "main.py"],
-    "cwd": str(DEFAULT_BLOODHOUND_MCP_DIR), "url": "", "headers": [],
-    "timeout": 30, "sse_read_timeout": 300, "terminate_on_close": True, "ssl_verify": True,
-}
+READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 
 
-async def issue_and_read(client, command, params, wait=12):
-    t = await mythic.issue_task(mythic=client, command_name=command,
-                                parameters=params if isinstance(params, str) else json.dumps(params),
-                                callback_display_id=1)
-    tid = t.get("display_id")
-    await asyncio.sleep(wait)
-    out = await mythic.get_all_task_output_by_id(mythic=client, task_display_id=tid)
-    import base64
-    s = ""
-    for o in out or []:
-        rt = o.get("response_text", "") or ""
-        try:
-            s += base64.b64decode(rt).decode("utf-8", "replace")
-        except Exception:
-            s += str(rt)
-    return tid, s
+def _load_readiness_contract():
+    spec = importlib.util.spec_from_file_location("sage_readiness_contract", READINESS_CONTRACT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load readiness contract helper from {READINESS_CONTRACT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-async def main():
-    c = await login_to_mythic(resolve_password())
-    tid, listing = await issue_and_read(c, "mcp-list", "")
-    print(f"=== mcp-list (task {tid}) ===\n{listing[:1200]}")
-    if "bloodhound" in listing.lower():
-        print("\n>>> BloodHound MCP IS connected.")
-    else:
-        print("\n>>> BloodHound NOT in list — issuing mcp-connect...")
-        ctid, cres = await issue_and_read(c, "mcp-connect", CONNECT_PARAMS, wait=15)
-        print(f"=== mcp-connect (task {ctid}) ===\n{cres[:800]}")
+async def collect_status(directory: str | Path | None = None) -> dict[str, Any]:
+    contract = _load_readiness_contract()
+    return await contract.probe_bloodhound_mcp_tools(directory)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--bloodhound-mcp-dir",
+        default=None,
+        help="Optional BloodHound MCP checkout path. Defaults to SAGE_BLOODHOUND_MCP_DIR or the workspace checkout.",
+    )
+    return parser
+
+
+async def _run(args: argparse.Namespace) -> int:
+    status = await collect_status(args.bloodhound_mcp_dir)
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return 0 if status.get("ready") else 1
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    raise SystemExit(asyncio.run(_run(args)))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

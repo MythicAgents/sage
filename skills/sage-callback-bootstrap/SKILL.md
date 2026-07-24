@@ -42,6 +42,10 @@ startup identity, runtime DB archival, exact six-VM/IP state, clock check, Blood
 MCP checkout and exact required tool set, Mythic chat/token, unique live foothold, and prepared channel are all
 ready. `selected_sage_cb` is intentionally null.
 
+`post-callback-preflight` is now strictly task-free. It waits for the selected live Apollo callback through
+Mythic control-plane observation, synchronizes range clocks out of band, and returns explicit zero-task metadata.
+It does not issue callback tasks, purge Kerberos tickets, or claim target-probed domain/identity output.
+
 ## Canonical Apollo Bootstrap Path
 
 Do not re-derive Apollo bootstrap manually when these helpers cover the case.

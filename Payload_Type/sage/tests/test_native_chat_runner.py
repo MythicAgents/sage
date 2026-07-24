@@ -86,7 +86,120 @@ def test_ensure_api_token_creates_wildcard_for_autonomous_operations(monkeypatch
     result = asyncio.run(native_chat.ensure_api_token(object()))
 
     assert result["created"] is True
+    assert calls[-1]["operatorId"] is None
     assert calls[-1]["scopes"] == ["*"]
+
+
+def test_select_operation_bot_requires_exact_unique_owner():
+    selected = native_chat.select_operation_bot({
+        "operator": [
+            {
+                "id": 7,
+                "username": "range-bot-alpha",
+                "account_type": "bot",
+                "active": True,
+                "deleted": False,
+            }
+        ]
+    })
+
+    assert selected["id"] == 7
+
+    with pytest.raises(RuntimeError, match="exactly one active Mythic bot operator"):
+        native_chat.select_operation_bot({"operator": []})
+
+    with pytest.raises(RuntimeError, match="exactly one active Mythic bot operator"):
+        native_chat.select_operation_bot({
+            "operator": [
+                {
+                    "id": 7,
+                    "username": "range-bot-alpha",
+                    "account_type": "bot",
+                    "active": True,
+                    "deleted": False,
+                },
+                {
+                    "id": 8,
+                    "username": "range-bot-beta",
+                    "account_type": "bot",
+                    "active": True,
+                    "deleted": False,
+                },
+            ]
+        })
+
+
+def test_resolve_operation_bot_binds_to_current_operation(monkeypatch):
+    observed = {}
+
+    class _Client:
+        current_operation_id = 12
+
+    async def fake_query(client, query, variables=None):
+        observed["query"] = query
+        observed["variables"] = variables
+        return {
+            "operator": [
+                {
+                    "id": 7,
+                    "username": "range-bot-alpha",
+                    "account_type": "bot",
+                    "active": True,
+                    "deleted": False,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(native_chat.resolve_operation_bot(_Client()))
+
+    assert observed["query"] == native_chat.OPERATION_BOT_QUERY
+    assert observed["variables"] == {"operationId": 12}
+    assert result["id"] == 7
+
+
+def test_ensure_api_token_creates_wildcard_for_exact_operation_bot_owner(monkeypatch):
+    calls = []
+
+    async def fake_query(client, query, variables=None):
+        calls.append((query, variables))
+        if query == native_chat.READINESS_QUERY:
+            return {
+                "apitokens": [
+                    {
+                        "id": 2,
+                        "operator_id": 99,
+                        "active": True,
+                        "deleted": False,
+                        "scopes": ["*"],
+                    }
+                ],
+            }
+        return {
+            "createAPIToken": {
+                "id": 3,
+                "name": "Sage BHUSA demo",
+                "scopes": ["*"],
+                "status": "success",
+                "error": "",
+                "operator_id": 7,
+            }
+        }
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(
+        native_chat.ensure_api_token(
+            object(),
+            name="Sage BHUSA demo",
+            operator_id=7,
+        )
+    )
+
+    assert result["created"] is True
+    assert calls[-1][1]["operatorId"] == 7
+    assert result["api_token"]["operator_id"] == 7
 
 
 def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
@@ -105,6 +218,25 @@ def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     assert metadata["config"]["max_steps"] == 0
     assert metadata["config"]["model"] == "test-model"
     assert metadata["config"]["provider"] == "openai"
+
+
+def test_bhusa_demo_metadata_is_exactly_supervised_hybrid():
+    metadata = native_chat.bhusa_demo_ai_metadata({
+        "config": {
+            "mode": "auto",
+            "autonomous_solve": True,
+            "policy_mode": "symbolic",
+            "max_steps": 1,
+        }
+    })
+
+    assert metadata["config"]["mode"] == "supervised"
+    assert metadata["config"]["autonomous_solve"] is False
+    assert metadata["config"]["policy_mode"] == "hybrid"
+    assert metadata["config"]["max_steps"] == 200
+    assert metadata["channel_metadata_display"] == {
+        "display": "expanded; max=15",
+    }
 
 
 def test_default_env_paths_derive_from_workspace_root():
@@ -381,8 +513,18 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
         calls += 1
         if calls == 1:
             return {
-                "chat_request": [{"status": "running", "updated_at": "t1"}],
+                "chat_request": [
+                    {
+                        "id": 7,
+                        "channel_id": 2,
+                        "status": "running",
+                        "updated_at": "t1",
+                    }
+                ],
                 "chat_message": [{
+                    "id": 1,
+                    "channel_id": 2,
+                    "chat_request_id": 7,
                     "metadata": {
                         "tool_use": {"tool_name": "collect_graph", "retry_count": 1},
                         "runtime_telemetry": {"current_operation": "collect-graph"},
@@ -391,8 +533,18 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
             }
         if calls == 2:
             return {
-                "chat_request": [{"status": "running", "updated_at": "t2"}],
+                "chat_request": [
+                    {
+                        "id": 7,
+                        "channel_id": 2,
+                        "status": "running",
+                        "updated_at": "t2",
+                    }
+                ],
                 "chat_message": [{
+                    "id": 1,
+                    "channel_id": 2,
+                    "chat_request_id": 7,
                     "metadata": {
                         "tool_use": {"tool_name": "collect_graph", "retry_count": 1},
                         "runtime_telemetry": {"current_operation": "collect-graph"},
@@ -401,8 +553,18 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
             }
         if calls == 3:
             return {
-                "chat_request": [{"status": "running", "updated_at": "t3"}],
+                "chat_request": [
+                    {
+                        "id": 7,
+                        "channel_id": 2,
+                        "status": "running",
+                        "updated_at": "t3",
+                    }
+                ],
                 "chat_message": [{
+                    "id": 1,
+                    "channel_id": 2,
+                    "chat_request_id": 7,
                     "metadata": {
                         "tool_use": {"tool_name": "collect_graph", "retry_count": 1},
                         "runtime_telemetry": {"current_operation": "collect-graph"},
@@ -411,8 +573,18 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
             }
         if calls == 4:
             return {
-                "chat_request": [{"status": "running", "updated_at": "t4"}],
+                "chat_request": [
+                    {
+                        "id": 7,
+                        "channel_id": 2,
+                        "status": "running",
+                        "updated_at": "t4",
+                    }
+                ],
                 "chat_message": [{
+                    "id": 1,
+                    "channel_id": 2,
+                    "chat_request_id": 7,
                     "metadata": {
                         "tool_use": {"tool_name": "grant_rights", "retry_count": 2},
                         "runtime_telemetry": {"current_operation": "grant-rights"},
@@ -420,7 +592,14 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                 }],
             }
         return {
-            "chat_request": [{"status": "complete", "updated_at": "t5"}],
+            "chat_request": [
+                {
+                    "id": 7,
+                    "channel_id": 2,
+                    "status": "complete",
+                    "updated_at": "t5",
+                }
+            ],
             "chat_message": [],
         }
 
@@ -535,6 +714,10 @@ def test_run_native_chat_turn_prefers_prepared_channel(monkeypatch):
             "chat_channel_name": "Sage GOAD Ready",
             "prepared": True,
             "reused": True,
+            "prepared_policy": {
+                "mode": "auto",
+                "autonomous_solve": True,
+            },
         }
 
     async def fail_create(*args, **kwargs):
@@ -556,6 +739,274 @@ def test_run_native_chat_turn_prefers_prepared_channel(monkeypatch):
 
     assert result["chat_channel_id"] == 11
     assert calls == [(11, "objective")]
+
+
+def test_prepare_bhusa_demo_channel_uses_operation_bot_token_and_exact_metadata(monkeypatch):
+    observed = {}
+
+    async def fake_resolve_operation_bot(client):
+        return {
+            "id": 7,
+            "username": "range-bot-alpha",
+            "account_type": "bot",
+            "active": True,
+            "deleted": False,
+        }
+
+    async def fake_ensure_api_token(client, *, name, operator_id=None):
+        observed["token"] = {"name": name, "operator_id": operator_id}
+        return {"created": False, "api_token": {"id": 55, "operator_id": operator_id}}
+
+    async def fake_create_locked_channel(client, **kwargs):
+        observed["channel"] = kwargs
+        return {"chat_channel_id": 88, "chat_channel_name": kwargs["name"]}
+
+    monkeypatch.setattr(native_chat, "resolve_operation_bot", fake_resolve_operation_bot)
+    monkeypatch.setattr(native_chat, "ensure_api_token", fake_ensure_api_token)
+    monkeypatch.setattr(native_chat, "create_locked_channel", fake_create_locked_channel)
+
+    result = asyncio.run(
+        native_chat.prepare_bhusa_demo_channel(
+            object(),
+            channel_name="BHUSA exact demo",
+            token_name="Sage BHUSA demo",
+        )
+    )
+
+    assert observed["token"] == {"name": "Sage BHUSA demo", "operator_id": 7}
+    assert observed["channel"]["api_token_id"] == 55
+    assert observed["channel"]["metadata"] == native_chat.bhusa_demo_ai_metadata()
+    assert result["operation_bot"]["id"] == 7
+    assert result["chat_channel"]["chat_channel_id"] == 88
+
+
+def test_approve_pending_input_card_selects_one_exact_unresolved_card(monkeypatch):
+    observed = {}
+
+    async def fake_snapshot(client, request_id):
+        assert request_id == 77
+        return {
+            "request": {"id": 77, "channel_id": 5, "status": "streaming"},
+            "messages": [
+                {
+                    "id": 41,
+                    "metadata": {
+                        "special_type": "input_requested",
+                        "input_requested": {"status": "accepted"},
+                    },
+                },
+                {
+                    "id": 42,
+                    "metadata": {
+                        "special_type": "input_requested",
+                        "input_requested": {"status": "pending"},
+                    },
+                },
+            ],
+        }
+
+    async def fake_query(client, query, variables=None):
+        observed["query"] = query
+        observed["variables"] = variables
+        return {
+            "chatInputResponse": {
+                "status": "success",
+                "error": "",
+                "message_id": 42,
+                "request_id": 77,
+            }
+        }
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_snapshot)
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    result = asyncio.run(native_chat.approve_pending_input_card(object(), 77))
+
+    assert observed["query"] == native_chat.CHAT_INPUT_RESPONSE_MUTATION
+    assert observed["variables"] == {
+        "messageId": 42,
+        "action": "accept",
+        "response": None,
+        "choiceId": None,
+    }
+    assert result["chat_request_id"] == 77
+    assert result["input_request_message_id"] == 42
+
+
+def test_approve_pending_input_card_fails_closed_on_ambiguous_cards(monkeypatch):
+    async def fake_snapshot(client, request_id):
+        return {
+            "request": {"id": 77, "channel_id": 5, "status": "streaming"},
+            "messages": [
+                {
+                    "id": 41,
+                    "metadata": {
+                        "special_type": "input_requested",
+                        "input_requested": {"status": "pending"},
+                    },
+                },
+                {
+                    "id": 42,
+                    "metadata": {
+                        "special_type": "input_requested",
+                        "input_requested": {"status": "pending"},
+                    },
+                },
+            ],
+        }
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_snapshot)
+
+    with pytest.raises(RuntimeError, match="exactly one unresolved input_requested"):
+        asyncio.run(native_chat.approve_pending_input_card(object(), 77))
+
+
+@pytest.mark.parametrize("status", ["completed", "", None, "pending", "unknown"])
+def test_approve_pending_input_card_rejects_nonstreaming_request_before_mutation(
+    monkeypatch, status
+):
+    async def fake_snapshot(client, request_id):
+        return {
+            "request": {"id": 77, "channel_id": 5, "status": status},
+            "messages": [{
+                "id": 42,
+                "metadata": {
+                    "special_type": "input_requested",
+                    "input_requested": {"status": "pending"},
+                },
+            }],
+        }
+
+    async def forbidden_query(*args, **kwargs):
+        raise AssertionError("approval mutation must not run")
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_snapshot)
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", forbidden_query)
+
+    with pytest.raises(RuntimeError, match="exact active streaming status"):
+        asyncio.run(native_chat.approve_pending_input_card(object(), 77))
+
+
+@pytest.mark.parametrize(
+    ("message_updates", "expected"),
+    [
+        ({"chat_request_id": 78}, "message request id does not match"),
+        ({"channel_id": 6}, "message channel id does not match"),
+    ],
+)
+def test_fetch_request_snapshot_rejects_mismatched_message_identity(
+    monkeypatch, message_updates, expected
+):
+    calls = []
+
+    async def fake_query(client, query, variables=None):
+        calls.append(query)
+        message = {
+            "id": 42,
+            "chat_request_id": 77,
+            "channel_id": 5,
+            "metadata": {},
+        }
+        message.update(message_updates)
+        return {
+            "chat_request": [{
+                "id": 77,
+                "channel_id": 5,
+                "status": "streaming",
+            }],
+            "chat_message": [message],
+        }
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    with pytest.raises(RuntimeError, match=expected):
+        asyncio.run(native_chat.fetch_request_snapshot(object(), 77))
+    assert calls == [native_chat.REQUEST_QUERY]
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {"status": "success", "error": "", "request_id": 77},
+            "message id must be an exact integer",
+        ),
+        (
+            {
+                "status": "success",
+                "error": "",
+                "message_id": 43,
+                "request_id": 77,
+            },
+            "wrong message_id",
+        ),
+        (
+            {"status": "success", "error": "", "message_id": 42},
+            "request id must be an exact integer",
+        ),
+        (
+            {
+                "status": "success",
+                "error": "",
+                "message_id": 42,
+                "request_id": 78,
+            },
+            "wrong request_id",
+        ),
+    ],
+)
+def test_approve_pending_input_card_requires_exact_response_identity(
+    monkeypatch, response, expected
+):
+    mutations = []
+
+    async def fake_snapshot(client, request_id):
+        return {
+            "request": {"id": 77, "channel_id": 5, "status": "streaming"},
+            "messages": [{
+                "id": 42,
+                "metadata": {
+                    "special_type": "input_requested",
+                    "input_requested": {"status": "pending"},
+                },
+            }],
+        }
+
+    async def fake_query(client, query, variables=None):
+        mutations.append(variables)
+        return {"chatInputResponse": response}
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_snapshot)
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+
+    with pytest.raises(RuntimeError, match=expected):
+        asyncio.run(native_chat.approve_pending_input_card(object(), 77))
+    assert len(mutations) == 1
+
+
+@pytest.mark.parametrize("status", ["accepted", "rejected", "responded", "selected"])
+def test_follow_ignores_resolved_input_requested_cards(status):
+    messages = [{
+        "id": 42,
+        "metadata": {
+            "special_type": "input_requested",
+            "input_requested": {"status": status},
+        },
+    }]
+
+    assert native_chat._has_input_requested(messages) is False
+
+
+def test_follow_stops_for_exact_pending_input_requested_card():
+    messages = [{
+        "id": 42,
+        "metadata": {
+            "special_type": "input_requested",
+            "input_requested": {"status": "pending"},
+        },
+    }]
+
+    assert native_chat._has_input_requested(messages) is True
 
 
 def test_restart_sage_process_delegates_to_canonical_launcher(monkeypatch):

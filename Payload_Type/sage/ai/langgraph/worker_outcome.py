@@ -27,8 +27,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
+import re
+from typing import Any
 
 CONTRACT_VERSION = 1
+HANDOFF_METADATA_VERSION = 2
+KNOWN_WORKERS = frozenset({
+    "Generalist",
+    "Mythic_Operator",
+    "Mythic_Payload",
+    "BloodHound",
+    "MCP_Manager",
+    "Sandbox",
+    "Autonomous_Executor",
+})
+_HANDOFF_HEADING_RE = re.compile(r"(?<!\S)(DONE|FAILED|BLOCKER|REMAINING)\s+\u2014\s+")
 
 
 class Outcome(str, Enum):
@@ -179,6 +193,108 @@ class LoopBreakerState:
     outcomes: list = field(default_factory=list)
     progress_epoch: int = 0
     last_turn_key: str = ""
+
+
+def parse_handback_summary(summary: str) -> dict[str, str] | None:
+    """Parse the exact DONE / FAILED / BLOCKER / REMAINING handback grammar conservatively."""
+    text = str(summary or "").strip()
+    matches = list(_HANDOFF_HEADING_RE.finditer(text))
+    if [match.group(1).upper() for match in matches] != ["DONE", "FAILED", "BLOCKER", "REMAINING"]:
+        return None
+    sections: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        sections[match.group(1).upper()] = text[start:end].strip()
+    return sections
+
+
+def _is_substantive(value: str) -> bool:
+    return str(value or "").strip().casefold().rstrip(".") not in {"", "none"}
+
+
+def build_handoff_metadata(
+    *,
+    source_worker: str,
+    source_turn_id: str,
+    source_seq: int,
+    reason: str,
+    summary: str,
+    next_owner: Any = "",
+) -> dict[str, Any] | None:
+    if source_worker not in KNOWN_WORKERS or not source_turn_id or source_seq <= 0:
+        return None
+    if (
+        not isinstance(next_owner, str)
+        or next_owner not in {*KNOWN_WORKERS, ""}
+        or next_owner == source_worker
+    ):
+        return None
+    sections = parse_handback_summary(summary)
+    if sections is None:
+        return None
+    if next_owner and not (
+        _is_substantive(sections["BLOCKER"])
+        or _is_substantive(sections["REMAINING"])
+    ):
+        return None
+    if next_owner:
+        outcome = Outcome.HANDOFF
+    elif _is_substantive(sections["BLOCKER"]):
+        outcome = Outcome.BLOCKED
+    elif (
+        _is_substantive(sections["DONE"])
+        and not _is_substantive(sections["FAILED"])
+        and not _is_substantive(sections["REMAINING"])
+    ):
+        outcome = Outcome.COMPLETE
+    else:
+        outcome = Outcome.PROGRESS
+    return {
+        "schema_version": HANDOFF_METADATA_VERSION,
+        "source_worker": source_worker,
+        "source_turn_id": source_turn_id,
+        "source_seq": source_seq,
+        "outcome": outcome.value,
+        "next_owner": next_owner,
+        "summary_digest": hashlib.sha256(str(summary).encode("utf-8")).hexdigest(),
+    }
+def latest_admitted_handoff(messages: list[Any], current_turn_id: str) -> tuple[dict[str, Any], str] | None:
+    latest_operator = -1
+    for index, message in enumerate(messages):
+        if getattr(message, "type", "") == "human" and not getattr(message, "additional_kwargs", {}).get("_hide_from_stream") and not getattr(message, "additional_kwargs", {}).get("_delegated_to"):
+            latest_operator = index
+    candidate: tuple[dict[str, Any], str, int] | None = None
+    for index, message in enumerate(messages[latest_operator + 1 :], start=latest_operator + 1):
+        kwargs = getattr(message, "additional_kwargs", {}) or {}
+        metadata = kwargs.get("_worker_outcome")
+        if not isinstance(metadata, dict):
+            continue
+        candidate = (metadata, str(getattr(message, "content", "") or ""), index)
+    if candidate is None:
+        return None
+    metadata, summary, index = candidate
+    required = {"schema_version", "source_worker", "source_turn_id", "source_seq", "outcome", "next_owner", "summary_digest"}
+    if set(metadata) != required:
+        return None
+    if (
+        metadata.get("schema_version") != HANDOFF_METADATA_VERSION
+        or metadata.get("source_worker") not in KNOWN_WORKERS
+        or metadata.get("source_turn_id") != current_turn_id
+        or metadata.get("outcome") not in {item.value for item in Outcome}
+        or metadata.get("next_owner") not in {*KNOWN_WORKERS, ""}
+        or not isinstance(metadata.get("source_seq"), int)
+        or metadata.get("source_seq", 0) <= 0
+        or metadata.get("summary_digest") != hashlib.sha256(summary.encode("utf-8")).hexdigest()
+    ):
+        return None
+    for later in messages[index + 1 :]:
+        kwargs = getattr(later, "additional_kwargs", {}) or {}
+        if isinstance(kwargs.get("_worker_outcome"), dict):
+            return None
+        if getattr(later, "name", "") in KNOWN_WORKERS and not kwargs.get("_is_completion_header"):
+            return None
+    return metadata, summary
 
 
 def observe_capability_outcome(state: LoopBreakerState, capability: str, result: dict, turn_key: str,

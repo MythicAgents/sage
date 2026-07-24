@@ -70,6 +70,13 @@ class _ReconcilingStubMythicClient(_StubMythicClient):
 
 
 class _GraphMustNotRun:
+    async def aget_state(self, _config):
+        class _Snapshot:
+            interrupts = ()
+            tasks = ()
+
+        return _Snapshot()
+
     async def astream(self, *args, **kwargs):
         raise AssertionError("graph.astream should not run after preflight objective completion")
         yield {}

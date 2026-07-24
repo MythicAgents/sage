@@ -9,6 +9,7 @@ success (Forge finding #1). We instantiate a bare Model via object.__new__ and i
 method touches, so no live Mythic/RabbitMQ is needed.
 """
 import asyncio
+from dataclasses import replace
 import json
 import re
 import sys
@@ -493,6 +494,75 @@ def test_supervised_explicit_objective_turn_routes_to_controller_without_autonom
             os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
 
 
+def test_slash_auto_override_reused_supervised_base_routes_objective_to_controller(monkeypatch):
+    import os
+    import sage_chat.service as service
+    from sage_chat.headless import build_chat_request
+    from sage_chat.slash import _handle_mode
+
+    saved_controller = os.environ.get("SAGE_AUTONOMOUS_CONTROLLER")
+    saved_hitl = os.environ.get("SAGE_CONTROLLER_HITL")
+    os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+    os.environ.pop("SAGE_CONTROLLER_HITL", None)
+    try:
+        request = build_chat_request(
+            "From the current foothold, achieve administrative control of essos.local.",
+            channel_id=807,
+            request_id=2,
+            config={"mode": "supervised", "autonomous_solve": "false"},
+        )
+        kwargs = service.build_model_kwargs(request)
+        signature = service._model_config_signature(kwargs)
+
+        existing = object.__new__(model.Model)
+        existing.mode = kwargs["mode"]
+        existing._autonomous_solve = kwargs["autonomous_solve"]
+        existing.policy_mode = kwargs["policy_mode"]
+        existing._max_steps = kwargs["max_steps"]
+        existing._bloodhound_exact_admission_at_initialize = True
+        existing.apitoken_id = request.APITokenID
+        existing.operation_id = request.OperationID
+        existing._chat_request_config_signature = signature
+        existing._chat_request_base_autonomous_solve = kwargs["autonomous_solve"]
+        existing.command_name = "chat"
+        existing._supervised_objective_active = False
+        assert "Mode set" in _handle_mode(existing, "auto")
+
+        async def _get_existing(_request):
+            return existing
+
+        async def _unexpected_drop(*_args, **_kwargs):
+            raise AssertionError("unchanged base request must preserve the slash override")
+
+        async def _ensure(_self, *, autonomous_required=False):
+            assert autonomous_required is True
+            return True
+
+        monkeypatch.setattr(service, "get_channel_session", _get_existing)
+        monkeypatch.setattr(service, "drop_channel_session", _unexpected_drop)
+        monkeypatch.setattr(service.SageChat, "_ensure_bloodhound_connected", _ensure)
+
+        reused, preexisted = asyncio.run(service.SageChat()._get_or_create_model(request))
+        reused._turn_authority = model.compile_turn_authority(
+            request.Prompt,
+            objective_classifier=model.Model._looks_like_explicit_objective_prompt,
+        )
+
+        assert preexisted is True
+        assert reused.mode == "auto"
+        assert reused._autonomous_solve is True
+        assert reused._should_use_controller(is_interactive=False, prompt=request.Prompt) is True
+    finally:
+        if saved_controller is None:
+            os.environ.pop("SAGE_AUTONOMOUS_CONTROLLER", None)
+        else:
+            os.environ["SAGE_AUTONOMOUS_CONTROLLER"] = saved_controller
+        if saved_hitl is None:
+            os.environ.pop("SAGE_CONTROLLER_HITL", None)
+        else:
+            os.environ["SAGE_CONTROLLER_HITL"] = saved_hitl
+
+
 def test_scoped_callback_inventory_prompt_detection_is_narrow_and_non_objective():
     assert model._looks_like_scoped_callback_inventory_prompt(
         "What can you tell me about our current callbacks?"
@@ -514,6 +584,27 @@ def test_scoped_callback_inventory_prompt_detection_is_narrow_and_non_objective(
     assert model.Model._looks_like_explicit_objective_prompt(
         "From the current foothold, achieve administrative control of essos.local."
     ) is True
+
+
+def test_explicit_objective_classifier_accepts_compatibility_phrases_only():
+    positive = (
+        "From the current foothold, achieve administrative control of essos.local.",
+        "Autonomously solve GOAD Trust Walker.",
+        "autonomously solve GOAD Trust Walker.",
+        "Solve the GOAD range from the current foothold.",
+    )
+    negative = (
+        "How would you solve GOAD Trust Walker?",
+        "Explain the GOAD Trust Walker benchmark.",
+        "Tell me about Trust Walker.",
+        "Solve this problem.",
+        "Autonomously solve this crossword.",
+        "Solve the range of this math function.",
+        "Random prose about solving a benchmark.",
+    )
+
+    assert all(model.Model._looks_like_explicit_objective_prompt(prompt) for prompt in positive)
+    assert not any(model.Model._looks_like_explicit_objective_prompt(prompt) for prompt in negative)
 
 
 def test_scoped_callback_inventory_turn_uses_one_slim_read_and_no_controller():
@@ -829,6 +920,35 @@ def test_collect_discovers_timestamped_zip_and_ingests_it():
     # downloaded the DISCOVERED timestamped path, not the predicted bare name
     dl_path = next(c[1]["path"] for c in fake.calls if c[0] == "download")
     assert dl_path.startswith("C:\\Users\\Public\\20260101000000_bloodhound_"), dl_path
+    assert ("ingest_collection", 11, 2) in fake.calls
+
+
+def test_bounded_collection_uses_the_turn_contract_token_across_task_download_and_ingest():
+    m = object.__new__(model.Model)
+    state = _live_foothold_state("2")
+    foothold = state.footholds[0]
+    adapter = m._controller_collection_adapter(foothold)
+    authority = model.compile_turn_authority(
+        "Complete the objective.",
+        objective_classifier=model.Model._looks_like_explicit_objective_prompt,
+        stored_operator_objective="Collect and ingest the current graph.",
+    )
+    contract = authority.objective_contract.resolve_collection_scope(
+        turn_id=authority.turn_id,
+        callback_display_id=2,
+        payload_type="apollo",
+        forest="north.local",
+        adapter=adapter,
+    )
+    m._turn_authority = replace(authority, objective_contract=contract)
+    fake = _CollectMythic({"status": "ingested", "graph_verified": True}, timestamp_prefix=True)
+    m.mythic_client = fake
+
+    result = asyncio.run(m._controller_collect(state))
+
+    assert result["ok"] is True, result
+    assert fake._zipname == f"bloodhound_{contract.collection_token}.zip"
+    assert ("_latest_download", 2, contract.collection_token) in fake.calls
     assert ("ingest_collection", 11, 2) in fake.calls
 
 
@@ -2194,7 +2314,9 @@ def test_autonomous_agent_topology_excludes_generic_mcp_and_sandbox_handoffs(mon
     assert "transfer_to_MCP_Manager" not in autonomous["Supervisor"]
     assert "transfer_to_Sandbox" not in autonomous["Supervisor"]
     assert "sandbox_exec" not in autonomous["Mythic_Operator"]
-    assert "generic_external_probe" in conversational["MCP_Manager"]
+    # A conversational graph exposes no third-party MCP tool until the current operator turn
+    # explicitly pins that server and the tool passes the local+annotation read-only policy.
+    assert "generic_external_probe" not in conversational["MCP_Manager"]
     assert "transfer_to_MCP_Manager" in conversational["Supervisor"]
     assert "transfer_to_Sandbox" in conversational["Supervisor"]
     assert "sandbox_exec" in conversational["Sandbox"]

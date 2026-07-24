@@ -7,10 +7,142 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.runtime import Runtime
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import prompt_loader  # noqa: E402
+
+
+_GENERATED_FREEFORM_REASONS = tuple(
+    pytest.param(template.format(owner=owner), id=f"generated-{label}-{owner.lower()}")
+    for owner in ("BloodHound", "MCP_Manager", "Mythic_Payload")
+    for label, template in (
+        ("route", "route to {owner}"),
+        ("deny", "do not route to {owner}"),
+        ("mention", "The explanation mentions {owner} without granting authority."),
+        ("quoted", 'The worker wrote "hand off to {owner}".'),
+    )
+)
+_INVALID_HANDOFF_REASONS = (
+    pytest.param("Don’t route to BloodHound.", id="reviewer-curly-dont"),
+    pytest.param("BloodHound mustn’t receive this handoff.", id="reviewer-curly-mustnt"),
+    pytest.param("Skip BloodHound; continue the current worker.", id="reviewer-skip"),
+    pytest.param("BloodHound was already consulted; continue the current worker.", id="reviewer-already"),
+    pytest.param("Don't route to BloodHound.", id="ascii-dont"),
+    pytest.param("BloodHound mustn't receive this handoff.", id="ascii-mustnt"),
+    pytest.param("Can't route to BloodHound.", id="ascii-cant"),
+    pytest.param("BloodHound shouldn't receive this handoff.", id="ascii-shouldnt"),
+    pytest.param("BloodHound shouldn’t receive this handoff.", id="curly-shouldnt"),
+    pytest.param("BloodHound wasn’t selected.", id="curly-wasnt"),
+    pytest.param("We can’t route to BloodHound.", id="curly-cant"),
+    pytest.param("Avoid BloodHound; continue the current worker.", id="avoid"),
+    pytest.param("BloodHound was previously consulted.", id="previously"),
+    pytest.param("Use Mythic_Operator instead of BloodHound.", id="instead"),
+    pytest.param("Consider BloodHound for later analysis.", id="consider"),
+    pytest.param("Whether BloodHound should act is unresolved.", id="whether"),
+    pytest.param("Should we route to BloodHound?", id="question-prefixed"),
+    pytest.param("Route to BloodHound?", id="question-imperative"),
+    pytest.param('Is "route to BloodHound" the right choice?', id="question-quoted"),
+    pytest.param('"route to BloodHound"', id="double-quoted"),
+    pytest.param("'hand off to BloodHound'", id="single-quoted"),
+    pytest.param('The worker said "route to BloodHound".', id="reported-quote"),
+    pytest.param("The note reads ‘hand off to BloodHound’.", id="curly-quoted"),
+    pytest.param("Please route to BloodHound.", id="polite-prefix"),
+    pytest.param("The next step might be to route to BloodHound.", id="embedded-route"),
+    pytest.param("We can hand off to BloodHound later.", id="embedded-handoff"),
+    pytest.param("Context: route to BloodHound.", id="colon-not-boundary"),
+    pytest.param("Context, route to BloodHound.", id="comma-not-boundary"),
+    pytest.param("Route to BloodHound, but do not transfer control.", id="postposed-comma"),
+    pytest.param("Route to BloodHound. Continue the current worker instead.", id="postposed-sentence"),
+    pytest.param("Route to BloodHound; skip the handoff.", id="postposed-semicolon"),
+    pytest.param(
+        "Route to BloodHound to analyze the graph. Continue Mythic_Operator instead.",
+        id="postposed-after-purpose",
+    ),
+    pytest.param("route to BloodHound to avoid using the graph", id="purpose-avoid"),
+    pytest.param("route to BloodHound to not use the graph", id="purpose-not"),
+    pytest.param("route to BloodHound to skip graph analysis", id="purpose-skip"),
+    pytest.param("rоute to BloodHound to analyze the graph", id="unicode-directive-lookalike"),
+    pytest.param("route to BloodHound to analyzе the graph", id="unicode-purpose-lookalike"),
+    pytest.param("Route to BloodHound to analyze the graph…", id="unicode-purpose-punctuation"),
+    pytest.param("route to BloodHoundExtra", id="owner-suffix"),
+    pytest.param("route to bloodhound", id="owner-case"),
+    pytest.param("route to UnknownOwner", id="unknown-owner"),
+    pytest.param("hand-off to BloodHound", id="hyphenated-handoff"),
+    pytest.param("route toward BloodHound", id="wrong-preposition"),
+    pytest.param("route to BloodHound immediately", id="malformed-suffix"),
+    pytest.param("route to BloodHound and MCP_Manager", id="multiple-owner-suffix"),
+    pytest.param("route to BloodHound to consult MCP_Manager", id="multiple-owner-purpose"),
+    pytest.param(
+        "Context mentions Mythic_Operator; route to BloodHound to analyze the graph",
+        id="multiple-owner-context",
+    ),
+    pytest.param("route to BloodHound; hand off to MCP_Manager", id="multiple-directive-owner"),
+    pytest.param(
+        "route to BloodHound to analyze, then route to MCP_Manager",
+        id="multiple-directive-purpose",
+    ),
+    pytest.param(
+        "Context; route to BloodHound. hand off to BloodHound",
+        id="multiple-directive-same-owner",
+    ),
+    pytest.param("route to Mythic_Operator", id="same-owner"),
+    pytest.param(
+        (
+            "BloodHound logon-session query is the next required step per operator steering; "
+            "route to BloodHound to check for <target-user> sessions before any further credential acquisition."
+        ),
+        id="exact-real-fixture-without-owner",
+    ),
+    *_GENERATED_FREEFORM_REASONS,
+)
+
+_VALID_HANDOFF_REASONS = (
+    pytest.param(
+        "Mythic_Operator",
+        "BloodHound",
+        (
+            "BloodHound logon-session query is the next required step per operator steering; "
+            "route to BloodHound to check for <target-user> sessions before any further credential acquisition."
+        ),
+        id="exact-real-fixture",
+    ),
+    pytest.param("Mythic_Operator", "BloodHound", "route to BloodHound", id="simple-route"),
+    pytest.param(
+        "Mythic_Operator",
+        "BloodHound",
+        "Route to BloodHound to analyze the graph",
+        id="route-purpose",
+    ),
+    pytest.param(
+        "Mythic_Operator",
+        "MCP_Manager",
+        "Context is complete; hand off to MCP_Manager to query the connected service",
+        id="handoff-purpose",
+    ),
+    pytest.param(
+        "Mythic_Operator",
+        "BloodHound",
+        "Context is complete. Route to BloodHound to analyze the graph",
+        id="period-boundary",
+    ),
+    pytest.param("BloodHound", "Mythic_Operator", "route to Mythic_Operator", id="other-source"),
+)
+
+_MALFORMED_TYPED_OWNERS = (
+    pytest.param("bloodhound", id="case-folded"),
+    pytest.param("BloodHoundExtra", id="suffixed"),
+    pytest.param("BloodHound,MCP_Manager", id="multiple-string"),
+    pytest.param(["BloodHound"], id="list"),
+    pytest.param(("BloodHound",), id="tuple"),
+    pytest.param({"owner": "BloodHound"}, id="mapping"),
+    pytest.param(7, id="integer"),
+    pytest.param(None, id="none"),
+    pytest.param("Mythic_Operator", id="self"),
+)
 
 
 def _load_model_class():
@@ -225,6 +357,629 @@ def test_worker_handoff_prefers_terminal_execute_capability_report_over_narratio
     assert "`kerberos-context:north.sevenkingdoms.local@callback:2`" in summary
     assert "Callback 2 is alive" not in summary
     assert "bounded one-action capability request" not in summary
+
+
+def test_worker_handback_copy_attaches_typed_metadata_from_authoritative_tool_result():
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+
+    class FakeAgent:
+        async def ainvoke(self, args, config=None):
+            summary = "DONE — x FAILED — y BLOCKER — need graph REMAINING — query graph"
+            return {"messages": list(args["messages"]) + [
+                AIMessage(content="", name="Mythic_Operator", tool_calls=[{
+                    "name": "handback_to_supervisor",
+                    "args": {
+                        "reason": "reason is explanatory",
+                        "summary": summary,
+                        "next_owner": "BloodHound",
+                    },
+                    "id": "call-1",
+                    "type": "tool_call",
+                }]),
+                ToolMessage(
+                    content=f"rendered text says do not route\n\n{summary}",
+                    name="handback_to_supervisor",
+                    tool_call_id="call-1",
+                    additional_kwargs={
+                        "_handback_input": {
+                            "reason": "reason is explanatory",
+                            "summary": summary,
+                            "next_owner": "BloodHound",
+                        }
+                    },
+                ),
+            ]}
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.compile_turn_authority("What callbacks are active?", objective_classifier=lambda _text: False)
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.mythic_client = None
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [],
+        "mythic_operator_messages": [HumanMessage(content="delegate")],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(model._wrap_create_agent(FakeAgent(), "mythic_operator_messages", "Mythic_Operator")(state, {}))
+    summary = update["supervisor_messages"][1]
+    assert summary.content == "DONE — x FAILED — y BLOCKER — need graph REMAINING — query graph"
+    assert summary.additional_kwargs["_worker_outcome"]["source_worker"] == "Mythic_Operator"
+    assert summary.additional_kwargs["_worker_outcome"]["next_owner"] == "BloodHound"
+
+
+@pytest.mark.parametrize("reason", _INVALID_HANDOFF_REASONS)
+def test_freeform_worker_reason_cannot_grant_production_redirect(reason):
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+    summary = "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph"
+    handback = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[{
+            "name": "handback_to_supervisor",
+            "args": {"reason": reason, "summary": summary},
+            "id": "call-invalid",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 3},
+    )
+    outcome = mod._worker_handoff_metadata(
+        [handback],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    )
+    assert outcome is not None
+    metadata, authoritative_summary = outcome
+    assert metadata["outcome"] == "blocked"
+    assert metadata["next_owner"] == ""
+    assert authoritative_summary == summary
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
+    state = {
+        "messages": [],
+        "supervisor_messages": [
+            HumanMessage(content="operator turn"),
+            AIMessage(
+                content=summary,
+                name="Mythic_Operator",
+                additional_kwargs={"_worker_outcome": metadata},
+            ),
+        ],
+        "mythic_operator_messages": [],
+        "generalist_messages": [],
+    }
+    assert model._latest_admitted_worker_handoff(state) == (metadata, summary)
+    tool = mod._create_handoff_tool(
+        agent_name="Generalist",
+        worker_outcome_lookup=model._latest_admitted_worker_handoff,
+    )
+    command = tool.func(
+        SimpleNamespace(state=state, tool_call_id="handoff-invalid"),
+        "perform new Mythic work",
+    )
+    assert command.goto == "Generalist"
+    assert command.goto != "BloodHound"
+
+
+@pytest.mark.parametrize(
+    "summary",
+    (
+        "DONE — x FAILED — none BLOCKER — none REMAINING — none",
+        "DONE — none FAILED — failed action BLOCKER — none REMAINING — none",
+        "DONE — none FAILED — none BLOCKER — none REMAINING — none",
+    ),
+)
+def test_contradictory_worker_handback_cannot_reach_production_redirect(summary):
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+    handback = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[{
+            "name": "handback_to_supervisor",
+            "args": {
+                "reason": "reason is explanatory",
+                "summary": summary,
+                "next_owner": "BloodHound",
+            },
+            "id": "call-contradictory",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 3},
+    )
+    assert mod._worker_handoff_metadata(
+        [handback],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    ) is None
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
+    state = {
+        "messages": [],
+        "supervisor_messages": [
+            HumanMessage(content="operator turn"),
+            AIMessage(content=summary, name="Mythic_Operator"),
+        ],
+        "mythic_operator_messages": [],
+        "bloodhound_messages": [],
+    }
+    assert model._latest_admitted_worker_handoff(state) is None
+    command = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        worker_outcome_lookup=model._latest_admitted_worker_handoff,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="handoff-contradictory"),
+        "perform new Mythic work",
+    )
+    assert command.goto == "Mythic_Operator"
+
+
+@pytest.mark.parametrize(("source_worker", "next_owner", "reason"), _VALID_HANDOFF_REASONS)
+def test_explicit_worker_handback_redirects_with_authoritative_summary(
+    source_worker,
+    next_owner,
+    reason,
+):
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need next owner REMAINING — perform next step"
+    handback = AIMessage(
+        content="",
+        name=source_worker,
+        tool_calls=[{
+            "name": "handback_to_supervisor",
+            "args": {
+                "reason": reason,
+                "summary": summary,
+                "next_owner": next_owner,
+            },
+            "id": "call-valid",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 3},
+    )
+    outcome = mod._worker_handoff_metadata(
+        [handback],
+        source_worker=source_worker,
+        source_turn_id="turn-1",
+    )
+    assert outcome is not None
+    metadata, authoritative_summary = outcome
+    assert metadata["outcome"] == "handoff"
+    assert metadata["next_owner"] == next_owner
+    assert authoritative_summary == summary
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
+    state = {
+        "messages": [],
+        "supervisor_messages": [
+            HumanMessage(content="operator turn"),
+            AIMessage(
+                content=summary,
+                name=source_worker,
+                additional_kwargs={"_worker_outcome": metadata},
+            ),
+        ],
+        "mythic_operator_messages": [],
+        "bloodhound_messages": [],
+        "mcp_manager_messages": [],
+    }
+    admitted = model._latest_admitted_worker_handoff(state)
+    assert admitted == (metadata, summary)
+    command = mod._create_handoff_tool(
+        agent_name=source_worker,
+        worker_outcome_lookup=model._latest_admitted_worker_handoff,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="handoff-valid"),
+        "repeat stale worker instruction",
+    )
+    channel = {
+        "BloodHound": "bloodhound_messages",
+        "MCP_Manager": "mcp_manager_messages",
+        "Mythic_Operator": "mythic_operator_messages",
+    }[next_owner]
+    assert command.goto == next_owner
+    assert command.update[channel][1].content == summary
+
+
+def test_handback_tool_hidden_owner_drives_metadata_admission_and_redirect():
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+    reason = "display text is explanatory and does not select an owner"
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need graph REMAINING — query graph"
+    tool = mod._create_handback_to_supervisor_tool()
+    assert "next_owner" in tool.args
+    command = tool.func(
+        SimpleNamespace(state={}, tool_call_id="typed-handback"),
+        reason,
+        summary,
+        "BloodHound",
+    )
+    tool_message = command.update["messages"][0]
+    assert tool_message.additional_kwargs["_handback_input"] == {
+        "reason": reason,
+        "summary": summary,
+        "next_owner": "BloodHound",
+    }
+    tool_message.additional_kwargs["_seq"] = 3
+
+    display_only = ToolMessage(
+        content=f"route to BloodHound\n\n{summary}",
+        name="handback_to_supervisor",
+        tool_call_id="display-only",
+        additional_kwargs={"_seq": 2},
+    )
+    assert mod._worker_handoff_metadata(
+        [display_only],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    ) is None
+
+    outcome = mod._worker_handoff_metadata(
+        [tool_message],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    )
+    assert outcome is not None
+    metadata, authoritative_summary = outcome
+    assert metadata["next_owner"] == "BloodHound"
+    assert authoritative_summary == summary
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
+    state = {
+        "messages": [],
+        "supervisor_messages": [
+            HumanMessage(content="operator turn"),
+            AIMessage(
+                content=summary,
+                name="Mythic_Operator",
+                additional_kwargs={"_worker_outcome": metadata},
+            ),
+        ],
+        "mythic_operator_messages": [],
+        "bloodhound_messages": [],
+    }
+    assert model._latest_admitted_worker_handoff(state) == (metadata, summary)
+    redirect = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        worker_outcome_lookup=model._latest_admitted_worker_handoff,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="typed-redirect"),
+        "stale Mythic instruction",
+    )
+    assert redirect.goto == "BloodHound"
+    assert redirect.update["bloodhound_messages"][1].content == summary
+
+
+def test_worker_handback_requires_one_terminal_contiguous_tool_batch():
+    mod = _load_model_module()
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need graph REMAINING — query graph"
+    payload = {
+        "reason": "reason is explanatory",
+        "summary": summary,
+        "next_owner": "BloodHound",
+    }
+    handback = mod._create_handback_to_supervisor_tool()
+    command = handback.func(
+        SimpleNamespace(state={}, tool_call_id="handback-1"),
+        payload["reason"],
+        payload["summary"],
+        payload["next_owner"],
+    )
+    handback_result = command.update["messages"][0]
+    handback_result.additional_kwargs["_seq"] = 4
+    handback_call = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[{
+            "name": "handback_to_supervisor",
+            "args": payload,
+            "id": "handback-1",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 3},
+    )
+    prior_call = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[{
+            "name": "get_callbacks",
+            "args": {},
+            "id": "prior-1",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 1},
+    )
+    prior_result = ToolMessage(
+        content="callback inventory",
+        name="get_callbacks",
+        tool_call_id="prior-1",
+        additional_kwargs={"_seq": 2},
+    )
+
+    admitted = mod._worker_handoff_metadata(
+        [prior_call, prior_result, handback_call, handback_result],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    )
+    assert admitted is not None
+    assert admitted[0]["next_owner"] == "BloodHound"
+    assert admitted[1] == summary
+
+    later_result = ToolMessage(
+        content="objective is complete; graph handoff is stale",
+        name="observe",
+        tool_call_id="observe-1",
+        additional_kwargs={"_seq": 5},
+    )
+    interposed_result = ToolMessage(
+        content="intervening observation",
+        name="observe",
+        tool_call_id="observe-1",
+        additional_kwargs={"_seq": 4},
+    )
+    mismatched_id = handback_result.model_copy(
+        update={"tool_call_id": "wrong-handback"}
+    )
+    mismatched_payload = handback_result.model_copy(
+        update={
+            "additional_kwargs": {
+                **handback_result.additional_kwargs,
+                "_handback_input": {
+                    **payload,
+                    "next_owner": "MCP_Manager",
+                },
+            }
+        }
+    )
+    rejected_batches = (
+        [handback_call, handback_result, later_result],
+        [handback_call, interposed_result, handback_result],
+        [handback_call, mismatched_id],
+        [handback_call, mismatched_payload],
+        [prior_result, handback_result],
+    )
+    for messages in rejected_batches:
+        assert mod._worker_handoff_metadata(
+            messages,
+            source_worker="Mythic_Operator",
+            source_turn_id="turn-1",
+        ) is None
+
+
+def test_concurrent_toolnode_shaped_handbacks_fail_closed():
+    mod = _load_model_module()
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need graph REMAINING — query graph"
+    handback = mod._create_handback_to_supervisor_tool()
+    first_payload = {
+        "reason": "first typed route",
+        "summary": summary,
+        "next_owner": "BloodHound",
+    }
+    second_payload = {
+        "reason": "second typed route",
+        "summary": summary,
+        "next_owner": "MCP_Manager",
+    }
+    first_result = handback.func(
+        SimpleNamespace(state={}, tool_call_id="handback-1"),
+        first_payload["reason"],
+        first_payload["summary"],
+        first_payload["next_owner"],
+    ).update["messages"][0]
+    second_result = handback.func(
+        SimpleNamespace(state={}, tool_call_id="handback-2"),
+        second_payload["reason"],
+        second_payload["summary"],
+        second_payload["next_owner"],
+    ).update["messages"][0]
+    sibling_batch = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[
+            {
+                "name": "handback_to_supervisor",
+                "args": first_payload,
+                "id": "handback-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "observe",
+                "args": {},
+                "id": "observe-1",
+                "type": "tool_call",
+            },
+        ],
+        additional_kwargs={"_seq": 1},
+    )
+    observation_result = ToolMessage(
+        content="objective is complete",
+        name="observe",
+        tool_call_id="observe-1",
+        additional_kwargs={"_seq": 3},
+    )
+    two_handbacks = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[
+            {
+                "name": "handback_to_supervisor",
+                "args": first_payload,
+                "id": "handback-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "handback_to_supervisor",
+                "args": second_payload,
+                "id": "handback-2",
+                "type": "tool_call",
+            },
+        ],
+        additional_kwargs={"_seq": 1},
+    )
+    for messages in (
+        [sibling_batch, first_result, observation_result],
+        [two_handbacks, first_result, second_result],
+    ):
+        assert mod._worker_handoff_metadata(
+            messages,
+            source_worker="Mythic_Operator",
+            source_turn_id="turn-1",
+        ) is None
+
+
+@pytest.mark.parametrize("batch_kind", ("command-and-dict", "two-commands"))
+def test_real_toolnode_concurrent_handback_batches_fail_closed(batch_kind):
+    mod = _load_model_module()
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need graph REMAINING — query graph"
+    handback = mod._create_handback_to_supervisor_tool()
+
+    @tool
+    def observe() -> dict:
+        """Return a later observation from a concurrent sibling call."""
+        return {"objective_complete": True}
+
+    first = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "first typed route",
+            "summary": summary,
+            "next_owner": "BloodHound",
+        },
+        "id": "handback-1",
+        "type": "tool_call",
+    }
+    if batch_kind == "command-and-dict":
+        calls = [
+            first,
+            {
+                "name": "observe",
+                "args": {},
+                "id": "observe-1",
+                "type": "tool_call",
+            },
+        ]
+        node = ToolNode([handback, observe])
+        expected_types = ["Command", "dict"]
+    else:
+        calls = [
+            first,
+            {
+                "name": "handback_to_supervisor",
+                "args": {
+                    "reason": "second typed route",
+                    "summary": summary,
+                    "next_owner": "MCP_Manager",
+                },
+                "id": "handback-2",
+                "type": "tool_call",
+            },
+        ]
+        node = ToolNode([handback])
+        expected_types = ["Command", "Command"]
+
+    request = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=calls,
+        additional_kwargs={"_seq": 1},
+    )
+    outputs = asyncio.run(node._afunc({"messages": [request]}, {}, Runtime()))
+    assert [type(output).__name__ for output in outputs] == expected_types
+
+    captured = [request]
+    for output in outputs:
+        update = output if isinstance(output, dict) else output.update
+        captured.extend(update["messages"])
+    for index, message in enumerate(captured, start=1):
+        message.additional_kwargs.setdefault("_seq", index)
+    assert mod._worker_handoff_metadata(
+        captured,
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        {"summary": "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph", "next_owner": "BloodHound"},
+        {"reason": "typed route", "next_owner": "BloodHound"},
+        {"reason": 7, "summary": "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph", "next_owner": "BloodHound"},
+        {"reason": "typed route", "summary": ["not", "a", "string"], "next_owner": "BloodHound"},
+        {"reason": "typed route", "summary": "DONE — x FAILED — none BLOCKER — need graph REMAINING — query graph", "next_owner": "BloodHound", "extra": True},
+    ),
+)
+def test_ai_only_handback_must_match_required_tool_argument_schema(args):
+    mod = _load_model_module()
+    message = AIMessage(
+        content="",
+        name="Mythic_Operator",
+        tool_calls=[{
+            "name": "handback_to_supervisor",
+            "args": args,
+            "id": "invalid-ai-only",
+            "type": "tool_call",
+        }],
+        additional_kwargs={"_seq": 3},
+    )
+    assert mod._worker_handoff_metadata(
+        [message],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    ) is None
+
+
+@pytest.mark.parametrize("message_source", ("ai", "tool"))
+@pytest.mark.parametrize("next_owner", _MALFORMED_TYPED_OWNERS)
+def test_malformed_typed_owner_fails_closed_from_every_authoritative_source(
+    message_source,
+    next_owner,
+):
+    mod = _load_model_module()
+    summary = "DONE — reviewed state FAILED — none BLOCKER — need graph REMAINING — query graph"
+    payload = {
+        "reason": "route to BloodHound",
+        "summary": summary,
+        "next_owner": next_owner,
+    }
+    if message_source == "ai":
+        message = AIMessage(
+            content="",
+            name="Mythic_Operator",
+            tool_calls=[{
+                "name": "handback_to_supervisor",
+                "args": payload,
+                "id": "malformed-ai",
+                "type": "tool_call",
+            }],
+            additional_kwargs={"_seq": 3},
+        )
+    else:
+        message = ToolMessage(
+            content=f"route to BloodHound\n\n{summary}",
+            name="handback_to_supervisor",
+            tool_call_id="malformed-tool",
+            additional_kwargs={"_seq": 3, "_handback_input": payload},
+        )
+    assert mod._worker_handoff_metadata(
+        [message],
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+    ) is None
 
 
 def test_completed_worker_summary_hands_back_to_supervisor_without_emitting_final_report():
@@ -1179,6 +1934,82 @@ def test_handoff_tool_returns_delta_only_for_add_reducers():
     assert command.update["messages"] == command.update["mythic_operator_messages"]
     assert len(command.update["messages"]) == 2
     assert all(msg is not old_supervisor_msg for msg in command.update["messages"])
+
+
+def test_typed_handoff_redirects_same_worker_to_known_next_owner():
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        worker_outcome_lookup=lambda _state: ({
+            "source_worker": "Mythic_Operator",
+            "outcome": "handoff",
+            "next_owner": "BloodHound",
+        }, "summary"),
+    )
+    runtime = SimpleNamespace(
+        state={"messages": [], "supervisor_messages": [], "mythic_operator_messages": [], "bloodhound_messages": []},
+        tool_call_id="handoff-typed",
+    )
+
+    command = tool.func(runtime, "repeat Mythic work")
+
+    assert command.goto == "BloodHound"
+    assert command.update["bloodhound_messages"][1].content == "summary"
+    assert command.update["bloodhound_messages"][1].additional_kwargs["_delegated_to"] == "BloodHound"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "tool_text", "final_text"),
+    (
+        ("blocked", "Worker outcome prevented repeated delegation: Mythic_Operator reported BLOCKED with no next owner.", "**Blocked**\n\nsummary"),
+        ("complete", "Worker outcome prevented repeated delegation: Mythic_Operator reported COMPLETE.", "**Objective complete**\n\nsummary"),
+    ),
+)
+def test_typed_worker_outcome_terminalizes_repeated_same_worker(outcome, tool_text, final_text):
+    mod = _load_model_module()
+    tool = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        worker_outcome_lookup=lambda _state: ({
+            "source_worker": "Mythic_Operator",
+            "outcome": outcome,
+            "next_owner": "",
+        }, "summary"),
+    )
+    runtime = SimpleNamespace(
+        state={"messages": [], "supervisor_messages": [], "mythic_operator_messages": []},
+        tool_call_id="handoff-terminal-typed",
+    )
+
+    command = tool.func(runtime, "repeat Mythic work")
+
+    assert command.goto == "__end__"
+    assert command.graph == mod.Command.PARENT
+    assert command.update["messages"] == command.update["supervisor_messages"]
+    assert [type(msg).__name__ for msg in command.update["messages"]] == ["ToolMessage", "AIMessage"]
+    assert command.update["messages"][0].name == "transfer_to_Mythic_Operator"
+    assert command.update["messages"][0].tool_call_id == "handoff-terminal-typed"
+    assert command.update["messages"][0].content == tool_text
+    assert command.update["messages"][1].content == final_text
+    assert command.update["messages"][1].additional_kwargs["_is_final_report"] is True
+
+
+def test_complete_terminalizes_different_requested_owner_but_blocked_does_not():
+    mod = _load_model_module()
+    runtime = SimpleNamespace(
+        state={"messages": [], "supervisor_messages": [], "mythic_operator_messages": [], "bloodhound_messages": []},
+        tool_call_id="handoff-cross-owner",
+    )
+    complete = mod._create_handoff_tool(
+        agent_name="BloodHound",
+        worker_outcome_lookup=lambda _state: ({"source_worker": "Mythic_Operator", "outcome": "complete", "next_owner": ""}, "summary"),
+    ).func(runtime, "stale follow-up")
+    assert complete.goto == "__end__"
+    assert complete.update["messages"][0].content == "Worker outcome prevented repeated delegation: Mythic_Operator reported COMPLETE."
+    blocked = mod._create_handoff_tool(
+        agent_name="BloodHound",
+        worker_outcome_lookup=lambda _state: ({"source_worker": "Mythic_Operator", "outcome": "blocked", "next_owner": ""}, "summary"),
+    ).func(runtime, "fresh BloodHound work")
+    assert blocked.goto == "BloodHound"
 
 
 def test_terminal_execute_capability_report_includes_existing_proof_chain():
