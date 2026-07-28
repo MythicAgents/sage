@@ -1,10 +1,12 @@
 import copy
 import json
+import math
 import ntpath
 import os
 import re
 import asyncio
 import aiosqlite
+import threading
 from collections import Counter
 from dataclasses import dataclass, replace
 from langgraph.graph import StateGraph, START, MessagesState, END
@@ -37,8 +39,10 @@ from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontm
 from .turn_authority import (
     TurnAuthority,
     apply_supervised_semantic_intent,
-    compile_turn_authority,
+    authority_from_request_contract,
 )
+from .request_events import RequestEventLedger, stable_event_id
+from .decision_record import seal_request_decision_record
 from . import worker_outcome as _worker_outcome
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
@@ -50,7 +54,7 @@ except ImportError:
     from logging_fix import ensure_logger_initialized, force_flush_all_handlers
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphRecursionError, ParentCommand
 import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
@@ -282,40 +286,351 @@ def _strip_blank_text_blocks(content: Any) -> Any:
 
 
 def _tool_call_ids_from_ai_message(message: AIMessage) -> list[str]:
-    """Return the ordered unique tool-call IDs carried by an assistant message."""
-    ids: list[str] = []
-    seen: set[str] = set()
+    """Return ordered tool-call IDs from the authoritative representation.
 
-    for tool_call in (getattr(message, "tool_calls", None) or []):
-        if not isinstance(tool_call, dict):
-            continue
-        tool_call_id = str(tool_call.get("id") or "").strip()
-        if tool_call_id and tool_call_id not in seen:
-            ids.append(tool_call_id)
-            seen.add(tool_call_id)
+    Duplicate IDs are distinct occurrences. Provider-native copies are fallbacks,
+    not additional calls, when normalized ``tool_calls`` are present.
+    """
+
+    normalized_calls = [
+        item
+        for item in (getattr(message, "tool_calls", None) or [])
+        if isinstance(item, dict)
+    ]
+    if normalized_calls:
+        return [
+            tool_call_id
+            for item in normalized_calls
+            if (tool_call_id := str(item.get("id") or "").strip())
+        ]
 
     additional_kwargs = getattr(message, "additional_kwargs", None) or {}
-    for tool_call in (additional_kwargs.get("tool_calls") or []):
-        if not isinstance(tool_call, dict):
-            continue
-        tool_call_id = str(tool_call.get("id") or "").strip()
-        if tool_call_id and tool_call_id not in seen:
-            ids.append(tool_call_id)
-            seen.add(tool_call_id)
+    raw_calls = [
+        item
+        for item in (additional_kwargs.get("tool_calls") or [])
+        if isinstance(item, dict)
+    ]
+    if raw_calls:
+        return [
+            tool_call_id
+            for item in raw_calls
+            if (
+                tool_call_id := str(
+                    item.get("id")
+                    or (item.get("function") or {}).get("id")
+                    or ""
+                ).strip()
+            )
+        ]
 
     content = getattr(message, "content", None)
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") not in {"tool_use", "tool_call"}:
-                continue
-            tool_call_id = str(block.get("id") or block.get("tool_use_id") or "").strip()
-            if tool_call_id and tool_call_id not in seen:
-                ids.append(tool_call_id)
-                seen.add(tool_call_id)
+    if not isinstance(content, list):
+        return []
+    return [
+        tool_call_id
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") in {"tool_use", "tool_call"}
+        and (
+            tool_call_id := str(
+                block.get("id") or block.get("tool_use_id") or ""
+            ).strip()
+        )
+    ]
 
-    return ids
+
+def _tool_call_batch_error(tool_calls: Any) -> str:
+    """Return why a model-produced tool batch is unsafe to execute.
+
+    Tool results are correlated by the provider call ID. Sage never invents or
+    normalizes that identity: one malformed occurrence makes the complete batch
+    ambiguous and therefore non-executable.
+    """
+
+    if not isinstance(tool_calls, list):
+        return "tool-call batch is not a list"
+    seen_ids: set[str] = set()
+    for index, tool_call in enumerate(tool_calls):
+        if not isinstance(tool_call, dict):
+            return f"tool call {index} is not a dictionary"
+        name = tool_call.get("name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name != name.strip()
+        ):
+            return f"tool call {index} has an invalid name"
+        args = tool_call.get("args")
+        if not isinstance(args, dict):
+            return f"tool call {index} has non-dictionary arguments"
+        tool_call_id = tool_call.get("id")
+        if (
+            not isinstance(tool_call_id, str)
+            or not tool_call_id
+            or tool_call_id != tool_call_id.strip()
+        ):
+            return f"tool call {index} has an invalid identity"
+        if tool_call_id in seen_ids:
+            return f"tool call {index} repeats identity {tool_call_id!r}"
+        seen_ids.add(tool_call_id)
+    return ""
+
+
+def _json_tree_error(value: Any, *, path: str = "$") -> str:
+    if value is None or isinstance(value, (str, bool, int)):
+        return ""
+    if isinstance(value, float):
+        return "" if math.isfinite(value) else f"{path} is non-finite"
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if error := _json_tree_error(item, path=f"{path}[{index}]"):
+                return error
+        return ""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                return f"{path} has a non-string key"
+            if error := _json_tree_error(item, path=f"{path}.{key}"):
+                return error
+        return ""
+    return f"{path} has non-JSON type {type(value).__name__}"
+
+
+def _strict_provider_argument_object(value: Any) -> tuple[dict[str, Any] | None, str]:
+    """Decode one provider argument payload without LangChain's shape coercion."""
+
+    if isinstance(value, dict):
+        tree_error = _json_tree_error(value)
+        return (
+            (None, f"arguments {tree_error}")
+            if tree_error
+            else (value, "")
+        )
+    if not isinstance(value, str) or not value:
+        return None, "arguments are not a JSON object"
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        decoded: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in decoded:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            decoded[key] = item
+        return decoded
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant {value!r}")
+
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite,
+        )
+    except (TypeError, ValueError) as exc:
+        return None, f"arguments are invalid JSON: {exc}"
+    if not isinstance(decoded, dict):
+        return None, "arguments JSON is not an object"
+    if tree_error := _json_tree_error(decoded):
+        return None, f"arguments {tree_error}"
+    return decoded, ""
+
+
+def _type_exact_json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON-like values without Python's bool/int or int/float aliases."""
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return (
+            left.keys() == right.keys()
+            and all(_type_exact_json_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, list):
+        return (
+            len(left) == len(right)
+            and all(
+                _type_exact_json_equal(left_item, right_item)
+                for left_item, right_item in zip(left, right)
+            )
+        )
+    return left == right
+
+
+def _provider_call_record(
+    item: Any,
+    *,
+    source: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Parse one provider-native call into Sage's canonical call shape."""
+
+    if not isinstance(item, dict):
+        return None, f"{source} call is not a dictionary"
+    if "function" in item:
+        function = item.get("function")
+        if not isinstance(function, dict):
+            return None, f"{source} function is not a dictionary"
+        name = function.get("name")
+        raw_args = function.get("arguments")
+    else:
+        name = item.get("name")
+        raw_args = item.get("args")
+        if not isinstance(raw_args, dict):
+            return None, f"{source} args are not a dictionary"
+    args, args_error = _strict_provider_argument_object(raw_args)
+    if args_error:
+        return None, f"{source} {args_error}"
+    canonical = {
+        "name": name,
+        "args": args,
+        "id": item.get("id"),
+    }
+    call_error = _tool_call_batch_error([canonical])
+    if call_error:
+        return None, f"{source} {call_error}"
+    return canonical, ""
+
+
+def _provider_content_call_record(
+    item: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(item, dict):
+        return None, "content tool block is not a dictionary"
+    has_id = "id" in item
+    has_tool_use_id = "tool_use_id" in item
+    if has_id and has_tool_use_id:
+        primary_id = item.get("id")
+        alias_id = item.get("tool_use_id")
+        if (
+            not isinstance(primary_id, str)
+            or not isinstance(alias_id, str)
+            or primary_id != alias_id
+        ):
+            return None, "content tool block has divergent identity aliases"
+    tool_call_id = item.get("id") if has_id else item.get("tool_use_id")
+    raw_args = item.get("input") if "input" in item else item.get("args")
+    if not isinstance(raw_args, dict):
+        return None, "content tool block arguments are not a dictionary"
+    args, args_error = _strict_provider_argument_object(raw_args)
+    if args_error:
+        return None, f"content tool block {args_error}"
+    canonical = {
+        "name": item.get("name"),
+        "args": args,
+        "id": tool_call_id,
+    }
+    call_error = _tool_call_batch_error([canonical])
+    if call_error:
+        return None, f"content tool block {call_error}"
+    return canonical, ""
+
+
+def _canonical_call_sequences_match(
+    canonical: list[dict[str, Any]],
+    native: list[dict[str, Any]],
+) -> bool:
+    if len(canonical) != len(native):
+        return False
+    return all(
+        left["id"] == right["id"]
+        and left["name"] == right["name"]
+        and _type_exact_json_equal(left["args"], right["args"])
+        for left, right in zip(canonical, native)
+    )
+
+
+def _tool_call_envelope_error(
+    message: AIMessage,
+    *,
+    require_normalized: bool = True,
+) -> str:
+    """Validate normalized and provider-native tool calls as one envelope.
+
+    Fresh model output must carry normalized calls because ``ToolNode`` consumes
+    that surface. Historical provider messages may predate normalization; the
+    sanitizer permits one valid native sequence as their canonical source while
+    still requiring exact agreement across every other present copy.
+    """
+
+    normalized = list(getattr(message, "tool_calls", None) or [])
+    invalid = list(getattr(message, "invalid_tool_calls", None) or [])
+    if invalid:
+        return "provider envelope contains invalid_tool_calls"
+    normalized_error = _tool_call_batch_error(normalized)
+    if normalized_error:
+        return normalized_error
+    for index, item in enumerate(normalized):
+        if args_error := _json_tree_error(item["args"]):
+            return f"tool call {index} arguments {args_error}"
+    canonical = [
+        {
+            "name": item["name"],
+            "args": item["args"],
+            "id": item["id"],
+        }
+        for item in normalized
+    ]
+    native_canonical_pending = not canonical and not require_normalized
+
+    additional_kwargs = getattr(message, "additional_kwargs", None) or {}
+    if "tool_calls" in additional_kwargs:
+        raw_calls = additional_kwargs.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return "raw tool_calls is not a list"
+        parsed_raw: list[dict[str, Any]] = []
+        for index, raw_call in enumerate(raw_calls):
+            parsed, error = _provider_call_record(
+                raw_call,
+                source=f"raw tool call {index}",
+            )
+            if error:
+                return error
+            parsed_raw.append(parsed)
+        if native_canonical_pending and parsed_raw:
+            canonical = parsed_raw
+            native_canonical_pending = False
+        elif not _canonical_call_sequences_match(canonical, parsed_raw):
+            return "raw tool_calls diverge from normalized tool_calls"
+
+    if "function_call" in additional_kwargs:
+        function_call = additional_kwargs.get("function_call")
+        if not isinstance(function_call, dict):
+            return "legacy function_call is not a dictionary"
+        args, args_error = _strict_provider_argument_object(
+            function_call.get("arguments")
+        )
+        if args_error:
+            return f"legacy function_call {args_error}"
+        if (
+            len(canonical) != 1
+            or function_call.get("name") != canonical[0]["name"]
+            or not _type_exact_json_equal(args, canonical[0]["args"])
+        ):
+            return "legacy function_call diverges from normalized tool_calls"
+
+    content = getattr(message, "content", None)
+    content_blocks = (
+        [
+            block
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") in {"tool_use", "tool_call"}
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if content_blocks:
+        parsed_content: list[dict[str, Any]] = []
+        for block in content_blocks:
+            parsed, error = _provider_content_call_record(block)
+            if error:
+                return error
+            parsed_content.append(parsed)
+        if native_canonical_pending and parsed_content:
+            canonical = parsed_content
+            native_canonical_pending = False
+        elif not _canonical_call_sequences_match(canonical, parsed_content):
+            return "content tool blocks diverge from normalized tool_calls"
+    return ""
 
 
 def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
@@ -333,6 +648,7 @@ def _strip_tool_call_payload(message: AIMessage) -> AIMessage | None:
 
     additional_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
     additional_kwargs.pop("tool_calls", None)
+    additional_kwargs.pop("function_call", None)
 
     repaired = message.model_copy(update={
         "content": content,
@@ -356,16 +672,27 @@ def _repair_tool_call_adjacency(msgs: list[AnyMessage]) -> tuple[list[AnyMessage
 
     for index, message in enumerate(msgs):
         if isinstance(message, AIMessage):
+            normalized_calls = getattr(message, "tool_calls", None) or []
+            batch_error = _tool_call_envelope_error(
+                message,
+                require_normalized=False,
+            )
+            if batch_error:
+                stripped = _strip_tool_call_payload(message)
+                if stripped is not None:
+                    repaired.append(stripped)
+                changed = True
+                continue
             tool_call_ids = _tool_call_ids_from_ai_message(message)
             if tool_call_ids:
-                immediate_result_ids: set[str] = set()
+                immediate_result_ids: Counter[str] = Counter()
                 lookahead = index + 1
                 while lookahead < len(msgs) and isinstance(msgs[lookahead], ToolMessage):
                     tool_call_id = str(getattr(msgs[lookahead], "tool_call_id", "") or "").strip()
                     if tool_call_id:
-                        immediate_result_ids.add(tool_call_id)
+                        immediate_result_ids[tool_call_id] += 1
                     lookahead += 1
-                if not set(tool_call_ids).issubset(immediate_result_ids):
+                if Counter(tool_call_ids) - immediate_result_ids:
                     stripped = _strip_tool_call_payload(message)
                     if stripped is not None:
                         repaired.append(stripped)
@@ -374,21 +701,21 @@ def _repair_tool_call_adjacency(msgs: list[AnyMessage]) -> tuple[list[AnyMessage
         repaired.append(message)
 
     cleaned: list[AnyMessage] = []
-    pending_result_ids: set[str] = set()
+    pending_result_ids: Counter[str] = Counter()
     for message in repaired:
         if isinstance(message, AIMessage):
             cleaned.append(message)
-            pending_result_ids = set(_tool_call_ids_from_ai_message(message))
+            pending_result_ids = Counter(_tool_call_ids_from_ai_message(message))
         elif isinstance(message, ToolMessage):
             tool_call_id = str(getattr(message, "tool_call_id", "") or "").strip()
-            if tool_call_id and tool_call_id in pending_result_ids:
+            if tool_call_id and pending_result_ids[tool_call_id] > 0:
                 cleaned.append(message)
-                pending_result_ids.remove(tool_call_id)
+                pending_result_ids[tool_call_id] -= 1
             else:
                 changed = True
         else:
             cleaned.append(message)
-            pending_result_ids = set()
+            pending_result_ids = Counter()
 
     return cleaned, changed
 
@@ -959,9 +1286,10 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
     HITL's state-changing tool set. Other turn modes retain their guarded-tool behavior.
     """
 
-    def __init__(self, model: "Model"):
+    def __init__(self, model: "Model", *, agent_name: str = ""):
         super().__init__()
         self._model = model
+        self._agent_name = str(agent_name or "").strip()
 
     @staticmethod
     def _blocked_tool_message(request: Any, reason: str) -> ToolMessage:
@@ -981,10 +1309,20 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
     def _pre_tool_block_reason(self, request: Any) -> str | None:
         from sage_chat.hitl import approval_action_fingerprint
         tool_name = _tool_name_from_request(request)
-        authority = getattr(self._model, "_turn_authority", TurnAuthority(mode="observe"))
         args = getattr(request, "tool_call", None)
         if isinstance(args, dict):
             args = args.get("args", args)
+        contract_reason = self._model._request_contract_block_reason(
+            tool_name,
+            args,
+        )
+        if contract_reason:
+            return contract_reason
+        # A typed request contract is the sole authority once installed. The legacy
+        # TurnAuthority methods below remain only for direct historical fixtures.
+        if getattr(self._model, "_request_contract", None) is not None:
+            return None
+        authority = getattr(self._model, "_turn_authority", TurnAuthority(mode="observe"))
         if tool_name in GUARDED_TOOLS:
             try:
                 if authority.denies_action_digest(approval_action_fingerprint({
@@ -1006,27 +1344,212 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
             return None
         return None if allowed else reason
 
+    def _with_canonical_control_state(
+        self,
+        request: Any,
+    ) -> tuple[Any, str]:
+        """Bind a managed control call to the exact canonical subgoal."""
+        if not _is_control_tool(_tool_name_from_request(request)):
+            return request, ""
+        projection = self._model._canonical_subgoal_projection()
+        if not projection:
+            if getattr(self._model, "_request_contract", None) is not None:
+                return request, "managed control call has no canonical subgoal projection"
+            return request, ""
+        state = getattr(request, "state", None)
+        if not isinstance(state, dict):
+            return request, "managed control call has no dictionary runtime state"
+        if "_subgoal_state" in state:
+            if state.get("_subgoal_state") != projection:
+                return request, "managed control call supplied a malformed or stale subgoal projection"
+            return request, ""
+        override = getattr(request, "override", None)
+        if not callable(override):
+            return request, "managed control call cannot bind canonical subgoal state"
+        return override(state={**state, "_subgoal_state": projection}), ""
+
+    @staticmethod
+    def _post_arbitration_control_error(request: Any) -> str:
+        """Require a control request to match the sole post-authority occurrence."""
+        tool_call = getattr(request, "tool_call", None)
+        if not isinstance(tool_call, dict):
+            return "managed control request has no dictionary tool call"
+        tool_name = tool_call.get("name")
+        if not isinstance(tool_name, str) or not _is_control_tool(tool_name):
+            return ""
+        tool_call_id = tool_call.get("id")
+        tool_args = tool_call.get("args")
+        if (
+            not isinstance(tool_call_id, str)
+            or not tool_call_id
+            or tool_call_id != tool_call_id.strip()
+            or not isinstance(tool_args, dict)
+        ):
+            return "managed control request has malformed identity or arguments"
+        state = getattr(request, "state", None)
+        messages = state.get("messages") if isinstance(state, dict) else None
+        if not isinstance(messages, list):
+            return "managed control request has no runtime message batch"
+        latest_ai = next(
+            (message for message in reversed(messages) if isinstance(message, AIMessage)),
+            None,
+        )
+        if latest_ai is None:
+            return "managed control request has no runtime AI message"
+        if envelope_error := _tool_call_envelope_error(latest_ai):
+            return f"managed control request has invalid runtime envelope: {envelope_error}"
+        runtime_calls = list(getattr(latest_ai, "tool_calls", None) or [])
+        if len(runtime_calls) != 1 or not isinstance(runtime_calls[0], dict):
+            return "managed control request is not the sole runtime tool call"
+        selected = runtime_calls[0]
+        if (
+            selected.get("id") != tool_call_id
+            or selected.get("name") != tool_name
+            or not _type_exact_json_equal(selected.get("args"), tool_args)
+        ):
+            return "managed control request diverges from the selected runtime call"
+        return ""
+
+    @classmethod
+    def _selected_control_call(cls, request: Any) -> dict[str, Any] | None:
+        """Return an explicit positive witness for one exact selected control."""
+        tool_call = getattr(request, "tool_call", None)
+        if not isinstance(tool_call, dict):
+            return None
+        tool_name = tool_call.get("name")
+        if not isinstance(tool_name, str) or not _is_control_tool(tool_name):
+            return None
+        if cls._post_arbitration_control_error(request):
+            return None
+        return tool_call
+
+    @staticmethod
+    def _summary_from_selected_control(
+        selected_control: dict[str, Any] | None,
+    ) -> str:
+        if not isinstance(selected_control, dict):
+            return ""
+        tool_args = selected_control.get("args")
+        if not isinstance(tool_args, dict):
+            return ""
+        return next(
+            (
+                value.strip()
+                for key in (
+                    "summary",
+                    "final_response",
+                    "progress_summary",
+                    "reason",
+                    "text",
+                )
+                for value in [tool_args.get(key)]
+                if isinstance(value, str) and value.strip()
+            ),
+            "",
+        )
+
+    @classmethod
+    def _selected_control_summary(cls, request: Any) -> str:
+        """Return summary text only for the exact post-arbitration control call."""
+        return cls._summary_from_selected_control(
+            cls._selected_control_call(request)
+        )
+
+    def _record_selected_control_summary(
+        self,
+        selected_control: dict[str, Any] | None,
+    ) -> None:
+        summary = self._summary_from_selected_control(selected_control)
+        if not summary:
+            return
+        recorder = getattr(self._model, "_record_delegation_final_summary", None)
+        if (
+            not self._agent_name
+            or self._agent_name == "Supervisor"
+            or not callable(recorder)
+        ):
+            return
+        recorder(self._agent_name, summary)
+
     def _after_model_update(self, state: Any) -> dict[str, Any] | None:
-        """Remove authority-denied guarded calls before HITL builds approval cards."""
+        """Apply one authority decision to the shared generation message in place."""
         from sage_chat.hitl import approval_action_fingerprint
         messages = state.get("messages", []) if isinstance(state, dict) else getattr(state, "messages", [])
         last_ai = next((msg for msg in reversed(messages) if isinstance(msg, AIMessage)), None)
-        if last_ai is None or not (getattr(last_ai, "tool_calls", None) or []):
+        if last_ai is None:
             return None
+        original_calls = list(last_ai.tool_calls)
+        batch_error = _tool_call_envelope_error(last_ai)
+        if not original_calls and not batch_error:
+            return None
+        first_control = next(
+            (
+                tool_call
+                for tool_call in original_calls
+                if isinstance(tool_call, dict)
+                and _is_control_tool(str(tool_call.get("name") or ""))
+            ),
+            None,
+        )
+        has_control = any(
+            isinstance(tool_call, dict)
+            and _is_control_tool(str(tool_call.get("name") or ""))
+            for tool_call in original_calls
+        )
+        candidate_calls = (
+            []
+            if batch_error
+            else (
+                [first_control]
+                if first_control is not None
+                else ([] if has_control else original_calls)
+            )
+        )
+        proposal_binding_error = ""
+        if not batch_error:
+            try:
+                self._model.bind_supervised_request_proposal(candidate_calls)
+            except (TypeError, ValueError) as exc:
+                proposal_binding_error = str(exc)
+                logger.warning("request proposal binding failed closed: %s", exc)
         authority = getattr(self._model, "_turn_authority", TurnAuthority(mode="observe"))
-        progress = self._model._objective_contract_progress()
+        typed_contract_installed = (
+            getattr(self._model, "_request_contract", None) is not None
+        )
+        progress = (
+            {}
+            if typed_contract_installed
+            else self._model._objective_contract_progress()
+        )
         allowed_calls = []
         blocked_reasons = []
-        for tool_call in last_ai.tool_calls:
+        if batch_error:
+            blocked_reasons.append(f"invalid provider tool-call batch: {batch_error}")
+        for tool_call in candidate_calls:
             name = str(tool_call.get("name") or "")
+            if proposal_binding_error and name in GUARDED_TOOLS:
+                blocked_reasons.append(
+                    f"{name or 'unknown_tool'}: request proposal binding failed"
+                )
+                continue
+            contract_reason = self._model._request_contract_block_reason(
+                name,
+                tool_call.get("args", {}),
+            )
+            if contract_reason:
+                allowed, reason = False, contract_reason
+                blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
+                continue
             denied = False
-            if name in GUARDED_TOOLS:
+            if name in GUARDED_TOOLS and not typed_contract_installed:
                 try:
                     denied = authority.denies_action_digest(approval_action_fingerprint(tool_call))
                 except ValueError:
                     denied = True
             if denied:
                 allowed, reason = False, "turn authority denied a previously rejected guarded action"
+            elif typed_contract_installed:
+                allowed, reason = True, ""
             elif authority.enforces_objective_tool_allowlist:
                 allowed, reason = authority.allows_model_tool(
                     name,
@@ -1041,45 +1564,38 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 allowed_calls.append(tool_call)
                 continue
             blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
-        if not blocked_reasons:
+        rewrite = bool(batch_error) or has_control or allowed_calls != original_calls
+        if not blocked_reasons and not rewrite:
             return None
-        denial_text = "[turn-authority] " + " | ".join(blocked_reasons)
-        allowed_ids = {str(tool_call.get("id") or "") for tool_call in allowed_calls}
+        denial_text = (
+            "[turn-authority] " + " | ".join(blocked_reasons)
+            if blocked_reasons
+            else ""
+        )
         if isinstance(last_ai.content, list):
-            revised_content = []
-            for block in last_ai.content:
-                if isinstance(block, dict) and str(block.get("type") or "").casefold() in {
-                    "tool_use", "tool_call"
-                }:
-                    block_id = str(block.get("id") or block.get("tool_call_id") or "")
-                    if not block_id or block_id not in allowed_ids:
-                        continue
-                revised_content.append(block)
-            revised_content.append({"type": "text", "text": denial_text})
+            last_ai.content[:] = [
+                block
+                for block in last_ai.content
+                if not (
+                    isinstance(block, dict)
+                    and str(block.get("type") or "").casefold()
+                    in {"tool_use", "tool_call"}
+                )
+            ]
+            if denial_text:
+                last_ai.content.append({"type": "text", "text": denial_text})
         else:
             existing = str(last_ai.content or "").strip()
-            revised_content = f"{existing}\n{denial_text}".strip()
-        revised_kwargs = dict(getattr(last_ai, "additional_kwargs", {}) or {})
-        raw_tool_calls = revised_kwargs.get("tool_calls")
-        if isinstance(raw_tool_calls, list):
-            revised_kwargs["tool_calls"] = [
-                raw_call for raw_call in raw_tool_calls
-                if isinstance(raw_call, dict)
-                and str(raw_call.get("id") or "") in allowed_ids
-            ]
-        if not allowed_ids:
-            revised_kwargs.pop("function_call", None)
-        # Do not emit a ToolMessage for a removed tool call: that produces an orphan tool_result
-        # rejected by strict providers. The revised assistant message carries the denial while any
-        # still-authorized calls retain normal tool-call/result adjacency. Scrub provider-native
-        # copies too so a persisted Anthropic/OpenAI message cannot resurrect the denied call.
-        revised = last_ai.model_copy(update={
-            "content": revised_content,
-            "tool_calls": allowed_calls,
-            "invalid_tool_calls": [],
-            "additional_kwargs": revised_kwargs,
-        })
-        return {"messages": [revised]}
+            if denial_text:
+                last_ai.content = f"{existing}\n{denial_text}".strip()
+        last_ai.tool_calls[:] = allowed_calls
+        last_ai.invalid_tool_calls[:] = []
+        last_ai.additional_kwargs.pop("tool_calls", None)
+        last_ai.additional_kwargs.pop("function_call", None)
+        # LangChain invokes callbacks with the same generation message object later
+        # consumed by agent middleware. Mutating that object prevents a pre-authority
+        # callback snapshot from restoring removed calls.
+        return None
 
     def after_model(self, state, runtime):
         return self._after_model_update(state)
@@ -1088,22 +1604,90 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         return self._after_model_update(state)
 
     async def awrap_tool_call(self, request, handler):
+        from sage_chat.hitl import approval_action_fingerprint
+
+        request, control_reason = self._with_canonical_control_state(request)
+        if control_reason:
+            return self._blocked_tool_message(request, control_reason)
         reason = self._pre_tool_block_reason(request)
         if reason:
             return self._blocked_tool_message(request, reason)
+        control_reason = self._post_arbitration_control_error(request)
+        if control_reason:
+            return self._blocked_tool_message(request, control_reason)
+        selected_control = self._selected_control_call(request)
         # Reserve a bounded attempt before the first await. LangGraph may execute sibling tool
         # calls concurrently; consuming afterward lets both pass the same attempts_used=0 check.
         if _tool_name_from_request(request) in GUARDED_TOOLS:
-            self._model._consume_turn_authority_attempt()
-        result = await handler(request)
+            tool_call = getattr(request, "tool_call", None)
+            try:
+                action_digest = approval_action_fingerprint(tool_call)
+            except ValueError:
+                return self._blocked_tool_message(
+                    request,
+                    "request contract denied malformed guarded action identity",
+                )
+            if not self._model._reserve_supervised_request_action(action_digest):
+                return self._blocked_tool_message(
+                    request,
+                    "request contract already admitted this guarded action",
+                )
+            if getattr(self._model, "_request_contract", None) is None:
+                self._model._consume_turn_authority_attempt()
+        self._record_selected_control_summary(selected_control)
+
+        async def close_selected_delegation() -> None:
+            if (
+                selected_control is not None
+                and self._agent_name
+                and self._agent_name != "Supervisor"
+            ):
+                closer = getattr(self._model, "_close_delegation", None)
+                if callable(closer):
+                    await closer(self._agent_name)
+
+        try:
+            result = await handler(request)
+        except ParentCommand:
+            await close_selected_delegation()
+            raise
+        if (
+            isinstance(result, Command)
+            and result.graph == Command.PARENT
+        ):
+            await close_selected_delegation()
         return result
 
     def wrap_tool_call(self, request, handler):
+        from sage_chat.hitl import approval_action_fingerprint
+
+        request, control_reason = self._with_canonical_control_state(request)
+        if control_reason:
+            return self._blocked_tool_message(request, control_reason)
         reason = self._pre_tool_block_reason(request)
         if reason:
             return self._blocked_tool_message(request, reason)
+        control_reason = self._post_arbitration_control_error(request)
+        if control_reason:
+            return self._blocked_tool_message(request, control_reason)
+        selected_control = self._selected_control_call(request)
         if _tool_name_from_request(request) in GUARDED_TOOLS:
-            self._model._consume_turn_authority_attempt()
+            tool_call = getattr(request, "tool_call", None)
+            try:
+                action_digest = approval_action_fingerprint(tool_call)
+            except ValueError:
+                return self._blocked_tool_message(
+                    request,
+                    "request contract denied malformed guarded action identity",
+                )
+            if not self._model._reserve_supervised_request_action(action_digest):
+                return self._blocked_tool_message(
+                    request,
+                    "request contract already admitted this guarded action",
+                )
+            if getattr(self._model, "_request_contract", None) is None:
+                self._model._consume_turn_authority_attempt()
+        self._record_selected_control_summary(selected_control)
         return handler(request)
 
 
@@ -1803,8 +2387,11 @@ class _ToolSchemaSlimMiddleware(AgentMiddleware):
 class SageState(MessagesState):
     count: int
     remaining_steps: RemainingSteps
-    mode: NotRequired[Literal["auto", "supervised"]]
+    mode: NotRequired[Literal["conversation", "auto", "supervised"]]
     next_owner: NotRequired[str]
+    _request_id: NotRequired[str]
+    _request_stop_condition: NotRequired[str]
+    _subgoal_state: NotRequired[dict[str, Any]]
     _pending_objective_refinement: NotRequired[dict[str, Any] | None]
     recursion_summary_requested: bool
     recursion_handback: bool
@@ -1934,7 +2521,7 @@ def _worker_handoff_metadata(
     ) -> dict[str, str] | None:
         if not isinstance(candidate, dict):
             return None
-        required = {"reason", "summary"}
+        required = {"reason", "summary", "outcome"}
         allowed = {*required, "next_owner"}
         if (
             not required.issubset(candidate)
@@ -1942,12 +2529,19 @@ def _worker_handoff_metadata(
             or (require_owner_key and "next_owner" not in candidate)
             or not isinstance(candidate.get("reason"), str)
             or not isinstance(candidate.get("summary"), str)
+            or candidate.get("outcome") not in {
+                "progress",
+                "handoff",
+                "blocked",
+                "complete",
+            }
             or not isinstance(candidate.get("next_owner", ""), str)
         ):
             return None
         return {
             "reason": candidate["reason"],
             "summary": candidate["summary"],
+            "outcome": candidate["outcome"],
             "next_owner": candidate.get("next_owner", ""),
         }
 
@@ -2027,7 +2621,9 @@ def _worker_handoff_metadata(
         source_seq=_get_seq(source_message),
         reason=reason,
         summary=summary,
+        outcome=payload.get("outcome"),
         next_owner=payload.get("next_owner", ""),
+        verified_revision=_worker_outcome.worker_evidence_revision(messages),
     )
     return (metadata, summary) if metadata is not None else None
 
@@ -2215,7 +2811,6 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         tool_use_func=None,
         tool_source_func=None,
         agent_text_func=None,
-        handback_summary_func=None,
         activity_func=None,
         delegation_id: str | None = None,
         delegation_name: str | None = None,
@@ -2231,7 +2826,6 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         self._tool_use_func = tool_use_func  # Function to stream tool-use cards to Mythic chat
         self._tool_source_func = tool_source_func
         self._agent_text_func = agent_text_func  # Function to stream delegated specialist text to its drill-down
-        self._handback_summary_func = handback_summary_func  # Function to retain control-tool handback summaries
         self._activity_func = activity_func
         # Track run_ids for SummarizationMiddleware's internal model.invoke calls.
         # Those produce a summary AIMessage that must NOT be captured or streamed:
@@ -2317,13 +2911,27 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                             msg.name = self.agent_name
                             self.captured_messages.append(msg)
 
-                            # Track tool calls for later matching with ToolMessages
-                            for tc in getattr(msg, 'tool_calls', []) or []:
-                                tc_id = tc.get('id')
-                                tc_name = tc.get('name')
-                                if tc_id and tc_name:
-                                    self._tool_call_to_name[tc_id] = tc_name
-                                    self._tool_call_to_args[tc_id] = tc.get('args')
+                            tool_calls = list(getattr(msg, "tool_calls", []) or [])
+                            invalid_tool_batch = bool(
+                                _tool_call_envelope_error(msg)
+                            )
+                            contains_request_control = any(
+                                _is_control_tool(str(call.get("name") or ""))
+                                for call in tool_calls
+                                if isinstance(call, dict)
+                            )
+                            # Control selection belongs exclusively to authority middleware.
+                            # Callback state tracks only a valid ordinary-only batch that can
+                            # later receive matching tool-end events.
+                            if not invalid_tool_batch and not contains_request_control:
+                                for tc in tool_calls:
+                                    if not isinstance(tc, dict):
+                                        continue
+                                    tc_id = tc.get('id')
+                                    tc_name = tc.get('name')
+                                    if tc_id and tc_name:
+                                        self._tool_call_to_name[tc_id] = tc_name
+                                        self._tool_call_to_args[tc_id] = tc.get('args')
 
                             logger.debug(f"📨 [Callback:{self.agent_name}] Captured AIMessage: "
                                        f"content={str(msg.content)[:50]!r}, "
@@ -2341,33 +2949,22 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                 should_stream = False
 
                             if should_stream and self._tool_use_func:
-                                for tc in getattr(msg, 'tool_calls', []) or []:
+                                for tc in tool_calls:
+                                    if not isinstance(tc, dict):
+                                        continue
+                                    if invalid_tool_batch:
+                                        continue
                                     tc_id = tc.get('id')
                                     tc_name = tc.get('name')
                                     if not (tc_id and tc_name):
                                         continue
                                     if _is_control_tool(tc_name):
-                                        if (
-                                            self.delegation_id is not None
-                                            and self._handback_summary_func is not None
-                                            and tc_name in ("handback_to_supervisor", "summarize_and_handback", "respond_to_user")
-                                        ):
-                                            try:
-                                                args = tc.get('args')
-                                                if isinstance(args, dict):
-                                                    summary = next(
-                                                        (
-                                                            value.strip()
-                                                            for key in ("summary", "final_response", "progress_summary", "reason", "text")
-                                                            for value in [args.get(key)]
-                                                            if isinstance(value, str) and value.strip()
-                                                        ),
-                                                        "",
-                                                    )
-                                                    if summary:
-                                                        await self._handback_summary_func(self.delegation_name, summary)
-                                            except Exception as e:
-                                                logger.debug(f"handback summary capture failed (non-fatal): {e}")
+                                        continue
+                                    if contains_request_control:
+                                        # The authority middleware retains only the
+                                        # valid control transition. Invalid batches
+                                        # and control siblings can never have a
+                                        # matching tool-end lifecycle.
                                         continue
                                     if (
                                         self._tool_source_func is not None
@@ -2388,7 +2985,12 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                                     except Exception as e:
                                         logger.debug(f"tool_use started card failed (non-fatal): {e}")
 
-                            if should_stream and self._format_func:
+                            if (
+                                should_stream
+                                and self._format_func
+                                and not invalid_tool_batch
+                                and not contains_request_control
+                            ):
                                 formatted = self._format_func(msg, agent_name=self.agent_name)
                                 if formatted:
                                     if self.delegation_id is not None and self._agent_text_func is not None:
@@ -2484,6 +3086,37 @@ class MessageCaptureCallback(AsyncCallbackHandler):
         except Exception as e:
             logger.warning(f"⚠️  [Callback:{self.agent_name}] Error in on_tool_end: {e}")
 
+    async def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Terminalize a raised tool call when the provider exposes its call identity."""
+        tool_call_id = str(kwargs.get("tool_call_id") or "").strip()
+        if not tool_call_id or self._tool_use_func is None or self.agent_name == "Supervisor":
+            return
+        tool_name = self._tool_call_to_name.get(tool_call_id, "unknown_tool")
+        if _is_control_tool(tool_name):
+            return
+        try:
+            await self._tool_use_func(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                status="error",
+                complete=True,
+                arguments_present=bool(self._tool_call_to_args.get(tool_call_id)),
+                arguments=self._tool_call_to_args.get(tool_call_id),
+                result_preview=str(error),
+                delegation_id=self.delegation_id,
+                delegation_name=self.delegation_name,
+            )
+        except Exception as exc:
+            logger.debug(f"tool_use error card failed (non-fatal): {exc}")
+
 
 class Model:
     """A class to represent an LLM model with its configuration for use with Mythic commands.
@@ -2511,7 +3144,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "supervised", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "conversation", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -2534,9 +3167,7 @@ class Model:
         self._execution_activity_seq: int = 0
         self._active_agent_label: str = "Idle"
         self._streamed_supervisor_message_keys: set[str] = set()
-        self._visibility_expected: set[str] = set()
-        self._visibility_rendered: set[str] = set()
-        self._visibility_failed: set[str] = set()
+        self._request_event_ledger: RequestEventLedger | None = None
         self.operation_id = operation_id
         # Chat-path Mythic auth context (Section 7 / 8A-P0): the numeric channel id and the per-channel
         # bot API token id, threaded so MythicTools can mint a channel-scoped token via
@@ -2551,9 +3182,21 @@ class Model:
         self._thread_id_override = None
         self.provider = provider
         self.model = model
-        self.mode = mode if mode in ("auto", "supervised") else "supervised"
+        self.mode = (
+            mode
+            if mode in ("conversation", "auto", "supervised")
+            else "conversation"
+        )
         self._autonomous_solve = bool(autonomous_solve)
         self._turn_authority = TurnAuthority(mode="observe")
+        self._request_contract = None
+        self._request_execution_digest = ""
+        self._request_admitted_action_digests: set[str] = set()
+        self._subgoal_authority_lock = threading.Lock()
+        self._subgoal_authority = None
+        self._subgoal_evidence_records: set[str] = set()
+        self._request_dynamic_proposals = False
+        self._active_approval_claim: dict[str, Any] | None = None
         self._graph_signature = None
         try:
             from .policy import resolve_policy_mode
@@ -2639,6 +3282,9 @@ class Model:
             "recursion_summary_requested": False,
             "recursion_handback": False,
             "_pending_objective_refinement": None,
+            "_request_id": "",
+            "_request_stop_condition": "",
+            "_subgoal_state": {},
         }
         # Note: LangChain instrumentation is initialized globally in main.py
         # Note: remaining_steps and recursion_summary_requested will be managed by LangGraph
@@ -2676,24 +3322,34 @@ class Model:
             return self._thread_id_override
         return f"{self.agent_task_id}-{self.task_id}"
 
-    def _compile_turn_authority(self, prompt: Any) -> TurnAuthority:
-        stored_operator_objective = ""
-        mythic_client = getattr(self, "mythic_client", None)
-        if mythic_client is not None:
-            try:
-                stored_operator_objective = mythic_client.operator_objective_binding()
-            except Exception:
-                stored_operator_objective = ""
-        pending_objective_refinement = None
-        state = getattr(self, "state", None)
-        if isinstance(state, dict):
-            pending_objective_refinement = state.get("_pending_objective_refinement")
-        return compile_turn_authority(
-            _coerce_prompt_text(prompt),
-            objective_classifier=self._looks_like_explicit_objective_prompt,
-            stored_operator_objective=stored_operator_objective,
-            pending_objective_refinement=pending_objective_refinement,
-            session_mode=getattr(self, "mode", "supervised"),
+    def _build_typed_session_request_contract(self) -> Any:
+        """Build a conservative typed contract for non-native one-shot callers.
+
+        Native chat installs its transport-owned contract before ``invoke``. Legacy task and
+        headless callers have no equivalent request envelope, so their typed session/config
+        fields supply one without accepting prompt prose or classifier output.
+        """
+        from .request_contract import build_request_contract
+
+        sequence = int(getattr(self, "_typed_request_sequence", 0) or 0) + 1
+        self._typed_request_sequence = sequence
+        thread_id = self._session_thread_id()
+        channel_id = str(
+            getattr(self, "channel_id", "")
+            or getattr(self, "task_id", "")
+            or thread_id
+        )
+        operation_id = str(
+            getattr(self, "operation_id", "")
+            or getattr(self, "operation_name", "")
+            or "unbound-operation"
+        )
+        return build_request_contract(
+            request_id=f"session:{thread_id}:request:{sequence}",
+            channel_id=channel_id,
+            operation_id=operation_id,
+            mode=str(getattr(self, "mode", "conversation") or "conversation"),
+            autonomous_solve=bool(getattr(self, "_autonomous_solve", False)),
         )
 
     @staticmethod
@@ -3063,6 +3719,507 @@ class Model:
                 mythic_client.set_turn_authority(authority)
             except Exception:
                 pass
+        # 49R-19 authority.* witness: emit the installed turn-authority mode into the request ledger so the
+        # sealed decision record carries `authority.<mode>` and the attester can witness it. Behaviour-neutral
+        # — a new observation, no control change. record_once keyed on the mode dedupes a constant lane and
+        # records a transition when the mode changes.
+        try:
+            mode = str(getattr(authority, "mode", "") or "").strip()
+            ledger = self._ensure_request_event_ledger()
+            if mode and ledger is not None and getattr(ledger, "request_id", ""):
+                ledger.record_once(
+                    event_id=stable_event_id(ledger.request_id, "authority", mode),
+                    kind="authority",
+                    phase=mode,
+                    content=mode,
+                    metadata={"mode": mode},
+                )
+        except Exception:  # pragma: no cover — witness emission must never break authority install
+            pass
+
+    def install_request_contract(self, contract: Any) -> None:
+        """Install the one immutable native request contract used by all enforcement layers."""
+        from .request_contract import RequestContract
+
+        if not isinstance(contract, RequestContract):
+            raise TypeError("request contract must be a RequestContract")
+        prior = getattr(self, "_request_contract", None)
+        if (
+            not isinstance(prior, RequestContract)
+            or prior.request_id != contract.request_id
+            or prior.stop_condition != contract.stop_condition
+        ):
+            self._request_dynamic_proposals = not bool(contract.requested_actions)
+            lock = getattr(self, "_subgoal_authority_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._subgoal_authority_lock = lock
+            from .subgoal_state import new_subgoal
+
+            with lock:
+                subgoal = new_subgoal(
+                    contract.request_id,
+                    contract.stop_condition.kind.value,
+                )
+                self._subgoal_authority = subgoal
+                self._subgoal_evidence_records = set()
+            state = getattr(self, "state", None)
+            if isinstance(state, dict):
+                state["_request_id"] = contract.request_id
+                state["_request_stop_condition"] = contract.stop_condition.kind.value
+                state["_subgoal_state"] = subgoal.to_dict()
+        if getattr(self, "_request_execution_digest", "") != contract.digest:
+            self._request_execution_digest = contract.digest
+            self._request_admitted_action_digests = set()
+            self._active_approval_claim = None
+        self._request_contract = contract
+        ledger = self._ensure_request_event_ledger(contract.request_id)
+        contract_event_id = stable_event_id(
+            contract.request_id,
+            "control_transition",
+            "request_contract",
+        )
+        ledger.record_once(
+            event_id=contract_event_id,
+            kind="control_transition",
+            phase="request_installed",
+            content="request contract installed",
+            metadata={
+                "contract_digest": contract.digest,
+                "lane": contract.lane.value,
+            },
+        )
+        self._install_turn_authority(authority_from_request_contract(contract))
+        mythic_client = getattr(self, "mythic_client", None)
+        setter = getattr(mythic_client, "set_request_contract", None)
+        if callable(setter):
+            setter(contract)
+
+    def bind_supervised_request_proposal(self, tool_calls: Any) -> None:
+        """Fold the exact model-generated guarded proposal into the immutable request."""
+        from .request_contract import (
+            RequestContract,
+            RequestLane,
+            action_spec_from_tool_call,
+        )
+
+        contract = getattr(self, "_request_contract", None)
+        if (
+            not isinstance(contract, RequestContract)
+            or contract.lane != RequestLane.SUPERVISED_WORKFLOW
+            or not getattr(self, "_request_dynamic_proposals", False)
+            or not isinstance(tool_calls, list)
+        ):
+            return
+        proposed = []
+        for tool_call in tool_calls:
+            if (
+                isinstance(tool_call, dict)
+                and str(tool_call.get("name") or "") in GUARDED_TOOLS
+            ):
+                proposed.append(action_spec_from_tool_call(tool_call))
+        if not proposed:
+            return
+        by_id = {action.action_id: action for action in contract.requested_actions}
+        changed = False
+        for action in proposed:
+            if action.action_id not in by_id:
+                by_id[action.action_id] = action
+                changed = True
+        if changed:
+            self.install_request_contract(
+                contract.amend(requested_actions=tuple(by_id.values()))
+            )
+
+    def apply_request_action_selection(
+        self,
+        context: Any,
+        approved_action_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Narrow a supervised proposal to the exact typed operator selection."""
+        from .request_contract import ActionSelector, RequestContract
+        from sage_chat.hitl import (
+            approval_action_digest,
+            approval_action_fingerprint,
+            approval_proposal_digest,
+            approval_selection_digest,
+        )
+
+        contract = getattr(self, "_request_contract", None)
+        if not isinstance(contract, RequestContract) or not isinstance(context, dict):
+            raise ValueError("action selection requires an active request contract")
+        actions = context.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("action selection contains no canonical actions")
+        action_digest = approval_action_digest(actions)
+        if (
+            str(context.get("request_id") or "") != contract.request_id
+            or str(context.get("request_contract_digest") or "") != contract.digest
+            or str(context.get("action_digest") or "") != action_digest
+            or str(context.get("proposal_digest") or "")
+            != approval_proposal_digest(contract.digest, action_digest)
+        ):
+            raise ValueError("action selection binding is stale or mismatched")
+        action_ids = tuple(approval_action_fingerprint(action) for action in actions)
+        selected = tuple(approved_action_ids)
+        expected_selection_mode = "exact_one" if len(actions) > 1 else "single"
+        if (
+            len(action_ids) != len(set(action_ids))
+            or str(context.get("selection_mode") or "") != expected_selection_mode
+            or any(not isinstance(value, str) for value in selected)
+            or (
+                all(isinstance(value, str) for value in selected)
+                and len(selected) != len(set(selected))
+            )
+            or any(value not in action_ids for value in selected)
+            or (len(actions) == 1 and len(selected) not in {0, 1})
+            or (len(actions) > 1 and len(selected) not in {0, 1})
+        ):
+            raise ValueError("action selection is not an exact proposal subset")
+        rejected_ids = set(action_ids) - set(selected)
+        selectors = list(contract.prohibited_actions)
+        existing = {selector.action_id for selector in selectors if selector.action_id}
+        selectors.extend(
+            ActionSelector(action_id=action_id)
+            for action_id in sorted(rejected_ids - existing)
+        )
+        if len(selectors) != len(contract.prohibited_actions):
+            self.install_request_contract(
+                contract.amend(prohibited_actions=tuple(selectors))
+            )
+        narrowed = self._request_contract
+        rebound = dict(context)
+        if narrowed.digest != contract.digest:
+            rebound["parent_request_contract_digest"] = contract.digest
+        rebound["request_contract_digest"] = narrowed.digest
+        rebound["proposal_digest"] = approval_proposal_digest(
+            narrowed.digest,
+            action_digest,
+        )
+        rebound["approved_action_ids"] = list(selected)
+        rebound["approved_actions"] = [
+            dict(action)
+            for action, action_id in zip(actions, action_ids)
+            if action_id in selected
+        ]
+        rebound["selection_digest"] = (
+            approval_selection_digest(
+                narrowed.digest,
+                action_digest,
+                selected,
+            )
+            if selected
+            else ""
+        )
+        return rebound
+
+    def reject_request_actions(self, context: Any) -> None:
+        """Persist all actions in the exact rejected proposal as typed prohibitions."""
+        self.apply_request_action_selection(context, ())
+
+    def install_approval_claim(self, context: Any) -> None:
+        """Install an exact, already-correlated native approval for the resumed action."""
+        from .request_contract import (
+            action_spec_from_tool_call,
+            contract_action_denial_reason,
+        )
+        from sage_chat.hitl import (
+            approval_action_digest,
+            approval_action_fingerprint,
+            approval_proposal_digest,
+            approval_selection_digest,
+        )
+
+        contract = getattr(self, "_request_contract", None)
+        if contract is None or not isinstance(context, dict):
+            raise ValueError("approval claim requires an active request contract")
+        actions = context.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("approval claim contains no canonical actions")
+        action_digest = approval_action_digest(actions)
+        action_ids = tuple(approval_action_fingerprint(action) for action in actions)
+        approved_ids = tuple(context.get("approved_action_ids") or ())
+        approved_actions = context.get("approved_actions")
+        selection_mode = str(context.get("selection_mode") or "")
+        expected_proposal = approval_proposal_digest(contract.digest, action_digest)
+        if (
+            str(context.get("request_id") or "") != contract.request_id
+            or str(context.get("request_contract_digest") or "")
+            != contract.digest
+            or str(context.get("action_digest") or "") != action_digest
+            or str(context.get("proposal_digest") or "") != expected_proposal
+            or not approved_ids
+            or selection_mode
+            != ("exact_one" if len(actions) > 1 else "single")
+            or len(approved_ids) != 1
+            or len(approved_ids) != len(set(approved_ids))
+            or any(action_id not in action_ids for action_id in approved_ids)
+            or not isinstance(approved_actions, list)
+            or approved_actions != [
+                action
+                for action, action_id in zip(actions, action_ids)
+                if action_id in approved_ids
+            ]
+            or str(context.get("selection_digest") or "")
+            != approval_selection_digest(
+                contract.digest,
+                action_digest,
+                approved_ids,
+            )
+        ):
+            raise ValueError("approval claim is stale or mismatched")
+        for action in approved_actions:
+            denial = contract_action_denial_reason(
+                contract,
+                action_spec_from_tool_call(action),
+            )
+            if denial:
+                raise ValueError(f"approval claim action is not permitted: {denial}")
+        self._active_approval_claim = {
+            key: (
+                [copy.deepcopy(action) for action in context.get(key, [])]
+                if key in {"actions", "approved_actions"}
+                else list(approved_ids)
+                if key == "approved_action_ids"
+                else str(context.get(key) or "")
+            )
+            for key in (
+                "approval_id",
+                "request_id",
+                "request_contract_digest",
+                "tool_name",
+                "selection_mode",
+                "actions",
+                "approved_actions",
+                "approved_action_ids",
+                "action_digest",
+                "proposal_digest",
+                "selection_digest",
+            )
+        }
+        mythic_client = getattr(self, "mythic_client", None)
+        setter = getattr(mythic_client, "set_approval_claim", None)
+        if callable(setter):
+            setter(self._active_approval_claim)
+
+    def clear_approval_claim(self) -> None:
+        self._active_approval_claim = None
+        mythic_client = getattr(self, "mythic_client", None)
+        clearer = getattr(mythic_client, "clear_approval_claim", None)
+        if callable(clearer):
+            clearer()
+
+    def _request_contract_authority(self) -> TurnAuthority:
+        """Return native typed authority, failing closed when its contract is unavailable."""
+        contract = getattr(self, "_request_contract", None)
+        if contract is not None:
+            return authority_from_request_contract(contract)
+        if getattr(self, "_native_chat_explicit_hitl", False):
+            return TurnAuthority(
+                mode="observe",
+                turn_id=self._session_thread_id(),
+            )
+        return self._turn_authority
+
+    def _request_contract_block_reason(
+        self,
+        tool_name: str,
+        args: Any = None,
+    ) -> str:
+        """Check exact native contract identity and conversation-lane tool isolation."""
+        from .request_contract import (
+            RequestContract,
+            RequestIntent,
+            RequestLane,
+            action_spec_from_tool_call,
+            contract_action_denial_reason,
+        )
+
+        contract = getattr(self, "_request_contract", None)
+        if contract is None:
+            return (
+                "native request has no installed request contract"
+                if getattr(self, "_native_chat_explicit_hitl", False)
+                else ""
+            )
+        if not isinstance(contract, RequestContract):
+            return "installed request contract has an invalid type"
+        authority = getattr(self, "_turn_authority", None)
+        if not isinstance(authority, TurnAuthority):
+            return "request contract has no enforcement projection"
+        if (
+            authority.request_id != contract.request_id
+            or authority.request_contract_digest != contract.digest
+        ):
+            return "request contract digest does not match the active enforcement projection"
+        if contract.intent == RequestIntent.STOP:
+            return "stopped request denies tool execution"
+        if contract.lane == RequestLane.CONVERSATIONAL and not _is_control_tool(tool_name):
+            return "conversational request denies external tool execution"
+        if tool_name in GUARDED_TOOLS:
+            try:
+                action = action_spec_from_tool_call({
+                    "name": tool_name,
+                    "args": args,
+                })
+            except ValueError:
+                return "request contract denied malformed guarded action identity"
+            return contract_action_denial_reason(contract, action)
+        return ""
+
+    def _reserve_supervised_request_action(self, action_digest: str) -> bool:
+        """Admit one exact guarded action once for a supervised native request."""
+        from .request_contract import RequestContract, RequestLane
+
+        contract = getattr(self, "_request_contract", None)
+        if not isinstance(contract, RequestContract):
+            return True
+        if contract.lane != RequestLane.SUPERVISED_WORKFLOW:
+            return True
+        normalized = str(action_digest or "").strip()
+        admitted = getattr(self, "_request_admitted_action_digests", set())
+        if not normalized or normalized in admitted:
+            return False
+        admitted.add(normalized)
+        self._request_admitted_action_digests = admitted
+        return True
+
+    def _canonical_subgoal_projection(self) -> dict[str, Any]:
+        """Return only the active request's canonical subgoal projection."""
+        from .request_contract import RequestContract
+        from .subgoal_state import SubgoalState
+
+        contract = getattr(self, "_request_contract", None)
+        lock = getattr(self, "_subgoal_authority_lock", None)
+        if not isinstance(contract, RequestContract) or lock is None:
+            return {}
+        with lock:
+            canonical = getattr(self, "_subgoal_authority", None)
+            if (
+                not isinstance(canonical, SubgoalState)
+                or canonical.request_id != contract.request_id
+                or canonical.stop_condition
+                != contract.stop_condition.kind.value
+            ):
+                return {}
+            return canonical.to_dict()
+
+    def _schedule_subgoal_transition(
+        self,
+        *,
+        raw_subgoal: dict[str, Any],
+        runtime_state: dict[str, Any],
+        requested_owner: str,
+        admitted: tuple[dict[str, Any], str] | None,
+    ) -> dict[str, Any]:
+        """Atomically advance the one canonical request-scoped subgoal."""
+        from .subgoal_state import (
+            DuplicateAdmissionError,
+            SubgoalState,
+            apply_worker_outcome,
+            assign_and_admit,
+            block_duplicate,
+        )
+
+        lock = getattr(self, "_subgoal_authority_lock", None)
+        if lock is None:
+            return {"disposition": "invalid", "reason": "canonical authority is unavailable"}
+        with lock:
+            try:
+                projected = SubgoalState.from_dict(raw_subgoal)
+            except (TypeError, ValueError):
+                return {"disposition": "invalid", "reason": "serialized subgoal projection is invalid"}
+            canonical = getattr(self, "_subgoal_authority", None)
+            if not isinstance(canonical, SubgoalState):
+                return {"disposition": "invalid", "reason": "canonical authority is unavailable"}
+            if projected != canonical:
+                return {"disposition": "stale", "reason": "serialized subgoal projection is stale"}
+
+            candidate = canonical
+            evidence_records = set(
+                getattr(self, "_subgoal_evidence_records", set()) or set()
+            )
+            owner = str(requested_owner or "")
+            summary = ""
+            if admitted is not None:
+                metadata, summary = admitted
+                source_owner = str(metadata.get("source_worker") or "")
+                outcome = str(metadata.get("outcome") or "")
+                next_owner = str(metadata.get("next_owner") or "")
+                evidence_records.update(
+                    _worker_outcome.current_turn_evidence_records(
+                        list(runtime_state.get("supervisor_messages", []) or [])
+                    )
+                )
+                try:
+                    candidate = apply_worker_outcome(
+                        candidate,
+                        outcome_id=str(metadata.get("outcome_id") or ""),
+                        outcome=outcome,
+                        source_owner=source_owner,
+                        next_owner=next_owner,
+                        verified_revision=_worker_outcome.evidence_revision(
+                            evidence_records
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    return {
+                        "disposition": "invalid",
+                        "reason": "typed worker outcome is invalid for canonical authority",
+                    }
+                if candidate.is_terminal:
+                    self._subgoal_authority = candidate
+                    self._subgoal_evidence_records = evidence_records
+                    self._record_subgoal_control_events(candidate)
+                    return {
+                        "disposition": outcome,
+                        "state": candidate.to_dict(),
+                        "summary": summary,
+                    }
+                owner = candidate.owner
+
+            try:
+                scheduled = assign_and_admit(
+                    candidate,
+                    owner=owner,
+                    method=f"transfer_to_{owner}",
+                )
+            except DuplicateAdmissionError:
+                blocked = block_duplicate(candidate)
+                self._subgoal_authority = blocked
+                self._subgoal_evidence_records = evidence_records
+                self._record_subgoal_control_events(blocked)
+                return {
+                    "disposition": "duplicate",
+                    "state": blocked.to_dict(),
+                    "summary": summary,
+                }
+            except (TypeError, ValueError):
+                return {
+                    "disposition": "invalid",
+                    "reason": "requested owner is invalid for canonical authority",
+                }
+            self._subgoal_authority = scheduled
+            self._subgoal_evidence_records = evidence_records
+            self._record_subgoal_control_events(scheduled)
+            return {
+                "disposition": "route",
+                "owner": owner,
+                "state": scheduled.to_dict(),
+                "summary": summary,
+            }
+
+    def request_contract_snapshot(self) -> dict[str, Any]:
+        contract = getattr(self, "_request_contract", None)
+        if contract is None:
+            return {}
+        return {
+            "request_id": contract.request_id,
+            "contract_digest": contract.digest,
+            "lane": contract.lane.value,
+            "intent": contract.intent.value,
+            "revision": contract.revision,
+        }
 
     def _latest_admitted_worker_handoff(self, state: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
         authority = getattr(self, "_turn_authority", TurnAuthority(mode="observe"))
@@ -3119,6 +4276,14 @@ class Model:
             return bool(
                 getattr(self, "_autonomous_solve", False)
                 or getattr(self, "_supervised_objective_active", False)
+            )
+        if getattr(self, "_request_contract", None) is not None:
+            return bool(
+                authority.is_autonomous_objective
+                or (
+                    authority.is_supervised_action
+                    and getattr(self, "_autonomous_solve", False)
+                )
             )
         return bool(
             authority.is_autonomous_objective
@@ -3466,6 +4631,94 @@ class Model:
             logger.debug(f"tool source classification failed (non-fatal): {e}")
         return "mythic"
 
+    def _ensure_request_event_ledger(
+        self,
+        request_id: str = "",
+    ) -> RequestEventLedger:
+        normalized = str(request_id or "").strip()
+        if not normalized:
+            contract = getattr(self, "_request_contract", None)
+            normalized = str(getattr(contract, "request_id", "") or "").strip()
+        if not normalized:
+            normalized = str(getattr(self, "_delegation_scope", "") or "").strip()
+        if not normalized:
+            normalized = "request:unbound"
+        ledger = getattr(self, "_request_event_ledger", None)
+        if not isinstance(ledger, RequestEventLedger) or ledger.request_id != normalized:
+            ledger = RequestEventLedger(normalized)
+            self._request_event_ledger = ledger
+        return ledger
+
+    def _record_subgoal_control_events(self, state: Any) -> None:
+        """Append newly committed typed subgoal transitions to request evidence."""
+        transitions = getattr(state, "transitions", ())
+        request_id = str(getattr(state, "request_id", "") or "")
+        if not request_id:
+            return
+        ledger = self._ensure_request_event_ledger(request_id)
+        if ledger.actual_events(
+            kind="control_transition",
+            phase="request_terminal",
+        ):
+            # Native cancel can reach service cleanup after invoke() has already
+            # terminalized this logical request. Late worker transitions cannot
+            # reopen or extend a terminal request.
+            return
+        for transition in transitions:
+            transition_id = str(getattr(transition, "event_id", "") or "")
+            if not transition_id:
+                continue
+            ledger.record_once(
+                event_id=transition_id,
+                kind="control_transition",
+                phase=str(getattr(transition, "kind", "") or "transition"),
+                content=json.dumps(
+                    transition.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                metadata={
+                    "subgoal_id": str(getattr(state, "subgoal_id", "") or ""),
+                    "status": str(getattr(transition, "status", "") or ""),
+                },
+            )
+
+    def begin_visibility_turn(
+        self,
+        delegation_scope: str = "",
+        *,
+        operator_prompt: str = "",
+        native_request_id: str = "",
+        logical_request_id: str = "",
+    ) -> None:
+        """Open or resume the logical request ledger and record exact operator input."""
+        self._delegation_scope = str(delegation_scope or "").strip()
+        ledger = self._ensure_request_event_ledger(logical_request_id)
+        external_identity = str(native_request_id or delegation_scope or "operator").strip()
+        event_id = stable_event_id(
+            ledger.request_id,
+            "operator_input",
+            external_identity,
+        )
+        ledger.record_once(
+            event_id=event_id,
+            kind="operator_input",
+            phase="received",
+            content=str(operator_prompt or ""),
+            metadata={"native_request_id": str(native_request_id or "")},
+        )
+
+    def request_event_transcript(self) -> list[dict[str, str]]:
+        ledger = getattr(self, "_request_event_ledger", None)
+        return ledger.reconstruct_transcript() if isinstance(ledger, RequestEventLedger) else []
+
+    def request_control_transitions(self) -> list[dict[str, str]]:
+        return [
+            row
+            for row in self.request_event_transcript()
+            if row["kind"] == "control_transition"
+        ]
+
     async def _emit_tool_use_card(
         self,
         *,
@@ -3481,6 +4734,7 @@ class Model:
         delegation_name: str | None = None,
         tool_source: str | None = None,
         preserve_arguments: bool = False,
+        lifecycle_event_id: str = "",
     ) -> bool:
         """Bridge a captured tool call/result to the chat emitter as a collapsible card.
 
@@ -3488,12 +4742,70 @@ class Model:
         its arguments — so the operator sees what was called alongside the `result_preview` response.
         `output`, when set, is the full raw result shipped lazily (Mythic's "View output").
         """
-        emitter = self._response_emitter
-        if emitter is None or not hasattr(emitter, "emit_tool_use"):
-            return False
         try:
             raw_name = tool_name or "unknown_tool"
             source = tool_source or self._classify_tool_source(raw_name)
+            ledger = getattr(self, "_request_event_ledger", None)
+            event_id = str(lifecycle_event_id or "").strip()
+            if isinstance(ledger, RequestEventLedger) and not event_id:
+                event_id = stable_event_id(
+                    ledger.request_id,
+                    "tool",
+                    f"{source}:{tool_call_id}:{raw_name}",
+                )
+            phase = (
+                "started"
+                if status == "started"
+                else status
+                if status in {"completed", "error", "stopped", "cancelled"}
+                else "completed"
+            )
+            should_project = True
+            if isinstance(ledger, RequestEventLedger):
+                terminal_phases = {"completed", "error", "stopped", "cancelled"}
+                existing_starts = ledger.actual_events(
+                    event_id=event_id,
+                    kind="tool",
+                    phase="started",
+                )
+                existing_terminals = tuple(
+                    event
+                    for event in ledger.actual_events(
+                        event_id=event_id,
+                        kind="tool",
+                    )
+                    if event.phase in terminal_phases
+                )
+                if (
+                    (phase == "started" and existing_starts)
+                    or (phase in terminal_phases and existing_terminals)
+                ):
+                    return True
+                _, created = ledger.record_once(
+                    event_id=event_id,
+                    kind="tool",
+                    phase=phase,
+                    content=str(result_preview or ""),
+                    metadata={
+                        "delegation_id": str(delegation_id or ""),
+                        "delegation_name": str(delegation_name or ""),
+                        "tool_call_id": str(tool_call_id or ""),
+                        "tool_name": raw_name,
+                        "tool_source": source,
+                    },
+                )
+                should_project = created and ledger.should_project(
+                    event_id,
+                    "tool",
+                    phase,
+                )
+                if phase == "started" and existing_terminals:
+                    should_project = False
+                if not should_project:
+                    return False
+            emitter = self._response_emitter
+            if emitter is None or not hasattr(emitter, "emit_tool_use"):
+                return False
             source_label = "MCP" if source == "mcp" else "Mythic"
             capability_name = _capability_name_from_tool_arguments(arguments) if raw_name == "execute_capability" else ""
             name = capability_name or raw_name
@@ -3516,6 +4828,7 @@ class Model:
             else:
                 content = request_line or f"Tool `{name}` finished."
             emitted = await emitter.emit_tool_use(
+                event_id=event_id,
                 tool_call_id=tool_call_id or "",
                 tool_name=name,
                 tool_source=source,
@@ -3531,19 +4844,19 @@ class Model:
             )
             if emitted is False:
                 return False
+            if isinstance(ledger, RequestEventLedger):
+                ledger.record_projection(
+                    event_id=event_id,
+                    kind="tool",
+                    phase=phase,
+                    projection_key=f"event:{event_id}",
+                )
             if delegation_id is not None and delegation_name is not None and status == "started":
                 await self._bump_delegation_progress(delegation_name)
             return True
         except Exception as e:
             logger.debug(f"_emit_tool_use_card failed (non-fatal): {e}")
             return False
-
-    def begin_visibility_turn(self, delegation_scope: str = "") -> None:
-        """Reset request-scoped visibility accounting before execution starts."""
-        self._visibility_expected = set()
-        self._visibility_rendered = set()
-        self._visibility_failed = set()
-        self._delegation_scope = str(delegation_scope or "").strip()
 
     async def _emit_execution_event(self, event: dict[str, Any]) -> None:
         """Render one boundary-owned Mythic or MCP lifecycle event."""
@@ -3556,9 +4869,6 @@ class Model:
         status = str(event.get("status") or "").strip().casefold()
         if not event_id or source not in {"mythic", "mcp"} or not tool_name:
             return
-        if status == "started":
-            self._visibility_expected.add(event_id)
-
         activity = event.get("activity") if isinstance(event.get("activity"), dict) else {}
         arguments = event.get("arguments")
         if source == "mythic":
@@ -3574,7 +4884,7 @@ class Model:
             if purpose:
                 arguments["purpose"] = purpose
 
-        rendered = await self._emit_tool_use_card(
+        await self._emit_tool_use_card(
             tool_call_id=event_id,
             tool_name=tool_name,
             status=status or "completed",
@@ -3587,36 +4897,149 @@ class Model:
             delegation_name=str(activity.get("name") or "") or None,
             tool_source=source,
             preserve_arguments=True,
+            lifecycle_event_id=stable_event_id(
+                self._ensure_request_event_ledger().request_id,
+                "tool",
+                f"{source}:execution:{event_id}",
+            ),
         )
-        if rendered:
-            self._visibility_rendered.add(event_id)
-        else:
-            self._visibility_failed.add(event_id)
 
-    async def finalize_visibility_turn(self) -> dict[str, Any]:
-        """Reconcile boundary events against rendered cards and surface degraded visibility."""
-        expected = set(getattr(self, "_visibility_expected", set()) or set())
-        rendered = set(getattr(self, "_visibility_rendered", set()) or set())
-        failed = set(getattr(self, "_visibility_failed", set()) or set())
-        missing = sorted(expected - rendered)
-        degraded = sorted(set(missing) | failed)
-        summary = {
-            "expected": len(expected),
-            "rendered": len(expected & rendered),
-            "failed": len(degraded),
-            "missing_event_ids": degraded,
-        }
-        if degraded:
-            preview = ", ".join(degraded[:5])
-            suffix = "" if len(degraded) <= 5 else f" (+{len(degraded) - 5} more)"
+    async def finalize_visibility_turn(
+        self,
+        *,
+        require_final: bool = True,
+    ) -> dict[str, Any]:
+        """Reconcile actual request events with their exact Mythic projections."""
+        ledger = self._ensure_request_event_ledger()
+        summary = ledger.reconcile(require_final=require_final)
+        summary["failed"] = len(summary["errors"])
+        summary["missing_event_ids"] = list(summary["errors"])
+        if require_final:
+            # ISC-49R 49R-16: seal the kernel decision record once the request is terminal. Evidence
+            # only — a pure read of this ledger that cannot raise into the request path. Guarded because
+            # the success path reaches this twice (service.py:780 and :793), and reached on every
+            # terminal outcome (complete/cancelled/error) so 49R-14 keeps failed canaries as failures.
+            sealed = getattr(self, "_sealed_decision_record_ids", None)
+            if sealed is None:
+                sealed = self._sealed_decision_record_ids = set()
+            if ledger.request_id not in sealed:
+                sealed.add(ledger.request_id)
+                seal_request_decision_record(ledger, summary=summary)
+        if not summary["ok"]:
+            preview = "; ".join(summary["errors"][:5])
+            suffix = "" if len(summary["errors"]) <= 5 else (
+                f" (+{len(summary['errors']) - 5} more)"
+            )
             try:
                 await self._stream_message_to_mythic(
-                    "**Visibility degraded**\n"
-                    f"{len(degraded)} execution event(s) could not be rendered: {preview}{suffix}.\n"
+                    "**Request lifecycle reconciliation failed**\n"
+                    f"{preview}{suffix}.\n"
                 )
             except Exception as exc:
-                logger.warning(f"Visibility reconciliation warning failed: {exc}")
+                logger.warning(f"Lifecycle reconciliation warning failed: {exc}")
         return summary
+
+    def record_final_response(
+        self,
+        content: str,
+        *,
+        response_key: str,
+    ) -> str:
+        ledger = self._ensure_request_event_ledger()
+        event_id = stable_event_id(
+            ledger.request_id,
+            "final_response",
+            "terminal",
+        )
+        ledger.record_once(
+            event_id=event_id,
+            kind="final_response",
+            phase="emitted",
+            content=content,
+            metadata={"response_key": response_key},
+        )
+        return event_id
+
+    def record_request_terminal(self, status: str = "complete") -> str:
+        ledger = self._ensure_request_event_ledger()
+        normalized = str(status or "").strip().casefold()
+        if normalized not in {"complete", "blocked", "stopped", "cancelled", "error"}:
+            raise ValueError("request terminal status is invalid")
+        event_id = stable_event_id(
+            ledger.request_id,
+            "control_transition",
+            "request_terminal",
+        )
+        ledger.record_once(
+            event_id=event_id,
+            kind="control_transition",
+            phase="request_terminal",
+            content=normalized,
+            metadata={"status": normalized},
+        )
+        return event_id
+
+    def record_final_response_projection(
+        self,
+        event_id: str,
+        *,
+        response_key: str,
+    ) -> None:
+        ledger = self._ensure_request_event_ledger()
+        if ledger.should_project(event_id, "final_response", "emitted"):
+            ledger.record_projection(
+                event_id=event_id,
+                kind="final_response",
+                phase="emitted",
+                projection_key=response_key,
+            )
+
+    def _project_private_collection_terminal(
+        self,
+        status: str,
+        report: str,
+        *,
+        attempted: bool = False,
+    ) -> None:
+        """Project one supervised collection controller terminal through existing lifecycle APIs."""
+        checker = getattr(getattr(self, "mythic_client", None), "_private_collection_transaction_active", None)
+        if not attempted and (not callable(checker) or checker() is not True):
+            return
+        terminal_status = "complete" if str(status or "").strip().casefold() == "complete" else "blocked"
+        projection = self._canonical_subgoal_projection()
+        if projection and projection.get("status") not in {"blocked", "completed", "cancelled"}:
+            runtime_state = getattr(self, "state", {})
+            runtime_state = runtime_state if isinstance(runtime_state, dict) else {}
+            current = projection
+            if not str(projection.get("owner") or ""):
+                routed = self._schedule_subgoal_transition(
+                    raw_subgoal=projection,
+                    runtime_state=runtime_state,
+                    requested_owner="Autonomous_Executor",
+                    admitted=None,
+                )
+                current = routed.get("state") if isinstance(routed, dict) else {}
+            if current and current.get("status") not in {"blocked", "completed", "cancelled"}:
+                ledger = self._ensure_request_event_ledger()
+                self._schedule_subgoal_transition(
+                    raw_subgoal=current,
+                    runtime_state=runtime_state,
+                    requested_owner="Autonomous_Executor",
+                    admitted=(
+                        {
+                            "source_worker": "Autonomous_Executor",
+                            "outcome": terminal_status,
+                            "next_owner": "",
+                            "outcome_id": stable_event_id(
+                                ledger.request_id,
+                                "controller_collection",
+                                terminal_status,
+                            ),
+                        },
+                        "",
+                    ),
+                )
+        self.record_request_terminal(terminal_status)
 
     async def _emit_capability_command_card(self, event: dict[str, Any]) -> None:
         """Render non-task capability lifecycle prose; accepted tasks use the shared boundary."""
@@ -3661,6 +5084,7 @@ class Model:
     async def _emit_subagent_status(
         self,
         *,
+        event_id: str = "",
         title: str,
         prompt: str = "",
         delegation_id: str,
@@ -3673,12 +5097,13 @@ class Model:
         summary: str = "",
         content: str = "",
         complete: bool = False,
-    ) -> None:
+    ) -> bool:
         emitter = self._response_emitter
         if emitter is None or not hasattr(emitter, "emit_subagent_status"):
-            return
+            return False
         try:
-            await emitter.emit_subagent_status(
+            emitted = await emitter.emit_subagent_status(
+                event_id=event_id,
                 title=title,
                 prompt=prompt,
                 delegation_id=delegation_id,
@@ -3692,8 +5117,10 @@ class Model:
                 content=content,
                 complete=complete,
             )
+            return emitted is not False
         except Exception as e:
             logger.debug(f"_emit_subagent_status failed (non-fatal): {e}")
+            return False
 
     async def _emit_agent_text(
         self,
@@ -3834,13 +5261,16 @@ class Model:
         except Exception:
             return None
 
-    async def _capture_delegation_final_summary(self, agent_name: str | None, summary: str) -> None:
+    def _record_delegation_final_summary(self, agent_name: str | None, summary: str) -> None:
         try:
             delegation = getattr(self, "_active_delegations", {}).get(agent_name)
             if delegation is not None and isinstance(summary, str) and summary.strip():
                 delegation["final_summary"] = summary.strip()
         except Exception as e:
-            logger.debug(f"_capture_delegation_final_summary failed (non-fatal): {e}")
+            logger.debug(f"_record_delegation_final_summary failed (non-fatal): {e}")
+
+    async def _capture_delegation_final_summary(self, agent_name: str | None, summary: str) -> None:
+        self._record_delegation_final_summary(agent_name, summary)
 
     async def _open_delegation(
         self,
@@ -3868,8 +5298,15 @@ class Model:
             icon = self._delegation_icon(agent_name)
             icon_color = self._delegation_color(agent_name)
             card_title = _normalize_handoff_title(title, instruction, agent_name)
+            ledger = self._ensure_request_event_ledger()
+            event_id = stable_event_id(
+                ledger.request_id,
+                "delegation",
+                delegation_id,
+            )
             self._active_delegations[agent_name] = {
                 "id": delegation_id,
+                "event_id": event_id,
                 "name": agent_name,
                 "title": card_title,
                 "instruction": instruction,
@@ -3882,7 +5319,21 @@ class Model:
                 "final_summary": "",
                 "text_seq": 0,
             }
-            await self._emit_subagent_status(
+            ledger.record_once(
+                event_id=event_id,
+                kind="delegation",
+                phase="opened",
+                content=instruction,
+                metadata={
+                    "delegation_id": delegation_id,
+                    "delegation_name": agent_name,
+                    "icon": icon,
+                    "icon_color": icon_color,
+                    "title": card_title,
+                },
+            )
+            emitted = await self._emit_subagent_status(
+                event_id=event_id,
                 title=card_title,
                 prompt=instruction,
                 delegation_id=delegation_id,
@@ -3893,6 +5344,13 @@ class Model:
                 icon_color=icon_color,
                 content="",
             )
+            if emitted and ledger.should_project(event_id, "delegation", "opened"):
+                ledger.record_projection(
+                    event_id=event_id,
+                    kind="delegation",
+                    phase="opened",
+                    projection_key=f"event:{event_id}",
+                )
         except Exception as e:
             logger.debug(f"_open_delegation failed (non-fatal): {e}")
 
@@ -3904,6 +5362,7 @@ class Model:
             tool_count = int(delegation.get("tool_count", 0)) + 1
             delegation["tool_count"] = tool_count
             await self._emit_subagent_status(
+                event_id=str(delegation.get("event_id", "")),
                 title=str(delegation.get("title", "")),
                 prompt=str(delegation.get("instruction", "")),
                 delegation_id=str(delegation.get("id", "")),
@@ -3944,7 +5403,26 @@ class Model:
                     streamed_text_candidates.add("\n\n".join(cleaned_chunks))
             if content and content in streamed_text_candidates:
                 content = ""
-            await self._emit_subagent_status(
+            ledger = self._ensure_request_event_ledger()
+            event_id = str(delegation.get("event_id") or "") or stable_event_id(
+                ledger.request_id,
+                "delegation",
+                str(delegation.get("id") or agent_name),
+            )
+            phase = status if status in {"finished", "error", "stopped", "cancelled"} else "error"
+            ledger.record_once(
+                event_id=event_id,
+                kind="delegation",
+                phase=phase,
+                content=summary,
+                metadata={
+                    "delegation_id": str(delegation.get("id", "")),
+                    "delegation_name": str(delegation.get("name", agent_name)),
+                    "title": str(delegation.get("title", "")),
+                },
+            )
+            emitted = await self._emit_subagent_status(
+                event_id=event_id,
                 title=str(delegation.get("title", "")),
                 prompt=str(delegation.get("instruction", "")),
                 delegation_id=str(delegation.get("id", "")),
@@ -3957,6 +5435,13 @@ class Model:
                 content=content,
                 complete=True,
             )
+            if emitted and ledger.should_project(event_id, "delegation", phase):
+                ledger.record_projection(
+                    event_id=event_id,
+                    kind="delegation",
+                    phase=phase,
+                    projection_key=f"event:{event_id}",
+                )
         except Exception as e:
             logger.debug(f"_close_delegation failed (non-fatal): {e}")
 
@@ -3972,7 +5457,59 @@ class Model:
         for agent_name in names:
             await self._close_delegation(agent_name, status=status)
 
-    async def _emit_operator_stop(self, stop_message: str) -> None:
+    def _open_tool_lifecycle_ids(self) -> tuple[str, ...]:
+        """Return the exact currently-open tool event identities."""
+        ledger = getattr(self, "_request_event_ledger", None)
+        if not isinstance(ledger, RequestEventLedger):
+            return ()
+        return tuple(
+            event_id
+            for kind, event_id in ledger.open_lifecycles()
+            if kind == "tool"
+        )
+
+    async def _close_open_tool_lifecycles(
+        self,
+        status: str = "cancelled",
+        *,
+        event_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        """Terminalize only tool events still open at a typed resume boundary."""
+        phase = status if status in {"stopped", "cancelled", "error"} else "stopped"
+        ledger = getattr(self, "_request_event_ledger", None)
+        if not isinstance(ledger, RequestEventLedger):
+            return
+        selected = None if event_ids is None else frozenset(event_ids)
+        for kind, event_id in tuple(ledger.open_lifecycles()):
+            if kind != "tool" or (
+                selected is not None and event_id not in selected
+            ):
+                continue
+            opened = ledger.actual_events(event_id=event_id, kind=kind)[0]
+            metadata = dict(opened.metadata)
+            await self._emit_tool_use_card(
+                lifecycle_event_id=event_id,
+                tool_call_id=metadata.get("tool_call_id", ""),
+                tool_name=metadata.get("tool_name", "unknown_tool"),
+                tool_source=metadata.get("tool_source", "mythic"),
+                status=phase,
+                complete=True,
+                delegation_id=metadata.get("delegation_id") or None,
+                delegation_name=metadata.get("delegation_name") or None,
+            )
+
+    async def _close_all_request_lifecycles(self, status: str = "stopped") -> None:
+        """Terminalize and project every lifecycle that remains open."""
+        phase = status if status in {"stopped", "cancelled", "error"} else "stopped"
+        await self._close_all_delegations(status=phase)
+        await self._close_open_tool_lifecycles(status=phase)
+
+    async def _emit_operator_stop(
+        self,
+        stop_message: str,
+        *,
+        status: str = "stopped",
+    ) -> None:
         """Stream the operator-stop notice and mark every open sub-agent card 'stopped'.
 
         Grouped into one coroutine so the hard-cancel path can drive it under
@@ -3981,15 +5518,79 @@ class Model:
         un-shielded emit can be cut off before it reaches Mythic — leaving a card stuck on
         "running". Shielding lets the whole notice+close sequence complete on the loop.
         """
-        try:
+        terminal_status = str(status or "").strip().casefold()
+        if terminal_status not in {"stopped", "cancelled", "error"}:
+            raise ValueError("request stop status is invalid")
+        await self._close_all_request_lifecycles(status=terminal_status)
+        ledger = getattr(self, "_request_event_ledger", None)
+        if not isinstance(ledger, RequestEventLedger):
             await self._stream_message_to_mythic(stop_message)
-        except Exception:
-            pass
-        await self._close_all_delegations(status="stopped")
+            return
+        lock = getattr(self, "_request_final_projection_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._request_final_projection_lock = lock
+        async with lock:
+            final_event_id = stable_event_id(
+                ledger.request_id,
+                "final_response",
+                "terminal",
+            )
+            final_events = ledger.actual_events(
+                event_id=final_event_id,
+                kind="final_response",
+                phase="emitted",
+            )
+            if (
+                final_events
+                and not ledger.should_project(
+                    final_event_id,
+                    "final_response",
+                    "emitted",
+                )
+            ):
+                return
+            if not final_events:
+                self.record_request_terminal(terminal_status)
+                self.record_final_response(stop_message, response_key="")
+                final_events = ledger.actual_events(
+                    event_id=final_event_id,
+                    kind="final_response",
+                    phase="emitted",
+                )
+            final_content = final_events[0].content
+            emitter = getattr(self, "_response_emitter", None)
+            try:
+                if hasattr(emitter, "emit_final_response"):
+                    emitted = await emitter.emit_final_response(
+                        event_id=final_event_id,
+                        content=final_content,
+                        control_transitions=self.request_control_transitions(),
+                    )
+                else:
+                    emitted = await self._stream_message_to_mythic(final_content)
+            except Exception:
+                emitted = False
+            if emitted:
+                response_key = str(
+                    getattr(emitter, "last_response_key", "")
+                    or f"event:{final_event_id}"
+                )
+                self.record_final_response_projection(
+                    final_event_id,
+                    response_key=response_key,
+                )
 
-    async def _run_operator_stop_shielded(self, stop_message: str) -> None:
+    async def _run_operator_stop_shielded(
+        self,
+        stop_message: str,
+        *,
+        status: str = "stopped",
+    ) -> None:
         """Run _emit_operator_stop to completion even if the caller's task is being cancelled."""
-        cleanup = asyncio.ensure_future(self._emit_operator_stop(stop_message))
+        cleanup = asyncio.ensure_future(
+            self._emit_operator_stop(stop_message, status=status)
+        )
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
@@ -4267,6 +5868,8 @@ class Model:
         self.mythic_client.set_capability_command_observer(self._emit_capability_command_card)
         self.mythic_client.set_execution_observer(self._emit_execution_event)
         self.mythic_client.set_turn_authority(self._turn_authority)
+        if self._request_contract is not None:
+            self.mythic_client.set_request_contract(self._request_contract)
         await self.mythic_client.login()
         # Scope preflight (Section 8A P1): learn the bot token's granted scopes and disable guarded tools
         # it can't use BEFORE the graph attaches them (get_tools skips disabled ones). No-op on the task
@@ -4434,9 +6037,6 @@ class Model:
             else:
                 channel = getattr(state, state_key, []) or []
 
-            # Store original channel length to detect new messages
-            original_channel_length = len(channel)
-
             # Ensure at least one message (Anthropic Bedrock requires non-empty messages list)
             if len(channel) == 0:
                 channel.append(SystemMessage(content=f"{node_name} context start"))
@@ -4497,7 +6097,6 @@ class Model:
                 tool_use_func=self._emit_tool_use_card,
                 tool_source_func=self._classify_tool_source,
                 agent_text_func=self._emit_agent_text,
-                handback_summary_func=self._capture_delegation_final_summary,
                 activity_func=self.set_active_agent,
                 delegation_id=delegation_id,
                 delegation_name=node_name if delegation_id is not None else None,
@@ -4517,6 +6116,7 @@ class Model:
 
             # Sanitize messages before invoking agent to prevent "multiple non-consecutive system messages" error
             sanitized_channel = self._sanitize_messages(channel)
+            initial_agent_input_length = len(sanitized_channel)
 
             # Autonomous keep-going: in an autonomous solve, the Mythic_Operator must not yield control to the
             # Supervisor by accident (a react agent ends its turn whenever the LLM emits no tool call). If the
@@ -4532,7 +6132,7 @@ class Model:
             )
             _continue_count = 0
             _agent_input = sanitized_channel
-            updated_channel = channel  # safe default if we halt before the first invocation
+            updated_channel = sanitized_channel  # safe default if stopped before invocation
             while True:
                 # Cooperative kill switch INSIDE the autonomous continue-loop: an operator `stop`/`exit` set
                 # _stop_requested, but the outer astream only checks it between top-level super-steps — so
@@ -4563,7 +6163,7 @@ class Model:
                     break
                 if result.get("recursion_handback"):
                     break  # explicit handback — let upstream flag handling end/route
-                _new_msgs = updated_channel[original_channel_length:]
+                _new_msgs = updated_channel[initial_agent_input_length:]
                 if _bounded_one_action_request and _terminal_execute_capability_payload(_new_msgs):
                     break  # the delegated task explicitly said one capability action, then stop
                 _explicit_yield = any(
@@ -4583,7 +6183,7 @@ class Model:
                         "[autonomous-continue] You ended your turn without reaching the objective and without an explicit "
                         "handback. In autonomous mode you must NOT stop after a sub-goal — execute the NEXT "
                         "action from your own REMAINING list now. To hand off you MUST call a tool (a plain stop just loops "
-                        "you back here): call `handback_to_supervisor(reason, summary, next_owner)` with the exact next "
+                        "you back here): call `handback_to_supervisor(reason, summary, outcome, next_owner)` with the exact next "
                         "agent (BloodHound for graph work, Mythic_Payload for a build) or the objective is complete — the "
                         "Supervisor will route and the solve continues. Use `summarize_and_handback` ONLY at the recursion "
                         "limit (it pauses for the operator). Do not stop silently."
@@ -4619,70 +6219,17 @@ class Model:
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
             returned_messages = [
-                msg for msg in updated_channel[original_channel_length:]
+                msg for msg in updated_channel[initial_agent_input_length:]
                 if not _is_internal_human_message(msg)
             ]
 
-            # Merge captured messages (from callback) with returned messages
-            # The callback captures ALL messages including the first tool-calling AIMessage
-            # that LangChain's react agent doesn't return
+            # LangGraph's returned sequence is the sole normal-path persistence
+            # authority. Callback capture is completion-timed observability only:
+            # it may render progress, but it must never supplement, deduplicate,
+            # or reorder framework state.
             captured = callback_handler.captured_messages
             logger.info(f"🎯 [{node_name}] Callback captured {len(captured)} messages, agent returned {len(returned_messages)}")
-
-            # Build a unified message list:
-            # - Use captured messages as the primary source (they're in chronological order)
-            # - Add any returned messages that weren't captured (rare, but possible)
-            #
-            # Deduplication: For AIMessages, match by tool_call IDs if present; for ToolMessages, match by tool_call_id
-            seen_tool_call_ids: set[str] = set()  # AIMessage tool_call IDs
-            seen_tool_result_ids: set[str] = set()  # ToolMessage tool_call_ids
-
-            # First pass: collect IDs from captured messages
-            for msg in captured:
-                if isinstance(msg, AIMessage):
-                    for tc in getattr(msg, 'tool_calls', []) or []:
-                        tc_id = tc.get('id')
-                        if tc_id:
-                            seen_tool_call_ids.add(tc_id)
-                elif isinstance(msg, ToolMessage):
-                    tc_id = getattr(msg, 'tool_call_id', None)
-                    if tc_id:
-                        seen_tool_result_ids.add(tc_id)
-
-            # Add any returned messages that weren't captured (shouldn't happen often)
-            new_messages_from_agent = list(captured)
-
-            # Build content hash set for captured AIMessages (for deduplication of messages without tool calls)
-            captured_ai_content_hashes = set()
-            for msg in captured:
-                if isinstance(msg, AIMessage):
-                    # Hash the content for comparison
-                    content_str = str(msg.content) if msg.content else ""
-                    captured_ai_content_hashes.add(hash(content_str))
-
-            for msg in returned_messages:
-                is_duplicate = False
-                if isinstance(msg, AIMessage):
-                    tool_calls = getattr(msg, 'tool_calls', []) or []
-                    if tool_calls:
-                        # Check if all tool_call IDs are already seen
-                        msg_tc_ids = {tc.get('id') for tc in tool_calls if tc.get('id')}
-                        if msg_tc_ids and msg_tc_ids.issubset(seen_tool_call_ids):
-                            is_duplicate = True
-                    else:
-                        # For AIMessages without tool calls, check content hash
-                        content_str = str(msg.content) if msg.content else ""
-                        if hash(content_str) in captured_ai_content_hashes:
-                            is_duplicate = True
-                            logger.debug(f"🔁 [{node_name}] Skipping duplicate AIMessage (same content as captured)")
-                elif isinstance(msg, ToolMessage):
-                    tc_id = getattr(msg, 'tool_call_id', None)
-                    if tc_id and tc_id in seen_tool_result_ids:
-                        is_duplicate = True
-
-                if not is_duplicate:
-                    new_messages_from_agent.append(msg)
-                    logger.debug(f"➕ [{node_name}] Added non-captured message: {type(msg).__name__}")
+            new_messages_from_agent = returned_messages
 
             # A guard middleware (e.g. BloodHound-not-connected) can short-circuit BEFORE the model runs:
             # nothing is captured and create_agent does not return its before_model-injected message, so the
@@ -5121,13 +6668,9 @@ class Model:
                 phase = str(_es.engagement_phase(snapshot))
                 if phase.startswith("BLOCKED"):
                     if _recent_bloodhound_blocker_observed(state):
-                        instruction = _compiled_autonomous_blocked_report(
-                            snapshot,
-                            handoff_instruction=handoff_instruction,
-                            requested_agent=agent_name,
-                        )
-                        if instruction:
-                            return _handoff_directive("__terminal__", instruction, "Report blocked objective")
+                        # Managed requests terminalize through typed worker/request
+                        # state, never through a parallel display-prose redirect.
+                        return None
                     if agent_name == "Mythic_Operator":
                         instruction = _compiled_autonomous_blocked_bloodhound_instruction(
                             snapshot,
@@ -5156,8 +6699,11 @@ class Model:
             _complete = str(_es_stall.engagement_phase(snapshot)).startswith("COMPLETE-CANDIDATE")
         except Exception:
             _complete = False
-        if not _complete and self._autonomous_stall_halt(_progress, _action_signature(action)):
-            return _handoff_directive("__terminal__", _autonomous_stall_report(snapshot), "Report stalled objective")
+        if not _complete and self._autonomous_stall_halt(
+            _progress,
+            _action_signature(action),
+        ):
+            return None
         instruction = _compiled_autonomous_capability_instruction(
             action,
             snapshot,
@@ -5349,22 +6895,6 @@ class Model:
             rf"{use_foothold_prefix}(?:autonomously\s+)?{objective})",
             candidate,
         ))
-
-    def _supervised_objective_controller_enabled_for_prompt(self, prompt: str) -> bool:
-        """Whether this fresh supervised chat turn should use controller-native HITL."""
-        authority = getattr(self, "_turn_authority", None)
-        objective_authorized = (
-            authority.is_autonomous_objective and authority.uses_controller_engine
-            if isinstance(authority, TurnAuthority)
-            else self._looks_like_explicit_objective_prompt(prompt)
-        )
-        return bool(
-            getattr(self, "mode", "auto") == "supervised"
-            and getattr(self, "command_name", "") == "chat"
-            and _controller_flag_enabled()
-            and _controller_hitl_flag_enabled()
-            and objective_authorized
-        )
 
     @staticmethod
     def _looks_like_casual_greeting(prompt: Any) -> bool:
@@ -5617,62 +7147,18 @@ class Model:
         )
 
     def _should_use_controller(self, is_interactive: bool, prompt: Any = "") -> bool:
-        """Whether the policy-selected execution kernel should handle this solve.
-
-        Existing autonomous solves keep their first-turn behavior. A supervised chat objective turn is the
-        exception: it may begin on an already-open chat session because `is_interactive` there means "reused
-        channel", not "approval response". Pending approvals are routed before this method is reached.
-
-        AUTO-MODE INITIATION GATE (default-deny): the execution kernel drives offensive execution off
-        the observed range state (`capabilities.actions_from_state`), so ceding control to it on a turn that is
-        NOT an explicit objective means the ENVIRONMENT — not an authorized operator objective — starts the
-        attack. A greeting ("hello") on a pre-collected range would otherwise begin executing. We therefore
-        require the same conservative, deterministic objective detector the supervised path already uses before
-        initiating in auto mode. A non-objective first turn falls through to normal conversational handling; the
-        operator can restate. The gate is deliberately deterministic (not an LLM classifier on the hot path):
-        an LLM guard is itself prompt-injectable/DoS-able, and a false negative here costs only a clarifying
-        turn while a false positive fires offensive actions.
-        """
+        """Route only from the installed typed lane; prose and reuse state are display inputs."""
+        del is_interactive, prompt
         authority = getattr(self, "_turn_authority", None)
-        if (
-            isinstance(authority, TurnAuthority)
-            and authority.objective_contract is not None
-            and authority.objective_contract.is_bounded
-        ):
+        if not isinstance(authority, TurnAuthority):
             return False
         if not self._controller_owned_solve() or not _controller_flag_enabled():
             return False
-        if getattr(self, "_supervised_objective_active", False):
-            return self._controller_hitl_enabled()
-        if is_interactive:
-            if (
-                getattr(self, "mode", "auto") == "supervised"
-                and getattr(self, "_autonomous_solve", False)
-            ):
-                return self._controller_hitl_enabled()
-            authority = getattr(self, "_turn_authority", None)
-            if not (
-                getattr(self, "mode", "auto") == "auto"
-                and isinstance(authority, TurnAuthority)
-                and authority.uses_stored_objective
-            ):
-                return False
-        if getattr(self, "mode", "auto") == "auto":
-            authority = getattr(self, "_turn_authority", None)
-            if isinstance(authority, TurnAuthority):
-                if authority.is_autonomous_objective:
-                    return True
-            elif self._looks_like_explicit_objective_prompt(_coerce_prompt_text(prompt)):
-                return True
-            # Observable decline (not a silent fallthrough): the turn is not an explicit objective, so the
-            # execution kernel does NOT initiate; the normal supervisor graph handles it conversationally
-            # and can still ask the operator to restate the objective.
-            logger.info(
-                "Auto-mode initiation gate DECLINED: first turn is not an explicit engagement objective; "
-                "handling via the supervisor graph instead of the execution kernel."
-            )
-            return False
-        return bool(self._controller_hitl_enabled())
+        if authority.is_autonomous_objective:
+            return True
+        if authority.is_supervised_action:
+            return bool(self._controller_hitl_enabled())
+        return False
 
     def _controller_hitl_enabled(self) -> bool:
         """Whether supervised controller-owned chat should pause moves for operator approval."""
@@ -5683,27 +7169,29 @@ class Model:
             and _controller_hitl_flag_enabled()
         )
 
+    def _supervised_collection_proposal_enabled(self) -> bool:
+        """Whether the typed supervised actions-complete lane may offer a collection peer."""
+        try:
+            from . import policy as _policy
+        except ImportError:
+            import policy as _policy
+        contract = getattr(self, "_request_contract", None)
+        lane = getattr(getattr(contract, "lane", None), "value", "")
+        stop = getattr(getattr(getattr(contract, "stop_condition", None), "kind", None), "value", "")
+        policy_mode, resolution = _policy.resolve_policy_mode(getattr(self, "policy_mode", ""))
+        resolution = str(getattr(self, "_policy_mode_resolution", "") or resolution)
+        return bool(
+            self._controller_hitl_enabled()
+            and lane == "supervised_workflow"
+            and stop == "actions_complete"
+            and policy_mode == _policy.POLICY_HYBRID
+            and resolution == "explicit_valid"
+        )
+
     def _controller_hitl_key(self, kind: str, args: dict[str, Any]) -> str:
-        """Stable fingerprint for the exact controller move shown to the operator.
-
-        Policy provenance is intentionally excluded: a resumed controller rebuilds its
-        episode/decision IDs, but those audit fields do not change the capability the
-        operator approved. Concrete target, preconditions, effects, callback, and inputs
-        remain bound into the fingerprint.
-        """
-        def approval_identity(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {
-                    str(key): approval_identity(item)
-                    for key, item in value.items()
-                    if str(key) != "policy_decision"
-                }
-            if isinstance(value, (list, tuple, set)):
-                return [approval_identity(item) for item in value]
-            return _jsonable_value(value)
-
+        """Stable fingerprint for the exact controller move shown to the operator."""
         return json.dumps(
-            {"kind": str(kind or ""), "args": approval_identity(args or {})},
+            {"kind": str(kind or ""), "args": _jsonable_value(args or {})},
             sort_keys=True,
             separators=(",", ":"),
             default=str,
@@ -5716,7 +7204,7 @@ class Model:
         objective: str,
     ) -> dict[str, Any]:
         args = {
-            "capability": _jsonable_value(payload or {}),
+            "action": _jsonable_value(payload or {}),
             "inputs": _jsonable_value(inputs or {}),
         }
         return {
@@ -5743,6 +7231,7 @@ class Model:
             "callback_id": str(getattr(foothold, "callback_id", "") or ""),
             "host": str(getattr(foothold, "host", "") or ""),
             "agent": str(getattr(foothold, "agent", "") or ""),
+            "identity": str(getattr(foothold, "identity", "") or ""),
         }
         if decision:
             args["policy_decision"] = _jsonable_value(decision)
@@ -5760,11 +7249,13 @@ class Model:
         args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
         if getattr(self, "_hitl_card_emitter", None) is not None:
             try:
-                await self._hitl_card_emitter([{
+                action_requests = [{
                     "name": str(pending.get("tool") or "guarded_controller_action"),
                     "display_name": str(pending.get("display_name") or ""),
                     "args": args,
-                }])
+                }]
+                self.bind_supervised_request_proposal(action_requests)
+                await self._hitl_card_emitter(action_requests)
                 self._hitl_card_pending = True
             except Exception as e:
                 logger.warning(f"HITL: failed to emit controller confirmation card ({e})")
@@ -5774,7 +7265,7 @@ class Model:
 
         lines: list[str] = []
         if kind == "capability":
-            payload = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+            payload = args.get("action") if isinstance(args.get("action"), dict) else {}
             inputs = args.get("inputs") if isinstance(args.get("inputs"), dict) else {}
             lines = [
                 f"  * `{pending.get('display_name') or 'execute_capability'}`",
@@ -6102,7 +7593,7 @@ class Model:
         decision = inputs.get("policy_decision")
         if isinstance(decision, dict):
             return dict(decision)
-        capability = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+        capability = args.get("action") if isinstance(args.get("action"), dict) else {}
         intent = capability.get("intent") if isinstance(capability.get("intent"), dict) else {}
         decision = intent.get("policy_decision")
         return dict(decision) if isinstance(decision, dict) else {}
@@ -6134,10 +7625,18 @@ class Model:
         decision: Any | None,
         callback_id: str = "",
         parent_transaction_id: str = "",
+        transaction_id: str = "",
     ) -> dict[str, Any]:
         """Record only authorized semantic moves, before the side-effecting seam starts."""
+        resolved_transaction_id = (
+            str(transaction_id or "").strip()
+            or f"transaction-{uuid4().hex}"
+        )
+        observed = list(getattr(self, "_controller_observed_transactions", []) or [])
+        for existing in observed:
+            if str(existing.get("transaction_id") or "") == resolved_transaction_id:
+                raise RuntimeError("controller semantic transaction ID was already recorded")
         data = {
-            "transaction_id": f"transaction-{uuid4().hex}",
             "parent_transaction_id": str(parent_transaction_id or ""),
             "kind": str(kind or ""),
             "capability": str(capability or ""),
@@ -6150,8 +7649,8 @@ class Model:
             "wait_count": 0,
             "retry_count": 0,
             **self._controller_decision_dict(decision),
+            "transaction_id": resolved_transaction_id,
         }
-        observed = list(getattr(self, "_controller_observed_transactions", []) or [])
         observed.append(data)
         self._controller_observed_transactions = observed
         self._controller_refresh_runtime_policy_telemetry()
@@ -6473,7 +7972,13 @@ class Model:
             logger.info(f"[autonomous-controller] {msg}")
             self._queue_controller_verbose_event(msg, operator_message=operator_message)
 
-        snap = {"state": None, "collection_request": None}
+        snap = {
+            "state": None,
+            "collection_request": None,
+            "private_collection_attempted": False,
+            "private_collection_complete": False,
+        }
+        supervised_collection_lane = self._supervised_collection_proposal_enabled()
 
         async def observe():
             state = await self._build_current_engagement_state()
@@ -6511,13 +8016,43 @@ class Model:
             )
             if decision_context.get("model_response_observed") is False:
                 approved_decision = self._controller_pending_policy_decision(approved_pending)
-                if approved_decision.get("policy_mode"):
+                if approved_decision:
                     decision_context = approved_decision
             self._controller_record_policy_decision(decision_context)
             if decision_context:
                 payload["intent"] = dict(payload.get("intent") or {})
                 payload["intent"]["policy_decision"] = decision_context
                 inputs["policy_decision"] = decision_context
+            approved_args = (
+                approved_pending.get("args")
+                if isinstance(approved_pending.get("args"), dict)
+                else {}
+            )
+            approved_action = (
+                approved_args.get("action")
+                if isinstance(approved_args.get("action"), dict)
+                else {}
+            )
+            approved_intent = (
+                approved_action.get("intent")
+                if isinstance(approved_action.get("intent"), dict)
+                else {}
+            )
+            approved_inputs = (
+                approved_args.get("inputs")
+                if isinstance(approved_args.get("inputs"), dict)
+                else {}
+            )
+            action_transaction_id = str(approved_intent.get("transaction_id") or "")
+            input_transaction_id = str(approved_inputs.get("transaction_id") or "")
+            transaction_id = (
+                action_transaction_id
+                if action_transaction_id and action_transaction_id == input_transaction_id
+                else f"transaction-{uuid4().hex}"
+            )
+            payload["intent"] = dict(payload.get("intent") or {})
+            payload["intent"]["transaction_id"] = transaction_id
+            inputs["transaction_id"] = transaction_id
             pending = self._controller_hitl_capability_request(payload, inputs, prompt)
             if (
                 not self._controller_hitl_enabled()
@@ -6534,10 +8069,8 @@ class Model:
                 target=str(payload.get("target") or ""),
                 decision=decision_context,
                 callback_id=str(inputs.get("callback_id") or ""),
+                transaction_id=transaction_id,
             )
-            inputs["transaction_id"] = transaction["transaction_id"]
-            payload["intent"] = dict(payload.get("intent") or {})
-            payload["intent"]["transaction_id"] = transaction["transaction_id"]
             capability_name = str(payload.get("name") or "capability")
             target = str(payload.get("target") or "").strip()
             activity = await self._open_execution_activity(
@@ -6598,8 +8131,7 @@ class Model:
             # _controller_collection_target — so an unsupported-agent missing foothold doesn't trigger a
             # collect()->no_target slot burn. (current_access_collection_missing counts ALL agents.)
             try:
-                frontier_empty = not bool(policy_frontier(state))
-                if not frontier_empty:
+                if not supervised_collection_lane and policy_frontier(state):
                     snap["collection_request"] = None
                     return False
                 request = self._controller_collection_request(
@@ -6623,7 +8155,7 @@ class Model:
             )
             if decision_context.get("model_response_observed") is False:
                 approved_decision = self._controller_pending_policy_decision(approved_pending)
-                if approved_decision.get("policy_mode"):
+                if approved_decision:
                     decision_context = approved_decision
             self._controller_record_policy_decision(decision_context)
             pending = self._controller_hitl_collection_request(request, prompt, decision_context)
@@ -6636,6 +8168,7 @@ class Model:
                     operator_message=self._controller_collection_selection_progress(request),
                 )
             await self._require_controller_hitl_approval(pending)
+            snap["private_collection_attempted"] = supervised_collection_lane
             transaction = self._controller_record_semantic_transaction(
                 kind="collection",
                 capability="collect-graph",
@@ -6653,18 +8186,39 @@ class Model:
             activity_status = "finished"
             visibility_token = None
             try:
-                if decision_context:
-                    try:
-                        from . import mythic_tools as _mt
-                    except ImportError:
-                        import mythic_tools as _mt
-                    visibility_token = _mt._task_visibility_context.set({
-                        "capability": "collect-graph",
-                        "purpose": str(getattr(request, "reason", "") or ""),
-                        "policy_decision": decision_context,
-                        "transaction_id": transaction["transaction_id"],
-                    })
+                try:
+                    from . import mythic_tools as _mt
+                except ImportError:
+                    import mythic_tools as _mt
+                visibility_token = _mt._task_visibility_context.set({
+                    "capability": "collect-graph",
+                    "purpose": str(getattr(request, "reason", "") or ""),
+                    "policy_decision": decision_context,
+                    "transaction_id": transaction["transaction_id"],
+                })
                 result = await self._controller_collect(state, request=request)
+                checker = getattr(
+                    getattr(self, "mythic_client", None),
+                    "_private_collection_transaction_active",
+                    None,
+                )
+                try:
+                    private_active = callable(checker) and checker() is True
+                except Exception:
+                    private_active = False
+                valid_private_result = bool(
+                    supervised_collection_lane
+                    and isinstance(result, dict)
+                    and result.get("ok") is True
+                    and result.get("graph_verified") is True
+                    and result.get("status") in ("ingested", "already_ingested")
+                    and private_active
+                )
+                snap["private_collection_complete"] = valid_private_result
+                if supervised_collection_lane and not valid_private_result:
+                    result = dict(result) if isinstance(result, dict) else {}
+                    result["ok"] = False
+                    result.setdefault("reason", "collection result lacked exact private success proof")
                 self._controller_refresh_transaction_proof_lineage(transaction["transaction_id"])
                 return result
             except BaseException:
@@ -6684,6 +8238,8 @@ class Model:
 
         def objective_met(state):
             try:
+                if supervised_collection_lane and snap["private_collection_complete"]:
+                    return True
                 if _es.objective_effects_complete(state):
                     return True
                 if not str(_es.engagement_phase(state)).startswith("COMPLETE-CANDIDATE"):
@@ -6709,6 +8265,7 @@ class Model:
             wall_clock_budget_s=float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700)),
             token_budget=_env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000),
             max_cycles=_env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
+            max_collection_attempts_per_request=1 if supervised_collection_lane else 2,
         )
 
         objective_text = str(prompt or "").strip()
@@ -6742,7 +8299,7 @@ class Model:
                     match_index = None
                     match_candidate_id = ""
                     if kind == "capability":
-                        approved = args.get("capability") if isinstance(args.get("capability"), dict) else {}
+                        approved = args.get("action") if isinstance(args.get("action"), dict) else {}
                         if policy_mode == _policy.POLICY_LLM:
                             candidates = [
                                 {
@@ -6964,6 +8521,11 @@ class Model:
             report = self._objective_completion_report(require_autonomous=False)
         if not report:
             report = self._controller_terminal_report(result)
+        self._project_private_collection_terminal(
+            result.status,
+            report,
+            attempted=bool(snap["private_collection_attempted"]),
+        )
         # Persist the assistant turn to state so a reused Model on a later interactive turn does not see a
         # human prompt with no recorded reply (Forge MEDIUM: dangling-turn hazard).
         report_msg = AIMessage(content=report, name="Supervisor")
@@ -7059,13 +8621,26 @@ class Model:
             if _cap._normalize_callback_id(getattr(foothold, "callback_id", ""))
         }
         preferred_callback_id = _cap._preferred_live_callback_id(state, live_callback_ids)
-        if not preferred_callback_id:
-            return candidates
+
+        def stable_key(foothold):
+            raw = tuple(
+                str(getattr(foothold, field, "") or "")
+                for field in ("callback_id", "agent", "host", "forest", "identity", "integrity", "source", "timestamp")
+            )
+            callback_id = _cap._normalize_callback_id(raw[0])
+            numeric = int(raw[0]) if re.fullmatch(r"[0-9]+", raw[0]) else None
+            return (
+                raw[0] != preferred_callback_id if preferred_callback_id else False,
+                numeric is None,
+                numeric if numeric is not None else 0,
+                callback_id,
+                *(value.casefold() for value in raw[1:]),
+                *raw,
+            )
+
         return sorted(
             candidates,
-            key=lambda foothold: (
-                _cap._normalize_callback_id(getattr(foothold, "callback_id", "")) != preferred_callback_id,
-            ),
+            key=stable_key,
         )
 
     def _controller_latest_capability_failure_is_retryable(self, state) -> bool:
@@ -7192,6 +8767,14 @@ class Model:
                         reason="trusted-scope-expansion",
                         support=f"trusted domain {scope_domain} is visible and uncollected",
                     )
+        if self._supervised_collection_proposal_enabled():
+            candidate = supported_footholds[0]
+            forest = str(getattr(candidate, "forest", "") or "").strip().casefold()
+            return request_for(
+                candidate,
+                reason="supervised-refresh",
+                support=f"operator approval may refresh graph observations for {forest or 'the foothold forest'}",
+            )
         return None
 
     async def _controller_collect(self, state, request=None) -> dict:
@@ -7250,10 +8833,25 @@ class Model:
         if adapter is None:
             return outcome(False, "no_target", "no supported foothold needs collection")
         cb = str(getattr(foothold, "callback_id", "") or "").strip()
-        try:
-            cb_int = int(cb.lstrip("#").removeprefix("cb"))
-        except (TypeError, ValueError):
+        if re.fullmatch(r"[0-9]+", cb) is None:
             return outcome(False, "bad_callback", f"non-numeric callback id {cb!r}")
+        cb_int = int(cb)
+
+        begin_transaction = getattr(self.mythic_client, "_begin_private_collection_transaction", None)
+        if callable(begin_transaction):
+            root_args = {
+                "collection_key": collection_key,
+                "scope_domain": scope_domain,
+                "reason": collection_reason,
+                "support": str(getattr(request, "support", "") or ""),
+                "callback_id": cb,
+                "host": str(getattr(foothold, "host", "") or ""),
+                "agent": str(getattr(foothold, "agent", "") or ""),
+                "identity": str(getattr(foothold, "identity", "") or ""),
+            }
+            blocker = begin_transaction(root_args, request=request, adapter=adapter)
+            if blocker:
+                return outcome(False, "blocked", str(blocker))
 
         authority = getattr(self, "_turn_authority", None)
         objective_contract = (
@@ -7327,7 +8925,13 @@ class Model:
 
         # Open-ended solves retain their random per-run anchor. A bounded collection objective instead uses
         # the immutable token derived from its turn id so task, ZIP, download, and ingest share one identity.
-        if objective_contract is not None and objective_contract.collection_scope_resolved:
+        private_token = ""
+        token_getter = getattr(self.mythic_client, "_private_collection_transaction_token", None)
+        if callable(token_getter):
+            private_token = str(token_getter() or "")
+        if private_token:
+            token = private_token
+        elif objective_contract is not None and objective_contract.collection_scope_resolved:
             token = objective_contract.collection_token
         else:
             import secrets as _secrets
@@ -7421,6 +9025,15 @@ class Model:
                 return outcome(False, "no_fresh_collection",
                                "the downloaded collection ZIP was not found in Mythic")
             file_name = (row.get("filename_utf8") if isinstance(row, dict) else "") or zip_name
+            bind_artifact = getattr(self.mythic_client, "_bind_private_collection_artifact", None)
+            if callable(bind_artifact):
+                artifact_blocker = bind_artifact(
+                    file_uuid=file_uuid,
+                    path=real_path,
+                    filename=file_name,
+                )
+                if artifact_blocker:
+                    return outcome(False, "artifact_blocked", str(artifact_blocker))
             fire(
                 f"ingest_collection(file_uuid={file_uuid}, callback_display_id={cb_int})",
                 operator_message=(
@@ -7450,17 +9063,20 @@ class Model:
             parsed = json.loads(ingest_raw) if isinstance(ingest_raw, str) else (ingest_raw or {})
         except Exception:
             parsed = {}
-        ok = bool(parsed.get("graph_verified")) if isinstance(parsed, dict) else False
-        status = str(parsed.get("status", "")) if isinstance(parsed, dict) else ""
+        graph_verified = parsed.get("graph_verified") if isinstance(parsed, dict) else None
+        status = parsed.get("status") if isinstance(parsed, dict) and isinstance(parsed.get("status"), str) else ""
+        ok = graph_verified is True and status in ("ingested", "already_ingested")
         fire(
-            f"ingest status={status} graph_verified={ok}",
+            f"ingest status={status} graph_verified={graph_verified}",
             operator_message=(
                 "**Collection verified**\n"
                 f"Sage finished graph ingest with status `{status or 'unknown'}` and "
-                f"`graph_verified={str(ok).lower()}`."
+                f"`graph_verified={str(graph_verified).lower()}`."
             ),
         )
-        return outcome(ok, status or "unknown")
+        result = outcome(ok, status or "unknown")
+        result["graph_verified"] = graph_verified
+        return result
 
     async def _autonomous_executor_node(self, state: SageState | dict, config=None):
         """Execute a compiled autonomous capability step without another LLM handoff."""
@@ -7639,19 +9255,24 @@ class Model:
         return True
 
     def _objective_completion_preflight_allowed(self, prompt: str) -> bool:
-        """Whether this prompt should check for already-recorded objective completion before more work."""
-        if self._controller_owned_solve():
-            return True
-        text = str(prompt or "").casefold()
-        if not text:
+        """Admit completion preflight only for the typed autonomous stop contract."""
+        del prompt
+        try:
+            from .request_contract import (
+                RequestContract,
+                RequestIntent,
+                RequestLane,
+                StopConditionKind,
+            )
+        except ImportError:  # pragma: no cover
             return False
-        if "autonomous" in text and "objective" in text:
-            return True
-        if "observed engagement state" in text and ("continue" in text or "satisfied" in text or "proof chain" in text):
-            return True
-        if "objective" in text and ("already satisfied" in text or "proof chain" in text or "continue" in text):
-            return True
-        return False
+        contract = getattr(self, "_request_contract", None)
+        return bool(
+            isinstance(contract, RequestContract)
+            and contract.lane == RequestLane.AUTONOMOUS_OBJECTIVE
+            and contract.intent in {RequestIntent.EXECUTE, RequestIntent.CONTINUE}
+            and contract.stop_condition.kind == StopConditionKind.OBJECTIVE_PROVED
+        )
 
     def _autonomous_nudge_content(self, base_nudge_text: str, rendered_state: str | None) -> str:
         """Compose the autonomous-continue nudge, optionally prefixed with observed state.
@@ -7667,6 +9288,7 @@ class Model:
 
     def _context_middleware(
             self,
+            agent_name: str = "",
             inject_engagement_state: bool = False,
             bounded_execute_stop: bool = False,
             mcp_no_progress_stop: bool = False,
@@ -7748,7 +9370,7 @@ class Model:
             ))
         # Listed after HITL so LangChain's reverse after_model order runs this authority filter
         # first. Its tool wrapper remains a second enforcement point immediately before execution.
-        mw.append(_TurnAuthorityToolMiddleware(self))
+        mw.append(_TurnAuthorityToolMiddleware(self, agent_name=agent_name))
         # Per-turn engagement-state injection (Mythic_Operator only, autonomous + gate-on, fail-open).
         # Appended LAST so it is the INNERMOST wrapper: the rendered block is added AFTER all the
         # context-editing/summarization middleware run, so it is never trimmed before reaching the model.
@@ -7778,7 +9400,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(agent_name=name),
         )
         return self._wrap_create_agent(agent, "generalist_messages", name)
     
@@ -7825,7 +9447,8 @@ class Model:
             # Add handoff to Mythic_Payload for payload creation needs
             transfer_to_payload = _create_handoff_tool(
                 agent_name="Mythic_Payload",
-                description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload. Always include the source/reference callback display_id in handoff_instruction so Mythic_Payload can inherit working C2 config, e.g. 'inherit C2 config from reference callback 22'."
+                description="Delegate payload creation task to Mythic_Payload agent. Use when privilege escalation, lateral movement, or persistence requires a new payload. Always include the source/reference callback display_id in handoff_instruction so Mythic_Payload can inherit working C2 config, e.g. 'inherit C2 config from reference callback 22'.",
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
             tools = mythic_tools + [handback_tool, handback_to_supervisor_tool, transfer_to_payload]
@@ -7840,6 +9463,7 @@ class Model:
             tools=tools,
             name=name,
             middleware=self._context_middleware(
+                agent_name=name,
                 inject_engagement_state=True,
                 bounded_execute_stop=True,
             ),
@@ -7883,7 +9507,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(agent_name=name),
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
@@ -7969,7 +9593,7 @@ class Model:
             # the turn before any model call, instead of silently failing with no graph tools.
             middleware=[
                 _BloodHoundConnectionGuardMiddleware(self),
-            ] + self._context_middleware(),
+            ] + self._context_middleware(agent_name=name),
         )
         return self._wrap_create_agent(agent, "bloodhound_messages", name)
 
@@ -8008,7 +9632,10 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(mcp_no_progress_stop=True),
+            middleware=self._context_middleware(
+                agent_name=name,
+                mcp_no_progress_stop=True,
+            ),
         )
         return self._wrap_create_agent(agent, "mcp_manager_messages", name)
 
@@ -8035,7 +9662,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(agent_name=name),
         )
         return self._wrap_create_agent(agent, "sandbox_messages", name)
 
@@ -8050,48 +9677,48 @@ class Model:
             agent_name="Generalist",
             description="Assign task to Generalist for general questions, explanations, advice, and tasks that don't require Mythic operations or external tools.",
             autonomous_redirect=self._autonomous_handoff_step_redirect,
-            autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
             worker_outcome_lookup=self._latest_admitted_worker_handoff,
+            subgoal_scheduler=self._schedule_subgoal_transition,
         )
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
                 agent_name="Mythic_Operator",
                 description="Assign task to Mythic Operator for ALL Mythic C2 operations: callbacks, agents, tasks, commands, files, reconnaissance. ALWAYS use this for Mythic-related queries instead of the BloodHound agent.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
-                autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
                 agent_name="Mythic_Payload",
                 description="Assign task to Mythic Payload for creating Mythic payloads, configuring C2 profiles, and build options.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
-                autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
         assign_to_bloodhound_agent = _create_handoff_tool(
                 agent_name="BloodHound",
                 description="Assign to the BloodHound agent for the BloodHound attack-graph: INGEST a staged SharpHound/AzureHound collection (file_upload) then VERIFY it, and attack-path ANALYSIS (shortest path, ADCS/ESC paths, Cypher, object detail). NOTE: the Operator auto-hands-off freshly-staged collections to BloodHound; route here for any BloodHound/graph work, to re-attempt a failed ingest, or for path analysis. Do NOT route BloodHound work to Mythic_Operator.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
-                autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
         assign_to_mcp_manager_agent = _create_handoff_tool(
                 agent_name="MCP_Manager",
                 description="Assign to the general-purpose MCP Manager for tools from ARBITRARY third-party MCP servers a user has connected (web fetching, external APIs, non-Mythic integrations) — anything that is NOT BloodHound, NOT Mythic C2, and NOT a payload build. For BloodHound/graph work use the BloodHound agent; for Mythic operations use Mythic_Operator.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
-                autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
         assign_to_sandbox_agent = _create_handoff_tool(
                 agent_name="Sandbox",
                 description="Assign to the Sandbox agent for isolated LOCAL scratch execution only: run shell/Python snippets, parse/transform text, test regexes, or perform ad-hoc computation in a throwaway container. Do NOT use this for Mythic, BloodHound, target-facing actions, payload work, or proof.",
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
-                autonomous_redirect_enabled=self._autonomous_execution_enabled_for_turn,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
+                subgoal_scheduler=self._schedule_subgoal_transition,
             )
 
         # Completion tool - use when task is done
@@ -8132,7 +9759,7 @@ class Model:
             # _sanitize_messages. supervisor.md is non-empty today, but a blank render would otherwise send an
             # empty `system` block to Bedrock (bug 2). Normalize here too, consistently with __init__.
             system_prompt=_nonempty_system(prompt),
-            middleware=self._context_middleware(),
+            middleware=self._context_middleware(agent_name=name),
         )
         return self._wrap_create_agent(agent, "supervisor_messages", name)
 
@@ -8434,6 +10061,21 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
+        try:
+            from .subgoal_state import SubgoalState, cancel
+
+            lock = getattr(self, "_subgoal_authority_lock", None)
+            canonical = getattr(self, "_subgoal_authority", None)
+            if lock is not None and isinstance(canonical, SubgoalState):
+                with lock:
+                    canonical = getattr(self, "_subgoal_authority", None)
+                    if isinstance(canonical, SubgoalState):
+                        stopped = cancel(canonical)
+                        self._subgoal_authority = stopped
+                        self.state["_subgoal_state"] = stopped.to_dict()
+                        self._record_subgoal_control_events(stopped)
+        except (AttributeError, TypeError, ValueError):
+            logger.warning("Could not project stop into the typed subgoal state")
         current_task = None
         try:
             current_task = asyncio.current_task()
@@ -8515,6 +10157,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         thread_id: str,
         operator_message: str = "",
         expected_action_digest: str = "",
+        approved_action_ids: tuple[str, ...] | None = None,
     ) -> str:
         """Resume a graph paused on a guarded-tool approval interrupt with a DEFAULT-DENY decision map.
 
@@ -8530,6 +10173,13 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         so we add NO side effects here beyond the audit log.
         """
         config = RunnableConfig(configurable={"thread_id": thread_id})
+        # Minimal loop-breaker: clear any denial from a prior cycle so the flag reflects only this resume.
+        _mc = getattr(self, "mythic_client", None)
+        if _mc is not None:
+            try:
+                _mc._last_effect_denial = None
+            except Exception:
+                pass
         snapshot = await self.graph.aget_state(config)
 
         # Collect the pending HITLRequest action_requests, counted ONCE (single authoritative source +
@@ -8540,10 +10190,30 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         if not action_requests:
             raise RuntimeError(_HITL_GUARDED_REQUEST_UNAVAILABLE)
         self._verify_hitl_action_digest(action_requests, expected_action_digest)
+        selected_ids = (
+            None
+            if approved_action_ids is None
+            else set(approved_action_ids)
+        )
         steer = (operator_message or "").strip()
         decision_word = "approve" if approved else ("steer" if steer else "deny")
-        if not approved:
-            self._record_hitl_denials(action_requests)
+        try:
+            from sage_chat.hitl import approval_action_fingerprint
+        except ImportError:  # pragma: no cover
+            from ...sage_chat.hitl import approval_action_fingerprint  # type: ignore
+        rejected_actions = [
+            action
+            for action in action_requests
+            if (
+                not approved
+                or (
+                    selected_ids is not None
+                    and approval_action_fingerprint(action) not in selected_ids
+                )
+            )
+        ]
+        if rejected_actions:
+            self._record_hitl_denials(rejected_actions)
 
         # One audit line + one Decision per interrupted tool call. On a steer, the guarded action is still
         # rejected (never blind-run), but the operator's text becomes the rejection message.
@@ -8552,8 +10222,18 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             for ar in action_requests:
                 tool_name = ar.get("name", "unknown") if isinstance(ar, dict) else "unknown"
                 tool_args = ar.get("args", {}) if isinstance(ar, dict) else {}
-                self._write_hitl_audit(tool_name, tool_args, decision_word)
-                if approved:
+                action_approved = bool(
+                    approved
+                    and (
+                        selected_ids is None
+                        or approval_action_fingerprint(ar) in selected_ids
+                    )
+                )
+                action_decision = "approve" if action_approved else (
+                    "steer" if steer else "deny"
+                )
+                self._write_hitl_audit(tool_name, tool_args, action_decision)
+                if action_approved:
                     decisions.append({"type": "approve"})
                 else:
                     message = (f"[Operator steering] {steer}" if steer
@@ -8572,11 +10252,51 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # A subsequent guarded tool call in the same supervised run interrupts again — surface
             # the next approve/deny prompt and pause rather than silently halting.
             if isinstance(event, dict) and "__interrupt__" in event:
+                # Minimal loop-breaker: if the just-approved action was refused at the effect boundary,
+                # this interrupt is the model re-proposing it. Surface the reason and terminalise instead
+                # of blindly re-carding the same denied action (the livelock).
+                if await self._handle_reproposal_after_denial():
+                    break
                 await self._surface_hitl_interrupt(event)
                 break
             await self._process_stream_event(event)
 
         return ""
+
+    async def _handle_reproposal_after_denial(self) -> bool:
+        """Minimal loop-breaker (staged ahead of full denial-routing). When the just-approved supervised
+        action was refused at the effect boundary, the model re-proposes it and the resume loop would
+        surface a fresh approval card — the livelock. Instead, surface the denial reason to the operator
+        and terminalise the request `blocked` (ISC-30), which also seals the 49R-16 decision record that a
+        never-terminalising request would starve. Returns True when it handled a denial (caller must break).
+
+        Fires ONLY when a denial was recorded this resume cycle, so the legitimate path — an approved action
+        that SUCCEEDS and is followed by a distinct next action — records no denial and is untouched. The
+        follow-on denial-routing replaces the terminalise with recover / return-to-user by reason."""
+        denial = getattr(getattr(self, "mythic_client", None), "_last_effect_denial", None)
+        if not denial:
+            return False
+        reason = str((denial or {}).get("reason") or "the approved action was refused")
+        msg = (
+            "🚫 **Blocked** — your approved action was refused at the effect boundary and was **not** re-run:\n\n"
+            f"> {reason[:600]}\n\n"
+            "I did not re-propose it. Start a new request once the blocking condition changes "
+            "(for example, a live target), or tell me how you'd like to proceed."
+        )
+        try:
+            await self._stream_message_to_mythic(msg)
+        except Exception as e:
+            logger.warning(f"loop-breaker: failed to stream denial reason ({e})")
+        try:
+            self.record_request_terminal("blocked")
+            await self._close_all_request_lifecycles(status="blocked")
+        except Exception as e:
+            logger.warning(f"loop-breaker: failed to terminalise blocked ({e})")
+        try:
+            self.mythic_client._last_effect_denial = None
+        except Exception:
+            pass
+        return True
 
     def _write_hitl_audit(self, tool: str, args: dict, decision: str) -> None:
         """Append one JSON line to MEMORY/audit.jsonl recording an approve/deny decision. Best-effort:
@@ -8619,6 +10339,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 if isinstance(val, dict) and isinstance(val.get("action_requests"), list):
                     action_requests.extend(val["action_requests"])
             try:
+                self.bind_supervised_request_proposal(action_requests)
                 await self._hitl_card_emitter(action_requests)
                 self._hitl_card_pending = True
             except Exception as e:
@@ -8714,23 +10435,18 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             self.state["recursion_summary_requested"] = False
             return await self.handle_continuation_response(prompt)
 
-        await self._restore_pending_objective_refinement_from_checkpoint(thread_id)
-        authority = self._compile_turn_authority(prompt)
-        authority = await self._resolve_supervised_semantic_authority(authority)
-        authority = await self._resolve_turn_authority_scope(authority)
-        self._update_pending_objective_refinement(authority)
+        request_contract = getattr(self, "_request_contract", None)
+        if request_contract is None:
+            request_contract = self._build_typed_session_request_contract()
+            self.install_request_contract(request_contract)
+        authority = authority_from_request_contract(request_contract)
         self._install_turn_authority(authority)
         self._refresh_graph_for_turn()
-        await self._persist_pending_objective_refinement_checkpoint(thread_id)
-        effective_objective = self._effective_objective_for_turn(prompt)
+        effective_objective = _coerce_prompt_text(prompt)
 
-        # Fresh turn only: controller-owned objectives use the bounded execution kernel while scoped
-        # questions and stored-objective graph contracts remain on the normal supervisor graph. Leave the flag
-        # alive across a controller-native HITL pause so the next approval can resume the exact pending move.
-        self._supervised_objective_active = bool(
-            authority.is_autonomous_objective
-            and self._supervised_objective_controller_enabled_for_prompt(prompt)
-        )
+        # Typed transport/session state is the only controller-routing authority. The old
+        # prompt-derived supervised activation flag is intentionally never compiled.
+        self._supervised_objective_active = False
 
         # Fresh stall-detector window per solve — never carry a prior objective's counters into this one
         # (a Sage session may reuse one Model across invoke() calls).
@@ -8801,50 +10517,20 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             if formatted_prompt:
                 await self._stream_message_to_mythic(formatted_prompt)
 
-        if _looks_like_scoped_callback_inventory_prompt(prompt):
+        if (
+            _looks_like_scoped_callback_inventory_prompt(prompt)
+            and not self._request_contract_block_reason("list_callbacks")
+        ):
             logger.info("Scoped callback inventory prompt routed to one deterministic list_callbacks read")
             return await self._run_scoped_callback_inventory_turn()
 
         if (
-            authority.objective_contract is not None
-            and authority.objective_contract.requires_collection_scope
-            and not authority.objective_contract.collection_scope_resolved
-        ):
-            logger.info(
-                "Collection objective turn %s stopped before graph execution: %s",
-                authority.turn_id,
-                authority.objective_contract.scope_resolution_reason,
+            authority.is_autonomous_objective
+            and self._objective_completion_preflight_allowed(prompt)
+            and await self._maybe_stream_objective_completion_stop(
+                refresh_footholds=True,
+                require_autonomous=False,
             )
-            return self._collection_scope_clarification(authority)
-
-        if (
-            authority.is_bounded
-            or (
-                authority.is_autonomous_objective
-                and authority.objective_contract is not None
-                and authority.objective_contract.is_bounded
-            )
-        ):
-            logger.info(
-                "Bounded turn %s starts checkpointed graph at Mythic_Operator",
-                authority.turn_id,
-            )
-            self._seed_bounded_mythic_turn(effective_objective)
-
-        elif authority.mcp_server_pin and not authority.is_autonomous_objective:
-            logger.info("Exact MCP server pin routed deterministically to MCP_Manager: %s", authority.mcp_server_pin)
-            return await self._run_pinned_mcp_turn(prompt)
-
-        if authority.stored_objective_trigger and not authority.uses_stored_objective:
-            logger.info("Stored-objective trigger declined because no operator-set objective is bound")
-            return (
-                "No operator objective is set for this operation. Set one with "
-                "`/state objective <text>`, then retry the start command."
-            )
-
-        if self._objective_completion_preflight_allowed(prompt) and await self._maybe_stream_objective_completion_stop(
-            refresh_footholds=True,
-            require_autonomous=False,
         ):
             return ""
 
@@ -8865,10 +10551,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 return await self._run_autonomous_controller(effective_objective)
             except asyncio.CancelledError:
                 logger.info("🛑 Autonomous controller cancelled — clean stop")
-                try:
-                    await self._stream_message_to_mythic("\n🛑 Session stopped by operator.\n")
-                except Exception:
-                    pass
+                await self._run_operator_stop_shielded(
+                    "\n🛑 Session stopped by operator.\n"
+                )
                 raise
             except Exception as e:
                 logger.error(f"Autonomous controller failed: {e}", exc_info=True)
@@ -8889,12 +10574,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 # Model; halt before driving the next super-step so the session can't run away.
                 if self._stop_requested:
                     logger.info("🛑 Stop requested — terminating graph execution (main loop)")
-                    try:
-                        await self._stream_message_to_mythic("\n🛑 Session stopped by operator.\n")
-                    except Exception:
-                        pass
-                    # Any sub-agent card still open would otherwise stay stuck on "running".
-                    await self._close_all_delegations(status="stopped")
+                    await self._run_operator_stop_shielded(
+                        "\n🛑 Session stopped by operator.\n"
+                    )
                     break
 
                 # HITL: in supervised mode a guarded tool call interrupts here. The outer graph
@@ -9058,11 +10740,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             else:
                 stop_message = "\n🛑 Session stopped by operator.\n"
                 logger.info("🛑 Operator stop honored inside agent loop — terminating session")
-            try:
-                await self._stream_message_to_mythic(stop_message)
-            except Exception:
-                pass
-            await self._close_all_delegations(status="stopped")
+            await self._run_operator_stop_shielded(stop_message)
             return ""
         except GraphRecursionError as e:
             # Catch recursion limit error and return progress made so far
@@ -9587,7 +11265,10 @@ Continue now.""")
         elif intent == "STOP":
             # User wants to stop (or inhibit further tasking — e.g. "don't run anything, just summarize")
             logger.info("User requested to stop the task")
-            self._install_turn_authority(self._compile_turn_authority(response))
+            contract = getattr(self, "_request_contract", None)
+            if contract is None:
+                contract = self._build_typed_session_request_contract()
+            self.install_request_contract(contract.stop())
             self._supervised_objective_active = False
             stop_message = AIMessage(content="✅ Task stopped as requested. The session remains active for new tasks.")
             self.state["messages"].append(stop_message)
@@ -9750,7 +11431,8 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
     def handback_to_supervisor(
         runtime: ToolRuntime,
         reason: Annotated[str, "Why you are handing back now. This explanation never selects the next agent."],
-        summary: Annotated[str, "Structured DONE / FAILED / BLOCKER / REMAINING summary with concrete values (hashes, SIDs, file UUIDs, exact errors)."],
+        summary: Annotated[str, "Human-readable summary with concrete values (hashes, SIDs, file UUIDs, exact errors). Summary wording never controls routing or completion."],
+        outcome: Annotated[Literal["progress", "handoff", "blocked", "complete"], "Typed worker outcome that controls the state transition independently of summary prose."],
         next_owner: Annotated[str, "Exact next agent name when another specialist must act; otherwise leave empty."] = "",
     ) -> Command:
         """Yield control to the Supervisor WITHOUT ending the run so it can route to another agent
@@ -9765,35 +11447,11 @@ def _create_handback_to_supervisor_tool(mythic_client=None, *, autonomous: bool 
                 "_handback_input": {
                     "reason": reason,
                     "summary": summary,
+                    "outcome": outcome,
                     "next_owner": next_owner,
                 }
             },
         )
-        post_ingest_route = (
-            _deterministic_post_ingest_owner(mythic_client)
-            if autonomous else None
-        )
-        if post_ingest_route is not None:
-            owner, instruction = post_ingest_route
-            delegated = HumanMessage(
-                content=instruction,
-                additional_kwargs={
-                    "_delegated_to": owner,
-                    "_handoff_title": post_ingest_route.title,
-                },
-            )
-            return Command(
-                goto=owner,
-                update={
-                    "messages": [msg, delegated],
-                    "supervisor_messages": [msg],
-                    "bloodhound_messages": [msg, delegated],
-                    "next_owner": owner,
-                    "_last_calling_agent": "Mythic_Operator",
-                    "_last_target_agent": owner,
-                },
-                graph=Command.PARENT,
-            )
         updated_state = {**runtime.state}
         updated_state["supervisor_messages"] = [msg]
         updated_state["messages"] = [msg]
@@ -9894,8 +11552,8 @@ def _create_handoff_tool(
     agent_name: str,
     description: str | None = None,
     autonomous_redirect: Callable[[str, str, dict], _HandoffDirective | tuple[str, str] | dict[str, str] | None] | None = None,
-    autonomous_redirect_enabled: Callable[[], bool] | None = None,
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
+    subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
 ):
     """
     Create a handoff tool to transfer control to another agent.
@@ -9934,46 +11592,36 @@ def _create_handoff_tool(
     ) -> Command:
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
+        raw_subgoal = runtime.state.get("_subgoal_state")
         admitted = worker_outcome_lookup(runtime.state) if worker_outcome_lookup is not None else None
+        subgoal_caller = ""
+        outcome = ""
+        next_owner = ""
+        outcome_summary = ""
         if admitted is not None:
-            metadata, summary = admitted
+            metadata, outcome_summary = admitted
             source_worker = str(metadata.get("source_worker") or "")
-            outcome = metadata.get("outcome")
+            subgoal_caller = source_worker
+            outcome = str(metadata.get("outcome") or "")
             next_owner = str(metadata.get("next_owner") or "")
-            same_worker = source_worker == agent_name
-            if same_worker and outcome == "handoff" and next_owner and next_owner != agent_name:
-                redirect = _handoff_directive(next_owner, summary, handoff_title)
-            elif not next_owner and (outcome == "complete" or (same_worker and outcome == "blocked")):
-                max_seq = max((_get_seq(msg) for key in channel_map.values() for msg in runtime.state.get(key, [])), default=0)
-                tool_text = (
-                    f"Worker outcome prevented repeated delegation: {source_worker} reported BLOCKED with no next owner."
-                    if outcome == "blocked"
-                    else f"Worker outcome prevented repeated delegation: {source_worker} reported COMPLETE."
-                )
-                final_text = f"**{'Blocked' if outcome == 'blocked' else 'Objective complete'}**\n\n{summary}"
-                tool_message = ToolMessage(content=tool_text, name=name, tool_call_id=runtime.tool_call_id)
-                final_message = AIMessage(content=final_text, name="Supervisor", additional_kwargs={"_is_final_report": True})
-                _tag_msg(tool_message, max_seq + 1)
-                _tag_msg(final_message, max_seq + 2)
-                return Command(goto="__end__", update={
-                    "messages": [tool_message, final_message],
-                    "supervisor_messages": [tool_message, final_message],
-                    "_message_seq": max_seq + 3,
-                    "recursion_handback": True,
-                }, graph=Command.PARENT)
-        if redirect is None and autonomous_redirect is not None:
+        if admitted is None and autonomous_redirect is not None:
             try:
                 redirect = autonomous_redirect(agent_name, handoff_instruction, runtime.state)
             except Exception:
                 redirect = None
-        allow_static_redirect = True
-        if autonomous_redirect_enabled is not None:
-            try:
-                allow_static_redirect = bool(autonomous_redirect_enabled())
-            except Exception:
-                allow_static_redirect = False
-        if redirect is None and allow_static_redirect:
-            redirect = _autonomous_handoff_redirect(agent_name, handoff_instruction, runtime.state)
+        if admitted is not None:
+            if outcome == "handoff":
+                redirect = _handoff_directive(
+                    next_owner,
+                    outcome_summary or handoff_instruction,
+                    handoff_title,
+                )
+            elif outcome == "progress":
+                redirect = _handoff_directive(
+                    subgoal_caller,
+                    outcome_summary or handoff_instruction,
+                    handoff_title,
+                )
         directive = _coerce_handoff_directive(
             redirect,
             fallback_agent_name=requested.agent_name,
@@ -9984,6 +11632,106 @@ def _create_handoff_tool(
         actual_agent_name = "Supervisor" if terminal_redirect else directive.agent_name
         actual_instruction = directive.instruction
         actual_title = directive.title
+        subgoal_state = None
+        if isinstance(raw_subgoal, dict) and raw_subgoal and not terminal_redirect:
+            if subgoal_scheduler is None:
+                raise RuntimeError(
+                    "typed subgoal projection requires the canonical Model scheduler"
+                )
+            decision = subgoal_scheduler(
+                raw_subgoal=raw_subgoal,
+                runtime_state=runtime.state,
+                requested_owner=actual_agent_name,
+                admitted=admitted,
+            )
+            disposition = str(decision.get("disposition") or "invalid")
+            subgoal_state = decision.get("state")
+            if disposition == "route":
+                actual_agent_name = str(decision.get("owner") or "")
+                if admitted is not None:
+                    actual_instruction = str(
+                        decision.get("summary") or actual_instruction
+                    )
+            else:
+                max_seq = max(
+                    (
+                        _get_seq(message)
+                        for channel_key in channel_map.values()
+                        for message in runtime.state.get(channel_key, [])
+                    ),
+                    default=0,
+                )
+                completed = disposition == "complete"
+                blocked = disposition in {"blocked", "duplicate"}
+                if completed or blocked:
+                    label = "Objective complete" if completed else "Blocked"
+                    detail = str(decision.get("summary") or outcome_summary or "").strip()
+                    tool_text = (
+                        f"Typed worker outcome terminalized the subgoal as {disposition}."
+                        if disposition in {"blocked", "complete"}
+                        else "Typed subgoal state denied duplicate execution at the same semantic revision."
+                    )
+                else:
+                    label = "Blocked"
+                    detail = str(decision.get("reason") or "Canonical subgoal authority rejected the transition.")
+                    tool_text = detail
+                tool_message = ToolMessage(
+                    content=tool_text,
+                    name=name,
+                    tool_call_id=runtime.tool_call_id,
+                )
+                final_message = AIMessage(
+                    content=f"**{label}**\n\n{detail}".rstrip(),
+                    name="Supervisor",
+                    additional_kwargs={"_is_final_report": True},
+                )
+                _tag_msg(tool_message, max_seq + 1)
+                _tag_msg(final_message, max_seq + 2)
+                update = {
+                    "messages": [tool_message, final_message],
+                    "supervisor_messages": [tool_message, final_message],
+                    "_message_seq": max_seq + 3,
+                    "recursion_handback": True,
+                }
+                if isinstance(subgoal_state, dict):
+                    update["_subgoal_state"] = subgoal_state
+                return Command(
+                    goto="__end__",
+                    update=update,
+                    graph=Command.PARENT,
+                )
+        elif admitted is not None and outcome in {"blocked", "complete"}:
+            max_seq = max(
+                (
+                    _get_seq(message)
+                    for channel_key in channel_map.values()
+                    for message in runtime.state.get(channel_key, [])
+                ),
+                default=0,
+            )
+            label = "Blocked" if outcome == "blocked" else "Objective complete"
+            tool_message = ToolMessage(
+                content=f"Worker reported typed {outcome}.",
+                name=name,
+                tool_call_id=runtime.tool_call_id,
+            )
+            final_message = AIMessage(
+                content=f"**{label}**\n\n{outcome_summary}".rstrip(),
+                name="Supervisor",
+                additional_kwargs={"_is_final_report": True},
+            )
+            _tag_msg(tool_message, max_seq + 1)
+            _tag_msg(final_message, max_seq + 2)
+            return Command(
+                goto="__end__",
+                update={
+                    "messages": [tool_message, final_message],
+                    "supervisor_messages": [tool_message, final_message],
+                    "_message_seq": max_seq + 3,
+                    "recursion_handback": True,
+                },
+                graph=Command.PARENT,
+            )
         delegated_instruction = (
             _render_sandbox_handoff_instruction(actual_instruction, input_payload, input_type)
             if actual_agent_name == "Sandbox"
@@ -10029,6 +11777,8 @@ def _create_handoff_tool(
             "messages": [acknowledgment, injected_human],
             "_message_seq": current_seq,
         }
+        if isinstance(subgoal_state, dict):
+            update_state["_subgoal_state"] = subgoal_state
         if terminal_redirect:
             update_state["recursion_handback"] = True
 
@@ -10039,13 +11789,14 @@ def _create_handoff_tool(
         # CRITICAL: Track who is calling this agent so responses can be copied back
         # Store the calling agent's name in state for response routing
         # We need to detect the current agent from the message history
-        current_agent = None
-        for channel_name, channel_key in channel_map.items():
-            if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
-                # Check if this channel has recent activity (last message is not too old)
-                # This is a heuristic - the agent that just called a tool is the calling agent
-                if channel_key in ["supervisor_messages", "mythic_operator_messages", "mythic_payload_messages", "generalist_messages", "mcp_manager_messages", "bloodhound_messages", "sandbox_messages", "autonomous_executor_messages"]:
-                    # Simple approach: assume the tool was called from whichever non-target channel exists
+        current_agent = (
+            subgoal_caller
+            if isinstance(raw_subgoal, dict) and raw_subgoal and subgoal_caller
+            else None
+        )
+        if current_agent is None:
+            for channel_name, channel_key in channel_map.items():
+                if runtime.state.get(channel_key) and len(runtime.state.get(channel_key, [])) > 0:
                     if channel_name != actual_agent_name:
                         current_agent = channel_name
                         break
@@ -11343,6 +13094,13 @@ async def request_stop_for_sessions(session_id: str | None = None) -> dict[str, 
             continue
         try:
             model.request_stop()
+            emit_stop = getattr(model, "_emit_operator_stop", None)
+            if callable(emit_stop):
+                await emit_stop("\n🛑 Session stopped by operator.\n")
+            else:
+                close_all = getattr(model, "_close_all_request_lifecycles", None)
+                if callable(close_all):
+                    await close_all(status="stopped")
             stopped[str(key)] = model
         except Exception as exc:
             logger.warning(f"Failed to request stop for session {key}: {exc}")

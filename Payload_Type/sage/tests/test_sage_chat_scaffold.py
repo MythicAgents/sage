@@ -6,6 +6,8 @@ with a stubbed Model (no live LLM), per PRD Section 13.
 """
 
 import asyncio
+import copy
+import json
 
 import pytest
 
@@ -41,6 +43,7 @@ class _FakeModel:
         self.stop_called = False
         self.closed_delegation_statuses = []
         self.invoked_with = None
+        self.installed_request_contracts = []
 
     def request_stop(self):
         self.stop_called = True
@@ -50,6 +53,10 @@ class _FakeModel:
 
     async def _hitl_interrupt_pending(self, thread_id):
         return False
+
+    def install_request_contract(self, contract):
+        self._request_contract = contract
+        self.installed_request_contracts.append(contract)
 
     async def invoke(self, prompt, is_interactive=False):
         self.invoked_with = (prompt, is_interactive)
@@ -89,6 +96,130 @@ def test_happy_path_emits_exactly_one_terminal():
     assert terminals[0]["kind"] == "complete"
     # prompt threaded through, first turn → is_interactive False
     assert model.invoked_with == ("do the thing", False)
+
+
+def test_native_service_reconciles_one_typed_terminal_after_request_terminal():
+    from ai.langgraph.request_events import RequestEventLedger, stable_event_id
+
+    class _LifecycleModel(_FakeModel):
+        def request_event_transcript(self):
+            return self.ledger.reconstruct_transcript()
+
+        def request_control_transitions(self):
+            return [
+                row
+                for row in self.request_event_transcript()
+                if row["kind"] == "control_transition"
+            ]
+
+        def begin_visibility_turn(
+            self,
+            _scope,
+            *,
+            operator_prompt,
+            native_request_id,
+            logical_request_id,
+        ):
+            self.ledger = RequestEventLedger(logical_request_id)
+            self.ledger.record(
+                event_id=stable_event_id(
+                    logical_request_id,
+                    "operator_input",
+                    native_request_id,
+                ),
+                kind="operator_input",
+                phase="received",
+                content=operator_prompt,
+            )
+
+        def install_request_contract(self, contract):
+            super().install_request_contract(contract)
+            self.ledger.record(
+                event_id=stable_event_id(
+                    contract.request_id,
+                    "control_transition",
+                    "contract",
+                ),
+                kind="control_transition",
+                phase="request_installed",
+                content="request contract installed",
+            )
+
+        async def finalize_visibility_turn(self, *, require_final):
+            return self.ledger.reconcile(require_final=require_final)
+
+        def record_request_terminal(self, status):
+            self.ledger.record(
+                event_id=stable_event_id(
+                    self.ledger.request_id,
+                    "control_transition",
+                    "terminal",
+                ),
+                kind="control_transition",
+                phase="request_terminal",
+                content=status,
+            )
+
+        def record_final_response(self, content, *, response_key):
+            event_id = stable_event_id(
+                self.ledger.request_id,
+                "final_response",
+                "terminal",
+            )
+            self.ledger.record(
+                event_id=event_id,
+                kind="final_response",
+                phase="emitted",
+                content=content,
+            )
+            return event_id
+
+        def record_final_response_projection(self, event_id, *, response_key):
+            self.ledger.record_projection(
+                event_id=event_id,
+                kind="final_response",
+                phase="emitted",
+                projection_key=response_key,
+            )
+
+    model = _LifecycleModel(stream=(), return_value="done")
+    chat = _DriverChat(model)
+    request = build_chat_request(
+        "exact operator prompt",
+        channel_id=5,
+        request_id=91,
+    )
+
+    _run(chat.chat(request))
+
+    assert len(chat.terminal_emissions) == 1
+    report = model.ledger.reconcile()
+    assert report["ok"] is True
+    transcript = model.ledger.reconstruct_transcript()
+    assert transcript[0]["kind"] == "operator_input"
+    assert transcript[0]["content"] == "exact operator prompt"
+    assert transcript[-2]["phase"] == "request_terminal"
+    assert transcript[-1]["kind"] == "final_response"
+    assert chat.terminal_emissions[0]["metadata"]["event_id"] == transcript[-1]["event_id"]
+    assert [
+        row["phase"]
+        for row in chat.terminal_emissions[0]["metadata"]["control_transitions"]
+    ] == ["request_installed", "request_terminal"]
+
+    error_model = _LifecycleModel(behavior="error", stream=())
+    error_chat = _DriverChat(error_model)
+    _run(error_chat.chat(build_chat_request(
+        "failing operator prompt",
+        channel_id=5,
+        request_id=92,
+    )))
+    assert len(error_chat.terminal_emissions) == 1
+    assert error_chat.terminal_emissions[0]["kind"] == "error"
+    error_report = error_model.ledger.reconcile()
+    assert error_report["ok"] is True, error_report
+    error_transcript = error_model.ledger.reconstruct_transcript()
+    assert error_transcript[-2]["content"] == "error"
+    assert error_transcript[-1]["content"] == "boom"
 
 
 def test_same_channel_turns_are_serialized():
@@ -149,6 +280,55 @@ def test_native_chat_marks_model_command_name_chat():
     chat = _DriverChat(model)
     _run(chat.chat(build_chat_request("first turn", channel_id=5, request_id=10)))
     assert model.command_name == "chat"
+
+
+def test_native_chat_installs_one_typed_contract_before_invoke():
+    model = _FakeModel()
+    model.mode = "supervised"
+    chat = _DriverChat(model)
+    request = build_chat_request(
+        "same prose",
+        channel_id=5,
+        operation_id=8,
+        request_id=10,
+        config={"mode": "supervised"},
+    )
+    _run(chat.chat(request))
+
+    assert len(model.installed_request_contracts) == 1
+    contract = model.installed_request_contracts[0]
+    assert contract.request_id == "chat:5:request:10"
+    assert contract.scope.operation_id == "8"
+    assert contract.scope.channel_id == "5"
+    assert contract.lane.value == "supervised_workflow"
+    assert model.invoked_with == ("same prose", False)
+
+
+def test_identical_prompt_uses_typed_mode_not_prose_for_lane():
+    supervised_model = _FakeModel()
+    supervised_model.mode = "supervised"
+    auto_model = _FakeModel()
+    auto_model.mode = "auto"
+    auto_model._autonomous_solve = True
+    prompt = "Explain the current objective."
+
+    _run(_DriverChat(supervised_model).chat(build_chat_request(
+        prompt,
+        channel_id=51,
+        operation_id=8,
+        request_id=1,
+        config={"mode": "supervised"},
+    )))
+    _run(_DriverChat(auto_model).chat(build_chat_request(
+        prompt,
+        channel_id=52,
+        operation_id=8,
+        request_id=1,
+        config={"mode": "auto"},
+    )))
+
+    assert supervised_model.installed_request_contracts[0].lane.value == "supervised_workflow"
+    assert auto_model.installed_request_contracts[0].lane.value == "autonomous_objective"
 
 
 def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monkeypatch):
@@ -563,7 +743,7 @@ def test_reused_auto_session_is_recreated_for_current_supervised_request(monkeyp
     assert preexisted is False
     assert stopped == [True]
     assert dropped == [existing]
-    assert replacement.mode == "supervised"
+    assert replacement.mode == "conversation"
     assert replacement._autonomous_solve is False
 
 
@@ -681,6 +861,26 @@ def test_slash_supervised_restores_bound_base_autonomy_after_auto_override():
     assert existing._chat_mode_override_base_autonomous_solve is False
 
 
+def test_slash_conversation_is_exact_and_disables_bound_autonomy():
+    from sage_chat.slash import _handle_mode
+
+    class _Existing:
+        mode = "auto"
+        _autonomous_solve = True
+        _chat_request_config_signature = "base-signature"
+        _chat_request_base_autonomous_solve = True
+
+    existing = _Existing()
+    assert "Mode set" in _handle_mode(existing, "conversation")
+    assert existing.mode == "conversation"
+    assert existing._autonomous_solve is False
+    assert "conversation" in _handle_mode(existing, "")
+    assert "Valid: `conversation`, `supervised`, `auto`" in _handle_mode(
+        existing,
+        "execute",
+    )
+
+
 def test_base_request_config_change_rotates_session_and_clears_slash_mode_override(monkeypatch):
     import sage_chat.service as service
     from sage_chat.slash import _handle_mode
@@ -753,7 +953,7 @@ def test_base_request_config_change_rotates_session_and_clears_slash_mode_overri
     assert preexisted is False
     assert stopped == [True]
     assert dropped == [existing]
-    assert replacement.mode == "supervised"
+    assert replacement.mode == "conversation"
     assert replacement._chat_mode_override == ""
     assert replacement._chat_mode_override_base_signature == ""
     assert replacement._chat_mode_override_base_autonomous_solve is None
@@ -1071,12 +1271,18 @@ def test_emit_subagent_status_forwards_icon_color():
 
 
 def test_delegation_color_is_deterministic_and_frontmatter_driven():
-    """Model._delegation_color pins one stable color per agent; BloodHound resolves to red
-    from its prompt frontmatter, and an unknown agent yields '' (Mythic auto-derives)."""
+    """Model._delegation_color pins one stable color per agent, resolved in the documented order:
+    the agent's prompt frontmatter ``color:`` (operator-editable), then the built-in fallback
+    palette, then '' (Mythic auto-derives)."""
     from ai.langgraph.model import Model
+    from ai.langgraph.prompt_loader import load_prompt_meta
 
-    assert Model._delegation_color("BloodHound") == "#E5484D"   # from prompts/bloodhound.md
-    assert Model._delegation_color("Mythic_Operator") == "#3B82F6"
+    # Frontmatter is authoritative for any agent that ships a prompt file. Assert the resolution
+    # contract, not a literal: an operator recoloring a card is a supported edit, not a failure.
+    for agent, prompt in (("BloodHound", "bloodhound"), ("Mythic_Operator", "mythic_operator")):
+        assert Model._delegation_color(agent) == load_prompt_meta(prompt)["color"].strip()
+    # No prompt file at all → the built-in fallback palette supplies the color.
+    assert Model._delegation_color("Execution") == "#3B82F6"
     # Same agent → same color every call (the whole point — no per-card drift).
     assert Model._delegation_color("BloodHound") == Model._delegation_color("BloodHound")
     # Unknown agent with no prompt file / no frontmatter color → empty (UI derives).
@@ -1158,6 +1364,53 @@ def test_emit_tool_use_started_then_finished_reuse_key():
     assert finished["status"] == "complete"
     assert finished["metadata"]["tool_use"]["result_preview"] == "ok done"
     assert finished["metadata"]["tool_use"]["status"] == "completed"
+
+
+def test_lifecycle_event_id_is_shared_by_tool_evidence_and_projection():
+    chat = HeadlessSageChat()
+    request = build_chat_request("x", request_id=34)
+    emitter = ChatStreamEmitter(chat, request)
+    event_id = "tool:stable-lifecycle-id"
+
+    for status, complete in (("started", False), ("completed", True)):
+        assert _run(emitter.emit_tool_use(
+            event_id=event_id,
+            tool_call_id="provider-reused-id",
+            tool_name="list_callbacks",
+            tool_source="mythic",
+            status=status,
+            content=status,
+            complete=complete,
+        ))
+
+    assert [row["response_key"] for row in chat.emissions] == [
+        f"event:{event_id}",
+        f"event:{event_id}",
+    ]
+    assert all(
+        row["metadata"]["event_id"] == event_id
+        for row in chat.emissions
+    )
+
+
+def test_stop_final_text_projection_carries_the_lifecycle_event_id():
+    chat = HeadlessSageChat()
+    emitter = ChatStreamEmitter(
+        chat,
+        build_chat_request("stop", request_id=35),
+    )
+
+    assert _run(emitter.emit_final_response(
+        event_id="final_response:stable-id",
+        content="Session stopped.",
+    ))
+
+    assert chat.emissions == [{
+        "kind": "text",
+        "response_key": "event:final_response:stable-id",
+        "content": "Session stopped.",
+        "metadata": {"event_id": "final_response:stable-id"},
+    }]
 
 
 def test_subagent_lifecycle_reuses_key_and_tags_tool_card():
@@ -2167,7 +2420,12 @@ def test_login_task_branch_unchanged(monkeypatch):
 # --------------------------------------------------------------------------------------
 
 from sage_chat.hitl import (
+    approved_action_ids_for_request,
     approval_action_digest,
+    approval_action_fingerprint,
+    approval_claim_actions,
+    approval_proposal_digest,
+    approval_selection_digest,
     approval_response_matches,
     build_approval_request,
     make_card_emitter,
@@ -2187,9 +2445,49 @@ class _HitlModel:
         self._thread_id_override = None
         self._pending = False
         self.resumed_with = None
+        self.approval_claims = []
+        self.approval_claim_clears = 0
+        self.open_tool_close_statuses = []
+        self.open_tool_ids = ("claimed-tool",)
 
     async def _hitl_interrupt_pending(self, thread_id):
         return self._pending
+
+    def install_approval_claim(self, context):
+        self.approval_claims.append(dict(context))
+
+    def apply_request_action_selection(self, context, approved_action_ids):
+        rebound = dict(context)
+        rebound["approved_action_ids"] = list(approved_action_ids)
+        rebound["approved_actions"] = [
+            action
+            for action in context["actions"]
+            if approval_action_fingerprint(action) in approved_action_ids
+        ]
+        rebound["selection_digest"] = (
+            approval_selection_digest(
+                rebound["request_contract_digest"],
+                rebound["action_digest"],
+                approved_action_ids,
+            )
+            if approved_action_ids
+            else ""
+        )
+        return rebound
+
+    def clear_approval_claim(self):
+        self.approval_claim_clears += 1
+
+    def _open_tool_lifecycle_ids(self):
+        return self.open_tool_ids
+
+    async def _close_open_tool_lifecycles(
+        self,
+        status="cancelled",
+        *,
+        event_ids=None,
+    ):
+        self.open_tool_close_statuses.append((status, tuple(event_ids or ())))
 
     async def invoke(self, prompt, is_interactive=False):
         # Simulate hitting a guarded tool: emit the card (which finishes request N) and pause.
@@ -2203,8 +2501,9 @@ class _HitlModel:
         thread_id,
         operator_message="",
         expected_action_digest="",
+        approved_action_ids=None,
     ):
-        del expected_action_digest
+        del expected_action_digest, approved_action_ids
         self.resumed_with = decision
         self.steered_with = operator_message
         self._pending = False
@@ -2239,15 +2538,77 @@ class _ControllerHitlModel(_HitlModel):
         return ""
 
 
-def _install_pending_approval_context(model, request, approval_id="approval-1"):
+class _MultiHitlModel(_HitlModel):
+    def __init__(self):
+        super().__init__()
+        self.selected_action_ids = None
+
+    async def invoke(self, prompt, is_interactive=False):
+        del prompt, is_interactive
+        await self._hitl_card_emitter([
+            {
+                "name": "issue_task_and_waitfor_task_output",
+                "args": {
+                    "command": "whoami",
+                    "parameters": "",
+                    "callback_display_id": 7,
+                },
+            },
+            {
+                "name": "add_credential",
+                "args": {"credential": "example", "account": "sam"},
+            },
+        ])
+        self._hitl_card_pending = True
+        self._pending = True
+
+    async def handle_hitl_resume(
+        self,
+        decision,
+        thread_id,
+        operator_message="",
+        expected_action_digest="",
+        approved_action_ids=None,
+    ):
+        del thread_id, operator_message, expected_action_digest
+        self.resumed_with = decision
+        self.selected_action_ids = tuple(approved_action_ids or ())
+        self._pending = False
+        return ""
+
+
+def _install_pending_approval_context(
+    model,
+    request,
+    approval_id="approval-1",
+    action_requests=None,
+):
+    from ai.langgraph.request_contract import build_request_contract
+
     thread_id = bind_channel_thread_id(request, model)
-    action_requests = [{"name": "execute_capability", "args": {"target": "DC01"}}]
+    action_requests = action_requests or [
+        {"name": "execute_capability", "args": {"target": "DC01"}}
+    ]
+    contract = build_request_contract(
+        request_id=f"chat:{request.ChannelID}:request:{request.RequestID}",
+        channel_id=str(request.ChannelID),
+        operation_id=str(request.OperationID),
+        mode="supervised",
+        autonomous_solve=False,
+    )
+    model._request_contract = contract
+    action_digest = approval_action_digest(action_requests)
     context = {
         "approval_id": approval_id,
         "thread_id": thread_id,
-        "turn_id": thread_id,
+        "turn_id": contract.request_id,
+        "request_id": contract.request_id,
+        "request_contract_digest": contract.digest,
         "tool_name": "execute_capability",
-        "action_digest": approval_action_digest(action_requests),
+        "actions": approval_claim_actions(action_requests),
+        "selection_mode": "single",
+        "action_digest": action_digest,
+        "proposal_digest": approval_proposal_digest(contract.digest, action_digest),
         "operation_id": str(request.OperationID),
         "apitoken_id": str(request.APITokenID),
     }
@@ -2255,10 +2616,72 @@ def _install_pending_approval_context(model, request, approval_id="approval-1"):
     return context
 
 
-def _input_response_for_context(action, context):
+def _input_response_for_context(action, context, choice=None):
+    card = build_approval_request(context["actions"])
+    input_type = (
+        "single_choice"
+        if context.get("selection_mode") == "exact_one"
+        else "approval"
+    )
+    canonical_choices = card.get("choices", [])
+    selected_choice = choice or {}
+    if (
+        action == "select"
+        and isinstance(choice, dict)
+        and set(choice) == {"id"}
+    ):
+        selected_choice = next(
+            (
+                dict(candidate)
+                for candidate in canonical_choices
+                if candidate["id"] == choice["id"]
+            ),
+            dict(choice),
+        )
+    input_request_message_id = 71
+    resolved_by_operator_id = 19
+    resolved_by = "operator"
+    resolved_at = "2026-07-24T00:00:00Z"
+    response_payload = {
+        "action": action,
+        "input_request_message_id": input_request_message_id,
+        "resolved_by_operator_id": resolved_by_operator_id,
+        "resolved_by": resolved_by,
+        "resolved_at": resolved_at,
+    }
+    if action == "select":
+        response_payload["choice"] = selected_choice
+    input_request = {
+        "status": {
+            "accept": "accepted",
+            "reject": "rejected",
+            "respond": "responded",
+            "select": "selected",
+        }[action],
+        "input_type": input_type,
+        "title": card["title"],
+        "prompt": card["prompt"],
+        "description": card["description"],
+        # Mythic persists this field for all input-request types, including
+        # an empty catalog for a one-action approval card.
+        "choices": canonical_choices,
+        "data": {
+            **card["data"],
+            "sage_approval_context": dict(context),
+        },
+        "response": response_payload,
+        "resolved_by_operator_id": resolved_by_operator_id,
+        "resolved_by": resolved_by,
+        "resolved_at": resolved_at,
+    }
     return ChatInputResponse(
         action=action,
-        input_request={"data": {"sage_approval_context": dict(context)}},
+        choice=selected_choice,
+        input_request_message_id=input_request_message_id,
+        input_request=input_request,
+        resolved_by_operator_id=resolved_by_operator_id,
+        resolved_by=resolved_by,
+        resolved_at=resolved_at,
     )
 
 
@@ -2295,8 +2718,8 @@ def test_approval_request_discloses_every_guarded_action_and_exact_arguments():
         {"name": "execute_capability", "args": {"action": {"name": "dcsync-krbtgt"}}},
     ])
 
-    assert req["title"] == "Approve 2 guarded actions"
-    assert "Accept approves all 2" in req["prompt"]
+    assert req["title"] == "Select 1 of 2 guarded actions"
+    assert "Select exactly one" in req["prompt"]
     assert "Action 1: create_payload" in req["description"]
     assert "os: windows" in req["description"]
     assert "Action 2: dcsync-krbtgt" in req["description"]
@@ -2305,6 +2728,17 @@ def test_approval_request_discloses_every_guarded_action_and_exact_arguments():
         "create_payload",
         "execute_capability",
     ]
+    assert len(req["choices"]) == 2
+    assert len({choice["id"] for choice in req["choices"]}) == 2
+
+
+def test_approval_request_rejects_duplicate_action_identities():
+    action = {
+        "name": "execute_capability",
+        "args": {"action": {"name": "example"}, "inputs": {"callback_id": "7"}},
+    }
+    with pytest.raises(ValueError, match="duplicate guarded action identities"):
+        build_approval_request([action, dict(action)])
 
 
 def test_failed_approval_card_send_never_installs_resumable_context():
@@ -2370,14 +2804,22 @@ def test_hitl_confirm_flow_input_request_then_resume():
     input_reqs = [e for e in chat.emissions if e.get("metadata", {}).get("special_type") == "input_requested"]
     assert len(input_reqs) == 1
     assert model._pending is True
+    paused_contract = model._request_contract
 
     # Request N+1: operator ACCEPTS → InputResponse(action="accept") → resume APPROVE, one terminal.
     chat.emissions.clear()
     reqN1 = build_chat_request("", channel_id=5, request_id=2)
     reqN1.InputResponse = _input_response_for_context("accept", model._pending_approval_context)
     _run(chat.chat(reqN1))
+    assert model._request_contract is paused_contract
     assert model.resumed_with == "approve"
     assert model._pending is False
+    assert len(model.approval_claims) == 1
+    assert model.approval_claims[0]["request_contract_digest"] == paused_contract.digest
+    assert model.approval_claim_clears == 1
+    assert model.open_tool_close_statuses == [
+        ("cancelled", ("claimed-tool",)),
+    ]
     assert len(chat.terminal_emissions) == 1
 
 
@@ -2391,7 +2833,56 @@ def test_hitl_reject_resumes_deny():
     reqR.InputResponse = _input_response_for_context("reject", context)
     _run(chat.chat(reqR))
     assert model.resumed_with == "deny"
+    assert model.approval_claims == []
+    assert model.open_tool_close_statuses == [
+        ("cancelled", ("claimed-tool",)),
+    ]
     assert len(chat.terminal_emissions) == 1
+
+
+def test_multi_action_native_card_selects_one_and_denies_batch_accept():
+    model = _MultiHitlModel()
+    chat = _HitlDriverChat(model)
+    _run(chat.chat(build_chat_request(
+        "Run one approved action.",
+        channel_id=105,
+        request_id=1,
+    )))
+    card = next(
+        item for item in chat.emissions
+        if item.get("metadata", {}).get("special_type") == "input_requested"
+    )
+    input_request = card["metadata"]["input_requested"]
+    assert input_request["input_type"] == "single_choice"
+    assert len(input_request["choices"]) == 2
+    context = dict(model._pending_approval_context)
+    selected_id = input_request["choices"][0]["id"]
+
+    response = build_chat_request("", channel_id=105, request_id=2)
+    response.InputResponse = _input_response_for_context(
+        "select",
+        context,
+        choice={"id": selected_id},
+    )
+    _run(chat.chat(response))
+    assert model.resumed_with == "approve"
+    assert model.selected_action_ids == (selected_id,)
+    assert model.approval_claims[0]["approved_action_ids"] == [selected_id]
+
+    model = _MultiHitlModel()
+    chat = _HitlDriverChat(model)
+    _run(chat.chat(build_chat_request(
+        "Run one approved action.",
+        channel_id=107,
+        request_id=1,
+    )))
+    context = dict(model._pending_approval_context)
+    response = build_chat_request("", channel_id=107, request_id=2)
+    response.InputResponse = _input_response_for_context("accept", context)
+    _run(chat.chat(response))
+    assert model.resumed_with == "deny"
+    assert model.selected_action_ids == ()
+    assert model.approval_claims == []
 
 
 def test_replayed_approval_response_resumes_checkpoint_only_once():
@@ -2406,8 +2897,9 @@ def test_replayed_approval_response_resumes_checkpoint_only_once():
             thread_id,
             operator_message="",
             expected_action_digest="",
+            approved_action_ids=None,
         ):
-            del expected_action_digest
+            del expected_action_digest, approved_action_ids
             self.resume_calls += 1
             await asyncio.sleep(0.02)
             self.resumed_with = decision
@@ -2463,6 +2955,7 @@ def test_delayed_approval_for_old_generation_cannot_approve_new_pending_action()
     assert new_model.resumed_with is None
     assert new_model._pending is True
     assert new_model._pending_approval_context != old_context
+    assert new_model.open_tool_close_statuses == []
     assert any("no longer active" in str(item.get("content", "")) for item in new_chat.emissions)
 
 
@@ -2519,6 +3012,319 @@ def test_approval_response_correlation_fails_closed_without_echoed_context():
     request.InputResponse = ChatInputResponse(action="accept")
 
     assert approval_response_matches(request, expected) is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "approval_id",
+        "thread_id",
+        "turn_id",
+        "request_id",
+        "request_contract_digest",
+        "tool_name",
+        "selection_mode",
+        "actions",
+        "action_digest",
+        "proposal_digest",
+        "operation_id",
+        "apitoken_id",
+    ),
+)
+def test_approval_response_rejects_every_mismatched_binding_field(field):
+    model = _HitlModel()
+    request = build_chat_request("", channel_id=153, request_id=8)
+    expected = _install_pending_approval_context(model, request)
+    actual = dict(expected)
+    actual[field] = f"{actual[field]}-stale"
+    if field == "actions":
+        request.InputResponse = _input_response_for_context("accept", expected)
+        request.InputResponse.InputRequest["data"]["sage_approval_context"] = actual
+    else:
+        request.InputResponse = _input_response_for_context("accept", actual)
+
+    assert approval_response_matches(request, expected) is False
+
+
+def test_approval_response_rejects_action_mutation_even_when_outer_ids_match():
+    model = _HitlModel()
+    request = build_chat_request("", channel_id=154, request_id=9)
+    expected = _install_pending_approval_context(model, request)
+    actual = {
+        **expected,
+        "actions": [
+            {
+                "name": "execute_capability",
+                "args": {"target": "DC02"},
+            }
+        ],
+    }
+    request.InputResponse = _input_response_for_context("accept", actual)
+
+    assert approval_response_matches(request, expected) is False
+
+
+def test_single_action_approval_requires_exact_mythic_empty_choice_catalog():
+    model = _HitlModel()
+    request = build_chat_request("", channel_id=154, request_id=10)
+    expected = _install_pending_approval_context(model, request)
+    valid = _input_response_for_context("accept", expected)
+
+    assert valid.InputRequest["choices"] == []
+    request.InputResponse = valid
+    assert approval_response_matches(request, expected) is True
+    assert approved_action_ids_for_request(request, expected)
+
+    malformed = []
+    missing = copy.deepcopy(valid)
+    del missing.InputRequest["choices"]
+    malformed.append(missing)
+    nonempty = copy.deepcopy(valid)
+    nonempty.InputRequest["choices"] = [{
+        "id": "f" * 64,
+        "label": "not canonical",
+        "description": "",
+        "data": {},
+    }]
+    malformed.append(nonempty)
+    unknown_key = copy.deepcopy(valid)
+    unknown_key.InputRequest["unexpected"] = True
+    malformed.append(unknown_key)
+
+    for response in malformed:
+        request.InputResponse = response
+        assert approval_response_matches(request, expected) is False
+        assert approved_action_ids_for_request(request, expected) == ()
+
+
+def test_json_number_normalized_echo_matches_and_installs_one_exact_claim():
+    model = _HitlModel()
+    model._pending = True
+    request = build_chat_request("", channel_id=157, request_id=11)
+    raw_actions = [{
+        "name": "execute_capability",
+        "args": {
+            "callback_id": "1",
+            "identity": "samwell.tarly",
+            "policy_decision": {
+                "model_branch_coverage": 1.0,
+                "nested": [{"count": 2.0}, -0.0],
+            },
+        },
+    }]
+    expected = _install_pending_approval_context(
+        model,
+        request,
+        action_requests=raw_actions,
+    )
+    response = _input_response_for_context("accept", expected)
+    encoded_card = json.dumps(
+        response.InputRequest,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    response.InputRequest = json.loads(encoded_card)
+    request.InputResponse = response
+
+    normalized_args = expected["actions"][0]["args"]
+    assert normalized_args["callback_id"] == "1"
+    assert normalized_args["identity"] == "samwell.tarly"
+    assert normalized_args["policy_decision"] == {
+        "model_branch_coverage": 1,
+        "nested": [{"count": 2}, 0],
+    }
+    assert '"model_branch_coverage":1' in encoded_card
+    assert approval_response_matches(request, expected) is True
+    approved_ids = approved_action_ids_for_request(request, expected)
+    assert approved_ids == (
+        approval_action_fingerprint(expected["actions"][0]),
+    )
+
+    chat = _HitlDriverChat(model)
+    _run(chat.chat(request))
+    assert model.resumed_with == "approve"
+    assert len(model.approval_claims) == 1
+    assert model.approval_claims[0]["approved_action_ids"] == list(approved_ids)
+    assert model.approval_claims[0]["approved_actions"] == expected["actions"]
+
+    replay = build_chat_request("", channel_id=157, request_id=12)
+    replay.InputResponse = _input_response_for_context("accept", expected)
+    _run(chat.chat(replay))
+    assert len(model.approval_claims) == 1
+
+
+def test_json_number_normalized_echo_still_denies_authority_mutations():
+    model = _HitlModel()
+    request = build_chat_request("", channel_id=158, request_id=13)
+    expected = _install_pending_approval_context(
+        model,
+        request,
+        action_requests=[{
+            "name": "execute_capability",
+            "args": {
+                "callback_id": "1",
+                "identity": "samwell.tarly",
+                "policy_decision": {"model_branch_coverage": 1.0},
+            },
+        }],
+    )
+    valid = _input_response_for_context("accept", expected)
+    mutations = []
+    for field, value in (
+        ("callback_id", "2"),
+        ("identity", "other.user"),
+    ):
+        mutated = copy.deepcopy(valid)
+        mutated.InputRequest["data"]["sage_approval_context"]["actions"][0][
+            "args"
+        ][field] = value
+        mutations.append(mutated)
+    for field, value in (
+        ("action_digest", "0" * 64),
+        ("request_id", f"{expected['request_id']}-stale"),
+    ):
+        mutated = copy.deepcopy(valid)
+        mutated.InputRequest["data"]["sage_approval_context"][field] = value
+        mutations.append(mutated)
+    changed_card = copy.deepcopy(valid)
+    changed_card.InputRequest["description"] += " changed"
+    mutations.append(changed_card)
+    changed_choice = copy.deepcopy(valid)
+    changed_choice.Choice = {"id": "f" * 64}
+    mutations.append(changed_choice)
+
+    for mutated in mutations:
+        request.InputResponse = mutated
+        assert approval_response_matches(request, expected) is False
+        assert approved_action_ids_for_request(request, expected) == ()
+
+
+def test_multi_action_approval_requires_one_exact_typed_choice():
+    request = build_chat_request("", channel_id=155, request_id=10)
+    model = _HitlModel()
+    single = _install_pending_approval_context(model, request)
+    actions = [
+        {"name": "execute_capability", "args": {"target": "DC01"}},
+        {"name": "add_credential", "args": {"credential": "example"}},
+    ]
+    action_digest = approval_action_digest(actions)
+    expected = {
+        **single,
+        "actions": actions,
+        "selection_mode": "exact_one",
+        "action_digest": action_digest,
+        "proposal_digest": approval_proposal_digest(
+            single["request_contract_digest"],
+            action_digest,
+        ),
+    }
+    selected_id = approval_action_fingerprint(actions[1])
+
+    request.InputResponse = _input_response_for_context(
+        "select",
+        expected,
+        choice={"id": selected_id},
+    )
+    assert approved_action_ids_for_request(request, expected) == (selected_id,)
+
+    for action, choice in (
+        ("accept", None),
+        ("reject", None),
+        ("select", {"id": "0" * 64}),
+        ("select", {"id": selected_id + "-stale"}),
+    ):
+        request.InputResponse = _input_response_for_context(
+            action,
+            expected,
+            choice=choice,
+        )
+        assert approved_action_ids_for_request(request, expected) == ()
+
+
+def test_multi_action_selection_rejects_every_malformed_typed_envelope():
+    request = build_chat_request("", channel_id=156, request_id=10)
+    model = _HitlModel()
+    single = _install_pending_approval_context(model, request)
+    actions = [
+        {"name": "execute_capability", "args": {"target": "DC01"}},
+        {"name": "add_credential", "args": {"credential": "example"}},
+    ]
+    action_digest = approval_action_digest(actions)
+    expected = {
+        **single,
+        "actions": actions,
+        "selection_mode": "exact_one",
+        "action_digest": action_digest,
+        "proposal_digest": approval_proposal_digest(
+            single["request_contract_digest"],
+            action_digest,
+        ),
+    }
+    selected_id = approval_action_fingerprint(actions[0])
+    valid = _input_response_for_context(
+        "select",
+        expected,
+        choice={"id": selected_id},
+    )
+    request.InputResponse = valid
+    assert approval_response_matches(request, expected) is True
+    assert approved_action_ids_for_request(request, expected) == (selected_id,)
+
+    malformed = []
+
+    whitespace_id = copy.deepcopy(valid)
+    whitespace_choice = dict(whitespace_id.Choice)
+    whitespace_choice["id"] = f" {selected_id} "
+    whitespace_id.Choice = whitespace_choice
+    whitespace_id.InputRequest["response"]["choice"] = whitespace_choice
+    malformed.append(whitespace_id)
+
+    wrong_type = copy.deepcopy(valid)
+    wrong_type.InputRequest["input_type"] = "approval"
+    malformed.append(wrong_type)
+
+    missing_catalog = copy.deepcopy(valid)
+    del missing_catalog.InputRequest["choices"]
+    malformed.append(missing_catalog)
+
+    duplicate_catalog = copy.deepcopy(valid)
+    duplicate_catalog.InputRequest["choices"] = [
+        valid.InputRequest["choices"][0],
+        valid.InputRequest["choices"][0],
+    ]
+    malformed.append(duplicate_catalog)
+
+    reversed_catalog = copy.deepcopy(valid)
+    reversed_catalog.InputRequest["choices"] = list(
+        reversed(reversed_catalog.InputRequest["choices"])
+    )
+    malformed.append(reversed_catalog)
+
+    conflicting_alias = copy.deepcopy(valid)
+    conflicting_alias.Choice["ID"] = "0" * 64
+    conflicting_alias.InputRequest["response"]["choice"] = conflicting_alias.Choice
+    malformed.append(conflicting_alias)
+
+    conflicting_data = copy.deepcopy(valid)
+    conflicting_data.Choice["data"] = {
+        "action_id": approval_action_fingerprint(actions[1]),
+    }
+    conflicting_data.InputRequest["response"]["choice"] = conflicting_data.Choice
+    malformed.append(conflicting_data)
+
+    extra_catalog_item = copy.deepcopy(valid)
+    extra_catalog_item.InputRequest["choices"].append({
+        "id": "f" * 64,
+        "label": "extra",
+        "description": "extra",
+        "data": {"action_id": "f" * 64},
+    })
+    malformed.append(extra_catalog_item)
+
+    for response in malformed:
+        request.InputResponse = response
+        assert approval_response_matches(request, expected) is False
+        assert approved_action_ids_for_request(request, expected) == ()
 
 
 # --------------------------------------------------------------------------------------
@@ -2627,9 +3433,13 @@ def test_token_change_rotates_the_entire_channel_session():
             self.apitoken_id = 1
             self.operation_id = 1
             self.stopped = False
+            self.closed = []
 
         def request_stop(self):
             self.stopped = True
+
+        async def _close_all_request_lifecycles(self, status):
+            self.closed.append(status)
 
     model = _Model()
     request = _slash_req("sandbox", "shell id", channel_id=177, request_id=1)
@@ -2643,6 +3453,7 @@ def test_token_change_rotates_the_entire_channel_session():
         _run(drop_channel_session(request, expected_model=model))
 
     assert model.stopped is True
+    assert model.closed == ["stopped"]
 
 
 def test_operation_change_cannot_reuse_old_model_state():
@@ -2710,6 +3521,17 @@ def test_autonomous_is_boolean_option_and_verbose_removed():
     assert "verbose" not in opts  # removed — chat container is always full-detail
 
 
+def test_mode_configuration_exposes_three_typed_lanes_with_safe_default():
+    opts = {o.Name: o for o in SAGE_MODELS[0].Metadata.ConfigurationOptions}
+    mode = opts["mode"]
+    assert mode.DefaultValue == "conversation"
+    assert {choice.Value for choice in mode.Choices} == {
+        "conversation",
+        "supervised",
+        "auto",
+    }
+
+
 def test_provider_is_choice_dropdown_not_freeform_string():
     """Restored the Mythic-v3 provider dropdown: `provider` is a Choice, not a freeform String. A freeform box
     lets a typo'd provider name through to init_chat_model, which then fails at model init. Values must be the
@@ -2741,7 +3563,10 @@ def test_provider_and_model_are_adjacent_static_header_chips():
 @pytest.mark.parametrize(
     ("config", "expected_mode", "expected_autonomy"),
     (
-        ({}, "supervised", False),
+        ({}, "conversation", False),
+        ({"mode": "conversation", "autonomous_solve": "false"}, "conversation", False),
+        ({"mode": "conversation", "autonomous_solve": "true"}, "auto", True),
+        ({"mode": "invalid", "autonomous_solve": "false"}, "conversation", False),
         ({"mode": "supervised", "autonomous_solve": "false"}, "supervised", False),
         ({"mode": "supervised", "autonomous_solve": "true"}, "supervised", True),
         ({"mode": "auto", "autonomous_solve": "false"}, "auto", True),
@@ -2844,6 +3669,8 @@ class _RecEmitter:
         self.agent_text_calls = []
         self.tool_use_calls = []
         self.text_sends = []
+        self.final_response_calls = []
+        self.last_response_key = ""
 
     async def __call__(self, formatted_message):
         self.text_sends.append(formatted_message)
@@ -2861,6 +3688,12 @@ class _RecEmitter:
         self.tool_use_calls.append(kw)
         return True
 
+    async def emit_final_response(self, **kw):
+        self.final_response_calls.append(kw)
+        self.last_response_key = f"event:{kw['event_id']}"
+        self.text_sends.append(kw["content"])
+        return True
+
 
 def _bare_model_with(emitter, delegations):
     """A Model with just the attributes the close-path touches (no heavy __init__)."""
@@ -2870,6 +3703,28 @@ def _bare_model_with(emitter, delegations):
     m._active_delegations = delegations
     m.verbose = False
     return m
+
+
+def _begin_request_lifecycle(model, request_id="request:test"):
+    from ai.langgraph.request_events import stable_event_id
+
+    model.begin_visibility_turn(
+        request_id,
+        operator_prompt="operator prompt",
+        native_request_id="1",
+        logical_request_id=request_id,
+    )
+    ledger = model._request_event_ledger
+    ledger.record_once(
+        event_id=stable_event_id(
+            request_id,
+            "control_transition",
+            "contract-installed",
+        ),
+        kind="control_transition",
+        phase="request_installed",
+        content="request contract installed",
+    )
 
 
 def test_close_all_delegations_marks_open_cards_stopped():
@@ -3024,6 +3879,34 @@ def test_request_scope_prevents_delegation_id_reuse_after_restart():
     assert emitter.calls[1]["delegation_id"] == "generalist:chat:3:request:5:1"
 
 
+def test_hitl_continuation_keeps_one_logical_ledger_with_both_operator_inputs():
+    model = _bare_model_with(_RecEmitter(), {})
+    model.begin_visibility_turn(
+        "chat:3:request:4",
+        operator_prompt="run bounded action",
+        native_request_id="4",
+        logical_request_id="logical-request",
+    )
+    first_ledger = model._request_event_ledger
+    model.begin_visibility_turn(
+        "chat:3:request:5",
+        operator_prompt="approve",
+        native_request_id="5",
+        logical_request_id="logical-request",
+    )
+
+    assert model._request_event_ledger is first_ledger
+    operator_rows = [
+        row
+        for row in model.request_event_transcript()
+        if row["kind"] == "operator_input"
+    ]
+    assert [row["content"] for row in operator_rows] == [
+        "run bounded action",
+        "approve",
+    ]
+
+
 def test_run_operator_stop_shielded_streams_notice_and_stops_cards():
     """The shielded operator-stop cleanup streams the stop notice AND flips every open card to
     'stopped' — the fix for a mid-run card left stuck on 'running' after the operator hits stop."""
@@ -3064,7 +3947,7 @@ def test_execution_observer_surfaces_real_callback_command_name():
     emitter = _RecEmitter()
     m = _bare_model_with(emitter, {})
     m._classify_tool_source = lambda _tool_name: "mythic"
-    m.begin_visibility_turn()
+    _begin_request_lifecycle(m)
     base_event = {
         "event_id": "mythic-task:3:42",
         "source": "mythic",
@@ -3089,7 +3972,7 @@ def test_execution_observer_surfaces_real_callback_command_name():
     assert "forge-golden-ticket" in emitter.tool_use_calls[0]["arguments"]
     assert emitter.tool_use_calls[1]["result_preview"] == "Ticket cache purged."
     assert emitter.tool_use_calls[0]["delegation_id"] == "execution:1"
-    assert _run(m.finalize_visibility_turn())["failed"] == 0
+    assert _run(m.finalize_visibility_turn(require_final=False))["failed"] == 0
 
 
 def test_execution_observer_preserves_raw_large_arguments_and_output():
@@ -3127,21 +4010,295 @@ def test_visibility_reconciliation_surfaces_failed_card_emission():
 
     emitter = _FailedCardEmitter()
     m = _bare_model_with(emitter, {})
-    m.begin_visibility_turn()
+    _begin_request_lifecycle(m)
 
-    _run(m._emit_execution_event({
+    event = {
         "event_id": "mcp:BloodHound:cypher_query:1",
         "source": "mcp",
         "tool_name": "cypher_query",
-        "status": "started",
         "arguments": {"query": "MATCH (n) RETURN n"},
-    }))
-    summary = _run(m.finalize_visibility_turn())
+    }
+    _run(m._emit_execution_event({**event, "status": "started"}))
+    _run(m._emit_execution_event({**event, "status": "completed"}))
+    summary = _run(m.finalize_visibility_turn(require_final=False))
 
-    assert summary["expected"] == 1
-    assert summary["rendered"] == 0
-    assert summary["failed"] == 1
-    assert "Visibility degraded" in emitter.text_sends[0]
+    assert summary["ok"] is False
+    assert summary["projection_count"] == 0
+    assert summary["failed"] == 2
+    assert all("projection count=0" in error for error in summary["errors"])
+    assert "lifecycle reconciliation failed" in emitter.text_sends[0].lower()
+
+
+def test_operator_stop_terminalizes_every_open_tool_and_delegation_projection():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    model._delegation_seq = 0
+    _begin_request_lifecycle(model, "request:stop")
+    _run(model._open_delegation("Generalist", "inspect", 1))
+    _run(model._emit_tool_use_card(
+        tool_call_id="call-1",
+        tool_name="list_callbacks",
+        status="started",
+        complete=False,
+        delegation_id=model.current_delegation_id("Generalist"),
+        delegation_name="Generalist",
+    ))
+
+    _run(model._emit_operator_stop("Session stopped."))
+
+    assert model._request_event_ledger.open_lifecycles() == ()
+    report = _run(model.finalize_visibility_turn(require_final=True))
+    assert report["ok"] is True
+    assert [call["status"] for call in emitter.tool_use_calls] == [
+        "started",
+        "stopped",
+    ]
+    assert [call["status"] for call in emitter.subagent_calls if call["complete"]] == [
+        "stopped",
+    ]
+    assert emitter.text_sends == ["Session stopped."]
+    transcript = model.request_event_transcript()
+    assert transcript[-2]["phase"] == "request_terminal"
+    assert transcript[-1]["kind"] == "final_response"
+
+
+def test_resume_cleanup_terminalizes_only_tools_that_remain_open():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:resume-tools")
+
+    for call_id in ("approved", "denied"):
+        _run(model._emit_tool_use_card(
+            tool_call_id=call_id,
+            tool_name="issue_task_and_waitfor_task_output",
+            status="started",
+            complete=False,
+        ))
+    claimed = model._open_tool_lifecycle_ids()
+    _run(model._emit_tool_use_card(
+        tool_call_id="approved",
+        tool_name="issue_task_and_waitfor_task_output",
+        status="completed",
+        complete=True,
+    ))
+
+    _run(model._close_open_tool_lifecycles(
+        status="cancelled",
+        event_ids=claimed,
+    ))
+    _run(model._close_open_tool_lifecycles(
+        status="cancelled",
+        event_ids=claimed,
+    ))
+
+    assert [
+        (call["tool_call_id"], call["status"])
+        for call in emitter.tool_use_calls
+    ] == [
+        ("approved", "started"),
+        ("denied", "started"),
+        ("approved", "completed"),
+        ("denied", "cancelled"),
+    ]
+    assert model._request_event_ledger.open_lifecycles() == ()
+
+
+def test_resume_cleanup_preserves_tool_opened_by_chained_hitl():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:chained-hitl")
+    _run(model._emit_tool_use_card(
+        tool_call_id="old-denied",
+        tool_name="issue_task_and_waitfor_task_output",
+        status="started",
+        complete=False,
+    ))
+    claimed = model._open_tool_lifecycle_ids()
+    _run(model._emit_tool_use_card(
+        tool_call_id="new-pending",
+        tool_name="issue_task_and_waitfor_task_output",
+        status="started",
+        complete=False,
+    ))
+
+    _run(model._close_open_tool_lifecycles(
+        status="cancelled",
+        event_ids=claimed,
+    ))
+
+    statuses = [
+        (call["tool_call_id"], call["status"])
+        for call in emitter.tool_use_calls
+    ]
+    assert statuses == [
+        ("old-denied", "started"),
+        ("new-pending", "started"),
+        ("old-denied", "cancelled"),
+    ]
+    remaining = model._open_tool_lifecycle_ids()
+    assert len(remaining) == 1
+    opened = model._request_event_ledger.actual_events(
+        event_id=remaining[0],
+        kind="tool",
+        phase="started",
+    )
+    assert dict(opened[0].metadata)["tool_call_id"] == "new-pending"
+
+
+def test_late_subgoal_transition_cannot_follow_request_terminal():
+    from ai.langgraph.subgoal_state import assign_and_admit, new_subgoal
+
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:cancel-race")
+    _run(model._emit_operator_stop("Session cancelled.", status="cancelled"))
+    before = list(model.request_control_transitions())
+
+    late = assign_and_admit(
+        new_subgoal("request:cancel-race", "operator_stop"),
+        owner="BloodHound",
+        method="transfer_to_BloodHound",
+    )
+    model._record_subgoal_control_events(late)
+
+    assert model.request_control_transitions() == before
+    assert before[-1]["phase"] == "request_terminal"
+    assert _run(model.finalize_visibility_turn(require_final=True))["ok"] is True
+
+
+def test_duplicate_or_conflicting_tool_delivery_cannot_project_twice():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:duplicate-tool")
+
+    for status in ("started", "started", "completed", "error"):
+        _run(model._emit_tool_use_card(
+            tool_call_id="call-1",
+            tool_name="list_callbacks",
+            status=status,
+            complete=status != "started",
+        ))
+
+    assert [call["status"] for call in emitter.tool_use_calls] == [
+        "started",
+        "completed",
+    ]
+    report = _run(model.finalize_visibility_turn(require_final=False))
+    assert report["ok"] is True
+
+
+def test_model_final_response_boundary_is_idempotent_and_reconciles_once():
+    model = _bare_model_with(_RecEmitter(), {})
+    _begin_request_lifecycle(model, "request:final")
+    model.record_request_terminal("complete")
+
+    first = model.record_final_response("done", response_key="assistant:1")
+    second = model.record_final_response("duplicate", response_key="assistant:2")
+    model.record_final_response_projection(first, response_key="assistant:1")
+    model.record_final_response_projection(second, response_key="assistant:2")
+
+    assert first == second
+    report = _run(model.finalize_visibility_turn())
+    assert report["ok"] is True
+    events = model._request_event_ledger.actual_events(
+        kind="final_response",
+        phase="emitted",
+    )
+    assert len(events) == 1
+    assert events[0].content == "done"
+
+
+def test_repeated_stop_has_one_lifecycle_owned_final_projection():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:repeated-stop")
+
+    _run(model._emit_operator_stop("Session stopped."))
+    _run(model._emit_operator_stop("Session stopped."))
+
+    assert len(emitter.final_response_calls) == 1
+    assert len(emitter.text_sends) == 1
+    assert emitter.final_response_calls[0]["event_id"]
+    assert _run(model.finalize_visibility_turn(require_final=True))["ok"] is True
+
+
+def test_failed_final_projection_retries_same_event_once_then_suppresses():
+    class _FailOnceChat:
+        def __init__(self):
+            self.attempts = []
+
+        async def send_text(self, _request, response_key, *, content, metadata):
+            self.attempts.append({
+                "response_key": response_key,
+                "content": content,
+                "metadata": metadata,
+            })
+            if len(self.attempts) == 1:
+                raise RuntimeError("transient transport failure")
+
+    chat = _FailOnceChat()
+    request = build_chat_request(
+        "stop",
+        channel_id=12,
+        request_id=34,
+    )
+    emitter = ChatStreamEmitter(chat, request)
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:fail-once-final")
+
+    _run(model._emit_operator_stop("Session stopped."))
+    first_report = _run(model.finalize_visibility_turn(require_final=True))
+    _run(model._emit_operator_stop("different retry text is inert"))
+    _run(model._emit_operator_stop("already projected"))
+    final_report = _run(model.finalize_visibility_turn(require_final=True))
+
+    assert first_report["ok"] is False
+    assert len(chat.attempts) == 2
+    assert chat.attempts[0] == chat.attempts[1]
+    assert chat.attempts[0]["response_key"].startswith("event:final_response:")
+    assert chat.attempts[0]["content"] == "Session stopped."
+    assert final_report["ok"] is True
+
+
+def test_concurrent_stop_serializes_failed_then_successful_final_projection():
+    class _FailFirstEmitter(_RecEmitter):
+        async def emit_final_response(self, **kw):
+            self.final_response_calls.append(kw)
+            self.last_response_key = f"event:{kw['event_id']}"
+            await asyncio.sleep(0)
+            return len(self.final_response_calls) > 1
+
+    emitter = _FailFirstEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:concurrent-stop")
+
+    async def scenario():
+        await asyncio.gather(
+            model._emit_operator_stop("Session stopped."),
+            model._emit_operator_stop("Session stopped."),
+        )
+
+    _run(scenario())
+
+    assert len(emitter.final_response_calls) == 2
+    assert (
+        emitter.final_response_calls[0]["event_id"]
+        == emitter.final_response_calls[1]["event_id"]
+    )
+    assert _run(model.finalize_visibility_turn(require_final=True))["ok"] is True
+
+
+def test_paused_request_cleanup_terminalizes_before_model_is_dropped():
+    emitter = _RecEmitter()
+    model = _bare_model_with(emitter, {})
+    _begin_request_lifecycle(model, "request:paused-hitl")
+    model.request_stop = lambda: None
+    chat = HeadlessSageChat()
+
+    _run(chat._stop_and_close_request_lifecycles(model, status="stopped"))
+
+    assert len(emitter.final_response_calls) == 1
+    assert _run(model.finalize_visibility_turn(require_final=True))["ok"] is True
 
 
 def test_capability_wait_observer_emits_operator_progress_messages():

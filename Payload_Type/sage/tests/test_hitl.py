@@ -6,6 +6,7 @@ Run: cd Payload_Type/sage && python3 -m pytest tests/test_hitl.py -q
 """
 import sys
 import asyncio
+import copy
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from ai.langgraph.model import (  # noqa: E402
 )
 from ai.langgraph.mythic_tools import GUARDED_TOOLS  # noqa: E402
 from langchain.agents.middleware import HumanInTheLoopMiddleware  # noqa: E402
-from sage_chat.hitl import approval_action_fingerprint, build_approval_request  # noqa: E402
+from sage_chat.hitl import approval_action_digest, approval_action_fingerprint, build_approval_request  # noqa: E402
 
 
 def _bare_model(mode: str) -> Model:
@@ -105,9 +106,12 @@ def test_action_fingerprint_is_exact_over_tool_and_json_native_args_only():
         "display_name": "different label",
         "args": {"a": {"x": "y"}, "b": [1, True, None]},
     })
+    assert approval_action_fingerprint(base) == approval_action_fingerprint({
+        "name": "execute_capability",
+        "args": {"b": [1.0, True, None], "a": {"x": "y"}},
+    })
     for other in (
         {"name": "execute_capability", "args": {"b": [True, 1, None], "a": {"x": "y"}}},
-        {"name": "execute_capability", "args": {"b": [1.0, True, None], "a": {"x": "y"}}},
         {"name": "execute_capability", "args": {"b": [1, True, "null"], "a": {"x": "y"}}},
         {"name": "execute_capability", "args": {"b": [1, False, None], "a": {"x": "y"}}},
         {"name": "execute_capability", "args": {"b": [1, True, None], "a": {"x": "z"}}},
@@ -129,6 +133,38 @@ def test_action_fingerprint_is_exact_over_tool_and_json_native_args_only():
     ):
         with pytest.raises(ValueError):
             approval_action_fingerprint(malformed)
+
+
+def test_approval_identity_and_card_bytes_normalize_nested_integral_floats():
+    float_actions = [{
+        "name": "execute_capability",
+        "args": {
+            "callback_id": "1",
+            "policy_decision": {
+                "model_branch_coverage": 1.0,
+                "nested": [-0.0, {"count": 3.0}],
+            },
+        },
+    }]
+    integer_actions = [{
+        "name": "execute_capability",
+        "args": {
+            "callback_id": "1",
+            "policy_decision": {
+                "model_branch_coverage": 1,
+                "nested": [0, {"count": 3}],
+            },
+        },
+    }]
+
+    assert approval_action_digest(float_actions) == approval_action_digest(integer_actions)
+    float_card = build_approval_request(float_actions)
+    integer_card = build_approval_request(integer_actions)
+    assert float_card == integer_card
+    assert float_card["data"]["arguments"]["policy_decision"] == {
+        "model_branch_coverage": 1,
+        "nested": [0, {"count": 3}],
+    }
 
 
 class _FakeInterrupt:
@@ -386,7 +422,7 @@ def test_controller_hitl_collection_pauses_with_scope_and_reason():
     assert "merlin" in sent[0]
 
 
-def test_controller_hitl_collection_preserves_policy_decision_without_changing_approval_key():
+def test_controller_hitl_collection_policy_decision_changes_exact_approval_key():
     m = _controller_hitl_model()
     request = _ControllerCollectionRequest(
         foothold=SimpleNamespace(callback_id="7", host="workstation01", agent="merlin"),
@@ -411,7 +447,7 @@ def test_controller_hitl_collection_preserves_policy_decision_without_changing_a
         decision,
     )
 
-    assert with_decision["key"] == without_decision["key"]
+    assert with_decision["key"] != without_decision["key"]
     assert with_decision["args"]["policy_decision"] == decision
     assert m._controller_pending_policy_decision(with_decision) == decision
 
@@ -532,7 +568,61 @@ def test_controller_hitl_stale_approval_never_authorizes_different_action():
     assert m._controller_hitl_approved_key == ""
 
 
-def test_controller_hitl_key_ignores_policy_provenance_but_binds_action():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("target", "domain=other.local"),
+        ("callback", "4"),
+        ("policy", "decision-mutated"),
+        ("transaction", "transaction-mutated"),
+    ),
+)
+def test_controller_hitl_mutated_authority_bytes_deny_before_resume(field, value):
+    m = _controller_hitl_model()
+    pending = m._controller_hitl_capability_request(
+        {
+            "name": "dcsync-account",
+            "target": "domain=lab.local;account=alice",
+            "intent": {
+                "policy_decision": {"decision_id": "decision-original"},
+                "transaction_id": "transaction-original",
+            },
+        },
+        {
+            "callback_id": "3",
+            "policy_decision": {"decision_id": "decision-original"},
+            "transaction_id": "transaction-original",
+        },
+        "obtain credentials for alice@lab.local",
+    )
+    action_requests = [{
+        "name": pending["tool"],
+        "display_name": pending["display_name"],
+        "args": pending["args"],
+    }]
+    digest = approval_action_digest(action_requests)
+    mutated = copy.deepcopy(pending)
+    if field == "target":
+        mutated["args"]["action"]["target"] = value
+    elif field == "callback":
+        mutated["args"]["inputs"]["callback_id"] = value
+    elif field == "policy":
+        mutated["args"]["inputs"]["policy_decision"]["decision_id"] = value
+    else:
+        mutated["args"]["action"]["intent"]["transaction_id"] = value
+    m._controller_hitl_pending = mutated
+    m._controller_observed_transactions = []
+    m._run_autonomous_controller = lambda _objective: (_ for _ in ()).throw(
+        AssertionError("mutated approval reached controller resume")
+    )
+
+    with pytest.raises(RuntimeError, match="changed after its approval card was created"):
+        _run(m.handle_controller_hitl_resume("approve", expected_action_digest=digest))
+
+    assert m._controller_observed_transactions == []
+
+
+def test_controller_hitl_key_binds_policy_provenance_and_action():
     m = _controller_hitl_model()
     payload = {
         "name": "dcsync-account",
@@ -542,6 +632,11 @@ def test_controller_hitl_key_ignores_policy_provenance_but_binds_action():
         "intent": {"policy_decision": {"episode_id": "one", "decision_id": "first"}},
     }
     first = m._controller_hitl_capability_request(
+        payload,
+        {"callback_id": "3", "policy_decision": {"timestamp": "one"}},
+        "obtain credentials for alice@lab.local",
+    )
+    replay = m._controller_hitl_capability_request(
         payload,
         {"callback_id": "3", "policy_decision": {"timestamp": "one"}},
         "obtain credentials for alice@lab.local",
@@ -558,5 +653,75 @@ def test_controller_hitl_key_ignores_policy_provenance_but_binds_action():
         "obtain credentials for alice@lab.local",
     )
 
-    assert first["key"] == second["key"]
+    assert first["key"] == replay["key"]
+    assert first["key"] != second["key"]
     assert first["key"] != changed["key"]
+
+
+# --- Minimal loop-breaker (denial-routing spec, staged) -----------------------------------------
+
+def test_reproposal_after_effect_denial_terminalises_blocked_and_does_not_recard():
+    """When the just-approved supervised action was refused at the effect boundary, the resume loop must
+    surface the denial reason and terminalise `blocked` instead of re-carding the denied action (the
+    livelock). Red-before: `_handle_reproposal_after_denial` did not exist, so the interrupt was always
+    re-surfaced as a fresh approval card."""
+    m = _bare_model("supervised")
+    emitted, terminal, closed = [], [], []
+
+    async def _emit(msg):
+        emitted.append(msg)
+
+    async def _close(status="stopped"):
+        closed.append(status)
+
+    m._stream_message_to_mythic = _emit
+    m.record_request_terminal = lambda status="complete": terminal.append(status)
+    m._close_all_request_lifecycles = _close
+    m.mythic_client = SimpleNamespace(
+        _last_effect_denial={"reason": "STOP — callback 5 is not taskable: dead; no checkin"}
+    )
+
+    handled = _run(m._handle_reproposal_after_denial())
+
+    assert handled is True
+    assert terminal == ["blocked"]          # terminalised blocked
+    assert closed == ["blocked"]            # lifecycle closed → seals the 49R-16 decision record
+    assert emitted and "Blocked" in emitted[0] and "not taskable" in emitted[0]
+    assert m.mythic_client._last_effect_denial is None   # flag cleared, no re-trigger next cycle
+
+
+def test_no_denial_recorded_leaves_reproposal_path_untouched():
+    """Legitimate path: an approved action that SUCCEEDED records no denial, so the loop-breaker does NOT
+    fire and normal approval-card surfacing is preserved. This is the non-regression the guard must keep."""
+    m = _bare_model("supervised")
+    terminal = []
+    m.record_request_terminal = lambda status="complete": terminal.append(status)
+    m.mythic_client = SimpleNamespace(_last_effect_denial=None)
+
+    handled = _run(m._handle_reproposal_after_denial())
+
+    assert handled is False
+    assert terminal == []
+
+
+def test_note_effect_denial_records_only_for_supervised_approved_effect():
+    """The refusal source records a denial only when the request is a supervised lane WITH an active
+    approval claim (an approved action refused), and returns the blocker string unchanged."""
+    from ai.langgraph.mythic_tools import MythicTools
+    from ai.langgraph.request_contract import RequestLane
+
+    supervised = SimpleNamespace(
+        _active_approval_claim={"approval_id": "x"},
+        _request_contract=SimpleNamespace(lane=RequestLane.SUPERVISED_WORKFLOW),
+    )
+    out = MythicTools._note_effect_denial(supervised, "STOP — callback 5 is not taskable: dead")
+    assert out == "STOP — callback 5 is not taskable: dead"
+    assert supervised._last_effect_denial and "not taskable" in supervised._last_effect_denial["reason"]
+
+    # no active approval claim → not an approved-then-refused effect → do not record
+    no_claim = SimpleNamespace(
+        _active_approval_claim=None,
+        _request_contract=SimpleNamespace(lane=RequestLane.SUPERVISED_WORKFLOW),
+    )
+    MythicTools._note_effect_denial(no_claim, "STOP — something")
+    assert getattr(no_claim, "_last_effect_denial", None) is None

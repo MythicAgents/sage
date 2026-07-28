@@ -498,8 +498,26 @@ def test_invoke_preflight_stops_before_graph_astream(monkeypatch):
 
 def test_objective_completion_preflight_does_not_intercept_unrelated_query():
     Model = _load_model_class()
+    from ai.langgraph.request_contract import build_request_contract
+
     m = Model.__new__(Model)
     m._autonomous_solve = False
 
+    m._request_contract = build_request_contract(
+        request_id="conversation",
+        channel_id="channel",
+        operation_id="operation",
+        mode="conversation",
+        autonomous_solve=False,
+    )
     assert m._objective_completion_preflight_allowed("list active callbacks") is False
+
+    m._request_contract = build_request_contract(
+        request_id="autonomous",
+        channel_id="channel",
+        operation_id="operation",
+        mode="auto",
+        autonomous_solve=False,
+    )
     assert m._objective_completion_preflight_allowed("Continue the autonomous objective from the observed engagement state") is True
+    assert m._objective_completion_preflight_allowed("list active callbacks") is True

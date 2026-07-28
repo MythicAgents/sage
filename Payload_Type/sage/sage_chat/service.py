@@ -28,9 +28,9 @@ from mythic_container.logging import logger
 
 from .config import build_model_kwargs
 from .hitl import (
+    approved_action_ids_for_request,
     approval_response_matches,
     make_card_emitter,
-    resume_decision_for_request,
     resume_steer_message_for_request,
 )
 from .metadata import build_channel_metadata
@@ -88,7 +88,7 @@ def _runtime_routing_matches(
         None,
     )
     if (
-        override_mode in {"supervised", "auto"}
+        override_mode in {"conversation", "supervised", "auto"}
         and stored_signature
         and stored_signature == resolved_signature == override_signature
         and override_base_autonomy is not None
@@ -96,13 +96,67 @@ def _runtime_routing_matches(
         and base_autonomy == expected_autonomy
     ):
         expected_mode = override_mode
-        expected_autonomy = True if override_mode == "auto" else bool(override_base_autonomy)
+        expected_autonomy = (
+            True
+            if override_mode == "auto"
+            else False
+            if override_mode == "conversation"
+            else bool(override_base_autonomy)
+        )
     return bool(
         str(getattr(model, "mode", "")) == expected_mode
         and bool(getattr(model, "_autonomous_solve", False))
         == expected_autonomy
         and str(getattr(model, "policy_mode", "")) == str(kwargs.get("policy_mode", ""))
         and int(getattr(model, "_max_steps", -1)) == int(kwargs.get("max_steps", -2))
+    )
+
+
+def _build_request_contract(
+    request: ChatRequest,
+    model: Any,
+    *,
+    has_input_response: bool,
+):
+    """Compile the request contract from typed native transport/session fields only."""
+    try:
+        from ai.langgraph.request_contract import (
+            RequestContract,
+            RequestIntent,
+            build_request_contract,
+        )
+    except ImportError:  # pragma: no cover
+        from ..ai.langgraph.request_contract import (  # type: ignore
+            RequestContract,
+            RequestIntent,
+            build_request_contract,
+        )
+    pending_context = getattr(model, "_pending_approval_context", None)
+    active_contract = getattr(model, "_request_contract", None)
+    if (
+        has_input_response
+        and isinstance(active_contract, RequestContract)
+        and isinstance(pending_context, dict)
+        and str(pending_context.get("request_id") or "") == active_contract.request_id
+        and str(pending_context.get("request_contract_digest") or "")
+        == active_contract.digest
+    ):
+        # Approval is a typed transition of the already-paused request. Reinstall the same immutable
+        # contract so the resumed action reaches the sink under the digest the operator reviewed.
+        return active_contract
+    parent_request_id = (
+        str(pending_context.get("request_id") or "")
+        if isinstance(pending_context, dict)
+        else ""
+    )
+    return build_request_contract(
+        request_id=f"chat:{request.ChannelID}:request:{request.RequestID}",
+        channel_id=str(request.ChannelID),
+        operation_id=str(request.OperationID),
+        mode=str(getattr(model, "mode", "conversation") or "conversation"),
+        autonomous_solve=bool(getattr(model, "_autonomous_solve", False)),
+        intent=RequestIntent.CONTINUE if has_input_response else None,
+        parent_request_id=parent_request_id,
     )
 
 
@@ -187,6 +241,38 @@ class SageChat(Chat):
         if token_changed or operation_changed:
             raise RuntimeError("Mythic auth identity changed; a fresh Sage session is required.")
 
+    @staticmethod
+    async def _stop_and_close_request_lifecycles(
+        model: Any,
+        *,
+        status: str,
+    ) -> None:
+        try:
+            model.request_stop()
+        except Exception:
+            logger.debug("request_stop() failed during lifecycle cleanup", exc_info=True)
+        emit_terminal = getattr(model, "_emit_operator_stop", None)
+        if callable(emit_terminal) and status in {"stopped", "cancelled"}:
+            try:
+                await emit_terminal(
+                    "\n🛑 Session stopped by operator.\n",
+                    status=status,
+                )
+                return
+            except Exception:
+                logger.debug(
+                    "request lifecycle terminalization failed",
+                    exc_info=True,
+                )
+        close_all = getattr(model, "_close_all_request_lifecycles", None)
+        if not callable(close_all):
+            close_all = getattr(model, "_close_all_delegations", None)
+        if callable(close_all):
+            try:
+                await close_all(status=status)
+            except Exception:
+                logger.debug("request lifecycle cleanup failed", exc_info=True)
+
     async def _rotate_auth_changed_session(self, request: ChatRequest, model: Any | None) -> Any | None:
         if model is None:
             return None
@@ -195,10 +281,7 @@ class SageChat(Chat):
             and getattr(model, "operation_id", None) == request.OperationID
         ):
             return model
-        try:
-            model.request_stop()
-        except Exception:
-            logger.debug("request_stop() failed while rotating changed Mythic auth identity", exc_info=True)
+        await self._stop_and_close_request_lifecycles(model, status="stopped")
         await drop_channel_session(request, expected_model=model)
         logger.info("Rotated Sage channel session after Mythic token/operation identity changed")
         return None
@@ -222,10 +305,10 @@ class SageChat(Chat):
                 config_signature=config_signature,
             )
         ):
-            try:
-                existing.request_stop()
-            except Exception:
-                logger.debug("request_stop() failed while rotating changed chat config", exc_info=True)
+            await self._stop_and_close_request_lifecycles(
+                existing,
+                status="stopped",
+            )
             await drop_channel_session(request, expected_model=existing)
             logger.info("Rotated Sage channel session after ChatRequest configuration changed")
             existing = None
@@ -312,10 +395,10 @@ class SageChat(Chat):
             if not has_input_response and preexisted and (
                 controller_pending or hitl_pending or hitl_probe_failed
             ):
-                try:
-                    model.request_stop()
-                except Exception:
-                    logger.debug("request_stop() failed while invalidating stale HITL session", exc_info=True)
+                await self._stop_and_close_request_lifecycles(
+                    model,
+                    status="stopped",
+                )
                 await drop_channel_session(request, expected_model=model)
                 model, preexisted = await self._get_or_create_model(request)
                 thread_id = bind_channel_thread_id(request, model)
@@ -331,6 +414,34 @@ class SageChat(Chat):
 
             if not has_input_response:
                 model._pending_approval_context = None
+            request_contract = _build_request_contract(
+                request,
+                model,
+                has_input_response=has_input_response,
+            )
+            begin_visibility = getattr(model, "begin_visibility_turn", None)
+            if callable(begin_visibility):
+                scope = f"chat:{request.ChannelID}:request:{request.RequestID}"
+                if callable(getattr(model, "request_event_transcript", None)):
+                    begin_visibility(
+                        scope,
+                        operator_prompt=prompt,
+                        native_request_id=str(request.RequestID),
+                        logical_request_id=request_contract.request_id,
+                    )
+                else:
+                    begin_visibility(scope)
+            install_request_contract = getattr(
+                model,
+                "install_request_contract",
+                None,
+            )
+            if callable(install_request_contract):
+                install_request_contract(request_contract)
+            else:
+                # Compatibility for lightweight test/eval models. Production Model instances install
+                # the contract through the typed method above.
+                model._request_contract = request_contract
             # Reassert on reused sessions too; older in-memory sessions created before this field was wired
             # should gain controller-native HITL without requiring a process restart.
             model.command_name = "chat"
@@ -343,9 +454,12 @@ class SageChat(Chat):
 
             def approval_context() -> dict[str, str]:
                 authority = getattr(model, "_turn_authority", None)
+                active_contract = getattr(model, "_request_contract", request_contract)
                 return {
                     "thread_id": thread_id,
                     "turn_id": str(getattr(authority, "turn_id", "") or thread_id),
+                    "request_id": active_contract.request_id,
+                    "request_contract_digest": active_contract.digest,
                     "operation_id": str(request.OperationID),
                     "apitoken_id": str(request.APITokenID),
                 }
@@ -381,11 +495,6 @@ class SageChat(Chat):
                     await asyncio.sleep(_CHANNEL_METADATA_HEARTBEAT_SECONDS)
                     await publish_channel_metadata()
 
-            begin_visibility = getattr(model, "begin_visibility_turn", None)
-            if callable(begin_visibility):
-                begin_visibility(
-                    f"chat:{request.ChannelID}:request:{request.RequestID}"
-                )
             try:
                 from ai.mcp import MCPManager
             except ImportError:  # pragma: no cover
@@ -414,62 +523,199 @@ class SageChat(Chat):
                     model._pending_approval_context = None
                     approval_claimed = True
                 stale_approval_response = bool(has_input_response and not approval_claimed)
-                if stale_approval_response:
-                    await stream_emitter(
-                        "That approval request is no longer active. No action was executed; "
-                        "submit the instruction again if it is still needed."
+                approved_action_ids = (
+                    approved_action_ids_for_request(
+                        request,
+                        approval_claim_context,
                     )
-                elif has_input_response and controller_pending:
-                    # Controller-native HITL is not a LangGraph checkpoint interrupt, so it has its own pending
-                    # marker and resume seam. Native input cards still map accept -> approve, everything else
-                    # -> deny, preserving the same default-deny policy.
-                    native_response_text = _nonempty_native_response_text(
-                        await model.handle_controller_hitl_resume(
-                            resume_decision_for_request(request),
-                            expected_action_digest=str(
-                                approval_claim_context.get("action_digest") or ""
-                            ),
+                    if approval_claimed
+                    else ()
+                )
+                approval_decision = "approve" if approved_action_ids else "deny"
+                claimed_open_tool_ids: tuple[str, ...] = ()
+                if approval_claimed:
+                    open_tool_ids = getattr(
+                        model,
+                        "_open_tool_lifecycle_ids",
+                        None,
+                    )
+                    if callable(open_tool_ids):
+                        claimed_open_tool_ids = tuple(open_tool_ids())
+                approval_installed = False
+                if approval_claimed:
+                    apply_selection = getattr(
+                        model,
+                        "apply_request_action_selection",
+                        None,
+                    )
+                    if callable(apply_selection):
+                        approval_claim_context = apply_selection(
+                            approval_claim_context,
+                            approved_action_ids,
                         )
-                    )
-                elif has_input_response and hitl_pending:
-                    # A prior turn raised a confirmation card and finished; this request is the operator's
-                    # answer. Resume the paused graph in place (Section 6): Confirm → approve; Reject →
-                    # default-deny; Respond/Select → deny the guarded action but steer the replan with the
-                    # operator's free-text (Phase 3).
-                    native_response_text = _nonempty_native_response_text(
-                        await model.handle_hitl_resume(
-                            resume_decision_for_request(request), thread_id,
-                            operator_message=resume_steer_message_for_request(request),
-                            expected_action_digest=str(
-                                approval_claim_context.get("action_digest") or ""
-                            ),
+                    elif getattr(model, "mythic_client", None) is not None:
+                        raise RuntimeError(
+                            "Native supervised selection cannot reach the request contract."
                         )
+                if approval_claimed and approval_decision == "approve":
+                    install_claim = getattr(model, "install_approval_claim", None)
+                    if callable(install_claim):
+                        install_claim(approval_claim_context)
+                        approval_installed = True
+                    elif getattr(model, "mythic_client", None) is not None:
+                        raise RuntimeError(
+                            "Native supervised approval cannot reach the final effect sink."
+                        )
+                try:
+                    if stale_approval_response:
+                        await stream_emitter(
+                            "That approval request is no longer active. No action was executed; "
+                            "submit the instruction again if it is still needed."
+                        )
+                    elif has_input_response and controller_pending:
+                        # Controller-native HITL is not a LangGraph checkpoint interrupt, so it has its own pending
+                        # marker and resume seam. Native input cards still map accept -> approve, everything else
+                        # -> deny, preserving the same default-deny policy.
+                        native_response_text = _nonempty_native_response_text(
+                            await model.handle_controller_hitl_resume(
+                                approval_decision,
+                                expected_action_digest=str(
+                                    approval_claim_context.get("action_digest") or ""
+                                ),
+                            )
+                        )
+                    elif has_input_response and hitl_pending:
+                        # A prior turn raised a confirmation card and finished; this request is the operator's
+                        # answer. Resume the paused graph in place (Section 6): Confirm → approve; Reject →
+                        # default-deny; Respond/Select → deny the guarded action but steer the replan with the
+                        # operator's free-text (Phase 3).
+                        native_response_text = _nonempty_native_response_text(
+                            await model.handle_hitl_resume(
+                                approval_decision,
+                                thread_id,
+                                operator_message=resume_steer_message_for_request(request),
+                                expected_action_digest=str(
+                                    approval_claim_context.get("action_digest") or ""
+                                ),
+                                approved_action_ids=approved_action_ids,
+                            )
+                        )
+                    else:
+                        native_response_text = _nonempty_native_response_text(
+                            await model.invoke(prompt, is_interactive=preexisted)
+                        )
+                finally:
+                    if approval_installed:
+                        clear_claim = getattr(model, "clear_approval_claim", None)
+                        if callable(clear_claim):
+                            clear_claim()
+                if approval_claimed:
+                    # LangGraph does not emit a normal tool-end callback for a
+                    # denied/unselected guarded call. Close only the tool events
+                    # that remain open after resume; approved calls that already
+                    # completed or errored are untouched.
+                    close_open_tools = getattr(
+                        model,
+                        "_close_open_tool_lifecycles",
+                        None,
                     )
-                else:
-                    native_response_text = _nonempty_native_response_text(
-                        await model.invoke(prompt, is_interactive=preexisted)
-                    )
+                    if callable(close_open_tools):
+                        await close_open_tools(
+                            status="cancelled",
+                            event_ids=claimed_open_tool_ids,
+                        )
             except asyncio.CancelledError:
                 # Operator cancel: cooperatively stop the graph so it stops issuing tasks, then re-raise
                 # so the SDK emits the terminal `cancelled` status (Cody, f). Never swallow this.
-                if not getattr(model, "_stop_requested", False):
-                    try:
-                        model.request_stop()
-                    except Exception:
-                        logger.warning("request_stop() failed during cancel handling", exc_info=True)
+                await self._stop_and_close_request_lifecycles(
+                    model,
+                    status="cancelled",
+                )
+                finalize_visibility = getattr(
+                    model,
+                    "finalize_visibility_turn",
+                    None,
+                )
+                if (
+                    callable(finalize_visibility)
+                    and callable(getattr(model, "request_event_transcript", None))
+                ):
+                    reconciled = await finalize_visibility(require_final=True)
+                    if not reconciled.get("ok", False):
+                        logger.error(
+                            "Cancelled request lifecycle reconciliation failed: %s",
+                            reconciled,
+                        )
                 await drop_channel_session(request, expected_model=model)
                 raise
-            except Exception:
+            except Exception as error:
                 # A graph/runtime exception can occur after a sub-agent card was already opened.
                 # Without an explicit terminal update Mythic keeps that card on "Running" even though
                 # run_chat_turn will emit an error terminal for the request itself.
-                close_all = getattr(model, "_close_all_delegations", None)
-                if callable(close_all):
-                    try:
-                        await close_all(status="error")
-                    except Exception:
-                        logger.debug("sub-agent error cleanup failed (non-fatal)", exc_info=True)
+                await self._stop_and_close_request_lifecycles(
+                    model,
+                    status="error",
+                )
                 await drop_channel_session(request, expected_model=model)
+                record_terminal = getattr(model, "record_request_terminal", None)
+                record_final = getattr(model, "record_final_response", None)
+                record_projection = getattr(
+                    model,
+                    "record_final_response_projection",
+                    None,
+                )
+                finalize_visibility = getattr(
+                    model,
+                    "finalize_visibility_turn",
+                    None,
+                )
+                if all(callable(item) for item in (
+                    record_terminal,
+                    record_final,
+                    record_projection,
+                    finalize_visibility,
+                )):
+                    error_text = str(error) or "Sage request failed."
+                    preterminal = await finalize_visibility(require_final=False)
+                    if not preterminal.get("ok", False):
+                        logger.error(
+                            "Failed request lifecycle was already degraded: %s",
+                            preterminal,
+                        )
+                    record_terminal("error")
+                    response_key = turn.response_key
+                    event_id = record_final(
+                        error_text,
+                        response_key=response_key,
+                    )
+                    control_transitions = getattr(
+                        model,
+                        "request_control_transitions",
+                        None,
+                    )
+                    error_metadata = {
+                        "channel_id": request.ChannelID,
+                        "event_id": event_id,
+                    }
+                    if callable(control_transitions):
+                        error_metadata["control_transitions"] = (
+                            control_transitions()
+                        )
+                    await self.send_error(
+                        request,
+                        response_key,
+                        error=error_text,
+                        metadata=turn._metadata(error_metadata),
+                        complete_request=True,
+                    )
+                    record_projection(event_id, response_key=response_key)
+                    reconciled = await finalize_visibility(require_final=True)
+                    if not reconciled.get("ok", False):
+                        logger.error(
+                            "Failed request lifecycle reconciliation failed: %s",
+                            reconciled,
+                        )
+                    return None
                 raise
             finally:
                 metadata_task.cancel()
@@ -479,9 +725,6 @@ class SageChat(Chat):
                 if callable(set_active_agent):
                     set_active_agent("Idle")
                 await publish_channel_metadata()
-            finalize_visibility = getattr(model, "finalize_visibility_turn", None)
-            if callable(finalize_visibility):
-                await finalize_visibility()
             # Refresh the header's live count chips (MCP servers/tools, rounds, BloodHound) now that the
             # turn's work is done. The publisher de-duplicates unchanged payloads.
             await publish_channel_metadata()
@@ -496,20 +739,64 @@ class SageChat(Chat):
             terminal_metadata = {"channel_id": request.ChannelID}
             if runtime_telemetry:
                 terminal_metadata["runtime_telemetry"] = runtime_telemetry
-            if native_response_text or stream_emitter.last_response_key:
-                # Reuse the final visible block's key so Mythic updates it in place instead of creating
-                # a separate empty timestamp row for the request terminal. A distinct return from invoke
-                # or HITL resume is authoritative terminal content even when progress was streamed first.
-                await self.send_complete(
-                    request,
-                    stream_emitter.last_response_key or turn.response_key,
-                    metadata=turn._metadata(terminal_metadata),
-                    content=native_response_text or stream_emitter.last_content,
-                    complete_request=True,
+            response_key = stream_emitter.last_response_key or turn.response_key
+            response_content = (
+                native_response_text
+                or stream_emitter.last_content
+                or "Completed."
+            )
+            record_final = getattr(model, "record_final_response", None)
+            record_terminal = getattr(model, "record_request_terminal", None)
+            record_projection = getattr(
+                model,
+                "record_final_response_projection",
+                None,
+            )
+            finalize_visibility = getattr(model, "finalize_visibility_turn", None)
+            lifecycle_event_id = ""
+            if callable(record_final) and callable(finalize_visibility):
+                preterminal = await finalize_visibility(require_final=False)
+                if not preterminal.get("ok", False):
+                    raise RuntimeError(
+                        "Request lifecycle reconciliation failed before terminal response."
+                    )
+                if callable(record_terminal):
+                    record_terminal("complete")
+                lifecycle_event_id = record_final(
+                    response_content,
+                    response_key=response_key,
                 )
-                return None
-            # No assistant text was emitted. Let run_chat_turn create a visible fallback terminal.
-            return terminal_metadata
+                terminal_metadata["event_id"] = lifecycle_event_id
+                control_transitions = getattr(
+                    model,
+                    "request_control_transitions",
+                    None,
+                )
+                if callable(control_transitions):
+                    terminal_metadata["control_transitions"] = (
+                        control_transitions()
+                    )
+            elif callable(finalize_visibility):
+                await finalize_visibility()
+            await self.send_complete(
+                request,
+                response_key,
+                metadata=turn._metadata(terminal_metadata),
+                content=response_content,
+                complete_request=True,
+            )
+            if lifecycle_event_id and callable(record_projection):
+                record_projection(
+                    lifecycle_event_id,
+                    response_key=response_key,
+                )
+                reconciled = await finalize_visibility(require_final=True)
+                if not reconciled.get("ok", False):
+                    logger.error(
+                        "Request lifecycle reconciliation failed after terminal response: %s",
+                        reconciled,
+                    )
+            return None
 
         async def _handler(turn) -> dict[str, Any] | None:
             # `/stop` must bypass serialization so it can cancel a long-running turn that currently

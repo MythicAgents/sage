@@ -504,19 +504,28 @@ class AutonomousController:
             if over:
                 return done(STATUS_BUDGET, over)
 
-            # 3) collection (deterministic, reasoned, per-request bounded) — covers the empty-frontier early
-            #    phase without using a low global cap that can starve later justified scopes.
+            # 3) Compute collection and capability candidates once so policy sees the complete peer set.
+            frontier = list(self._frontier_fn(state) or [])
+            action = None
+            decision = None
+            phase = ""
+            need = False
             if self._needs_collection is not None and self._collect is not None:
-                st, need = await self._seam(lambda: self._needs_collection(state), "needs_collection")
-                if st == "ok" and bool(need):
+                st, requested = await self._seam(lambda: self._needs_collection(state), "needs_collection")
+                if st == "ok":
+                    need = requested
+                if bool(need):
                     collect_candidate = _CollectionCandidate(
                         target=_collection_request_key(need),
                     )
-                    selected, decision = await self._policy_select(
-                        state,
-                        [collect_candidate],
-                        decisions,
-                    )
+                    if self._policy is None:
+                        selected, decision = collect_candidate, None
+                    else:
+                        selected, decision = await self._policy_select(
+                            state,
+                            [collect_candidate, *frontier],
+                            decisions,
+                        )
                     if decision is not None:
                         decisions.append(decision)
                     if selected is None:
@@ -532,62 +541,64 @@ class AutonomousController:
                             policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                         ))
                         return done(STATUS_NO_ACTION, "policy declined graph collection")
-                    request_key = _collection_request_key(need) or "__anonymous_collection_request__"
-                    attempts = self._collection_attempts.get(request_key, 0)
-                    if attempts >= self.config.max_collection_attempts_per_request:
-                        blocker = {
-                            "reason": "collection retry budget exhausted",
-                            "collection_key": request_key,
-                            "attempts": attempts,
-                            "achieved": sorted(achieved),
-                        }
+                    if selected is collect_candidate:
+                        request_key = _collection_request_key(need) or "__anonymous_collection_request__"
+                        attempts = self._collection_attempts.get(request_key, 0)
+                        if attempts >= self.config.max_collection_attempts_per_request:
+                            blocker = {
+                                "reason": "collection retry budget exhausted",
+                                "collection_key": request_key,
+                                "attempts": attempts,
+                                "achieved": sorted(achieved),
+                            }
+                            return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
+                        if self.config.max_collections is not None and self._collections >= self.config.max_collections:
+                            blocker = {
+                                "reason": "configured global collection emergency cap exhausted",
+                                "collection_key": request_key,
+                                "attempts": attempts,
+                                "achieved": sorted(achieved),
+                            }
+                            return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
+                        transactions.append(_transaction_record("collection", "collect-graph", request_key, decision))
+                        cst, cres = await self._collect_seam(state, decision)
+                        self._collections += 1
+                        attempts += 1
+                        self._collection_attempts[request_key] = attempts
+                        res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
+                        collection_ok = res.get("ok") is True
+                        note = str(res.get("status") or res.get("reason") or "")
+                        collection_reason = str(res.get("collection_reason") or "")
+                        if collection_reason:
+                            note = f"{collection_reason}: {note}" if note else collection_reason
                         cycles.append(CycleRecord(
                             cycle,
                             "collect",
                             action="collect_graph",
-                            ok=False,
-                            note=f"collection retry budget exhausted for {request_key}",
+                            ok=collection_ok,
+                            note=note,
+                            decision_id=str(getattr(decision, "decision_id", "") or ""),
+                            policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                         ))
-                        return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
-                    if self.config.max_collections is not None and self._collections >= self.config.max_collections:
-                        blocker = {
-                            "reason": "configured global collection emergency cap exhausted",
-                            "collection_key": request_key,
-                            "attempts": attempts,
-                            "achieved": sorted(achieved),
-                        }
-                        cycles.append(CycleRecord(
-                            cycle,
-                            "collect",
-                            action="collect_graph",
-                            ok=False,
-                            note=f"configured global collection emergency cap exhausted at {self._collections}",
-                        ))
-                        return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
-                    transactions.append(_transaction_record("collection", "collect-graph", request_key, decision))
-                    cst, cres = await self._collect_seam(state, decision)
-                    self._collections += 1
-                    self._collection_attempts[request_key] = attempts + 1
-                    res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
-                    note = str(res.get("status") or res.get("reason") or "")
-                    collection_reason = str(res.get("collection_reason") or "")
-                    if collection_reason:
-                        note = f"{collection_reason}: {note}" if note else collection_reason
-                    cycles.append(CycleRecord(cycle, "collect", action="collect_graph",
-                                              ok=bool(res.get("ok", True)), note=note,
-                                              decision_id=str(getattr(decision, "decision_id", "") or ""),
-                                              policy_mode=str(getattr(decision, "policy_mode", "") or "")))
-                    ost, state = await self._seam(lambda: self._observe(), "observe")
-                    if ost != "ok" or state is None:
-                        blocker = {"reason": f"observe unavailable after collect: {state}"}
-                        return done(STATUS_NO_ACTION, "could not observe after collection")
-                    achieved = self._achieved(state)
-                    continue
+                        if not collection_ok and attempts >= self.config.max_collection_attempts_per_request:
+                            blocker = {
+                                "reason": note or "collection failed",
+                                "collection_key": request_key,
+                                "attempts": attempts,
+                                "achieved": sorted(achieved),
+                            }
+                            return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
+                        ost, state = await self._seam(lambda: self._observe(), "observe")
+                        if ost != "ok" or state is None:
+                            blocker = {"reason": f"observe unavailable after collect: {state}"}
+                            return done(STATUS_NO_ACTION, "could not observe after collection")
+                        achieved = self._achieved(state)
+                        continue
+                    action = selected
+                    phase = "execute"
 
-            # 4) frontier
-            frontier = list(self._frontier_fn(state) or [])
-            decision = None
-            if not frontier:
+            # 4) Resolve the already-computed capability frontier when collection was absent or not selected.
+            if action is None and not frontier:
                 if self._policy is not None:
                     blocker = {
                         "reason": "no admissible capability action from observed state",
@@ -618,7 +629,7 @@ class AutonomousController:
                     return done(STATUS_NO_ACTION, "empty frontier and no admissible route-discovery move")
                 action = candidate
                 phase = "route_discovery"
-            else:
+            elif action is None:
                 action, decision = await self._policy_select(state, frontier, decisions)
                 if decision is not None:
                     decisions.append(decision)

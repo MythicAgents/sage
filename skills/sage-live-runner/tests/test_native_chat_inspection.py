@@ -105,33 +105,57 @@ def test_resolve_latest_rejects_coerced_result_identity(
 
 def test_fetch_snapshot_sorts_messages_and_builds_full_transcript(monkeypatch):
     async def fake_query(_client, query, variables=None):
-        assert query == native_chat.REQUEST_QUERY
-        assert variables == {"requestId": 9}
+        if query == native_chat.REQUEST_QUERY:
+            assert variables == {"requestId": 9}
+            return {
+                "chat_request": [
+                    {
+                        "id": 9,
+                        "channel_id": 4,
+                        "request_message_id": 1,
+                        "status": "complete",
+                        "error": "",
+                    }
+                ],
+                "chat_message": [
+                    {
+                        "id": 3,
+                        "channel_id": 4,
+                        "chat_request_id": 9,
+                        "message": "final",
+                        "metadata": {
+                            "container_metadata": {
+                                "control_transitions": [
+                                    {
+                                        "event_id": "control:one",
+                                        "kind": "control_transition",
+                                        "phase": "request_installed",
+                                        "content": "request contract installed",
+                                    },
+                                    {
+                                        "event_id": "control:two",
+                                        "kind": "control_transition",
+                                        "phase": "request_terminal",
+                                        "content": "complete",
+                                    },
+                                ]
+                            }
+                        },
+                    },
+                ],
+            }
+        assert query == native_chat.REQUEST_MESSAGE_QUERY
+        assert variables == {"messageId": 1}
         return {
-            "chat_request": [
-                {
-                    "id": 9,
-                    "channel_id": 4,
-                    "status": "complete",
-                    "error": "",
-                }
-            ],
             "chat_message": [
-                {
-                    "id": 3,
-                    "channel_id": 4,
-                    "chat_request_id": 9,
-                    "message": "final",
-                    "metadata": {},
-                },
                 {
                     "id": 1,
                     "channel_id": 4,
-                    "chat_request_id": 9,
+                    "chat_request_id": None,
                     "message": "prompt",
                     "metadata": {},
                 },
-            ],
+            ]
         }
 
     monkeypatch.setattr(
@@ -148,6 +172,73 @@ def test_fetch_snapshot_sorts_messages_and_builds_full_transcript(monkeypatch):
     assert transcript["chat_channel_id"] == 4
     assert transcript["chat_request_id"] == 9
     assert transcript["status"] == "complete"
+    assert [
+        event["phase"]
+        for event in transcript["control_transitions"]
+    ] == ["request_installed", "request_terminal"]
+
+
+@pytest.mark.parametrize(
+    "operator_rows",
+    (
+        [],
+        [
+            {
+                "id": 1,
+                "channel_id": 4,
+                "chat_request_id": 9,
+                "message": "prompt",
+                "metadata": {},
+            }
+        ],
+        [
+            {
+                "id": 2,
+                "channel_id": 4,
+                "chat_request_id": None,
+                "message": "near match",
+                "metadata": {},
+            }
+        ],
+    ),
+)
+def test_fetch_snapshot_rejects_missing_or_wrong_operator_identity(
+    monkeypatch,
+    operator_rows,
+):
+    async def fake_query(_client, query, variables=None):
+        if query == native_chat.REQUEST_QUERY:
+            return {
+                "chat_request": [
+                    {
+                        "id": 9,
+                        "channel_id": 4,
+                        "request_message_id": 1,
+                        "status": "complete",
+                    }
+                ],
+                "chat_message": [
+                    {
+                        "id": 3,
+                        "channel_id": 4,
+                        "chat_request_id": 9,
+                        "message": "response only",
+                        "metadata": {},
+                    }
+                ],
+            }
+        assert query == native_chat.REQUEST_MESSAGE_QUERY
+        assert variables == {"messageId": 1}
+        return {"chat_message": operator_rows}
+
+    monkeypatch.setattr(
+        native_chat.mythic,
+        "execute_custom_query",
+        fake_query,
+    )
+
+    with pytest.raises(RuntimeError, match="operator message"):
+        asyncio.run(native_chat.fetch_request_snapshot(object(), 9))
 
 
 @pytest.mark.parametrize("returned_id", [10, True, 9.0, "9"])
@@ -207,6 +298,7 @@ def test_transcript_export_rejects_message_identity_drift():
                 "request": {
                     "id": 9,
                     "channel_id": 4,
+                    "request_message_id": 1,
                     "status": "complete",
                     "error": "",
                 },
@@ -214,10 +306,17 @@ def test_transcript_export_rejects_message_identity_drift():
                     {
                         "id": 1,
                         "channel_id": 4,
-                        "chat_request_id": 10,
+                        "chat_request_id": None,
                         "message": "prompt",
                         "metadata": {},
-                    }
+                    },
+                    {
+                        "id": 2,
+                        "channel_id": 4,
+                        "chat_request_id": 10,
+                        "message": "response",
+                        "metadata": {},
+                    },
                 ],
             }
         )
@@ -230,6 +329,7 @@ def test_transcript_export_rejects_missing_message_identity():
                 "request": {
                     "id": 9,
                     "channel_id": 4,
+                    "request_message_id": 1,
                     "status": "complete",
                     "error": "",
                 },
@@ -237,12 +337,170 @@ def test_transcript_export_rejects_missing_message_identity():
                     {
                         "id": 1,
                         "channel_id": 4,
+                        "chat_request_id": None,
                         "message": "prompt",
+                        "metadata": {},
+                    },
+                    {
+                        "id": 2,
+                        "channel_id": 4,
+                        "message": "response",
                         "metadata": {},
                     }
                 ],
             }
         )
+
+
+def test_transcript_export_rejects_response_only_near_match():
+    with pytest.raises(RuntimeError, match="exact operator message"):
+        native_chat.build_transcript_export(
+            {
+                "request": {
+                    "id": 9,
+                    "channel_id": 4,
+                    "request_message_id": 1,
+                    "status": "complete",
+                    "error": "",
+                },
+                "messages": [
+                    {
+                        "id": 2,
+                        "channel_id": 4,
+                        "chat_request_id": 9,
+                        "message": "same text is not the operator row",
+                        "metadata": {},
+                    },
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "control_transitions",
+    (
+        {"event_id": "not-a-list"},
+        [{"event_id": "missing-fields"}],
+        [
+            {
+                "event_id": "control:one",
+                "kind": "tool",
+                "phase": "request_terminal",
+                "content": "complete",
+            }
+        ],
+        [
+            {
+                "event_id": "control:one",
+                "kind": "control_transition",
+                "phase": "request_installed",
+                "content": "installed",
+            },
+            {
+                "event_id": "control:one",
+                "kind": "control_transition",
+                "phase": "request_terminal",
+                "content": "complete",
+            },
+        ],
+    ),
+)
+def test_transcript_export_rejects_invalid_typed_control_events(
+    control_transitions,
+):
+    snapshot = {
+        "request": {
+            "id": 9,
+            "channel_id": 4,
+            "request_message_id": 1,
+            "status": "complete",
+            "error": "",
+        },
+        "messages": [
+            {
+                "id": 1,
+                "channel_id": 4,
+                "chat_request_id": None,
+                "message": "prompt",
+                "metadata": {},
+            },
+            {
+                "id": 2,
+                "channel_id": 4,
+                "chat_request_id": 9,
+                "message": "response",
+                "metadata": {
+                    "control_transitions": control_transitions,
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="control transition"):
+        native_chat.build_transcript_export(snapshot)
+
+
+@pytest.mark.parametrize(
+    "control_transitions",
+    (
+        [],
+        [
+            {
+                "event_id": "control:bogus",
+                "kind": "control_transition",
+                "phase": "not_a_typed_phase",
+                "content": "nonsense",
+            }
+        ],
+        [
+            {
+                "event_id": "control:terminal",
+                "kind": "control_transition",
+                "phase": "request_terminal",
+                "content": "complete",
+            },
+            {
+                "event_id": "control:install",
+                "kind": "control_transition",
+                "phase": "request_installed",
+                "content": "request contract installed",
+            },
+        ],
+    ),
+)
+def test_transcript_export_rejects_incomplete_or_semantically_invalid_controls(
+    control_transitions,
+):
+    snapshot = {
+        "request": {
+            "id": 9,
+            "channel_id": 4,
+            "request_message_id": 1,
+            "status": "complete",
+            "error": "",
+        },
+        "messages": [
+            {
+                "id": 1,
+                "channel_id": 4,
+                "chat_request_id": None,
+                "message": "prompt",
+                "metadata": {},
+            },
+            {
+                "id": 2,
+                "channel_id": 4,
+                "chat_request_id": 9,
+                "message": "response",
+                "metadata": {
+                    "control_transitions": control_transitions,
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="control transition"):
+        native_chat.build_transcript_export(snapshot)
 
 
 @pytest.mark.parametrize(
@@ -638,4 +896,28 @@ def test_transcript_writer_is_atomic_json(tmp_path):
     )
 
     assert json.loads(output.read_text())["messages"] == [{"id": 1}]
+    assert output.stat().st_mode & 0o777 == 0o600
     assert not output.with_suffix(".json.tmp").exists()
+
+
+def test_default_transcript_path_is_private_durable_and_manifested(
+    tmp_path, monkeypatch
+):
+    durable = tmp_path / "history"
+    monkeypatch.setenv("SAGE_HISTORY_ROOT", str(durable))
+
+    output = native_chat.default_transcript_export_path(42)
+    native_chat.write_transcript_export(
+        output,
+        {
+            "schema": "sage-native-chat-transcript-v1",
+            "chat_request_id": 42,
+            "messages": [],
+        },
+    )
+    retention = native_chat.record_transcript_export(output, 42)
+
+    assert output.is_relative_to(durable)
+    assert retention["retention_class"] == "durable-private"
+    assert retention["manifested"] is True
+    assert (durable / "manifest.jsonl").is_file()

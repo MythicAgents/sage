@@ -1,3 +1,4 @@
+import copy
 import os
 import contextvars
 import inspect
@@ -1092,6 +1093,353 @@ _VOLATILE_OUTPUT_PATTERNS = [
 ]
 
 
+class _PrivateCollectionTransaction:
+    """One supervised collect_graph root owns every admitted child effect."""
+
+    _MAX_LIST_ATTEMPTS = 4
+
+    def __init__(self, *, contract, claim, root_args: dict[str, Any], request: Any, adapter: dict[str, Any]):
+        self.request_id = str(contract.request_id)
+        self.contract_digest = str(contract.digest)
+        self.claim_id = str(claim.get("approval_id") or "")
+        self.root_args = dict(root_args)
+        self.callback_id = str(root_args.get("callback_id") or "")
+        self.collection_key = str(root_args.get("collection_key") or "")
+        self.scope_domain = str(root_args.get("scope_domain") or "").strip().casefold()
+        self.profile = dict(adapter or {})
+        self.token = hashlib.sha256(
+            json.dumps(
+                {
+                    "approval_id": self.claim_id,
+                    "contract_digest": self.contract_digest,
+                    "root_args": self.root_args,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        self.zip_filename = f"bloodhound_{self.token}.zip"
+        self._phase = "probe_identity"
+        self._probe_round = 0
+        self._reverted = False
+        self._list_attempts = 0
+        self._steps: list[dict[str, Any]] = []
+        self._artifact: dict[str, str] | None = None
+        self._artifact_consumed = False
+
+    def _profile_text(self, key: str, default: str) -> str:
+        return str(self.profile.get(key, default) or "").strip()
+
+    @staticmethod
+    def _canonical(parameters: Any) -> str:
+        value = parameters
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    value = parsed
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _ascii_decimal(value: Any) -> str:
+        text = str(value or "")
+        return text if _re_mod.fullmatch(r"[0-9]+", text) else ""
+
+    def active_for(self, client: Any) -> bool:
+        contract = getattr(client, "_request_contract", None)
+        claim = getattr(client, "_active_approval_claim", None)
+        actions = claim.get("approved_actions") if isinstance(claim, dict) else None
+        approved = actions[0] if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], dict) else {}
+        return bool(
+            contract is not None
+            and isinstance(claim, dict)
+            and str(getattr(contract, "request_id", "") or "") == self.request_id
+            and str(getattr(contract, "digest", "") or "") == self.contract_digest
+            and str(claim.get("approval_id") or "") == self.claim_id
+            and str(claim.get("request_id") or "") == self.request_id
+            and str(claim.get("request_contract_digest") or "") == self.contract_digest
+            and str(approved.get("name") or "") == "collect_graph"
+            and approved.get("args") == self.root_args
+        )
+
+    def _current_step(self) -> dict[str, Any] | None:
+        return self._steps[-1] if self._steps else None
+
+    def _prior_step_blocker(self) -> str:
+        current = self._current_step()
+        if current is None:
+            return ""
+        if not current.get("task_id"):
+            return "prior collection child has no Mythic task"
+        if current.get("terminal_success") is not True:
+            return "prior collection child lacks terminal success"
+        return ""
+
+    def _expected_runner_parameters(self) -> dict[str, Any]:
+        return {
+            self._profile_text("dotnet_tool_param", "assembly_name"): "SharpHound.exe",
+            self._profile_text("dotnet_args_param", "assembly_arguments"): build_sharphound_arguments(
+                zip_filename=self.zip_filename,
+                domain=self.scope_domain,
+            ),
+        }
+
+    def _expected_ls_parameters(self) -> dict[str, Any]:
+        return {
+            self._profile_text("collection_ls_path_param", "path"): SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY,
+        }
+
+    def _reserve(self, kind: str, command: str, parameters: Any, *, next_phase: str) -> str:
+        self._steps.append({
+            "kind": kind,
+            "command": str(command or ""),
+            "parameters": self._canonical(parameters),
+            "callback_id": self.callback_id,
+            "task_id": "",
+            "terminal_success": False,
+            "terminal_status": "",
+            "next_phase": next_phase,
+            "authority_checks": [],
+        })
+        return ""
+
+    def _reserve_checked(self, kind: str, command: str, parameters: Any, *, next_phase: str, recheck: bool) -> str:
+        blocker = self._reserve(kind, command, parameters, next_phase=next_phase)
+        self._current_step()["authority_checks"] = ["recheck" if recheck else "top"]
+        return blocker
+
+    def _reserve_runner_or_revert(self, command: str, parameters: Any, *, recheck: bool) -> str:
+        revert_command = self._profile_text("collection_revert_command", "rev2self")
+        if not self._reverted and command == revert_command and self._canonical(parameters) == "":
+            self._reverted = True
+            return self._reserve_checked("revert", command, parameters, next_phase="probe_identity", recheck=recheck)
+        runner_command = self._profile_text("dotnet_runner_command", "execute_assembly")
+        if command != runner_command or self._canonical(parameters) != self._canonical(self._expected_runner_parameters()):
+            return "collection child command/arguments do not match the registered runner or revert step"
+        return self._reserve_checked("runner", command, parameters, next_phase="listing", recheck=recheck)
+
+    def reserve_child(
+        self,
+        *,
+        command: str,
+        parameters: Any,
+        callback_display_id: Any,
+        token_id: Any,
+        timeout: Any,
+        visibility_context: dict[str, Any] | None,
+        recheck: bool = False,
+    ) -> str:
+        if self._ascii_decimal(callback_display_id) != self.callback_id:
+            return "collection child does not match the bound callback"
+        if token_id is not None or int(timeout or 0) != 300:
+            return "collection child changed the reserved task envelope"
+        if str((visibility_context or {}).get("capability") or "") != "collect-graph":
+            return "collection child lacks exact collect-graph provenance"
+        current = self._current_step()
+        if (
+            current is not None
+            and not current.get("task_id")
+            and str(command or "") == current.get("command")
+            and self._canonical(parameters) == current.get("parameters")
+        ):
+            checks = list(current.get("authority_checks") or [])
+            next_check = "recheck" if recheck else "top"
+            if {
+                ("recheck",): "top",
+                ("recheck", "top"): "recheck",
+                ("top",): "recheck",
+            }.get(tuple(checks)) == next_check:
+                current["authority_checks"] = [*checks, next_check]
+                return ""
+        prior = self._prior_step_blocker()
+        if prior:
+            return prior
+        identity_command = self._profile_text("collection_identity_command", "whoami")
+        identity_parameters = self.profile.get("collection_identity_parameters", "")
+        ticket_command = self._profile_text("collection_ticket_command", "ticket_cache_list")
+        ticket_parameters = self.profile.get(
+            "collection_ticket_parameters",
+            {"luid": "", "getSystemTickets": False},
+        )
+        if self._phase == "probe_identity":
+            if command != identity_command or self._canonical(parameters) != self._canonical(identity_parameters):
+                return "collection child order requires the registered identity probe"
+            next_phase = "probe_ticket" if ticket_command else "after_probe"
+            return self._reserve_checked("identity", command, parameters, next_phase=next_phase, recheck=recheck)
+        if self._phase == "probe_ticket":
+            if command != ticket_command or self._canonical(parameters) != self._canonical(ticket_parameters):
+                return "collection child order requires the registered ticket probe"
+            return self._reserve_checked("ticket", command, parameters, next_phase="after_probe", recheck=recheck)
+        if self._phase == "after_probe":
+            return self._reserve_runner_or_revert(command, parameters, recheck=recheck)
+        if self._phase == "listing":
+            ls_command = self._profile_text("collection_ls_command", "ls")
+            if command == ls_command:
+                if self._list_attempts >= self._MAX_LIST_ATTEMPTS:
+                    return "collection child exceeded the bounded listing envelope"
+                if self._canonical(parameters) != self._canonical(self._expected_ls_parameters()):
+                    return "collection child arguments do not match the registered listing step"
+                return self._reserve_checked("ls", command, parameters, next_phase="listing", recheck=recheck)
+            download_command = self._profile_text("collection_download_command", "download")
+            if command != download_command or self._list_attempts < 1:
+                return "collection child order requires a bounded listing before download"
+            path = self._single_parameter(
+                parameters,
+                self._profile_text("collection_download_path_param", "path"),
+            )
+            bound_path, bound_filename = _contract_collection_download_binding(path, self.token)
+            if not bound_path or not bound_filename:
+                return "collection child download path does not match the current transaction artifact"
+            return self._reserve_checked("download", command, parameters, next_phase="artifact", recheck=recheck)
+        return "collection transaction admits no further Mythic task children"
+
+    @staticmethod
+    def _single_parameter(parameters: Any, expected_key: str) -> str:
+        value = parameters
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return ""
+        if not isinstance(value, dict) or len(value) != 1:
+            return ""
+        key, candidate = next(iter(value.items()))
+        if str(key or "").strip() != expected_key:
+            return ""
+        return str(candidate or "").strip().strip("\"'")
+
+    def bind_issue(self, command: str, parameters: Any, callback_display_id: Any) -> str:
+        current = self._current_step()
+        if current is None:
+            return ""
+        if (
+            current.get("task_id")
+            or str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+        ):
+            return "collection child final task bytes diverged from the reservation"
+        return ""
+
+    def record_created(self, command: str, parameters: Any, callback_display_id: Any, task_display_id: Any) -> None:
+        current = self._current_step()
+        if current is None or current.get("task_id"):
+            return
+        if (
+            str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+        ):
+            return
+        task_id = str(task_display_id or "").strip()
+        if task_id:
+            current["task_id"] = task_id
+            current["terminal_status"] = "created"
+
+    def record_terminal(
+        self,
+        command: str,
+        parameters: Any,
+        callback_display_id: Any,
+        task_display_id: Any,
+        *,
+        success: bool,
+        status: str,
+    ) -> None:
+        current = self._current_step()
+        if current is None:
+            return
+        if (
+            str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+            or str(task_display_id or "").strip() != current.get("task_id")
+        ):
+            return
+        current["terminal_success"] = success is True
+        current["terminal_status"] = str(status or ("completed" if success else "failed"))
+        if success is not True:
+            return
+        self._phase = str(current.get("next_phase") or self._phase)
+        if current.get("kind") == "revert":
+            self._probe_round += 1
+        elif current.get("kind") == "ls":
+            self._list_attempts += 1
+
+    def bind_artifact(self, *, file_uuid: Any, path: str, filename: str) -> str:
+        current = self._current_step()
+        if self._phase != "artifact" or current is None or current.get("kind") != "download":
+            return "collection artifact is unavailable before a completed download"
+        if current.get("terminal_success") is not True:
+            return "collection artifact is unavailable before download terminal success"
+        bound_path, bound_filename = _contract_collection_download_binding(path, self.token)
+        if not bound_path or not bound_filename or bound_filename != str(filename or ""):
+            return "collection artifact does not match the transaction token/path/filename"
+        if self._artifact is not None:
+            return "collection artifact is already bound"
+        file_id = str(file_uuid or "").strip()
+        if not file_id:
+            return "collection artifact file UUID is missing"
+        self._artifact = {
+            "file_uuid": file_id,
+            "path": bound_path,
+            "filename": bound_filename,
+            "task_id": str(current.get("task_id") or ""),
+            "callback_id": self.callback_id,
+            "command": str(current.get("command") or ""),
+        }
+        return ""
+
+    def reserve_ingest(self, args: dict[str, Any], visibility_context: dict[str, Any] | None) -> str:
+        if str((visibility_context or {}).get("capability") or "") != "collect-graph":
+            return "collection ingest lacks exact collect-graph provenance"
+        if self._artifact is None:
+            return "collection ingest has no bound artifact"
+        if self._artifact_consumed:
+            return "collection artifact was already consumed"
+        if str(args.get("file_uuid") or "") != self._artifact["file_uuid"]:
+            return "collection ingest file UUID does not match the bound artifact"
+        if self._ascii_decimal(args.get("callback_display_id")) != self.callback_id:
+            return "collection ingest callback does not match the bound artifact"
+        caller_name = str(args.get("file_name") or "")
+        if caller_name and caller_name != self._artifact["filename"]:
+            return "collection ingest filename does not match the bound artifact"
+        return ""
+
+    def ingest_blocker(self, args: dict[str, Any], source_metadata: Any) -> str:
+        if self._artifact is None:
+            return "collection artifact metadata is unavailable"
+        source = source_metadata if isinstance(source_metadata, dict) else {}
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        expected = self._artifact
+        path_values = [
+            str(source.get(key) or "").strip().replace("/", "\\")
+            for key in ("full_name", "full_path", "path", "remote_path")
+            if str(source.get(key) or "").strip()
+        ]
+        if (
+            str(source.get("agent_file_id") or "") != expected["file_uuid"]
+            or str(source.get("filename_utf8") or "") != expected["filename"]
+            or str(task.get("display_id") or "") != expected["task_id"]
+            or str(callback.get("display_id") or "") != expected["callback_id"]
+            or str(task.get("command_name") or "") != expected["command"]
+            or any(value.casefold() != expected["path"].casefold() for value in path_values)
+        ):
+            return "collection artifact metadata does not match the bound transaction"
+        if self._artifact_consumed:
+            return "collection artifact was already consumed"
+        self._artifact_consumed = True
+        return ""
+
+
 class MythicTools:
     """A class to manage Mythic API tools for LangChain agents.
 
@@ -1135,6 +1483,12 @@ class MythicTools:
         self._execution_observer = None
         self._turn_authority = None
         self._turn_authority_sink_reservation = ""
+        self._request_contract = None
+        # Native chat makes this explicit through ``set_request_contract``/``require_request_contract``.
+        # A channel id alone is also used by older test/eval adapters and is not an authority claim.
+        self._request_contract_required = False
+        self._active_approval_claim: dict[str, Any] | None = None
+        self._private_collection_transaction: _PrivateCollectionTransaction | None = None
         # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
         # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
         self.disabled_tools: set[str] = set()
@@ -1335,6 +1689,578 @@ class MythicTools:
             self._turn_authority_sink_reservation = ""
         self._turn_authority = authority
 
+    def set_request_contract(self, contract) -> None:
+        """Bind the typed native request contract at the final effect sink."""
+        try:
+            from .request_contract import RequestContract
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestContract  # type: ignore
+        if not isinstance(contract, RequestContract):
+            raise TypeError("request contract must be a RequestContract")
+        prior = getattr(self, "_request_contract", None)
+        if prior is None or getattr(prior, "digest", "") != contract.digest:
+            self._active_approval_claim = None
+        self._request_contract_required = True
+        self._request_contract = contract
+
+    def require_request_contract(self) -> None:
+        """Mark this client as native so absence of a contract cannot inherit legacy authority."""
+        self._request_contract_required = True
+
+    def set_approval_claim(self, context: Any) -> None:
+        """Bind the exact supervised approval currently resuming through the sink."""
+        try:
+            from sage_chat.hitl import (
+                approval_action_digest,
+                approval_action_fingerprint,
+                approval_proposal_digest,
+                approval_selection_digest,
+            )
+        except ImportError:  # pragma: no cover
+            from ...sage_chat.hitl import (  # type: ignore
+                approval_action_digest,
+                approval_action_fingerprint,
+                approval_proposal_digest,
+                approval_selection_digest,
+            )
+        try:
+            from .request_contract import (
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        except ImportError:  # pragma: no cover
+            from request_contract import (  # type: ignore
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        contract = getattr(self, "_request_contract", None)
+        if contract is None or not isinstance(context, dict):
+            raise ValueError("approval claim requires an active request contract")
+        actions = context.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("approval claim contains no canonical actions")
+        action_digest = approval_action_digest(actions)
+        action_ids = tuple(approval_action_fingerprint(action) for action in actions)
+        approved_ids = tuple(context.get("approved_action_ids") or ())
+        approved_actions = context.get("approved_actions")
+        selection_mode = str(context.get("selection_mode") or "")
+        if (
+            str(context.get("request_id") or "") != contract.request_id
+            or str(context.get("request_contract_digest") or "")
+            != contract.digest
+            or str(context.get("action_digest") or "") != action_digest
+            or str(context.get("proposal_digest") or "")
+            != approval_proposal_digest(contract.digest, action_digest)
+            or not approved_ids
+            or selection_mode
+            != ("exact_one" if len(actions) > 1 else "single")
+            or len(approved_ids) != 1
+            or len(approved_ids) != len(set(approved_ids))
+            or any(action_id not in action_ids for action_id in approved_ids)
+            or not isinstance(approved_actions, list)
+            or approved_actions != [
+                action
+                for action, action_id in zip(actions, action_ids)
+                if action_id in approved_ids
+            ]
+            or str(context.get("selection_digest") or "")
+            != approval_selection_digest(
+                contract.digest,
+                action_digest,
+                approved_ids,
+            )
+        ):
+            raise ValueError("approval claim is stale or mismatched")
+        for action in approved_actions:
+            denial = contract_action_denial_reason(
+                contract,
+                action_spec_from_tool_call(action),
+            )
+            if denial:
+                raise ValueError(f"approval claim action is not permitted: {denial}")
+        self._active_approval_claim = {
+            key: (
+                [copy.deepcopy(action) for action in context.get(key, [])]
+                if key in {"actions", "approved_actions"}
+                else list(approved_ids)
+                if key == "approved_action_ids"
+                else str(context.get(key) or "")
+            )
+            for key in (
+                "approval_id",
+                "request_id",
+                "request_contract_digest",
+                "tool_name",
+                "selection_mode",
+                "actions",
+                "approved_actions",
+                "approved_action_ids",
+                "action_digest",
+                "proposal_digest",
+                "selection_digest",
+            )
+        }
+
+    def clear_approval_claim(self) -> None:
+        self._active_approval_claim = None
+
+    def _begin_private_collection_transaction(
+        self,
+        root_args: dict[str, Any],
+        *,
+        request: Any,
+        adapter: dict[str, Any] | None,
+    ) -> str:
+        """Start the one supervised collect_graph transaction for the active claim."""
+        try:
+            from .request_contract import RequestLane
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestLane  # type: ignore
+        contract = getattr(self, "_request_contract", None)
+        if contract is None or getattr(contract, "lane", None) != RequestLane.SUPERVISED_WORKFLOW:
+            self._private_collection_transaction = None
+            return ""
+        claim = getattr(self, "_active_approval_claim", None)
+        if not isinstance(claim, dict):
+            return "supervised collect_graph lacks an exact active approval claim"
+        if (
+            str(claim.get("request_id") or "") != str(getattr(contract, "request_id", "") or "")
+            or str(claim.get("request_contract_digest") or "") != str(getattr(contract, "digest", "") or "")
+        ):
+            return "supervised collect_graph lacks an exact active approval claim"
+        actions = claim.get("approved_actions")
+        if not isinstance(actions, list) or len(actions) != 1:
+            return "supervised collect_graph lacks an exact active approval claim"
+        approved = actions[0] if isinstance(actions[0], dict) else {}
+        if str(approved.get("name") or "") != "collect_graph" or not isinstance(approved.get("args"), dict):
+            return "supervised collect_graph lacks an exact active approval claim"
+        expected = dict(approved["args"])
+        authority_fields = {
+            "collection_key",
+            "scope_domain",
+            "reason",
+            "support",
+            "callback_id",
+            "host",
+            "agent",
+            "identity",
+        }
+        actual = {key: root_args.get(key) for key in authority_fields}
+        bound = {key: expected.get(key) for key in authority_fields}
+        if not _PrivateCollectionTransaction._ascii_decimal(actual.get("callback_id")):
+            return "supervised collect_graph requires an exact ASCII callback"
+        if actual != bound:
+            return "supervised collect_graph root does not match the exact active approval"
+        callback_id = _PrivateCollectionTransaction._ascii_decimal(expected.get("callback_id"))
+        if not callback_id:
+            return "supervised collect_graph requires an exact ASCII callback"
+        foothold = getattr(request, "foothold", None)
+        request_bound = {
+            "collection_key": str(getattr(request, "collection_key", "") or ""),
+            "scope_domain": str(getattr(request, "scope_domain", "") or ""),
+            "reason": str(getattr(request, "reason", "") or ""),
+            "support": str(getattr(request, "support", "") or ""),
+            "callback_id": str(getattr(foothold, "callback_id", "") or ""),
+            "host": str(getattr(foothold, "host", "") or ""),
+            "agent": str(getattr(foothold, "agent", "") or ""),
+            "identity": str(getattr(foothold, "identity", "") or ""),
+        }
+        if request_bound != bound:
+            return "supervised collect_graph root does not match the exact active approval"
+        current = getattr(self, "_private_collection_transaction", None)
+        if isinstance(current, _PrivateCollectionTransaction) and current.active_for(self):
+            return "supervised collect_graph transaction is already active"
+        self._private_collection_transaction = _PrivateCollectionTransaction(
+            contract=contract,
+            claim=claim,
+            root_args=expected,
+            request=request,
+            adapter=dict(adapter or {}),
+        )
+        return ""
+
+    def _private_collection_transaction_active(self) -> bool:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        return bool(
+            isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+        )
+
+    def _private_collection_transaction_token(self) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        return (
+            transaction.token
+            if isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+            else ""
+        )
+
+    def _bind_private_collection_artifact(self, *, file_uuid: Any, path: str, filename: str) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+            return ""
+        return transaction.bind_artifact(file_uuid=file_uuid, path=path, filename=filename)
+
+    def _private_collection_ingest_blocker(self, args: dict[str, Any], source_metadata: Any) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+            return ""
+        return transaction.ingest_blocker(args, source_metadata)
+
+    @staticmethod
+    def _request_action_callback(arguments: dict[str, Any]) -> str:
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        return action_binding_values(arguments).callback_id
+
+    @staticmethod
+    def _request_action_capability(arguments: dict[str, Any]) -> str:
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        return action_binding_values(arguments).capability
+
+    def _effective_request_action_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize omitted Python defaults without authorizing transformed effect values."""
+        try:
+            from .request_contract import canonical_action_arguments
+        except ImportError:  # pragma: no cover
+            from request_contract import canonical_action_arguments  # type: ignore
+        values = dict(arguments)
+        method = getattr(self, tool_name, None)
+        if callable(method):
+            try:
+                for name, parameter in inspect.signature(method).parameters.items():
+                    if (
+                        name not in values
+                        and parameter.default is not inspect.Parameter.empty
+                    ):
+                        values[name] = parameter.default
+            except (TypeError, ValueError):
+                pass
+        if tool_name == "issue_task_and_waitfor_task_output":
+            if values.get("timeout") is None:
+                values["timeout"] = 300
+            if values.get("parameters") in (None, {}, "", "{}", '""', "''"):
+                values["parameters"] = ""
+            elif _normalize_command_name(values.get("command")) == "shell":
+                # The approval claim captures the model's structured proposal
+                # (`{"command": "whoami"}`) while the effect path passes the flattened shell
+                # string (`"whoami"`). Both denote the same effect, so canonicalize to the
+                # product's existing shell form on BOTH sides of the coverage comparison. Without
+                # this an approved shell action can never execute: coverage denies on the shape
+                # difference, the agent re-proposes, and the request livelocks (ISC-49R S4-01,
+                # channel 40 / request 55 — three identical approvals, zero Mythic tasks).
+                shell_text = _shell_parameter_text(values.get("parameters"))
+                if shell_text:
+                    values["parameters"] = shell_text
+        elif tool_name == "sandbox_exec":
+            timeout = values.get("timeout")
+            values["timeout"] = 30 if timeout is None else max(1, min(int(timeout), 120))
+        canonical = canonical_action_arguments(values)
+        if not isinstance(canonical, dict):  # pragma: no cover - guarded above
+            raise ValueError("effective action arguments are not an object")
+        return canonical
+
+    def _approved_workflow_child(
+        self,
+        root_name: str,
+        root_args: dict[str, Any],
+        tool_name: str,
+        actual_args: dict[str, Any],
+        visibility_context: dict[str, Any] | None,
+        *,
+        recheck: bool = False,
+    ) -> bool:
+        """Admit only declared internal effects of the exact approved workflow root."""
+        if root_name == "collect_graph":
+            transaction = getattr(self, "_private_collection_transaction", None)
+            if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+                return False
+            if tool_name == "issue_task_and_waitfor_task_output":
+                return not transaction.reserve_child(
+                    command=str(actual_args.get("command") or ""),
+                    parameters=actual_args.get("parameters"),
+                    callback_display_id=actual_args.get("callback_display_id"),
+                    token_id=actual_args.get("token_id"),
+                    timeout=actual_args.get("timeout"),
+                    visibility_context=visibility_context,
+                    recheck=recheck,
+                )
+            if tool_name == "ingest_collection":
+                return not transaction.reserve_ingest(actual_args, visibility_context)
+            return False
+        children = {
+            "execute_capability": {
+                "materialize_capability_inputs",
+                "upload_file_by_file_uuid",
+                "ensure_tool_uploaded",
+                "issue_task_and_waitfor_task_output",
+            },
+            "materialize_capability_inputs": {
+                "upload_file_by_file_uuid",
+                "issue_task_and_waitfor_task_output",
+            },
+            "upload_file_by_file_uuid": {
+                "issue_task_and_waitfor_task_output",
+            },
+        }
+        if tool_name not in children.get(root_name, set()):
+            return False
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        try:
+            root_bindings = action_binding_values(root_args)
+            actual_bindings = action_binding_values(actual_args)
+        except ValueError:
+            return False
+        root_callback = root_bindings.callback_id
+        actual_callback = actual_bindings.callback_id
+        if root_callback and actual_callback != root_callback:
+            return False
+        if root_name == "upload_file_by_file_uuid":
+            mapped = {
+                key: root_args.get(key)
+                for key in ("command", "parameters", "callback_display_id", "token_id", "timeout")
+                if key in root_args
+            }
+            return all(actual_args.get(key) == value for key, value in mapped.items())
+        expected_capability = root_bindings.capability
+        ambient_capability = self._capability_text(
+            (visibility_context or {}).get("capability")
+        )
+        explicit_capability = actual_bindings.capability
+        if (
+            ambient_capability
+            and explicit_capability
+            and ambient_capability != explicit_capability
+        ):
+            return False
+        observed_capability = explicit_capability or ambient_capability
+        if expected_capability and observed_capability != expected_capability:
+            return False
+        # A declared child must carry positive provenance for every root binding. The allowed-kind
+        # table is necessary but never sufficient on its own.
+        return bool(
+            (not root_callback or actual_callback == root_callback)
+            and (
+                not expected_capability
+                or observed_capability == expected_capability
+            )
+            and (root_callback or expected_capability)
+        )
+
+    def _approval_effect_blocker(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        visibility_context: dict[str, Any] | None = None,
+        recheck: bool = False,
+    ) -> str:
+        try:
+            from .request_contract import (
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        except ImportError:  # pragma: no cover
+            from request_contract import (  # type: ignore
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        contract = self._request_contract
+        claim = getattr(self, "_active_approval_claim", None)
+        actions = (
+            claim.get("approved_actions")
+            if isinstance(claim, dict)
+            else None
+        )
+        if not isinstance(actions, list) or not actions:
+            return "supervised request lacks an exact active approval claim"
+        try:
+            actual_effective = self._effective_request_action_arguments(tool_name, args)
+        except (TypeError, ValueError) as exc:
+            return f"effect arguments are not canonical: {exc}"
+        trace: list[dict[str, Any]] = []
+        for root in actions:
+            if not isinstance(root, dict):
+                continue
+            root_name = str(root.get("name") or "")
+            root_args = root.get("args")
+            if not isinstance(root_args, dict):
+                continue
+            root_spec = action_spec_from_tool_call(root)
+            denial = contract_action_denial_reason(contract, root_spec)
+            if denial:
+                trace.append({"root": root_name, "outcome": "contract_denied_root",
+                              "denial": str(denial)})
+                continue
+            if root_name == tool_name:
+                try:
+                    expected_effective = self._effective_request_action_arguments(
+                        root_name,
+                        root_args,
+                    )
+                except (TypeError, ValueError) as exc:
+                    trace.append({"root": root_name, "outcome": "root_args_not_canonical",
+                                  "error": str(exc)})
+                    continue
+                if expected_effective == actual_effective:
+                    return ""
+                trace.append({"root": root_name, "outcome": "effective_args_mismatch",
+                              "expected": expected_effective, "actual": actual_effective})
+            else:
+                trace.append({"root": root_name, "outcome": "name_mismatch",
+                              "tool_name": tool_name})
+            if self._approved_workflow_child(
+                root_name,
+                root_args,
+                tool_name,
+                actual_effective,
+                visibility_context,
+                recheck=recheck,
+            ):
+                return ""
+        # ISC-49R S4-01: an approved action that never executes livelocks the request, and the
+        # blocker string alone cannot distinguish "contract forbids this root" from "arguments
+        # differ". Log-only; the return value below is unchanged.
+        try:
+            logger.warning(
+                "approval-coverage denial: tool=%s claim=%s contract_digest=%s "
+                "claim_contract_digest=%s roots=%s",
+                tool_name,
+                (claim or {}).get("approval_id"),
+                getattr(contract, "digest", None),
+                (claim or {}).get("request_contract_digest"),
+                json.dumps(trace, default=str, sort_keys=True)[:4000],
+            )
+        except Exception:  # pragma: no cover - diagnostics must never break the effect path
+            pass
+        return "approved proposal does not cover this exact effect"
+
+    def _note_effect_denial(self, blocker: str) -> str:
+        """Minimal loop-breaker (denial-routing spec, staged). When an APPROVED supervised effect is
+        refused at the boundary, record the reason so the resume loop returns it to the operator and
+        terminalises instead of letting the model blindly re-propose the same action into the same gate.
+        Returns `blocker` unchanged; never breaks the effect path on bookkeeping."""
+        try:
+            if not blocker:
+                return blocker
+            claim = getattr(self, "_active_approval_claim", None)
+            contract = getattr(self, "_request_contract", None)
+            lane = getattr(contract, "lane", None)
+            try:
+                from .request_contract import RequestLane
+            except ImportError:  # pragma: no cover
+                from request_contract import RequestLane  # type: ignore
+            if isinstance(claim, dict) and lane == RequestLane.SUPERVISED_WORKFLOW:
+                self._last_effect_denial = {"reason": str(blocker)[:600]}
+        except Exception:  # pragma: no cover - diagnostics must never break the effect path
+            pass
+        return blocker
+
+    def _request_contract_identity_blocker(
+        self,
+        tool_name: str = "",
+        args: dict[str, Any] | None = None,
+        *,
+        visibility_context: dict[str, Any] | None = None,
+        recheck: bool = False,
+    ) -> str:
+        """Fail closed when native contract identity diverges at an effect boundary."""
+        contract = getattr(self, "_request_contract", None)
+        if contract is None:
+            return (
+                "native effect sink has no installed request contract"
+                if getattr(self, "_request_contract_required", False)
+                else ""
+            )
+        try:
+            from .request_contract import RequestContract, RequestIntent, RequestLane
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestContract, RequestIntent, RequestLane  # type: ignore
+        if not isinstance(contract, RequestContract):
+            return "installed request contract has an invalid type"
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return "request contract has no final-sink enforcement projection"
+        if (
+            str(getattr(authority, "request_id", "") or "") != contract.request_id
+            or str(getattr(authority, "request_contract_digest", "") or "")
+            != contract.digest
+        ):
+            return "request contract digest does not match the final-sink enforcement projection"
+        if contract.intent == RequestIntent.STOP:
+            return "stopped request denies external effects"
+        if contract.lane == RequestLane.CONVERSATIONAL:
+            return "conversational request denies external effects"
+        if contract.lane == RequestLane.SUPERVISED_WORKFLOW:
+            claim = getattr(self, "_active_approval_claim", None)
+            if (
+                not isinstance(claim, dict)
+                or claim.get("request_id") != contract.request_id
+                or claim.get("request_contract_digest") != contract.digest
+            ):
+                return "supervised request lacks an exact active approval claim"
+            if tool_name:
+                return self._approval_effect_blocker(
+                    tool_name,
+                    dict(args or {}),
+                    visibility_context=visibility_context,
+                    recheck=recheck,
+                )
+        elif tool_name:
+            try:
+                from .request_contract import (
+                    action_spec_from_tool_call,
+                    contract_action_denial_reason,
+                )
+            except ImportError:  # pragma: no cover
+                from request_contract import (  # type: ignore
+                    action_spec_from_tool_call,
+                    contract_action_denial_reason,
+                )
+            try:
+                denial = contract_action_denial_reason(
+                    contract,
+                    action_spec_from_tool_call({
+                        "name": tool_name,
+                        "args": dict(args or {}),
+                    }),
+                )
+            except ValueError as exc:
+                return f"effect arguments are not canonical: {exc}"
+            if denial:
+                return denial
+        return ""
+
+    def _require_request_contract_effect(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        visibility_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Enforce native request identity at an effectful tool's final method boundary."""
+        blocker = self._request_contract_identity_blocker(
+            tool_name,
+            args,
+            visibility_context=visibility_context,
+        )
+        if blocker:
+            raise PermissionError(
+                f"STOP — request contract denied `{tool_name}`: {blocker}"
+            )
+
     def _turn_authority_issue_blocker(
         self,
         command: str,
@@ -1342,13 +2268,34 @@ class MythicTools:
         *,
         parameters: Any = None,
         token_id: Any = None,
+        timeout: Any = None,
         visibility_context: dict | None = None,
         recheck: bool = False,
     ) -> str:
+        request_visibility = dict(
+            visibility_context or _task_visibility_context.get() or {}
+        )
+        contract_blocker = self._request_contract_identity_blocker(
+            "issue_task_and_waitfor_task_output",
+            {
+                "command": command,
+                "parameters": parameters,
+                "callback_display_id": callback_display_id,
+                "token_id": token_id,
+                "timeout": timeout,
+                "visibility_context": visibility_context,
+            },
+            visibility_context=request_visibility,
+            recheck=recheck,
+        )
+        if contract_blocker:
+            return f"STOP — request contract denied Mythic task issue: {contract_blocker}"
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
         authority = getattr(self, "_turn_authority", None)
         if authority is None:
             return ""
-        context = dict(visibility_context or _task_visibility_context.get() or {})
+        context = request_visibility
         # The final normalized parameters are authoritative. Never let an earlier visibility
         # context shadow them with a benign value while a different task payload is issued.
         context["parameters"] = parameters
@@ -1379,6 +2326,15 @@ class MythicTools:
         return f"STOP — turn authority denied Mythic task issue: {reason}"
 
     def _turn_authority_guarded_tool_blocker(self, tool_name: str, args: dict[str, Any]) -> str:
+        contract_blocker = self._request_contract_identity_blocker(
+            tool_name,
+            args,
+            visibility_context=_task_visibility_context.get() or {},
+        )
+        if contract_blocker:
+            return f"STOP — request contract denied guarded action: {contract_blocker}"
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
         authority = getattr(self, "_turn_authority", None)
         if authority is None:
             return ""
@@ -1401,6 +2357,8 @@ class MythicTools:
         *,
         source_metadata: Any,
     ) -> str:
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
         authority = getattr(self, "_turn_authority", None)
         if authority is None:
             return ""
@@ -2613,6 +3571,10 @@ class MythicTools:
             str: JSON string describing whether the payload was deleted or refused, and why.
         """
         # HITL: guarded
+        self._require_request_contract_effect("delete_payload", {
+            "payload_uuid": payload_uuid,
+            "confirm_delete_successful": confirm_delete_successful,
+        })
         preflight_query = """
             query PayloadDeletePreflight($uuid: String!) {
               payload(where: {uuid: {_eq: $uuid}}) {
@@ -2876,6 +3838,14 @@ class MythicTools:
             str: JSON string containing the created payload information.
         """
         # HITL: guarded
+        self._require_request_contract_effect("create_payload", {
+            "payload_type_name": payload_type_name,
+            "filename": filename,
+            "operating_system": operating_system,
+            "c2_profiles": c2_profiles,
+            "build_parameters": build_parameters,
+            "description": description,
+        })
         # uuid is the Payload UUID not to be confused with the Mythic file UUID
         custom_attributes = """
         build_phase
@@ -3615,12 +4585,13 @@ class MythicTools:
             callback_display_id,
             parameters=parameters,
             token_id=token_id,
+            timeout=timeout,
             visibility_context=visibility_context,
             recheck=True,
         )
         if authority_blocker:
             self._pending_task_backed_transition = None
-            return authority_blocker
+            return self._note_effect_denial(authority_blocker)
         self._pending_task_backed_transition = None
         collection_reservation_blocker = self._reserve_contract_collection_attempt(
             command,
@@ -3657,7 +4628,7 @@ class MythicTools:
         liveness_blocker = await self._callback_tasking_liveness_blocker(callback_display_id)
         if liveness_blocker:
             self._pending_task_backed_transition = None
-            return liveness_blocker
+            return self._note_effect_denial(liveness_blocker)
 
         # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
         # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
@@ -3849,6 +4820,7 @@ class MythicTools:
             callback_display_id,
             parameters=parameters,
             token_id=token_id,
+            timeout=timeout,
             visibility_context=visibility_context,
         )
         if authority_blocker:
@@ -3880,6 +4852,7 @@ class MythicTools:
                         callback_display_id,
                         parameters=parameters,
                         token_id=token_id,
+                        timeout=timeout,
                         visibility_context=visibility_context,
                         recheck=True,
                     )
@@ -3919,6 +4892,7 @@ class MythicTools:
                             callback_display_id,
                             parameters=parameters,
                             token_id=token_id,
+                            timeout=timeout,
                             visibility_context=visibility_context,
                             recheck=True,
                         )
@@ -4832,6 +5806,9 @@ class MythicTools:
         The invariant is simple: classifier/gate decisions can stage intent, but operational state is committed
         only when Mythic returns a concrete task display_id for the command that will produce the effect.
         """
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            transaction.record_created(command, parameters, callback_display_id, task_display_id)
         self._record_contract_task_created(
             command,
             parameters,
@@ -4963,6 +5940,11 @@ class MythicTools:
         callback_display_id,
     ) -> str:
         """Bind a reserved collection step to the final authority-checked issue bytes."""
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            blocker = transaction.bind_issue(command, parameters, callback_display_id)
+            if blocker:
+                return f"STOP — supervised collection denied: {blocker}"
         request = self._active_contract_collection_request()
         if request is None:
             return ""
@@ -5029,6 +6011,16 @@ class MythicTools:
         success: bool,
         status: str,
     ) -> None:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            transaction.record_terminal(
+                command,
+                parameters,
+                callback_display_id,
+                task_display_id,
+                success=success,
+                status=status,
+            )
         record = self._contract_task_record(command, parameters, callback_display_id)
         task_id = str(task_display_id or "").strip()
         if record is None or not task_id or str(record.get("task_id") or "") != task_id:
@@ -7789,16 +8781,16 @@ class MythicTools:
         if isinstance(action, capabilities_mod.CapabilityAction):
             return action
 
-        value = self._capability_json_value(action)
-        if isinstance(value, str):
-            data = {"name": value}
-        elif isinstance(value, dict):
-            data = dict(value)
-        else:
+        try:
+            from .request_contract import parse_capability_request
+        except ImportError:  # pragma: no cover
+            from request_contract import parse_capability_request  # type: ignore
+        try:
+            parsed_request = parse_capability_request(action, inputs)
+        except ValueError:
             return None
-
-        intent = self._capability_json_value(data.get("intent"))
-        intent = dict(intent) if isinstance(intent, dict) else {}
+        data = dict(parsed_request.action_data)
+        intent = dict(parsed_request.intent)
         for key in (
             "capability", "domain", "source_domain", "target_domain", "effect_domain",
             "gpo", "gpo_name", "gponame", "gpo_display_name",
@@ -7842,12 +8834,9 @@ class MythicTools:
             if key in inputs and key not in intent:
                 intent[key] = inputs[key]
 
-        name = self._capability_text(
-            data.get("name") or data.get("capability") or intent.get("capability") or inputs.get("capability")
-        )
+        name = parsed_request.bindings.capability
         if not name:
             return None
-        name = self._canonical_capability_name(name, intent, inputs)
         intent["capability"] = name
         if name == "gpo-controlled-system-exec" and not self._capability_text(
             intent.get("gpo") or intent.get("gpo_name") or intent.get("gponame") or intent.get("gpo_display_name")
@@ -7897,28 +8886,6 @@ class MythicTools:
             source_facts=source_facts,
         )
 
-    def _canonical_capability_name(self, name: str, intent: dict, inputs: dict) -> str:
-        capability = self._capability_text(name).strip()
-        normalized = capability.casefold()
-        if normalized in {
-            "prove-domain-admin-control",
-            "prove-administrative-control",
-            "domain-admin-control-proof",
-            "administrative-control-proof",
-            "prove-domain-control",
-        }:
-            return "ensure-kerberos-context"
-        if normalized == "dcsync":
-            raw_account = self._capability_text(
-                inputs.get("account") or inputs.get("user") or inputs.get("target_account")
-                or intent.get("account") or intent.get("user") or intent.get("target_account")
-            ).casefold()
-            account = self._canonical_credential_account(raw_account)
-            if not account or account == "krbtgt":
-                return "dcsync-krbtgt"
-            return "dcsync-account"
-        return capability
-
     async def execute_capability(
         self,
         action: Annotated[dict | str, (
@@ -7942,6 +8909,10 @@ class MythicTools:
         replay a command list by hand. Currently materialization is implemented for
         `adcs-certificate-auth`; other builder-backed capabilities are executed from their adapter plan.
         """
+        self._require_request_contract_effect("execute_capability", {
+            "action": action,
+            "inputs": inputs,
+        })
         try:
             if self.client is None:
                 return json.dumps({
@@ -8701,6 +9672,11 @@ class MythicTools:
         `build_capability_commands`. The payload adapter must perform the target-account certificate
         forge through Mythic tasking; Sage never forges the account certificate locally.
         """
+        self._require_request_contract_effect(
+            "materialize_capability_inputs",
+            {"action": action, "inputs": inputs},
+            visibility_context=_task_visibility_context.get() or {},
+        )
         try:
             if self.client is None:
                 return json.dumps({
@@ -14281,23 +15257,25 @@ class MythicTools:
         return domain
 
     def _capability_callback_id(self, action, inputs: dict) -> str:
-        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-        target_fields = {}
         try:
-            for part in self._capability_text(getattr(action, "target", "")).split(";"):
-                if "=" in part:
-                    key, value = part.split("=", 1)
-                    target_fields[key.strip().casefold()] = value.strip()
-        except Exception:
-            target_fields = {}
-        callback_id = self._capability_text(
-            inputs.get("callback_id") or inputs.get("callback") or inputs.get("callback_display_id")
-            or intent.get("callback_id") or intent.get("callback") or intent.get("callback_display_id")
-            or target_fields.get("callback") or target_fields.get("callback_id")
-        ).casefold().lstrip("#")
-        if callback_id.startswith("cb") and callback_id[2:].isdigit():
-            return callback_id[2:]
-        return callback_id
+            from .request_contract import parse_capability_request
+        except ImportError:  # pragma: no cover
+            from request_contract import parse_capability_request  # type: ignore
+        if isinstance(action, dict) or isinstance(action, str):
+            action_value = action
+        else:
+            action_value = {
+                "name": getattr(action, "name", ""),
+                "intent": getattr(action, "intent", {}),
+                "target": getattr(action, "target", ""),
+            }
+        try:
+            return parse_capability_request(
+                action_value,
+                inputs,
+            ).bindings.callback_id
+        except ValueError:
+            return ""
 
     def _capability_target_host_from_context(self, context: dict) -> str:
         action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
@@ -15122,7 +16100,19 @@ class MythicTools:
         Caveat: file_uuid is the Mythic *file* UUID (`agent_file_id` from create_payload), NOT the
         payload `uuid`; the command's target parameter must be type "File", never "String"."""
         # HITL: guarded
-        
+        self._require_request_contract_effect(
+            "upload_file_by_file_uuid",
+            {
+                "command": command,
+                "parameters": parameters,
+                "file_uuid": file_uuid,
+                "callback_display_id": callback_display_id,
+                "token_id": token_id,
+                "timeout": timeout,
+            },
+            visibility_context=_task_visibility_context.get() or {},
+        )
+
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling upload_file_by_file_uuid tool for file UUID {file_uuid} and callback_display_id {callback_display_id}")
@@ -15329,6 +16319,17 @@ class MythicTools:
             resolved_by = "callback:" + str(callback_display_id)
         else:
             return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
+        private_blocker = self._private_collection_ingest_blocker(
+            authority_ingest_args,
+            source_metadata,
+        )
+        if private_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "file_uuid": file_uuid,
+                "error": f"STOP — supervised collection denied: {private_blocker}",
+            }, sort_keys=True)
         authority_blocker = self._contract_collection_ingest_blocker(
             authority_ingest_args,
             source_metadata,
@@ -15687,6 +16688,13 @@ class MythicTools:
         (default plaintext). `account` = username, `realm` = domain. State-changing (HITL-gated).
         """
         # HITL: guarded (mutates the Mythic credential store)
+        self._require_request_contract_effect("add_credential", {
+            "credential": credential,
+            "account": account,
+            "realm": realm,
+            "credential_type": credential_type,
+            "comment": comment,
+        })
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         if not (credential or "").strip():
@@ -16583,6 +17591,11 @@ class MythicTools:
         "file not found by name" — the file is just unregistered, not unavailable.
         """
         # HITL: free
+        self._require_request_contract_effect(
+            "ensure_tool_uploaded",
+            {"binary_filename": binary_filename},
+            visibility_context=_task_visibility_context.get() or {},
+        )
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ensure_tool_uploaded tool (binary={binary_filename!r})")
@@ -16666,6 +17679,10 @@ class MythicTools:
         and receive approval before calling.
         """
         # HITL: guarded
+        self._require_request_contract_effect(
+            "download_tool",
+            {"binary_filename": binary_filename},
+        )
         import hashlib, io, zipfile
         logger.debug(f"🛠️ Calling download_tool tool (binary={binary_filename!r})")
         # 1. Find the TTP carrying this binary_filename. Multiple TTPs may share the same
@@ -16829,6 +17846,11 @@ class MythicTools:
         Returns:
             str: JSON {status, exit_code, stdout, stderr, timed_out, truncated} or {status:error,...}.
         """
+        self._require_request_contract_effect("sandbox_exec", {
+            "code_or_command": code_or_command,
+            "language": language,
+            "timeout": timeout,
+        })
         try:
             import docker  # noqa: F401  (lazy: module must import even when the SDK is absent)
         except ImportError:

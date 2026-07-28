@@ -49,9 +49,41 @@ class ChatStreamEmitter:
             # records a failed stream without raising into the graph's astream loop.
             return False
 
+    async def emit_final_response(
+        self,
+        *,
+        event_id: str,
+        content: str,
+        control_transitions: list[dict[str, str]] | None = None,
+    ) -> bool:
+        """Project a lifecycle-owned terminal text block with its evidence ID."""
+        if not event_id or not content:
+            return False
+        response_key = f"event:{event_id}"
+        try:
+            await self._chat.send_text(
+                self._request,
+                response_key,
+                content=content,
+                metadata={
+                    "event_id": event_id,
+                    **(
+                        {"control_transitions": control_transitions}
+                        if control_transitions
+                        else {}
+                    ),
+                },
+            )
+            self.last_response_key = response_key
+            self.last_content = content
+            return True
+        except Exception:
+            return False
+
     async def emit_tool_use(
         self,
         *,
+        event_id: str = "",
         tool_call_id: str,
         tool_name: str,
         tool_source: str,
@@ -71,7 +103,11 @@ class ChatStreamEmitter:
         UI updates the card in place. Separate from assistant text keys and the turn terminal, so it
         never touches the always-terminal invariant. Fail-soft: returns False on send errors.
         """
-        response_key = f"tool_use:{tool_call_id}:{tool_name}"
+        response_key = (
+            f"event:{event_id}"
+            if event_id
+            else f"tool_use:{tool_call_id}:{tool_name}"
+        )
         tool_use: dict[str, Any] = {
             "status": status,
             "tool_name": tool_name,
@@ -89,7 +125,13 @@ class ChatStreamEmitter:
             # metadata, and serves it lazily via "View output" (never in normal subscriptions), so a big
             # result never inflates the chat message.
             tool_use["output"] = output
-        metadata: dict[str, Any] = {"special_type": "tool_use", "tool_use": tool_use}
+        metadata: dict[str, Any] = {
+            "special_type": "tool_use",
+            "tool_use": tool_use,
+        }
+        if event_id:
+            metadata["event_id"] = event_id
+            tool_use["event_id"] = event_id
         if delegation_id is not None:
             metadata["delegation_id"] = delegation_id
             tool_use["delegation_id"] = delegation_id
@@ -141,6 +183,7 @@ class ChatStreamEmitter:
     async def emit_subagent_status(
         self,
         *,
+        event_id: str = "",
         title: str,
         prompt: str = "",
         delegation_id: str,
@@ -177,18 +220,26 @@ class ChatStreamEmitter:
                 char if char.isalnum() or char in ("-", "_") else "_"
                 for char in str(delegation_id or title).strip().lower()
             ).strip("_")[:80] or "input"
+            response_key = (
+                f"event:{event_id}"
+                if event_id
+                else f"subagent:{fragment}"
+            )
+            metadata = {
+                "special_type": "subagent",
+                "subagent": subagent,
+                "delegation_id": delegation_id,
+                "delegation_name": delegation_name,
+            }
+            if event_id:
+                metadata["event_id"] = event_id
             await self._chat.send_response(
                 self._request,
-                response_key=f"subagent:{fragment}",
+                response_key=response_key,
                 content=content,
                 status="complete" if complete else "streaming",
                 complete=complete,
-                metadata={
-                    "special_type": "subagent",
-                    "subagent": subagent,
-                    "delegation_id": delegation_id,
-                    "delegation_name": delegation_name,
-                },
+                metadata=metadata,
             )
             return True
         except Exception:

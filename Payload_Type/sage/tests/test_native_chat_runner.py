@@ -510,6 +510,17 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
 
     async def fake_query(client, query, variables=None):
         nonlocal calls
+        if query == native_chat.REQUEST_MESSAGE_QUERY:
+            assert variables == {"messageId": 100}
+            return {
+                "chat_message": [{
+                    "id": 100,
+                    "channel_id": 2,
+                    "chat_request_id": None,
+                    "metadata": {},
+                }]
+            }
+        assert query == native_chat.REQUEST_QUERY
         calls += 1
         if calls == 1:
             return {
@@ -517,6 +528,7 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                     {
                         "id": 7,
                         "channel_id": 2,
+                        "request_message_id": 100,
                         "status": "running",
                         "updated_at": "t1",
                     }
@@ -537,6 +549,7 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                     {
                         "id": 7,
                         "channel_id": 2,
+                        "request_message_id": 100,
                         "status": "running",
                         "updated_at": "t2",
                     }
@@ -557,6 +570,7 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                     {
                         "id": 7,
                         "channel_id": 2,
+                        "request_message_id": 100,
                         "status": "running",
                         "updated_at": "t3",
                     }
@@ -577,6 +591,7 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                     {
                         "id": 7,
                         "channel_id": 2,
+                        "request_message_id": 100,
                         "status": "running",
                         "updated_at": "t4",
                     }
@@ -596,6 +611,7 @@ def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch)
                 {
                     "id": 7,
                     "channel_id": 2,
+                    "request_message_id": 100,
                     "status": "complete",
                     "updated_at": "t5",
                 }

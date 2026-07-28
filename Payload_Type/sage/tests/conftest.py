@@ -1,6 +1,17 @@
-"""Shared pytest fixtures for the Sage test suite."""
+"""Shared pytest fixtures and import bootstrap for the Sage test suite."""
+
+import sys
+from pathlib import Path
 
 import pytest
+
+# Test modules here import Payload_Type/sage top-level packages (`ai`, `sage_chat`, ...). Because
+# `Payload_Type/sage/__init__.py` exists, pytest's prepend import mode puts `Payload_Type/` on
+# sys.path, not `Payload_Type/sage/` — so those imports do not resolve on their own. Individual
+# modules used to each insert the path themselves, which meant the suite only collected as long as
+# some alphabetically earlier module happened to do it first. Do it once, here, before any test
+# module is imported.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Payload_Type/sage
 
 
 @pytest.fixture(autouse=True)

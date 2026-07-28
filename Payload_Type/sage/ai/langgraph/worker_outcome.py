@@ -28,11 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
-import re
 from typing import Any
 
 CONTRACT_VERSION = 1
-HANDOFF_METADATA_VERSION = 2
+HANDOFF_METADATA_VERSION = 3
 KNOWN_WORKERS = frozenset({
     "Generalist",
     "Mythic_Operator",
@@ -42,7 +41,6 @@ KNOWN_WORKERS = frozenset({
     "Sandbox",
     "Autonomous_Executor",
 })
-_HANDOFF_HEADING_RE = re.compile(r"(?<!\S)(DONE|FAILED|BLOCKER|REMAINING)\s+\u2014\s+")
 
 
 class Outcome(str, Enum):
@@ -195,22 +193,68 @@ class LoopBreakerState:
     last_turn_key: str = ""
 
 
-def parse_handback_summary(summary: str) -> dict[str, str] | None:
-    """Parse the exact DONE / FAILED / BLOCKER / REMAINING handback grammar conservatively."""
-    text = str(summary or "").strip()
-    matches = list(_HANDOFF_HEADING_RE.finditer(text))
-    if [match.group(1).upper() for match in matches] != ["DONE", "FAILED", "BLOCKER", "REMAINING"]:
-        return None
-    sections: dict[str, str] = {}
-    for index, match in enumerate(matches):
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-        sections[match.group(1).upper()] = text[start:end].strip()
-    return sections
+def worker_evidence_records(messages: list[Any]) -> tuple[str, ...]:
+    """Return unique semantic tool observations without provider invocation identity."""
+    records: set[str] = set()
+    for message in messages:
+        if getattr(message, "type", "") != "tool":
+            continue
+        name = str(getattr(message, "name", "") or "")
+        if (
+            not name
+            or name.startswith("transfer_to_")
+            or name in {
+                "handback_to_supervisor",
+                "summarize_and_handback",
+                "request_continuation",
+                "respond_to_user",
+            }
+        ):
+            continue
+        records.add(repr({
+            "content": str(getattr(message, "content", "") or ""),
+            "name": name,
+        }))
+    return tuple(sorted(records))
 
 
-def _is_substantive(value: str) -> bool:
-    return str(value or "").strip().casefold().rstrip(".") not in {"", "none"}
+def evidence_revision(records: Any) -> str:
+    """Digest a cumulative set of canonical semantic observations."""
+    normalized = tuple(sorted({
+        str(record)
+        for record in records
+        if isinstance(record, str) and record
+    }))
+    if not normalized:
+        return ""
+    return hashlib.sha256(repr(normalized).encode("utf-8")).hexdigest()
+
+
+def worker_evidence_revision(messages: list[Any]) -> str:
+    """Digest semantic non-control results; retries and prose cannot advance revision."""
+    records = worker_evidence_records(messages)
+    if not records:
+        return ""
+    return evidence_revision(records)
+
+
+def current_operator_turn(messages: list[Any]) -> list[Any]:
+    """Return only messages after the latest exact real-operator boundary."""
+    latest_operator = -1
+    for index, message in enumerate(messages):
+        kwargs = getattr(message, "additional_kwargs", {}) or {}
+        if (
+            getattr(message, "type", "") == "human"
+            and not kwargs.get("_hide_from_stream")
+            and not kwargs.get("_delegated_to")
+        ):
+            latest_operator = index
+    return list(messages[latest_operator + 1 :])
+
+
+def current_turn_evidence_records(messages: list[Any]) -> tuple[str, ...]:
+    """Return semantic evidence admitted only after the current operator boundary."""
+    return worker_evidence_records(current_operator_turn(messages))
 
 
 def build_handoff_metadata(
@@ -220,52 +264,55 @@ def build_handoff_metadata(
     source_seq: int,
     reason: str,
     summary: str,
+    outcome: Any,
     next_owner: Any = "",
+    verified_revision: Any = "",
 ) -> dict[str, Any] | None:
     if source_worker not in KNOWN_WORKERS or not source_turn_id or source_seq <= 0:
+        return None
+    try:
+        typed_outcome = Outcome(outcome)
+    except (TypeError, ValueError):
         return None
     if (
         not isinstance(next_owner, str)
         or next_owner not in {*KNOWN_WORKERS, ""}
         or next_owner == source_worker
+        or not isinstance(verified_revision, str)
     ):
         return None
-    sections = parse_handback_summary(summary)
-    if sections is None:
-        return None
-    if next_owner and not (
-        _is_substantive(sections["BLOCKER"])
-        or _is_substantive(sections["REMAINING"])
+    if (
+        (typed_outcome == Outcome.HANDOFF and not next_owner)
+        or (typed_outcome != Outcome.HANDOFF and bool(next_owner))
     ):
         return None
-    if next_owner:
-        outcome = Outcome.HANDOFF
-    elif _is_substantive(sections["BLOCKER"]):
-        outcome = Outcome.BLOCKED
-    elif (
-        _is_substantive(sections["DONE"])
-        and not _is_substantive(sections["FAILED"])
-        and not _is_substantive(sections["REMAINING"])
-    ):
-        outcome = Outcome.COMPLETE
-    else:
-        outcome = Outcome.PROGRESS
+    summary_digest = hashlib.sha256(str(summary).encode("utf-8")).hexdigest()
+    outcome_id = hashlib.sha256(
+        repr({
+            "next_owner": next_owner,
+            "outcome": typed_outcome.value,
+            "source_seq": source_seq,
+            "source_turn_id": source_turn_id,
+            "source_worker": source_worker,
+            "verified_revision": verified_revision,
+        }).encode("utf-8")
+    ).hexdigest()
     return {
         "schema_version": HANDOFF_METADATA_VERSION,
         "source_worker": source_worker,
         "source_turn_id": source_turn_id,
         "source_seq": source_seq,
-        "outcome": outcome.value,
+        "outcome_id": outcome_id,
+        "outcome": typed_outcome.value,
         "next_owner": next_owner,
-        "summary_digest": hashlib.sha256(str(summary).encode("utf-8")).hexdigest(),
+        "verified_revision": verified_revision,
+        "summary_digest": summary_digest,
     }
 def latest_admitted_handoff(messages: list[Any], current_turn_id: str) -> tuple[dict[str, Any], str] | None:
-    latest_operator = -1
-    for index, message in enumerate(messages):
-        if getattr(message, "type", "") == "human" and not getattr(message, "additional_kwargs", {}).get("_hide_from_stream") and not getattr(message, "additional_kwargs", {}).get("_delegated_to"):
-            latest_operator = index
+    turn_messages = current_operator_turn(messages)
+    latest_operator = len(messages) - len(turn_messages) - 1
     candidate: tuple[dict[str, Any], str, int] | None = None
-    for index, message in enumerate(messages[latest_operator + 1 :], start=latest_operator + 1):
+    for index, message in enumerate(turn_messages, start=latest_operator + 1):
         kwargs = getattr(message, "additional_kwargs", {}) or {}
         metadata = kwargs.get("_worker_outcome")
         if not isinstance(metadata, dict):
@@ -274,7 +321,17 @@ def latest_admitted_handoff(messages: list[Any], current_turn_id: str) -> tuple[
     if candidate is None:
         return None
     metadata, summary, index = candidate
-    required = {"schema_version", "source_worker", "source_turn_id", "source_seq", "outcome", "next_owner", "summary_digest"}
+    required = {
+        "schema_version",
+        "source_worker",
+        "source_turn_id",
+        "source_seq",
+        "outcome_id",
+        "outcome",
+        "next_owner",
+        "verified_revision",
+        "summary_digest",
+    }
     if set(metadata) != required:
         return None
     if (
@@ -283,6 +340,9 @@ def latest_admitted_handoff(messages: list[Any], current_turn_id: str) -> tuple[
         or metadata.get("source_turn_id") != current_turn_id
         or metadata.get("outcome") not in {item.value for item in Outcome}
         or metadata.get("next_owner") not in {*KNOWN_WORKERS, ""}
+        or not isinstance(metadata.get("outcome_id"), str)
+        or len(metadata.get("outcome_id", "")) != 64
+        or not isinstance(metadata.get("verified_revision"), str)
         or not isinstance(metadata.get("source_seq"), int)
         or metadata.get("source_seq", 0) <= 0
         or metadata.get("summary_digest") != hashlib.sha256(summary.encode("utf-8")).hexdigest()

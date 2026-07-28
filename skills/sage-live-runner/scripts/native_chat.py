@@ -28,6 +28,12 @@ DEFAULT_BHUSA_DEMO_CHANNEL_NAME = "BHUSA Demo"
 BHUSA_DEMO_METADATA_DISPLAY = "expanded; max=15"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE_ROOT = REPO_ROOT.parent
+SAGE_PYTHON_ROOT = REPO_ROOT / "Payload_Type" / "sage"
+if str(SAGE_PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(SAGE_PYTHON_ROOT))
+
+from ai.langgraph.request_events import control_transition_errors
+
 DEFAULT_ENV_PATHS = (
     WORKSPACE_ROOT / "mythic_v4" / ".env",
     WORKSPACE_ROOT / "mythic" / ".env",
@@ -35,6 +41,13 @@ DEFAULT_ENV_PATHS = (
 SAGE_ENV_PATH = REPO_ROOT / "Payload_Type" / "sage" / ".env"
 READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 BOOTSTRAP_PATH = REPO_ROOT / "skills" / "sage-callback-bootstrap" / "scripts" / "bootstrap_payloads.py"
+ARTIFACT_RETENTION_PATH = (
+    REPO_ROOT
+    / "skills"
+    / "sage-artifact-retention"
+    / "scripts"
+    / "artifact_retention.py"
+)
 TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
 APPROVABLE_INPUT_REQUEST_STATUS = "streaming"
 REQUIRED_TOKEN_SCOPES = {"apitoken.write", "chat-ai.write"}
@@ -224,6 +237,26 @@ query SageChatRequest($requestId: Int!) {
 }
 """
 
+REQUEST_MESSAGE_QUERY = """
+query SageChatRequestMessage($messageId: Int!) {
+  chat_message(where: {id: {_eq: $messageId}}, limit: 1) {
+    id
+    channel_id
+    chat_request_id
+    chat_response_key
+    author_type
+    sender_display_name
+    message
+    metadata
+    edited
+    deleted
+    status
+    created_at
+    updated_at
+  }
+}
+"""
+
 SAGE_CHANNEL_IDS_QUERY = """
 query SageChannelIds {
   chat_channel(
@@ -357,17 +390,26 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def canary_ai_metadata(
-    *, max_steps: int, extra: dict[str, Any] | None = None
+    *, max_steps: int, session_mode: str = "supervised", extra: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Build isolated supervised metadata without changing normal Auto defaults."""
+    """Build isolated canary metadata in the case's declared session mode.
+
+    The mode drives the kernel's deterministic lane→authority mapping (conversation→observe,
+    supervised→supervised_action), so a canary must run a case in ITS declared `session_mode` — a
+    conversation-mode negative case (C01/C02) forced into supervised mode resolves to
+    `authority.supervised_action`, not the `authority.observe` its frozen contract requires. Default stays
+    `supervised` for the must-act cases; never `auto`/autonomous (autonomous_solve stays False)."""
 
     if max_steps < 1:
         raise ValueError("canary max_steps must be at least 1")
+    mode = str(session_mode or "supervised").strip().casefold()
+    if mode not in {"supervised", "conversation"}:
+        raise ValueError(f"canary session_mode must be 'supervised' or 'conversation', not {session_mode!r}")
     metadata = default_ai_metadata()
     config = dict(metadata.get("config") or {})
     config.update(
         {
-            "mode": "supervised",
+            "mode": mode,
             "autonomous_solve": False,
             "max_steps": int(max_steps),
         }
@@ -379,7 +421,7 @@ def canary_ai_metadata(
         metadata.update(extra_copy)
         if isinstance(extra_config, dict):
             config.update(extra_config)
-            config["mode"] = "supervised"
+            config["mode"] = mode
             config["autonomous_solve"] = False
             config["max_steps"] = int(max_steps)
     return metadata
@@ -437,6 +479,16 @@ async def login(
     password: str | None = None,
     env_path: str | Path | None = None,
 ) -> Any:
+    # ISC-49R 49R-18 option 1: when SAGE_DRIVER_APITOKEN is set, the driver authenticates with a
+    # SCOPED api token (no task.write) instead of the admin password, so the driver itself cannot
+    # issue a Mythic task. The channel is still bound to a tasking-capable backing token
+    # (SAGE_BACKING_APITOKEN_ID), so the KERNEL can task — closing 49R-18 by credential placement.
+    # The value must be the secret returned by the createAPIToken *mutation response* (the apitokens
+    # table column is masked and does NOT authenticate). Opt-in: absent this env, the admin-password
+    # path is unchanged, so every existing flow (inspect/prepare/run) is unaffected.
+    driver_token = os.environ.get("SAGE_DRIVER_APITOKEN")
+    if driver_token:
+        return await mythic.login(server_ip=server, apitoken=driver_token)
     return await mythic.login(
         server_ip=server,
         username=user,
@@ -580,8 +632,19 @@ async def create_locked_channel(
     api_token_id: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    observed = await mythic.execute_custom_query(client, READINESS_QUERY)
-    container, token = select_chat_resources(observed, api_token_id=api_token_id)
+    # ISC-49R 49R-18 option 1: under a scoped driver token, the session cannot run the wildcard-token
+    # readiness query (it lacks apitoken.read). When SAGE_BACKING_APITOKEN_ID is set, bind the channel
+    # directly to that tasking-capable backing token id, using SAGE_CHAT_CONTAINER_ID for the container
+    # so no privileged read is needed. The kernel tasks via the backing token; the driver cannot.
+    backing_token_id = os.environ.get("SAGE_BACKING_APITOKEN_ID")
+    if backing_token_id:
+        container_id = int(os.environ["SAGE_CHAT_CONTAINER_ID"])
+        token_id = int(backing_token_id)
+    else:
+        observed = await mythic.execute_custom_query(client, READINESS_QUERY)
+        container, token = select_chat_resources(observed, api_token_id=api_token_id)
+        container_id = int(container["id"])
+        token_id = int(token["id"])
     channel_name = name or (
         f"sage-one-shot-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
     )
@@ -592,9 +655,9 @@ async def create_locked_channel(
         variables={
             "name": channel_name,
             "description": description,
-            "containerId": int(container["id"]),
+            "containerId": container_id,
             "model": model,
-            "tokenId": int(token["id"]),
+            "tokenId": token_id,
             "metadata": built_metadata,
         },
     )
@@ -605,8 +668,8 @@ async def create_locked_channel(
     return {
         "chat_channel_id": int(channel_id),
         "chat_channel_name": channel_name,
-        "chat_container_id": int(container["id"]),
-        "api_token_id": int(token["id"]),
+        "chat_container_id": container_id,
+        "api_token_id": token_id,
         "chat_runtime_identity": _chat_runtime_identity_from_metadata(built_metadata),
     }
 
@@ -781,6 +844,54 @@ def _metadata_containers(message: dict[str, Any]) -> list[dict[str, Any]]:
     return containers
 
 
+def _extract_control_transitions(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    transitions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    required = {"event_id", "kind", "phase", "content"}
+    for message in messages:
+        for metadata in _metadata_containers(message):
+            values = metadata.get("control_transitions")
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                raise RuntimeError(
+                    "Transcript control transitions must be a list."
+                )
+            for value in values:
+                if not isinstance(value, dict) or set(value) != required:
+                    raise RuntimeError(
+                        "Transcript control transition has an invalid schema."
+                    )
+                if value.get("kind") != "control_transition":
+                    raise RuntimeError(
+                        "Transcript control transition has an invalid kind."
+                    )
+                normalized = {
+                    key: str(value.get(key) or "")
+                    for key in sorted(required)
+                }
+                if any(not normalized[key] for key in ("event_id", "kind", "phase")):
+                    raise RuntimeError(
+                        "Transcript control transition identity is incomplete."
+                    )
+                event_id = normalized["event_id"]
+                if event_id in seen:
+                    raise RuntimeError(
+                        "Transcript contains a duplicate control transition event id."
+                    )
+                seen.add(event_id)
+                transitions.append(normalized)
+    grammar_errors = control_transition_errors(transitions)
+    if grammar_errors:
+        raise RuntimeError(
+            "Transcript control transition sequence is invalid: "
+            + "; ".join(grammar_errors)
+        )
+    return transitions
+
+
 def _has_input_requested(messages: list[dict[str, Any]]) -> bool:
     return bool(_pending_input_requested_messages(messages))
 
@@ -829,8 +940,8 @@ async def fetch_request_snapshot(
     request_channel_id = _require_exact_int(
         request.get("channel_id"), "Returned Mythic chat request channel id"
     )
-    message_rows = result.get("chat_message") or []
-    for message in message_rows:
+    response_rows = result.get("chat_message") or []
+    for message in response_rows:
         _require_exact_int(message.get("id"), "Mythic chat message id")
         message_request_id = _require_exact_int(
             message.get("chat_request_id"), "Mythic chat message request id"
@@ -846,8 +957,43 @@ async def fetch_request_snapshot(
             raise RuntimeError(
                 "Returned Mythic chat message channel id does not match the request channel."
             )
+    request_message_id = _require_exact_int(
+        request.get("request_message_id"),
+        "Returned Mythic chat request message id",
+    )
+    operator_result = await mythic.execute_custom_query(
+        client,
+        REQUEST_MESSAGE_QUERY,
+        variables={"messageId": request_message_id},
+    )
+    operator_rows = operator_result.get("chat_message") or []
+    if len(operator_rows) != 1:
+        raise RuntimeError(
+            "Expected exactly one operator message for the Mythic chat request."
+        )
+    operator_message = operator_rows[0]
+    observed_operator_id = _require_exact_int(
+        operator_message.get("id"),
+        "Mythic operator message id",
+    )
+    if observed_operator_id != request_message_id:
+        raise RuntimeError(
+            "Returned Mythic operator message id does not match request_message_id."
+        )
+    if operator_message.get("chat_request_id") is not None:
+        raise RuntimeError(
+            "Exact Mythic operator message must have a null chat_request_id."
+        )
+    operator_channel_id = _require_exact_int(
+        operator_message.get("channel_id"),
+        "Mythic operator message channel id",
+    )
+    if operator_channel_id != request_channel_id:
+        raise RuntimeError(
+            "Returned Mythic operator message channel id does not match the request channel."
+        )
     messages = sorted(
-        message_rows,
+        [operator_message, *response_rows],
         key=lambda row: row["id"],
     )
     return {"request": request, "messages": messages}
@@ -1051,19 +1197,38 @@ def _validate_transcript_identity(
     channel_id = _require_exact_int(
         request.get("channel_id"), "Transcript request channel id"
     )
-    for message in messages:
-        _require_exact_int(message.get("id"), "Transcript message id")
-        message_request_id = _require_exact_int(
-            message.get("chat_request_id"),
-            "Transcript message chat_request_id",
+    request_message_id = _require_exact_int(
+        request.get("request_message_id"),
+        "Transcript request message id",
+    )
+    operator_rows = [
+        message
+        for message in messages
+        if message.get("id") == request_message_id
+    ]
+    if len(operator_rows) != 1:
+        raise RuntimeError(
+            "Transcript export must contain exactly one exact operator message."
         )
+    for message in messages:
+        message_id = _require_exact_int(message.get("id"), "Transcript message id")
         message_channel_id = _require_exact_int(
             message.get("channel_id"), "Transcript message channel_id"
         )
-        if message_request_id != request_id:
-            raise RuntimeError(
-                "Transcript export message chat_request_id does not match request id."
+        if message_id == request_message_id:
+            if message.get("chat_request_id") is not None:
+                raise RuntimeError(
+                    "Transcript operator message must have a null chat_request_id."
+                )
+        else:
+            message_request_id = _require_exact_int(
+                message.get("chat_request_id"),
+                "Transcript message chat_request_id",
             )
+            if message_request_id != request_id:
+                raise RuntimeError(
+                    "Transcript export message chat_request_id does not match request id."
+                )
         if message_channel_id != channel_id:
             raise RuntimeError(
                 "Transcript export message channel_id does not match request channel_id."
@@ -1094,6 +1259,7 @@ def build_transcript_export(
         "error": request.get("error"),
         "request": request,
         "messages": messages,
+        "control_transitions": _extract_control_transitions(messages),
         "runtime_telemetry": result["runtime_telemetry"],
         "progress": result["progress"],
         **(
@@ -1114,8 +1280,50 @@ def write_transcript_export(
         json.dumps(transcript, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
+    temporary.chmod(0o600)
     temporary.replace(resolved)
+    resolved.chmod(0o600)
     return resolved
+
+
+def default_transcript_export_path(request_id: int) -> Path:
+    retention = _load_module(
+        "sage_artifact_retention_for_native_chat",
+        ARTIFACT_RETENTION_PATH,
+    )
+    return retention.allocate_artifact_path(
+        "transcripts/native-chat",
+        f"request-{request_id}.json",
+        root=REPO_ROOT,
+    )
+
+
+def record_transcript_export(path: str | Path, request_id: int) -> dict[str, Any]:
+    retention = _load_module(
+        "sage_artifact_retention_record_for_native_chat",
+        ARTIFACT_RETENTION_PATH,
+    )
+    resolved = Path(path).expanduser().resolve()
+    durable = retention.history_root(REPO_ROOT)
+    try:
+        resolved.relative_to(durable)
+    except ValueError:
+        return {
+            "retention_class": "explicit-output",
+            "manifested": False,
+        }
+    record = retention.record_artifact(
+        resolved,
+        category="transcripts/native-chat",
+        artifact_type="native-chat-transcript",
+        context=f"Mythic native chat request {request_id}",
+        root=REPO_ROOT,
+    )
+    return {
+        "retention_class": record["retention_class"],
+        "manifested": True,
+        "artifact_id": record["artifact_id"],
+    }
 
 
 def extract_runtime_telemetry(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1220,6 +1428,65 @@ def build_demo_manifest(
         "readiness": readiness_snapshot,
     }
     return contract.redact_structure(manifest)
+
+
+def write_canary_manifest(
+    path: str | Path,
+    result: dict[str, Any],
+    *,
+    prompt: str,
+    max_steps: int,
+    case_id: str | None = None,
+) -> Path:
+    """Write the durable record of one bounded canary (ISC-49R 49R-06).
+
+    Records only what the driver itself observed. This is untrusted self-report by design — the
+    attester re-derives the same facts from Mythic and never reads this file as its gold side.
+    """
+    manifest = {
+        "schema": "sage-native-canary-manifest-v1",
+        "case_id": case_id or "",
+        "prompt": prompt,
+        "max_steps": max_steps,
+        "chat_channel_id": result.get("chat_channel_id"),
+        "chat_channel_name": result.get("chat_channel_name"),
+        "chat_request_id": result.get("chat_request_id"),
+        "status": result.get("status"),
+        "halt_reason": result.get("halt_reason"),
+        "message_count": len(result.get("messages") or []),
+    }
+    resolved = Path(path).expanduser()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return resolved
+
+
+def record_canary_manifest(path: str | Path, request_id: int) -> dict[str, Any]:
+    """Register a canary manifest in the private history manifest, mirroring transcript export."""
+    retention = _load_module(
+        "sage_artifact_retention_record_for_native_chat",
+        ARTIFACT_RETENTION_PATH,
+    )
+    resolved = Path(path).expanduser().resolve()
+    durable = retention.history_root(REPO_ROOT)
+    try:
+        resolved.relative_to(durable)
+    except ValueError:
+        # Outside `.sage_history/` the artifact is explicit output, not durable evidence. Say so
+        # rather than silently implying the criterion was met.
+        return {"retention_class": "explicit-output", "manifested": False}
+    record = retention.record_artifact(
+        resolved,
+        category="evidence/isc49r-canary",
+        artifact_type="native-chat-canary-manifest",
+        context=f"ISC-49R bounded canary, Mythic native chat request {request_id}",
+        root=REPO_ROOT,
+    )
+    return {
+        "retention_class": record["retention_class"],
+        "manifested": True,
+        "artifact_id": record["artifact_id"],
+    }
 
 
 def write_demo_manifest(path: str | Path, manifest: dict[str, Any]) -> Path:
@@ -1412,9 +1679,10 @@ async def _run(args: argparse.Namespace) -> int:
             snapshot = await fetch_request_snapshot(client, request_id)
         if args.command == "transcript":
             result = build_transcript_export(snapshot)
-            if args.output:
-                written = write_transcript_export(args.output, result)
-                result["export_path"] = str(written)
+            output_path = args.output or default_transcript_export_path(request_id)
+            written = write_transcript_export(output_path, result)
+            result["export_path"] = str(written)
+            result["retention"] = record_transcript_export(written, request_id)
         else:
             result = request_snapshot_result(snapshot)
             if args.output_mode == "eval":
@@ -1427,11 +1695,28 @@ async def _run(args: argparse.Namespace) -> int:
             poll_interval_seconds=args.poll_interval,
             channel_name=args.channel_name,
             api_token_id=args.api_token_id,
-            metadata=canary_ai_metadata(max_steps=args.max_steps),
+            metadata=canary_ai_metadata(max_steps=args.max_steps, session_mode=args.session_mode),
             use_prepared_channel=False,
             progress_sink=emit_jsonl_event,
             stop_on_input_requested=True,
         )
+        if args.manifest_path:
+            # ISC-49R 49R-06: a canary's evidence must survive a reboot in the durable private
+            # history, not live only in /tmp or an ad-hoc directory. Deliberately NOT gated on
+            # --runtime-dbs-archived: that gate exists for clean-solve demo provenance, and a
+            # bounded canary makes no clean-solve claim, so requiring it would block the very
+            # evidence this criterion asks for.
+            written = write_canary_manifest(
+                args.manifest_path,
+                result,
+                prompt=args.prompt,
+                max_steps=args.max_steps,
+                case_id=args.case_id,
+            )
+            result["manifest_path"] = str(written)
+            result["retention"] = record_canary_manifest(
+                written, int(result.get("chat_request_id") or 0)
+            )
     elif args.command == "approve-pending":
         result = await approve_pending_input_card(client, args.request_id)
     else:
@@ -1520,6 +1805,15 @@ def build_parser() -> argparse.ArgumentParser:
     canary.add_argument("--poll-interval", type=float, default=2.0)
     canary.add_argument("--channel-name")
     canary.add_argument("--max-steps", type=int, default=20)
+    canary.add_argument("--manifest-path",
+                        help="durable manifest destination; allocate with sage-artifact-retention "
+                             "so it lands under .sage_history/ (ISC-49R 49R-06)")
+    canary.add_argument("--case-id",
+                        help="frozen ConversationCase id this canary runs, recorded in the manifest")
+    canary.add_argument("--session-mode", choices=("supervised", "conversation"), default="supervised",
+                        help="the case's declared session_mode; conversation-mode cases (C01/C02) MUST run "
+                             "as 'conversation' so the kernel resolves lane→authority.observe, not "
+                             "supervised_action")
     approve_pending = sub.add_parser("approve-pending")
     approve_pending.add_argument("--request-id", type=int, required=True)
 

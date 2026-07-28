@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -372,6 +373,7 @@ def test_worker_handback_copy_attaches_typed_metadata_from_authoritative_tool_re
                     "args": {
                         "reason": "reason is explanatory",
                         "summary": summary,
+                        "outcome": "handoff",
                         "next_owner": "BloodHound",
                     },
                     "id": "call-1",
@@ -385,6 +387,7 @@ def test_worker_handback_copy_attaches_typed_metadata_from_authoritative_tool_re
                         "_handback_input": {
                             "reason": "reason is explanatory",
                             "summary": summary,
+                            "outcome": "handoff",
                             "next_owner": "BloodHound",
                         }
                     },
@@ -397,6 +400,7 @@ def test_worker_handback_copy_attaches_typed_metadata_from_authoritative_tool_re
     model._message_seq = 1
     model.state = {"_message_seq": 1}
     model.llm = None
+    model.verbose = False
     model.mythic_client = None
     state = {
         "_message_seq": 1,
@@ -426,7 +430,7 @@ def test_freeform_worker_reason_cannot_grant_production_redirect(reason):
         name="Mythic_Operator",
         tool_calls=[{
             "name": "handback_to_supervisor",
-            "args": {"reason": reason, "summary": summary},
+            "args": {"reason": reason, "summary": summary, "outcome": "blocked"},
             "id": "call-invalid",
             "type": "tool_call",
         }],
@@ -467,8 +471,9 @@ def test_freeform_worker_reason_cannot_grant_production_redirect(reason):
         SimpleNamespace(state=state, tool_call_id="handoff-invalid"),
         "perform new Mythic work",
     )
-    assert command.goto == "Generalist"
+    assert command.goto == "__end__"
     assert command.goto != "BloodHound"
+    assert command.update["messages"][-1].content.startswith("**Blocked**")
 
 
 @pytest.mark.parametrize(
@@ -490,6 +495,7 @@ def test_contradictory_worker_handback_cannot_reach_production_redirect(summary)
             "args": {
                 "reason": "reason is explanatory",
                 "summary": summary,
+                "outcome": "handoff",
                 "next_owner": "BloodHound",
             },
             "id": "call-contradictory",
@@ -497,11 +503,14 @@ def test_contradictory_worker_handback_cannot_reach_production_redirect(summary)
         }],
         additional_kwargs={"_seq": 3},
     )
-    assert mod._worker_handoff_metadata(
+    typed = mod._worker_handoff_metadata(
         [handback],
         source_worker="Mythic_Operator",
         source_turn_id="turn-1",
-    ) is None
+    )
+    assert typed is not None
+    assert typed[0]["outcome"] == "handoff"
+    assert typed[0]["next_owner"] == "BloodHound"
 
     model = mod.Model.__new__(mod.Model)
     model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
@@ -542,6 +551,7 @@ def test_explicit_worker_handback_redirects_with_authoritative_summary(
             "args": {
                 "reason": reason,
                 "summary": summary,
+                "outcome": "handoff",
                 "next_owner": next_owner,
             },
             "id": "call-valid",
@@ -605,12 +615,14 @@ def test_handback_tool_hidden_owner_drives_metadata_admission_and_redirect():
         SimpleNamespace(state={}, tool_call_id="typed-handback"),
         reason,
         summary,
+        "handoff",
         "BloodHound",
     )
     tool_message = command.update["messages"][0]
     assert tool_message.additional_kwargs["_handback_input"] == {
         "reason": reason,
         "summary": summary,
+        "outcome": "handoff",
         "next_owner": "BloodHound",
     }
     tool_message.additional_kwargs["_seq"] = 3
@@ -670,6 +682,7 @@ def test_worker_handback_requires_one_terminal_contiguous_tool_batch():
     payload = {
         "reason": "reason is explanatory",
         "summary": summary,
+        "outcome": "handoff",
         "next_owner": "BloodHound",
     }
     handback = mod._create_handback_to_supervisor_tool()
@@ -677,6 +690,7 @@ def test_worker_handback_requires_one_terminal_contiguous_tool_batch():
         SimpleNamespace(state={}, tool_call_id="handback-1"),
         payload["reason"],
         payload["summary"],
+        payload["outcome"],
         payload["next_owner"],
     )
     handback_result = command.update["messages"][0]
@@ -767,23 +781,27 @@ def test_concurrent_toolnode_shaped_handbacks_fail_closed():
     first_payload = {
         "reason": "first typed route",
         "summary": summary,
+        "outcome": "handoff",
         "next_owner": "BloodHound",
     }
     second_payload = {
         "reason": "second typed route",
         "summary": summary,
+        "outcome": "handoff",
         "next_owner": "MCP_Manager",
     }
     first_result = handback.func(
         SimpleNamespace(state={}, tool_call_id="handback-1"),
         first_payload["reason"],
         first_payload["summary"],
+        first_payload["outcome"],
         first_payload["next_owner"],
     ).update["messages"][0]
     second_result = handback.func(
         SimpleNamespace(state={}, tool_call_id="handback-2"),
         second_payload["reason"],
         second_payload["summary"],
+        second_payload["outcome"],
         second_payload["next_owner"],
     ).update["messages"][0]
     sibling_batch = AIMessage(
@@ -857,6 +875,7 @@ def test_real_toolnode_concurrent_handback_batches_fail_closed(batch_kind):
         "args": {
             "reason": "first typed route",
             "summary": summary,
+            "outcome": "handoff",
             "next_owner": "BloodHound",
         },
         "id": "handback-1",
@@ -882,6 +901,7 @@ def test_real_toolnode_concurrent_handback_batches_fail_closed(batch_kind):
                 "args": {
                     "reason": "second typed route",
                     "summary": summary,
+                    "outcome": "handoff",
                     "next_owner": "MCP_Manager",
                 },
                 "id": "handback-2",
@@ -954,6 +974,7 @@ def test_malformed_typed_owner_fails_closed_from_every_authoritative_source(
     payload = {
         "reason": "route to BloodHound",
         "summary": summary,
+        "outcome": "handoff",
         "next_owner": next_owner,
     }
     if message_source == "ai":
@@ -1145,7 +1166,8 @@ def test_autonomous_handoff_redirects_verified_collection_regression_to_bloodhou
     assert "Analyze the verified BloodHound graph" in instruction
 
 
-def test_post_ingest_handback_routes_directly_to_bloodhound_without_supervisor():
+@pytest.mark.parametrize("outcome", ("progress", "blocked", "complete"))
+def test_post_ingest_handback_returns_to_typed_supervisor_boundary(outcome):
     mod = _load_model_module()
     es, _ = _engagement_modules()
     foothold = _fake_foothold(es, callback_id="2")
@@ -1178,13 +1200,13 @@ def test_post_ingest_handback_routes_directly_to_bloodhound_without_supervisor()
         runtime,
         "Graph analysis is required next.",
         "Collection and ingest completed; determine the next graph-supported hop.",
+        outcome,
     )
 
-    assert command.goto == "BloodHound"
-    assert command.update["next_owner"] == "BloodHound"
-    assert command.update["_last_target_agent"] == "BloodHound"
-    assert "AUTONOMOUS POST-INGEST ROUTER" in command.update["bloodhound_messages"][1].content
-    assert "do not route back to Mythic_Operator" in command.update["bloodhound_messages"][1].content
+    assert command.goto == "Supervisor"
+    assert command.update["next_owner"] == "Supervisor"
+    assert "_last_target_agent" not in command.update
+    assert "bloodhound_messages" not in command.update
 
 
 def test_post_ingest_handback_stays_with_supervisor_when_collection_is_missing():
@@ -1203,7 +1225,12 @@ def test_post_ingest_handback_stays_with_supervisor_when_collection_is_missing()
     tool = mod._create_handback_to_supervisor_tool(FakeMythic(), autonomous=True)
     runtime = SimpleNamespace(state={}, tool_call_id="pre-ingest")
 
-    command = tool.func(runtime, "Collection required.", "No verified graph exists.")
+    command = tool.func(
+        runtime,
+        "Collection required.",
+        "No verified graph exists.",
+        "progress",
+    )
 
     assert command.goto == "Supervisor"
     assert command.update["next_owner"] == "Supervisor"
@@ -1233,7 +1260,12 @@ def test_post_ingest_handback_stays_with_supervisor_when_ingest_covered_other_do
 
     tool = mod._create_handback_to_supervisor_tool(FakeMythic(), autonomous=True)
     runtime = SimpleNamespace(state={}, tool_call_id="wrong-domain-ingest")
-    command = tool.func(runtime, "Collection required.", "The source domain is still missing.")
+    command = tool.func(
+        runtime,
+        "Collection required.",
+        "The source domain is still missing.",
+        "progress",
+    )
 
     assert command.goto == "Supervisor"
     assert command.update["next_owner"] == "Supervisor"
@@ -1542,7 +1574,7 @@ def test_autonomous_step_gate_routes_blocked_mythic_handoff_to_bloodhound(monkey
     assert "Execute STARKWALLPAPER again" in instruction
 
 
-def test_autonomous_step_gate_terminalizes_blocked_after_bloodhound_blocker(monkeypatch):
+def test_autonomous_step_gate_does_not_terminalize_blocked_after_bloodhound_blocker(monkeypatch):
     mod = _load_model_module()
     es, mythic_tools = _engagement_modules()
 
@@ -1596,12 +1628,7 @@ def test_autonomous_step_gate_terminalizes_blocked_after_bloodhound_blocker(monk
         runtime_state,
     )
 
-    assert redirect is not None
-    target, instruction = redirect
-    assert target == "__terminal__"
-    assert "AUTONOMOUS BLOCKED REPORT" in instruction
-    assert "No reset is indicated" in instruction
-    assert "Suppressed handoff text: Execute STARKWALLPAPER again." in instruction
+    assert redirect is None
 
 
 def test_autonomous_executor_node_calls_execute_capability_once(monkeypatch):
@@ -1961,8 +1988,8 @@ def test_typed_handoff_redirects_same_worker_to_known_next_owner():
 @pytest.mark.parametrize(
     ("outcome", "tool_text", "final_text"),
     (
-        ("blocked", "Worker outcome prevented repeated delegation: Mythic_Operator reported BLOCKED with no next owner.", "**Blocked**\n\nsummary"),
-        ("complete", "Worker outcome prevented repeated delegation: Mythic_Operator reported COMPLETE.", "**Objective complete**\n\nsummary"),
+        ("blocked", "Worker reported typed blocked.", "**Blocked**\n\nsummary"),
+        ("complete", "Worker reported typed complete.", "**Objective complete**\n\nsummary"),
     ),
 )
 def test_typed_worker_outcome_terminalizes_repeated_same_worker(outcome, tool_text, final_text):
@@ -1993,23 +2020,837 @@ def test_typed_worker_outcome_terminalizes_repeated_same_worker(outcome, tool_te
     assert command.update["messages"][1].additional_kwargs["_is_final_report"] is True
 
 
-def test_complete_terminalizes_different_requested_owner_but_blocked_does_not():
+def _typed_subgoal_runtime_state(request_id="request-subgoal"):
+    from ai.langgraph.subgoal_state import new_subgoal
+
+    return {
+        "_request_id": request_id,
+        "_request_stop_condition": "actions_complete",
+        "_subgoal_state": new_subgoal(
+            request_id,
+            "actions_complete",
+        ).to_dict(),
+        "messages": [],
+        "supervisor_messages": [HumanMessage(content="operator request")],
+        "generalist_messages": [],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+        "autonomous_executor_messages": [],
+    }
+
+
+def _canonical_subgoal_model(mod, state):
+    from ai.langgraph.subgoal_state import SubgoalState
+
+    model = mod.Model.__new__(mod.Model)
+    model._subgoal_authority_lock = mod.threading.Lock()
+    model._subgoal_authority = SubgoalState.from_dict(state["_subgoal_state"])
+    model._subgoal_evidence_records = set()
+    return model
+
+
+def _bind_matching_request_contract(model, state):
+    from ai.langgraph.request_contract import build_request_contract
+
+    contract = build_request_contract(
+        request_id=state["_request_id"],
+        channel_id="7",
+        operation_id="9",
+        mode="supervised",
+        autonomous_solve=False,
+    )
+    model._request_contract = contract
+    model._request_dynamic_proposals = False
+    model._turn_authority = importlib.import_module(
+        "ai.langgraph.turn_authority"
+    ).authority_from_request_contract(contract)
+    model.mythic_client = None
+    return contract
+
+
+def test_production_handoff_admits_one_exact_subgoal_execution_tuple():
+    from ai.langgraph.subgoal_state import SubgoalState
+
     mod = _load_model_module()
+    state = _typed_subgoal_runtime_state()
+    model = _canonical_subgoal_model(mod, state)
+    tool = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    )
+
+    first = tool.func(
+        SimpleNamespace(state=state, tool_call_id="first"),
+        "Inspect callback state.",
+    )
+    running = SubgoalState.from_dict(first.update["_subgoal_state"])
+    assert running.owner == "Mythic_Operator"
+    assert len(running.admissions) == 1
+    assert running.admissions[0].key == (
+        running.request_id,
+        running.subgoal_id,
+        "Mythic_Operator",
+        "transfer_to_Mythic_Operator",
+        "0",
+    )
+
+    replay_state = {**state, **first.update}
+    replay = tool.func(
+        SimpleNamespace(state=replay_state, tool_call_id="replay"),
+        "Same work with different prose.",
+    )
+    assert replay.goto == "__end__"
+    assert "duplicate execution" in replay.update["messages"][0].content
+    assert replay.update["_subgoal_state"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("request_id", "instruction", "prior_summary"),
+    (
+        (
+            "request-legacy-heading",
+            "Use STARKWALLPAPER GPO with SharpGPOAbuse to add the user to Domain Admins.",
+            "handback to supervisor; done (do not repeat): STARKWALLPAPER Domain Admins "
+            "graph-supported BloodHound path to essos on callback 7",
+        ),
+        (
+            "request-renamed-heading",
+            "Use ORIONPOLICY policy control with the approved adapter to add the principal to Administrators.",
+            "return to coordinator; complete: ORIONPOLICY Administrators graph-supported "
+            "directory path to vega.example on callback 42",
+        ),
+        (
+            "request-neutral-heading",
+            "Inspect the typed callback state and report evidence.",
+            "Arbitrary display prose that must not control ownership.",
+        ),
+    ),
+)
+def test_typed_handoff_owner_is_invariant_to_legacy_headings_and_entity_renaming(
+    request_id,
+    instruction,
+    prior_summary,
+):
+    from ai.langgraph.subgoal_state import SubgoalState
+
+    mod = _load_model_module()
+    state = _typed_subgoal_runtime_state(request_id)
+    state["supervisor_messages"] = [HumanMessage(content=prior_summary)]
+    state["messages"] = [HumanMessage(content=prior_summary)]
+    model = _canonical_subgoal_model(mod, state)
+    tool = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    )
+
+    command = tool.func(
+        SimpleNamespace(state=state, tool_call_id=f"handoff-{request_id}"),
+        instruction,
+    )
+    projected = SubgoalState.from_dict(command.update["_subgoal_state"])
+
+    assert command.goto == "Mythic_Operator"
+    assert projected.owner == "Mythic_Operator"
+    assert "mythic_operator_messages" in command.update
+    assert "bloodhound_messages" not in command.update
+    assert "_autonomous_handoff_redirect" not in inspect.getsource(
+        mod._create_handoff_tool
+    )
+
+
+@pytest.mark.parametrize("same_target", (True, False))
+def test_concurrent_production_transfers_admit_exactly_one_prestate(same_target):
+    from ai.langgraph.subgoal_state import SubgoalState
+
+    mod = _load_model_module()
+    state = _typed_subgoal_runtime_state("request-concurrent")
+    model = _canonical_subgoal_model(mod, state)
+    first = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    )
+    second = (
+        first
+        if same_target
+        else mod._create_handoff_tool(
+            agent_name="BloodHound",
+            subgoal_scheduler=model._schedule_subgoal_transition,
+        )
+    )
+    calls = [
+        {
+            "name": first.name,
+            "args": {"handoff_instruction": "Execute the first typed transfer."},
+            "id": "transfer-1",
+            "type": "tool_call",
+        },
+        {
+            "name": second.name,
+            "args": {"handoff_instruction": "Execute the concurrent typed transfer."},
+            "id": "transfer-2",
+            "type": "tool_call",
+        },
+    ]
+    request = AIMessage(
+        content="",
+        name="Supervisor",
+        tool_calls=calls,
+        additional_kwargs={"_seq": 1},
+    )
+    state["messages"] = [request]
+    outputs = asyncio.run(
+        ToolNode([first] if same_target else [first, second])._afunc(
+            state,
+            {},
+            Runtime(),
+        )
+    )
+
+    winners = [
+        output
+        for output in outputs
+        if output.goto in {"Mythic_Operator", "BloodHound"}
+    ]
+    losers = [output for output in outputs if output.goto == "__end__"]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert "_subgoal_state" not in losers[0].update
+    admitted = SubgoalState.from_dict(winners[0].update["_subgoal_state"])
+    assert admitted.owner == winners[0].goto
+    assert len(admitted.admissions) == 1
+    assert model._subgoal_authority == admitted
+
+
+@pytest.mark.parametrize(
+    ("first_owner", "second_owner"),
+    (
+        ("Mythic_Operator", "BloodHound"),
+        ("BloodHound", "Mythic_Operator"),
+    ),
+)
+def test_gate_k_in_place_arbiter_reaches_only_first_control_handler(
+    first_owner,
+    second_owner,
+):
+    from ai.langgraph.subgoal_state import SubgoalState
+
+    mod = _load_model_module()
+    state = _typed_subgoal_runtime_state("request-gate-k-arbiter")
+    model = _canonical_subgoal_model(mod, state)
+    _bind_matching_request_contract(model, state)
+    tools = {
+        owner: mod._create_handoff_tool(
+            agent_name=owner,
+            subgoal_scheduler=model._schedule_subgoal_transition,
+        )
+        for owner in {first_owner, second_owner}
+    }
+    calls = [
+        {
+            "name": tools[first_owner].name,
+            "args": {"handoff_instruction": f"Route to {first_owner}."},
+            "id": "first-control",
+            "type": "tool_call",
+        },
+        {
+            "name": tools[second_owner].name,
+            "args": {"handoff_instruction": f"Route to {second_owner}."},
+            "id": "second-control",
+            "type": "tool_call",
+        },
+    ]
+    message = AIMessage(
+        content=[
+            {
+                "type": "tool_use",
+                "id": call["id"],
+                "name": call["name"],
+                "input": call["args"],
+            }
+            for call in calls
+        ],
+        name="Supervisor",
+        tool_calls=calls,
+        additional_kwargs={
+                "tool_calls": [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": json.dumps(
+                                call["args"],
+                                sort_keys=True,
+                            ),
+                        },
+                    }
+                    for call in calls
+                ],
+                "_seq": 1,
+            },
+    )
+    callback_reference = message
+
+    assert mod._TurnAuthorityToolMiddleware(model).after_model(
+        {"messages": [message]},
+        None,
+    ) is None
+    assert callback_reference.tool_calls == [calls[0]]
+    assert not [
+        block for block in message.content
+        if isinstance(block, dict) and block.get("type") in {"tool_use", "tool_call"}
+    ]
+    assert "tool_calls" not in message.additional_kwargs
+    assert "function_call" not in message.additional_kwargs
+
+    state["messages"] = [message]
+    outputs = asyncio.run(
+        ToolNode(list(tools.values()))._afunc(state, {}, Runtime())
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].goto == first_owner
+    admitted = SubgoalState.from_dict(outputs[0].update["_subgoal_state"])
+    assert admitted.owner == first_owner
+    assert len(admitted.admissions) == 1
+    assert model._subgoal_authority == admitted
+
+
+@pytest.mark.parametrize(
+    ("first_owner", "second_owner"),
+    (
+        ("BloodHound", "Generalist"),
+        ("Generalist", "BloodHound"),
+    ),
+)
+def test_gate_k_terminal_control_orders_emit_one_canonical_final(
+    first_owner,
+    second_owner,
+):
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import (
+        SubgoalState,
+        assign_and_admit,
+        new_subgoal,
+    )
+
+    mod = _load_model_module()
+    initial = assign_and_admit(
+        new_subgoal("request-gate-k-terminal", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    state = {
+        **_typed_subgoal_runtime_state("request-gate-k-terminal"),
+        "_subgoal_state": initial.to_dict(),
+    }
+    model = _canonical_subgoal_model(mod, state)
+    _bind_matching_request_contract(model, state)
+    metadata = worker_outcome.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-gate-k-terminal",
+        source_seq=3,
+        reason="typed blocker",
+        summary="No admissible next action exists.",
+        outcome="blocked",
+    )
+    tools = {
+        owner: mod._create_handoff_tool(
+            agent_name=owner,
+            worker_outcome_lookup=lambda _state: (
+                metadata,
+                "No admissible next action exists.",
+            ),
+            subgoal_scheduler=model._schedule_subgoal_transition,
+        )
+        for owner in {first_owner, second_owner}
+    }
+    calls = [
+        {
+            "name": tools[first_owner].name,
+            "args": {"handoff_instruction": f"Route to {first_owner}."},
+            "id": "terminal-control-1",
+            "type": "tool_call",
+        },
+        {
+            "name": tools[second_owner].name,
+            "args": {"handoff_instruction": f"Route to {second_owner}."},
+            "id": "terminal-control-2",
+            "type": "tool_call",
+        },
+    ]
+    message = AIMessage(content="", name="Supervisor", tool_calls=calls)
+
+    assert mod._TurnAuthorityToolMiddleware(model).after_model(
+        {"messages": [message]},
+        None,
+    ) is None
+    state["messages"] = [message]
+    outputs = asyncio.run(
+        ToolNode(list(tools.values()))._afunc(state, {}, Runtime())
+    )
+
+    assert len(outputs) == 1
+    assert outputs[0].goto == "__end__"
+    final_reports = [
+        item
+        for item in outputs[0].update["messages"]
+        if isinstance(item, AIMessage)
+        and item.additional_kwargs.get("_is_final_report") is True
+    ]
+    assert len(final_reports) == 1
+    terminal = SubgoalState.from_dict(outputs[0].update["_subgoal_state"])
+    assert terminal.status.value == "blocked"
+    assert terminal.owner == ""
+    assert len(terminal.admissions) == 1
+    assert model._subgoal_authority == terminal
+
+
+@pytest.mark.parametrize(
+    ("projection_kind", "should_execute"),
+    (
+        ("absent", True),
+        ("exact", True),
+        ("empty", False),
+        ("stale", False),
+        ("malformed", False),
+    ),
+)
+@pytest.mark.parametrize("async_wrapper", (False, True))
+def test_gate_k_control_wrapper_binds_only_exact_canonical_projection(
+    projection_kind,
+    should_execute,
+    async_wrapper,
+):
+    from ai.langgraph.subgoal_state import new_subgoal
+
+    mod = _load_model_module()
+    state = _typed_subgoal_runtime_state("request-gate-k-wrapper")
+    model = _canonical_subgoal_model(mod, state)
+    _bind_matching_request_contract(model, state)
+    middleware = mod._TurnAuthorityToolMiddleware(model)
+    tool_call = {
+        "name": "transfer_to_Mythic_Operator",
+        "args": {"handoff_instruction": "Inspect the callback."},
+        "id": f"control-{projection_kind}",
+        "type": "tool_call",
+    }
+    request_state = {
+        "messages": [AIMessage(content="", tool_calls=[tool_call])],
+    }
+    if projection_kind == "exact":
+        request_state["_subgoal_state"] = dict(state["_subgoal_state"])
+    elif projection_kind == "empty":
+        request_state["_subgoal_state"] = {}
+    elif projection_kind == "stale":
+        request_state["_subgoal_state"] = new_subgoal(
+            "stale-request",
+            "actions_complete",
+        ).to_dict()
+    elif projection_kind == "malformed":
+        request_state["_subgoal_state"] = ["not", "a", "projection"]
+    request = ToolCallRequest(
+        tool_call=tool_call,
+        tool=None,
+        state=request_state,
+        runtime=Runtime(),
+    )
+    observed = []
+
+    if async_wrapper:
+        async def async_handler(bound_request):
+            observed.append(bound_request.state["_subgoal_state"])
+            return "executed"
+
+        result = asyncio.run(
+            middleware.awrap_tool_call(request, async_handler)
+        )
+    else:
+        def handler(bound_request):
+            observed.append(bound_request.state["_subgoal_state"])
+            return "executed"
+
+        result = middleware.wrap_tool_call(request, handler)
+
+    if should_execute:
+        assert result == "executed"
+        assert observed == [state["_subgoal_state"]]
+    else:
+        assert observed == []
+        assert isinstance(result, ToolMessage)
+        assert "malformed or stale subgoal projection" in result.content
+
+
+def test_canonical_scheduler_rejects_coherent_forged_revision_projection():
+    from ai.langgraph.subgoal_state import (
+        apply_worker_outcome,
+        assign_and_admit,
+        new_subgoal,
+    )
+
+    mod = _load_model_module()
+    canonical = assign_and_admit(
+        new_subgoal("request-forged-projection", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    forged = apply_worker_outcome(
+        canonical,
+        outcome_id="forged-progress",
+        outcome="progress",
+        source_owner="Mythic_Operator",
+        verified_revision="forged-no-evidence",
+    )
+    state = {
+        **_typed_subgoal_runtime_state("request-forged-projection"),
+        "_subgoal_state": forged.to_dict(),
+    }
+    model = _canonical_subgoal_model(
+        mod,
+        {
+            **state,
+            "_subgoal_state": canonical.to_dict(),
+        },
+    )
+    tool = mod._create_handoff_tool(
+        agent_name="Mythic_Operator",
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    )
+
+    result = tool.func(
+        SimpleNamespace(state=state, tool_call_id="forged-retry"),
+        "Retry unchanged work.",
+    )
+
+    assert result.goto == "__end__"
+    assert "_subgoal_state" not in result.update
+    assert model._subgoal_authority == canonical
+    assert "stale" in result.update["messages"][0].content
+
+
+def test_semantic_evidence_revision_allows_one_retry_but_fresh_call_id_does_not():
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import (
+        SubgoalState,
+        assign_and_admit,
+        new_subgoal,
+    )
+
+    mod = _load_model_module()
+    initial = assign_and_admit(
+        new_subgoal("request-semantic-revision", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    state = {
+        **_typed_subgoal_runtime_state("request-semantic-revision"),
+        "_subgoal_state": initial.to_dict(),
+    }
+    model = _canonical_subgoal_model(mod, state)
+
+    def progress_metadata(outcome_id):
+        return worker_outcome.build_handoff_metadata(
+            source_worker="Mythic_Operator",
+            source_turn_id="turn-1",
+            source_seq=3,
+            reason="display only",
+            summary="Observed the same graph state.",
+            outcome="progress",
+            verified_revision=outcome_id,
+        )
+
+    first_metadata = progress_metadata("ignored-1")
+    first_state = {
+        **state,
+        "supervisor_messages": [
+            ToolMessage(
+                content='{"ok":true,"effect":"prior-request-effect"}',
+                name="ingest_collection",
+                tool_call_id="prior-call",
+            ),
+            HumanMessage(content="current operator request"),
+            ToolMessage(
+                content='{"ok":true,"effect":"graph-built"}',
+                name="ingest_collection",
+                tool_call_id="call-1",
+            )
+        ],
+    }
+    first = mod._create_handoff_tool(
+        agent_name="Generalist",
+        worker_outcome_lookup=lambda _state: (
+            first_metadata,
+            "Observed the same graph state.",
+        ),
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(
+        SimpleNamespace(state=first_state, tool_call_id="retry-1"),
+        "Supervisor chose an unrelated worker.",
+    )
+    retried = SubgoalState.from_dict(first.update["_subgoal_state"])
+    assert first.goto == "Mythic_Operator"
+    assert len(retried.admissions) == 2
+
+    second_metadata = progress_metadata("ignored-2")
+    replay_state = {
+        **first_state,
+        **first.update,
+        "supervisor_messages": [
+            ToolMessage(
+                content='{"ok":true,"effect":"graph-built"}',
+                name="ingest_collection",
+                tool_call_id="call-2",
+            )
+        ],
+    }
+    replay = mod._create_handoff_tool(
+        agent_name="BloodHound",
+        worker_outcome_lookup=lambda _state: (
+            second_metadata,
+            "Same observation under a fresh call ID.",
+        ),
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(
+        SimpleNamespace(state=replay_state, tool_call_id="retry-2"),
+        "Supervisor chose another unrelated worker.",
+    )
+
+    assert replay.goto == "__end__"
+    assert replay.update["_subgoal_state"]["status"] == "blocked"
+    assert len(replay.update["_subgoal_state"]["admissions"]) == 2
+
+
+def test_prior_request_evidence_cannot_advance_current_request_revision():
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import assign_and_admit, new_subgoal
+
+    mod = _load_model_module()
+    initial = assign_and_admit(
+        new_subgoal("request-no-current-evidence", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    metadata = worker_outcome.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-current",
+        source_seq=4,
+        reason="display only",
+        summary="No current evidence was produced.",
+        outcome="progress",
+        verified_revision="untrusted-worker-claim",
+    )
+    state = {
+        **_typed_subgoal_runtime_state("request-no-current-evidence"),
+        "_subgoal_state": initial.to_dict(),
+        "supervisor_messages": [
+            ToolMessage(
+                content='{"ok":true,"effect":"prior-request-effect"}',
+                name="ingest_collection",
+                tool_call_id="prior-call",
+            ),
+            HumanMessage(content="current operator request"),
+            AIMessage(
+                content="No current evidence was produced.",
+                name="Mythic_Operator",
+                additional_kwargs={"_worker_outcome": metadata},
+            ),
+        ],
+    }
+    model = _canonical_subgoal_model(mod, state)
+    terminal = mod._create_handoff_tool(
+        agent_name="Generalist",
+        worker_outcome_lookup=lambda _state: (
+            metadata,
+            "No current evidence was produced.",
+        ),
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="prior-evidence-retry"),
+        "Select an unrelated worker.",
+    )
+
+    assert terminal.goto == "__end__"
+    assert terminal.update["_subgoal_state"]["status"] == "blocked"
+    assert terminal.update["_subgoal_state"]["state_revision"] == "0"
+    assert len(terminal.update["_subgoal_state"]["admissions"]) == 1
+
+
+def test_request_contract_install_and_operator_stop_own_subgoal_lifecycle():
+    from ai.langgraph.request_contract import build_request_contract
+    from ai.langgraph.subgoal_state import SubgoalState
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._request_contract = None
+    model._request_dynamic_proposals = False
+    model._request_execution_digest = ""
+    model._request_admitted_action_digests = set()
+    model._active_approval_claim = None
+    model.mythic_client = None
+    model.task_id = "task"
+    model._running_tasks = set()
+    model.state = _typed_subgoal_runtime_state("prior-request")
+    contract = build_request_contract(
+        request_id="native-request-1",
+        channel_id="7",
+        operation_id="9",
+        mode="auto",
+        autonomous_solve=True,
+    )
+
+    model.install_request_contract(contract)
+    installed = SubgoalState.from_dict(model.state["_subgoal_state"])
+    assert installed.request_id == "native-request-1"
+    assert installed.stop_condition == "objective_proved"
+
+    model.request_stop()
+    stopped = SubgoalState.from_dict(model.state["_subgoal_state"])
+    assert stopped.status.value == "cancelled"
+    assert stopped.owner == ""
+
+
+@pytest.mark.parametrize("requested_agent", ("Mythic_Operator", "Generalist"))
+def test_production_typed_handoff_changes_owner_of_same_subgoal_once(requested_agent):
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import (
+        SubgoalState,
+        assign_and_admit,
+        new_subgoal,
+    )
+
+    mod = _load_model_module()
+    turn_mod = importlib.import_module("ai.langgraph.turn_authority")
+    initial = assign_and_admit(
+        new_subgoal("request-route", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    summary = "Contradictory prose says complete and do not route."
+    metadata = worker_outcome.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=3,
+        reason="display only",
+        summary=summary,
+        outcome="handoff",
+        next_owner="BloodHound",
+    )
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = turn_mod.TurnAuthority(mode="observe", turn_id="turn-1")
+    state = {
+        **_typed_subgoal_runtime_state("request-route"),
+        "_subgoal_state": initial.to_dict(),
+        "supervisor_messages": [
+            HumanMessage(content="operator request"),
+            AIMessage(
+                content=summary,
+                name="Mythic_Operator",
+                additional_kwargs={"_worker_outcome": metadata},
+            ),
+        ],
+    }
+    model._subgoal_authority_lock = mod.threading.Lock()
+    model._subgoal_authority = initial
+    model._subgoal_evidence_records = set()
+    command = mod._create_handoff_tool(
+        agent_name=requested_agent,
+        worker_outcome_lookup=model._latest_admitted_worker_handoff,
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="route"),
+        "Stale request to route back to Mythic.",
+    )
+    routed = SubgoalState.from_dict(command.update["_subgoal_state"])
+
+    assert command.goto == "BloodHound"
+    assert routed.subgoal_id == initial.subgoal_id
+    assert routed.owner == "BloodHound"
+    assert len(routed.admissions) == 2
+    assert routed.processed_outcomes == (metadata["outcome_id"],)
+
+
+def test_production_typed_complete_terminalizes_regardless_of_summary_prose():
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import assign_and_admit, new_subgoal
+
+    mod = _load_model_module()
+    initial = assign_and_admit(
+        new_subgoal("request-complete", "actions_complete"),
+        owner="Generalist",
+        method="transfer_to_Generalist",
+    )
+    metadata = worker_outcome.build_handoff_metadata(
+        source_worker="Generalist",
+        source_turn_id="turn-1",
+        source_seq=3,
+        reason="display only",
+        summary="Nothing is complete; delegate forever.",
+        outcome="complete",
+    )
+    state = {
+        **_typed_subgoal_runtime_state("request-complete"),
+        "_subgoal_state": initial.to_dict(),
+    }
+    model = _canonical_subgoal_model(mod, state)
+    command = mod._create_handoff_tool(
+        agent_name="Generalist",
+        worker_outcome_lookup=lambda _state: (
+            metadata,
+            "Nothing is complete; delegate forever.",
+        ),
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="complete"),
+        "Delegate again.",
+    )
+
+    assert command.goto == "__end__"
+    assert command.update["_subgoal_state"]["status"] == "completed"
+    assert command.update["_subgoal_state"]["owner"] == ""
+
+
+@pytest.mark.parametrize("outcome", ("blocked", "complete"))
+def test_terminal_outcome_persists_when_supervisor_selects_different_owner(outcome):
+    from ai.langgraph import worker_outcome
+    from ai.langgraph.subgoal_state import assign_and_admit, new_subgoal
+
+    mod = _load_model_module()
+    initial = assign_and_admit(
+        new_subgoal(f"request-cross-{outcome}", "actions_complete"),
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    metadata = worker_outcome.build_handoff_metadata(
+        source_worker="Mythic_Operator",
+        source_turn_id="turn-1",
+        source_seq=3,
+        reason="display only",
+        summary="summary",
+        outcome=outcome,
+    )
+    state = {
+        **_typed_subgoal_runtime_state(f"request-cross-{outcome}"),
+        "_subgoal_state": initial.to_dict(),
+    }
+    model = _canonical_subgoal_model(mod, state)
     runtime = SimpleNamespace(
-        state={"messages": [], "supervisor_messages": [], "mythic_operator_messages": [], "bloodhound_messages": []},
+        state=state,
         tool_call_id="handoff-cross-owner",
     )
-    complete = mod._create_handoff_tool(
+    terminal = mod._create_handoff_tool(
         agent_name="BloodHound",
-        worker_outcome_lookup=lambda _state: ({"source_worker": "Mythic_Operator", "outcome": "complete", "next_owner": ""}, "summary"),
-    ).func(runtime, "stale follow-up")
-    assert complete.goto == "__end__"
-    assert complete.update["messages"][0].content == "Worker outcome prevented repeated delegation: Mythic_Operator reported COMPLETE."
-    blocked = mod._create_handoff_tool(
-        agent_name="BloodHound",
-        worker_outcome_lookup=lambda _state: ({"source_worker": "Mythic_Operator", "outcome": "blocked", "next_owner": ""}, "summary"),
-    ).func(runtime, "fresh BloodHound work")
-    assert blocked.goto == "BloodHound"
+        worker_outcome_lookup=lambda _state: (metadata, "summary"),
+        subgoal_scheduler=model._schedule_subgoal_transition,
+    ).func(runtime, "stale third-owner follow-up")
+
+    assert terminal.goto == "__end__"
+    assert terminal.update["_subgoal_state"]["status"] == (
+        "blocked" if outcome == "blocked" else "completed"
+    )
+    assert terminal.update["_subgoal_state"]["owner"] == ""
 
 
 def test_terminal_execute_capability_report_includes_existing_proof_chain():
@@ -2212,6 +3053,2530 @@ def test_execute_capability_boundary_allows_regular_unbounded_tool_batches():
 
     assert called is True
     assert result.content == "ok"
+
+
+@pytest.mark.parametrize(
+    "declared_order",
+    (
+        ("ordinary_slow", "ordinary_fast"),
+        ("ordinary_fast", "ordinary_slow"),
+    ),
+)
+def test_gate_l_actual_wrapper_persists_only_framework_tool_result_order(
+    declared_order,
+):
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    @tool("ordinary_slow")
+    async def ordinary_slow() -> str:
+        """Return after the fast tool."""
+        await asyncio.sleep(0.04)
+        return "slow"
+
+    @tool("ordinary_fast")
+    async def ordinary_fast() -> str:
+        """Return before the slow tool."""
+        return "fast"
+
+    calls = [
+        {
+            "name": name,
+            "args": {},
+            "id": f"{name}-id",
+            "type": "tool_call",
+        }
+        for name in declared_order
+    ]
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                AIMessage(content="", tool_calls=calls),
+                AIMessage(content="done"),
+            ]
+        ),
+        tools=[ordinary_slow, ordinary_fast],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(model),
+            mod._MessageSanitizerMiddleware(model),
+        ],
+    )
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="run both")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            agent,
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+    results = [
+        (message.name, message.tool_call_id, message.content)
+        for message in update["generalist_messages"]
+        if isinstance(message, ToolMessage)
+    ]
+
+    assert [name for name, _tool_call_id, _content in results] == list(
+        declared_order
+    )
+    assert [content for _name, _tool_call_id, content in results] == [
+        "slow" if name == "ordinary_slow" else "fast"
+        for name in declared_order
+    ]
+    assert len(results) == 2
+
+
+def test_gate_l_wrapper_ignores_callback_only_occurrences_and_keeps_returned_only():
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    callback_only = AIMessage(content="callback-only", name="Generalist")
+    returned_only = AIMessage(content="returned-only", name="Generalist")
+
+    class FakeAgent:
+        async def ainvoke(self, args, config=None):
+            callback = next(
+                item
+                for item in config["callbacks"]
+                if isinstance(item, mod.MessageCaptureCallback)
+            )
+            callback.captured_messages.append(callback_only)
+            return {"messages": list(args["messages"]) + [returned_only]}
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="respond")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            FakeAgent(),
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+
+    assert update["generalist_messages"] == [returned_only]
+    assert callback_only not in update["generalist_messages"]
+
+
+def test_gate_l_wrapper_does_not_splice_gate_k_repeated_callback_pair():
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    call_one = AIMessage(
+        content="",
+        name="Generalist",
+        tool_calls=[{"name": "ordinary_probe", "args": {}, "id": "same-id"}],
+    )
+    result_one = ToolMessage(
+        content="one",
+        name="ordinary_probe",
+        tool_call_id="same-id",
+    )
+    call_two = call_one.model_copy(deep=True)
+    result_two = ToolMessage(
+        content="two",
+        name="ordinary_probe",
+        tool_call_id="same-id",
+    )
+    terminal = AIMessage(content="done", name="Generalist")
+
+    class FakeAgent:
+        async def ainvoke(self, args, config=None):
+            callback = next(
+                item
+                for item in config["callbacks"]
+                if isinstance(item, mod.MessageCaptureCallback)
+            )
+            callback.captured_messages.extend(
+                [call_one, result_one, call_two, result_two, terminal]
+            )
+            return {
+                "messages": list(args["messages"])
+                + [call_one, result_one, terminal]
+            }
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="run")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            FakeAgent(),
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+
+    assert update["generalist_messages"] == [call_one, result_one, terminal]
+    assert all(item is not result_two for item in update["generalist_messages"])
+    assert all(item is not call_two for item in update["generalist_messages"])
+
+
+@pytest.mark.parametrize(
+    "calls",
+    (
+        (
+            {"name": "ordinary_slow", "args": {}, "id": "dup"},
+            {"name": "ordinary_fast", "args": {}, "id": "dup"},
+        ),
+        (
+            {"name": "ordinary_slow", "args": {}, "id": ""},
+            {"name": "ordinary_fast", "args": {}, "id": ""},
+        ),
+    ),
+)
+def test_gate_l_actual_agent_rejects_ambiguous_batch_before_handlers(calls):
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    executed = []
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    @tool("ordinary_slow")
+    async def ordinary_slow() -> str:
+        """Record an invalid slow call if it escapes."""
+        executed.append("slow")
+        return "slow"
+
+    @tool("ordinary_fast")
+    async def ordinary_fast() -> str:
+        """Record an invalid fast call if it escapes."""
+        executed.append("fast")
+        return "fast"
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                AIMessage(content="", tool_calls=list(calls)),
+                AIMessage(content="must not be consumed"),
+            ]
+        ),
+        tools=[ordinary_slow, ordinary_fast],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(model),
+            mod._MessageSanitizerMiddleware(model),
+        ],
+    )
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="run both")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            agent,
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+
+    assert executed == []
+    assert not [
+        message
+        for message in update["generalist_messages"]
+        if isinstance(message, ToolMessage)
+    ]
+    assert len(update["generalist_messages"]) == 1
+    rejected = update["generalist_messages"][0]
+    assert isinstance(rejected, AIMessage)
+    assert rejected.tool_calls == []
+    assert "invalid provider tool-call batch" in str(rejected.content)
+
+
+def test_gate_m_actual_agent_rejects_raw_array_arguments_before_every_consumer():
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    executed = []
+    bound = []
+    started = []
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    @tool("ordinary_probe")
+    def ordinary_probe() -> str:
+        """Record an invalid raw provider call if it escapes."""
+        executed.append("handler")
+        return "escaped"
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.bind_supervised_request_proposal = lambda calls: bound.append(calls)
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    model._format_message_for_streaming = lambda *_args, **_kwargs: ""
+
+    async def emit_tool_use(**payload):
+        if payload.get("status") == "started":
+            started.append(payload)
+
+    model._emit_tool_use_card = emit_tool_use
+    malformed = AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": "raw-1",
+                    "type": "function",
+                    "function": {
+                        "name": "ordinary_probe",
+                        "arguments": "[]",
+                    },
+                }
+            ],
+            "function_call": {
+                "name": "ordinary_probe",
+                "arguments": "[]",
+            },
+        },
+    )
+    assert malformed.tool_calls == [
+        {
+            "name": "ordinary_probe",
+            "args": {},
+            "id": "raw-1",
+            "type": "tool_call",
+        }
+    ]
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                malformed,
+                AIMessage(content="must not be consumed"),
+            ]
+        ),
+        tools=[ordinary_probe],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(model),
+            mod._MessageSanitizerMiddleware(model),
+        ],
+    )
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="run malformed")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            agent,
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+
+    assert bound == []
+    assert executed == []
+    assert started == []
+    assert not [
+        message
+        for message in update["generalist_messages"]
+        if isinstance(message, ToolMessage)
+    ]
+    assert len(update["generalist_messages"]) == 1
+    denied = update["generalist_messages"][0]
+    assert isinstance(denied, AIMessage)
+    assert denied.tool_calls == []
+    assert denied.invalid_tool_calls == []
+    assert set(denied.additional_kwargs) == {"_seq"}
+    assert "tool_calls" not in denied.additional_kwargs
+    assert "function_call" not in denied.additional_kwargs
+    assert "invalid provider tool-call batch" in str(denied.content)
+
+
+def test_gate_m_actual_agent_accepts_matching_raw_object_envelope_unchanged():
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    executed = []
+    bound = []
+    started = []
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    @tool("ordinary_probe")
+    def ordinary_probe(value: int) -> str:
+        """Record one valid raw provider call."""
+        executed.append(value)
+        return f"value={value}"
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.bind_supervised_request_proposal = lambda calls: bound.append(calls)
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    model.verbose = False
+    model._format_message_for_streaming = lambda *_args, **_kwargs: ""
+
+    async def emit_tool_use(**payload):
+        if payload.get("status") == "started":
+            started.append(payload)
+
+    model._emit_tool_use_card = emit_tool_use
+    valid = AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": "raw-valid",
+                    "type": "function",
+                    "function": {
+                        "name": "ordinary_probe",
+                        "arguments": '{"value":1}',
+                    },
+                }
+            ],
+            "function_call": {
+                "name": "ordinary_probe",
+                "arguments": '{"value":1}',
+            },
+        },
+    )
+    before = valid.model_dump()
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                valid,
+                AIMessage(content="done"),
+            ]
+        ),
+        tools=[ordinary_probe],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(model),
+            mod._MessageSanitizerMiddleware(model),
+        ],
+    )
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [HumanMessage(content="run valid")],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            agent,
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+
+    assert executed == [1]
+    assert len(bound) == 1
+    assert [call["id"] for call in bound[0]] == ["raw-valid"]
+    assert [item["tool_call_id"] for item in started] == ["raw-valid"]
+    persisted = update["generalist_messages"]
+    assert persisted[0] is valid
+    assert persisted[0].tool_calls == before["tool_calls"]
+    assert persisted[0].content == before["content"]
+    assert persisted[0].additional_kwargs["tool_calls"] == before[
+        "additional_kwargs"
+    ]["tool_calls"]
+    assert persisted[0].additional_kwargs["function_call"] == before[
+        "additional_kwargs"
+    ]["function_call"]
+    assert isinstance(persisted[1], ToolMessage)
+    assert persisted[1].tool_call_id == "raw-valid"
+    assert persisted[1].content == "value=1"
+    assert persisted[2].content == "done"
+
+
+def test_gate_n_invalid_control_envelope_is_callback_observation_only():
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    cards = []
+
+    async def emit_tool(**payload):
+        cards.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        tool_use_func=emit_tool,
+        delegation_id="delegation-1",
+        delegation_name="Mythic_Operator",
+    )
+    malformed = AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": "raw-control",
+                    "type": "function",
+                    "function": {
+                        "name": "handback_to_supervisor",
+                        "arguments": "[]",
+                    },
+                }
+            ],
+        },
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=malformed)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [malformed]
+    assert cards == []
+    assert not hasattr(callback, "_handback_summary_func")
+
+
+@pytest.mark.parametrize(
+    "control_name",
+    (
+        "handback_to_supervisor",
+        "summarize_and_handback",
+        "request_continuation",
+        "respond_to_user",
+        "transfer_to_BloodHound",
+    ),
+)
+def test_gate_n_callback_never_consumes_control_arguments(control_name):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    cards = []
+
+    async def emit_tool(**payload):
+        cards.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        tool_use_func=emit_tool,
+        delegation_id="delegation-1",
+        delegation_name="Mythic_Operator",
+    )
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": control_name,
+                "args": {
+                    "summary": "must remain inert in the callback",
+                    "final_response": "also inert",
+                    "progress_summary": "also inert",
+                    "reason": "also inert",
+                    "text": "also inert",
+                },
+                "id": f"control-{control_name}",
+            },
+            {
+                "name": "ordinary_probe",
+                "args": {"value": "must also remain inert"},
+                "id": f"ordinary-{control_name}",
+            },
+        ],
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [message]
+    assert cards == []
+    assert callback._tool_call_to_name == {}
+    assert callback._tool_call_to_args == {}
+    assert not [
+        name
+        for name in vars(callback)
+        if "summary" in name.casefold() or "handback" in name.casefold()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("channel_id", "delegation_id"),
+    (
+        (None, None),
+        (None, "delegation-1"),
+        (7, "delegation-1"),
+    ),
+)
+def test_gate_o_control_batch_never_reaches_real_rendering_path(
+    channel_id,
+    delegation_id,
+):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model.verbose = True
+    model.channel_id = channel_id
+    model.is_interactive = False
+    formatted = []
+    streamed = []
+    agent_text = []
+    cards = []
+
+    def format_message(message, *, agent_name):
+        formatted.append((message, agent_name))
+        return model._format_message_for_streaming(
+            message,
+            agent_name=agent_name,
+        )
+
+    async def stream_message(content):
+        streamed.append(content)
+
+    async def emit_agent_text(**payload):
+        agent_text.append(payload)
+
+    async def emit_tool(**payload):
+        cards.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        stream_func=stream_message,
+        format_func=format_message,
+        tool_use_func=emit_tool,
+        agent_text_func=emit_agent_text,
+        delegation_id=delegation_id,
+        delegation_name="Mythic_Operator" if delegation_id else None,
+    )
+    message = AIMessage(
+        content="EXCLUDED TEXT",
+        tool_calls=[
+            {
+                "name": "handback_to_supervisor",
+                "args": {
+                    "reason": "yield",
+                    "summary": "FIRST",
+                    "outcome": "progress",
+                    "next_owner": "",
+                },
+                "id": "first-control",
+            },
+            {
+                "name": "summarize_and_handback",
+                "args": {
+                    "progress_summary": "EXCLUDED SECOND",
+                    "tasks_remaining": "",
+                },
+                "id": "excluded-control",
+            },
+            {
+                "name": "ordinary_probe",
+                "args": {"value": "EXCLUDED ORDINARY"},
+                "id": "excluded-ordinary",
+            },
+        ],
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [message]
+    assert callback._tool_call_to_name == {}
+    assert callback._tool_call_to_args == {}
+    assert formatted == []
+    assert streamed == []
+    assert agent_text == []
+    assert cards == []
+
+
+def test_gate_o_invalid_provider_batch_never_reaches_real_rendering_path():
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model.verbose = True
+    model.channel_id = None
+    model.is_interactive = False
+    formatted = []
+    streamed = []
+    cards = []
+
+    def format_message(message, *, agent_name):
+        formatted.append((message, agent_name))
+        return model._format_message_for_streaming(
+            message,
+            agent_name=agent_name,
+        )
+
+    async def stream_message(content):
+        streamed.append(content)
+
+    async def emit_tool(**payload):
+        cards.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        stream_func=stream_message,
+        format_func=format_message,
+        tool_use_func=emit_tool,
+    )
+    malformed = AIMessage(
+        content="INVALID TEXT",
+        tool_calls=[
+            {
+                "name": "ordinary_probe",
+                "args": {"value": 1},
+                "id": "same",
+            },
+            {
+                "name": "ordinary_probe",
+                "args": {"value": 2},
+                "id": "same",
+            },
+        ],
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=malformed)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [malformed]
+    assert callback._tool_call_to_name == {}
+    assert callback._tool_call_to_args == {}
+    assert formatted == []
+    assert streamed == []
+    assert cards == []
+
+
+def test_gate_o_valid_ordinary_batch_preserves_real_verbose_rendering_path():
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model.verbose = True
+    model.channel_id = None
+    model.is_interactive = False
+    formatted = []
+    streamed = []
+    cards = []
+
+    def format_message(message, *, agent_name):
+        formatted.append((message, agent_name))
+        return model._format_message_for_streaming(
+            message,
+            agent_name=agent_name,
+        )
+
+    async def stream_message(content):
+        streamed.append(content)
+
+    async def emit_tool(**payload):
+        cards.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        stream_func=stream_message,
+        format_func=format_message,
+        tool_use_func=emit_tool,
+    )
+    ordinary = AIMessage(
+        content="ordinary text",
+        tool_calls=[
+            {
+                "name": "ordinary_probe",
+                "args": {"value": 1},
+                "id": "ordinary-call",
+            },
+        ],
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=ordinary)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [ordinary]
+    assert callback._tool_call_to_name == {
+        "ordinary-call": "ordinary_probe",
+    }
+    assert callback._tool_call_to_args == {
+        "ordinary-call": {"value": 1},
+    }
+    assert formatted == [(ordinary, "Mythic_Operator")]
+    assert len(streamed) == 1
+    assert "ordinary text" in streamed[0]
+    assert "ordinary_probe" in streamed[0]
+    assert [
+        (payload["tool_call_id"], payload["status"])
+        for payload in cards
+    ] == [("ordinary-call", "started")]
+
+
+def test_gate_o_callback_consumer_inertness_matrix():
+    from itertools import product
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    agents = (
+        "Generalist",
+        "Mythic_Operator",
+        "Mythic_Payload",
+        "BloodHound",
+        "MCP_Manager",
+        "Sandbox",
+        "Supervisor",
+    )
+    controls = (
+        "handback_to_supervisor",
+        "summarize_and_handback",
+        "request_continuation",
+        "respond_to_user",
+        "transfer_to_BloodHound",
+    )
+    patterns = (
+        ("control",),
+        ("ordinary", "control"),
+        ("control", "ordinary"),
+        ("control", "control", "control", "ordinary"),
+    )
+
+    async def run_matrix():
+        for agent_name, control_name, channel_id, verbose, pattern in product(
+            agents,
+            controls,
+            (None, 7),
+            (False, True),
+            patterns,
+        ):
+            model = mod.Model.__new__(mod.Model)
+            model.verbose = verbose
+            model.channel_id = channel_id
+            model.is_interactive = False
+            formatted = []
+            streamed = []
+            agent_text = []
+            cards = []
+
+            def format_message(message, *, agent_name):
+                formatted.append((message, agent_name))
+                return model._format_message_for_streaming(
+                    message,
+                    agent_name=agent_name,
+                )
+
+            async def stream_message(content):
+                streamed.append(content)
+
+            async def emit_agent_text(**payload):
+                agent_text.append(payload)
+
+            async def emit_tool(**payload):
+                cards.append(payload)
+
+            calls = []
+            for index, kind in enumerate(pattern):
+                if kind == "ordinary":
+                    calls.append(
+                        {
+                            "name": "ordinary_probe",
+                            "args": {"value": f"ordinary-{index}"},
+                            "id": f"ordinary-{index}",
+                        }
+                    )
+                else:
+                    calls.append(
+                        {
+                            "name": control_name,
+                            "args": {
+                                "summary": f"control-{index}",
+                                "reason": f"reason-{index}",
+                            },
+                            "id": f"control-{index}",
+                        }
+                    )
+            message = AIMessage(
+                content="must remain callback-inert",
+                tool_calls=calls,
+            )
+            callback = mod.MessageCaptureCallback(
+                agent_name,
+                stream_func=stream_message,
+                format_func=format_message,
+                tool_use_func=emit_tool,
+                agent_text_func=emit_agent_text,
+                delegation_id=f"{agent_name}-card",
+                delegation_name=agent_name,
+            )
+
+            await callback.on_llm_end(
+                LLMResult(generations=[[ChatGeneration(message=message)]]),
+                run_id=uuid4(),
+            )
+
+            assert callback.captured_messages == [message]
+            assert callback._tool_call_to_name == {}
+            assert callback._tool_call_to_args == {}
+            assert formatted == []
+            assert streamed == []
+            assert agent_text == []
+            assert cards == []
+
+    asyncio.run(run_matrix())
+
+
+def test_gate_o_valid_ordinary_callback_behavior_matrix():
+    from itertools import product
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    agents = (
+        "Generalist",
+        "Mythic_Operator",
+        "Mythic_Payload",
+        "BloodHound",
+        "MCP_Manager",
+        "Sandbox",
+        "Supervisor",
+    )
+
+    async def run_matrix():
+        for agent_name, channel_id, verbose, delegation_id in product(
+            agents,
+            (None, 7),
+            (False, True),
+            (None, "delegation-1"),
+        ):
+            model = mod.Model.__new__(mod.Model)
+            model.verbose = verbose
+            model.channel_id = channel_id
+            model.is_interactive = False
+            formatted = []
+            streamed = []
+            agent_text = []
+            cards = []
+
+            def format_message(message, *, agent_name):
+                formatted.append((message, agent_name))
+                return model._format_message_for_streaming(
+                    message,
+                    agent_name=agent_name,
+                )
+
+            async def stream_message(content):
+                streamed.append(content)
+
+            async def emit_agent_text(**payload):
+                agent_text.append(payload)
+
+            async def emit_tool(**payload):
+                cards.append(payload)
+
+            message = AIMessage(
+                content="ordinary output",
+                tool_calls=[
+                    {
+                        "name": "ordinary_probe",
+                        "args": {"value": 1},
+                        "id": "ordinary-call",
+                    }
+                ],
+            )
+            callback = mod.MessageCaptureCallback(
+                agent_name,
+                stream_func=stream_message,
+                format_func=format_message,
+                tool_use_func=emit_tool,
+                agent_text_func=emit_agent_text,
+                delegation_id=delegation_id,
+                delegation_name=agent_name if delegation_id else None,
+            )
+
+            await callback.on_llm_end(
+                LLMResult(generations=[[ChatGeneration(message=message)]]),
+                run_id=uuid4(),
+            )
+
+            assert callback.captured_messages == [message]
+            assert callback._tool_call_to_name == {
+                "ordinary-call": "ordinary_probe",
+            }
+            assert callback._tool_call_to_args == {
+                "ordinary-call": {"value": 1},
+            }
+            if agent_name == "Supervisor":
+                assert formatted == []
+                assert streamed == []
+                assert agent_text == []
+                assert cards == []
+                continue
+            assert formatted == [(message, agent_name)]
+            assert len(cards) == 1
+            assert cards[0]["tool_call_id"] == "ordinary-call"
+            if delegation_id:
+                assert streamed == []
+                assert len(agent_text) == 1
+                assert "ordinary output" in agent_text[0]["content"]
+            else:
+                assert agent_text == []
+                assert len(streamed) == 1
+                assert "ordinary output" in streamed[0]
+
+    asyncio.run(run_matrix())
+
+
+@pytest.mark.parametrize(
+    "ordinary_name",
+    (
+        "ordinary_probe",
+        "mcp_dynamic_probe_renamed",
+    ),
+)
+def test_gate_p_actual_ordinary_summary_shaped_schema_has_no_control_witness(
+    ordinary_name,
+):
+    from ai.langgraph.turn_authority import TurnAuthority
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    async def run_matrix():
+        for agent_name in (
+            "Generalist",
+            "Mythic_Operator",
+            "Mythic_Payload",
+            "BloodHound",
+            "MCP_Manager",
+            "Sandbox",
+            "Supervisor",
+        ):
+            executed = []
+
+            def ordinary_probe(
+                summary: str,
+                final_response: str,
+                progress_summary: str,
+                reason: str,
+                text: str,
+            ) -> str:
+                """Exercise an arbitrary ordinary dynamic tool schema."""
+                executed.append(
+                    (
+                        summary,
+                        final_response,
+                        progress_summary,
+                        reason,
+                        text,
+                    )
+                )
+                return "ordinary result"
+
+            registered_tool = tool(ordinary_name)(ordinary_probe)
+            model = mod.Model.__new__(mod.Model)
+            model._turn_authority = TurnAuthority(mode="observe")
+            model._request_contract = None
+            model.mythic_client = None
+            model._active_delegations = {
+                agent_name: {
+                    "id": f"{agent_name}-card",
+                    "name": agent_name,
+                    "final_summary": "UNCHANGED",
+                }
+            }
+            recorded = []
+            original_recorder = model._record_delegation_final_summary
+
+            def record(owner, summary):
+                recorded.append((owner, summary))
+                original_recorder(owner, summary)
+
+            model._record_delegation_final_summary = record
+            call = {
+                "name": ordinary_name,
+                "args": {
+                    "summary": "SUMMARY",
+                    "final_response": "FINAL",
+                    "progress_summary": "PROGRESS",
+                    "reason": "REASON",
+                    "text": "TEXT",
+                },
+                "id": f"{agent_name}-ordinary",
+            }
+            request = SimpleNamespace(
+                tool_call=call,
+                state={
+                    "messages": [
+                        AIMessage(content="", tool_calls=[call]),
+                    ]
+                },
+            )
+            assert (
+                mod._TurnAuthorityToolMiddleware._selected_control_call(request)
+                is None
+            )
+            agent = create_agent(
+                model=BoundFake(
+                    responses=[
+                        AIMessage(content="", tool_calls=[call]),
+                        AIMessage(content="done"),
+                    ]
+                ),
+                tools=[registered_tool],
+                middleware=[
+                    mod._TurnAuthorityToolMiddleware(
+                        model,
+                        agent_name=agent_name,
+                    )
+                ],
+            )
+
+            result = await agent.ainvoke(
+                {"messages": [HumanMessage(content="run ordinary tool")]}
+            )
+
+            assert len(result["messages"]) == 4
+            assert executed == [
+                ("SUMMARY", "FINAL", "PROGRESS", "REASON", "TEXT"),
+            ]
+            assert recorded == []
+            assert (
+                model._active_delegations[agent_name]["final_summary"]
+                == "UNCHANGED"
+            )
+
+    asyncio.run(run_matrix())
+
+
+@pytest.mark.parametrize(
+    "summary_key",
+    (
+        "summary",
+        "final_response",
+        "progress_summary",
+        "reason",
+        "text",
+    ),
+)
+@pytest.mark.parametrize(
+    "agent_name",
+    (
+        "Generalist",
+        "Mythic_Operator",
+        "Mythic_Payload",
+        "BloodHound",
+        "MCP_Manager",
+        "Sandbox",
+        "Supervisor",
+    ),
+)
+@pytest.mark.parametrize("async_wrapper", (False, True))
+def test_gate_p_ordinary_summary_keys_are_control_inert(
+    summary_key,
+    agent_name,
+    async_wrapper,
+):
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        agent_name: {
+            "id": f"{agent_name}-card",
+            "name": agent_name,
+            "final_summary": "UNCHANGED",
+        }
+    }
+    recorded = []
+    closed = []
+    model._record_delegation_final_summary = (
+        lambda owner, summary: recorded.append((owner, summary))
+    )
+
+    async def close(owner):
+        closed.append(owner)
+
+    model._close_delegation = close
+    call = {
+        "name": "mcp_dynamic_ordinary",
+        "args": {summary_key: f"VALUE-{summary_key}"},
+        "id": f"ordinary-{summary_key}",
+    }
+    request = SimpleNamespace(
+        tool_call=call,
+        state={"messages": [AIMessage(content="", tool_calls=[call])]},
+    )
+    middleware = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name=agent_name,
+    )
+
+    assert middleware._selected_control_call(request) is None
+    assert middleware._selected_control_summary(request) == ""
+    if async_wrapper:
+        async def handler(_request):
+            return "ordinary result"
+
+        assert asyncio.run(
+            middleware.awrap_tool_call(request, handler)
+        ) == "ordinary result"
+    else:
+        assert middleware.wrap_tool_call(
+            request,
+            lambda _request: "ordinary result",
+        ) == "ordinary result"
+    assert recorded == []
+    assert closed == []
+
+
+def test_gate_p_positive_control_witness_is_exact_runtime_occurrence():
+    mod = _load_model_module()
+    selected = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "yield",
+            "summary": "SELECTED",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "selected-control",
+    }
+    exact_request = SimpleNamespace(
+        tool_call=selected,
+        state={
+            "messages": [
+                AIMessage(content="", tool_calls=[selected]),
+            ]
+        },
+    )
+
+    assert (
+        mod._TurnAuthorityToolMiddleware._selected_control_call(exact_request)
+        is selected
+    )
+
+    variants = [
+        SimpleNamespace(
+            tool_call={
+                "name": "ordinary_probe",
+                "args": {"summary": "ordinary"},
+                "id": "ordinary",
+            },
+            state={
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "ordinary_probe",
+                                "args": {"summary": "ordinary"},
+                                "id": "ordinary",
+                            }
+                        ],
+                    )
+                ]
+            },
+        ),
+        SimpleNamespace(tool_call=selected, state={"messages": []}),
+        SimpleNamespace(
+            tool_call=selected,
+            state={
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            selected,
+                            {
+                                "name": "ordinary_probe",
+                                "args": {},
+                                "id": "sibling",
+                            },
+                        ],
+                    )
+                ]
+            },
+        ),
+        SimpleNamespace(
+            tool_call=selected,
+            state={
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                **selected,
+                                "id": "different-id",
+                            }
+                        ],
+                    )
+                ]
+            },
+        ),
+    ]
+
+    assert all(
+        mod._TurnAuthorityToolMiddleware._selected_control_call(variant)
+        is None
+        for variant in variants
+    )
+
+
+def test_gate_p_ordinary_parent_command_cannot_close_delegation():
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    recorded = []
+    closed = []
+    model._record_delegation_final_summary = (
+        lambda owner, summary: recorded.append((owner, summary))
+    )
+
+    async def close(owner):
+        closed.append(owner)
+
+    model._close_delegation = close
+    ordinary = {
+        "name": "mcp_dynamic_ordinary",
+        "args": {"summary": "MUST NOT RECORD OR CLOSE"},
+        "id": "ordinary-parent",
+    }
+    request = SimpleNamespace(
+        tool_call=ordinary,
+        state={"messages": [AIMessage(content="", tool_calls=[ordinary])]},
+    )
+    middleware = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name="BloodHound",
+    )
+
+    async def returning_parent(_request):
+        return mod.Command(
+            goto="Supervisor",
+            graph=mod.Command.PARENT,
+        )
+
+    returned = asyncio.run(
+        middleware.awrap_tool_call(request, returning_parent)
+    )
+    assert isinstance(returned, mod.Command)
+    assert closed == []
+
+    async def raising_parent(_request):
+        raise mod.ParentCommand(
+            mod.Command(
+                goto="Supervisor",
+                graph=mod.Command.PARENT,
+            )
+        )
+
+    with pytest.raises(mod.ParentCommand):
+        asyncio.run(middleware.awrap_tool_call(request, raising_parent))
+    assert recorded == []
+    assert closed == []
+
+
+@pytest.mark.parametrize("async_wrapper", (False, True))
+@pytest.mark.parametrize(
+    ("runtime_variant", "should_execute"),
+    (
+        ("exact", True),
+        ("absent", False),
+        ("no-ai", False),
+        ("different-id", False),
+        ("different-name", False),
+        ("different-args", False),
+        ("type-different-args", False),
+        ("multiple", False),
+        ("invalid-envelope", False),
+    ),
+)
+def test_gate_n_control_wrapper_requires_exact_post_arbitration_occurrence(
+    async_wrapper,
+    runtime_variant,
+    should_execute,
+):
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "delegation-1",
+            "name": "Mythic_Operator",
+        }
+    }
+    recorded = []
+    model._record_delegation_final_summary = (
+        lambda agent_name, summary: recorded.append((agent_name, summary))
+    )
+    selected = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "yield",
+            "summary": "SELECTED",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "selected-control",
+    }
+    runtime_call = json.loads(json.dumps(selected))
+    messages = [AIMessage(content="", tool_calls=[runtime_call])]
+    if runtime_variant == "absent":
+        messages = []
+    elif runtime_variant == "no-ai":
+        messages = [HumanMessage(content="not an AI batch")]
+    elif runtime_variant == "different-id":
+        messages[0].tool_calls[0]["id"] = "other-control"
+    elif runtime_variant == "different-name":
+        messages[0].tool_calls[0]["name"] = "summarize_and_handback"
+    elif runtime_variant == "different-args":
+        messages[0].tool_calls[0]["args"]["summary"] = "OTHER"
+    elif runtime_variant == "type-different-args":
+        messages[0].tool_calls[0]["args"]["next_owner"] = False
+    elif runtime_variant == "multiple":
+        messages[0].tool_calls.append(
+            {
+                "name": "ordinary_probe",
+                "args": {},
+                "id": "ordinary-sibling",
+            }
+        )
+    elif runtime_variant == "invalid-envelope":
+        messages[0].additional_kwargs["tool_calls"] = [
+            {
+                "id": "selected-control",
+                "type": "function",
+                "function": {
+                    "name": "handback_to_supervisor",
+                    "arguments": "[]",
+                },
+            }
+        ]
+    request = SimpleNamespace(
+        tool_call=selected,
+        state={"messages": messages},
+    )
+    handled = []
+    middleware = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name="Mythic_Operator",
+    )
+
+    if async_wrapper:
+        async def handler(bound_request):
+            handled.append(bound_request.tool_call["id"])
+            return "executed"
+
+        result = asyncio.run(middleware.awrap_tool_call(request, handler))
+    else:
+        def handler(bound_request):
+            handled.append(bound_request.tool_call["id"])
+            return "executed"
+
+        result = middleware.wrap_tool_call(request, handler)
+
+    if should_execute:
+        assert result == "executed"
+        assert handled == ["selected-control"]
+        assert recorded == [("Mythic_Operator", "SELECTED")]
+    else:
+        assert isinstance(result, ToolMessage)
+        assert handled == []
+        assert recorded == []
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    (
+        (
+            {
+                "summary": " summary ",
+                "final_response": "final",
+                "progress_summary": "progress",
+                "reason": "reason",
+                "text": "text",
+            },
+            "summary",
+        ),
+        ({"summary": " ", "final_response": " final "}, "final"),
+        ({"progress_summary": " progress "}, "progress"),
+        ({"reason": " reason "}, "reason"),
+        ({"text": " text "}, "text"),
+        ({"summary": 7, "reason": ""}, ""),
+    ),
+)
+def test_gate_n_selected_summary_field_priority_is_deterministic(args, expected):
+    mod = _load_model_module()
+    tool_call = {
+        "name": "handback_to_supervisor",
+        "args": args,
+        "id": "selected",
+    }
+    request = SimpleNamespace(
+        tool_call=tool_call,
+        state={"messages": [AIMessage(content="", tool_calls=[tool_call])]},
+    )
+
+    assert (
+        mod._TurnAuthorityToolMiddleware._selected_control_summary(request)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("identity_fields", "valid"),
+    (
+        ({"id": "same", "tool_use_id": "same"}, True),
+        ({"id": "only-id"}, True),
+        ({"tool_use_id": "only-tool-use-id"}, True),
+        ({"id": "one", "tool_use_id": "two"}, False),
+        ({"id": "", "tool_use_id": ""}, False),
+        ({"id": " padded ", "tool_use_id": " padded "}, False),
+        ({"id": 7, "tool_use_id": 7}, False),
+        ({"id": "same", "tool_use_id": 7}, False),
+    ),
+)
+def test_gate_n_content_identity_aliases_must_be_exact(identity_fields, valid):
+    mod = _load_model_module()
+    record, error = mod._provider_content_call_record(
+        {
+            "type": "tool_use",
+            "name": "ordinary_probe",
+            "input": {},
+            **identity_fields,
+        }
+    )
+
+    assert (error == "") is valid
+    assert (record is not None) is valid
+
+
+@pytest.mark.parametrize(
+    "excluded_summaries",
+    (
+        (),
+        ("SECOND",),
+        ("SECOND", "THIRD", "FOURTH"),
+    ),
+)
+def test_gate_n_actual_parent_command_records_only_post_arbitration_summary(
+    excluded_summaries,
+):
+    from ai.langgraph.turn_authority import TurnAuthority
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "delegation-1",
+            "name": "Mythic_Operator",
+        }
+    }
+    recorded = []
+    original_recorder = model._record_delegation_final_summary
+
+    def record(agent_name, summary):
+        recorded.append((agent_name, summary))
+        original_recorder(agent_name, summary)
+
+    model._record_delegation_final_summary = record
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        delegation_id="delegation-1",
+        delegation_name="Mythic_Operator",
+    )
+    calls = [{
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "first reason",
+            "summary": "FIRST",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "first-handback",
+    }]
+    calls.extend(
+        {
+            "name": "handback_to_supervisor",
+            "args": {
+                "reason": f"excluded reason {index}",
+                "summary": summary,
+                "outcome": "progress",
+                "next_owner": "",
+            },
+            "id": f"excluded-handback-{index}",
+        }
+        for index, summary in enumerate(excluded_summaries, start=2)
+    )
+    agent = create_agent(
+        model=BoundFake(
+            responses=[AIMessage(content="", tool_calls=calls)]
+        ),
+        tools=[mod._create_handback_to_supervisor_tool()],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(
+                model,
+                agent_name="Mythic_Operator",
+            )
+        ],
+    )
+
+    async def invoke():
+        try:
+            await agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content="yield")],
+                    "supervisor_messages": [],
+                },
+                {"callbacks": [callback]},
+            )
+        except BaseException as exc:
+            return exc
+        raise AssertionError("expected ParentCommand")
+
+    error = asyncio.run(invoke())
+    assert type(error).__name__ == "ParentCommand"
+    command = getattr(error, "command", None)
+    if command is None and getattr(error, "args", None):
+        command = error.args[0]
+
+    assert [call["id"] for call in callback.captured_messages[0].tool_calls] == [
+        "first-handback"
+    ]
+    assert recorded == [("Mythic_Operator", "FIRST")]
+    assert "Mythic_Operator" not in model._active_delegations
+    assert len(command.update["messages"]) == 1
+    assert "FIRST" in command.update["messages"][0].content
+    assert all(
+        summary not in command.update["messages"][0].content
+        for summary in excluded_summaries
+    )
+
+
+def test_gate_n_actual_recursion_handback_records_only_selected_progress():
+    from ai.langgraph.turn_authority import TurnAuthority
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "delegation-1",
+            "name": "Mythic_Operator",
+        }
+    }
+    recorded = []
+    model._record_delegation_final_summary = (
+        lambda agent_name, summary: recorded.append((agent_name, summary))
+    )
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        delegation_id="delegation-1",
+        delegation_name="Mythic_Operator",
+    )
+    calls = [
+        {
+            "name": "summarize_and_handback",
+            "args": {
+                "progress_summary": "SELECTED PROGRESS",
+                "tasks_remaining": "one task",
+                "key_findings": "one finding",
+            },
+            "id": "first-recursion-handback",
+        },
+        {
+            "name": "summarize_and_handback",
+            "args": {
+                "progress_summary": "EXCLUDED PROGRESS",
+                "tasks_remaining": "other task",
+                "key_findings": "other finding",
+            },
+            "id": "second-recursion-handback",
+        },
+    ]
+    agent = create_agent(
+        model=BoundFake(responses=[AIMessage(content="", tool_calls=calls)]),
+        tools=[mod._create_summarize_handback_tool()],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(
+                model,
+                agent_name="Mythic_Operator",
+            )
+        ],
+    )
+
+    async def invoke():
+        try:
+            await agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content="summarize")],
+                    "supervisor_messages": [],
+                },
+                {"callbacks": [callback]},
+            )
+        except BaseException as exc:
+            return exc
+        raise AssertionError("expected ParentCommand")
+
+    error = asyncio.run(invoke())
+    assert type(error).__name__ == "ParentCommand"
+    command = getattr(error, "command", None)
+    if command is None and getattr(error, "args", None):
+        command = error.args[0]
+
+    assert [call["id"] for call in callback.captured_messages[0].tool_calls] == [
+        "first-recursion-handback"
+    ]
+    assert recorded == [("Mythic_Operator", "SELECTED PROGRESS")]
+    assert len(command.update["messages"]) == 1
+    assert "SELECTED PROGRESS" in command.update["messages"][0].content
+    assert "EXCLUDED PROGRESS" not in command.update["messages"][0].content
+
+
+def test_gate_o_summary_uses_static_agent_owner_with_overlapping_cards():
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "mythic-card",
+            "name": "Mythic_Operator",
+            "final_summary": "UNCHANGED",
+        },
+        "BloodHound": {
+            "id": "bloodhound-card",
+            "name": "BloodHound",
+            "final_summary": "",
+        },
+    }
+    selected = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "yield",
+            "summary": "BLOODHOUND SUMMARY",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "bloodhound-handback",
+    }
+    request = SimpleNamespace(
+        tool_call=selected,
+        state={"messages": [AIMessage(content="", tool_calls=[selected])]},
+    )
+    middleware = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name="BloodHound",
+    )
+
+    assert middleware.wrap_tool_call(request, lambda _request: "executed") == "executed"
+    assert (
+        model._active_delegations["BloodHound"]["final_summary"]
+        == "BLOODHOUND SUMMARY"
+    )
+    assert (
+        model._active_delegations["Mythic_Operator"]["final_summary"]
+        == "UNCHANGED"
+    )
+
+    unbound = mod._TurnAuthorityToolMiddleware(model)
+    assert unbound.wrap_tool_call(request, lambda _request: "unbound") == "unbound"
+    supervisor = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name="Supervisor",
+    )
+    assert supervisor.wrap_tool_call(
+        request,
+        lambda _request: "supervisor",
+    ) == "supervisor"
+    assert (
+        model._active_delegations["BloodHound"]["final_summary"]
+        == "BLOODHOUND SUMMARY"
+    )
+
+
+def test_gate_o_actual_direct_transfer_closes_only_source_delegation():
+    from ai.langgraph.turn_authority import TurnAuthority
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "source-card",
+            "name": "Mythic_Operator",
+        },
+        "BloodHound": {
+            "id": "target-card",
+            "name": "BloodHound",
+        },
+        "Execution": {
+            "id": "execution-card",
+            "name": "Execution",
+        },
+        "Collection": {
+            "id": "collection-card",
+            "name": "Collection",
+        },
+    }
+    transfer_call = {
+        "name": "transfer_to_BloodHound",
+        "args": {
+            "handoff_title": "Analyze graph",
+            "handoff_instruction": "Analyze the current graph.",
+        },
+        "id": "direct-transfer",
+    }
+    agent = create_agent(
+        model=BoundFake(
+            responses=[AIMessage(content="", tool_calls=[transfer_call])]
+        ),
+        tools=[mod._create_handoff_tool(agent_name="BloodHound")],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(
+                model,
+                agent_name="Mythic_Operator",
+            )
+        ],
+    )
+
+    async def invoke():
+        try:
+            await agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content="transfer")],
+                    "supervisor_messages": [],
+                    "bloodhound_messages": [],
+                }
+            )
+        except BaseException as exc:
+            return exc
+        raise AssertionError("expected ParentCommand")
+
+    error = asyncio.run(invoke())
+    assert type(error).__name__ == "ParentCommand"
+    assert set(model._active_delegations) == {
+        "BloodHound",
+        "Execution",
+        "Collection",
+    }
+    assert model._active_delegations["BloodHound"]["id"] == "target-card"
+    assert model._active_delegations["Execution"]["id"] == "execution-card"
+    assert model._active_delegations["Collection"]["id"] == "collection-card"
+
+
+def test_gate_o_direct_transfer_then_handback_preserves_selected_target_summary():
+    from ai.langgraph.turn_authority import TurnAuthority
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "Mythic_Operator": {
+            "id": "source-card",
+            "name": "Mythic_Operator",
+            "final_summary": "",
+        },
+        "BloodHound": {
+            "id": "target-card",
+            "name": "BloodHound",
+            "final_summary": "",
+        },
+    }
+    closed = []
+
+    async def close(agent_name, content="", status="finished"):
+        delegation = model._active_delegations.pop(agent_name)
+        closed.append(
+            (
+                agent_name,
+                delegation.get("final_summary", ""),
+                content,
+                status,
+            )
+        )
+
+    model._close_delegation = close
+    transfer_call = {
+        "name": "transfer_to_BloodHound",
+        "args": {
+            "handoff_title": "Analyze graph",
+            "handoff_instruction": "Analyze the current graph.",
+        },
+        "id": "direct-transfer",
+    }
+    source_agent = create_agent(
+        model=BoundFake(
+            responses=[AIMessage(content="", tool_calls=[transfer_call])]
+        ),
+        tools=[mod._create_handoff_tool(agent_name="BloodHound")],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(
+                model,
+                agent_name="Mythic_Operator",
+            )
+        ],
+    )
+
+    async def invoke(agent, state):
+        try:
+            await agent.ainvoke(state)
+        except BaseException as exc:
+            return exc
+        raise AssertionError("expected ParentCommand")
+
+    transfer_error = asyncio.run(
+        invoke(
+            source_agent,
+            {
+                "messages": [HumanMessage(content="transfer")],
+                "supervisor_messages": [],
+                "bloodhound_messages": [],
+            },
+        )
+    )
+    assert type(transfer_error).__name__ == "ParentCommand"
+    assert closed == [
+        ("Mythic_Operator", "", "", "finished"),
+    ]
+    assert set(model._active_delegations) == {"BloodHound"}
+
+    handback_call = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "analysis complete",
+            "summary": "SELECTED BLOODHOUND SUMMARY",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "bloodhound-handback",
+    }
+    target_agent = create_agent(
+        model=BoundFake(
+            responses=[AIMessage(content="", tool_calls=[handback_call])]
+        ),
+        tools=[mod._create_handback_to_supervisor_tool()],
+        middleware=[
+            mod._TurnAuthorityToolMiddleware(
+                model,
+                agent_name="BloodHound",
+            )
+        ],
+    )
+    handback_error = asyncio.run(
+        invoke(
+            target_agent,
+            {
+                "messages": [HumanMessage(content="hand back")],
+                "supervisor_messages": [],
+            },
+        )
+    )
+
+    assert type(handback_error).__name__ == "ParentCommand"
+    assert closed == [
+        ("Mythic_Operator", "", "", "finished"),
+        (
+            "BloodHound",
+            "SELECTED BLOODHOUND SUMMARY",
+            "",
+            "finished",
+        ),
+    ]
+    assert model._active_delegations == {}
+
+
+def test_gate_o_async_control_cleanup_preserves_normal_return_and_error():
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._active_delegations = {
+        "BloodHound": {
+            "id": "bloodhound-card",
+            "name": "BloodHound",
+        }
+    }
+    closed = []
+
+    async def close(agent_name):
+        closed.append(agent_name)
+
+    model._close_delegation = close
+    selected = {
+        "name": "handback_to_supervisor",
+        "args": {
+            "reason": "yield",
+            "summary": "summary",
+            "outcome": "progress",
+            "next_owner": "",
+        },
+        "id": "selected-control",
+    }
+    request = SimpleNamespace(
+        tool_call=selected,
+        state={"messages": [AIMessage(content="", tool_calls=[selected])]},
+    )
+    middleware = mod._TurnAuthorityToolMiddleware(
+        model,
+        agent_name="BloodHound",
+    )
+
+    async def normal_handler(_request):
+        return "ordinary return"
+
+    assert asyncio.run(
+        middleware.awrap_tool_call(request, normal_handler)
+    ) == "ordinary return"
+    assert closed == []
+
+    async def failing_handler(_request):
+        raise ValueError("ordinary failure")
+
+    with pytest.raises(ValueError, match="ordinary failure"):
+        asyncio.run(middleware.awrap_tool_call(request, failing_handler))
+    assert closed == []
+
+    async def parent_handler(_request):
+        raise mod.ParentCommand(
+            mod.Command(
+                goto="Supervisor",
+                graph=mod.Command.PARENT,
+            )
+        )
+
+    with pytest.raises(mod.ParentCommand):
+        asyncio.run(middleware.awrap_tool_call(request, parent_handler))
+    assert closed == ["BloodHound"]
+
+
+def test_gate_o_context_middleware_binds_exact_static_agent_owner():
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model.mode = "auto"
+    model._get_base_chat_model = lambda: None
+
+    for agent_name in (
+        "Generalist",
+        "Mythic_Operator",
+        "Mythic_Payload",
+        "BloodHound",
+        "MCP_Manager",
+        "Sandbox",
+        "Supervisor",
+    ):
+        middleware = model._context_middleware(agent_name=agent_name)
+        authority = [
+            item
+            for item in middleware
+            if isinstance(item, mod._TurnAuthorityToolMiddleware)
+        ]
+        assert len(authority) == 1
+        assert authority[0]._agent_name == agent_name
+
+
+def test_gate_l_actual_agent_shared_message_survives_orphan_input_cleanup():
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+    executed = []
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    @tool("transfer_to_Alpha")
+    def transfer() -> str:
+        """Perform one test control transition."""
+        executed.append("control")
+        return "controlled"
+
+    @tool("ordinary_probe")
+    def ordinary() -> str:
+        """Perform one ordinary test action."""
+        executed.append("ordinary")
+        return "ordinary"
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    model._autonomous_solve = False
+    model._message_seq = 1
+    model.state = {"_message_seq": 1}
+    model.llm = None
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "ordinary_probe",
+                            "args": {},
+                            "id": "ordinary-call",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "transfer_to_Alpha",
+                            "args": {},
+                            "id": "control-call",
+                            "type": "tool_call",
+                        },
+                    ],
+                ),
+                AIMessage(content="done"),
+            ]
+        ),
+        tools=[transfer, ordinary],
+        middleware=[mod._TurnAuthorityToolMiddleware(model)],
+    )
+    state = {
+        "_message_seq": 1,
+        "supervisor_messages": [],
+        "generalist_messages": [
+            HumanMessage(content="go"),
+            ToolMessage(
+                content="orphan",
+                name="old_tool",
+                tool_call_id="missing-call",
+            ),
+        ],
+        "mythic_operator_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+    }
+
+    update = asyncio.run(
+        model._wrap_create_agent(
+            agent,
+            "generalist_messages",
+            "Generalist",
+        )(state, {})
+    )
+    persisted = update["generalist_messages"]
+
+    assert executed == ["control"]
+    assert [type(message).__name__ for message in persisted] == [
+        "AIMessage",
+        "ToolMessage",
+        "AIMessage",
+    ]
+    assert [call["id"] for call in persisted[0].tool_calls] == ["control-call"]
+    assert persisted[1].tool_call_id == "control-call"
+    assert persisted[2].content == "done"
+
+
+def test_gate_l_actual_parent_command_uses_only_in_place_selected_final():
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import (
+        FakeMessagesListChatModel,
+    )
+    from ai.langgraph.turn_authority import TurnAuthority
+
+    mod = _load_model_module()
+
+    class BoundFake(FakeMessagesListChatModel):
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+    model = mod.Model.__new__(mod.Model)
+    model._turn_authority = TurnAuthority(mode="observe")
+    model._request_contract = None
+    model.mythic_client = None
+    callback = mod.MessageCaptureCallback("Supervisor")
+    agent = create_agent(
+        model=BoundFake(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "respond_to_user",
+                            "args": {"final_response": "first"},
+                            "id": "first-final",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "respond_to_user",
+                            "args": {"final_response": "second"},
+                            "id": "second-final",
+                            "type": "tool_call",
+                        },
+                    ],
+                )
+            ]
+        ),
+        tools=[mod._create_respond_to_user_tool()],
+        middleware=[mod._TurnAuthorityToolMiddleware(model)],
+    )
+
+    async def invoke():
+        try:
+            await agent.ainvoke(
+                {
+                    "messages": [HumanMessage(content="finish")],
+                    "supervisor_messages": [],
+                },
+                {"callbacks": [callback]},
+            )
+        except BaseException as exc:
+            return exc
+        raise AssertionError("expected ParentCommand")
+
+    error = asyncio.run(invoke())
+    assert type(error).__name__ == "ParentCommand"
+    command = getattr(error, "command", None)
+    if command is None and getattr(error, "args", None):
+        command = error.args[0]
+
+    assert [call["id"] for call in callback.captured_messages[0].tool_calls] == [
+        "first-final"
+    ]
+    assert [message.content for message in command.update["messages"]] == [
+        "first"
+    ]
+
+
+def test_gate_l_callback_suppresses_start_card_for_control_excluded_sibling():
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    started = []
+
+    async def emit_tool(**payload):
+        started.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        tool_use_func=emit_tool,
+    )
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "ordinary_probe",
+                "args": {},
+                "id": "ordinary-call",
+                "type": "tool_call",
+            },
+            {
+                "name": "transfer_to_Alpha",
+                "args": {},
+                "id": "control-call",
+                "type": "tool_call",
+            },
+        ],
+    )
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [message]
+    assert [call["id"] for call in message.tool_calls] == [
+        "ordinary-call",
+        "control-call",
+    ]
+    assert started == []
+
+
+@pytest.mark.parametrize(
+    "calls",
+    (
+        (
+            {"name": "ordinary_probe", "args": {}, "id": "dup"},
+            {"name": "ordinary_probe", "args": {}, "id": "dup"},
+        ),
+        (
+            {"name": "ordinary_probe", "args": {}, "id": ""},
+            {"name": "ordinary_probe", "args": {}, "id": "other"},
+        ),
+    ),
+)
+def test_gate_l_callback_suppresses_start_cards_for_invalid_batch(calls):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    mod = _load_model_module()
+    started = []
+
+    async def emit_tool(**payload):
+        started.append(payload)
+
+    callback = mod.MessageCaptureCallback(
+        "Mythic_Operator",
+        tool_use_func=emit_tool,
+    )
+    message = AIMessage(content="", tool_calls=list(calls))
+
+    asyncio.run(
+        callback.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=message)]]),
+            run_id=uuid4(),
+        )
+    )
+
+    assert callback.captured_messages == [message]
+    assert started == []
+
+
+def test_gate_l_same_request_stop_replacement_resets_canonical_subgoal():
+    from ai.langgraph.request_contract import (
+        StopCondition,
+        build_request_contract,
+    )
+    from ai.langgraph.subgoal_state import (
+        SubgoalState,
+        assign_and_admit,
+    )
+
+    mod = _load_model_module()
+    model = mod.Model.__new__(mod.Model)
+    model._request_contract = None
+    model._request_dynamic_proposals = False
+    model._request_execution_digest = ""
+    model._request_admitted_action_digests = set()
+    model._active_approval_claim = None
+    model.mythic_client = None
+    model.state = _typed_subgoal_runtime_state("prior-request")
+    contract = build_request_contract(
+        request_id="native-request-stop-replacement",
+        channel_id="7",
+        operation_id="9",
+        mode="supervised",
+        autonomous_solve=False,
+    )
+
+    model.install_request_contract(contract)
+    admitted = assign_and_admit(
+        model._subgoal_authority,
+        owner="Mythic_Operator",
+        method="transfer_to_Mythic_Operator",
+    )
+    model._subgoal_authority = admitted
+    model.state["_subgoal_state"] = admitted.to_dict()
+    same_stop = contract.amend()
+    model.install_request_contract(same_stop)
+    assert model._subgoal_authority == admitted
+
+    changed_value = same_stop.amend(
+        stop_condition=StopCondition(
+            kind=same_stop.stop_condition.kind,
+            value="one-specific-effect",
+        )
+    )
+    model.install_request_contract(changed_value)
+    value_replaced = SubgoalState.from_dict(model.state["_subgoal_state"])
+    assert value_replaced.stop_condition == "actions_complete"
+    assert value_replaced.subgoal_id == admitted.subgoal_id
+    assert value_replaced.owner == ""
+    assert value_replaced.method == ""
+    assert value_replaced.status.value == "proposed"
+    assert value_replaced.admissions == ()
+    assert value_replaced.transitions == ()
+
+    model.install_request_contract(changed_value.stop())
+    replaced = SubgoalState.from_dict(model.state["_subgoal_state"])
+    assert replaced.request_id == contract.request_id
+    assert replaced.stop_condition == "operator_stop"
+    assert replaced.subgoal_id != value_replaced.subgoal_id
+    assert replaced.admissions == ()
+    assert replaced.status.value == "proposed"
 
 
 def test_bounded_execute_capability_middleware_is_opt_in_for_operator_only():

@@ -10,6 +10,9 @@ budget, empty-frontier clean halt); bounded-LLM tie ranking; and once-per-need c
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import autonomous_controller as ac  # noqa: E402
@@ -571,6 +574,162 @@ def test_collection_retry_budget_is_per_request():
     assert len(attempts) == 2
     assert r.status == ac.STATUS_BLOCKED, r.to_dict()
     assert r.blocker and r.blocker.get("collection_key") == "scope:broken"
+
+
+def _peer_policy(select_name, *, disposition="select", selected_target=None):
+    calls = []
+
+    class PeerPolicy:
+        mode = "hybrid"
+
+        async def select(self, *, episode_id, candidates, **_kwargs):
+            calls.append([(item.name, item.target) for item in candidates])
+            index = next(
+                (i for i, item in enumerate(candidates) if item.name == select_name),
+                0,
+            )
+            selected = candidates[index]
+            return SimpleNamespace(
+                episode_id=episode_id,
+                decision_id=f"decision-{len(calls)}",
+                policy_mode=self.mode,
+                disposition=disposition,
+                selected_index=index if disposition == "select" else None,
+                selected_capability=selected.name,
+                selected_target=selected.target if selected_target is None else selected_target,
+                rationale="scripted peer selection",
+                to_dict=lambda: {
+                    "episode_id": episode_id,
+                    "decision_id": f"decision-{len(calls)}",
+                    "policy_mode": self.mode,
+                    "disposition": disposition,
+                },
+            )
+
+    return PeerPolicy(), calls
+
+
+def test_collection_peer_selected_once_and_success_stops_before_capability():
+    w = World({"graph-covered"})
+    policy, proposals = _peer_policy("collect-graph")
+    calls = {"collect": 0, "execute": 0, "complete": False}
+
+    def collect(_state, _decision=None):
+        calls["collect"] += 1
+        calls["complete"] = True
+        return {"ok": True, "graph_verified": True}
+
+    def execute(_action, _decision=None):
+        calls["execute"] += 1
+        return {"ok": True}
+
+    c = ac.AutonomousController(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=lambda _state: [FakeAction("capability-one", "host", effects=["effect:one"])],
+        needs_collection=lambda _state: {"collection_key": "forest|baseline"},
+        collect=collect,
+        objective_met=lambda _state: calls["complete"],
+        policy_backend=policy,
+        episode_id="episode-peer",
+    )
+    result = run(c)
+
+    assert proposals == [[("collect-graph", "forest|baseline"), ("capability-one", "host")]]
+    assert calls == {"collect": 1, "execute": 0, "complete": True}
+    assert result.status == ac.STATUS_COMPLETE
+
+
+def test_capability_peer_selected_once_without_collection():
+    w = World({"graph-covered"})
+    policy, proposals = _peer_policy("capability-one")
+    calls = {"collect": 0, "execute": 0}
+
+    def execute(action, _decision=None):
+        calls["execute"] += 1
+        w.effects.update(action.effects)
+        return {"ok": True}
+
+    c = ac.AutonomousController(
+        observe=w.observe,
+        execute=execute,
+        frontier_fn=lambda state: (
+            [] if "effect:one" in state.achieved_effects()
+            else [FakeAction("capability-one", "host", effects=["effect:one"])]
+        ),
+        needs_collection=lambda _state: {"collection_key": "forest|baseline"},
+        collect=lambda _state, _decision=None: calls.__setitem__("collect", calls["collect"] + 1),
+        objective_met=lambda state: "effect:one" in state.achieved_effects(),
+        policy_backend=policy,
+        episode_id="episode-peer",
+    )
+    result = run(c)
+
+    assert proposals == [[("collect-graph", "forest|baseline"), ("capability-one", "host")]]
+    assert calls == {"collect": 0, "execute": 1}
+    assert result.status == ac.STATUS_COMPLETE
+
+
+def test_failed_collection_peer_exhausts_one_attempt_without_spillover():
+    w = World({"graph-covered"})
+    policy, proposals = _peer_policy("collect-graph")
+    calls = {"collect": 0, "execute": 0}
+
+    def collect(_state, _decision=None):
+        calls["collect"] += 1
+        return {"ok": False, "reason": "ingest failed"}
+
+    c = ac.AutonomousController(
+        observe=w.observe,
+        execute=lambda _action, _decision=None: calls.__setitem__("execute", calls["execute"] + 1),
+        frontier_fn=lambda _state: [FakeAction("capability-one", "host", effects=["effect:one"])],
+        needs_collection=lambda _state: {"collection_key": "forest|baseline"},
+        collect=collect,
+        policy_backend=policy,
+        episode_id="episode-peer",
+        config=ac.ControllerConfig(max_collection_attempts_per_request=1),
+    )
+    result = run(c)
+
+    assert len(proposals) == 1
+    assert calls == {"collect": 1, "execute": 0}
+    assert result.status == ac.STATUS_BLOCKED
+    assert result.blocker["attempts"] == 1
+
+
+@pytest.mark.parametrize(
+    ("disposition", "selected_target"),
+    (
+        ("stop", None),
+        ("ask", None),
+        ("select", "mutated-target"),
+        ("select", "FOREST|BASELINE"),
+        ("select", "forest|baseline.evil"),
+        ("select", "forest|baselıne"),
+    ),
+)
+def test_collection_peer_invalid_policy_selection_has_no_effect(disposition, selected_target):
+    w = World({"graph-covered"})
+    policy, proposals = _peer_policy(
+        "collect-graph",
+        disposition=disposition,
+        selected_target=selected_target,
+    )
+    effects = []
+    c = ac.AutonomousController(
+        observe=w.observe,
+        execute=lambda _action, _decision=None: effects.append("execute"),
+        frontier_fn=lambda _state: [FakeAction("capability-one", "host", effects=["effect:one"])],
+        needs_collection=lambda _state: {"collection_key": "forest|baseline"},
+        collect=lambda _state, _decision=None: effects.append("collect"),
+        policy_backend=policy,
+        episode_id="episode-peer",
+    )
+    result = run(c)
+
+    assert len(proposals) == 1
+    assert effects == []
+    assert result.status == ac.STATUS_NO_ACTION
 
 
 def test_no_op_success_is_no_progress_not_blocked():
