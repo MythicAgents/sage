@@ -38,7 +38,7 @@ def _resolve_password(explicit: str | None, env_path: str | None) -> str:
         os.environ.get("SAGE_RUNAS_FILE"),
         str(Path.home() / ".config" / "sage" / "runas.env"),
         str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage" / ".env"),
-        env_path or os.environ.get("MYTHIC_ENV_PATH") or str(Path.home() / "dev" / "mythic_v4" / ".env"),
+        env_path or os.environ.get("MYTHIC_ENV_PATH") or "",
     ]
     for path in candidates:
         if not path or not Path(path).is_file():

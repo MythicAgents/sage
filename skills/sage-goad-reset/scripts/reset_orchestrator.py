@@ -243,7 +243,11 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "range_poll_interval": float(args.range_poll_interval),
         "mythic_server": str(args.mythic_server),
         "mythic_user": str(args.mythic_user),
-        "mythic_env_path": str(Path(args.mythic_env_path).expanduser()),
+        "mythic_env_path": (
+            str(Path(args.mythic_env_path).expanduser())
+            if str(args.mythic_env_path or "").strip()
+            else ""
+        ),
     }
 
 
@@ -1386,7 +1390,9 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mythic-user", default="mythic_admin")
     parser.add_argument(
         "--mythic-env-path",
-        default=str(REPO_ROOT.parent / "mythic_v4" / ".env"),
+        # Honor MYTHIC_ENV_PATH so one variable configures every tool at once. No directory-name
+        # default: guessing a checkout name would bake one machine's layout into the repo.
+        default=os.environ.get("MYTHIC_ENV_PATH") or "",
     )
 
 

@@ -102,11 +102,9 @@ def test_skill_env_loader_sets_sage_defaults_without_overriding(monkeypatch, tmp
     assert os.environ["SAGE_API_KEY"] == "dummy-key"
 
 
-def test_default_mythic_env_paths_derive_from_workspace_root():
-    assert bootstrap_payloads.DEFAULT_MYTHIC_ENV_PATHS == (
-        bootstrap_payloads.WORKSPACE_ROOT / "mythic_v4" / ".env",
-        bootstrap_payloads.WORKSPACE_ROOT / "mythic" / ".env",
-    )
+def test_no_mythic_checkout_name_is_guessed():
+    """A checkout-name default would bake one machine's layout into the repo."""
+    assert bootstrap_payloads.DEFAULT_MYTHIC_ENV_PATHS == ()
 
 
 def test_sage_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):

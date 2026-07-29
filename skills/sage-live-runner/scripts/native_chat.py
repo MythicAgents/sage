@@ -34,10 +34,10 @@ if str(SAGE_PYTHON_ROOT) not in sys.path:
 
 from ai.langgraph.request_events import control_transition_errors
 
-DEFAULT_ENV_PATHS = (
-    WORKSPACE_ROOT / "mythic_v4" / ".env",
-    WORKSPACE_ROOT / "mythic" / ".env",
-)
+# No directory-name fallback: guessing a Mythic checkout name would bake one machine's
+# layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
+# MYTHIC_ADMIN_PASSWORD directly and skip the .env entirely.
+DEFAULT_ENV_PATHS: tuple[Path, ...] = ()
 SAGE_ENV_PATH = REPO_ROOT / "Payload_Type" / "sage" / ".env"
 READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 BOOTSTRAP_PATH = REPO_ROOT / "skills" / "sage-callback-bootstrap" / "scripts" / "bootstrap_payloads.py"
@@ -305,9 +305,12 @@ def resolve_env_path(explicit: str | Path | None = None) -> Path:
         candidates.append(Path(configured).expanduser())
     candidates.extend(DEFAULT_ENV_PATHS)
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
-    return candidates[0] if candidates else DEFAULT_ENV_PATHS[0]
+    # `Path("")` is the "not configured" sentinel — it never exists, so resolve_password below
+    # falls through to its fail-closed error. Indexing DEFAULT_ENV_PATHS would IndexError now
+    # that no checkout-name default is guessed.
+    return candidates[0] if candidates else Path("")
 
 
 def _load_module(name: str, path: Path):
@@ -324,7 +327,7 @@ def resolve_password(env_path: str | Path | None = None) -> str:
     if value:
         return value
     path = resolve_env_path(env_path)
-    if path.exists():
+    if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -333,15 +336,16 @@ def resolve_password(env_path: str | Path | None = None) -> str:
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
     raise RuntimeError(
-        "Set MYTHIC_ADMIN_PASSWORD or MYTHIC_ENV_PATH; checked "
-        + ", ".join(str(path) for path in DEFAULT_ENV_PATHS)
+        "Mythic auth is not configured. Set MYTHIC_ADMIN_PASSWORD, or set MYTHIC_ENV_PATH to your "
+        "Mythic install's .env (see .env.example at the repository root). No checkout location is "
+        + (f"guessed. Checked: {path}" if str(path) != "." else "guessed.")
     )
 
 
 def _read_env_defaults(path: Path | None = None) -> dict[str, str]:
     path = path or SAGE_ENV_PATH
     values: dict[str, str] = {}
-    if not path.exists():
+    if not path.is_file():
         return values
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()

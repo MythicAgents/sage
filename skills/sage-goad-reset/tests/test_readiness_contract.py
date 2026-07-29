@@ -150,11 +150,11 @@ def test_write_startup_identity_records_only_safe_route_and_required_env(tmp_pat
             "model": "test-model",
             "API_ENDPOINT": "http://127.0.0.1:8100/v1?secret=1",
             "SAGE_ENGAGEMENT_GATE": "1",
-            "SAGE_BLOODHOUND_MCP_DIR": "/home/john/dev/bloodhound_mcp",
+            "SAGE_BLOODHOUND_MCP_DIR": "/opt/bloodhound_mcp",
             "API_KEY": "secret-value",
         },
         pid=123,
-        cwd="/home/john/dev/sage/Payload_Type/sage",
+        cwd="/srv/sage/Payload_Type/sage",
         recorded_at="2026-07-20T00:00:00+00:00",
     )
 

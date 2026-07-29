@@ -239,11 +239,9 @@ def test_bhusa_demo_metadata_is_exactly_supervised_hybrid():
     }
 
 
-def test_default_env_paths_derive_from_workspace_root():
-    assert native_chat.DEFAULT_ENV_PATHS == (
-        native_chat.WORKSPACE_ROOT / "mythic_v4" / ".env",
-        native_chat.WORKSPACE_ROOT / "mythic" / ".env",
-    )
+def test_no_mythic_checkout_name_is_guessed():
+    """A checkout-name default would bake one machine's layout into the repo."""
+    assert native_chat.DEFAULT_ENV_PATHS == ()
 
 
 def test_create_locked_channel_returns_sanitized_effective_chat_identity(monkeypatch):

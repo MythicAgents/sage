@@ -26,10 +26,11 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-ROOT = Path(__file__).resolve().parents[3]            # /home/john/dev/sage
+ROOT = Path(__file__).resolve().parents[3]            # repository root
+WORKSPACE = ROOT.parent                               # sibling checkouts beside Sage
 PAYLOAD = ROOT / "Payload_Type" / "sage"
 PY = str(ROOT / ".venv" / "bin" / "python")
-BH = "/home/john/dev/bloodhound_mcp"
+BH = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or str(WORKSPACE / "bloodhound_mcp")
 DEFAULT_SNAPSHOT = "sage-seed-apollo-staged-20260710"
 DEFAULT_RETAINED_CALLBACK_CONFIG = (
     ROOT / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
@@ -716,7 +717,7 @@ def _resolve_password_source(password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV) 
         os.environ.get("SAGE_RUNAS_FILE"),
         str(Path.home() / ".config" / "sage" / "runas.env"),
         str(PAYLOAD / ".env"),
-        os.environ.get("MYTHIC_ENV_PATH") or str(Path.home() / "dev" / "mythic_v4" / ".env"),
+        os.environ.get("MYTHIC_ENV_PATH") or "",
     ]
     for value in candidates:
         path = Path(value).expanduser() if value else None

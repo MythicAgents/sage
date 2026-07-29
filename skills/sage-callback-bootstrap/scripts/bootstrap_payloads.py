@@ -44,20 +44,21 @@ if str(LANGGRAPH_ROOT) not in sys.path:
 from mythic_tools import assess_callback_liveness  # noqa: E402
 
 
-DEFAULT_MYTHIC_ENV_PATHS = (
-    WORKSPACE_ROOT / "mythic_v4" / ".env",
-    WORKSPACE_ROOT / "mythic" / ".env",
-)
+# No directory-name fallback: guessing a Mythic checkout name would bake one machine's
+# layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
+# MYTHIC_ADMIN_PASSWORD directly and skip the .env entirely.
+DEFAULT_MYTHIC_ENV_PATHS: tuple[Path, ...] = ()
 
 
 def _default_mythic_env_path() -> Path:
     configured = os.environ.get("MYTHIC_ENV_PATH")
     if configured:
         return Path(configured).expanduser()
-    return next(
-        (path for path in DEFAULT_MYTHIC_ENV_PATHS if path.exists()),
-        DEFAULT_MYTHIC_ENV_PATHS[0],
-    )
+    # `Path("")` is the "not configured" sentinel. Note it normalises to `Path(".")`, which DOES
+    # exist — so every guard must use `.is_file()`, not `.exists()`, or the sentinel sails through
+    # and something tries to read the cwd as an env file. Returning DEFAULT_MYTHIC_ENV_PATHS[0]
+    # would IndexError now that the tuple is empty.
+    return next((path for path in DEFAULT_MYTHIC_ENV_PATHS if path.is_file()), Path(""))
 
 
 MYTHIC_ENV_PATH = _default_mythic_env_path()
@@ -179,7 +180,7 @@ def resolve_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
     env_value = os.environ.get("MYTHIC_ADMIN_PASSWORD")
     if env_value:
         return env_value
-    if env_path.exists():
+    if env_path.is_file():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -188,7 +189,9 @@ def resolve_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
     raise RuntimeError(
-        f"Set MYTHIC_ADMIN_PASSWORD or provide {env_path} with MYTHIC_ADMIN_PASSWORD."
+        "Mythic auth is not configured. Set MYTHIC_ADMIN_PASSWORD, or set MYTHIC_ENV_PATH to your "
+        "Mythic install's .env (see .env.example at the repository root). No checkout location is "
+        + (f"guessed. Checked: {env_path}" if env_path.is_file() or str(env_path) != "." else "guessed.")
     )
 
 

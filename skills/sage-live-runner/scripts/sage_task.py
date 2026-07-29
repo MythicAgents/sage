@@ -19,10 +19,10 @@ from mythic import mythic
 
 SERVER = "127.0.0.1"
 USER = "mythic_admin"
-MYTHIC_ENV_PATHS = (
-    Path("/home/john/dev/mythic_v4/.env"),
-    Path("/home/john/dev/mythic/.env"),
-)
+# No directory-name fallback: guessing a Mythic checkout name would bake one machine's
+# layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
+# MYTHIC_ADMIN_PASSWORD directly and skip the .env entirely.
+MYTHIC_ENV_PATHS: tuple[Path, ...] = ()
 
 
 def resolve_password(env_paths: Path | tuple[Path, ...] = MYTHIC_ENV_PATHS) -> str:
@@ -32,7 +32,7 @@ def resolve_password(env_paths: Path | tuple[Path, ...] = MYTHIC_ENV_PATHS) -> s
     if isinstance(env_paths, Path):
         env_paths = (env_paths,)
     for env_path in env_paths:
-        if not env_path.exists():
+        if not env_path.is_file():
             continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()

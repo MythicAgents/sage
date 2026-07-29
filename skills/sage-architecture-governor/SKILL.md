@@ -155,7 +155,6 @@ failing the stop event. Manual and CI invocations remain strict by default and r
 Validate the skill and scripts after changes:
 
 ```bash
-python3 /home/john/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/sage-architecture-governor
 python3 skills/sage-architecture-governor/scripts/pre_tool_use_arch_gate.py --self-test
 python3 skills/sage-architecture-governor/scripts/open_gate.py --self-test
 python3 skills/sage-architecture-governor/scripts/review_lease.py --self-test

@@ -11,7 +11,7 @@ v4 chat container; do not create or wait for a Sage payload callback.
 ## Credentials
 
 The helper resolves `MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`, then
-`/home/john/dev/mythic_v4/.env`, with the v3 `.env` retained only as fallback.
+`MYTHIC_ENV_PATH`; there is no checkout-name default. See `.env.example`.
 
 ## Workflow
 

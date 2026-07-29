@@ -15,11 +15,11 @@ Phoenix trace sqlite data. A Sage payload callback is not required.
 From the repo root:
 
 ```bash
-/home/john/dev/sage/.venv/bin/python Payload_Type/sage/evals/harness.py run --cases Payload_Type/sage/evals/cases.yaml --db Payload_Type/sage/.phoenix/phoenix.db --out Payload_Type/sage/evals/results --seeds 3 --poll-interval 35
+.venv/bin/python Payload_Type/sage/evals/harness.py run --cases Payload_Type/sage/evals/cases.yaml --db Payload_Type/sage/.phoenix/phoenix.db --out Payload_Type/sage/evals/results --seeds 3 --poll-interval 35
 ```
 
 The live run resolves credentials from `MYTHIC_ADMIN_PASSWORD`, `MYTHIC_ENV_PATH`,
-`/home/john/dev/mythic_v4/.env`, then the legacy v3 `.env`.
+`MYTHIC_ENV_PATH`; there is no checkout-name default. See `.env.example` at the repository root.
 
 Useful live-run options:
 
@@ -52,7 +52,7 @@ Full `answer_full` text and raw `spans` are persisted per seed so a future binar
 ## Comparing Runs
 
 ```bash
-/home/john/dev/sage/.venv/bin/python Payload_Type/sage/evals/harness.py compare Payload_Type/sage/evals/results/eval-baseline.json Payload_Type/sage/evals/results/eval-new.json
+.venv/bin/python Payload_Type/sage/evals/harness.py compare Payload_Type/sage/evals/results/eval-baseline.json Payload_Type/sage/evals/results/eval-new.json
 ```
 
 Compare mode preserves the old v1 output when both inputs are v1 reports. When either input is schema v2, it normalizes v1/v2 cases and prints pass-fraction deltas, per-case `tokens_mean` deltas, and a variance verdict.
@@ -64,5 +64,5 @@ The v2 significance rule is a crude noise band: if `abs(mean_b - mean_a) > (std_
 The included tests build a temporary sqlite fixture and mock Mythic and Phoenix reader functions. They do not touch the live lab or real Phoenix DB.
 
 ```bash
-/home/john/dev/sage/.venv/bin/python -m pytest Payload_Type/sage/tests/test_eval_harness.py -q
+.venv/bin/python -m pytest Payload_Type/sage/tests/test_eval_harness.py -q
 ```

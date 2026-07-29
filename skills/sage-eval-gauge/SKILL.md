@@ -87,8 +87,8 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 `from-transitions` only emits a case when the persisted visible excerpt still reproduces the persisted deterministic failure label. This prevents the replay corpus from grading a model against evidence that was truncated out of the packet. Frozen fixtures reject unredacted secret-like material and local home paths.
 
 ## Read-only lab helpers (validated)
-- BloodHound domains: `uv --directory /home/john/dev/bloodhound_mcp run python skills/sage-goad-reset/scripts/bh_reset.py status`
-- BloodHound cypher: `uv --directory /home/john/dev/bloodhound_mcp run python skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher>'`
+- BloodHound domains: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py status`
+- BloodHound cypher: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher>'`
 - Mythic tasking: `skills/sage-live-runner/scripts/sage_task.py task-callback <id> <cmd>`
 
 ## Live Holdout Discipline

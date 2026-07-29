@@ -20,7 +20,7 @@ What these tests pin:
   5. resolve: known names -> dict with those keys; unknown name skipped (absent,
      no raise); a provider that raises -> "" for that key (fail-safe).
 
-Run: cd /home/john/dev/sage && .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_context.py -q
+Run from the repository root: .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_context.py -q
 """
 import json
 import sys

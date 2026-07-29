@@ -5,7 +5,7 @@ description: Repo-local Sage GOAD/Trust Walker full lab reset and readiness work
 
 # Sage GOAD Reset
 
-Use from `/home/john/dev/sage`. Sage runs locally in the `sage` tmux session for this workflow, not in a
+Use from the repository root. Sage runs locally in the `sage` tmux session for this workflow, not in a
 Docker/Mythic Sage container. Mythic remains Docker-backed and is managed through `mythic-cli`. Do not delete
 runtime databases or retained archives.
 
@@ -110,7 +110,7 @@ For a custom DreadGOAD-format purpose range, keep source validation and runtime 
 4. Reset/verify GOAD, then wipe BloodHound and require zero domains before continuing:
 
 ```bash
-uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
 ```
 
    The wipe command includes its own delayed verification and must finish with `available-domains: count=0`.
@@ -118,7 +118,7 @@ uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skil
 5. Restart local Sage in tmux:
 
 ```bash
-/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp
+/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR="$SAGE_BLOODHOUND_MCP_DIR"
 ```
 
 Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
@@ -226,8 +226,8 @@ Mythic, Apollo, or a PFX.
 ## BloodHound
 
 ```bash
-uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
-uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py status
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py status
 ```
 
 The wipe is mandatory for every full reset. It waits 10 seconds before its first verification poll, then polls
@@ -237,8 +237,8 @@ After a target-scope collection on a GOAD-style cross-forest range, use the read
 blaming Sage for an empty frontier:
 
 ```bash
-uv --directory /home/john/dev/bloodhound_mcp run python \
-  /home/john/dev/sage/skills/sage-goad-reset/scripts/check_cross_forest_laps_bridge.py \
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python \
+  skills/sage-goad-reset/scripts/check_cross_forest_laps_bridge.py \
   --source-domain <controlled-root-domain> \
   --target-domain <trusted-target-domain>
 ```

@@ -88,7 +88,7 @@ if [ -z "${SAGE_RUN_AS_PASSWORD:-}" ]; then
     "${SAGE_RUNAS_FILE:-}" \
     "$HOME/.config/sage/runas.env" \
     "$REPO/Payload_Type/sage/.env" \
-    "${MYTHIC_ENV_PATH:-$HOME/dev/mythic_v4/.env}"
+    "${MYTHIC_ENV_PATH:-}"
   do
     [ -n "$f" ] && [ -f "$f" ] || continue
     v="$(grep -E '^SAGE_RUN_AS_PASSWORD=' "$f" | head -1 | cut -d= -f2- | tr -d "\"'" || true)"

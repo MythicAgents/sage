@@ -3,9 +3,10 @@
 Pulls Mythic tasks issued during the run window and summarizes the command sequence + redundancy."""
 import asyncio
 import sys
+from pathlib import Path
 from collections import Counter
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from mythic import mythic  # noqa: E402
 

@@ -5,7 +5,7 @@ description: Repo-local Sage native Mythic v4 chat execution and inspection work
 
 # Sage Live Runner
 
-Use from `/home/john/dev/sage`. Sage is a Mythic v4 chat container. A normal solve does not require a Sage
+Use from the repository root. Sage is a Mythic v4 chat container. A normal solve does not require a Sage
 payload or Sage callback.
 
 ## Native Chat
@@ -44,7 +44,7 @@ and messages. A prepared channel is reused only when its stored configuration is
 `autonomous_solve=true`; otherwise the run creates a fresh correctly configured channel. Use `--new-channel` to
 bypass a prepared channel. The helper configures autonomous mode explicitly.
 It resolves credentials in this order:
-`MYTHIC_ADMIN_PASSWORD`, `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, then the legacy v3 `.env`.
+`MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH`. No checkout-name default — see `.env.example`.
 
 Do not reuse an old channel for a seeded proof. Do not add route hints, callback IDs, hostnames, credentials, or
 intermediate goals to the objective.

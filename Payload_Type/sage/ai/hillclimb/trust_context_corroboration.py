@@ -692,7 +692,9 @@ async def _run_targeted_trusted_collection_async(client: Any) -> dict[str, Any]:
         import model as langgraph_model  # type: ignore
         import mythic_tools  # type: ignore
 
-    bloodhound_dir = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "/home/john/dev/bloodhound_mcp"
+    bloodhound_dir = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or str(
+        Path(__file__).resolve().parents[5] / "bloodhound_mcp"
+    )
     connected, connection_message = await ensure_bloodhound_connected(bloodhound_dir)
     if not connected:
         raise ValueError(f"BloodHound MCP is required for the targeted collection: {connection_message}")

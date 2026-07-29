@@ -12,7 +12,7 @@ configuration documented in `CLAUDE.md`; do not change global Forge defaults fro
 
 - `sage_forge.sh`
 
-Run from `/home/john/dev/sage`:
+Run from the repository root:
 
 ```bash
 /bin/bash skills/sage-forge-ops/scripts/sage_forge.sh

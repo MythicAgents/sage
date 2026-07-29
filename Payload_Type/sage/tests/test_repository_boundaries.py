@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 from pathlib import Path
+import re
+import subprocess
 import tomllib
 
 
@@ -172,10 +174,89 @@ def test_maintained_operator_helpers_have_no_personal_absolute_paths():
     for relative_path in maintained_helpers:
         path = REPO_ROOT / relative_path
         assert path.is_file(), f"maintained helper is missing: {relative_path}"
-        if "/home/john" in path.read_text(encoding="utf-8"):
+        if _LAYOUT_PATH_RE.search(path.read_text(encoding="utf-8")):
             offenders.append(relative_path)
 
     assert not offenders, "personal absolute paths remain in: " + ", ".join(offenders)
+
+
+# A path that encodes ONE developer's SOURCE-CHECKOUT location. `~/dev/...` and `$HOME/dev/...` are
+# the same defect as `/home/<user>/dev/...` wearing a portable-looking hat — a sweep for
+# `/home/john` alone passes them, which is exactly how five survived a cleanup pass.
+#
+# Deliberately NOT "any /home/ path": the repo legitimately contains target-side paths that only
+# look similar. `ttps/` documents victim-host tradecraft (`/home/user/.ssh/id_rsa`), and several
+# tests feed a synthetic `/home/alice/...` in to prove the redactor strips it. Anchoring on a
+# checkout directory rather than on `/home` separates those from the real defect without needing a
+# per-file exemption for each one.
+#
+# Known limit: only the `dev/` convention is matched. A checkout under `~/code/` or `~/src/` would
+# slip through. Widen this the day that happens rather than guessing at it now.
+_LAYOUT_PATH_RE = re.compile(
+    r"/home/[a-z][a-z0-9_-]*/dev/|~/dev/|\$HOME/dev\b|/Users/[a-z][a-z0-9_-]*/(?:dev|Documents)/"
+)
+
+# One-off forensics scripts named after specific 2026 task IDs and runs (poll_1960, watch_2215,
+# diag_ingest_run4, …). They still hardcode the maintainer's layout. They are excluded here rather
+# than silently skipped so the debt stays countable: the assertion below fails if this list grows,
+# and the list should only ever shrink. Fixing or archiving them is tracked separately.
+_LAYOUT_PATH_DEBT = 30
+
+# Legitimate occurrences. Not debt, and must never be "fixed":
+#   test_hillclimb_operator_replay_benchmark.py — feeds a personal path in to prove redaction strips it
+#   test_repository_boundaries.py               — this file; the pattern is the thing being searched for
+_LAYOUT_PATH_EXEMPT = {
+    "Payload_Type/sage/tests/test_hillclimb_operator_replay_benchmark.py",
+    "Payload_Type/sage/tests/test_repository_boundaries.py",
+}
+
+
+
+def test_no_layout_encoding_paths_outside_the_known_one_off_scripts():
+    """Docs, product code, and tests must not encode one machine's directory layout.
+
+    Scope is everything tracked except `skills/*/scripts/` one-offs, which carry a counted debt.
+    A green run means a fresh clone reads documentation and product code that work anywhere.
+    """
+    # The tracked set is exactly what a contributor sees in a clone, so `git ls-files` is the right
+    # source of truth — a filesystem walk instead pulls in local runtime state (archived engagement
+    # ledgers, `.claude/settings.local.json`) that no clone ever contains, and needs an
+    # ever-growing skip-list to suppress.
+    #
+    # The floor assertion is the point: `git ls-files` returns nothing in a tarball export or a
+    # freshly-initialised repo, and without it this assertion passed while inspecting ZERO files.
+    # A guard that can pass vacuously is worse than no guard.
+    listing = subprocess.run(
+        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+    tracked = listing.stdout.split() if listing.returncode == 0 else []
+    assert len(tracked) >= 300, (
+        f"git ls-files returned {len(tracked)} paths (rc={listing.returncode}); this test needs a "
+        "real git checkout, and a green result without one would prove nothing"
+    )
+
+    offenders, one_off_debt = [], []
+    for relative_path in tracked:
+        if relative_path in _LAYOUT_PATH_EXEMPT:
+            continue
+        path = REPO_ROOT / relative_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if not _LAYOUT_PATH_RE.search(text):
+            continue
+        bucket = one_off_debt if "/scripts/" in relative_path else offenders
+        bucket.append(relative_path)
+    assert not offenders, (
+        "layout-encoding paths outside the one-off scripts: " + ", ".join(sorted(offenders))
+    )
+    assert len(one_off_debt) <= _LAYOUT_PATH_DEBT, (
+        f"one-off-script debt grew to {len(one_off_debt)} (cap {_LAYOUT_PATH_DEBT}); "
+        "new scripts must not hardcode a home directory: " + ", ".join(sorted(one_off_debt))
+    )
 
 
 def test_reset_and_bootstrap_helpers_do_not_use_callback_task_apis():

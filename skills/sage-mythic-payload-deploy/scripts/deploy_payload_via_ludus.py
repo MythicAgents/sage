@@ -30,13 +30,11 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
 MYTHIC_ENV_PATH = Path(
-    os.environ.get("MYTHIC_ENV_PATH")
-    or (
-        "/home/john/dev/mythic_v4/.env"
-        if Path("/home/john/dev/mythic_v4/.env").exists()
-        else "/home/john/dev/mythic/.env"
-    )
+    # No directory-name fallback — see .env.example. Empty means "not configured", and the
+    # password resolver fails closed naming the variable to set.
+    os.environ.get("MYTHIC_ENV_PATH") or ""
 )
 DEFAULT_MYTHIC_SERVER = "127.0.0.1"
 DEFAULT_MYTHIC_USER = "mythic_admin"

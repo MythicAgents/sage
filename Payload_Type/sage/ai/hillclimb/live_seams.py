@@ -26,20 +26,25 @@ from typing import Any, Callable
 
 DirectProbe = Callable[[], bool]
 
+# Sibling-of-Sage anchor: Mythic is checked out next to this repo. Encodes the relationship,
+# not a home-directory layout, so it survives cloning either repo anywhere.
+_WORKSPACE = Path(__file__).resolve().parents[5]
+_REPO = Path(__file__).resolve().parents[4]
+_BLOODHOUND_DIR = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or str(_WORKSPACE / "bloodhound_mcp")
+
 
 def _resolve_mythic_password() -> str:
     password = os.environ.get("MYTHIC_ADMIN_PASSWORD")
     if password:
         return password
+    # MYTHIC_ENV_PATH only — no checkout-name guess. See .env.example.
     candidates = [
         Path(os.environ["MYTHIC_ENV_PATH"]).expanduser()
         if os.environ.get("MYTHIC_ENV_PATH")
         else None,
-        Path("/home/john/dev/mythic_v4/.env"),
-        Path("/home/john/dev/mythic/.env"),
     ]
     for path in (candidate for candidate in candidates if candidate is not None):
-        if not path.exists():
+        if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("MYTHIC_ADMIN_PASSWORD="):
@@ -191,8 +196,8 @@ def bloodhound_domain_count(*, timeout: int = 60) -> int:
     """Read-only count of BloodHound domains via the MCP's signed client (reuses bh_reset.py status).
     VALIDATED 2026-06-18: returns 0 on a freshly-wiped graph (`available-domains: 200 count=0`)."""
     cmd = [
-        "uv", "--directory", "/home/john/dev/bloodhound_mcp", "run", "python",
-        "/home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py", "status",
+        "uv", "--directory", _BLOODHOUND_DIR, "run", "python",
+        str(_REPO / "skills" / "sage-goad-reset" / "scripts" / "bh_reset.py"), "status",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return parse_domain_count(proc.stdout)
@@ -208,7 +213,7 @@ def graph_collected_probe(*, timeout: int = 60) -> Callable[[], bool]:
 
 # --- Sage model defaults (so the BARE model uses the SAME model as Sage; answers "--model") ----------
 
-_SAGE_ENV = "/home/john/dev/sage/skills/sage-callback-bootstrap/.env"
+_SAGE_ENV = str(_REPO / "skills" / "sage-callback-bootstrap" / ".env")
 
 
 def load_sage_defaults(env_path: str = _SAGE_ENV) -> dict:
@@ -288,13 +293,13 @@ def apollo_tools_spec(commands: list | None = None) -> list:
 
 # --- BloodHound cypher (read-only) -> deeper milestone probes (DA, objective) ------------------------
 
-_BH_CYPHER = "/home/john/dev/sage/skills/sage-eval-gauge/scripts/bh_cypher.py"
+_BH_CYPHER = str(_REPO / "skills" / "sage-eval-gauge" / "scripts" / "bh_cypher.py")
 
 
 def bloodhound_cypher_count(query: str, *, timeout: int = 60) -> int:
     """Run a read-only Cypher and return the node count, via the BloodHound MCP's signed client.
     Grounded in CypherClient.run_query (POST /api/v2/graphs/cypher)."""
-    cmd = ["uv", "--directory", "/home/john/dev/bloodhound_mcp", "run", "python", _BH_CYPHER, query]
+    cmd = ["uv", "--directory", _BLOODHOUND_DIR, "run", "python", _BH_CYPHER, query]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     try:
         return int(json.loads(proc.stdout.strip().splitlines()[-1]).get("node_count", 0))

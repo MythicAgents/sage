@@ -28,14 +28,8 @@ SAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = SAGE_ROOT / "evals" / "cases.yaml"
 DEFAULT_RESULTS = SAGE_ROOT / "evals" / "results"
 DEFAULT_DB = SAGE_ROOT / ".phoenix" / "phoenix.db"
-MYTHIC_ENV_PATH = Path(
-    os.environ.get("MYTHIC_ENV_PATH")
-    or (
-        "/home/john/dev/mythic_v4/.env"
-        if Path("/home/john/dev/mythic_v4/.env").exists()
-        else "/home/john/dev/mythic/.env"
-    )
-)
+# Empty when unset: no checkout-name guess. resolve_password fails closed naming the variable.
+MYTHIC_ENV_PATH = Path(os.environ.get("MYTHIC_ENV_PATH") or "")
 MYTHIC_SERVER = "127.0.0.1"
 MYTHIC_USER = "mythic_admin"
 NATIVE_CHAT_SCRIPTS = REPO_ROOT / "skills" / "sage-live-runner" / "scripts"
@@ -114,7 +108,7 @@ def resolve_password(env_path: str | Path = MYTHIC_ENV_PATH) -> str:
         return env_value
 
     path = Path(env_path)
-    if path.exists():
+    if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:

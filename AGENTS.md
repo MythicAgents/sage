@@ -222,7 +222,7 @@ Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
 
 Do not store lab passwords in skills or copied helper scripts. Prefer session environment variables, local gitignored
 `.env` files owned by each tool, or an OS keychain/secret manager. Current Mythic-facing reset helpers should resolve
-`MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`, `/home/john/dev/mythic_v4/.env`, and the legacy v3 `.env`.
+`MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`. There is no checkout-name default — see `.env.example`.
 
 ### Range Source, Runtime, and Evidence States
 
@@ -273,7 +273,7 @@ in tmux throughout current development.
    `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes` and require `"ready": true`;
    RAM-backed snapshots can restore guests with clocks days apart.
 4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
-   `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR=/home/john/dev/bloodhound_mcp`.
+   `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR="$SAGE_BLOODHOUND_MCP_DIR"`.
 5. **Verify Sage chat and create Apollo.** Run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It requires
    a running Sage chat container and builds/downloads a fresh Apollo payload. It does not create Sage payloads.
@@ -313,9 +313,9 @@ payload/callback lifecycle above.
   - Read-only clock gate:
     `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py check`
 - **BloodHound CE reset:** `skills/sage-goad-reset/scripts/bh_reset.py` uses the BloodHound MCP environment at
-  `/home/john/dev/bloodhound_mcp`.
-  - Status: `uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py status`
-  - Wipe collected graph data: `uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py wipe --yes`
+  `"$SAGE_BLOODHOUND_MCP_DIR"`.
+  - Status: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py status`
+  - Wipe collected graph data: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes`
   - `clear-database: 204 (empty body)` is expected. The wipe is asynchronous; verify `available-domains:
     count=0` before any ingest. Do not start SharpHound ingest while the wipe is still settling.
 

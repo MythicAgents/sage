@@ -23,7 +23,7 @@ The core guarantee these tests pin:
 model.py is deliberately NOT imported (it pulls the mythic_container runtime);
 prompt_loader is tested directly with tiny mock tool objects.
 
-Run: cd /home/john/dev/sage && .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_externalization.py -q
+Run from the repository root: .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_externalization.py -q
 """
 import logging
 import sys

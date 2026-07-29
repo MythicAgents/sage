@@ -16,7 +16,7 @@ set -euo pipefail
 
 MODEL="gpt-5.5-cyber-preview"   # HARDCODED — do not parameterize. The whole point is no override.
 EFFORT="high"
-CD="/home/john/dev/sage"
+CD="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 
 SPEC=""
 while [[ $# -gt 0 ]]; do

@@ -36,7 +36,7 @@ def _config() -> dict:
         "range_poll_interval": 1.0,
         "mythic_server": "127.0.0.1",
         "mythic_user": "mythic_admin",
-        "mythic_env_path": "/workspace/mythic_v4/.env",
+        "mythic_env_path": "/opt/mythic-install/.env",
     }
 
 
