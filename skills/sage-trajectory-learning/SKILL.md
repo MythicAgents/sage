@@ -13,14 +13,19 @@ Use this skill to convert retained experience into reusable decision data. Histo
 The trajectory tooling is product code, not a `Plans` script:
 
 ```bash
-.venv/bin/python -m Payload_Type.sage.ai.trajectory manifest --corpus-root /home/john/dev/sage --output /tmp/sage_trajectory_manifest.json
-.venv/bin/python -m Payload_Type.sage.ai.trajectory export --corpus-root /home/john/dev/sage --output /tmp/sage_transitions.jsonl
-.venv/bin/python -m Payload_Type.sage.ai.trajectory replay --train /tmp/sage_transitions.jsonl --eval /tmp/sage_transitions.jsonl
+MANIFEST_PATH=$(.venv/bin/python skills/sage-artifact-retention/scripts/artifact_retention.py path --category trajectory/manifests --name corpus-manifest.json)
+TRANSITIONS_PATH=$(.venv/bin/python skills/sage-artifact-retention/scripts/artifact_retention.py path --category trajectory/transitions --name transitions.jsonl)
+.venv/bin/python -m Payload_Type.sage.ai.trajectory manifest --corpus-root "$(git rev-parse --show-toplevel)" --output "$MANIFEST_PATH"
+.venv/bin/python -m Payload_Type.sage.ai.trajectory export --corpus-root "$(git rev-parse --show-toplevel)" --output "$TRANSITIONS_PATH"
+.venv/bin/python skills/sage-artifact-retention/scripts/artifact_retention.py record --category trajectory/manifests --artifact-type trajectory-corpus-manifest "$MANIFEST_PATH"
+.venv/bin/python skills/sage-artifact-retention/scripts/artifact_retention.py record --category trajectory/transitions --artifact-type trajectory-transition-export "$TRANSITIONS_PATH"
+.venv/bin/python -m Payload_Type.sage.ai.trajectory replay --train "$TRANSITIONS_PATH" --eval "$TRANSITIONS_PATH"
 ```
 
 Use `--corpus-root` repeatedly for off-host archives after mounting/copying them locally. The exporter redacts
 common credential material into stable handles. It reads `sage*.db`, `.phoenix/phoenix.db`, ledger JSON, and run
-logs read-only; it never mutates source DBs.
+logs read-only; it never mutates source DBs. Path allocation alone does not append output hashes to the manifest;
+run `record` after the producer closes each file.
 
 ## Runtime Bridge
 

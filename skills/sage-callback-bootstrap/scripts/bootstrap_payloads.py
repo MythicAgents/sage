@@ -557,9 +557,14 @@ def load_readiness_contract_module():
     return module
 
 
+async def ensure_sage_chat_api_token(client) -> dict[str, Any]:
+    native_chat = load_native_chat_module()
+    return await native_chat.ensure_api_token(client)
+
+
 async def prepare_sage_chat(client) -> dict[str, Any]:
     native_chat = load_native_chat_module()
-    token = await native_chat.ensure_api_token(client)
+    token = await ensure_sage_chat_api_token(client)
     channel = await native_chat.prepare_locked_channel(
         client,
         api_token_id=int(token["api_token"]["id"]),
@@ -584,6 +589,7 @@ async def readiness(
     clock_observation: dict[str, Any] | None = None,
     bloodhound_api_observation: dict[str, Any] | None = None,
     bloodhound_mcp_observation: dict[str, Any] | None = None,
+    require_prepared_channel: bool = True,
 ) -> dict[str, Any]:
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
@@ -638,6 +644,7 @@ async def readiness(
         clock_observation=clock_observation,
         bloodhound_api_observation=bloodhound_api_observation,
         bloodhound_mcp_observation=bloodhound_mcp_observation,
+        require_prepared_channel=require_prepared_channel,
     )
     return {**report, "callbacks": callbacks}
 
@@ -826,6 +833,9 @@ async def command_readiness(args: argparse.Namespace) -> int:
         foothold_payload_type=args.foothold_payload_type,
         foothold_host=args.foothold_host,
         foothold_user_match=args.foothold_user_match,
+        require_prepared_channel=getattr(
+            args, "require_prepared_channel", True
+        ),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report.get("ready") else 1
@@ -959,7 +969,15 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
     result: dict[str, Any] = {
         "sage_chat_container": running_chat[0],
         "sage_payload_created": False,
-        "sage_chat": await prepare_sage_chat(client),
+        "sage_chat": (
+            await prepare_sage_chat(client)
+            if getattr(args, "prepare_chat", True)
+            else {
+                "api_token": await ensure_sage_chat_api_token(client),
+                "prepared": False,
+                "reason": "operator_managed_chat_creation",
+            }
+        ),
     }
     if use_baked_apollo:
         result["apollo_callback_import"] = await import_callback_config(
@@ -1101,6 +1119,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     readiness_parser.add_argument(
+        "--require-prepared-channel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the empty prepared Sage channel (default). Use "
+            "--no-require-prepared-channel when the operator will create the "
+            "demo chat manually after infrastructure readiness."
+        ),
+    )
+    readiness_parser.add_argument(
         "--foothold-payload-type",
         default=os.environ.get("FOOTHOLD_PAYLOAD_TYPE", "apollo"),
         help="Payload type expected on the foothold callback (default: apollo).",
@@ -1176,6 +1204,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--callback-config",
         default=os.environ.get("APOLLO_CALLBACK_CONFIG_PATH"),
         help=f"Legacy retained callback config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
+    )
+    reset_parser.add_argument(
+        "--prepare-chat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Create/reuse the empty prepared Sage channel (default). Use "
+            "--no-prepare-chat when the operator will create the chat manually."
+        ),
     )
     reset_parser.add_argument(
         "--use-baked-apollo",

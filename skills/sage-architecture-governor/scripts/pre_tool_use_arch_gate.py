@@ -9,6 +9,7 @@ import sys
 
 from arch_governor_common import (
     approval_status,
+    frozen_path_conflicts,
     high_risk_paths,
     parse_apply_patch_paths,
     repo_root,
@@ -55,6 +56,14 @@ def _allow_context(message: str) -> dict:
 def run_hook(event: dict) -> tuple[int, dict]:
     root = repo_root()
     paths = _event_paths(event)
+    conflicts, lease = frozen_path_conflicts(root, paths)
+    if conflicts:
+        return 0, _deny(
+            "active Sage review lease "
+            f"{lease.get('lease_id')} freezes candidate "
+            f"{lease.get('candidate_id')}; write conflicts: {', '.join(conflicts)}. "
+            "Close the exact lease before changing reviewed bytes."
+        )
     high = high_risk_paths(paths, root)
     if not high:
         return 0, {}

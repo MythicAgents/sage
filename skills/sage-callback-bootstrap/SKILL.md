@@ -30,6 +30,16 @@ Verify the Sage chat container and create a fresh Apollo payload:
 `bootstrap-reset` must report a running `sage_chat_container`, a wildcard-scoped autonomous API token, an empty locked prepared channel named
 `Sage GOAD Ready`, and `sage_payload_created: false`.
 
+The standalone command keeps that prepare-chat behavior for compatibility. When the operator will create the
+operation and demo chat manually, use:
+
+```bash
+.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset --no-prepare-chat
+```
+
+Pair it with `readiness --no-require-prepared-channel`. This relaxes only the prepared-channel section; Sage
+container, token, range, clock, BloodHound, and unique foothold requirements remain enforced.
+
 After Apollo is launched as `NORTH\samwell.tarly` on CASTELBLACK, run:
 
 ```bash
@@ -45,6 +55,8 @@ ready. `selected_sage_cb` is intentionally null.
 `post-callback-preflight` is now strictly task-free. It waits for the selected live Apollo callback through
 Mythic control-plane observation, synchronizes range clocks out of band, and returns explicit zero-task metadata.
 It does not issue callback tasks, purge Kerberos tickets, or claim target-probed domain/identity output.
+The `sage-goad-reset` orchestrator additionally proves this with observed Mythic task-count deltas before
+admitting reset completion.
 
 ## Canonical Apollo Bootstrap Path
 

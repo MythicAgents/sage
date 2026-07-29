@@ -8,6 +8,25 @@ description: Repo-local Sage trace, Phoenix, Mythic task-output, and run-log ana
 Treat `sage.db`, `.phoenix/phoenix.db`, run logs, and engagement ledgers as sensitive read-only data unless the
 operator explicitly says otherwise. Do not delete, compact, or mutate retained historical DBs.
 
+Export the request first with `sage-live-runner`, then run the parameterized read-only audit:
+
+```bash
+TRANSCRIPT_PATH=$(.venv/bin/python skills/sage-live-runner/scripts/native_chat.py transcript --request-id <id> | jq -r .export_path)
+.venv/bin/python skills/sage-trace-analysis/scripts/trace_audit.py --transcript "$TRANSCRIPT_PATH"
+```
+
+The audit reports finished sub-agents missing summaries, duplicate assistant finals, payload-task counts,
+input-request pauses, and post-sub-agent activity gaps. It binds the redundant request/channel/status tuple and
+reconciles exact task IDs from runtime telemetry with completed Mythic task-card evidence before certifying a
+zero-task or bounded-task expectation. Add explicit canary expectations when appropriate:
+
+```bash
+.venv/bin/python skills/sage-trace-analysis/scripts/trace_audit.py --transcript "$TRANSCRIPT_PATH" --require-zero-payload-tasks --expect-halt-reason operator_input_requested
+```
+
+Optional `--phoenix-db` plus repeatable `--trace-rowid` arguments correlate the transcript with Phoenix through
+the repository's read-only SQLite reader.
+
 ## Common Uses
 
 Mine failure classes:
@@ -27,6 +46,7 @@ Use `$sage-trajectory-learning` when the output should become normalized transit
 
 ## Bundled Scripts
 
+- `trace_audit.py` (parameterized and read-only)
 - `backfill_task_ids.py`
 - `diag_ingest_narration.py`
 - `diag_ingest_run4.py`

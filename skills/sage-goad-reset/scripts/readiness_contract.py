@@ -485,18 +485,25 @@ def foothold_status(summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def channel_status(channel: dict[str, Any] | None) -> dict[str, Any]:
+def channel_status(
+    channel: dict[str, Any] | None, *, required: bool = True
+) -> dict[str, Any]:
     channel = dict(channel or {})
     channel_id = channel.get("chat_channel_id")
     prepared = bool(channel.get("prepared"))
-    ready = channel_id is not None and prepared
+    ready = (channel_id is not None and prepared) if required else True
     return {
         "ready": ready,
+        "required": required,
         "chat_channel_id": channel_id,
         "chat_channel_name": channel.get("chat_channel_name"),
         "prepared": prepared,
         "reused": bool(channel.get("reused")),
-        "blockers": [] if ready else ["prepared native-chat channel is unavailable"],
+        "blockers": (
+            []
+            if ready
+            else ["prepared native-chat channel is unavailable"]
+        ),
     }
 
 
@@ -598,6 +605,7 @@ async def collect_operator_readiness(
     clock_observation: dict[str, Any] | None = None,
     bloodhound_api_observation: dict[str, Any] | None = None,
     bloodhound_mcp_observation: dict[str, Any] | None = None,
+    require_prepared_channel: bool = True,
 ) -> dict[str, Any]:
     ludus_section = ludus_observation if ludus_observation is not None else probe_ludus_status()
     clock_section = clock_observation if clock_observation is not None else probe_clock_status()
@@ -620,7 +628,9 @@ async def collect_operator_readiness(
         bloodhound_mcp=bloodhound_mcp_section,
         mythic_chat=mythic_chat_status(chat_containers, api_token),
         foothold=foothold_status(callback_summary),
-        channel=channel_status(channel),
+        channel=channel_status(
+            channel, required=require_prepared_channel
+        ),
     )
 
 

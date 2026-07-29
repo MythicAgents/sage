@@ -273,3 +273,12 @@ def test_channel_status_requires_prepared_channel():
         "chat_channel_name": "prepared",
         "prepared": True,
     })["ready"] is True
+
+
+def test_channel_status_can_defer_chat_creation_to_operator():
+    status = MODULE.channel_status(None, required=False)
+
+    assert status["ready"] is True
+    assert status["required"] is False
+    assert status["prepared"] is False
+    assert status["blockers"] == []

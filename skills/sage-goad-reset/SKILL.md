@@ -21,6 +21,36 @@ Treat `full reset`, `reset everything`, or an equivalent request as the entire w
 chat verification, fresh Apollo creation, and Samwell callback establishment through `$sage-callback-bootstrap`. A Ludus-only rollback
 must be requested explicitly as a range-only or GOAD-only reset.
 
+For repeatable operator execution, use the resumable orchestrator. Previewing the plan is read-only:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py plan --snapshot <exact-snapshot> --callback-host <mythic-callback-url>
+```
+
+Start the live reset only with explicit authorization:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py start --snapshot <exact-snapshot> --callback-host <mythic-callback-url> --yes
+```
+
+The orchestrator composes the existing helpers in canonical order, writes an atomic redacted checkpoint under
+`.sage_engagement/reset_runs/`, and pauses at `await-operator-foothold-launch`. It never deploys or launches the
+payload itself. Checkpoint load and write validate the exact phase order, legal state progression, command
+derivation, operator boundary, terminal state, and zero-task observation lineage; malformed or ambiguous state
+fails closed before another phase can run. After the operator completes the documented interactive RDP launch:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/reset_orchestrator.py resume --checkpoint <checkpoint.json> --operator-foothold-launched --yes
+```
+
+It establishes an observed Mythic task-count baseline immediately after Mythic reset and requires an exact zero
+delta after bootstrap, operator payload launch, post-callback preflight, and final readiness. A nonzero delta
+blocks completion.
+
+The orchestrator defaults to `--no-prepare-chat`, leaving operation and chat creation to the operator. Pass
+`--prepare-chat` only when the empty `Sage GOAD Ready` channel is wanted. The standalone `bootstrap-reset`
+command retains its historical prepare-chat default.
+
 ## Range Source and Lifecycle
 
 For reusable AD ranges intended for publication or transfer, keep the portable definition in DreadGOAD format and
@@ -229,5 +259,6 @@ does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 - `readiness_contract.py`
 - `mythic_reset.sh`
 - `pkinit_padata_probe.py`
+- `reset_orchestrator.py` (resumable canonical reset with observed zero-task proof)
 - `sage_restart.sh`
 - `sage_stop.sh`
