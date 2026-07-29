@@ -84,7 +84,7 @@ Verify important claims against source, tests, Mythic, BloodHound, and the curre
 - Give deadline-bound `runtime_bugfix` reviews an explicit wall-clock and command budget in the task contract
   (15 minutes and the focused production-path suite by default). Complete the declared probes, then return a
   disposition. Do not expand into unrelated history, whole-repository archaeology, or lifecycle review; the
-  maintained supported tier remains the implementation owner's regression evidence unless the frozen contract
+  maintained offline suite remains the implementation owner's regression evidence unless the frozen contract
   identifies a concrete reason the reviewer must rerun it.
 
 ## Repo Map
@@ -108,6 +108,49 @@ Verify important claims against source, tests, Mythic, BloodHound, and the curre
 - `Payload_Type/sage/tests/`: fast offline unit/regression suite.
 - `Payload_Type/sage/ai/trajectory/`: trajectory corpus/export/replay/runtime bridge tooling for data-backed repair policy.
 - `skills/`: repo-local Sage skills. Reusable operator/Codex/Claude tooling belongs here, not in `Plans/`. **Read `skills/README.md` first** — it indexes every skill (name, purpose, entry script); tool-agnostic.
+
+## Publishable-By-Default Contract
+
+**Every file you write or edit here must be committable as-is.** This repository is public. The maintainer should
+never have to review a diff and ask you to remove something personal — if a change needs that correction, it was
+authored wrong, not caught late.
+
+Rules 1, 3, and 4 are enforced by `Payload_Type/sage/tests/test_repository_boundaries.py`. Rule 2 is enforced
+behaviourally — the resolvers' fallback lists are asserted empty in `test_native_chat_runner.py` and
+`test_bootstrap_payloads_script.py`, so no directory name has to be named anywhere to forbid guessing one.
+Rules 5 and 6 are prose only; if they recur, that is the signal to build a probe rather than restate them.
+
+1. **No path that encodes one machine's layout.** That covers an absolute home path, a tilde-relative one,
+   and a `HOME`-variable one alike — all three name a directory tree that exists only on the author's box.
+   Derive repo-internal paths from `Path(__file__).resolve().parents[N]` or
+   `$(git rev-parse --show-toplevel)`.
+
+2. **No checkout-name guessing for external dependencies.** Do not probe for a sibling directory by name, in
+   any spelling or version suffix. External locations come from an environment variable
+   (`MYTHIC_ENV_PATH`, `MYTHIC_CLI`, `SAGE_BLOODHOUND_MCP_DIR`) documented in `.env.example`, and the resolver
+   **fails closed naming the variable to set** when it is absent. A name guess silently reads the wrong install
+   on any machine with two checkouts; a refusal is strictly more useful than a wrong default.
+
+3. **No pointer into a gitignored directory.** `Plans/`, `Notes/`, and `.sage_history/` are absent from a clone.
+   Rules *about* them are fine ("evidence belongs in `.sage_history/`"); telling a reader to go *read* a file
+   there is a dead link for everyone but the maintainer.
+
+4. **No maintainer-only tooling.** Personal agent profiles, model pins, and workflow shortcuts belong in the
+   operator's own `~/.codex/` or `CLAUDE.local.md`, not here. Test: would this help someone who is not the
+   maintainer run or develop Sage? If no, it is not repository content.
+
+5. **No completed-campaign artifacts in the product tree.** Sealed evaluation source and evidence go to
+   `.sage_history/`. The test that tells them apart: **can it be refactored without invalidating its own
+   attestations?** If refactoring breaks hashes it pinned of itself, it is a sealed historical artifact, not
+   living code, and it does not belong under `Payload_Type/`.
+
+6. **Keep the two `.env` files distinct.** `Payload_Type/sage/.env` is the deployed container's runtime
+   environment (RabbitMQ, Bedrock credentials, `SAGE_RUN_AS_PASSWORD`). The repo-root `.env` is operator-tooling
+   discovery only. No key belongs in both, and nothing auto-loads the root one — see `.env.example`.
+
+Lab identifiers are **not** covered by this contract. GOAD names as overridable CLI defaults
+(`--foothold-host CASTELBLACK`) are correct in operator skills whose purpose is driving GOAD; what is forbidden is
+hardcoding them into product capability logic (see § Highest-Value Demo Work).
 
 ## Current Validation Baseline
 
@@ -157,6 +200,22 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
   Put them in repo-local skills under `skills/<skill-name>/scripts/` and document the workflow in that skill's
   `SKILL.md`. `Plans/` is for minimal current planning/handoff markdown plus archived historical notes.
 - Preserve user changes; do not reset, checkout, or revert unrelated files.
+- **A clean parse is not a clean run — execute what you edited.** `py_compile` accepts an undefined name;
+  `bash -n` accepts an unbound variable that `set -u` will kill at runtime. After any edit to an executable, run
+  it (`--help` or its no-arg path) and check for `NameError`, `ImportError`, `IndexError`, `unbound variable`. An
+  automated multi-file edit must additionally **assert its insertion landed at the intended scope** — inserting
+  "before the first line mentioning X" can place a module-level assignment inside a tuple literal, which compiles
+  in neither direction but is only caught by actually parsing the result.
+- **Verify against a clean checkout, not the working tree.** A green working tree proves nothing about what is
+  committed; that exact gap once left `HEAD` unable to import while local tests passed. Extract and test the real
+  artifact: `git archive $(git write-tree) | tar -x -C "$(mktemp -d)"`. Re-extract after **every** edit — a stale
+  extraction reports defects you already fixed.
+- **A guard test must be able to fail.** Before trusting one, plant the violation it exists to catch and confirm
+  it goes red, then remove it and confirm green. A test that reads an empty file list and reports success is worse
+  than no test, because it converts silence into false confidence.
+- **When fixing a class of defect, verify the class — not the instance.** Re-running the exact grep you just
+  satisfied proves only that one spelling is gone. Rewriting an absolute home path as a tilde-relative one
+  passes a search for the absolute form while preserving the defect exactly.
 - Do not start expensive live GOAD/inference runs without clear user intent. A full autonomous solve can take ~25 minutes and depends on external lab state.
 - Always re-discover live payload callback IDs after lab resets. Sage itself uses a fresh chat channel, not a callback.
 - When reporting long live work, separate engineering/debug time from live-lab execution time. Include the current
@@ -166,7 +225,7 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
   operator action is required.
 - Prefer single-line shell commands in operator instructions. Avoid backslash-continued commands when one line is practical.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
-- If touching autonomous execution, run focused tests plus the supported offline tier above.
+- If touching autonomous execution, run focused tests plus the full offline suite above.
 - High-risk Sage architecture work must pass the architecture governor before edits. Use
   `skills/sage-architecture-governor` for any change touching prompts, agent topology, tool lists,
   `Payload_Type/sage/ai/langgraph/model.py`, `mythic_tools.py`, `engagement_state.py`, reconcilers,
