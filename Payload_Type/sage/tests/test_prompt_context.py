@@ -49,10 +49,20 @@ class FakeModel:
 # commands_text
 # --------------------------------------------------------------------------- #
 
+# ISC-72: repointed from the all-commands dump to the per-command schema tool. The broad tool
+# returns 75,650 chars for Apollo and was head-truncated to 16,000 by _compact_tool_result_str, so
+# the schema the model was told to trust arrived ~79% missing — that is how `ticket_cache_list` was
+# issued with empty parameters on 2026-07-28.
 NOTE_TAIL = (
-    "\n**Note:** This is an index only. Before issuing any command that takes "
-    "parameters, call get_all_commands_for_payloadtype('<payload>') to retrieve "
-    "the exact parameter schema. Use it also for payloads not listed here.\n"
+    "\n**Note:** This is an index only. Before issuing any command that takes parameters, call "
+    "get_all_command_args_for_payloadtype('<payload>', '<command>') for that ONE command's exact "
+    "schema — its `default_value`, `required`, `choices`, and `parameter_group_name` are "
+    "authoritative. Never issue a command with empty parameters: send the resolved JSON object "
+    "(`{}` at minimum), never an empty string — agents parse the parameter blob and an empty "
+    "string is a parse error, whereas `{}` lets the agent apply its own declared defaults. Use "
+    "get_all_command_names_for_payloadtype('<payload>') to discover commands for payloads not "
+    "listed here, and get_all_commands_for_payloadtype('<payload>') only when you genuinely need "
+    "every command's schema at once.\n"
 )
 
 

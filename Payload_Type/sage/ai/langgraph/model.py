@@ -59,6 +59,11 @@ import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
+# ISC-59: consecutive zero-message returns from one delegated node before the no-progress backstop
+# fires. A node that returns nothing gives the Supervisor nothing to act on, so it re-delegates the
+# identical objective forever (the supervised re-approval livelock). N=3 chosen by Russel 2026-07-28:
+# tolerates one genuinely empty-but-legitimate cycle, still bounds the loop to seconds.
+_ZERO_PROGRESS_DELEGATION_CAP = 3
 # Halt the autonomous solve after this many consecutive capability steps that add NO new achieved effect
 # (the ledger doesn't grow) — a stall detector so a dead/unsatisfiable hop (e.g. a dcsync that keeps failing)
 # halts with a report instead of looping forever and burning tokens.
@@ -84,6 +89,14 @@ _COMPACTION_PROTECTED_TOOLS = frozenset((
     "transfer_to_Supervisor", "transfer_to_Generalist", "transfer_to_Mythic_Operator",
     "transfer_to_Mythic_Payload", "transfer_to_BloodHound", "transfer_to_MCP_Manager",
     "transfer_to_Sandbox",
+    # ISC-72: command schema is not chatter — truncating it makes the model guess parameters, which
+    # is exactly how `ticket_cache_list` went out with empty params on 2026-07-28 (75,650 chars head-
+    # truncated to 16,000, losing ~79%). These three were already excluded from ContextEditingMiddleware
+    # via _STATIC_SCHEMA_TOOLS but not from result compaction. The truncation notice told the model to
+    # "re-query narrower", which was impossible until the narrow tools were registered this same day.
+    "get_all_commands_for_payloadtype",
+    "get_all_command_args_for_payloadtype",
+    "get_all_command_names_for_payloadtype",
 ))
 
 
@@ -1532,6 +1545,35 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                     f"{name or 'unknown_tool'}: request proposal binding failed"
                 )
                 continue
+            denied = False
+            denied_reason = "turn authority denied a previously rejected guarded action"
+            if name in GUARDED_TOOLS:
+                # ISC-75/76: this MUST come before the request-contract check below, which ends in a
+                # `continue`. The first cut sat after it and was therefore dead on the live path —
+                # every re-proposal was short-circuited by the contract reason, so neither the
+                # operator's decision nor the attempt flag was ever recorded, and the loop looked
+                # like ordinary analysis to the backstop.
+                #
+                # An operator rejection must bind the ACTION for the rest of the request. Two further
+                # gaps let a rejected action keep coming back: the digest check below is keyed on the
+                # full argument dict (so any reworded re-proposal is a different digest), and it is
+                # skipped entirely when a typed contract is installed — which is the supervised path.
+                # The coarse (tool, command, callback) key closes both, and its reason is written FOR
+                # THE MODEL: a denial has to read as a decision to plan around, not a failed attempt
+                # worth retrying.
+                self._model._guarded_attempt_pending = True
+                _denied_keys = getattr(self._model, "_denied_action_keys", None) or ()
+                if _guarded_action_key(tool_call) in _denied_keys:
+                    denied = True
+                    denied_reason = (
+                        f"the operator REJECTED {name} against this target earlier in this request. "
+                        "That decision stands — do not propose it again. Take a different approach, "
+                        "or stop and report to the operator what you would need in order to continue."
+                    )
+            if denied:
+                allowed, reason = False, denied_reason
+                blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
+                continue
             contract_reason = self._model._request_contract_block_reason(
                 name,
                 tool_call.get("args", {}),
@@ -1540,14 +1582,13 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 allowed, reason = False, contract_reason
                 blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
                 continue
-            denied = False
-            if name in GUARDED_TOOLS and not typed_contract_installed:
+            if not denied and name in GUARDED_TOOLS and not typed_contract_installed:
                 try:
                     denied = authority.denies_action_digest(approval_action_fingerprint(tool_call))
                 except ValueError:
                     denied = True
             if denied:
-                allowed, reason = False, "turn authority denied a previously rejected guarded action"
+                allowed, reason = False, denied_reason
             elif typed_contract_installed:
                 allowed, reason = True, ""
             elif authority.enforces_objective_tool_allowlist:
@@ -1564,6 +1605,13 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 allowed_calls.append(tool_call)
                 continue
             blocked_reasons.append(f"{name or 'unknown_tool'}: {reason}")
+            if name in GUARDED_TOOLS:
+                # ISC-75: this delegation TRIED to cross the effect boundary and was stopped. That is
+                # what distinguishes a stall from ordinary analysis, and it is what the no-progress
+                # backstop counts. Without it the backstop also fires on legitimate non-tasking work
+                # — a BloodHound-only request that runs three graph queries in a row never issues a
+                # Mythic task and is not stalled.
+                self._model._guarded_attempt_pending = True
         rewrite = bool(batch_error) or has_control or allowed_calls != original_calls
         if not blocked_reasons and not rewrite:
             return None
@@ -2473,6 +2521,141 @@ def _tool_result_is_error(content: str) -> bool:
     return False
 
 
+def _messages_added_by_agent(
+    updated_channel: list,
+    agent_input: list,
+    initial_agent_input_length: int,
+) -> list:
+    """Return the messages the agent ADDED, identified by message id rather than list position.
+
+    ISC-56, and it is HARDENING — not the established fix for the channel-56/57 zero-return.
+    `_ainvoke` used to slice `updated_channel[initial_agent_input_length:]`, which is sound only when
+    the returned list is (input + new). Identifying the agent's output by identity rather than by
+    arithmetic is unconditionally sounder, so this stays. What it does NOT do is explain the observed
+    live defect — see below before attributing a zero-return to it.
+
+    ATTRIBUTION WITHDRAWN 2026-07-28 (round 9). This function landed on the theory that Sage's
+    history-rewriting middleware shortens the returned list, so a rewrite dropping as many messages
+    off the front as the model added to the back makes the positional slice return EMPTY. That
+    theory is refuted for this runtime:
+
+    - `ContextEditingMiddleware(_DigestToolUsesEdit)` CANNOT shorten a list. Sage's subclass and
+      langchain's `ClearToolUsesEdit.apply` both only do `messages[idx] = ...` — length is invariant.
+    - `SummarizationMiddleware` is the only list-shortener, and it has never fired: all 247
+      `SummarizationMiddleware.before_model` spans in Phoenix are <=2ms with zero child spans and
+      zero LLM descendants. Its `trigger=("tokens", 150000)` was never approachable — the all-time
+      peak per-call prompt is 80,839, and the channel-56/57 hours peaked at 37,510 and 18,594.
+    - `keep=("messages", 12)` would have collapsed channel 57's 20-message input to ~13, not the
+      observed 20.
+
+    The round-8 hermetic probe reproduced the symptom shape with a synthetic middleware emitting
+    `RemoveMessage` that Sage does not run. The real mechanism of the channel-56/57 zero-return is
+    UNKNOWN (third refuted attribution, after interrupt/resume replay and create_agent jump-to-end).
+    Note the leading hypothesis would defeat this function too: `add_messages` dedupes by id, so a
+    returned message whose id already exists REPLACES in place, which leaves both the positional
+    slice and this id-diff returning empty.
+
+    Falls back to the positional slice when any message lacks an id, so behaviour is byte-identical
+    on transcripts this cannot reason about.
+    """
+    try:
+        input_ids = {mid for m in agent_input if (mid := getattr(m, "id", None))}
+        if len(input_ids) != len(agent_input):
+            return list(updated_channel[initial_agent_input_length:])
+        added = []
+        for msg in updated_channel:
+            msg_id = getattr(msg, "id", None)
+            if msg_id is None:
+                return list(updated_channel[initial_agent_input_length:])
+            if msg_id not in input_ids:
+                added.append(msg)
+        return added
+    except Exception:  # pragma: no cover - never break the node on bookkeeping
+        return list(updated_channel[initial_agent_input_length:])
+
+
+def _zero_return_id_forensics(updated_channel: list, agent_input: list) -> str:
+    """ISC-53 round 10: describe a zero-return by message IDENTITY, not just by length.
+
+    The round-9 refutation left the mechanism unknown, and the leading hypothesis is an
+    `add_messages` id collision: create_agent's state channel uses the `add_messages` reducer, which
+    REPLACES a message in place when the incoming id already exists instead of appending. That
+    leaves `len(updated) == len(input)` with the model having produced real messages — the exact
+    channel-56/57 signature — and it defeats both the positional slice and `_messages_added_by_agent`.
+
+    The three numbers the old instrument logged cannot tell that apart from a plain drop. These can:
+
+    - `new`     — ids returned that were not in the input. A true zero-return should show 0.
+    - `dropped` — ids sent that did not come back. Non-zero means something removed messages.
+    - `mutated` — ids present on BOTH sides whose CONTENT changed. **This is the collision tell:**
+      `new=0 dropped=0 mutated>0` is replace-in-place and confirms the hypothesis; `mutated=0`
+      kills it and sends the search elsewhere.
+
+    Purely diagnostic. Wrapped so a bookkeeping failure can never break the node.
+    """
+    try:
+        def _by_id(msgs):
+            out = {}
+            for m in msgs:
+                mid = getattr(m, "id", None)
+                if mid is not None:
+                    out[mid] = m
+            return out
+
+        in_by_id = _by_id(agent_input)
+        out_by_id = _by_id(updated_channel)
+        missing_ids = (len(agent_input) - len(in_by_id)) + (len(updated_channel) - len(out_by_id))
+
+        new_ids = [i for i in out_by_id if i not in in_by_id]
+        dropped_ids = [i for i in in_by_id if i not in out_by_id]
+        mutated_ids = [
+            i for i in out_by_id
+            if i in in_by_id and out_by_id[i].content != in_by_id[i].content
+        ]
+
+        def _sample(ids):
+            return [str(i)[-12:] for i in ids[:5]]
+
+        verdict = (
+            "COLLISION-REPLACE (round-10 hypothesis CONFIRMED)"
+            if (not new_ids and not dropped_ids and mutated_ids)
+            else "no-collision (round-10 hypothesis does NOT explain this one)"
+            if not mutated_ids
+            else "mixed"
+        )
+        return (
+            f"ids: n_in={len(agent_input)} n_out={len(updated_channel)} "
+            f"new={len(new_ids)} dropped={len(dropped_ids)} mutated={len(mutated_ids)} "
+            f"untracked_no_id={missing_ids} "
+            f"new_sample={_sample(new_ids)} dropped_sample={_sample(dropped_ids)} "
+            f"mutated_sample={_sample(mutated_ids)} verdict={verdict}"
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics must never break the node
+        return f"ids: forensics-unavailable ({type(exc).__name__})"
+
+
+def _guarded_action_key(action: Any) -> str:
+    """Coarse identity of a guarded action: the ACTION and its TARGET, not its exact arguments.
+
+    `approval_action_fingerprint` hashes the full canonical argument dict, which is right for binding
+    one approval to one exact proposal but wrong for recognising a re-proposal. ISC-69a already had to
+    learn this: the observed loop went `luid: ""` then `luid: "0"` then `luid: "0x5b16c"`, so every
+    cycle produced a different fingerprint and any full-argument key stayed silent.
+
+    "The same command against the same target" is what an operator means when they reject an action,
+    so that is what a denial has to remember. Typed fields only — no prose.
+    """
+    if not isinstance(action, dict):
+        return ""
+    args = action.get("args")
+    args = args if isinstance(args, dict) else {}
+    return "::".join((
+        str(action.get("name") or ""),
+        str(args.get("command") or ""),
+        str(args.get("callback_display_id") or ""),
+    ))
+
+
 def _is_internal_human_message(msg: AnyMessage) -> bool:
     """True for provider/control nudges that must not be treated as operator input."""
     return isinstance(msg, HumanMessage) and bool(msg.additional_kwargs.get("_hide_from_stream"))
@@ -3189,6 +3372,9 @@ class Model:
         )
         self._autonomous_solve = bool(autonomous_solve)
         self._turn_authority = TurnAuthority(mode="observe")
+        # ISC-59/60: per-node consecutive zero-message-return counter for the cause-agnostic
+        # no-progress backstop. Keyed by node name; reset to 0 whenever that node returns work.
+        self._zero_progress_returns: dict[str, int] = {}
         self._request_contract = None
         self._request_execution_digest = ""
         self._request_admitted_action_digests: set[str] = set()
@@ -6133,6 +6319,7 @@ class Model:
             _continue_count = 0
             _agent_input = sanitized_channel
             updated_channel = sanitized_channel  # safe default if stopped before invocation
+            result: Any = None  # same reason: the ISC-53 zero-progress instrument reads it below
             while True:
                 # Cooperative kill switch INSIDE the autonomous continue-loop: an operator `stop`/`exit` set
                 # _stop_requested, but the outer astream only checks it between top-level super-steps — so
@@ -6163,7 +6350,10 @@ class Model:
                     break
                 if result.get("recursion_handback"):
                     break  # explicit handback — let upstream flag handling end/route
-                _new_msgs = updated_channel[initial_agent_input_length:]
+                # ISC-56: same reason as the return path below — position is not identity.
+                _new_msgs = _messages_added_by_agent(
+                    updated_channel, _agent_input, initial_agent_input_length
+                )
                 if _bounded_one_action_request and _terminal_execute_capability_payload(_new_msgs):
                     break  # the delegated task explicitly said one capability action, then stop
                 _explicit_yield = any(
@@ -6218,8 +6408,13 @@ class Model:
                 break
 
             # With operator.add reducer, we only pass the NEW messages, not the full list
+            # ISC-56 (hardening): identify what the agent added by message id, not by list position.
+            # Identity beats arithmetic regardless of cause. This does NOT close the channel-56/57
+            # zero-return — that mechanism is unknown; see _messages_added_by_agent.
             returned_messages = [
-                msg for msg in updated_channel[initial_agent_input_length:]
+                msg for msg in _messages_added_by_agent(
+                    updated_channel, _agent_input, initial_agent_input_length
+                )
                 if not _is_internal_human_message(msg)
             ]
 
@@ -6242,6 +6437,125 @@ class Model:
                 if not new_messages_from_agent:
                     new_messages_from_agent = [_guard_msg]
                     logger.info(f"🩸 [{node_name}] surfaced pending guard message (agent produced no messages)")
+
+            # ── ISC-59/60/75: no-progress delegation backstop, keyed on PROGRESS ───────────────
+            # This guard triggers on the SYMPTOM (no progress), never on a cause — a guard that
+            # enumerates known causes misses the next one. Four distinct causes have now produced the
+            # same operator-visible livelock.
+            #
+            # ISC-75 replaced this counter's signal. It used to count consecutive ZERO-MESSAGE
+            # returns, which a refusal loop walks straight past: every cycle emits a refusal message,
+            # so the streak resets forever and only the global step limit ends the request — leaving
+            # the operator an `error` with no explanation.
+            # Messages moving is not progress. Progress is the EFFECT BOUNDARY being crossed, or the
+            # delegation handing back something it had not handed back before. That definition already
+            # existed in this file — the ISC-69a card guard resets on `_last_issued_task_display_id`
+            # moving — but it was wired into one call site and never applied here. This lifts it to
+            # request scope rather than adding a seventh guard (RCA: ISC-53 plan, "why loop
+            # containment keeps failing").
+            #
+            # Zero-message returns are a strict subset of no-progress returns, so the ISC-59 behaviour
+            # this replaces still fires at the same cap.
+            #
+            # Fetched defensively: tests construct Model instances without running __init__, which is
+            # why the sibling guard-message read above uses getattr too. Direct attribute access here
+            # broke 19 previously-green tier tests on 2026-07-28.
+            _task_marker = str(getattr(
+                getattr(self, "mythic_client", None), "_last_issued_task_display_id", "",
+            ) or "")
+            _effect_crossed = _task_marker != str(
+                getattr(self, "_last_progress_task_marker", "") or ""
+            )
+            self._last_progress_task_marker = _task_marker
+
+            # Progress is the effect boundary and NOTHING ELSE.
+            #
+            # Attempt 1 also treated "this delegation returned different content than last time" as
+            # progress, to avoid truncating legitimate non-tasking work. A live rejection loop
+            # refuted it immediately: the model paraphrases its own refusal, so the returned content
+            # alternates ("[turn-authority] issue_task…" / "Let me issue the ticket_cache_list…" /
+            # "[turn-authority] mode is `supervised_action`…") and the streak resets every second or
+            # third cycle. The guard reached 2/3 and never fired while the request looped to the
+            # global step limit. Widening the comparison to a set of seen digests does not fix it —
+            # genuinely new phrasing still reads as new.
+            #
+            # That is AGENTS.md's rule in a different costume: do not encode control authority by
+            # classifying open-ended natural-language prose when protocol state carries the same
+            # decision. Message content is prose. The Mythic task display id is protocol state.
+            #
+            # The cost is accepted deliberately: a request whose delegations legitimately do not task
+            # for three consecutive cycles is surfaced to the operator as "no progress" rather than
+            # left running. That is recoverable — the operator is told and can continue — whereas a
+            # silent livelock is not.
+            _progressed = _effect_crossed
+
+            if not new_messages_from_agent:
+                # ISC-53 instrument: the empty slice is the thing we cannot yet explain. Round 9
+                # refuted the history-rewrite attribution, so lengths alone are no longer enough —
+                # the second line reports message IDENTITY, which is what distinguishes an
+                # add_messages collision-replace from a genuine drop. See _zero_return_id_forensics.
+                logger.warning(
+                    f"🔁 [{node_name}] ZERO-PROGRESS return — "
+                    f"len(channel)={len(channel)} initial_agent_input_length={initial_agent_input_length} "
+                    f"len(updated_channel)={len(updated_channel)} "
+                    f"result_had_messages_key={isinstance(result, dict) and 'messages' in result} "
+                    f"captured={len(captured)}"
+                )
+                logger.warning(
+                    f"🔁 [{node_name}] ZERO-PROGRESS forensics — "
+                    f"{_zero_return_id_forensics(updated_channel, _agent_input)}"
+                )
+            # ISC-75: only a delegation that TRIED to act and failed counts against the streak.
+            # Effect-only progress on its own would fire on legitimate non-tasking work — three
+            # consecutive BloodHound graph queries issue no Mythic task and are not a stall. An
+            # analysis delegation is therefore NEUTRAL: it neither advances the streak nor clears it.
+            # `_guarded_attempt_pending` is typed state set where a guarded call is actually blocked
+            # or carded, not inferred from message text.
+            _attempted_effect = bool(getattr(self, "_guarded_attempt_pending", False))
+            self._guarded_attempt_pending = False
+            # A delegation that hands back NOTHING is a stall under every definition — there is no
+            # analysis result either, and the Supervisor has nothing to act on. That is the original
+            # ISC-53/56 symptom, so the neutral exemption must not swallow it.
+            _returned_something = bool(new_messages_from_agent)
+
+            # The streak is REQUEST-scoped, not per node. A loop that alternates nodes is still a
+            # loop, and a per-node counter lets it hide by rotating.
+            if _progressed:
+                self._nonprogress_delegations = 0
+            elif not _attempted_effect and _returned_something:
+                pass  # analysis-only delegation: neutral, streak untouched
+            else:
+                _streak = int(getattr(self, "_nonprogress_delegations", 0)) + 1
+                self._nonprogress_delegations = _streak
+                logger.warning(
+                    f"🔁 [{node_name}] NO-PROGRESS delegation {_streak}/{_ZERO_PROGRESS_DELEGATION_CAP} — "
+                    f"task_marker={_task_marker or '(none)'} returned={len(new_messages_from_agent)}"
+                )
+                if _streak >= _ZERO_PROGRESS_DELEGATION_CAP:
+                    self._nonprogress_delegations = 0
+                    _stall_msg = AIMessage(
+                        content=(
+                            f"🛑 **Stopped — no progress.** `{node_name}` was delegated this objective "
+                            f"{_streak} times in a row without anything taking effect or any new result "
+                            "coming back, so I stopped rather than keep retrying.\n\n"
+                            "Nothing was executed on the target by these attempts. If you approved an "
+                            "action, check the callback's task output before re-running — a completed "
+                            "result that never comes back is indistinguishable, from here, from work that "
+                            "never happened.\n\n"
+                            "Tell me how you'd like to proceed, or start a new request."
+                        ),
+                        name=node_name,
+                    )
+                    new_messages_from_agent = [_stall_msg]
+                    # Halt the graph the same way the global step limit does, so the Supervisor
+                    # cannot simply re-delegate past this message — which is what happens when the
+                    # backstop only injects text. The operator gets this reason instead of a bare
+                    # step-limit `error` (ISC-75 A3).
+                    self._stop_requested = True
+                    logger.warning(
+                        f"🛑 [{node_name}] no-progress backstop fired after {_streak} consecutive "
+                        f"non-progressing delegations — halting the request (ISC-59/ISC-75)"
+                    )
 
             # Tag new messages with sequence numbers for chronological ordering
             # Compute from max of existing messages to avoid collisions with handoff-created messages
@@ -9416,6 +9730,14 @@ class Model:
         if self.mythic_client is not None:
             mythic_tools = self.mythic_client.get_tools([
                 "list_callbacks",
+                # ISC-72: the per-command schema tools existed in mythic_tools.py but were registered
+                # nowhere, so the only schema source the model could see was the all-commands dump —
+                # 75,650 chars for Apollo, head-truncated to 16,000 by _compact_tool_result_str. That
+                # is how `ticket_cache_list` was issued with empty params on 2026-07-28. These return
+                # one command's parameters (including default_value) and a names-only index, both far
+                # under the 4,000-char compaction trigger.
+                "get_all_command_args_for_payloadtype",
+                "get_all_command_names_for_payloadtype",
                 "get_all_commands_for_payloadtype",
                 "wait_for_seconds",
                 "issue_task_and_waitfor_task_output",
@@ -9434,6 +9756,11 @@ class Model:
                 "ensure_tool_uploaded",
                 "download_tool",
                 "ingest_collection",
+                # ISC-73: prompts/mythic_operator.md names this twice — the tool list at :18 and the
+                # OPSEC cleanup instruction at :52 ("Clean up dropped files and scratch beacons
+                # (`list_open_artifacts`)") — but it was in no allowlist, so the agent was told to use
+                # a tool it could not call.
+                "list_open_artifacts",
             ])
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
@@ -9486,6 +9813,12 @@ class Model:
                 "create_payload",
                 "get_all_payload_info",
                 "get_all_payloads",
+                # ISC-73: prompts/mythic_payload.md:46 instructs this agent to "discover it via
+                # get_all_commands_for_payloadtype('merlin')" — a tool it was never given. Register the
+                # narrow pair alongside it so the prompt's instruction is actually executable.
+                "get_all_command_args_for_payloadtype",
+                "get_all_command_names_for_payloadtype",
+                "get_all_commands_for_payloadtype",
                 "get_c2_profiles_for_payload",
                 "get_callback_c2_config",
                 "get_payload_c2_config",
@@ -10143,13 +10476,34 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 "The pending guarded-action batch changed after its approval card was created."
             )
 
-    def _record_hitl_denials(self, action_requests: list[dict[str, Any]]) -> None:
+    def _record_hitl_denials(
+        self, action_requests: list[dict[str, Any]], *, bind_action: bool = True
+    ) -> None:
         from sage_chat.hitl import approval_action_fingerprint
         authority = getattr(self, "_turn_authority", TurnAuthority(mode="observe"))
         self._install_turn_authority(authority.record_denied_action_digests([
             approval_action_fingerprint(action)
             for action in action_requests
         ]))
+        # An operator rejection is a decision about the ACTION, not about one exact argument dict.
+        # The digest set above is keyed on the full canonical arguments, so a re-proposal that
+        # changes any value — which is what the model actually does — produces a different digest and
+        # slips past. Keep a coarse (tool, command, callback) key alongside it so "you already said no
+        # to this" survives rephrasing. Request-scoped: a new Model is a new request.
+        # `bind_action=False` on a steer: the action is still denied for THIS proposal (the digest
+        # above), but it is not closed for the rest of the request, because the operator gave
+        # guidance the agent is meant to replan with — and that guidance frequently means
+        # "yes, and also...". See the call site in handle_hitl_resume.
+        if not bind_action:
+            return
+        keys = getattr(self, "_denied_action_keys", None)
+        if keys is None:
+            keys = set()
+            self._denied_action_keys = keys
+        for action in action_requests:
+            key = _guarded_action_key(action)
+            if key.strip(":"):
+                keys.add(key)
 
     async def handle_hitl_resume(
         self,
@@ -10213,7 +10567,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             )
         ]
         if rejected_actions:
-            self._record_hitl_denials(rejected_actions)
+            # ISC-76: bind the action ONLY on a bare reject. A steer (`respond`/`select`) still denies
+            # the guarded call — the operator's text becomes its rejection message — but it is the
+            # operator ENGAGING, and their words routinely read as conditional approval:
+            # "approved, but also do this on callback 2". Binding there would permanently block the
+            # very action they just said yes to, which is worse than the loop this fix exists to stop.
+            # A bare reject carries no such ambiguity: no guidance, nothing to replan from, and a
+            # re-proposal of the identical action is exactly the pathology.
+            self._record_hitl_denials(rejected_actions, bind_action=not steer)
 
         # One audit line + one Decision per interrupted tool call. On a steer, the guarded action is still
         # rejected (never blind-run), but the operator's text becomes the rejection message.
@@ -10241,6 +10602,22 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     decisions.append({"type": "reject", "message": message})
         logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
 
+        # ISC-74: a REJECTED guarded tool never executes, so LangGraph emits no tool-end callback and
+        # its `started` tool event never receives a terminal. The request-event ledger then reports
+        # `tool terminal count=0`, pre-terminal reconciliation raises, and a request that behaved
+        # correctly surfaces to the operator as `status=error`.
+        #
+        # `service.py` already closes such events, but from a snapshot taken ONCE at approval-claim
+        # time — so a card created by a later re-proposal was never in that set and stayed open. That
+        # is the observed asymmetry: two rejections, one unterminated tool.
+        #
+        # Snapshot HERE, at the decision boundary. A card still awaiting an operator decision is
+        # opened later and therefore cannot be in this set — which is the hazard that makes the naive
+        # "close everything open" fix wrong. Approved calls terminalize themselves when they execute,
+        # so intersecting this snapshot with what is STILL open after the resume yields exactly the
+        # rejected ones. Skipped entirely when nothing was rejected.
+        _open_at_decision = self._open_tool_lifecycle_ids() if rejected_actions else ()
+
         # Resume the paused graph with the decision payload the installed middleware expects.
         async for event in self.graph.astream(
             Command(resume={"decisions": decisions}),
@@ -10260,6 +10637,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 await self._surface_hitl_interrupt(event)
                 break
             await self._process_stream_event(event)
+
+        # ISC-74: terminalize the rejected tool events (see the snapshot note above).
+        # `_close_open_tool_lifecycles` filters against the ledger's CURRENTLY-open lifecycles, so an
+        # approved call that already completed or errored is skipped rather than double-terminalized.
+        if _open_at_decision:
+            await self._close_open_tool_lifecycles(
+                status="cancelled", event_ids=_open_at_decision
+            )
 
         return ""
 
@@ -10338,6 +10723,73 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 val = getattr(itr, "value", None)
                 if isinstance(val, dict) and isinstance(val.get("action_requests"), list):
                     action_requests.extend(val["action_requests"])
+            # ── ISC-69: identical-re-proposal guard ────────────────────────────────────────────
+            # My first backstop counted consecutive ZERO-MESSAGE node returns. The 2026-07-28
+            # channel-57 loop emitted a denial ToolMessage plus a fresh AIMessage every cycle, so the
+            # counter reset each time and nine cards flew past it. Progress is not "messages moved";
+            # it is "the effect boundary was crossed". This counts consecutive cards carrying the SAME
+            # action fingerprint and refuses to surface the Nth, which is the loop-guard spec's own
+            # invariant: never blindly re-propose the identical action into the identical gate.
+            # ISC-69a: key on the ACTION and its TARGET, not on exact argument equality.
+            # `approval_action_fingerprint` hashes the full canonical argument dict, and the
+            # channel-57 loop did not repeat identical arguments — it went `luid: ""` on one cycle and
+            # `luid: "0"` on a later one. Under a full-argument key the streak reset every cycle and
+            # the guard would have sat silent through all nine cards. "Never blindly re-propose the
+            # identical action into the identical gate" means the same command at the same target;
+            # a cosmetically different retry is the same re-proposal. The Mythic task-id progress
+            # reset below is what keeps this from truncating a healthy run (ISC-61).
+            def _action_key(a: dict) -> str:
+                args = a.get("args") if isinstance(a, dict) else None
+                args = args if isinstance(args, dict) else {}
+                return "::".join((
+                    str(a.get("name") or "") if isinstance(a, dict) else "",
+                    str(args.get("command") or ""),
+                    str(args.get("callback_display_id") or ""),
+                ))
+
+            try:
+                fingerprint = "|".join(sorted(_action_key(a) for a in action_requests))
+                if fingerprint.strip("|:") == "":
+                    fingerprint = ""
+            except Exception:  # pragma: no cover - never break the approval path on bookkeeping
+                fingerprint = ""
+            # A real Mythic task id moving is the progress signal — it means the effect boundary was
+            # actually crossed. Without it, an operator legitimately running the same command three
+            # times in a row would trip the guard (ISC-61: never truncate a healthy run).
+            task_marker = str(
+                getattr(getattr(self, "mythic_client", None), "_last_issued_task_display_id", "") or ""
+            )
+            progressed = task_marker != str(getattr(self, "_last_card_task_marker", "") or "")
+            self._last_card_task_marker = task_marker
+            if (
+                fingerprint
+                and not progressed
+                and fingerprint == str(getattr(self, "_last_card_fingerprint", "") or "")
+            ):
+                repeats = int(getattr(self, "_repeat_card_count", 0)) + 1
+                self._repeat_card_count = repeats
+                if repeats >= _ZERO_PROGRESS_DELEGATION_CAP:
+                    self._last_card_fingerprint = ""
+                    self._repeat_card_count = 0
+                    logger.warning(
+                        f"🛑 [identical-reproposal] refusing card #{repeats} for the same action "
+                        f"fingerprint — terminating the approval loop (ISC-69)"
+                    )
+                    await self._stream_message_to_mythic(
+                        f"🛑 **Stopped — the same action was proposed {repeats} times.**\n\n"
+                        "I asked you to approve an identical action repeatedly without it ever taking "
+                        "effect, so I stopped instead of asking again. Something between the approval "
+                        "and the agent is rejecting it — check the callback's task output for a parse "
+                        "or argument error.\n\n"
+                        "Tell me how you'd like to proceed, or start a new request."
+                    )
+                    return True
+            else:
+                # The first proposal of an action counts as 1, so the cap is a count of TOTAL
+                # consecutive identical proposals: with N=3 the operator is asked twice and the third
+                # is refused. Starting at 0 here would ask three times and refuse the fourth.
+                self._last_card_fingerprint = fingerprint
+                self._repeat_card_count = 1
             try:
                 self.bind_supervised_request_proposal(action_requests)
                 await self._hitl_card_emitter(action_requests)
@@ -10345,6 +10797,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             except Exception as e:
                 logger.warning(f"HITL: failed to emit confirmation card ({e})")
                 raise RuntimeError("Failed to surface the guarded-action approval card") from e
+            # ISC-75: surfacing a card is an attempt to cross the effect boundary — the delegation
+            # asked to act and is waiting on the operator. Counts the same as a blocked guarded call.
+            self._guarded_attempt_pending = True
             logger.info(f"HITL interrupt surfaced as native card ({len(action_requests)} action(s))")
             return True
         lines = []
@@ -11590,6 +12045,18 @@ def _create_handoff_tool(
         input_payload: str = "",
         input_type: str = "",
     ) -> Command:
+        # ISC-70 probe: routing is a model choice — `transfer_to_<Agent>` is a tool the Supervisor's LLM
+        # calls, and the instruction is whatever it put in the args. Nothing inspects whether that
+        # instruction merely restates a prior worker's own narration, which is how channel 58 sent the
+        # Mythic_Operator's deliberation to the Generalist and got a policy essay back. The text lives
+        # only in the tool-call args and was invisible at INFO, so log it. Read-only; no behaviour change.
+        try:
+            logger.info(
+                f"🧭 [handoff] → {agent_name} | title={str(handoff_title or '')[:120]!r} | "
+                f"instruction={str(handoff_instruction or '')[:600]!r}"
+            )
+        except Exception:  # pragma: no cover - diagnostics must never break routing
+            pass
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
         raw_subgoal = runtime.state.get("_subgoal_state")

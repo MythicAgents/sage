@@ -25,7 +25,7 @@ Prepare the visible empty channel used by the next run:
 Run the stock strict one-shot objective through a fresh locked AI channel:
 
 ```bash
-.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400
+.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --autonomous --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400
 ```
 
 `--output-mode full` is the default and returns the complete operator-visible message record. Automated
@@ -35,7 +35,8 @@ While a request is in flight, the runner now emits JSONL request-start/progress/
 the channel ID, request ID, and evolving status are visible immediately without waiting for the terminal JSON.
 Pass `--manifest-path <path>` to write a redacted demo manifest that binds clean/resumed status, runtime identity,
 range/snapshot context, callback/channel/request identity, tasks/proofs, and artifact hashes when those inputs are
-available.
+available. Allocate that path with `sage-artifact-retention` and record it after the run; a decision-bearing demo
+manifest must not live only in `/tmp`.
 
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
@@ -64,10 +65,12 @@ input status is exactly `pending`. Historical accepted, rejected, responded, or 
 Export a full-fidelity, ordered request transcript for offline analysis:
 
 ```bash
-.venv/bin/python skills/sage-live-runner/scripts/native_chat.py transcript --request-id <id> --output /tmp/sage-chat-transcript.json
+.venv/bin/python skills/sage-live-runner/scripts/native_chat.py transcript --request-id <id>
 ```
 
-The export is intentionally operator-sensitive and is not the allowlisted evaluator projection.
+The default export is a private, manifested file under `.sage_history/<year>/<month>/transcripts/native-chat/`.
+Use `--output <path>` only for an explicitly temporary or externally managed copy. The export is intentionally
+operator-sensitive and is not the allowlisted evaluator projection.
 Export fails closed unless the request, channel, and every returned message carry one consistent request identity.
 
 ## Supervised Canary
@@ -80,7 +83,7 @@ Create a fresh supervised, non-autonomous channel and stop at the first native a
 
 The canary never reuses a prepared Auto channel and never posts an approval response. It may still perform
 control-plane reads needed to construct the proposed action. Approval or rejection remains an explicit Mythic UI
-action. The existing `run` command remains Auto and autonomous by default.
+action. The existing `run` command remains Auto and autonomous by default, and since 2026-07-28 it **refuses without an explicit `--autonomous` acknowledgement** (exit 2) and points at `canary`. That guard exists because this warning, and the matching one in `AGENTS.md`, were both already written and neither prevented a `run` invoked as a "read-only probe" from executing a full autonomous solve against the live range.
 
 ## BHUSA Demo Helpers
 
@@ -99,9 +102,26 @@ native `chatInputResponse` mutation:
 .venv/bin/python skills/sage-live-runner/scripts/native_chat.py approve-pending --request-id <id>
 ```
 
-`approve-pending` requires the selected request to be exactly `streaming`, every returned message to match that
-request and channel, exactly one unresolved card, and exact request/message IDs in Mythic's response. It fails
-closed otherwise. It does not bypass HITL; it submits the same explicit Mythic approval action the UI uses.
+Deny exactly one unresolved approval card:
+
+```bash
+.venv/bin/python skills/sage-live-runner/scripts/native_chat.py reject-pending --request-id <id>
+```
+
+`--response '<text>'` records operator guidance as the rejection message, and the helper submits it as Mythic
+action **`respond`**, not `reject`. That distinction is load-bearing: Sage's
+`resume_steer_message_for_request` reads `InputResponse.Response` only on `respond`/`select` and returns `""`
+for `accept`/`reject`, so a `reject` carrying text drops it silently — the agent sees only the default
+`[DENIED by operator] <tool> was not executed.` Omitting `--response` sends a bare `reject`, which is the
+shape that produced the 2026-07-28 re-proposal loop. Use the bare form when deliberately exercising the
+loop-guard or the post-denial path. Either form: the guarded action is never executed.
+
+`approve-pending` and `reject-pending` share one implementation and one set of fail-closed preconditions: the
+selected request must be exactly `streaming`, every returned message must match that request and channel, there
+must be exactly one unresolved card, and Mythic's response must echo the exact request/message IDs. Neither
+bypasses HITL; both submit the same explicit Mythic action the UI submits, and a rejection carries the same
+operator weight as an approval. Mythic's own mapping is authoritative for the action strings
+(`sage_chat/hitl.py`: `accept`->`accepted`, `reject`->`rejected`).
 Mythic conditionally updates only a still-pending card, but the request can become terminal between this helper's
 preflight and Mythic's later request-status check. That upstream race can leave the card resolved while the
 approval returns failure; the helper reports the failure and does not retry.

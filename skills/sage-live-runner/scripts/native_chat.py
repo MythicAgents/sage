@@ -999,7 +999,24 @@ async def fetch_request_snapshot(
     return {"request": request, "messages": messages}
 
 
-async def approve_pending_input_card(client: Any, request_id: int) -> dict[str, Any]:
+async def _respond_to_pending_input_card(
+    client: Any,
+    request_id: int,
+    *,
+    action: str,
+    response: str | None = None,
+) -> dict[str, Any]:
+    """Submit ONE explicit Mythic decision to exactly one unresolved approval card.
+
+    Shared by `approve-pending` (action="accept") and `reject-pending` (action="reject"). Mythic's
+    own mapping is authoritative for the action strings: `sage_chat/hitl.py:467` maps
+    "accept"->"accepted" and "reject"->"rejected", and :572 maps accept->approve, else->deny.
+
+    This does NOT bypass HITL for either decision — it submits the same mutation the Mythic UI
+    submits. Every fail-closed precondition is identical for accept and reject on purpose: exactly
+    `streaming` status, exactly one unresolved card, and exact message/request id echo. A reject is
+    an operator decision with the same weight as an approve, so it gets the same gates.
+    """
     snapshot = await fetch_request_snapshot(client, request_id)
     request = snapshot["request"]
     if request.get("status") != APPROVABLE_INPUT_REQUEST_STATUS:
@@ -1019,33 +1036,66 @@ async def approve_pending_input_card(client: Any, request_id: int) -> dict[str, 
         CHAT_INPUT_RESPONSE_MUTATION,
         variables={
             "messageId": message_id,
-            "action": "accept",
-            "response": None,
+            "action": action,
+            "response": response,
             "choiceId": None,
         },
     )
     submitted = _require_success(
-        "chat input approval", result.get("chatInputResponse") or {}
+        f"chat input {action}", result.get("chatInputResponse") or {}
     )
     returned_message_id = _require_exact_int(
-        submitted.get("message_id"), "Approved input_requested message id"
+        submitted.get("message_id"), f"{action} input_requested message id"
     )
     if returned_message_id != message_id:
-        raise RuntimeError("Mythic chat input approval returned the wrong message_id.")
+        raise RuntimeError(f"Mythic chat input {action} returned the wrong message_id.")
     returned_request_id = _require_exact_int(
-        submitted.get("request_id"), "Approved Mythic chat request id"
+        submitted.get("request_id"), f"{action} Mythic chat request id"
     )
     selected_request_id = _require_exact_int(
         request.get("id"), "Selected Mythic chat request id"
     )
     if returned_request_id != selected_request_id:
-        raise RuntimeError("Mythic chat input approval returned the wrong request_id.")
+        raise RuntimeError(f"Mythic chat input {action} returned the wrong request_id.")
     return {
         "chat_request_id": selected_request_id,
         "input_request_message_id": message_id,
-        "action": "accept",
+        "action": action,
         "response": submitted,
     }
+
+
+async def approve_pending_input_card(client: Any, request_id: int) -> dict[str, Any]:
+    return await _respond_to_pending_input_card(client, request_id, action="accept")
+
+
+async def reject_pending_input_card(
+    client: Any, request_id: int, *, response: str | None = None
+) -> dict[str, Any]:
+    """Deny exactly one unresolved approval card, optionally with steering guidance.
+
+    The Mythic action depends on whether there is text, and this is NOT cosmetic. Sage reads the
+    operator's words only on `respond`/`select`:
+
+        resume_steer_message_for_request (sage_chat/hitl.py)
+            if action in ("respond", "select"): return InputResponse.Response
+            return ""                                  # <- accept/reject drop the text
+
+    So sending `action="reject"` WITH text silently discards it: the agent receives only the default
+    `[DENIED by operator] <tool> was not executed.` and never sees the guidance. The first cut of this
+    helper did exactly that and documented the flag as working — the text reached Mythic's record and
+    nothing else. Text therefore goes out as `respond`; a bare denial stays `reject`.
+
+    Either way the guarded action is never executed. `respond` is "deny this, but here is what to do
+    instead", not a blind run.
+    """
+    text = (response or "").strip()
+    return await _respond_to_pending_input_card(
+        client,
+        request_id,
+        action="respond" if text else "reject",
+        response=text or None,
+    )
 
 
 async def resolve_request_selector(
@@ -1719,7 +1769,31 @@ async def _run(args: argparse.Namespace) -> int:
             )
     elif args.command == "approve-pending":
         result = await approve_pending_input_card(client, args.request_id)
+    elif args.command == "reject-pending":
+        result = await reject_pending_input_card(
+            client, args.request_id, response=args.response
+        )
     else:
+        # `run` drives an Auto channel with autonomous_solve=true — SKILL.md: "The existing `run`
+        # command remains Auto and autonomous by default." On 2026-07-28 it was invoked as a
+        # "read-only probe" with a prompt saying "do not task any callback" and executed a full
+        # autonomous solve against the live GOAD range: 46 Mythic tasks including SharpGPOAbuse,
+        # mimikatz, Rubeus, and `ticket_cache_purge --all`. A prose warning in SKILL.md and in
+        # AGENTS.md ("Do not start expensive live GOAD/inference runs without clear user intent")
+        # both already existed and neither stopped it. This refusal is the deterministic version.
+        if not getattr(args, "autonomous", False):
+            print(json.dumps({
+                "error": "refused",
+                "reason": (
+                    "`run` executes a FULL AUTONOMOUS offensive solve against the live range. "
+                    "Re-run with --autonomous to acknowledge, or use `canary` for a supervised "
+                    "probe that stops at the first approval card."
+                ),
+                "intended_alternative": (
+                    "native_chat.py canary --prompt '<objective>' --max-steps 20"
+                ),
+            }, indent=2, sort_keys=True))
+            return 2
         result = await run_native_chat_turn(
             client,
             args.prompt,
@@ -1817,6 +1891,17 @@ def build_parser() -> argparse.ArgumentParser:
     approve_pending = sub.add_parser("approve-pending")
     approve_pending.add_argument("--request-id", type=int, required=True)
 
+    reject_pending = sub.add_parser("reject-pending")
+    reject_pending.add_argument("--request-id", type=int, required=True)
+    reject_pending.add_argument(
+        "--response",
+        default=None,
+        help=(
+            "optional operator guidance recorded as the rejection message; omit for a BARE denial, "
+            "which is the shape that produced the channel-57 re-proposal loop"
+        ),
+    )
+
     run = sub.add_parser("run")
     run.add_argument("--prompt", default=DEFAULT_OBJECTIVE)
     run.add_argument("--timeout", type=int, default=1800)
@@ -1832,6 +1917,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--new-channel",
         action="store_true",
         help="Ignore an empty prepared Sage channel and create a new channel.",
+    )
+    run.add_argument(
+        "--autonomous",
+        action="store_true",
+        help=(
+            "REQUIRED acknowledgement. `run` drives an Auto, autonomous channel and will execute a "
+            "full offensive solve against the live range. Without this flag the command refuses. "
+            "For a supervised probe that stops at the first approval card, use `canary`."
+        ),
     )
     run.add_argument("--manifest-path")
     run.add_argument(

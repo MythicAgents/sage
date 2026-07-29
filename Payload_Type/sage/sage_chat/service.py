@@ -755,6 +755,21 @@ class SageChat(Chat):
             finalize_visibility = getattr(model, "finalize_visibility_turn", None)
             lifecycle_event_id = ""
             if callable(record_final) and callable(finalize_visibility):
+                # ISC-74: a guarded tool that never executes never receives a tool-end callback, so
+                # its `started` ledger event has no terminal and reconciliation below fails — turning
+                # a request that behaved correctly into `status=error` for the operator. Two paths
+                # produce one: an operator rejection, and a call the turn-authority gate strips before
+                # execution. The cancelled and failed paths already close these; the NORMAL terminal
+                # path did not.
+                #
+                # Safe to close unconditionally *here*: this branch runs only once the request is
+                # terminating with a final response. A card still awaiting an operator decision
+                # releases the channel and returns before reaching this point, so nothing pending can
+                # be closed out from under the operator.
+                close_open_tools = getattr(model, "_close_open_tool_lifecycles", None)
+                if callable(close_open_tools):
+                    await close_open_tools(status="stopped")
+
                 preterminal = await finalize_visibility(require_final=False)
                 if not preterminal.get("ok", False):
                     raise RuntimeError(

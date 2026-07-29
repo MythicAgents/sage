@@ -56,6 +56,21 @@ def scope_usable_mythic_tools(model: Any) -> int:
         return len(universe)
 
 
+def _channel_id(model: Any) -> str:
+    """Best-effort Mythic chat channel id for the header chip.
+
+    Sage binds every session thread key as ``<channel_id>:generation:<uuid>``
+    (``sage_chat/session.py::next_channel_thread_id``), so the id is recoverable without threading a
+    new field through the model. Returns "" on any shape surprise — a header must never break a turn.
+    """
+    try:
+        thread_id = str(getattr(model, "_thread_id_override", "") or "")
+        head = thread_id.split(":", 1)[0].strip()
+        return head if head.isdigit() else ""
+    except Exception:
+        return ""
+
+
 def _runtime_rounds(model: Any) -> int:
     """Accumulate model calls across graph-agent and controller-policy execution paths.
 
@@ -117,7 +132,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     # Config-value chips (Policy / Mode / Autonomous) — rendered as metadata chips (NOT via DisplayAsChip)
     # so they can carry a color: Mythic locks config chips to neutral, but metadata chips honor `color`.
     # Accent them so they stand out from the neutral config chips (Provider / Model / Max Steps) + counts.
-    mode = str(getattr(model, "mode", "") or "supervised")
+    mode = str(getattr(model, "mode", "") or "conversation")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
     policy_mode = str(getattr(model, "policy_mode", "") or "llm")
     active_agent = str(getattr(model, "_active_agent_label", "") or "Idle")
@@ -126,10 +141,20 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
         "hybrid": "info",
         "symbolic": "warning",
     }.get(policy_mode, "neutral")
-    mode_color = "info" if mode == "supervised" else "warning"
+    mode_color = {
+        "conversation": "success",
+        "supervised": "info",
+        "auto": "warning",
+    }.get(mode, "neutral")
     autonomous_color = "warning" if autonomous else "neutral"
 
     items = [
+        # ISC-68: Mythic's UI surfaces no readable channel id, which makes "stay in chat 57" an
+        # un-followable instruction and makes log correlation guesswork — every Sage thread key is
+        # `<channel>:generation:<uuid>`. order=0 puts it leftmost, ahead of Agent.
+        {"key": "channel_id", "label": "Channel", "value": _channel_id(model), "order": 0,
+         "color": "neutral",
+         "tooltip": "Mythic chat channel ID — matches the <channel>:generation:<uuid> thread key in Sage's logs"},
         {"key": "active_agent", "label": "Agent", "value": active_agent, "order": 1,
          "color": "neutral" if active_agent == "Idle" else "info",
          "tooltip": "Sage component currently processing this channel"},

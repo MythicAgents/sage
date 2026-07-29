@@ -13,6 +13,9 @@ tools:
   - create_payload
   - get_all_payload_info
   - get_all_payloads
+  - get_all_command_args_for_payloadtype
+  - get_all_command_names_for_payloadtype
+  - get_all_commands_for_payloadtype
   - get_c2_profiles_for_payload
   - get_callback_c2_config
   - get_payload_c2_config

@@ -1961,6 +1961,29 @@ class MythicTools:
                 shell_text = _shell_parameter_text(values.get("parameters"))
                 if shell_text:
                     values["parameters"] = shell_text
+            # ISC-67 — resolver parity, applied identically to BOTH sides of the coverage
+            # comparison, exactly like the shell case above and for the same reason: an approved
+            # action that can never execute livelocks the request.
+            #
+            # ARGRES rewrites parameters against the live command schema (key renames, group
+            # repair, declared defaults) BETWEEN the operator's approval and the effect boundary.
+            # The claim stores the pre-ARGRES proposal; the effect path carries the post-ARGRES
+            # arguments. Comparing them denies the operator's own approval whenever the resolver
+            # changed anything — live failure: notes=["mapped 'path' to 'Path'"].
+            #
+            # This substitutes ONLY the exact input the resolver was given, with the exact output it
+            # produced, for the same command and callback, recorded in this turn. It is a lookup of
+            # one recorded pair, not a rule: a proposal that differs from that recorded input in any
+            # way does not match and the denial stands. It therefore cannot let a material argument
+            # change past the gate, which is the failure mode that kept ISC-67 held.
+            _binding = getattr(self, "_last_argres_binding", None)
+            if isinstance(_binding, dict) and isinstance(values.get("parameters"), dict):
+                if (
+                    _normalize_command_name(values.get("command")) == _binding.get("command")
+                    and values.get("callback_display_id") == _binding.get("callback_display_id")
+                    and values["parameters"] == _binding.get("original")
+                ):
+                    values["parameters"] = dict(_binding["resolved"])
         elif tool_name == "sandbox_exec":
             timeout = values.get("timeout")
             values["timeout"] = 30 if timeout is None else max(1, min(int(timeout), 120))
@@ -2210,13 +2233,23 @@ class MythicTools:
                 or claim.get("request_id") != contract.request_id
                 or claim.get("request_contract_digest") != contract.digest
             ):
-                return "supervised request lacks an exact active approval claim"
+                return self._note_effect_denial(
+                    "supervised request lacks an exact active approval claim"
+                )
             if tool_name:
-                return self._approval_effect_blocker(
-                    tool_name,
-                    dict(args or {}),
-                    visibility_context=visibility_context,
-                    recheck=recheck,
+                # ISC-66: record approval-coverage denials the way authority (:4594) and liveness
+                # (:4631) already do. Without this `_last_effect_denial` stays unset, so
+                # `Model._handle_reproposal_after_denial` — the loop-breaker built for exactly this
+                # — is structurally blind to the whole approval-coverage denial class. That is what
+                # let channel 57 re-card `ticket_cache_list` nine times on 2026-07-28 before Russel
+                # force-stopped it.
+                return self._note_effect_denial(
+                    self._approval_effect_blocker(
+                        tool_name,
+                        dict(args or {}),
+                        visibility_context=visibility_context,
+                        recheck=recheck,
+                    )
                 )
         elif tool_name:
             try:
@@ -4739,6 +4772,23 @@ class MythicTools:
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
                                 f"params={sorted(parameters.keys())} notes={resolved.notes}"
                             )
+                            # ISC-67: record the EXACT input->output of this resolution so the
+                            # approval gate can compare like with like. The gate runs microseconds
+                            # after this line and is synchronous, so it cannot re-run the resolver
+                            # itself (schema fetch is async). Without this the gate compares the
+                            # operator's approved proposal (pre-ARGRES) against the resolved
+                            # arguments (post-ARGRES) and denies the operator's own approval — the
+                            # observed live failure was a pure key rename,
+                            # notes=["mapped 'path' to 'Path'"], with no value change at all.
+                            # Scoped to this exact command+callback and to the exact original dict,
+                            # so it can neutralize only the difference the resolver itself
+                            # introduced, on this proposal, and nothing else.
+                            self._last_argres_binding = {
+                                "command": _normalize_command_name(command),
+                                "callback_display_id": callback_display_id,
+                                "original": dict(original_parameters),
+                                "resolved": dict(parameters),
+                            }
                             fail_key = self._task_failure_key(command, callback_display_id, parameters)
                             if self._task_failure_counts.get(fail_key, 0) >= 2:
                                 return (
@@ -4865,6 +4915,28 @@ class MythicTools:
                     )
                     if contract_binding_blocker:
                         raise PermissionError(contract_binding_blocker)
+                    # ISC-65: an empty parameter blob is only safe for commands that take a raw command
+                    # line. Apollo's parameterized commands parse with
+                    # `if self.command_line[0] != "{": raise` and no length check, so "" is
+                    # `string index out of range` — Mythic task 23 (ticket_cache_list, 2026-07-28) died
+                    # exactly there while the operator's identical no-argument task 24 succeeded,
+                    # because the UI submits a dict and the agent then applies its own declared
+                    # default_values. `{}` reproduces that. This is deliberately SCHEMA-AWARE: a first
+                    # attempt at this rewrote every empty blob to `{}` and was reverted, because for a
+                    # raw-command-line command like `shell` that would submit `{}` AS the command line.
+                    # Fails open — an unavailable schema leaves today's "" behaviour byte-identical.
+                    if isinstance(parameters, str) and not parameters.strip():
+                        try:
+                            _schema = await self._fetch_command_schema(command, callback_display_id)
+                        except Exception:
+                            _schema = None
+                        if isinstance(_schema, list) and _schema:
+                            logger.info(
+                                f"🧩 [empty-params] {command} on callback {callback_display_id} declares "
+                                f"{len(_schema)} parameter(s) — sending '{{}}' so the agent applies its "
+                                "own defaults instead of failing to parse an empty string (ISC-65)"
+                            )
+                            parameters = "{}"
                     try:
                         task = await mythic.issue_task(
                             mythic=self.client, command_name=command, parameters=parameters,

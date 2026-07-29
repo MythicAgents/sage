@@ -77,7 +77,17 @@ def commands_text(model) -> str:
                 lines.append(_command_index_line(entry, description))
             commands_index = "\n".join(lines)
             text += f"\n### Available Commands for '{payload_name}' Payload (index — names + summaries):\n{commands_index}\n"
-        text += "\n**Note:** This is an index only. Before issuing any command that takes parameters, call get_all_commands_for_payloadtype('<payload>') to retrieve the exact parameter schema. Use it also for payloads not listed here.\n"
+        text += (
+            "\n**Note:** This is an index only. Before issuing any command that takes parameters, call "
+            "get_all_command_args_for_payloadtype('<payload>', '<command>') for that ONE command's exact "
+            "schema — its `default_value`, `required`, `choices`, and `parameter_group_name` are "
+            "authoritative. Never issue a command with empty parameters: send the resolved JSON object "
+            "(`{}` at minimum), never an empty string — agents parse the parameter blob and an empty "
+            "string is a parse error, whereas `{}` lets the agent apply its own declared defaults. Use "
+            "get_all_command_names_for_payloadtype('<payload>') to discover commands for payloads not "
+            "listed here, and get_all_commands_for_payloadtype('<payload>') only when you genuinely need "
+            "every command's schema at once.\n"
+        )
     return text
 
 
