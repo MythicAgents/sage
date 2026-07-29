@@ -11,7 +11,6 @@ Plans
 sage.db*
 Payload_Type/sage/sage*.db*
 .claude/
-tasks/
 .env
 skills/sage-callback-bootstrap/*_callback_config.json
 .evals/
@@ -36,5 +35,8 @@ Payload_Type/sage/evals/results/
 .sage_engagement/
 .hillclimb/
 **/.trajectory/
-Payload_Type/sage/MEMORY/audit.jsonl
+**/MEMORY/audit.jsonl
 .r5_preflight/
+
+# Private durable Codex/Sage contracts, handoffs, reviews, transcripts, and evidence
+.sage_history/
