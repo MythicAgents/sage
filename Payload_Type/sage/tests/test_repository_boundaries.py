@@ -117,6 +117,44 @@ def test_enabled_codex_agent_profile_references_resolve_atomically():
         assert (REPO_ROOT / "skills" / "sage-cyber-runner" / "SKILL.md").is_file()
 
 
+def test_repo_carries_no_maintainer_private_codex_tooling():
+    """The public repo must not ship the maintainer's personal Codex agents.
+
+    `sage_cyber_executor` pins `gpt-5.5-cyber-preview` and `sage-cyber-runner` exists to drive it; both encode
+    how one maintainer works rather than how Sage is built, so they live in `~/.codex/` instead. Codex has no
+    gitignored project-local config layer (openai/codex#24961), so nothing but this test stops them drifting
+    back in the next time someone edits `.codex/config.toml`.
+    """
+    assert not (REPO_ROOT / "skills" / "sage-cyber-runner").exists()
+    assert not (REPO_ROOT / ".codex" / "agents").exists()
+
+    config_path = REPO_ROOT / ".codex" / "config.toml"
+    if config_path.exists():
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        named_agents = {
+            name
+            for name, definition in (config.get("agents") or {}).items()
+            if isinstance(definition, dict)
+        }
+        assert named_agents == set(), f"private agent profiles leaked back in: {sorted(named_agents)}"
+
+
+def test_public_guide_does_not_point_into_the_private_plans_directory():
+    """`Plans/` is gitignored, so a pointer into it is a dead link for everyone but the maintainer.
+
+    Rules *about* `Plans/` ("don't put tools there", "evidence belongs in .sage_history") are fine and expected.
+    What this rejects is `AGENTS.md` telling a reader to go *read* a file they cannot have.
+    """
+    for name in ("AGENTS.md", "CLAUDE.md", "README.md"):
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        offenders = [
+            line.strip()
+            for line in text.splitlines()
+            if "Read `Plans/" in line or "Plans/RESUME.md" in line or "Plans/Archived/SAGE" in line
+        ]
+        assert offenders == [], f"{name} points a reader into gitignored Plans/: {offenders}"
+
+
 def test_maintained_operator_helpers_have_no_personal_absolute_paths():
     maintained_helpers = (
         "skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py",

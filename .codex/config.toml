@@ -1,14 +1,15 @@
+# Project-scoped Codex config for the Sage repository.
+#
+# Scope rule: only settings that are useful to *anyone* working on Sage belong here. Personal agent
+# profiles, model pins, multi-agent limits, and TUI preferences live in the maintainer's
+# `~/.codex/config.toml`, because Codex has no gitignored project-local layer to hold them
+# (openai/codex#24961 is the open request for one).
+#
+# Everything below is a repository guardrail: the hooks run the architecture gate before risky edits
+# and warn at turn end when durable artifacts are still sitting in /tmp.
+
 [features]
 hooks = true
-
-[features.multi_agent_v2]
-enabled = true
-hide_spawn_agent_metadata = false
-tool_namespace = "agents"
-max_concurrent_threads_per_session = 4
-
-[agents]
-max_depth = 2
 
 [[hooks.PreToolUse]]
 matcher = "^(apply_patch|Edit|Write|Bash)$"
@@ -42,19 +43,3 @@ type = "command"
 command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-artifact-retention/scripts/retention_guard.py"'
 timeout = 20
 statusMessage = "Checking Sage sub-agent artifact retention"
-
-[agents.sage_cyber_executor]
-description = "Cybersecurity-specific Sage implementation and explicitly authorized live-range execution."
-config_file = "./agents/sage_cyber_executor.toml"
-nickname_candidates = ["Sentinel", "Vanguard", "Warden"]
-
-[agents.sage_eval_reviewer]
-description = "Fresh-context, read-only adversarial reviewer for Sage evaluation, conversation behavior, runtime authority, sealed candidates, provenance, and lifecycle gates."
-config_file = "./agents/sage_eval_reviewer.toml"
-nickname_candidates = ["Auditor", "Skeptic", "Verifier"]
-
-[tui]
-notifications = ["agent-turn-complete", "approval-requested"]
-notification_condition = "unfocused"
-notification_method = "auto"
-terminal_title = ["spinner", "project", "thread"]

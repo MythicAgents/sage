@@ -229,8 +229,8 @@ part of the shipped Sage capability.
 
 ## Development guidance
 
-Read `AGENTS.md` before making changes. The fastest-changing operational state is in `Plans/RESUME.md`, but plans
-are private working context and may be stale. Verify important claims against source, tests, and live state.
+Read `AGENTS.md` before making changes, then `skills/README.md` for the operator-tool index. Verify important
+claims against source, tests, and live state rather than against prose — this documentation has been stale before.
 
 High-risk changes to prompts, agent topology, tool surfaces, capability planning, trajectory behavior, evaluation
 drivers, or autonomous execution require the `sage-architecture-governor` workflow and explicit approval before

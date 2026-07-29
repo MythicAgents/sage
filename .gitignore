@@ -4,7 +4,9 @@
 .npmrc
 package.json
 package-lock.json
-CLAUDE.md
+# CLAUDE.md is committed (it imports AGENTS.md and adds the Claude-specific subset).
+# Personal, machine-specific notes go in CLAUDE.local.md, which Claude Code loads right after it.
+CLAUDE.local.md
 venv/
 Notes
 Plans

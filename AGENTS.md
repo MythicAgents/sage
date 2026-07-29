@@ -4,15 +4,15 @@ This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that o
 
 ## Start Here
 
-1. Read `Plans/RESUME.md` first. It is the fastest-changing operational state and usually names the live frontier.
-2. Read `Plans/CURRENT_WORK.md` for active priorities and archived source links.
-3. Read `Plans/TRAJECTORY_LEARNING_RUNTIME.md` for the current data-backed autonomy build direction.
-4. Read `Plans/SESSION_HANDOFF.md` when preparing a live GOAD/Mythic/BloodHound run.
-5. Read `CLAUDE.md` for lab gotchas, Phoenix usage, and historical debugging notes.
-6. Treat `README.md` as useful setup documentation, but verify safety/control claims against code. It has been stale before.
+1. Read `## Repo Map` below to find the subsystem you are changing.
+2. Read `skills/README.md` — it indexes every operator skill by name, purpose, and entry script.
+3. Read the `SKILL.md` of each skill your task touches. `--help` shows flags, not semantics.
+4. Read `README.md` for setup, but verify any safety or control claim against source. It has been stale before.
+5. Run the offline suite (`## Current Validation Baseline`) before and after your change.
 
-Plans and Notes are mostly private/gitignored working context. Do not assume they are committed history. Verify important claims against source.
-Historical markdown that is not part of the current minimal handoff lives under `Plans/Archived/`.
+`Plans/` and `Notes/` are the maintainer's private, gitignored working context and are absent from a clone.
+Nothing in this guide should require them; if you find a pointer into `Plans/`, treat it as a bug in this file.
+Verify important claims against source, tests, Mythic, BloodHound, and the current range — not against prose.
 
 ## Durable Artifact Retention
 
@@ -33,48 +33,6 @@ Historical markdown that is not part of the current minimal handoff lives under 
   operator or lab material even when obvious auth files are excluded.
 - Use the retention manifest to relate durable artifacts to source paths, hashes, sessions, runs, commits, and
   decisions. Later blog/publication work must curate and redact a separate published subset.
-
-## Custom Sub-Agent Routing
-
-- Use the project custom agent `sage_cyber_executor` for bounded cybersecurity-specific Sage implementation
-  and for explicitly authorized live-range execution. Appropriate work includes Mythic capability adapters,
-  command construction, callback/execution mechanics, capability verifiers, BloodHound/runtime integration,
-  operational Sage skills, live runners, and focused capability tests.
-- If the active Codex spawn surface cannot select `agent_type=sage_cyber_executor`, or a spawned thread reports
-  `agent_role=null`, use `skills/sage-cyber-runner/scripts/run_cyber.py` instead. It loads the existing cyber
-  developer instructions, pins `gpt-5.5-cyber-preview`, and disables nested agents. Route work to it from the
-  authorized task classification before model execution; never invoke it merely to retry a refusal or bypass a
-  safeguard.
-- When a user starts an active `/goal`, treat that goal objective as standing authorization for bounded runner
-  calls inside the goal. Populate `authorization_mode=active-goal` and `goal_scope` from the active goal; do not ask
-  for per-call approval or an approval hash. Continue autonomously through ordinary in-goal source edits,
-  allowlisted localhost/remote control-plane calls, and live activity explicitly covered by the goal and a complete
-  `live_run_contract`. Stop only for out-of-goal scope, new destructive authority, an unlisted endpoint, a missing
-  live binding, or another repository stop-loss.
-- Network-enabled runner contracts must enumerate exact control-plane hosts and use the generated Codex network
-  proxy allowlist. Target-facing LDAP, SMB, Kerberos, WinRM, RPC, HTTP, and similar operations remain Mythic
-  payload tasks; never list a target host as a runner network endpoint.
-- Before spawning `sage_cyber_executor` or invoking the runner, provide a supervisor task contract that identifies
-  the objective, permitted file scope, protected surfaces, verification plan, stop-loss, and whether live activity
-  is explicitly authorized. If the contract is incomplete, limit work to read-only inspection and require the
-  missing fields instead of editing or executing live activity.
-- Confirm that the spawned thread reports the active `sage_cyber_executor` custom profile, not merely that its
-  task name matches the agent name. If the custom developer instructions are not active, stop the delegation and
-  report the wiring failure; do not let a generic sub-agent perform the specialist task. For the runner, require
-  `profile_name=sage_cyber_executor`, `requested_model=gpt-5.5-cyber-preview`, and a successful profile smoke check.
-- Keep evaluation design, evidence admission, sealed artifacts and manifests, statistical conclusions, promotion
-  decisions, and product dispositions with the primary agent unless the current task contract names exact files
-  and explicitly delegates the requested change.
-- Use one-writer discipline: do not assign overlapping files to the primary agent and `sage_cyber_executor` at
-  the same time. The primary agent remains responsible for reviewing the sub-agent handoff and verifying the
-  result before claiming completion.
-- Use the project custom agent `sage_eval_reviewer` for fresh-context, read-only adversarial review of evaluation
-  source/tests, sealed candidates, provenance, authorization, and lifecycle gates. Spawn it without parent-turn
-  history when practical and require it to confirm the active custom profile before relying on its disposition.
-  It may coordinate at most two read-only specialist children; reviewer or agent agreement is not evidence.
-- A `sage_eval_reviewer` result is an internal pre-review unless the prospectively approved gate explicitly says
-  that fresh-context agent review satisfies its independence requirement. Keep a separate top-level review for a
-  promotion boundary that requires separate-session governance.
 
 ## Sealed Evaluation Review Discipline
 
@@ -420,9 +378,8 @@ This is higher value than another prompt iteration or another full autonomous ru
 A ground-truthed measurement instrument lives at `Payload_Type/sage/ai/hillclimb/` — the eval **gauge**: "is config A better than B?", bare-model-vs-harness, the Gate Experiment (Spearman ρ of eval-vs-ground-truth), and the noise floor. It exists because substring-match eval scores are gameable; a hill-climber optimizes whatever the metric measures, so the gauge must track real range state, not trace text.
 
 - **Entry point:** the `sage-eval-gauge` skill (run commands, helpers, gotchas).
-- **Why (canonical):** `Plans/Archived/SAGE_HILL_CLIMBING_DESIGN.md` +
-  `Plans/Archived/SAGE_HILL_CLIMBING_SPEC.md`. **Build spec/ISA:**
-  `Plans/Archived/SAGE_EVAL_GAUGE_PHASE0_ISA.md`.
+- **Why:** substring-match eval scores are gameable, so the gauge is validated against real range state via the
+  Gate Experiment rather than against trace text. The original design/spec documents are maintainer-private.
 - **Additive + read-only to Sage:** the running Sage process never imports it; **no Sage restart** is needed for gauge changes.
 - **Offline tests:** `tests/test_hillclimb_*.py` (hermetic). **Live driver** `ai/hillclimb/run_gauge_live.py --go` runs OFFENSIVE solves and is operator-gated.
 - The bare model uses Sage's own model from `skills/sage-callback-bootstrap/.env` (no `--model`); BloodHound ground truth is read-only via the CE REST API.

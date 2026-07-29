@@ -22,7 +22,6 @@ operational tooling (per `CLAUDE.md` / `AGENTS.md`); do **not** put helper scrip
 | **sage-trajectory-learning** | Convert retained runs into normalized `state → action → observation → verifier → repair` records; label repeated blocker classes; replay repair-policy decisions. | see `SKILL.md` (module CLI) |
 | **sage-artifact-retention** | Keep high-value Sage contracts, handoffs, reviews, transcripts, and evidence in private project-local history; warn when durable artifacts remain only in `/tmp`. | `scripts/artifact_retention.py`, `scripts/retention_guard.py` |
 | **sage-architecture-governor** | Falsifiable architecture gate + scoped edit token for high-risk Sage harness/prompt/planner/adapter changes — guards against prompt bloat, symbolic-planner creep, and GOAD coupling. | `scripts/open_gate.py`, `scripts/check_arch_budget.py` |
-| **sage-cyber-runner** | Goal-aware GPT-5.6 → `gpt-5.5-cyber-preview` routing fallback with contract validation, control-plane network allowlists, and live-run binding. | `scripts/run_cyber.py` |
 | **sage-forge-ops** | Sage-specific Forge/Codex helper automation. Sage offensive-security code must use the cyber-capable model config in `CLAUDE.md`; do not change global Forge defaults from here. | `scripts/sage_forge.sh` |
 
 > Keep this index in sync when adding/removing a skill: a skill is a directory under `skills/` with a `SKILL.md`
