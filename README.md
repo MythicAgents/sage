@@ -176,20 +176,16 @@ Mythic, range, clock, BloodHound, Sage, payload, callback, and final readiness g
 
 ## Verification
 
-Run focused tests for the subsystem being changed, then the maintained offline tier:
+Run focused tests for the subsystem being changed, then the offline suite:
 
 ```bash
-.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py supported
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
 ```
 
-Four append-only rejected successor-portfolio suites have a separate historical lifecycle and are explicitly
-excluded from the supported tier. They can be inspected without pretending they are current product failures:
+One tier, no exclusions — a green run means the tree is green. The rejected successor-portfolio suites that were
+once excluded are retained evaluation evidence and now live under `.sage_history/`.
 
-```bash
-.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py retired
-```
-
-See [Test Tiers](docs/development/TEST_TIERS.md) for the distinction. Changes to autonomous execution also require
+See [Test Tiers](docs/development/TEST_TIERS.md) for the details. Changes to autonomous execution also require
 focused controller/runtime tests and the architecture budget check:
 
 ```bash

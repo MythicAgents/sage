@@ -75,17 +75,30 @@ def test_docker_context_excludes_development_state_and_archived_databases():
     assert required <= ignored
 
 
-def test_supported_suite_exclusions_are_exact_and_historical():
+def test_offline_suite_runs_the_whole_tree_with_no_hidden_exclusions():
+    """The runner must not silently drop suites.
+
+    Replaces an earlier test that asserted the runner excluded exactly four rejected
+    successor-portfolio suites. Those portfolios moved to
+    `.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/` — rejected
+    evaluation evidence belongs in the retention store, not the product tree — so the exclusion
+    mechanism is gone rather than merely unused. This asserts it stays gone: an exclusion that
+    creeps back in makes a green run stop meaning the tree is green.
+    """
     runner = _load_runner()
-    assert runner.RETIRED_SUITES == (
-        "test_phase16r_phase17r1_successor_portfolio.py",
-        "test_phase16r_phase17r1_successor_r2_portfolio.py",
-        "test_phase16r_phase17r1_successor_r3_portfolio.py",
-        "test_phase16r_phase17r1_successor_r4_portfolio.py",
-    )
-    command = runner.command_for("supported", ["--collect-only", "-q"])
-    assert sum(item.startswith("--ignore=") for item in command) == 4
+    assert not hasattr(runner, "RETIRED_SUITES")
+    command = runner.command_for(["--collect-only", "-q"])
+    assert not any(item.startswith("--ignore=") for item in command)
     assert command[-2:] == ["--collect-only", "-q"]
+
+
+def test_rejected_successor_portfolios_are_absent_from_the_product_tree():
+    """Regression: 28k lines of rejected candidates must not return to Payload_Type/."""
+    strays = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / "Payload_Type" / "sage").rglob("*successor*portfolio*.py")
+    ]
+    assert strays == []
 
 
 def test_enabled_codex_agent_profile_references_resolve_atomically():

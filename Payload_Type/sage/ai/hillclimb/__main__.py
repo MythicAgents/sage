@@ -16,8 +16,6 @@
   python -m ai.hillclimb phase14-superseding-bundle   # no lab or model calls
   python -m ai.hillclimb phase14-superseding-bundle-validate # no lab or model calls
   python -m ai.hillclimb phase15-r5-retrospective-falsifiers # no lab or model calls
-  python -m ai.hillclimb phase16-structural-benchmark-portfolio # no lab or model calls
-  python -m ai.hillclimb phase17-experimental-readiness # no lab or model calls
   python -m ai.hillclimb phase5-full-frontier-t3      # no lab; add --run-model-matrix for weak/strong calls
   python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
   python -m ai.hillclimb target-value-census             # no lab or model calls
@@ -88,8 +86,6 @@ try:  # package import
     from . import phase14_superseding_bundle
     from . import phase14_bundle_validator
     from . import phase15_r5_retrospective_falsifiers
-    from . import phase16_structural_benchmark_portfolio
-    from . import phase17_experimental_readiness
     from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
@@ -134,8 +130,6 @@ except Exception:  # script / sys.path import
     import phase14_superseding_bundle  # type: ignore
     import phase14_bundle_validator  # type: ignore
     import phase15_r5_retrospective_falsifiers  # type: ignore
-    import phase16_structural_benchmark_portfolio  # type: ignore
-    import phase17_experimental_readiness  # type: ignore
     import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
@@ -481,8 +475,6 @@ def main(argv: list[str] | None = None) -> int:
     phase14_superseding_bundle.add_cli(sub)
     phase14_bundle_validator.add_cli(sub)
     phase15_r5_retrospective_falsifiers.add_cli(sub)
-    phase16_structural_benchmark_portfolio.add_cli(sub)
-    phase17_experimental_readiness.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

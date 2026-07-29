@@ -16,12 +16,12 @@ only when the relevant callback/lab state exists.
 4. Run focused unit tests and then:
 
 ```bash
-.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py supported
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
 ```
 
-The `supported` tier runs every maintained offline test and names the four append-only retired successor suites it
-excludes. Use `run_offline_suite.py retired` only when inspecting that historical lifecycle; it is intentionally
-not the default green product-development signal. See `docs/development/TEST_TIERS.md`.
+One tier, no exclusions — a green run means the tree is green. The four rejected successor-portfolio suites this
+once excluded now live append-only under `.sage_history/evaluation/architecture-policy/`. A trailing `supported`
+argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 
 ## Bundled Scripts
 
