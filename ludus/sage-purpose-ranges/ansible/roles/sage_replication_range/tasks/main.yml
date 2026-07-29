@@ -1,0 +1,226 @@
+---
+- name: Validate Sage replication purpose-range role mode
+  ansible.builtin.assert:
+    that:
+      - sage_replication_range_mode in ["domain", "gpo-target"]
+    fail_msg: "sage_replication_range_mode must be 'domain' or 'gpo-target'"
+
+- name: Configure domain-side replication purpose-range state
+  when: sage_replication_range_mode == "domain"
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ sage_replication_domain_admin }}"
+    ansible_become_password: "{{ sage_replication_domain_admin_password }}"
+  block:
+    - name: Move the GPO target and grant direct DCSync authority
+      ansible.windows.win_powershell:
+        script: |
+          param(
+              [string]$DomainFqdn,
+              [string]$FootholdUser,
+              [string]$GpoName,
+              [string]$TargetOu,
+              [string]$TargetComputer
+          )
+
+          $ErrorActionPreference = "Stop"
+          Import-Module ActiveDirectory
+          Import-Module GroupPolicy
+
+          $changed = $false
+          $aclChanged = $false
+          $domain = Get-ADDomain -Identity $DomainFqdn
+          $domainDn = $domain.DistinguishedName
+
+          $null = Get-ADOrganizationalUnit -Identity $TargetOu -ErrorAction Stop
+          $computer = Get-ADComputer -Identity $TargetComputer -ErrorAction Stop
+          $expectedComputerDn = "CN=$($computer.Name),$TargetOu"
+          if (-not $computer.DistinguishedName.Equals($expectedComputerDn, [System.StringComparison]::OrdinalIgnoreCase)) {
+              Move-ADObject -Identity $computer.DistinguishedName -TargetPath $TargetOu
+              Write-Output "Moved $TargetComputer into $TargetOu"
+              $changed = $true
+          }
+
+          $null = Get-GPO -Name $GpoName -ErrorAction Stop
+          $syncKey = "HKEY_LOCAL_MACHINE\Software\Policies\Microsoft\Windows NT\CurrentVersion\WinLogon"
+          $syncValue = Get-GPRegistryValue -Name $GpoName -Key $syncKey -ValueName SyncForegroundPolicy -ErrorAction SilentlyContinue
+          if (-not $syncValue -or [int]$syncValue.Value -ne 1) {
+              Set-GPRegistryValue -Name $GpoName -Key $syncKey -ValueName SyncForegroundPolicy -Type DWORD -Value 1
+              Write-Output "Set SyncForegroundPolicy=1 on $GpoName"
+              $changed = $true
+          }
+
+          $user = Get-ADUser -Identity $FootholdUser -Properties objectSid -ErrorAction Stop
+          $identity = New-Object System.Security.Principal.SecurityIdentifier($user.SID.Value)
+          $domainRoot = [ADSI]"LDAP://$domainDn"
+          $domainAcl = $domainRoot.psbase.ObjectSecurity
+          $extendedRight = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
+          $allow = [System.Security.AccessControl.AccessControlType]::Allow
+          $replicationRightGuids = @(
+              [Guid]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
+              [Guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+          )
+
+          foreach ($rightGuid in $replicationRightGuids) {
+              $existing = @(
+                  $domainAcl.Access | Where-Object {
+                      $sid = $null
+                      try {
+                          $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                      } catch {
+                          $sid = $_.IdentityReference.Value
+                      }
+                      $sid -eq $identity.Value -and
+                      (($_.ActiveDirectoryRights -band $extendedRight) -ne 0) -and
+                      $_.AccessControlType -eq $allow -and
+                      $_.ObjectType -eq $rightGuid
+                  }
+              )
+              if ($existing.Count -eq 0) {
+                  $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                      $identity,
+                      $extendedRight,
+                      $allow,
+                      $rightGuid
+                  )
+                  $domainAcl.AddAccessRule($ace)
+                  Write-Output "Granted $rightGuid to $FootholdUser on $domainDn"
+                  $aclChanged = $true
+              }
+          }
+
+          if ($aclChanged) {
+              $domainRoot.psbase.ObjectSecurity = $domainAcl
+              $domainRoot.psbase.CommitChanges()
+              $changed = $true
+          }
+
+          if ($aclChanged) {
+              try {
+                  repadmin.exe /syncall /AdeP | Out-Null
+              } catch {
+                  Write-Output "repadmin sync skipped: $($_.Exception.Message)"
+              }
+          }
+
+          $Ansible.Changed = $changed
+        parameters:
+          DomainFqdn: "{{ sage_replication_domain_fqdn }}"
+          FootholdUser: "{{ sage_replication_foothold_user }}"
+          GpoName: "{{ sage_replication_gpo_name }}"
+          TargetOu: "{{ sage_replication_target_ou }}"
+          TargetComputer: "{{ sage_replication_target_computer }}"
+
+- name: Configure remote GPO proof target
+  when: sage_replication_range_mode == "gpo-target"
+  block:
+    - name: Configure proof share and fast Group Policy refresh
+      ansible.windows.win_powershell:
+        script: |
+          param(
+              [string]$DomainNetbios,
+              [string]$ProofPath,
+              [string]$ProofShare,
+              [int]$RefreshMinutes
+          )
+
+          $ErrorActionPreference = "Stop"
+          $changed = $false
+          $policyPath = "HKLM:\Software\Policies\Microsoft\Windows\System"
+          New-Item -Path $policyPath -Force | Out-Null
+
+          foreach ($setting in @{
+              GroupPolicyRefreshTime = $RefreshMinutes
+              GroupPolicyRefreshTimeOffset = 0
+          }.GetEnumerator()) {
+              $current = Get-ItemProperty -Path $policyPath -Name $setting.Key -ErrorAction SilentlyContinue
+              $currentValue = $null
+              if ($current) {
+                  $currentValue = $current.PSObject.Properties[$setting.Key].Value
+              }
+              if ($null -eq $currentValue -or [int]$currentValue -ne [int]$setting.Value) {
+                  New-ItemProperty -Path $policyPath -Name $setting.Key -PropertyType DWord -Value $setting.Value -Force | Out-Null
+                  Write-Output "Set $($setting.Key)=$($setting.Value)"
+                  $changed = $true
+              }
+          }
+
+          if (-not (Test-Path -LiteralPath $ProofPath)) {
+              New-Item -ItemType Directory -Path $ProofPath -Force | Out-Null
+              Write-Output "Created $ProofPath"
+              $changed = $true
+          }
+
+          $domainUsers = "$DomainNetbios\Domain Users"
+          $proofAcl = Get-Acl -LiteralPath $ProofPath
+          $beforeSddl = $proofAcl.Sddl
+          $proofAcl.SetAccessRuleProtection($true, $false)
+          foreach ($rule in @($proofAcl.Access)) {
+              $proofAcl.RemoveAccessRuleAll($rule) | Out-Null
+          }
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+          $propagation = [System.Security.AccessControl.PropagationFlags]::None
+          $allow = [System.Security.AccessControl.AccessControlType]::Allow
+          $proofRules = @(
+              New-Object System.Security.AccessControl.FileSystemAccessRule(
+                  "NT AUTHORITY\SYSTEM",
+                  "FullControl",
+                  $inheritance,
+                  $propagation,
+                  $allow
+              )
+              New-Object System.Security.AccessControl.FileSystemAccessRule(
+                  "BUILTIN\Administrators",
+                  "FullControl",
+                  $inheritance,
+                  $propagation,
+                  $allow
+              )
+              New-Object System.Security.AccessControl.FileSystemAccessRule(
+                  $domainUsers,
+                  "ReadAndExecute",
+                  $inheritance,
+                  $propagation,
+                  $allow
+              )
+          )
+          foreach ($rule in $proofRules) {
+              $proofAcl.AddAccessRule($rule) | Out-Null
+          }
+          if ($proofAcl.Sddl -ne $beforeSddl) {
+              Set-Acl -LiteralPath $ProofPath -AclObject $proofAcl
+              Write-Output "Updated filesystem ACL for $ProofPath"
+              $changed = $true
+          }
+
+          $existingShare = Get-SmbShare -Name $ProofShare -ErrorAction SilentlyContinue
+          if ($existingShare -and -not $existingShare.Path.Equals($ProofPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+              Remove-SmbShare -Name $ProofShare -Force
+              Write-Output "Removed stale $ProofShare share"
+              $existingShare = $null
+              $changed = $true
+          }
+          if (-not $existingShare) {
+              New-SmbShare -Name $ProofShare -Path $ProofPath -FullAccess "BUILTIN\Administrators", "NT AUTHORITY\SYSTEM" -ReadAccess $domainUsers | Out-Null
+              Write-Output "Created $ProofShare share"
+              $changed = $true
+          } else {
+              $readGrant = Get-SmbShareAccess -Name $ProofShare | Where-Object {
+                  $_.AccountName -eq $domainUsers -and
+                  $_.AccessControlType -eq "Allow" -and
+                  $_.AccessRight -eq "Read"
+              }
+              if (-not $readGrant) {
+                  Grant-SmbShareAccess -Name $ProofShare -AccountName $domainUsers -AccessRight Read -Force | Out-Null
+                  Write-Output "Granted read access on $ProofShare to $domainUsers"
+                  $changed = $true
+              }
+          }
+
+          $Ansible.Changed = $changed
+        parameters:
+          DomainNetbios: "{{ sage_replication_domain_netbios }}"
+          ProofPath: "{{ sage_replication_proof_path }}"
+          ProofShare: "{{ sage_replication_proof_share }}"
+          RefreshMinutes: "{{ sage_replication_group_policy_refresh_minutes }}"
