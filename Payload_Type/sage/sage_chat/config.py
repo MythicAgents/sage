@@ -88,14 +88,16 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     model = _resolve(config, secrets, "model", env_key="model").lower()
     system_prompt = _resolve(config, secrets, "system_prompt", env_key="system_prompt", default="")
 
-    mode = _resolve(config, secrets, "mode", env_key="mode", default="supervised").lower()
-    if mode not in ("supervised", "auto"):
-        mode = "supervised"
+    mode = _resolve(config, secrets, "mode", env_key="mode", default="conversation").lower()
+    if mode not in ("conversation", "supervised", "auto"):
+        mode = "conversation"
     # Both legacy controls coexist (ChatArguments shipped `mode` AND `autonomous_solve`): Mode=Autonomous
     # OR the explicit autonomous_solve toggle enables it. The toggle resolves through the full chain.
     autonomous_solve = mode == "auto" or _resolve_bool(
         config, secrets, "autonomous_solve", env_key="autonomous_solve", default=False
     )
+    if mode == "conversation" and autonomous_solve:
+        mode = "auto"
     policy_mode_requested = _resolve(
         config,
         secrets,

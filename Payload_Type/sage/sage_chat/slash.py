@@ -30,7 +30,10 @@ except Exception:  # pragma: no cover
 SLASH_COMMANDS = [
     ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
-    ChatSlashCommandDefinition(Name="mode", Description="Show or set the agent mode: /mode [supervised|auto]."),
+    ChatSlashCommandDefinition(
+        Name="mode",
+        Description="Show or set the agent mode: /mode [conversation|supervised|auto].",
+    ),
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the baked-in BloodHound MCP: /bloodhound [directory]."),
@@ -41,12 +44,15 @@ _MCP_CALL_TIMEOUT_SECONDS = 60
 
 
 def _handle_mode(model: Any, arg: str) -> str:
-    current = getattr(model, "mode", "supervised") if model is not None else "(no session)"
+    current = getattr(model, "mode", "conversation") if model is not None else "(no session)"
     choice = arg.strip().lower()
     if not choice:
-        return f"Current mode: **{current}**. Set with `/mode supervised` or `/mode auto`."
-    if choice not in ("supervised", "auto"):
-        return f"Unknown mode `{choice}`. Valid: `supervised`, `auto`."
+        return (
+            f"Current mode: **{current}**. Set with `/mode conversation`, "
+            "`/mode supervised`, or `/mode auto`."
+        )
+    if choice not in ("conversation", "supervised", "auto"):
+        return f"Unknown mode `{choice}`. Valid: `conversation`, `supervised`, `auto`."
     if model is None:
         return f"No active session yet — send a message first, then `/mode {choice}`."
     base_autonomy = getattr(model, "_chat_request_base_autonomous_solve", None)
@@ -59,7 +65,9 @@ def _handle_mode(model: Any, arg: str) -> str:
         )
         model._chat_request_base_autonomous_solve = bool(base_autonomy)
     model.mode = choice
-    model._autonomous_solve = True if choice == "auto" else bool(base_autonomy)
+    model._autonomous_solve = (
+        True if choice == "auto" else False if choice == "conversation" else bool(base_autonomy)
+    )
     model._chat_mode_override = choice
     model._chat_mode_override_base_signature = str(
         getattr(model, "_chat_request_config_signature", "") or ""

@@ -68,13 +68,14 @@ _CONFIG_OPTIONS = [
         DisplayName="Mode",
         Type=OptType.Choice,
         Description=(
-            "Supervised keeps scoped questions on the multi-agent supervisor and runs explicit objectives "
-            "through the policy-selected execution kernel with approvals. Autonomous runs the same kernel "
-            "unattended."
+            "Conversation is read/response-only and cannot execute external tools. Supervised permits "
+            "model-proposed guarded work only after exact operator approval. Autonomous runs the execution "
+            "kernel unattended."
         ),
         Required=False,
-        DefaultValue="supervised",
+        DefaultValue="conversation",
         Choices=[
+            ChatModelConfigurationOptionChoice(Label="Conversation", Value="conversation"),
             ChatModelConfigurationOptionChoice(Label="Supervised", Value="supervised"),
             ChatModelConfigurationOptionChoice(Label="Autonomous", Value="auto"),
         ],
