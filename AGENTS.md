@@ -14,6 +14,121 @@ This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that o
 Plans and Notes are mostly private/gitignored working context. Do not assume they are committed history. Verify important claims against source.
 Historical markdown that is not part of the current minimal handoff lives under `Plans/Archived/`.
 
+## Durable Artifact Retention
+
+- Treat `/tmp` as scratch space, never as the source of truth for a durable Sage artifact.
+- Store durable-private contracts, final worker handoffs, decision-bearing reviews, external panel packets and
+  responses, full chat transcripts used for analysis, accepted or rejected evaluation evidence, closed governance
+  receipts, and manifests under `.sage_history/` through `skills/sage-artifact-retention`.
+- An artifact must be durable before task completion when a final response cites it, it approves or rejects a
+  decision, it proves an evaluation or live-run result, it contains a worker contract or final handoff, or exact
+  bytes are required to resume accurately after reboot.
+- Keep active locks and leases, temporary clones, fixtures, staging, downloaded payloads, environment snapshots,
+  credentials, and reproducible intermediates in `/tmp`. Never promote secrets or payloads automatically.
+- For Sage panel review, allocate `--output-dir` under `.sage_history/` and record the completed directory with
+  `sage-artifact-retention`; do not use a `/tmp` panel directory for a decision-bearing review.
+- Native Codex session and sub-agent transcripts remain in `~/.codex/sessions`. Keep bounded cyber-runner workers
+  ephemeral, but persist their validated contracts and final structured handoffs under `.sage_history/`.
+- `.sage_history/` is private, gitignored local state and is not a system backup. Raw history may contain sensitive
+  operator or lab material even when obvious auth files are excluded.
+- Use the retention manifest to relate durable artifacts to source paths, hashes, sessions, runs, commits, and
+  decisions. Later blog/publication work must curate and redact a separate published subset.
+
+## Custom Sub-Agent Routing
+
+- Use the project custom agent `sage_cyber_executor` for bounded cybersecurity-specific Sage implementation
+  and for explicitly authorized live-range execution. Appropriate work includes Mythic capability adapters,
+  command construction, callback/execution mechanics, capability verifiers, BloodHound/runtime integration,
+  operational Sage skills, live runners, and focused capability tests.
+- If the active Codex spawn surface cannot select `agent_type=sage_cyber_executor`, or a spawned thread reports
+  `agent_role=null`, use `skills/sage-cyber-runner/scripts/run_cyber.py` instead. It loads the existing cyber
+  developer instructions, pins `gpt-5.5-cyber-preview`, and disables nested agents. Route work to it from the
+  authorized task classification before model execution; never invoke it merely to retry a refusal or bypass a
+  safeguard.
+- When a user starts an active `/goal`, treat that goal objective as standing authorization for bounded runner
+  calls inside the goal. Populate `authorization_mode=active-goal` and `goal_scope` from the active goal; do not ask
+  for per-call approval or an approval hash. Continue autonomously through ordinary in-goal source edits,
+  allowlisted localhost/remote control-plane calls, and live activity explicitly covered by the goal and a complete
+  `live_run_contract`. Stop only for out-of-goal scope, new destructive authority, an unlisted endpoint, a missing
+  live binding, or another repository stop-loss.
+- Network-enabled runner contracts must enumerate exact control-plane hosts and use the generated Codex network
+  proxy allowlist. Target-facing LDAP, SMB, Kerberos, WinRM, RPC, HTTP, and similar operations remain Mythic
+  payload tasks; never list a target host as a runner network endpoint.
+- Before spawning `sage_cyber_executor` or invoking the runner, provide a supervisor task contract that identifies
+  the objective, permitted file scope, protected surfaces, verification plan, stop-loss, and whether live activity
+  is explicitly authorized. If the contract is incomplete, limit work to read-only inspection and require the
+  missing fields instead of editing or executing live activity.
+- Confirm that the spawned thread reports the active `sage_cyber_executor` custom profile, not merely that its
+  task name matches the agent name. If the custom developer instructions are not active, stop the delegation and
+  report the wiring failure; do not let a generic sub-agent perform the specialist task. For the runner, require
+  `profile_name=sage_cyber_executor`, `requested_model=gpt-5.5-cyber-preview`, and a successful profile smoke check.
+- Keep evaluation design, evidence admission, sealed artifacts and manifests, statistical conclusions, promotion
+  decisions, and product dispositions with the primary agent unless the current task contract names exact files
+  and explicitly delegates the requested change.
+- Use one-writer discipline: do not assign overlapping files to the primary agent and `sage_cyber_executor` at
+  the same time. The primary agent remains responsible for reviewing the sub-agent handoff and verifying the
+  result before claiming completion.
+- Use the project custom agent `sage_eval_reviewer` for fresh-context, read-only adversarial review of evaluation
+  source/tests, sealed candidates, provenance, authorization, and lifecycle gates. Spawn it without parent-turn
+  history when practical and require it to confirm the active custom profile before relying on its disposition.
+  It may coordinate at most two read-only specialist children; reviewer or agent agreement is not evidence.
+- A `sage_eval_reviewer` result is an internal pre-review unless the prospectively approved gate explicitly says
+  that fresh-context agent review satisfies its independence requirement. Keep a separate top-level review for a
+  promotion boundary that requires separate-session governance.
+
+## Sealed Evaluation Review Discipline
+
+- Generated `passes` fields, readiness flags, self-attestations, and tests that only reread generated claims are
+  not independent evidence. Inject adversarial inputs at the production boundary.
+- Cover semantic failure classes with recursive/property matrices, protocol boundaries, and valid near-match
+  controls before generating the first candidate. Named regression examples are necessary but insufficient.
+- Bind every allowed semantic delta to an artifact, exact pointer, delta kind, and exact expected old/new value or
+  a named independent validator. Do not allow generic whole-subtree, generic-hash, or candidate-self rules.
+- Validate the exact bytes selected for writing. Eliminate shadow/prepared/payload/serialized duals or prove full
+  equality before comparison and write.
+- Bind each approval record atomically to one gate's exact path, hash, phrase, operator, and scope. Never compose a
+  provenance tuple from multiple gates or rely on an implicit detached contextual join to cure a false assertion.
+- Define test suites by lifecycle stage. A pre-generation absence assertion must not be required during
+  post-generation candidate review; every sealed candidate needs a hermetic post-generation suite.
+- Treat source/test acceptance, artifact acceptance, phase exit, development/live authority, countability, and
+  promotion as separate state transitions. Changed hashes never inherit authority.
+- Treat a governor result with no classified paths as no enforcement evidence. Fix coverage or disclose the limit;
+  do not count an exit-zero result as approval proof.
+- Preserve rejected bundles append-only, but centralize integrity in one canonical machine-readable ledger rather
+  than copying large hash tables into every prose result.
+- After the first rejection of the same mechanism, stop resealing. Perform RCA, simplify the mechanism, and
+  property-test the complete failure class before another candidate or external review.
+
+## Review Lane And Acceptance-Contract Discipline
+
+- Classify work before implementation as either `runtime_bugfix` or `sealed_evaluation`. Runtime bugfixes use the
+  lightest review process that can prove the production behavior; do not introduce sealed manifests, promotion
+  gates, or evaluation lifecycle machinery merely to repair a bounded runtime defect. Sealed evaluation work keeps
+  the full provenance and lifecycle discipline above.
+- Freeze a prospective acceptance contract before the first edit. It must name the mechanism, lane, atomic Ideal
+  State Criteria, exact production call path, adversarial and valid-near-match probes, non-goals, permitted files,
+  and the rule that distinguishes a blocker from non-blocking hardening.
+- The implementation owner must run the acceptance contract's declared probes before candidate review and map each
+  changed behavior to one criterion. Passing author-written examples alone is not sufficient when the contract
+  declares a broader semantic class.
+- A post-implementation rejection must identify a reproducible, production-reachable counterexample to a frozen
+  criterion or a concrete safety/authority-boundary violation. New preferences or requirements discovered after
+  implementation are non-blocking unless they meet that standard.
+- Every review finding must be classified as `blocking`, `hardening`, `unreachable`, `pre_existing`, or
+  `out_of_scope`. Only `blocking` findings affect the candidate disposition.
+- One review round must return the complete observed blocking set from all predeclared probes. Do not stop at the
+  first defect and reveal the rest across serial review rounds.
+- A fresh reviewer provides adversarial diversity, not evidence by agreement. Prefer executable invariants,
+  production-boundary probes, and frozen criteria over changing models or accumulating reviewer opinions.
+- Do not encode control authority by classifying open-ended natural-language prose when a typed field, enum, or
+  protocol state can carry the same decision. If a rejection exposes a new paraphrase in the same language class,
+  simplify to structured authority instead of extending keyword, negation, or regex lists.
+- Give deadline-bound `runtime_bugfix` reviews an explicit wall-clock and command budget in the task contract
+  (15 minutes and the focused production-path suite by default). Complete the declared probes, then return a
+  disposition. Do not expand into unrelated history, whole-repository archaeology, or lifecycle review; the
+  maintained supported tier remains the implementation owner's regression evidence unless the frozen contract
+  identifies a concrete reason the reviewer must rerun it.
+
 ## Repo Map
 
 - `Payload_Type/sage/ai/langgraph/model.py`: LangGraph topology, agent creation, middleware, HITL, stop handling, checkpoint recovery, streaming.
@@ -41,10 +156,24 @@ Historical markdown that is not part of the current minimal handoff lives under 
 Run this from repo root before and after code changes:
 
 ```bash
-.venv/bin/python -m pytest Payload_Type/sage/tests -q
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py supported
 ```
 
-Latest observed baseline: `1550 passed, 4 warnings` on July 11, 2026.
+There is one tier and no exclusions: a green run means the tree is green. The trailing `supported` argument is
+accepted and ignored so older handoffs keep working.
+
+The four rejected successor-portfolio suites this command used to exclude are rejected *evaluation evidence*, and
+per § Durable Artifact Retention that belongs in `.sage_history/`, not the product tree. They are preserved
+append-only at `.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`. Do not rewrite or
+reseal them, and do not move them back. Record the observed suite count in the current handoff rather than
+preserving a fast-staling count here.
+
+Sealed evaluation evidence belongs under `.sage_history/`, never `Plans/`, which is the maintainer's own
+documents and is gitignored for an unrelated reason. The Phase 16R/17 campaign's evidence and source now live at
+`.sage_history/evaluation/architecture-policy/`. **Known gap:** `phase10_evidence_bundle`, `phase12`, `phase13`,
+`phase14` (both), and `phase15` still write outputs under `Plans/` — ten path anchors across six modules. Route
+new evidence writes to `.sage_history/`, and prefer a shared resolver over another per-module `/ "Plans" /`
+constant when those six are migrated.
 
 For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do not trust the Mythic task poller for long Sage runs; it can hang. Read results from `Payload_Type/sage/.phoenix/phoenix.db` or decoded Mythic task output.
 
@@ -79,7 +208,7 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
   operator action is required.
 - Prefer single-line shell commands in operator instructions. Avoid backslash-continued commands when one line is practical.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
-- If touching autonomous execution, run focused tests plus the full offline suite.
+- If touching autonomous execution, run focused tests plus the supported offline tier above.
 - High-risk Sage architecture work must pass the architecture governor before edits. Use
   `skills/sage-architecture-governor` for any change touching prompts, agent topology, tool lists,
   `Payload_Type/sage/ai/langgraph/model.py`, `mythic_tools.py`, `engagement_state.py`, reconcilers,
@@ -198,12 +327,13 @@ in tmux throughout current development.
    `tsdiscon` by default so the local client exits without logging off the Windows session.
 7. **Run the callback preflight.** Run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight`; it
-   waits for the live Samwell Apollo callback, synchronizes clocks, purges stale Kerberos tickets, and verifies
-   UTC/domain/identity output.
+   waits for the live Samwell Apollo callback through Mythic control-plane observation, synchronizes clocks out of
+   band, and returns explicit zero-task metadata. It issues no Mythic payload tasks and does not claim Kerberos
+   purge or target-probed UTC/domain/identity output.
 8. **Only then rediscover Apollo and run Sage.** After DB archival and Sage restart, run
    `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
    preflight; it must show `ready: true`. Then run
-   `.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400`.
+   `.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --autonomous --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400`.
 
 The GOAD and BloodHound reset helpers below are still used for lab state, but they do not replace the Mythic
 payload/callback lifecycle above.
@@ -211,8 +341,11 @@ payload/callback lifecycle above.
 - **GOAD Ludus range:** `skills/sage-goad-reset/scripts/ludus.py` reads Ludus credentials from `.mcp.json`.
   - Check state: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py status`
   - List snapshots: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots`
-  - Roll back all range VMs to the default `clean-baseline` snapshot:
-    `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback --yes`
+  - Treat `clean-baseline` as a logical state name, not a guaranteed Ludus snapshot ID. List the live restore
+    targets first, then pass the intended name explicitly. For range #4 the clean restore target verified on
+    July 20, 2026 is `sage-seed-baseline-20260710`:
+    `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback sage-seed-baseline-20260710 --yes`
+    Stop and reconcile the handoff if that exact target is absent; never guess among multiple snapshots.
   - Power on all range VMs: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all`
   - Verify all six VMs are ON and reporting IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`,
     SRV02/CASTELBLACK `.22`, SRV03/BRAAVOS `.23`. DC01/DC02 can briefly show `ip=null` after rollback; wait and

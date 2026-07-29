@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sage Cyber Runner Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "objective",
+    "task",
+    "authorization_mode",
+    "authorization_source",
+    "goal_scope",
+    "permitted_file_scope",
+    "protected_surfaces",
+    "verification_plan",
+    "stop_loss",
+    "workspace_write_authorized",
+    "network_activity_authorized",
+    "network_endpoints",
+    "live_activity_authorized",
+    "live_run_contract"
+  ],
+  "properties": {
+    "objective": {"type": "string", "minLength": 1},
+    "task": {"type": "string", "minLength": 1},
+    "authorization_mode": {"enum": ["direct", "active-goal"]},
+    "authorization_source": {"type": "string", "minLength": 1},
+    "goal_scope": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/goalScope"}
+      ]
+    },
+    "permitted_file_scope": {"$ref": "#/$defs/nonEmptyStrings"},
+    "protected_surfaces": {"$ref": "#/$defs/nonEmptyStrings"},
+    "verification_plan": {"$ref": "#/$defs/nonEmptyStrings"},
+    "stop_loss": {"$ref": "#/$defs/nonEmptyStrings"},
+    "workspace_write_authorized": {"type": "boolean"},
+    "network_activity_authorized": {"type": "boolean"},
+    "network_endpoints": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/networkEndpoint"}
+    },
+    "live_activity_authorized": {"type": "boolean"},
+    "live_run_contract": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/liveRunContract"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"authorization_mode": {"const": "active-goal"}}},
+      "then": {"properties": {"goal_scope": {"$ref": "#/$defs/goalScope"}}},
+      "else": {"properties": {"goal_scope": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"network_activity_authorized": {"const": true}}},
+      "then": {
+        "properties": {
+          "workspace_write_authorized": {"const": true},
+          "network_endpoints": {"minItems": 1}
+        }
+      },
+      "else": {"properties": {"network_endpoints": {"maxItems": 0}}}
+    },
+    {
+      "if": {"properties": {"live_activity_authorized": {"const": true}}},
+      "then": {
+        "properties": {
+          "network_activity_authorized": {"const": true},
+          "live_run_contract": {"$ref": "#/$defs/liveRunContract"}
+        }
+      },
+      "else": {"properties": {"live_run_contract": {"type": "null"}}}
+    }
+  ],
+  "$defs": {
+    "nonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "networkEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "role", "description"],
+      "properties": {
+        "host": {"type": "string", "minLength": 1},
+        "role": {
+          "enum": [
+            "mythic",
+            "bloodhound",
+            "ludus",
+            "model-provider",
+            "repository-service",
+            "other-control-plane"
+          ]
+        },
+        "description": {"type": "string", "minLength": 1}
+      }
+    },
+    "goalScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal_reference", "goal_objective", "live_activity_within_goal"],
+      "properties": {
+        "goal_reference": {"type": "string", "minLength": 1},
+        "goal_objective": {"type": "string", "minLength": 1},
+        "live_activity_within_goal": {"type": "boolean"}
+      }
+    },
+    "liveRunContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_or_tranche",
+        "attempt_id",
+        "range",
+        "snapshot",
+        "callback_binding",
+        "provider",
+        "route",
+        "startup_overrides",
+        "allowed_capabilities",
+        "countability_gates",
+        "retry_cap",
+        "evidence_schema",
+        "artifact_hashes"
+      ],
+      "properties": {
+        "phase_or_tranche": {"type": "string", "minLength": 1},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "range": {"type": "string", "minLength": 1},
+        "snapshot": {"type": "string", "minLength": 1},
+        "callback_binding": {"type": "string", "minLength": 1},
+        "provider": {"type": "string", "minLength": 1},
+        "route": {"type": "string", "minLength": 1},
+        "startup_overrides": {"type": "object"},
+        "allowed_capabilities": {"$ref": "#/$defs/nonEmptyStrings"},
+        "countability_gates": {"$ref": "#/$defs/nonEmptyStrings"},
+        "retry_cap": {"type": "integer", "minimum": 0},
+        "evidence_schema": {"type": "string", "minLength": 1},
+        "artifact_hashes": {"type": "object"}
+      }
+    }
+  }
+}

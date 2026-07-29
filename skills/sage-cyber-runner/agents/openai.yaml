@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Cyber Runner"
+  short_description: "Route authorized Sage work to the cyber model"
+  default_prompt: "Use $sage-cyber-runner to execute an authorized Sage task with the pinned cyber model."
