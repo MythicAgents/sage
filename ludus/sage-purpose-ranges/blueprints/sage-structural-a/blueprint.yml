@@ -1,0 +1,17 @@
+manifest_version: 1
+id: sage-structural-a
+name: "Sage Structural Family A"
+description: "Phase 16R candidate: four-realm benchmark with a child-domain GPO/DCSync lane and partner-forest ADCS lane."
+version: 0.2.0
+config: range-config.yml
+
+tags:
+  - active-directory
+  - benchmark
+  - structural
+  - gpo
+  - dcsync
+  - adcs
+  - sage
+
+min_ludus_version: "2.0.0"

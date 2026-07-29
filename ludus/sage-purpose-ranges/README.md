@@ -1,9 +1,9 @@
 # Sage Purpose Ranges
 
 This directory is a standalone Ludus source for Sage evaluation ranges. It is
-not a GOAD or DreadGOAD overlay. The first included blueprint is a small
-single-domain range that exposes a controlled GPO detour and a cheaper direct
-DCSync path from the same low-privileged foothold.
+not a GOAD or DreadGOAD overlay. It contains the original small replication
+purpose range plus two Phase 16R structural candidate sources used by the
+architecture-policy evaluation work.
 
 ## Ludus 2.0.6 Quick Start
 
@@ -125,6 +125,16 @@ That variant leaves the auto-created `SAGEREPL` default range unused.
 - `sage-replication-range`: three Windows hosts in `replication.local` with
   `REPLICATION\user1` on `WS01`, a controlled `SRV02-Policy` GPO, and direct
   domain-root DCSync rights for the same user.
+- `sage-structural-a`: seven Windows guests defining candidate family S1 with a
+  child-domain GPO/DCSync lane and a partner-forest ADCS lane.
+- `sage-structural-b`: seven Windows guests defining candidate family S2 with a
+  partner-forest LAPS/CA lane and a nested-child DCSync lane.
+
+The structural blueprints use the same 4 GB / 2 vCPU Windows profile as the
+replication purpose range. Their all-powered envelope is eight VMs, 30 GiB RAM,
+and 16 vCPUs after including the Ludus router. The sources are not independently
+accepted or authorized for live use; if a later review authorizes activation,
+power on only one purpose range at a time.
 
 ## Snapshots And Gauge Reset
 
