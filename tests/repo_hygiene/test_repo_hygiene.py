@@ -206,7 +206,10 @@ _LAYOUT_PATH_DEBT = 13
 #   test_repository_boundaries.py               — this file; the pattern is the thing being searched for
 _LAYOUT_PATH_EXEMPT = {
     "Payload_Type/sage/tests/test_hillclimb_operator_replay_benchmark.py",
-    "Payload_Type/sage/tests/test_repository_boundaries.py",
+    # This file. It must name the forbidden shapes in order to search for them, and it moved here
+    # from Payload_Type/sage/tests/test_repository_boundaries.py when the hygiene suite was split
+    # out — the stale entry made the guard flag itself, which is how the move got caught.
+    "tests/repo_hygiene/test_repo_hygiene.py",
 }
 
 

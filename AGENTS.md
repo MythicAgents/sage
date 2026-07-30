@@ -127,7 +127,8 @@ Rules 5 and 6 are prose only; if they recur, that is the signal to build a probe
 
 2. **No checkout-name guessing for external dependencies.** Do not probe for a sibling directory by name, in
    any spelling or version suffix. External locations come from an environment variable
-   (`MYTHIC_ENV_PATH`, `MYTHIC_CLI`, `SAGE_BLOODHOUND_MCP_DIR`) documented in `.env.example`, and the resolver
+   (`MYTHIC_ENV_PATH` / `MYTHIC_CLI` in the repo-root `.env.example`; `SAGE_BLOODHOUND_MCP_DIR` in the runtime
+   `Payload_Type/sage/.env`, since the Sage process itself consumes it), and the resolver
    **fails closed naming the variable to set** when it is absent. A name guess silently reads the wrong install
    on any machine with two checkouts; a refusal is strictly more useful than a wrong default.
 

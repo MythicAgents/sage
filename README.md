@@ -86,7 +86,7 @@ The main settings are:
 | `model` | Provider model identifier |
 | `API_ENDPOINT` | Optional OpenAI-compatible or provider endpoint |
 | `API_KEY` | Provider API key when required |
-| `mode` | `supervised` or `auto` |
+| `mode` | `conversation` (default, read/response only), `supervised`, or `auto` |
 | `autonomous_solve` | Force the autonomous execution kernel for the channel |
 | `policy_mode` | `hybrid`, `symbolic`, or `llm` capability selection |
 | `max_steps` | Global model-step ceiling; `0` means unlimited |
@@ -96,11 +96,16 @@ Never infer the effective backend from the model name alone; record the provider
 
 ## BloodHound MCP
 
-Set the MCP checkout directory before starting Sage:
+Set the MCP checkout directory before starting Sage. This is Sage **runtime** config — the process reads it
+to auto-connect BloodHound at startup — so its home is the Sage runtime env file, not the operator-tooling
+`.env` at the repository root:
 
 ```bash
-export SAGE_BLOODHOUND_MCP_DIR=/path/to/bloodhound_mcp
+echo 'SAGE_BLOODHOUND_MCP_DIR=/path/to/bloodhound_mcp' >> Payload_Type/sage/.env
 ```
+
+The container image bakes its own `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp`; the line above is the
+local-development equivalent. Exporting it in your shell also works for a single session.
 
 The default launcher uses `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run main.py` for the stdio MCP server.
 The BloodHound MCP environment is responsible for its own BloodHound URL and API-token configuration.

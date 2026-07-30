@@ -8,14 +8,12 @@ set -euo pipefail
 SESSION="sage"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
-WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 SNAP="/tmp/sage_env.snapshot"
 VENV_PY="${SAGE_VENV_PY:-$REPO_ROOT/.venv/bin/python}"
 DEFAULT_CWD="${SAGE_CWD:-$REPO_ROOT/Payload_Type/sage}"
 # No checkout-name default: set MYTHIC_ENV_PATH to your install (see .env.example).
 MYTHIC_ENV_PATH="${MYTHIC_ENV_PATH:-}"
 SAGE_RUNTIME_ENV_PATH="${SAGE_RUNTIME_ENV_PATH:-$REPO_ROOT/Payload_Type/sage/.env}"
-DEFAULT_BLOODHOUND_MCP_DIR="${SAGE_DEFAULT_BLOODHOUND_MCP_DIR:-$WORKSPACE_ROOT/bloodhound_mcp}"
 STARTUP_DISCOVERY_SECONDS="${SAGE_STARTUP_DISCOVERY_SECONDS:-10}"
 STARTUP_STABILITY_SECONDS="${SAGE_STARTUP_STABILITY_SECONDS:-3}"
 
@@ -51,11 +49,31 @@ normalize_local_mythic_hosts() {
   esac
 }
 
-ensure_default_bloodhound_dir() {
+require_bloodhound_dir() {
+  # SAGE_BLOODHOUND_MCP_DIR is Sage RUNTIME config — the process reads it to auto-connect the
+  # baked-in BloodHound MCP (ai/bloodhound_config.py). Its home is therefore the runtime env file
+  # ($SAGE_RUNTIME_ENV_PATH, i.e. Payload_Type/sage/.env), mirroring the container's own
+  # `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp`.
+  #
+  # A fresh start already picks it up: that branch sources the runtime env with `set -a`. This
+  # covers restarting an ALREADY-RUNNING Sage, where the snapshot comes from /proc/<pid>/environ and
+  # the env file is never read — so a Sage first started without the variable would otherwise keep
+  # inheriting its absence forever.
+  #
+  # No sibling-checkout guess. readiness_contract.py lists this in REQUIRED_STARTUP_ENV, so a wrong
+  # silent default yields a Sage that starts, passes readiness, and is bound to a BloodHound
+  # checkout the operator never chose.
   local configured
   configured="$(snapshot_last_value SAGE_BLOODHOUND_MCP_DIR)"
+  if [[ -z "$configured" && -f "$SAGE_RUNTIME_ENV_PATH" ]]; then
+    configured="$(grep -E '^SAGE_BLOODHOUND_MCP_DIR=' "$SAGE_RUNTIME_ENV_PATH" | tail -1 | cut -d= -f2- | tr -d "\"'")"
+    [[ -n "$configured" ]] && append_snapshot_override "SAGE_BLOODHOUND_MCP_DIR" "$configured"
+  fi
   if [[ -z "$configured" ]]; then
-    append_snapshot_override "SAGE_BLOODHOUND_MCP_DIR" "$DEFAULT_BLOODHOUND_MCP_DIR"
+    echo "ERR: SAGE_BLOODHOUND_MCP_DIR is not set. Add it to $SAGE_RUNTIME_ENV_PATH (Sage runtime env)" >&2
+    echo "     or pass SAGE_BLOODHOUND_MCP_DIR=<dir> to this script. Sage cannot auto-connect" >&2
+    echo "     BloodHound without it, and readiness requires it." >&2
+    exit 1
   fi
 }
 
@@ -99,7 +117,7 @@ else
 fi
 
 normalize_local_mythic_hosts
-ensure_default_bloodhound_dir
+require_bloodhound_dir
 
 # Optional env overrides: pass KEY=VAL args (e.g. `sage_restart.sh SAGE_ENGAGEMENT_GATE=1`).
 # Appended after the snapshot so they WIN (dict-merge in _sage_relaunch.py = last value wins).

@@ -122,8 +122,9 @@ uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scri
 ```
 
 Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
-The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, defaults
-`SAGE_BLOODHOUND_MCP_DIR` when it is absent, and records a redacted startup identity under
+The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, reads
+`SAGE_BLOODHOUND_MCP_DIR` from the Sage runtime env (`Payload_Type/sage/.env`) and **fails closed** if it is
+still unset — it no longer guesses a sibling checkout — and records a redacted startup identity under
 `/tmp/sage_startup_identity.json` for later readiness/manifest inspection.
 
 6. Run:
