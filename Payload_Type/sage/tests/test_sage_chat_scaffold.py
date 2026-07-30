@@ -335,7 +335,7 @@ def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monk
     from ai import bloodhound_config
     from sage_chat.service import SageChat
 
-    async def _ensure():
+    async def _ensure(**_kwargs):
         return True, "connected"
 
     monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
@@ -380,7 +380,7 @@ def test_supervised_native_chat_keeps_bloodhound_fail_soft(monkeypatch):
 
     events = []
 
-    async def _ensure():
+    async def _ensure(**_kwargs):
         return False, "missing config"
 
     monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
@@ -424,7 +424,7 @@ def test_autonomous_native_chat_initializes_after_exact_bloodhound_admission(mon
 
     events = []
 
-    async def _ensure():
+    async def _ensure(**_kwargs):
         events.append("connect")
         return True, "connected"
 
@@ -629,7 +629,7 @@ def test_new_model_records_exact_admission_state(monkeypatch):
     from ai import bloodhound_config
     from sage_chat.service import SageChat
 
-    async def _ensure():
+    async def _ensure(**_kwargs):
         return True, "connected"
 
     monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _ensure)
@@ -711,7 +711,7 @@ def test_reused_auto_session_is_recreated_for_current_supervised_request(monkeyp
     async def _put(_request, model):
         created.append(model)
 
-    async def _ensure(_self, *, autonomous_required=False):
+    async def _ensure(_self, *, autonomous_required=False, **_kwargs):
         assert autonomous_required is False
         return False
 
@@ -821,7 +821,7 @@ def test_slash_mode_override_reuses_unchanged_base_request_with_bound_autonomy(
     async def _unexpected_drop(*_args, **_kwargs):
         raise AssertionError("an override bound to unchanged base config must not rotate")
 
-    async def _ensure(_self, *, autonomous_required=False):
+    async def _ensure(_self, *, autonomous_required=False, **_kwargs):
         ensure_calls.append(autonomous_required)
         return True
 
@@ -922,7 +922,7 @@ def test_base_request_config_change_rotates_session_and_clears_slash_mode_overri
     async def _put(_request, _model):
         return None
 
-    async def _ensure(_self, *, autonomous_required=False):
+    async def _ensure(_self, *, autonomous_required=False, **_kwargs):
         assert autonomous_required is False
         return False
 
@@ -2263,7 +2263,7 @@ def test_slash_mcp_call_deadline_survives_cancellation_resistant_tool(monkeypatc
 def test_slash_bloodhound(monkeypatch):
     from ai import bloodhound_config as bh
 
-    async def _ensure(directory=None):
+    async def _ensure(directory=None, **_kwargs):
         return (True, "BloodHound MCP connected.")
 
     monkeypatch.setattr(bh, "ensure_bloodhound_connected", _ensure)
@@ -4613,7 +4613,7 @@ def test_headless_solver_connects_bloodhound_before_model_initialize(monkeypatch
 
     events = []
 
-    async def _ensure():
+    async def _ensure(**_kwargs):
         events.append("bloodhound")
         return True, "connected"
 

@@ -70,6 +70,40 @@ def _resolve_bool(
     return default
 
 
+BLOODHOUND_ENV_KEYS = (
+    "BLOODHOUND_DOMAIN",
+    "BLOODHOUND_PORT",
+    "BLOODHOUND_SCHEME",
+    "BLOODHOUND_TOKEN_ID",
+    "BLOODHOUND_TOKEN_KEY",
+)
+
+
+def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:
+    """Resolve BloodHound MCP credentials through the standard Config → Secret → env chain.
+
+    These are forwarded into the MCP server subprocess rather than read by Sage itself. The
+    forwarding is not optional plumbing: the MCP stdio client inherits only a safe subset of the
+    parent environment (``HOME``/``LOGNAME``/``PATH``/``SHELL``/``TERM``/``USER`` on POSIX — see
+    ``mcp.client.stdio.DEFAULT_INHERITED_ENV_VARS``), so a ``BLOODHOUND_*`` variable set on the Sage
+    container never reaches the server on its own. The SDK merges what we pass over that safe set
+    (``stdio/__init__.py``: ``{**get_default_environment(), **server.env}``), so supplying a partial
+    dict adds to the defaults instead of replacing them.
+
+    Only non-empty values are returned, so an unset key stays unset in the subprocess and the MCP
+    server falls back to its own directory ``.env`` — which is what keeps the file-based workflow
+    working unchanged for operators who prefer it.
+    """
+    config = ChatConfigView.from_request(request)
+    secrets = ChatSecretView.from_request(request)
+    resolved: dict[str, str] = {}
+    for key in BLOODHOUND_ENV_KEYS:
+        value = _resolve(config, secrets, key, env_key=key, default="")
+        if value:
+            resolved[key] = value
+    return resolved
+
+
 def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     """Produce the kwargs for ``Model(**kwargs)`` from a ``ChatRequest``.
 

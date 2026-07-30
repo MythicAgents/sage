@@ -69,16 +69,28 @@ python3 -m venv .venv
 Do not put credentials in tracked files. Use process environment variables, a local gitignored `.env`, Mythic
 user secrets, or a secret manager.
 
+## Configuration load order
+
+Every native-chat setting — model settings and BloodHound credentials alike — resolves through one
+chain, first non-empty wins:
+
+1. **Mythic channel configuration** — the per-chat fields you fill in when creating a Sage chat.
+2. **Mythic user secrets** — the operator's stored secrets. Preferred home for tokens and API keys.
+3. **Sage process environment** — the container's environment, or your shell for local development.
+4. **Safe defaults**, where one exists.
+
+Implemented once in `Payload_Type/sage/sage_chat/config.py` (`_resolve`); adding a setting means
+adding a lookup, not a new mechanism.
+
+One caveat worth knowing before you rely on layer 3: the BloodHound MCP runs as a **subprocess**, and
+the MCP stdio client only passes it a fixed safe subset of Sage's environment (`HOME`, `LOGNAME`,
+`PATH`, `SHELL`, `TERM`, `USER`). A `BLOODHOUND_*` variable set on the Sage container therefore does
+not reach the MCP server by inheritance — Sage resolves it through the chain above and forwards it
+explicitly. See the next section for the file-based alternative.
+
 ## Model configuration
 
-Native chat resolves configuration in this order:
-
-1. Mythic channel configuration.
-2. Mythic user secrets.
-3. Sage process environment.
-4. Safe defaults where one exists.
-
-The main settings are:
+Model settings resolve through the chain above. The main settings are:
 
 | Setting | Purpose |
 |---|---|
@@ -108,7 +120,55 @@ The container image bakes its own `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_m
 local-development equivalent. Exporting it in your shell also works for a single session.
 
 The default launcher uses `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run main.py` for the stdio MCP server.
-The BloodHound MCP environment is responsible for its own BloodHound URL and API-token configuration.
+
+### BloodHound credentials
+
+The MCP server needs to reach your BloodHound CE instance. These resolve through the standard load
+order, so the usual place to put them is the Mythic chat configuration or your Mythic user secrets —
+the same place your model API key already lives:
+
+| Setting | Purpose |
+|---|---|
+| `BLOODHOUND_DOMAIN` | BloodHound CE host |
+| `BLOODHOUND_TOKEN_ID` | API token ID |
+| `BLOODHOUND_TOKEN_KEY` | API token key |
+| `BLOODHOUND_PORT` | Optional; MCP default `443`, BloodHound CE web UI is commonly `8080` |
+| `BLOODHOUND_SCHEME` | Optional; default `https` |
+
+Sage forwards whatever it resolves into the MCP subprocess. Anything you leave unset is simply not
+forwarded, so the server falls back to its own `.env` — which is what keeps the file-based workflow
+below working unchanged.
+
+The BloodHound connection is **process-global**: the first chat that actually connects establishes
+the credentials for the whole container, and later chats reuse that connection. Changing credentials
+means restarting the container, not just opening a new chat.
+
+### Using a `.env` file instead, under a Mythic install
+
+The container bakes its own MCP checkout at `/opt/bloodhound_mcp` so the first connect needs no
+network. **That directory is inside the image, not the bind mount** — Mythic mounts only
+`<mythic>/InstalledServices/sage` onto `/Mythic`. A `.env` written into `/opt/bloodhound_mcp` with
+`docker exec` therefore survives a restart but is destroyed by any image rebuild.
+
+For a `.env` that persists, put your own MCP checkout inside the mounted service directory and point
+Sage at it:
+
+```bash
+# On the Mythic host — <mythic> is your Mythic installation directory
+git clone https://github.com/mwnickerson/bloodhound_mcp.git <mythic>/InstalledServices/sage/bloodhound_mcp
+printf 'BLOODHOUND_DOMAIN=%s\nBLOODHOUND_TOKEN_ID=%s\nBLOODHOUND_TOKEN_KEY=%s\n' "$BH_DOMAIN" "$BH_TOKEN_ID" "$BH_TOKEN_KEY" > <mythic>/InstalledServices/sage/bloodhound_mcp/.env
+```
+
+Then set `SAGE_BLOODHOUND_MCP_DIR=/Mythic/bloodhound_mcp` — the **container-side** path for that
+directory — through the chat configuration or the container environment.
+
+Trade-offs, so you can pick deliberately: this persists across rebuilds and keeps credentials in a
+file you control, but the checkout is no longer pinned by the image, `uv` resolves its dependencies
+on first connect (so that connect needs network), and the credentials sit in plaintext inside the
+service directory. The chat-configuration route avoids all three.
+
+For local development outside Mythic there is no bind mount and no baked checkout: point
+`SAGE_BLOODHOUND_MCP_DIR` at your own clone and put the `.env` beside it, as above.
 
 Autonomous sessions fail closed if BloodHound cannot connect with the graph tools required by the execution
 kernel. Ordinary supervised chat remains available in a degraded, fail-soft state so an operator can diagnose or

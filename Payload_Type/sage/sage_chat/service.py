@@ -178,7 +178,12 @@ class SageChat(Chat):
             from ..ai.mcp import MCPManager  # type: ignore
         return bool(MCPManager.is_bloodhound_server(server))
 
-    async def _ensure_bloodhound_connected(self, *, autonomous_required: bool = False) -> bool:
+    async def _ensure_bloodhound_connected(
+        self,
+        *,
+        autonomous_required: bool = False,
+        request: Any = None,
+    ) -> bool:
         """Lazily auto-connect the BloodHound MCP on the chat-request path.
 
         Connected here rather than at container boot on purpose: the MCP stdio session is bound to the
@@ -201,9 +206,22 @@ class SageChat(Chat):
                 bloodhound_tool_admission,
                 ensure_bloodhound_connected,
             )
+        bloodhound_env: dict[str, str] = {}
+        if request is not None:
+            try:
+                try:
+                    from .config import build_bloodhound_env
+                except ImportError:  # pragma: no cover
+                    from config import build_bloodhound_env  # type: ignore
+                bloodhound_env = build_bloodhound_env(request)
+            except Exception as exc:  # pragma: no cover - resolution must never block connect
+                logger.debug(f"BloodHound credential resolution skipped: {exc}")
         try:
-            connected, message = await ensure_bloodhound_connected()
-            logger.info(f"BloodHound auto-connect (chat): {message}")
+            connected, message = await ensure_bloodhound_connected(env=bloodhound_env or None)
+            logger.info(
+                f"BloodHound auto-connect (chat): {message}"
+                + (f" [credentials supplied: {sorted(bloodhound_env)}]" if bloodhound_env else "")
+            )
             admission = bloodhound_tool_admission()
             admitted = bool(
                 connected
@@ -317,7 +335,9 @@ class SageChat(Chat):
             await self._refresh_auth_context(existing, request)
             autonomous_now = bool(getattr(existing, "_autonomous_solve", False))
             if autonomous_now:
-                admitted = await self._ensure_bloodhound_connected(autonomous_required=True)
+                admitted = await self._ensure_bloodhound_connected(
+                    autonomous_required=True, request=request
+                )
                 if not getattr(existing, "_bloodhound_exact_admission_at_initialize", False):
                     raise RuntimeError(
                         "Autonomous native chat requires a fresh channel/session because this "
@@ -352,7 +372,7 @@ class SageChat(Chat):
         # be seen by this session's graph. Mirrors the legacy task path's ensure_bloodhound_task_preflight
         # (which sage_chat previously omitted, so chat sessions never auto-connected BloodHound at all).
         admitted_at_initialize = await self._ensure_bloodhound_connected(
-            autonomous_required=bool(kwargs.get("autonomous_solve"))
+            autonomous_required=bool(kwargs.get("autonomous_solve")), request=request
         )
         model._bloodhound_exact_admission_at_initialize = bool(admitted_at_initialize)
         await model.initialize()

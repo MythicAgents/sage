@@ -51,9 +51,19 @@ def _safe_server_identity(server: Any) -> str:
     return type(server).__name__
 
 
-def bloodhound_mcp_config(directory: Optional[str] = None) -> Optional[MCPConnectionConfig]:
+def bloodhound_mcp_config(
+    directory: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+) -> Optional[MCPConnectionConfig]:
     """Build the BloodHound MCP stdio config from an explicit directory or SAGE_BLOODHOUND_MCP_DIR.
-    Returns None when no directory is configured (auto-connect then no-ops, gracefully)."""
+    Returns None when no directory is configured (auto-connect then no-ops, gracefully).
+
+    ``env`` carries BloodHound connection credentials into the server subprocess. It must be passed
+    explicitly: the MCP stdio client inherits only a safe subset of the parent environment (POSIX:
+    HOME/LOGNAME/PATH/SHELL/TERM/USER), so ``BLOODHOUND_*`` set on the Sage process does NOT reach
+    the server by itself. The SDK merges this dict over that safe set rather than replacing it, so a
+    partial dict is fine. Empty/None leaves the server to read its own directory ``.env`` as before.
+    """
     d = directory or os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
     if not d:
         return None
@@ -62,7 +72,7 @@ def bloodhound_mcp_config(directory: Optional[str] = None) -> Optional[MCPConnec
         name=BLOODHOUND_SERVER_NAME,
         command=command,
         args=["--directory", d, "run", "main.py"],
-        env={},
+        env=dict(env) if env else {},
         cwd=d,
         encoding=None,
         encoding_error_handler=None,
@@ -188,15 +198,23 @@ def bloodhound_tool_admission() -> dict[str, Any]:
     }
 
 
-async def ensure_bloodhound_connected(directory: Optional[str] = None) -> tuple[bool, str]:
+async def ensure_bloodhound_connected(
+    directory: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[bool, str]:
     """Connect the BloodHound MCP if not already connected. Idempotent. Returns (connected, message).
 
     MUST be awaited inside the serving event loop (the MCP stdio session is bound to the loop that
     creates it) — i.e. from a task handler or the agent run, NOT a throwaway loop at import time.
+
+    ``env`` supplies BloodHound credentials to the server subprocess (see ``bloodhound_mcp_config``).
+    Because the connection is process-global, the FIRST caller to actually connect establishes the
+    credentials for the container; later callers short-circuit on the already-connected check and
+    their ``env`` is not applied. Reconnect (or restart the container) to change credentials.
     """
     if bloodhound_connected():
         return True, "BloodHound MCP already connected."
-    config = bloodhound_mcp_config(directory)
+    config = bloodhound_mcp_config(directory, env)
     if config is None:
         return False, ("BloodHound MCP not connected and no connection params configured "
                        "(set SAGE_BLOODHOUND_MCP_DIR or pass a directory).")

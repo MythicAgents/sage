@@ -1582,7 +1582,7 @@ def test_slash_auto_override_reused_supervised_base_routes_objective_to_controll
         async def _unexpected_drop(*_args, **_kwargs):
             raise AssertionError("unchanged base request must preserve the slash override")
 
-        async def _ensure(_self, *, autonomous_required=False):
+        async def _ensure(_self, *, autonomous_required=False, **_kwargs):
             assert autonomous_required is True
             return True
 
