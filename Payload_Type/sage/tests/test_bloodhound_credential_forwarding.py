@@ -399,6 +399,81 @@ def test_reused_non_autonomous_session_still_attempts_bloodhound():
     assert "autonomous_required" not in else_part, "the reuse keep-warm must stay fail-soft"
 
 
+def _canonical_with_env(tmp_path, env):
+    """Build the real stdio config against a real directory and run the real pre-connect guard."""
+    import os
+
+    from ai.mcp import MCPManager
+    from ai.bloodhound_config import bloodhound_mcp_config
+
+    d = str(tmp_path)
+    prior = os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+    os.environ["SAGE_BLOODHOUND_MCP_DIR"] = d
+    try:
+        return MCPManager._is_canonical_bloodhound_config(bloodhound_mcp_config(d, env))
+    finally:
+        if prior is None:
+            os.environ.pop("SAGE_BLOODHOUND_MCP_DIR", None)
+        else:
+            os.environ["SAGE_BLOODHOUND_MCP_DIR"] = prior
+
+
+def test_canonical_guard_admits_credentials_and_empty_env(tmp_path):
+    """The guard required `env == {}`, which refused the credentials the MCP server needs.
+
+    Empty must stay admissible so the pre-credential shape is unchanged, and the five credential
+    keys must now pass — that is the whole point of the relaxation.
+    """
+    from ai.mcp import BLOODHOUND_CREDENTIAL_ENV_KEYS
+
+    assert _canonical_with_env(tmp_path, None) is True
+    assert _canonical_with_env(tmp_path, {}) is True
+    assert _canonical_with_env(tmp_path, {"BLOODHOUND_DOMAIN": "127.0.0.1"}) is True
+    assert _canonical_with_env(tmp_path, {k: "v" for k in BLOODHOUND_CREDENTIAL_ENV_KEYS}) is True
+
+
+def test_canonical_guard_still_refuses_execution_redirecting_env(tmp_path):
+    """The property the guard defends: nothing may point the trusted launcher at other code.
+
+    These are the variables that make injected environment dangerous. If any of them ever passes,
+    the allowlist has been widened into a hole — the canonical name, directory and execution class
+    would all still look correct while a different binary runs.
+    """
+    for hostile in (
+        {"PATH": "/tmp/evil"},
+        {"LD_PRELOAD": "/tmp/x.so"},
+        {"PYTHONPATH": "/tmp/evil"},
+        {"VIRTUAL_ENV": "/tmp/evil"},
+        {"BLOODHOUND_DOMAIN": "127.0.0.1", "PATH": "/tmp/evil"},
+    ):
+        assert _canonical_with_env(tmp_path, hostile) is False, f"must refuse {sorted(hostile)}"
+
+
+def test_canonical_guard_matches_keys_exactly_not_by_prefix(tmp_path):
+    """A `BLOODHOUND_`-prefix rule would admit any future variable the server may interpret."""
+    assert _canonical_with_env(tmp_path, {"BLOODHOUND_EXTRA": "x"}) is False
+    assert _canonical_with_env(tmp_path, {"BLOODHOUND_": "x"}) is False
+    assert _canonical_with_env(tmp_path, {"bloodhound_domain": "x"}) is False, "case-exact"
+
+
+def test_canonical_guard_requires_string_values_and_a_dict(tmp_path):
+    """Non-strings get coerced somewhere downstream, and coercion is where surprises live."""
+    assert _canonical_with_env(tmp_path, {"BLOODHOUND_PORT": 8083}) is False
+    assert _canonical_with_env(tmp_path, {"BLOODHOUND_DOMAIN": None}) is False
+
+    from ai.mcp import _bloodhound_env_admissible
+
+    assert _bloodhound_env_admissible(["BLOODHOUND_DOMAIN=x"]) is False
+    assert _bloodhound_env_admissible("BLOODHOUND_DOMAIN=x") is False
+
+
+def test_credential_allowlist_is_the_same_list_the_resolver_uses():
+    """A key resolvable but not admissible would fail at connect with a confusing guard error."""
+    from ai.mcp import BLOODHOUND_CREDENTIAL_ENV_KEYS
+
+    assert tuple(BLOODHOUND_ENV_KEYS) == tuple(BLOODHOUND_CREDENTIAL_ENV_KEYS)
+
+
 def test_stdio_client_does_not_inherit_bloodhound_vars_by_default():
     """The premise the forwarding exists for.
 

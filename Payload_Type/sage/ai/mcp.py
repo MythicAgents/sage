@@ -33,6 +33,30 @@ ALLOWED_MCP_EXECUTION_CLASSES = frozenset({
     MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
     MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
 })
+
+# The ONLY environment variables admissible into the canonical BloodHound MCP subprocess.
+#
+# The canonical check previously required `env == {}` outright. That forbade the credential
+# forwarding the MCP server needs, because the stdio client passes a subprocess only a fixed safe
+# subset of the parent environment — so a BLOODHOUND_* variable set on the Sage container never
+# reaches the server on its own and must be handed over explicitly.
+#
+# Allowlisting these five keeps the property the guard actually defends. What makes injected
+# environment dangerous is variables that redirect execution — PATH, PYTHONPATH, LD_PRELOAD,
+# VIRTUAL_ENV and friends — which could point the trusted launcher at attacker-chosen code while it
+# keeps the canonical name, directory and execution class. These five are inert data consumed by the
+# MCP server's HTTP client; none of them influences what binary runs. Anything outside this set is
+# still refused before connect.
+#
+# Defined here rather than in ai/bloodhound_config.py because that module imports from this one;
+# the reverse would be a circular import. bloodhound_config re-exports it as the canonical name.
+BLOODHOUND_CREDENTIAL_ENV_KEYS = (
+    "BLOODHOUND_DOMAIN",
+    "BLOODHOUND_PORT",
+    "BLOODHOUND_SCHEME",
+    "BLOODHOUND_TOKEN_ID",
+    "BLOODHOUND_TOKEN_KEY",
+)
 _LEGACY_MCP_EXECUTION_CLASS_ALIASES = {
     "control_plane": MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
 }
@@ -45,6 +69,26 @@ def normalize_execution_class(value: Any) -> str:
 
 def execution_class_allowed(value: Any) -> bool:
     return normalize_execution_class(value) in ALLOWED_MCP_EXECUTION_CLASSES
+
+
+def _bloodhound_env_admissible(env: Any) -> bool:
+    """True when env carries nothing beyond the BloodHound credential allowlist.
+
+    Empty stays admissible, so the pre-credential shape is unchanged. Keys are matched exactly —
+    no prefix rule — because a prefix rule would admit anything an attacker can name
+    ``BLOODHOUND_``-something, including future variables the MCP server may interpret. Values must
+    be strings: a non-string would be coerced somewhere downstream, and coercion is where surprises
+    live.
+    """
+    if env is None or env == {}:
+        return True
+    if not isinstance(env, dict):
+        return False
+    allowed = set(BLOODHOUND_CREDENTIAL_ENV_KEYS)
+    return all(
+        isinstance(key, str) and key in allowed and isinstance(value, str)
+        for key, value in env.items()
+    )
 
 
 _execution_observer: contextvars.ContextVar[Any] = contextvars.ContextVar(
@@ -343,7 +387,7 @@ class MCPServerManager:
             == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
             and config.connection_type == ConnectionType.STDIO
             and str(config.command or "") == expected_command
-            and config.env == {}
+            and _bloodhound_env_admissible(config.env)
             and str(config.cwd or "") == configured_dir
             and os.path.realpath(str(config.cwd or "")) == expected_dir
             and len(args) == 4

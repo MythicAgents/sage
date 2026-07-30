@@ -15,6 +15,7 @@ from collections import Counter
 from typing import Any, Optional
 
 from ai.mcp import (
+    BLOODHOUND_CREDENTIAL_ENV_KEYS,
     MCPManager,
     MCPConnectionConfig,
     MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
@@ -24,16 +25,12 @@ from ai.mcp import (
 BLOODHOUND_SERVER_NAME = "BloodHound"
 REQUIRED_BLOODHOUND_TOOLS = frozenset({"file_upload", "domain_info", "cypher_query"})
 
-# Canonical list, defined here so the resolver (sage_chat/config.py), the UI declaration
-# (sage_chat/models.py) and this diagnostic cannot drift apart. sage_chat depends on ai, never
-# the reverse, so this is the correct home.
-BLOODHOUND_CREDENTIAL_KEYS = (
-    "BLOODHOUND_DOMAIN",
-    "BLOODHOUND_PORT",
-    "BLOODHOUND_SCHEME",
-    "BLOODHOUND_TOKEN_ID",
-    "BLOODHOUND_TOKEN_KEY",
-)
+# Single definition, re-exported. It lives in ai/mcp.py because the pre-connect canonical-config
+# guard there needs it to allowlist what may enter the MCP subprocess, and this module imports from
+# that one — defining it here would be a circular import. Re-exported under the name the resolver
+# (sage_chat/config.py), the UI declaration (sage_chat/models.py) and the diagnostic below already
+# use, so all four stay bound to one list.
+BLOODHOUND_CREDENTIAL_KEYS = BLOODHOUND_CREDENTIAL_ENV_KEYS
 # The MCP server refuses to start without these three; PORT and SCHEME have defaults.
 BLOODHOUND_REQUIRED_CREDENTIAL_KEYS = (
     "BLOODHOUND_DOMAIN",
