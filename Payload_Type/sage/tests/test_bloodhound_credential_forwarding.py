@@ -308,6 +308,97 @@ def test_slash_force_reaches_the_connect_call(monkeypatch):
     assert seen["force"] is False, "plain /bloodhound must stay idempotent"
 
 
+def test_signature_without_bloodhound_is_byte_identical_to_the_legacy_form():
+    """No BloodHound configuration must hash exactly as before, so upgrading rotates nobody."""
+    import sage_chat.service as svc
+
+    kwargs = {"provider": "openai", "model": "x", "mode": "conversation"}
+    legacy = svc._model_config_signature(kwargs)
+    assert legacy == svc._model_config_signature(kwargs, None)
+    assert legacy == svc._model_config_signature(kwargs, {})
+
+
+def test_changing_bloodhound_config_changes_the_session_signature():
+    """The fix for 'configured it and nothing happened'.
+
+    Model.initialize() resolves the BloodHound tool list at build time, so a session cannot pick up
+    a later connection. Changing BloodHound configuration therefore has to rotate the session — and
+    rotation is driven entirely by this signature.
+    """
+    import sage_chat.service as svc
+
+    kwargs = {"provider": "openai", "model": "x", "mode": "conversation"}
+    none = svc._model_config_signature(kwargs)
+    one = svc._model_config_signature(kwargs, {"BLOODHOUND_DOMAIN": "127.0.0.1"})
+    two = svc._model_config_signature(kwargs, {"BLOODHOUND_DOMAIN": "10.0.0.5"})
+
+    assert one != none, "adding BloodHound config must rotate"
+    assert one != two, "changing a BloodHound value must rotate"
+
+
+def test_signature_is_order_stable_and_does_not_mutate_caller_kwargs():
+    import sage_chat.service as svc
+
+    kwargs = {"provider": "openai", "model": "x"}
+    snapshot = dict(kwargs)
+    a = svc._model_config_signature(kwargs, {"BLOODHOUND_PORT": "8083", "BLOODHOUND_DOMAIN": "x"})
+    b = svc._model_config_signature(kwargs, {"BLOODHOUND_DOMAIN": "x", "BLOODHOUND_PORT": "8083"})
+
+    assert a == b, "dict ordering must not change the signature"
+    assert kwargs == snapshot, "kwargs are passed to Model(**kwargs) and must not be mutated"
+
+
+def test_get_or_create_model_actually_feeds_bloodhound_into_the_signature():
+    """Testing `_model_config_signature` proves nothing if the call site never passes the env.
+
+    Caught by a green→red→green control: reverting the call site to the one-argument form left every
+    other signature test passing, because they all call the helper directly. This asserts the wiring.
+    """
+    import inspect
+
+    import sage_chat.service as svc
+
+    src = inspect.getsource(svc.SageChat._get_or_create_model)
+    assert "build_bloodhound_env(request)" in src, (
+        "_get_or_create_model must resolve BloodHound config for the signature"
+    )
+    assert "_model_config_signature(kwargs, bloodhound_env)" in src, (
+        "the resolved BloodHound config must be fed into the session signature, or changing "
+        "credentials will not rotate the session and the new values never reach the graph"
+    )
+
+
+def test_reused_non_autonomous_session_still_attempts_bloodhound():
+    """Guard for the branch scoping, not just the behaviour.
+
+    Two failure modes are covered. First the reported one: only the autonomous branch attempted a
+    connect, so a reused conversation session never tried. Second the one I introduced fixing it —
+    inserting the `else` swallowed the autonomous branch's per-turn admission check, which is a
+    safety guard, and made `admitted` unbound. Both live in the same if/else, so both are asserted
+    here against the source.
+    """
+    import inspect
+    import re
+
+    import sage_chat.service as svc
+
+    src = inspect.getsource(svc.SageChat._get_or_create_model)
+    branch = src[src.index("autonomous_now = bool(") :]
+    branch = branch[: branch.index("return existing, True")]
+
+    assert re.search(r"\n\s+else:", branch), "reused non-autonomous sessions must attempt a connect"
+    assert branch.count("_ensure_bloodhound_connected") == 2, "both branches must attempt a connect"
+
+    autonomous_part, else_part = branch.split("\n            else:", 1)
+    assert "if not admitted" in autonomous_part, (
+        "the per-turn admission guard must stay inside the autonomous branch — it was swallowed by "
+        "the else once already, which unbound `admitted` and dropped a safety check"
+    )
+    assert "if not admitted" not in else_part
+    assert "autonomous_required=True" in autonomous_part
+    assert "autonomous_required" not in else_part, "the reuse keep-warm must stay fail-soft"
+
+
 def test_stdio_client_does_not_inherit_bloodhound_vars_by_default():
     """The premise the forwarding exists for.
 

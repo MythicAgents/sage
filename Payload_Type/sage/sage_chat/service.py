@@ -26,7 +26,7 @@ from typing import Any
 from mythic_container.ChatBase import Chat, ChatRequest
 from mythic_container.logging import logger
 
-from .config import build_model_kwargs
+from .config import build_bloodhound_env, build_model_kwargs
 from .hitl import (
     approved_action_ids_for_request,
     approval_response_matches,
@@ -58,9 +58,25 @@ def _nonempty_native_response_text(value: Any) -> str:
     return text if text.strip() else ""
 
 
-def _model_config_signature(kwargs: dict[str, Any]) -> str:
-    """Bind a reusable session to the exact resolved ChatRequest constructor config."""
-    encoded = json.dumps(kwargs, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+def _model_config_signature(
+    kwargs: dict[str, Any],
+    bloodhound_env: dict[str, str] | None = None,
+) -> str:
+    """Bind a reusable session to the exact resolved ChatRequest constructor config.
+
+    ``bloodhound_env`` is folded in even though it is not a ``Model`` constructor kwarg. It has to
+    be: ``Model.initialize()`` wires the BloodHound agent's tools from the MCP servers connected at
+    that moment, so a session whose graph already resolved its tool list cannot pick up a later
+    connection. Changing BloodHound configuration must therefore rotate the session, not mutate it.
+
+    Folded in only when non-empty, so a request with no BloodHound configuration hashes exactly as
+    it did before this parameter existed — existing sessions do not churn on upgrade. The result is
+    a SHA-256 digest, so no credential value is retained.
+    """
+    payload: dict[str, Any] = dict(kwargs)
+    if bloodhound_env:
+        payload["__bloodhound__"] = dict(sorted(bloodhound_env.items()))
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -312,7 +328,12 @@ class SageChat(Chat):
         any change rotates the Model instead of mutating a partially stale graph in place.
         """
         kwargs = build_model_kwargs(request)
-        config_signature = _model_config_signature(kwargs)
+        try:
+            bloodhound_env = build_bloodhound_env(request)
+        except Exception as exc:  # pragma: no cover - resolution must never block a chat turn
+            logger.debug(f"BloodHound credential resolution skipped for signature: {exc}")
+            bloodhound_env = {}
+        config_signature = _model_config_signature(kwargs, bloodhound_env)
         existing = await get_channel_session(request)
         existing = await self._rotate_auth_changed_session(request, existing)
         if existing is not None and (
@@ -347,6 +368,14 @@ class SageChat(Chat):
                     raise RuntimeError(
                         "Autonomous native chat requires BloodHound MCP exact-tool admission on every turn."
                     )
+            else:
+                # Fail-soft keep-warm. Previously only the autonomous branch attempted this, so a
+                # reused conversation/supervised session never tried to connect BloodHound at all —
+                # an operator who configured it and kept chatting saw nothing happen, not even an
+                # error. Idempotent when already connected. Note this cannot retro-fit tools into
+                # THIS session's graph (Model.initialize() already resolved its tool list); the
+                # signature change above is what rebuilds the session when configuration changes.
+                await self._ensure_bloodhound_connected(request=request)
             return existing, True
 
         # Lazy import: keep the heavy LangGraph/LangChain import off the module load path so the pure
