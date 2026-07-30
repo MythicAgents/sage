@@ -3495,6 +3495,11 @@ _EXPECTED_CONFIG_OPTIONS = {
     "provider", "model", "mode", "autonomous_solve", "policy_mode", "max_steps",
     "system_prompt", "API_ENDPOINT", "API_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_DEFAULT_REGION",
+    # BloodHound MCP connection (added 2026-07-30). Kept in this exact-equality inventory rather
+    # than relaxing the assertion to a subset: the point of the set is that every option Mythic
+    # renders is deliberate, so an accidental addition should fail here just as a removal does.
+    "BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY",
+    "BLOODHOUND_PORT", "BLOODHOUND_SCHEME",
 }
 
 

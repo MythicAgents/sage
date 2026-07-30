@@ -173,6 +173,58 @@ _CONFIG_OPTIONS = [
         Description="[OPTIONAL] The AWS Region (AWS_DEFAULT_REGION) to use for Bedrock.",
         Required=False,
     ),
+    # BloodHound MCP connection. Forwarded into the MCP server subprocess, which is why they must be
+    # resolved here rather than left to the container environment: the MCP stdio client passes the
+    # subprocess only a fixed safe subset of Sage's env (HOME/LOGNAME/PATH/SHELL/TERM/USER), so a
+    # BLOODHOUND_* variable set on the container never reaches the server by inheritance.
+    # Leave every field blank to keep the server's own directory .env as the source of truth.
+    ChatModelConfigurationOption(
+        Name="BLOODHOUND_DOMAIN",
+        DisplayName="BloodHound Host",
+        Type=OptType.String,
+        Description="[OPTIONAL] BloodHound CE host for the MCP server to connect to.",
+        Required=False,
+        HelpText=(
+            "Resolution order: this field → the BLOODHOUND_DOMAIN user secret → the container's "
+            "BLOODHOUND_DOMAIN env var. Leave blank to use the BloodHound MCP server's own .env."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="BLOODHOUND_TOKEN_ID",
+        DisplayName="BloodHound Token ID",
+        Type=OptType.String,
+        Description="[OPTIONAL] BloodHound CE API token ID.",
+        Required=False,
+        HelpText=(
+            "Stored in plaintext channel config. To keep it hidden, leave this blank and set the "
+            "BLOODHOUND_TOKEN_ID user secret instead."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="BLOODHOUND_TOKEN_KEY",
+        DisplayName="BloodHound Token Key",
+        Type=OptType.String,
+        Description="[OPTIONAL] BloodHound CE API token key.",
+        Required=False,
+        HelpText=(
+            "Stored in plaintext channel config. To keep it hidden, leave this blank and set the "
+            "BLOODHOUND_TOKEN_KEY user secret instead."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="BLOODHOUND_PORT",
+        DisplayName="BloodHound Port",
+        Type=OptType.String,
+        Description="[OPTIONAL] BloodHound CE port. MCP default is 443; the CE web UI is commonly 8080.",
+        Required=False,
+    ),
+    ChatModelConfigurationOption(
+        Name="BLOODHOUND_SCHEME",
+        DisplayName="BloodHound Scheme",
+        Type=OptType.String,
+        Description="[OPTIONAL] http or https. Defaults to https when unset.",
+        Required=False,
+    ),
 ]
 
 SAGE_MODELS = [
@@ -194,6 +246,14 @@ SAGE_MODELS = [
                 "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN",
                 "AWS_DEFAULT_REGION",
+                # BloodHound MCP credentials. Declared here as well as in ConfigurationOptions for the
+                # same reason as API_KEY: the config field is convenient, the secret keeps the token
+                # out of plaintext channel config, and the resolution order lets either win.
+                "BLOODHOUND_DOMAIN",
+                "BLOODHOUND_TOKEN_ID",
+                "BLOODHOUND_TOKEN_KEY",
+                "BLOODHOUND_PORT",
+                "BLOODHOUND_SCHEME",
             ],
             RequiredChannelAPITokenScopes=_CHANNEL_TOKEN_SCOPES,
             SlashCommands=SLASH_COMMANDS,

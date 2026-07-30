@@ -94,6 +94,30 @@ def test_caller_dict_is_copied_not_aliased():
     assert cfg.env == {"BLOODHOUND_DOMAIN": "bh.example.local"}
 
 
+def test_every_resolved_key_is_declared_to_mythic():
+    """Resolution without declaration is invisible to the operator.
+
+    The 2026-07-30 miss: `build_bloodhound_env` read all five keys correctly, but nothing declared
+    them in `ChatModelMetadata`, so Mythic rendered no fields and never populated `request.Config`.
+    The credential path worked and could not be reached. This ties the two sides together — a key
+    added to the resolver but not to the UI declaration (or vice versa) fails here.
+    """
+    from sage_chat.models import SAGE_MODELS, _CONFIG_OPTIONS
+
+    declared_options = {opt.Name for opt in _CONFIG_OPTIONS}
+    declared_secrets = set(SAGE_MODELS[0].Metadata.OptionalUserSecrets)
+
+    for key in BLOODHOUND_ENV_KEYS:
+        assert key in declared_options, (
+            f"{key} is resolved by build_bloodhound_env but not declared as a chat configuration "
+            "option — the operator would have no field to fill in"
+        )
+        assert key in declared_secrets, (
+            f"{key} is resolved by build_bloodhound_env but not declared as an optional user "
+            "secret — the secret-store layer of the documented resolution order would be dead"
+        )
+
+
 def test_stdio_client_does_not_inherit_bloodhound_vars_by_default():
     """The premise the forwarding exists for.
 
