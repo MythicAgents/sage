@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,14 @@ from urllib.parse import quote
 from .corpus import artifact_kind, build_manifest
 from .labeler import classify_observation, repair_for_label
 from .schema import (
+    EVIDENCE_ROLE_DIAGNOSTIC_ONLY,
+    EVIDENCE_ROLE_EMPIRICAL_NEGATIVE,
+    EVIDENCE_ROLE_EMPIRICAL_OUTCOME,
+    LABEL_SOURCE_BLOODHOUND,
+    LABEL_SOURCE_DIAGNOSTIC_ONLY,
+    LABEL_SOURCE_MYTHIC_PROOF,
+    OUTCOME_DIAGNOSTIC_ONLY,
+    OUTCOME_INDEPENDENTLY_OBSERVED,
     SourceArtifact,
     TransitionCommand,
     TransitionObservation,
@@ -153,6 +162,40 @@ def export_ledger_artifact(path: Path, artifact: SourceArtifact | None = None) -
         technique = str(row.get("technique") or row.get("capability") or "")
         target = str(row.get("target") or "")
         labels = ("ledger_" + status,)
+        evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
+        proof = (
+            row.get("proof_envelope")
+            if isinstance(row.get("proof_envelope"), dict)
+            else evidence.get("proof_envelope")
+            if isinstance(evidence.get("proof_envelope"), dict)
+            else {}
+        )
+        proof_origin = str(proof.get("origin") or "").casefold()
+        proof_hash = _proof_hash(proof, evidence)
+        proof_lineage_complete = all(
+            str(proof.get(key) or "").strip()
+            for key in ("transaction_id", "task_id", "verifier_id", "callback_id")
+        )
+        proof_runtime_lineage = (
+            str(proof.get("scope") or "").casefold() == "runtime"
+            and proof_origin in {"mythic_task", "mythic_artifact", "mythic_credential", "bloodhound_ingest"}
+            and bool(str(proof.get("verifier_id") or ""))
+            and proof_lineage_complete
+        )
+        proof_admissible = (
+            proof_runtime_lineage
+            and str(evidence.get("proof_persistence_state") or proof.get("persistence_state") or "admitted").casefold()
+            == "admitted"
+            and str(proof.get("terminal_status") or "").casefold() in {"completed", "complete", "success", "succeeded"}
+        )
+        empirical_negative = status in {"failed", "blocked"} and proof_runtime_lineage
+        label_source = (
+            LABEL_SOURCE_BLOODHOUND
+            if proof_origin == "bloodhound_ingest"
+            else LABEL_SOURCE_MYTHIC_PROOF
+            if proof_admissible or empirical_negative
+            else LABEL_SOURCE_DIAGNOSTIC_ONLY
+        )
         record = TransitionRecord(
             run_id=_run_id_from_path(path),
             source_files=(str(path),),
@@ -167,10 +210,36 @@ def export_ledger_artifact(path: Path, artifact: SourceArtifact | None = None) -
                     source=str(path),
                 ),
             ),
-            verifier=TransitionVerifier(status=status, labels=labels),
+            verifier=TransitionVerifier(
+                status=status,
+                labels=labels,
+                evidence={"proof_origin": proof_origin},
+                verifier_id=str(proof.get("verifier_id") or ""),
+                verifier_version=str(proof.get("verifier_version") or "v1"),
+                proof_ids=((proof_hash,) if proof_hash else ()),
+                admissible_proof=proof_admissible,
+            ),
             failure_label="" if status == "achieved" else "ledger_" + status,
             repair=None,
             state_after={"effects_added": row.get("effects") or row.get("effect") or []},
+            engagement_id=str(data.get("engagement_id") or ""),
+            decision_id=str(evidence.get("decision_id") or ""),
+            transaction_id=str(proof.get("transaction_id") or evidence.get("transaction_id") or ""),
+            callback_id=str(proof.get("callback_id") or evidence.get("callback_id") or ""),
+            task_ids=((str(proof.get("task_id")),) if proof.get("task_id") else ()),
+            proof_ids=((proof_hash,) if proof_hash else ()),
+            proof_envelope=dict(proof),
+            label_source=label_source,
+            evidence_role=(
+                EVIDENCE_ROLE_EMPIRICAL_OUTCOME
+                if status == "achieved" and proof_admissible
+                else EVIDENCE_ROLE_EMPIRICAL_NEGATIVE
+                if empirical_negative
+                else EVIDENCE_ROLE_DIAGNOSTIC_ONLY
+            ),
+            outcome_source=OUTCOME_INDEPENDENTLY_OBSERVED if proof_admissible or empirical_negative else OUTCOME_DIAGNOSTIC_ONLY,
+            transition_outcome=status,
+            proof_envelope_ref=proof_hash,
         )
         records.append(record)
     return records
@@ -215,6 +284,12 @@ def _record_from_observation(
         env_fingerprint={"source_kind": source_kind},
         state_before={"features": _state_features_for_label(primary_label)},
         state_after={"effects_added": [], "effects_failed": [capability]},
+        normalized_state_before={"features": _state_features_for_label(primary_label)},
+        normalized_state_after={"effects_added": [], "effects_failed": [capability]},
+        label_source=LABEL_SOURCE_DIAGNOSTIC_ONLY,
+        evidence_role=EVIDENCE_ROLE_DIAGNOSTIC_ONLY,
+        outcome_source=OUTCOME_DIAGNOSTIC_ONLY,
+        transition_outcome="failed",
     )
 
 
@@ -323,3 +398,15 @@ def _squash(text: str) -> str:
 
 def _quote_identifier(value: str) -> str:
     return '"' + str(value).replace('"', '""') + '"'
+
+
+def _proof_hash(proof: dict[str, Any], evidence: dict[str, Any]) -> str:
+    """Return the immutable proof identity without mutating historical rows."""
+    if isinstance(evidence, dict) and str(evidence.get("proof_hash") or "").strip():
+        return str(evidence.get("proof_hash") or "").strip()
+    if not isinstance(proof, dict) or not proof:
+        return ""
+    payload = dict(proof)
+    payload.pop("persistence_state", None)
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return "sha256:" + hashlib.sha256(blob).hexdigest()

@@ -1,3 +1,13 @@
+# Project-scoped Codex config for the Sage repository.
+#
+# Scope rule: only settings that are useful to *anyone* working on Sage belong here. Personal agent
+# profiles, model pins, multi-agent limits, and TUI preferences live in the maintainer's
+# `~/.codex/config.toml`, because Codex has no gitignored project-local layer to hold them
+# (openai/codex#24961 is the open request for one).
+#
+# Everything below is a repository guardrail: the hooks run the architecture gate before risky edits
+# and warn at turn end when durable artifacts are still sitting in /tmp.
+
 [features]
 hooks = true
 
@@ -18,3 +28,18 @@ type = "command"
 command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-architecture-governor/scripts/check_arch_budget.py" --quiet --changed --warn-only'
 timeout = 20
 statusMessage = "Checking Sage architecture budget"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-artifact-retention/scripts/retention_guard.py"'
+timeout = 20
+statusMessage = "Checking Sage artifact retention"
+
+[[hooks.SubagentStop]]
+matcher = ".*"
+
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = 'python3 "$(git rev-parse --show-toplevel)/skills/sage-artifact-retention/scripts/retention_guard.py"'
+timeout = 20
+statusMessage = "Checking Sage sub-agent artifact retention"

@@ -7,13 +7,14 @@ size the deterministic command-construction layer against real data instead of r
 import re
 import sqlite3
 import sys
+from pathlib import Path
 from collections import defaultdict
 from urllib.parse import quote
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals import phoenix_reader as pr  # noqa: E402
 
-DB = "/home/john/dev/sage/Payload_Type/sage/.phoenix/phoenix.db"
+DB = str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage" / ".phoenix" / "phoenix.db")
 
 # Failure CLASSES, checked against the tool OUTPUT text (first match wins, order = priority).
 CLASSES = [

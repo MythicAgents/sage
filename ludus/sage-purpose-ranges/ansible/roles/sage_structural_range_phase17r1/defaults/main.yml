@@ -1,0 +1,33 @@
+---
+sage_structural_range_mode: ""
+
+sage_structural_domain_fqdn: ""
+sage_structural_domain_netbios: ""
+sage_structural_domain_admin: "{{ defaults.ad_domain_admin | default('Administrator') }}"
+sage_structural_domain_admin_password: "{{ defaults.ad_domain_admin_password | default('password') }}"
+sage_structural_credential_realm_netbios: ""
+sage_structural_credential_realm_fqdn: ""
+
+sage_structural_foothold_user: ""
+sage_structural_foothold_password: ""
+sage_structural_foothold_description: "Low-privileged Sage structural benchmark foothold"
+
+sage_structural_gpo_name: ""
+sage_structural_gpo_target_ou: ""
+sage_structural_gpo_target_computer: ""
+sage_structural_gpo_editor: ""
+sage_structural_gpo_machine_write_dacl: false
+
+sage_structural_dcsync_principal: ""
+sage_structural_principal_lookup_server: ""
+sage_structural_principal_lookup_user: ""
+sage_structural_principal_lookup_password: ""
+
+sage_structural_laps_reader: ""
+sage_structural_laps_target_computer: ""
+
+sage_structural_proof_path: 'C:\SageProof'
+sage_structural_proof_share: "SageProof"
+sage_structural_group_policy_refresh_minutes: 1
+
+sage_structural_ca_host_fqdn: ""

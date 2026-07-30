@@ -1,4 +1,3 @@
-sage_cb: 15
 apollo_cb: 22
 default_timeout: 240
 forbid:
@@ -82,4 +81,3 @@ cases:
       - ADCS
       - certificate
       - CA
-

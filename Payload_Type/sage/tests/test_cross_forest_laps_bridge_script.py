@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,17 @@ def test_build_bridge_query_matches_reconciler_shape_without_sync_laps():
     assert "'ReadLAPS'" in query
     assert "'ReadMSLAPSPassword'" in query
     assert "SyncLAPSPassword" not in query
+
+
+def test_default_bloodhound_dir_derives_from_workspace_root():
+    expected = Path(
+        os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+        or (check_cross_forest_laps_bridge.WORKSPACE_ROOT / "bloodhound_mcp")
+    )
+    assert (
+        check_cross_forest_laps_bridge.DEFAULT_BLOODHOUND_MCP_DIR
+        == expected
+    )
 
 
 def test_check_bridge_reports_cross_forest_managed_secret_path():

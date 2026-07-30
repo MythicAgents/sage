@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import engagement_ledger as el  # noqa: E402
+import proof_boundary as pb  # noqa: E402
 
 
 def test_path_uses_state_dir_override(monkeypatch, tmp_path):
@@ -29,6 +30,37 @@ def test_roundtrip(monkeypatch, tmp_path):
     assert el.load("e")["hops"][0]["effect"] == "creds:cersei@d"
 
 
+def test_runtime_roundtrip_preserves_admitted_proof_envelope(monkeypatch, tmp_path):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    proof = pb.make_runtime_task_envelope(
+        engagement_id="e",
+        callback_id="13",
+        task_id="450",
+        terminal_status="completed",
+        command="dcsync",
+        verifier_id="test:ledger-roundtrip",
+        transaction_id="transaction-ledger",
+        verifier_input={"probe": {"krbtgt_hash_present": True}},
+        verifier_result={"verdict": "achieved"},
+        captured_at="2026-07-14T00:00:00+00:00",
+    ).to_dict()
+    data = {"engagement_id": "e", "hops": [{
+        "id": "dcsync:lab.local",
+        "technique": "dcsync",
+        "target": "lab.local",
+        "effect": "krbtgt-hash:lab.local",
+        "status": "achieved",
+        "evidence": {"proof_envelope": proof},
+        "proof_envelope": proof,
+    }]}
+
+    el.save_runtime(data, "e")
+    loaded = el.load_runtime("e")
+
+    assert loaded["hops"][0]["status"] == "achieved"
+    assert loaded["hops"][0]["proof_envelope"] == proof
+
+
 def test_load_missing_returns_skeleton(monkeypatch, tmp_path):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
     assert el.load("nope") == {"engagement_id": "nope", "hops": []}
@@ -45,6 +77,11 @@ def test_remove_by_effect_and_by_label():
 def test_set_hop_status():
     data, n = el.set_hop_status({"hops": [{"id": "a", "status": "achieved"}]}, "a", "failed")
     assert n == 1 and data["hops"][0]["status"] == "failed"
+
+
+def test_set_hop_status_cannot_promote_to_achieved():
+    data, n = el.set_hop_status({"hops": [{"id": "a", "status": "pending"}]}, "a", "achieved")
+    assert n == 0 and data["hops"][0]["status"] == "pending"
 
 
 def test_remove_by_row_number():

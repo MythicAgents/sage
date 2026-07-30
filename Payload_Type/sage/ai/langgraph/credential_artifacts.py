@@ -304,8 +304,9 @@ def extract_grant_probe(output) -> dict:
     low = text.lower()
     denied = (not low.strip()) or any(tok in low for tok in _GRANT_FAILURE_TOKENS)
 
-    get_changes = (_REPL_GUID_GET_CHANGES in low) or ("get-changes" in low and "get-changes-all" not in low) \
-        or ("get changes" in low and "get changes all" not in low) or ("replicating directory changes" in low)
+    get_changes = (_REPL_GUID_GET_CHANGES in low) \
+        or re.search(r"\bget[- ]changes\b(?![- ]all)", low) is not None \
+        or re.search(r"\breplicating directory changes\b(?! all)", low) is not None
     get_changes_all = (_REPL_GUID_GET_CHANGES_ALL in low) or ("get-changes-all" in low) \
         or ("get changes all" in low) or ("replicating directory changes all" in low)
     get_changes_filtered = (_REPL_GUID_GET_CHANGES_FILTERED in low) or ("filtered set" in low) \

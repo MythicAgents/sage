@@ -33,10 +33,13 @@ gotchas: |
   This is a REFERENCE DOCUMENT for lateral movement decision-making, not a tool.
   Technique selection should consider: what's running on the target, what protocols
   are accessible, what credential material is available, and how much noise is acceptable.
+  On DCOM-hardened Windows targets, a valid local-admin credential can still fail WMI
+  activation with target-side DistributedCOM Event 10036. Treat that as an activation
+  authentication-level problem, not as proof that the password, SMB access, or WMI ACL is wrong.
 related_ttps: [pass-the-hash, pass-the-ticket, sharpwmi, crackmapexec, impacket-wmiexec, sharprdp, sharp-mapexec]
 alternatives: []
 common_args: {}
-last_updated: 2026-05-29
+last_updated: 2026-07-11
 ---
 
 # Lateral Movement Decision Reference
@@ -92,6 +95,28 @@ Credentials available?
 3. **NTLM PTH + WMI** — NTLM auth events
 4. **New Apollo payload delivery** — clean but generates full EDR process event
 5. **SMBExec / PSExec-style** — service creation, highest signal
+
+## DCOM-Hardened Apollo WMI
+
+If a local-admin credential proves `\\target\C$` access but Apollo `wmiexecute` returns
+`0x80070005` during WMI connect, check the target System log before changing credentials.
+DistributedCOM Event 10036 means the client tried to activate the DCOM server below
+`RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`; in that case the failure occurs before WMI namespace
+authorization.
+
+For Apollo, prefer the token-backed sequence:
+
+1. `make_token` with the local-admin credential.
+2. `wmiexecute` with only `host` and `command` so Apollo uses its current-token COM branch.
+3. Read a target-side proof file over `C$`.
+4. `rev2self` after proof readback.
+
+Keep later WMI-backed follow-on work on the same token-backed branch too, including remote
+CA export or other administrative scripts; switching back to explicit-credential WMI can
+reintroduce the same activation failure.
+
+Do not treat `Command spawned PID` alone as objective proof. The proof file must show the
+marker, target hostname, and expected remote identity.
 
 ## Pre-Movement Checklist
 

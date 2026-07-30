@@ -1,5 +1,7 @@
 ---
 name: Generalist
+color: "#10B981"   # sub-agent card color (CSS text: #RRGGBB or named).
+icon: "robot"      # sub-agent card icon (Font-Awesome name, rc5).
 description: Answers general questions and tasks that need no Mythic, TTP, or MCP tools.
 variables: []   # no runtime variables are injected into this prompt
 tools: []

@@ -237,6 +237,42 @@ def test_sage_control_callback_is_not_rendered_as_target_foothold():
     assert "CASTELBLACK | forest=north.sevenkingdoms.local" in rendered
 
 
+def test_live_foothold_projects_current_account_context_predicate():
+    state = engagement_state.EngagementState(
+        objective="read laps",
+        footholds=[
+            _foothold(
+                forest="essos.local",
+                callback_id="2",
+                identity="jorah.mormont",
+            ),
+        ],
+    )
+
+    assert (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+        in engagement_state.foothold_predicates(state)
+    )
+
+
+def test_cross_domain_live_foothold_does_not_project_same_forest_account_context():
+    state = engagement_state.EngagementState(
+        objective="read laps",
+        footholds=[
+            _foothold(
+                forest="essos.local",
+                callback_id="2",
+                identity="NORTH\\jorah.mormont",
+            ),
+        ],
+    )
+
+    assert (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+        not in engagement_state.foothold_predicates(state)
+    )
+
+
 def test_render_no_longer_emits_planning_lines():
     state = engagement_state.EngagementState(
         objective="reach essos DA",
@@ -777,6 +813,23 @@ def test_objective_target_domains_parses_goal_not_intermediate():
     t = es._objective_target_domains(
         "reach Domain Admin on essos.local; first DCSync north.sevenkingdoms.local krbtgt then climb")
     assert "essos.local" in t and "north.sevenkingdoms.local" not in t  # intermediate is not a goal-target
+
+
+def test_credential_material_objective_completes_only_for_matching_effect():
+    objective = "Engagement objective: obtain verified credential material for alice@lab.local."
+    state = engagement_state.EngagementState(
+        objective=objective,
+        hops=[_hop("dcsync-account", "alice", "creds:alice@lab.local")],
+    )
+    wrong = engagement_state.EngagementState(
+        objective=objective,
+        hops=[_hop("dcsync-account", "bob", "creds:bob@lab.local")],
+    )
+
+    assert engagement_state._objective_credential_targets(objective) == {("alice", "lab.local")}
+    assert engagement_state.objective_effects_complete(state) is True
+    assert engagement_state._objective_is_complete(state, has_next=True) is True
+    assert engagement_state.objective_effects_complete(wrong) is False
 
 
 def test_objective_is_complete_intermediate_domain_is_milestone(monkeypatch):

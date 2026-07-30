@@ -8,10 +8,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph")
 import access_reconciler  # noqa: E402
 import engagement_state  # noqa: E402
 import graph_reconciler  # noqa: E402
+import proof_boundary  # noqa: E402
 
 
 NOW = "2026-06-06T12:00:00Z"
 TTL_SECONDS = 300
+
+
+def _bh_proof():
+    return proof_boundary.make_runtime_bloodhound_envelope(
+        engagement_id="op-1",
+        callback_id="10",
+        task_id="99",
+        terminal_status="completed",
+        command="execute_assembly",
+        ingest_job_id="job-1",
+        ingest_status="complete",
+        source_artifact_id="file-1",
+        source_artifact_sha256="a" * 64,
+        verifier_id="bloodhound_ingest:completed",
+        transaction_id="fixture:99",
+        verifier_input={"ingest_job_id": "job-1", "task_id": "99"},
+        verifier_result={"ingest_status": "complete"},
+        captured_at=NOW,
+    ).to_dict()
 
 
 def _north_foothold(alive=True):
@@ -134,6 +154,45 @@ def test_reconcile_graph_position_projects_gpo_domain_facts_from_mcp_shape():
     preds = [f.predicate for f in facts]
     assert "generic-write:gpo:starkwallpaper" in preds
     assert "gpo-domain:starkwallpaper:north.sevenkingdoms.local" in preds
+
+
+def test_reconcile_graph_position_carries_ingest_proof_envelope():
+    facts = asyncio.run(graph_reconciler.reconcile_graph_position(
+        _FakeMCP(_FakeTool()),
+        ["samwell.tarly@north.sevenkingdoms.local"],
+        "reach essos DA",
+        NOW,
+        TTL_SECONDS,
+        proof_envelope=_bh_proof(),
+    ))
+
+    assert facts
+    assert all(fact.proof_envelope == _bh_proof() for fact in facts)
+
+
+def test_runtime_state_ignores_graph_fact_without_completed_ingest_lineage():
+    unbound = engagement_state.GraphFact(
+        predicate="ds-replication-rights:lab.local",
+        source="bloodhound:cypher",
+        timestamp=NOW,
+        ttl_seconds=TTL_SECONDS,
+    )
+    bound = engagement_state.GraphFact(
+        predicate="ds-replication-rights:good.local",
+        source="bloodhound:cypher",
+        timestamp=NOW,
+        ttl_seconds=TTL_SECONDS,
+        proof_envelope=_bh_proof(),
+    )
+    state = engagement_state.EngagementState(
+        objective="x",
+        graph_facts=[unbound, bound],
+        engagement_id="op-1",
+        runtime_scope=True,
+    )
+
+    assert "ds-replication-rights:lab.local" not in state.satisfied_predicates()
+    assert "ds-replication-rights:good.local" in state.satisfied_predicates()
 
 
 def test_reconcile_graph_position_projects_trust_reachability_fact():
@@ -285,6 +344,21 @@ def test_project_graph_predicates_maps_laps_read_edge_to_managed_secret_fact():
         "can-read-managed-local-admin-secret:"
         "account=alice;account_domain=lab.local;target=ws01;target_domain=child.lab.local"
     ]
+
+
+def test_project_graph_predicates_maps_direct_dcsync_edge_to_replication_fact():
+    records = [
+        {
+            "principal": "alice@LAB.LOCAL",
+            "type": "DCSync",
+            "target_kind": "domain",
+            "domain": "LAB.LOCAL",
+        },
+    ]
+
+    facts = graph_reconciler.project_graph_predicates(records, NOW, TTL_SECONDS)
+
+    assert [fact.predicate for fact in facts] == ["ds-replication-rights:lab.local"]
 
 
 def test_project_graph_predicates_skips_unknown_edges_and_malformed_records():
@@ -462,6 +536,34 @@ def test_reconcile_graph_position_keys_gpo_by_name_via_literals():
     assert all(call.get("info_type") == "run" for call in tool.calls)
     assert any("samwell.tarly@north.sevenkingdoms.local" in call.get("query", "") for call in tool.calls)
     assert all("parameters" not in call for call in tool.calls)
+
+
+def test_reconcile_graph_position_projects_direct_dcsync_authority():
+    class _DirectDCSyncTool:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, args):
+            self.calls.append(args)
+            query = args.get("query", "")
+            if "type(e) IN ['DCSync']" in query:
+                return _literals_response("LAB.LOCAL")
+            return _literals_response()
+
+    tool = _DirectDCSyncTool()
+
+    facts = asyncio.run(
+        graph_reconciler.reconcile_graph_position(
+            _FakeMCPManager(tool),
+            ["alice@lab.local"],
+            "reach lab DA",
+            NOW,
+            TTL_SECONDS,
+        )
+    )
+
+    assert "ds-replication-rights:lab.local" in [fact.predicate for fact in facts]
+    assert any("type(e) IN ['DCSync']" in call.get("query", "") for call in tool.calls)
 
 
 def test_credential_target_domains_from_state_uses_live_kerberos_context():

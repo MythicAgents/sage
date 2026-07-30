@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: sage_replication_range
+  author: Sage
+  description: Configure the Sage replication purpose-range DCSync grant, GPO target scope, and proof share.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Windows
+      versions:
+        - "2022"
+  galaxy_tags:
+    - windows
+    - active_directory
+    - ludus
+    - benchmark
+    - dcsync
+    - gpo
+
+dependencies: []

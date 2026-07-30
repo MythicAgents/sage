@@ -11,11 +11,18 @@ Used by:
   - the BloodHound agent's not-connected EventFeed notice (the steps text)
 """
 import os
-from typing import Optional
+from collections import Counter
+from typing import Any, Optional
 
-from ai.mcp import MCPManager, MCPConnectionConfig, create_stdio_config
+from ai.mcp import (
+    MCPManager,
+    MCPConnectionConfig,
+    MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+    create_stdio_config,
+)
 
 BLOODHOUND_SERVER_NAME = "BloodHound"
+REQUIRED_BLOODHOUND_TOOLS = frozenset({"file_upload", "domain_info", "cypher_query"})
 
 BLOODHOUND_SETUP_STEPS = (
     "BloodHound is NOT connected, so attack-graph ingest and analysis are unavailable — and BloodHound "
@@ -27,6 +34,21 @@ BLOODHOUND_SETUP_STEPS = (
     "`mcp-connect`.\n"
     "Full steps: Sage payload documentation -> \"Connecting BloodHound to Sage\"."
 )
+
+
+def _safe_server_identity(server: Any) -> str:
+    if isinstance(server, str):
+        return server
+    if isinstance(server, (int, float, bool)):
+        return str(server)
+    if isinstance(server, dict):
+        name = server.get("name")
+        if isinstance(name, (str, int, float, bool)):
+            return str(name)
+    name = getattr(server, "name", None)
+    if isinstance(name, (str, int, float, bool)):
+        return str(name)
+    return type(server).__name__
 
 
 def bloodhound_mcp_config(directory: Optional[str] = None) -> Optional[MCPConnectionConfig]:
@@ -45,15 +67,125 @@ def bloodhound_mcp_config(directory: Optional[str] = None) -> Optional[MCPConnec
         encoding=None,
         encoding_error_handler=None,
         session_kwargs=None,
+        sage_execution_class=MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
     )
 
 
 def bloodhound_connected() -> bool:
     """True if a BloodHound MCP server is currently connected."""
     try:
-        return any("bloodhound" in s.lower() for s in MCPManager.get_connected_servers())
+        return any(MCPManager.is_bloodhound_server(s) for s in MCPManager.get_connected_servers())
     except Exception:
         return False
+
+
+def bloodhound_tool_admission() -> dict[str, Any]:
+    """Return an exact-name admission record for the canonical BloodHound MCP server.
+
+    Autonomous native chat may only build its graph when the canonical server exposes
+    the exact tools the runtime depends on. Matching is by full tool name, never by
+    substring or near-match alias.
+    """
+    try:
+        connected_servers = [
+            server
+            for server in MCPManager.get_connected_servers()
+            if MCPManager.is_bloodhound_server(server)
+        ]
+    except Exception as exc:
+        return {
+            "ready": False,
+            "connected": False,
+            "server": None,
+            "matching_server_count": 0,
+            "matching_servers": [],
+            "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "tool_names": [],
+            "missing_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "duplicate_tool_names": [],
+            "invalid_tool_name_count": 0,
+            "reason": f"BloodHound MCP inspection failed: {exc}",
+        }
+    if not connected_servers:
+        return {
+            "ready": False,
+            "connected": False,
+            "server": None,
+            "matching_server_count": 0,
+            "matching_servers": [],
+            "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "tool_names": [],
+            "missing_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "duplicate_tool_names": [],
+            "invalid_tool_name_count": 0,
+            "reason": "BloodHound MCP is not connected.",
+        }
+    matching_servers = [_safe_server_identity(server) for server in connected_servers]
+    if len(connected_servers) != 1:
+        return {
+            "ready": False,
+            "connected": True,
+            "server": None,
+            "matching_server_count": len(connected_servers),
+            "matching_servers": matching_servers,
+            "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "tool_names": [],
+            "missing_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "duplicate_tool_names": [],
+            "invalid_tool_name_count": 0,
+            "reason": "BloodHound MCP admission requires exactly one matching server.",
+        }
+    server = connected_servers[0]
+    try:
+        raw_names = [getattr(tool, "name", None) for tool in MCPManager.get_tools_by_server(server)]
+    except Exception as exc:
+        return {
+            "ready": False,
+            "connected": True,
+            "server": _safe_server_identity(server),
+            "matching_server_count": 1,
+            "matching_servers": matching_servers,
+            "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "tool_names": [],
+            "missing_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+            "duplicate_tool_names": [],
+            "invalid_tool_name_count": 0,
+            "reason": f"BloodHound MCP tool inspection failed: {exc}",
+        }
+    valid_names = [
+        name
+        for name in raw_names
+        if isinstance(name, str) and name and name == name.strip()
+    ]
+    name_counts = Counter(valid_names)
+    names = sorted(name_counts)
+    missing = sorted(REQUIRED_BLOODHOUND_TOOLS.difference(names))
+    duplicates = sorted(name for name, count in name_counts.items() if count > 1)
+    invalid_tool_name_count = len(raw_names) - len(valid_names)
+    problems: list[str] = []
+    if missing:
+        problems.append(f"missing exact tools: {', '.join(missing)}")
+    if duplicates:
+        problems.append(f"duplicate exact tools: {', '.join(duplicates)}")
+    if invalid_tool_name_count:
+        problems.append(f"invalid tool names: {invalid_tool_name_count}")
+    return {
+        "ready": not problems,
+        "connected": True,
+        "server": _safe_server_identity(server),
+        "matching_server_count": 1,
+        "matching_servers": matching_servers,
+        "required_tools": sorted(REQUIRED_BLOODHOUND_TOOLS),
+        "tool_names": names,
+        "missing_tools": missing,
+        "duplicate_tool_names": duplicates,
+        "invalid_tool_name_count": invalid_tool_name_count,
+        "reason": (
+            "BloodHound MCP exposes the required exact tools."
+            if not problems
+            else f"BloodHound MCP admission rejected: {'; '.join(problems)}."
+        ),
+    }
 
 
 async def ensure_bloodhound_connected(directory: Optional[str] = None) -> tuple[bool, str]:

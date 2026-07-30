@@ -153,6 +153,8 @@ def score_from_probes(
     substring_score: float = 0.0,
     foothold_seen: bool = True,
     wall_seconds: float = 0.0,
+    runtime_telemetry: dict | None = None,
+    configured_policy_mode: str = "unknown",
     gauge_version: str = GAUGE_VERSION,
 ) -> ScoreCard:
     """Score ANY agent's run from ledger-independent range probes — the SINGLE shared ruler for both
@@ -167,6 +169,14 @@ def score_from_probes(
         "score": substring_score, "status": status, "tool_calls": steps, "model_calls": steps,
         "recursion_deaths": 0, "errors": [], "total_tokens": 0, "wall_seconds": float(wall_seconds or 0.0),
     }
+    if runtime_telemetry:
+        record.update(runtime_telemetry)
+        record["model_calls"] = int(runtime_telemetry.get("model_calls", 0) or 0)
+    record["configured_policy_mode"] = configured_policy_mode
+    record["policy_identity_valid"] = bool(
+        runtime_telemetry
+        and str(runtime_telemetry.get("policy_mode") or "") == str(configured_policy_mode or "")
+    )
     return _score(record, gt, None, scenario=scenario, gauge_version=gauge_version)
 
 

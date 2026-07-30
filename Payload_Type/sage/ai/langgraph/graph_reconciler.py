@@ -12,8 +12,10 @@ Expected edge-record shape for pure projection:
     "domain": str,
 }
 
-Only write-like BloodHound edge labels are emitted. Unknown edge labels,
-unknown target kinds, missing keys, and malformed records are skipped.
+Only modeled BloodHound edge labels are emitted: write-like ACL control,
+managed-secret read authority, and direct DCSync authority on a domain.
+Unknown edge labels, unknown target kinds, missing keys, and malformed records
+are skipped.
 """
 
 import asyncio
@@ -34,6 +36,7 @@ GraphFact = engagement_state.GraphFact
 _SOURCE = "bloodhound:cypher"
 _WRITE_EDGE_TYPES = {"genericwrite", "genericall", "writedacl", "writeowner", "owns"}
 _MANAGED_SECRET_EDGE_TYPES = {"readlapspassword", "readlaps", "readmslapspassword"}
+_REPLICATION_EDGE_TYPES = {"dcsync"}
 _CYPHER_TOOL = "cypher_query"
 _MCP_TIMEOUT_SECONDS = 15.0
 
@@ -43,7 +46,8 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
 
     GPO edges emit one ``generic-write:gpo:{short_host}`` predicate per linked
     computer. Computer edges emit ``generic-write:computer:{short_host}``.
-    Domain edges emit ``write-dacl:domain:{fqdn}``.
+    Domain write edges emit ``write-dacl:domain:{fqdn}``. Direct DCSync edges
+    to domains emit ``ds-replication-rights:{fqdn}``.
     """
 
     facts: list[GraphFact] = []
@@ -53,6 +57,11 @@ def project_graph_predicates(edge_records: list[dict], now: str, ttl_seconds: in
             continue
         if _is_managed_secret_edge(edge_record):
             fact = _managed_secret_fact(edge_record, now, ttl_seconds)
+            if fact is not None:
+                facts.append(fact)
+            continue
+        if _is_replication_edge(edge_record):
+            fact = _replication_fact(edge_record, now, ttl_seconds)
             if fact is not None:
                 facts.append(fact)
             continue
@@ -151,11 +160,15 @@ def prune_stale_graph_facts(state: EngagementState, now: str) -> EngagementState
         footholds=list(state.footholds),
         hops=list(state.hops),
         graph_facts=pruned,
+        probed_effect_prefixes=set(getattr(state, "probed_effect_prefixes", set()) or set()),
+        engagement_id=getattr(state, "engagement_id", ""),
+        runtime_scope=bool(getattr(state, "runtime_scope", False)),
     )
 
 
 _WRITE_LABELS_CYPHER = "['GenericWrite', 'GenericAll', 'WriteDacl', 'WriteOwner', 'Owns']"
 _MANAGED_SECRET_LABELS_CYPHER = "['ReadLAPSPassword', 'ReadLAPS', 'ReadMSLAPSPassword']"
+_REPLICATION_LABELS_CYPHER = "['DCSync']"
 
 
 async def reconcile_graph_position(
@@ -165,9 +178,10 @@ async def reconcile_graph_position(
     now: str,
     ttl_seconds: int,
     credential_domains: list[str] | None = None,
+    proof_envelope: dict[str, Any] | None = None,
 ) -> list[GraphFact]:
-    """Project the ACL edges our controlled principals hold over GPOs / computers / domains into
-    engagement predicates, via the BloodHound MCP ``cypher_query`` tool.
+    """Project modeled BloodHound edges for controlled principals into engagement
+    predicates via the BloodHound MCP ``cypher_query`` tool.
 
     The real BloodHound CE cypher API (1) requires ``info_type="run"``, (2) does NOT support query
     parameters, and (3) returns scalar RETURNs under ``data.literals`` (a flat ``{value,key}`` list), NOT
@@ -188,6 +202,10 @@ async def reconcile_graph_position(
         inlist = _principal_in_list(principals) if principals else "[]"
         facts: list[GraphFact] = []
         seen: set[str] = set()
+        proof = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
+
+        def _runtime_fact(predicate: str) -> GraphFact:
+            return _graph_fact(predicate, now, ttl_seconds, proof_envelope=proof)
 
         async def _collect(target_label: str, predicate_prefix: str, key_fn) -> None:
             if not principals:
@@ -203,7 +221,7 @@ async def reconcile_graph_position(
                 predicate = f"{predicate_prefix}:{key}"
                 if predicate not in seen:
                     seen.add(predicate)
-                    facts.append(_graph_fact(predicate, now, ttl_seconds))
+                    facts.append(_runtime_fact(predicate))
 
         # GPO control: emit the control fact (keyed by NAME, matching SharpGPOAbuse --gponame) AND the
         # GPO->domain link, so the forward planner can effect-chain gpo-abuse -> dcsync on the domain whose
@@ -227,7 +245,7 @@ async def reconcile_graph_position(
                 ):
                     if predicate and predicate not in seen:
                         seen.add(predicate)
-                        facts.append(_graph_fact(predicate, now, ttl_seconds))
+                        facts.append(_runtime_fact(predicate))
             # BloodHound CE's cypher API rejects `WITH ... any(...) AS isDc` + `CASE WHEN` (observed live: the
             # old combined scope query silently returned nothing, so `gpo-affects-dc` was never produced and a
             # controlled GPO that governs a DC never gained its `da:` effect -> the deterministic controller
@@ -250,9 +268,20 @@ async def reconcile_graph_position(
                     for predicate in _gpo_scope_facts_from_scalar(raw_name):
                         if predicate and predicate not in seen:
                             seen.add(predicate)
-                            facts.append(_graph_fact(predicate, now, ttl_seconds))
+                            facts.append(_runtime_fact(predicate))
         await _collect("Computer", "generic-write:computer", _short_host)
         await _collect("Domain", "write-dacl:domain", lambda n: access_reconciler.normalize_forest(_text(n)))
+        if principals:
+            replication_query = (
+                f"MATCH (p)-[e]->(t:Domain) WHERE toLower(p.name) IN {inlist} "
+                f"AND type(e) IN {_REPLICATION_LABELS_CYPHER} RETURN DISTINCT t.name AS name"
+            )
+            for raw_name in await _run_scalar_names(tool, replication_query):
+                domain = access_reconciler.normalize_forest(_text(raw_name))
+                predicate = f"ds-replication-rights:{domain}" if domain else ""
+                if predicate and predicate not in seen:
+                    seen.add(predicate)
+                    facts.append(_runtime_fact(predicate))
         if principals:
             laps_query = (
                 f"MATCH (p)-[e]->(c:Computer) WHERE toLower(p.name) IN {inlist} "
@@ -260,7 +289,7 @@ async def reconcile_graph_position(
                 "RETURN DISTINCT p.name + '|' + c.name + '|' + coalesce(c.domain, '') AS name"
             )
             for raw_name in await _run_scalar_names(tool, laps_query):
-                fact = _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds)
+                fact = _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds, proof_envelope=proof)
                 if fact is not None and fact.predicate not in seen:
                     seen.add(fact.predicate)
                     facts.append(fact)
@@ -274,7 +303,7 @@ async def reconcile_graph_position(
                 "RETURN DISTINCT u.name AS name"
             )
             for raw_name in await _run_scalar_names(tool, controlled_group_member_query):
-                fact = _credential_target_fact_from_scalar(raw_name, now, ttl_seconds)
+                fact = _credential_target_fact_from_scalar(raw_name, now, ttl_seconds, proof_envelope=proof)
                 if fact is not None and fact.predicate not in seen:
                     seen.add(fact.predicate)
                     facts.append(fact)
@@ -287,8 +316,8 @@ async def reconcile_graph_position(
             )
             for raw_name in await _run_scalar_names(tool, cross_forest_laps_query):
                 for fact in (
-                    _credential_target_fact_from_scalar(raw_name, now, ttl_seconds),
-                    _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds),
+                    _credential_target_fact_from_scalar(raw_name, now, ttl_seconds, proof_envelope=proof),
+                    _managed_secret_fact_from_scalar(raw_name, now, ttl_seconds, proof_envelope=proof),
                 ):
                     if fact is not None and fact.predicate not in seen:
                         seen.add(fact.predicate)
@@ -302,7 +331,7 @@ async def reconcile_graph_position(
             predicate = _trust_reachable_fact_from_scalar(raw_name)
             if predicate and predicate not in seen:
                 seen.add(predicate)
-                facts.append(_graph_fact(predicate, now, ttl_seconds))
+                facts.append(_runtime_fact(predicate))
         return facts
     except Exception:
         return []
@@ -522,8 +551,29 @@ def _domain_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | N
     return _graph_fact(f"write-dacl:domain:{domain}", now, ttl_seconds)
 
 
-def _graph_fact(predicate: str, now: str, ttl_seconds: int) -> GraphFact:
-    return GraphFact(predicate=predicate, source=_SOURCE, timestamp=now, ttl_seconds=ttl_seconds)
+def _replication_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | None:
+    if _text(edge_record.get("target_kind")).casefold() != "domain":
+        return None
+    domain = access_reconciler.normalize_forest(_text(edge_record.get("domain")))
+    if not domain:
+        return None
+    return _graph_fact(f"ds-replication-rights:{domain}", now, ttl_seconds)
+
+
+def _graph_fact(
+    predicate: str,
+    now: str,
+    ttl_seconds: int,
+    *,
+    proof_envelope: dict[str, Any] | None = None,
+) -> GraphFact:
+    return GraphFact(
+        predicate=predicate,
+        source=_SOURCE,
+        timestamp=now,
+        ttl_seconds=ttl_seconds,
+        proof_envelope=dict(proof_envelope) if isinstance(proof_envelope, dict) else {},
+    )
 
 
 def _candidate_edge(edge_record: dict) -> dict:
@@ -561,6 +611,10 @@ def _is_managed_secret_edge(edge_record: dict) -> bool:
     return _text(edge_record.get("type")).casefold() in _MANAGED_SECRET_EDGE_TYPES
 
 
+def _is_replication_edge(edge_record: dict) -> bool:
+    return _text(edge_record.get("type")).casefold() in _REPLICATION_EDGE_TYPES
+
+
 def _managed_secret_fact(edge_record: dict, now: str, ttl_seconds: int) -> GraphFact | None:
     principal = _text(edge_record.get("principal"))
     account, account_domain = _principal_account_domain(principal)
@@ -582,14 +636,20 @@ def _managed_secret_fact(edge_record: dict, now: str, ttl_seconds: int) -> Graph
     return _graph_fact(predicate, now, ttl_seconds)
 
 
-def _managed_secret_fact_from_scalar(value: Any, now: str, ttl_seconds: int) -> GraphFact | None:
+def _managed_secret_fact_from_scalar(
+    value: Any,
+    now: str,
+    ttl_seconds: int,
+    *,
+    proof_envelope: dict[str, Any] | None = None,
+) -> GraphFact | None:
     parts = [_text(part) for part in _text(value).split("|")]
     if len(parts) < 2:
         return None
     principal = parts[0]
     computer = parts[1]
     domain = parts[2] if len(parts) > 2 else ""
-    return _managed_secret_fact(
+    fact = _managed_secret_fact(
         {
             "principal": principal,
             "type": "ReadLAPSPassword",
@@ -600,16 +660,30 @@ def _managed_secret_fact_from_scalar(value: Any, now: str, ttl_seconds: int) -> 
         now,
         ttl_seconds,
     )
+    if fact is not None and isinstance(proof_envelope, dict):
+        fact.proof_envelope = dict(proof_envelope)
+    return fact
 
 
-def _credential_target_fact_from_scalar(value: Any, now: str, ttl_seconds: int) -> GraphFact | None:
+def _credential_target_fact_from_scalar(
+    value: Any,
+    now: str,
+    ttl_seconds: int,
+    *,
+    proof_envelope: dict[str, Any] | None = None,
+) -> GraphFact | None:
     parts = [_text(part) for part in _text(value).split("|")]
     if not parts:
         return None
     account, domain = _principal_account_domain(parts[0])
     if not (account and domain) or account == "krbtgt" or account.endswith("$"):
         return None
-    return _graph_fact(f"credential-target:{account}@{domain}", now, ttl_seconds)
+    return _graph_fact(
+        f"credential-target:{account}@{domain}",
+        now,
+        ttl_seconds,
+        proof_envelope=proof_envelope,
+    )
 
 
 def _principal_account_domain(value: Any) -> tuple[str, str]:

@@ -15,10 +15,19 @@ harness record. C3's noise floor calibrates "how big a ρ/score difference is re
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
+import statistics
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from statistics import NormalDist
 from typing import Callable, Sequence
+
+try:
+    from .experiment_contracts import NOT_ESTIMABLE, READINESS_ELIGIBLE, READINESS_NOT_READY
+except Exception:  # script / sys.path import
+    from experiment_contracts import NOT_ESTIMABLE, READINESS_ELIGIBLE, READINESS_NOT_READY  # type: ignore
 
 try:  # package import
     from .fitness import ScoreCard, GAUGE_VERSION, score as _score
@@ -79,6 +88,362 @@ class GateExperimentReport:
     verdict: str = "INSUFFICIENT"                          # PASS | FAIL | INSUFFICIENT | INVALID
     note: str = ""
     record_written: bool = False                          # did the durable jsonl write succeed?
+    candidate_surface: str = ""
+    smallest_relevant_effect: float | None = None
+    target_power: float | None = None
+    achieved_power: float | None = None
+    measured_noise: float | None = None
+    mde: float | None = None
+    paired_effect_mean: float | None = None
+    paired_effect_ci95: dict[str, float] | None = None
+    rank_correlation_ci95: dict[str, float] | None = None
+    high_cheap_low_live_inversion_count: int = 0
+    readiness_decision: str = READINESS_NOT_READY
+    readiness_failed_gates: list[str] = field(default_factory=list)
+    substrate_class: str = ""
+    t1_reason_code: str = ""
+    paired_instance_count: int | None = None
+    t0_coverage: float | None = None
+    unscorable_new_behavior_rate: float | None = None
+    proposer_canary_passed: bool | None = None
+    provider_canary_passed: bool | None = None
+    reset_automation_passed: bool | None = None
+    authorization_boundary_passed: bool | None = None
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        for field_name in ("spearman_rho", "achieved_power", "mde"):
+            if payload[field_name] is None:
+                payload[field_name] = NOT_ESTIMABLE
+        return payload
+
+
+@dataclass(frozen=True)
+class CalibrationProtocolReport:
+    candidate_surface: str
+    t0_disposition: str
+    t1_substrate_status: str
+    t2_anchor_present: bool
+    smallest_relevant_effect: float | None
+    target_power: float | None
+    achieved_power: float | None
+    measured_noise: float | None
+    mde: float | None
+    paired_effect_mean: float | None
+    paired_effect_ci95: dict[str, float] | None
+    spearman_rho: float | None
+    rank_correlation_ci95: dict[str, float] | None
+    inversion_count: int
+    readiness_decision: str
+    failed_gates: tuple[str, ...] = field(default_factory=tuple)
+    ranking_authorized: bool = False
+    substrate_class: str = ""
+    t1_reason_code: str = ""
+    paired_instance_count: int | None = None
+    t0_coverage: float | None = None
+    unscorable_new_behavior_rate: float | None = None
+    proposer_canary_passed: bool | None = None
+    provider_canary_passed: bool | None = None
+    reset_automation_passed: bool | None = None
+    authorization_boundary_passed: bool | None = None
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        for field_name in ("spearman_rho", "achieved_power", "mde"):
+            if payload[field_name] is None:
+                payload[field_name] = NOT_ESTIMABLE
+        return payload
+
+
+@dataclass(frozen=True)
+class PairedSensitivityReport:
+    """Paired design sensitivity over candidate-minus-incumbent outcomes.
+
+    This is deliberately a measurement report, not an acceptance authority.  The
+    readiness gate consumes its fields and remains fail-closed when the design is
+    underpowered or has too few paired instances.
+    """
+
+    paired_instance_count: int
+    smallest_relevant_effect: float | None
+    target_power: float
+    alpha: float
+    paired_effect_mean: float | None
+    measured_noise: float | None
+    standard_error: float | None
+    mde: float | None
+    achieved_power: float | None
+    paired_effect_ci95: dict[str, float] | None
+    reason_codes: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def powered(self) -> bool:
+        return bool(
+            not self.reason_codes
+            and self.smallest_relevant_effect is not None
+            and self.mde is not None
+            and self.achieved_power is not None
+            and self.mde <= self.smallest_relevant_effect
+            and self.achieved_power >= self.target_power
+        )
+
+
+def _two_sided_normal_power(effect: float, standard_error: float, *, alpha: float) -> float:
+    if standard_error == 0.0:
+        return 1.0 if abs(effect) > 0.0 else 0.0
+    normal = NormalDist()
+    z_alpha = normal.inv_cdf(1.0 - alpha / 2.0)
+    noncentrality = abs(effect) / standard_error
+    return (
+        1.0
+        - normal.cdf(z_alpha - noncentrality)
+        + normal.cdf(-z_alpha - noncentrality)
+    )
+
+
+def paired_sensitivity_report(
+    candidate_scores: Sequence[float],
+    incumbent_scores: Sequence[float],
+    *,
+    smallest_relevant_effect: float | None,
+    target_power: float = 0.8,
+    alpha: float = 0.05,
+) -> PairedSensitivityReport:
+    """Calculate paired MDE, achieved power, and a normal-approximation effect CI.
+
+    The calculation is intentionally simple and preregisterable: use paired
+    candidate-minus-incumbent deltas, sample standard deviation of those deltas,
+    two-sided alpha, and normal-approximation power.  It is suitable for the
+    Phase 4 instrument and explicitly reports when the design is too small to
+    support a sensitivity claim.
+    """
+
+    if len(candidate_scores) != len(incumbent_scores):
+        raise ValueError("candidate and incumbent score vectors must have the same length")
+    if not 0.0 < float(alpha) < 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    if not 0.0 < float(target_power) < 1.0:
+        raise ValueError("target_power must be between 0 and 1")
+    n = len(candidate_scores)
+    differences = [float(candidate) - float(incumbent) for candidate, incumbent in zip(candidate_scores, incumbent_scores)]
+    reasons: list[str] = []
+    if n < 2:
+        reasons.append("insufficient_paired_instances")
+    if smallest_relevant_effect is None or float(smallest_relevant_effect) < 0.0:
+        reasons.append("missing_smallest_relevant_effect")
+    mean_effect = statistics.mean(differences) if differences else None
+    measured_noise = statistics.stdev(differences) if n >= 2 else None
+    standard_error = (measured_noise / math.sqrt(n)) if measured_noise is not None else None
+    normal = NormalDist()
+    z_alpha = normal.inv_cdf(1.0 - float(alpha) / 2.0)
+    z_power = normal.inv_cdf(float(target_power))
+    mde = (
+        (z_alpha + z_power) * standard_error
+        if standard_error is not None
+        else None
+    )
+    achieved_power = (
+        _two_sided_normal_power(float(smallest_relevant_effect), standard_error, alpha=float(alpha))
+        if smallest_relevant_effect is not None and standard_error is not None
+        else None
+    )
+    effect_ci95 = (
+        {
+            "lower": mean_effect - z_alpha * standard_error,
+            "upper": mean_effect + z_alpha * standard_error,
+        }
+        if mean_effect is not None and standard_error is not None
+        else None
+    )
+    return PairedSensitivityReport(
+        paired_instance_count=n,
+        smallest_relevant_effect=smallest_relevant_effect,
+        target_power=float(target_power),
+        alpha=float(alpha),
+        paired_effect_mean=mean_effect,
+        measured_noise=measured_noise,
+        standard_error=standard_error,
+        mde=mde,
+        achieved_power=achieved_power,
+        paired_effect_ci95=effect_ci95,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+    )
+
+
+def high_cheap_low_live_inversions(cheap_scores: Sequence[float], live_scores: Sequence[float]) -> int:
+    """Count pairwise rank inversions where cheap ranks higher but live ranks lower."""
+
+    if len(cheap_scores) != len(live_scores):
+        raise ValueError("cheap and live score vectors must have the same length")
+    inversions = 0
+    for left in range(len(cheap_scores)):
+        for right in range(left + 1, len(cheap_scores)):
+            cheap_delta = cheap_scores[left] - cheap_scores[right]
+            live_delta = live_scores[left] - live_scores[right]
+            if cheap_delta == 0 or live_delta == 0:
+                continue
+            if cheap_delta * live_delta < 0:
+                inversions += 1
+    return inversions
+
+
+def bootstrap_spearman_ci(
+    cheap_scores: Sequence[float],
+    live_scores: Sequence[float],
+    *,
+    samples: int = 1000,
+    seed: int = 0,
+) -> dict[str, float] | None:
+    """Return a deterministic percentile bootstrap CI for rho, or None when undefined."""
+
+    if len(cheap_scores) != len(live_scores) or len(cheap_scores) < 3:
+        return None
+    rng = random.Random(seed)
+    values: list[float] = []
+    n = len(cheap_scores)
+    for _ in range(max(1, int(samples))):
+        indices = [rng.randrange(n) for _ in range(n)]
+        rho = spearman([cheap_scores[index] for index in indices], [live_scores[index] for index in indices])
+        if rho is not None:
+            values.append(float(rho))
+    if not values:
+        return None
+    values.sort()
+
+    def percentile(q: float) -> float:
+        index = min(len(values) - 1, max(0, int(round((len(values) - 1) * q))))
+        return values[index]
+
+    return {"lower": percentile(0.025), "upper": percentile(0.975)}
+
+
+def run_calibration_protocol(
+    *,
+    candidate_surface: str,
+    cheap_scores: Sequence[float],
+    t2_scores: Sequence[float],
+    t0_disposition: str,
+    t1_substrate_status: str,
+    t2_anchor_present: bool,
+    smallest_relevant_effect: float | None,
+    target_power: float | None,
+    achieved_power: float | None = None,
+    measured_noise: float | None,
+    mde: float | None,
+    rho_threshold: float = 0.7,
+    bootstrap_samples: int = 1000,
+    substrate_class: str = "",
+    t1_reason_code: str = "",
+    paired_instance_count: int | None = None,
+    t0_coverage: float | None = None,
+    unscorable_new_behavior_rate: float | None = None,
+    proposer_canary_passed: bool | None = None,
+    provider_canary_passed: bool | None = None,
+    reset_automation_passed: bool | None = None,
+    authorization_boundary_passed: bool | None = None,
+    paired_effect_mean: float | None = None,
+    paired_effect_ci95: dict[str, float] | None = None,
+    paired_candidate_scores: Sequence[float] | None = None,
+    paired_incumbent_scores: Sequence[float] | None = None,
+    alpha: float = 0.05,
+) -> CalibrationProtocolReport:
+    """Instrument the T0/T1/T2 readiness gate without authorizing a campaign."""
+
+    surface = str(candidate_surface or "").strip()
+    rho = spearman(cheap_scores, t2_scores)
+    ci = bootstrap_spearman_ci(
+        cheap_scores,
+        t2_scores,
+        samples=bootstrap_samples,
+    )
+    inversions = high_cheap_low_live_inversions(cheap_scores, t2_scores)
+    sensitivity: PairedSensitivityReport | None = None
+    if paired_candidate_scores is not None or paired_incumbent_scores is not None:
+        sensitivity = paired_sensitivity_report(
+            paired_candidate_scores or (),
+            paired_incumbent_scores or (),
+            smallest_relevant_effect=smallest_relevant_effect,
+            target_power=float(target_power if target_power is not None else 0.8),
+            alpha=alpha,
+        )
+        target_power = sensitivity.target_power
+        achieved_power = sensitivity.achieved_power
+        measured_noise = sensitivity.measured_noise
+        mde = sensitivity.mde
+        paired_effect_mean = sensitivity.paired_effect_mean
+        paired_effect_ci95 = sensitivity.paired_effect_ci95
+        paired_instance_count = sensitivity.paired_instance_count
+    failed: list[str] = []
+    if not surface:
+        failed.append("missing_candidate_surface")
+    if str(t0_disposition or "") not in {"survived_triage", "triage_only", "unscorable_new_behavior"}:
+        failed.append("t0_not_instrumented")
+    if (
+        str(t0_disposition or "") == "unscorable_new_behavior"
+        and (str(t1_substrate_status or "") != "verified" or not t2_anchor_present)
+    ):
+        failed.append("unscorable_new_behavior")
+    if str(t1_substrate_status or "") != "verified":
+        failed.append(str(t1_substrate_status or "t1_substrate_unavailable"))
+    if not t2_anchor_present:
+        failed.append("t2_anchor_missing")
+    power_not_estimable = (
+        smallest_relevant_effect is None
+        or target_power is None
+        or achieved_power is None
+        or measured_noise is None
+        or mde is None
+    )
+    if power_not_estimable:
+        failed.append("statistical_power_not_estimable")
+    else:
+        if (
+            float(target_power) < 0.8
+            or float(achieved_power) < float(target_power)
+            or float(mde) > float(smallest_relevant_effect)
+        ):
+            failed.append("insufficient_statistical_power")
+    if sensitivity is not None and sensitivity.reason_codes:
+        failed.append("insufficient_statistical_power")
+    if rho is None:
+        failed.append("rank_correlation_not_estimable")
+    elif rho < float(rho_threshold):
+        failed.append("rank_correlation_below_threshold")
+    if ci is None:
+        failed.append("rank_correlation_interval_not_estimable")
+    elif float(ci["lower"]) <= 0.0:
+        failed.append("rank_correlation_lower_bound_not_positive")
+    if inversions:
+        failed.append("high_cheap_low_live_inversion")
+    decision = READINESS_ELIGIBLE if not failed else READINESS_NOT_READY
+    return CalibrationProtocolReport(
+        candidate_surface=surface,
+        t0_disposition=str(t0_disposition or ""),
+        t1_substrate_status=str(t1_substrate_status or ""),
+        t2_anchor_present=bool(t2_anchor_present),
+        smallest_relevant_effect=smallest_relevant_effect,
+        target_power=target_power,
+        achieved_power=achieved_power,
+        measured_noise=measured_noise,
+        mde=mde,
+        paired_effect_mean=paired_effect_mean,
+        paired_effect_ci95=paired_effect_ci95,
+        spearman_rho=rho,
+        rank_correlation_ci95=ci,
+        inversion_count=inversions,
+        readiness_decision=decision,
+        failed_gates=tuple(dict.fromkeys(failed)),
+        ranking_authorized=decision == READINESS_ELIGIBLE,
+        substrate_class=str(substrate_class or ""),
+        t1_reason_code=str(t1_reason_code or ""),
+        paired_instance_count=paired_instance_count,
+        t0_coverage=t0_coverage,
+        unscorable_new_behavior_rate=unscorable_new_behavior_rate,
+        proposer_canary_passed=proposer_canary_passed,
+        provider_canary_passed=provider_canary_passed,
+        reset_automation_passed=reset_automation_passed,
+        authorization_boundary_passed=authorization_boundary_passed,
+    )
 
 
 def default_results_dir() -> Path:
@@ -96,6 +461,30 @@ def run_gate_experiment(
     low_truth: float = 0.3,
     results_dir: str | os.PathLike | None = None,
     write_record: bool = True,
+    candidate_surface: str = "",
+    t0_disposition: str = "",
+    t1_substrate_status: str = "",
+    t2_anchor_present: bool = False,
+    smallest_relevant_effect: float | None = None,
+    target_power: float | None = None,
+    achieved_power: float | None = None,
+    measured_noise: float | None = None,
+    mde: float | None = None,
+    bootstrap_samples: int = 1000,
+    substrate_class: str = "",
+    t1_reason_code: str = "",
+    paired_instance_count: int | None = None,
+    t0_coverage: float | None = None,
+    unscorable_new_behavior_rate: float | None = None,
+    proposer_canary_passed: bool | None = None,
+    provider_canary_passed: bool | None = None,
+    reset_automation_passed: bool | None = None,
+    authorization_boundary_passed: bool | None = None,
+    paired_effect_mean: float | None = None,
+    paired_effect_ci95: dict[str, float] | None = None,
+    paired_candidate_scores: Sequence[float] | None = None,
+    paired_incumbent_scores: Sequence[float] | None = None,
+    alpha: float = 0.05,
 ) -> GateExperimentReport:
     per_config: list[dict] = []
     subs: list[float] = []
@@ -148,11 +537,61 @@ def run_gate_experiment(
         else:
             verdict, note = "FAIL", "freeze the optimizer and fix the verifier (low rho and/or high-eval/low-truth)"
 
+    calibration = run_calibration_protocol(
+        candidate_surface=candidate_surface,
+        cheap_scores=subs,
+        t2_scores=caps,
+        t0_disposition=t0_disposition,
+        t1_substrate_status=t1_substrate_status,
+        t2_anchor_present=t2_anchor_present,
+        smallest_relevant_effect=smallest_relevant_effect,
+        target_power=target_power,
+        achieved_power=achieved_power,
+        measured_noise=measured_noise,
+        mde=mde,
+        rho_threshold=rho_threshold,
+        bootstrap_samples=bootstrap_samples,
+        substrate_class=substrate_class,
+        t1_reason_code=t1_reason_code,
+        paired_instance_count=paired_instance_count,
+        t0_coverage=t0_coverage,
+        unscorable_new_behavior_rate=unscorable_new_behavior_rate,
+        proposer_canary_passed=proposer_canary_passed,
+        provider_canary_passed=provider_canary_passed,
+        reset_automation_passed=reset_automation_passed,
+        authorization_boundary_passed=authorization_boundary_passed,
+        paired_effect_mean=paired_effect_mean,
+        paired_effect_ci95=paired_effect_ci95,
+        paired_candidate_scores=paired_candidate_scores,
+        paired_incumbent_scores=paired_incumbent_scores,
+        alpha=alpha,
+    )
     report = GateExperimentReport(
         verifier_hash=vh, seeds=seeds, scenarios=len(scenarios), total_runs=total,
         per_config=per_config, spearman_rho=rho, high_eval_low_truth_count=len(danger),
         high_eval_low_truth_configs=danger, rho_threshold=rho_threshold, high_eval=high_eval,
         low_truth=low_truth, verdict=verdict, note=note,
+        candidate_surface=calibration.candidate_surface,
+        smallest_relevant_effect=calibration.smallest_relevant_effect,
+        target_power=calibration.target_power,
+        achieved_power=calibration.achieved_power,
+        measured_noise=calibration.measured_noise,
+        mde=calibration.mde,
+        paired_effect_mean=calibration.paired_effect_mean,
+        paired_effect_ci95=calibration.paired_effect_ci95,
+        rank_correlation_ci95=calibration.rank_correlation_ci95,
+        high_cheap_low_live_inversion_count=calibration.inversion_count,
+        readiness_decision=calibration.readiness_decision,
+        readiness_failed_gates=list(calibration.failed_gates),
+        substrate_class=calibration.substrate_class,
+        t1_reason_code=calibration.t1_reason_code,
+        paired_instance_count=calibration.paired_instance_count,
+        t0_coverage=calibration.t0_coverage,
+        unscorable_new_behavior_rate=calibration.unscorable_new_behavior_rate,
+        proposer_canary_passed=calibration.proposer_canary_passed,
+        provider_canary_passed=calibration.provider_canary_passed,
+        reset_automation_passed=calibration.reset_automation_passed,
+        authorization_boundary_passed=calibration.authorization_boundary_passed,
     )
     if write_record:
         try:
@@ -168,7 +607,7 @@ def write_gate_record(report: GateExperimentReport, *, results_dir: str | os.Pat
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "gate_experiment.jsonl"
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"kind": "gate_experiment", **asdict(report)}, sort_keys=True) + "\n")
+        handle.write(json.dumps({"kind": "gate_experiment", **report.to_dict()}, sort_keys=True) + "\n")
     return str(path)
 
 

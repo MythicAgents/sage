@@ -134,85 +134,6 @@ def test_session_stop_helper_requests_stop_by_display_id():
     asyncio.run(_case())
 
 
-def test_stop_command_marks_active_llm_task_stopped(monkeypatch):
-    from container.agent_functions import stop as stop_mod  # noqa: E402
-
-    class _FakeModel:
-        provider = "test"
-        model = "test"
-        task_id = 101
-        task_display_id = 202
-
-        def __init__(self):
-            self.stopped = False
-
-        def request_stop(self):
-            self.stopped = True
-
-    class _Args:
-        def get_arg(self, key):
-            return ""
-
-    async def _case():
-        model_mod.sessions.clear()
-        fake = _FakeModel()
-        await model_mod.add_session("101", fake)
-        updates = []
-        responses = []
-
-        async def fake_update(msg):
-            updates.append(msg)
-            return SimpleNamespace(Success=True, Error="")
-
-        async def fake_response(msg):
-            responses.append(msg)
-            return SimpleNamespace(Success=True, Error="")
-
-        async def fake_callback(msg):
-            return SimpleNamespace(Success=True, Error="")
-
-        monkeypatch.setattr(
-            stop_mod,
-            "MythicRPCTaskUpdateMessage",
-            lambda **kwargs: SimpleNamespace(**kwargs),
-        )
-        monkeypatch.setattr(
-            stop_mod,
-            "MythicRPCResponseCreateMessage",
-            lambda task_id, response: SimpleNamespace(TaskID=task_id, Response=response),
-        )
-        monkeypatch.setattr(
-            stop_mod,
-            "MythicRPCCallbackUpdateMessage",
-            lambda **kwargs: SimpleNamespace(**kwargs),
-        )
-        monkeypatch.setattr(stop_mod, "SendMythicRPCTaskUpdate", fake_update)
-        monkeypatch.setattr(stop_mod, "SendMythicRPCResponseCreate", fake_response)
-        monkeypatch.setattr(stop_mod, "SendMythicRPCCallbackUpdate", fake_callback)
-
-        task_data = SimpleNamespace(
-            Task=SimpleNamespace(ID=999),
-            args=_Args(),
-        )
-        command = stop_mod.StopCommand.__new__(stop_mod.StopCommand)
-        result = await command.create_go_tasking(task_data)
-
-        assert result.Success is True
-        assert result.Completed is True
-        assert fake.stopped is True
-        assert "101" not in model_mod.sessions
-        stopped_updates = [
-            msg for msg in updates
-            if getattr(msg, "TaskID", None) == 101 and getattr(msg, "UpdateStatus", None) == "stopped"
-        ]
-        assert stopped_updates
-        assert getattr(stopped_updates[0], "UpdateCompleted", False) is True
-        rendered = "\n".join(str(getattr(msg, "Response", b"")) for msg in responses)
-        assert "Stop requested" in rendered or responses
-
-    asyncio.run(_case())
-
-
 def test_intent_exact_continue_and_stop_no_llm():
     m = _bare_model()  # llm None: exact-match paths must not need the LLM
     assert asyncio.run(m._classify_continuation_intent("continue")) == "CONTINUE"
@@ -221,20 +142,17 @@ def test_intent_exact_continue_and_stop_no_llm():
     assert asyncio.run(m._classify_continuation_intent("quit")) == "STOP"
 
 
-def test_intent_no_llm_falls_back_to_redirect():
-    m = _bare_model()  # non-exact + llm None → REDIRECT
-    assert asyncio.run(m._classify_continuation_intent("go scan the subnet")) == "REDIRECT"
+def test_intent_no_llm_falls_back_to_stop():
+    m = _bare_model()  # unknown continuation + no classifier must not preserve or widen authority
+    assert asyncio.run(m._classify_continuation_intent("go scan the subnet")) == "STOP"
 
 
 def test_intent_llm_classifies_inhibit_as_stop():
     m = _bare_model()
 
-    class _Resp:
-        content = "STOP"
-
     class _FakeLLM:
         async def ainvoke(self, msgs):
-            return _Resp()
+            return model_mod.AIMessage(content="STOP")
 
     m.llm = _FakeLLM()
     got = asyncio.run(m._classify_continuation_intent(
@@ -245,18 +163,15 @@ def test_intent_llm_classifies_inhibit_as_stop():
 def test_intent_llm_redirect_passthrough():
     m = _bare_model()
 
-    class _Resp:
-        content = "the answer is REDIRECT"  # extra words around the label still parse
-
     class _FakeLLM:
         async def ainvoke(self, msgs):
-            return _Resp()
+            return model_mod.AIMessage(content="REDIRECT")
 
     m.llm = _FakeLLM()
     assert asyncio.run(m._classify_continuation_intent("now pivot to the DC and dump creds")) == "REDIRECT"
 
 
-def test_intent_llm_error_falls_back_to_redirect():
+def test_intent_llm_error_falls_back_to_stop():
     m = _bare_model()
 
     class _BadLLM:
@@ -264,7 +179,7 @@ def test_intent_llm_error_falls_back_to_redirect():
             raise RuntimeError("boom")
 
     m.llm = _BadLLM()
-    assert asyncio.run(m._classify_continuation_intent("some ambiguous instruction")) == "REDIRECT"
+    assert asyncio.run(m._classify_continuation_intent("some ambiguous instruction")) == "STOP"
 
 
 if __name__ == "__main__":

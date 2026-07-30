@@ -3,18 +3,26 @@
 
 Uses the BloodHound MCP's own signed base client (reads the MCP's .env), so it targets the exact
 instance the MCP/Sage reach — no raw host:port guessing. Run via the MCP's env:
-  uv --directory /home/john/dev/bloodhound_mcp run python /home/john/dev/sage/skills/sage-goad-reset/scripts/bh_reset.py [status|wipe --yes]
+  uv --directory <workspace>/bloodhound_mcp run python <repo>/skills/sage-goad-reset/scripts/bh_reset.py [status|wipe --yes]
 """
 import json
+import os
+from pathlib import Path
 import sys
 import time
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
+DEFAULT_BLOODHOUND_MCP_DIR = Path(
+    os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+    or (WORKSPACE_ROOT / "bloodhound_mcp")
+)
 _client = None
 
 def _get_client():
     global _client
     if _client is None:
-        sys.path.insert(0, "/home/john/dev/bloodhound_mcp")
+        sys.path.insert(0, str(DEFAULT_BLOODHOUND_MCP_DIR))
         from lib.bloodhound_api import BloodhoundBaseClient
         _client = BloodhoundBaseClient()
     return _client

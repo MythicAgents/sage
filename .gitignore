@@ -4,20 +4,21 @@
 .npmrc
 package.json
 package-lock.json
-CLAUDE.md
+# CLAUDE.md is committed (it imports AGENTS.md and adds the Claude-specific subset).
+# Personal, machine-specific notes go in CLAUDE.local.md, which Claude Code loads right after it.
+CLAUDE.local.md
 venv/
 Notes
 Plans
 sage.db*
 Payload_Type/sage/sage*.db*
 .claude/
-tasks/
 .env
-skills/sage-callback-bootstrap/apollo_callback_config.json
-skills/sage-callback-bootstrap/merlin_callback_config.json
+skills/sage-callback-bootstrap/*_callback_config.json
 .evals/
 .mcp.json
 .envrc
+skills/sage-eval-gauge/.env.local
 
 # Phoenix observability directory - ignore contents but keep structure
 Payload_Type/sage/.phoenix/*
@@ -32,8 +33,15 @@ Payload_Type/sage/certs/*.pem
 Payload_Type/sage/sage.log
 Payload_Type/sage/evals/results/
 
-# Sage durable engagement-state ledger (runtime state — never commit)
+# Sage durable engagement-state ledger and local analysis artifacts (runtime state — never commit)
 .sage_engagement/
-Payload_Type/sage/.trajectory/
-Payload_Type/sage/MEMORY/audit.jsonl
-Payload_Type/sage/Payload_Type/sage/.trajectory/
+.hillclimb/
+**/.trajectory/
+# Residual guard. The HITL audit writer was removed (model.py `_write_hitl_audit`), so nothing
+# creates this any more — but a Sage process still running the older code keeps appending until it
+# is restarted, and the file reached 12.8MB. Cheap insurance against committing that.
+**/MEMORY/audit.jsonl
+.r5_preflight/
+
+# Private durable Codex/Sage contracts, handoffs, reviews, transcripts, and evidence
+.sage_history/

@@ -1,6 +1,8 @@
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -12,6 +14,12 @@ class ResolveResult:
     group: str | None
     repair: str | None
     notes: list[str]
+
+
+@dataclass(frozen=True)
+class _SharpHoundTimestamp:
+    local: datetime
+    absolute_100ns: int
 
 
 class ResultClass(str, Enum):
@@ -37,6 +45,7 @@ _CONSTRUCTION_SIGNATURES = (
     "not registered",
     "ensure_tool_uploaded",
     "null uuid",
+    "credential material is not a plaintext password",
 )
 
 _GENUINE_SIGNATURES = (
@@ -70,8 +79,58 @@ _GENERIC_ERROR_HINTS = (
     "traceback",
 )
 
+_SHARPHOUND_COMMAND_SELECTORS = {
+    "execute_assembly": "Assembly",
+    "execute-assembly": "assembly",
+}
+_SHARPHOUND_CANONICAL_SELECTOR_KEYS = {
+    "assembly",
+    "assemblyname",
+    "assemblyfile",
+    "filename",
+    "file",
+}
+_SHARPHOUND_CANONICAL_MARKERS = (
+    "sharphoundenumerationcompleted",
+    "happygraphing",
+)
+_SHARPHOUND_LOG_RECORD_RE = re.compile(
+    r"^(?P<timestamp>[^|\r\n]+)\|(?P<level>[A-Z]+)\|(?P<message>[^|\r\n]*)$"
+)
+_SHARPHOUND_ISO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?P<fraction>\.\d{1,7})?"
+    r"(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$"
+)
+_SHARPHOUND_NONFATAL_HTTP_404_RE = re.compile(
+    r"^HttpRequestException occurred checking NTLM accessibility for URL: "
+    r"https?://[^\s|\r\n]+\. Exception: Response status code does not indicate success: "
+    r"404 \(Not Found\)\.$"
+)
+_SHARPHOUND_COMPLETION_RE = re.compile(
+    r"^SharpHound Enumeration Completed at "
+    r"(?P<hour>0?[1-9]|1[0-2]):(?P<minute>[0-5]\d) (?P<ampm>AM|PM) on "
+    r"(?P<month>0?[1-9]|1[0-2])/(?P<day>0?[1-9]|[12]\d|3[01])/(?P<year>\d{4})! Happy Graphing!$"
+)
+_SHARPHOUND_CACHE_CONTINUATION_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^ \d+ name to SID mappings\.$",
+        r"^ \d+ machine sid mappings\.$",
+        r"^ \d+ sid to domain mappings\.$",
+        r"^ \d+ global catalog mappings\.$",
+    )
+)
+_SHARPHOUND_OPSEC_SUFFIX_RE = re.compile(
+    r"^\[SAGE OPSEC\] footprint total=(?P<total>\d+) axes="
+    r"\{'disk_artifact': (?P<disk_artifact>\d+), 'new_beacon': (?P<new_beacon>\d+), "
+    r"'new_process': (?P<new_process>\d+), 'flagged_tool': (?P<flagged_tool>\d+), "
+    r"'lateral_hop': (?P<lateral_hop>\d+), 'network_signature': (?P<network_signature>\d+), "
+    r"'reversibility': (?P<reversibility>\d+)\}\. This action was recorded to the artifact ledger "
+    r"\u2014 clean it up at sub-goal completion \(list_open_artifacts\)\.$"
+)
 
-def classify_result(command: str, output: str, exception: str | None = None) -> str:
+
+def classify_result(command: str, output: str, exception: str | None = None, parameters: Any = None) -> str:
     try:
         _text(command)
         pieces = [_text(output)]
@@ -87,11 +146,189 @@ def classify_result(command: str, output: str, exception: str | None = None) -> 
             return ResultClass.TRANSIENT.value
         if exception is not None and _text(exception).strip():
             return ResultClass.TRANSIENT.value
+        sharphound_completion = _sharphound_completion_override(command, output, parameters)
+        if sharphound_completion is not None:
+            return ResultClass.SUCCESS.value if sharphound_completion else ResultClass.TRANSIENT.value
         if any(signature in low for signature in _GENERIC_ERROR_HINTS):
             return ResultClass.TRANSIENT.value
         return ResultClass.SUCCESS.value
     except Exception:
         return ResultClass.TRANSIENT.value
+
+
+def _sharphound_completion_override(command: str, output: str, parameters: Any) -> bool | None:
+    """Recognize strict SharpHound completion as task status, not capability proof."""
+    try:
+        if _text(command) not in _SHARPHOUND_COMMAND_SELECTORS:
+            return None
+        text = _text(output)
+        exact_binding = _has_exact_sharphound_selector_binding(command, parameters)
+        marker_signal = _has_sharphound_marker_signal(text)
+        record_signal = _has_sharphound_record_signal(text)
+        if not marker_signal and not (exact_binding and record_signal):
+            return None
+        if not exact_binding:
+            return False
+
+        saw_nonfatal_error = False
+        saw_completion = False
+        saw_opsec_suffix = False
+        previous_absolute_100ns = None
+        for raw_line in text.splitlines():
+            if saw_completion:
+                if not raw_line:
+                    continue
+                if saw_opsec_suffix or not _valid_sharphound_opsec_suffix(raw_line):
+                    return False
+                saw_opsec_suffix = True
+                continue
+
+            if not raw_line:
+                continue
+            if raw_line == "Closing writers" or any(
+                pattern.fullmatch(raw_line) is not None
+                for pattern in _SHARPHOUND_CACHE_CONTINUATION_PATTERNS
+            ):
+                continue
+
+            match = _SHARPHOUND_LOG_RECORD_RE.fullmatch(raw_line)
+            if match is None:
+                return False
+
+            timestamp = _strict_iso8601_timestamp(match.group("timestamp"))
+            if timestamp is None or (
+                previous_absolute_100ns is not None
+                and timestamp.absolute_100ns < previous_absolute_100ns
+            ):
+                return False
+            previous_absolute_100ns = timestamp.absolute_100ns
+            level = match.group("level")
+            message = match.group("message")
+            completion = _strict_sharphound_completion_message(message, timestamp.local)
+            if completion:
+                if level != "INFORMATION":
+                    return False
+                saw_completion = True
+                continue
+            if _has_sharphound_marker_signal(message):
+                return False
+            if level == "ERROR":
+                if saw_nonfatal_error or _SHARPHOUND_NONFATAL_HTTP_404_RE.fullmatch(message) is None:
+                    return False
+                saw_nonfatal_error = True
+                continue
+            if level != "INFORMATION":
+                return False
+
+        return saw_completion
+    except Exception:
+        return False
+
+
+def _has_sharphound_record_signal(value: Any) -> bool:
+    try:
+        return any("|" in line for line in _text(value).splitlines())
+    except Exception:
+        return False
+
+
+def _has_sharphound_marker_signal(value: Any) -> bool:
+    try:
+        canonical = _canonical_alphanumeric(value)
+        return any(marker in canonical for marker in _SHARPHOUND_CANONICAL_MARKERS)
+    except Exception:
+        return False
+
+
+def _canonical_alphanumeric(value: Any) -> str:
+    try:
+        normalized = unicodedata.normalize("NFKC", _text(value)).casefold()
+        return "".join(character for character in normalized if character.isalnum())
+    except Exception:
+        return ""
+
+
+def _has_exact_sharphound_selector_binding(command: Any, parameters: Any) -> bool:
+    try:
+        selector = _SHARPHOUND_COMMAND_SELECTORS.get(_text(command))
+        if (
+            selector is None
+            or not isinstance(parameters, dict)
+            or parameters.get(selector) != "SharpHound.exe"
+        ):
+            return False
+        for key in parameters:
+            key_text = _text(key)
+            canonical_key = _canonical_alphanumeric(key_text)
+            if canonical_key in _SHARPHOUND_CANONICAL_SELECTOR_KEYS and key_text != selector:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _strict_iso8601_timestamp(value: Any) -> _SharpHoundTimestamp | None:
+    try:
+        text = _text(value)
+        match = _SHARPHOUND_ISO_TIMESTAMP_RE.fullmatch(text)
+        if match is None:
+            return None
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        utc_second = parsed.replace(microsecond=0).astimezone(timezone.utc)
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        delta = utc_second - epoch
+        fraction = (match.group("fraction") or ".0")[1:].ljust(7, "0")
+        absolute_100ns = (
+            (delta.days * 86400 + delta.seconds) * 10_000_000
+            + int(fraction)
+        )
+        return _SharpHoundTimestamp(local=parsed, absolute_100ns=absolute_100ns)
+    except Exception:
+        return None
+
+
+def _strict_sharphound_completion_message(message: str, timestamp: datetime) -> bool:
+    try:
+        match = _SHARPHOUND_COMPLETION_RE.fullmatch(_text(message))
+        if match is None:
+            return False
+        completed_at = datetime.strptime(
+            (
+                f"{match.group('month')}/{match.group('day')}/{match.group('year')} "
+                f"{match.group('hour')}:{match.group('minute')} {match.group('ampm')}"
+            ),
+            "%m/%d/%Y %I:%M %p",
+        )
+        return (
+            completed_at.year == timestamp.year
+            and completed_at.month == timestamp.month
+            and completed_at.day == timestamp.day
+            and completed_at.hour == timestamp.hour
+            and completed_at.minute == timestamp.minute
+        )
+    except Exception:
+        return False
+
+
+def _valid_sharphound_opsec_suffix(value: Any) -> bool:
+    try:
+        match = _SHARPHOUND_OPSEC_SUFFIX_RE.fullmatch(_text(value))
+        if match is None:
+            return False
+        axes = (
+            "disk_artifact",
+            "new_beacon",
+            "new_process",
+            "flagged_tool",
+            "lateral_hop",
+            "network_signature",
+            "reversibility",
+        )
+        return int(match.group("total")) == sum(int(match.group(axis)) for axis in axes)
+    except Exception:
+        return False
 
 
 def breaker_decision(result_class: str, attempts: int) -> str:

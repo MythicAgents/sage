@@ -1,5 +1,9 @@
 import asyncio
+import contextvars
+import inspect
+import json
 import logging
+import os
 import traceback
 import warnings
 from datetime import timedelta
@@ -7,6 +11,7 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+import anyio
 import httpx
 from mcp import ClientSession
 from langchain_mcp_adapters.tools import load_mcp_tools, convert_mcp_tool_to_langchain_tool
@@ -14,6 +19,56 @@ from langchain_mcp_adapters.sessions import Connection, StdioConnection, SSEConn
 from langchain_core.tools import BaseTool
 
 from mythic_container.logging import logger
+
+
+MCP_EXECUTION_CLASS_UNCLASSIFIED = "unclassified"
+MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE = "non_target_control_plane"
+# Compatibility symbol for callers that imported the older name before the boundary contract was finalized.
+MCP_EXECUTION_CLASS_CONTROL_PLANE = MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE
+MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE = "bloodhound_control_plane"
+MCP_EXECUTION_CLASS_TARGET_FACING = "target_facing"
+MCP_EXECUTION_CONTEXT_GENERAL = "general"
+MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME = "offensive_runtime"
+ALLOWED_MCP_EXECUTION_CLASSES = frozenset({
+    MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+    MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE,
+})
+_LEGACY_MCP_EXECUTION_CLASS_ALIASES = {
+    "control_plane": MCP_EXECUTION_CLASS_NON_TARGET_CONTROL_PLANE,
+}
+
+
+def normalize_execution_class(value: Any) -> str:
+    normalized = str(value or "").strip().casefold() or MCP_EXECUTION_CLASS_UNCLASSIFIED
+    return _LEGACY_MCP_EXECUTION_CLASS_ALIASES.get(normalized, normalized)
+
+
+def execution_class_allowed(value: Any) -> bool:
+    return normalize_execution_class(value) in ALLOWED_MCP_EXECUTION_CLASSES
+
+
+_execution_observer: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "sage_execution_observer",
+    default=None,
+)
+_execution_activity: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "sage_execution_activity",
+    default=None,
+)
+_execution_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "sage_mcp_execution_context",
+    default=MCP_EXECUTION_CONTEXT_GENERAL,
+)
+
+
+def _execution_result_text(value: Any) -> str:
+    """Serialize the complete MCP result for operator-visible execution evidence."""
+    try:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, default=str, ensure_ascii=False)
+    except Exception:
+        return str(value)
 
 
 # Filter to suppress noisy SSE ping messages from MCP libraries
@@ -53,6 +108,18 @@ def _create_insecure_httpx_client(**kwargs) -> httpx.AsyncClient:
     return httpx.AsyncClient(verify=False, **kwargs)
 
 
+def _transport_is_closed(exc: BaseException) -> bool:
+    """Return True when an MCP failure proves the underlying transport is already dead."""
+    if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_transport_is_closed(nested) for nested in exc.exceptions)
+    for nested in (getattr(exc, "__cause__", None), getattr(exc, "__context__", None)):
+        if isinstance(nested, BaseException) and _transport_is_closed(nested):
+            return True
+    return False
+
+
 class ConnectionType(Enum):
     STDIO = "stdio"
     SSE = "sse"
@@ -83,6 +150,11 @@ class MCPConnectionConfig:
     # Additional connection parameters
     session_kwargs: Optional[Dict[str, Any]] = None
     extra_params: Optional[Dict[str, Any]] = None
+    # Sage boundary classification. Unclassified and target-facing servers are denied before connect.
+    sage_execution_class: str = MCP_EXECUTION_CLASS_UNCLASSIFIED
+
+    def __post_init__(self) -> None:
+        self.sage_execution_class = normalize_execution_class(self.sage_execution_class)
 
 
 class MCPServerManager:
@@ -94,8 +166,204 @@ class MCPServerManager:
         self.tools: Dict[str, List[BaseTool]] = {}
         self.configs: Dict[str, MCPConnectionConfig] = {}
         self._session_contexts: Dict[str, Any] = {}
-    
+        self._server_locks: Dict[str, asyncio.Lock] = {}
+        self._execution_seq = 0
+
+    def set_execution_observer(self, observer):
+        """Bind a request-local execution observer and return its reset token."""
+        return _execution_observer.set(observer if callable(observer) else None)
+
+    def reset_execution_observer(self, token) -> None:
+        _execution_observer.reset(token)
+
+    def set_execution_activity(self, activity: dict[str, str] | None):
+        """Bind a request-local grouping activity and return its reset token."""
+        return _execution_activity.set(dict(activity) if isinstance(activity, dict) else None)
+
+    def reset_execution_activity(self, token) -> None:
+        _execution_activity.reset(token)
+
+    def current_execution_activity(self) -> dict[str, str] | None:
+        activity = _execution_activity.get()
+        return dict(activity) if isinstance(activity, dict) else None
+
+    def set_execution_context(self, execution_context: str):
+        """Bind the request-local MCP authorization context and return its reset token."""
+        if execution_context not in {
+            MCP_EXECUTION_CONTEXT_GENERAL,
+            MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME,
+        }:
+            raise ValueError(f"unsupported MCP execution context: {execution_context!r}")
+        return _execution_context.set(execution_context)
+
+    def reset_execution_context(self, token) -> None:
+        _execution_context.reset(token)
+
+    def current_execution_context(self) -> str:
+        return _execution_context.get()
+
+    def _forget_server(self, server_name: str) -> None:
+        """Drop one server from the in-memory registry after a proven dead transport."""
+        self.sessions.pop(server_name, None)
+        self.connections.pop(server_name, None)
+        self.configs.pop(server_name, None)
+        self._session_contexts.pop(server_name, None)
+        self.tools.pop(server_name, None)
+
+    async def _notify_execution_observer(self, event: dict[str, Any]) -> None:
+        observer = _execution_observer.get()
+        if observer is None:
+            return
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"MCP execution observer failed (non-fatal): {exc}")
+
+    def _wrap_tool_for_visibility(
+        self,
+        server_name: str,
+        tool: BaseTool,
+        *,
+        source_identity: tuple[Any, Any, Any] | None = None,
+    ) -> Optional[BaseTool]:
+        """Clone one MCP tool with lifecycle observation around its outbound call.
+
+        The wrapper is part of the execution boundary. If it cannot be installed,
+        the tool is not registered.
+        """
+        original = getattr(tool, "coroutine", None)
+        if not callable(original):
+            logger.warning(f"MCP tool {server_name}.{tool.name} has no async coroutine; tool denied")
+            return None
+
+        self._execution_seq += 1
+        wrapper_version = self._execution_seq
+        manager = self
+        source_config, source_session, source_connection = source_identity or (
+            self.configs.get(server_name),
+            self.sessions.get(server_name),
+            self.connections.get(server_name),
+        )
+
+        async def _observed_coroutine(*args, **kwargs):
+            if (
+                manager.configs.get(server_name) is not source_config
+                or manager.sessions.get(server_name) is not source_session
+                or manager.connections.get(server_name) is not source_connection
+            ):
+                raise PermissionError(
+                    f"MCP tool '{server_name}.{tool.name}' denied: its source connection is no longer active"
+                )
+            if (
+                manager.current_execution_context() == MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+                and not manager.is_bloodhound_server(server_name)
+            ):
+                raise PermissionError(
+                    f"MCP tool '{server_name}.{tool.name}' denied: offensive runtime permits only "
+                    "the canonical BloodHound control-plane server"
+                )
+            manager._execution_seq += 1
+            call_id = f"mcp:{server_name}:{tool.name}:{manager._execution_seq}"
+            arguments = kwargs if kwargs else {"args": list(args)}
+            base_event = {
+                "event_id": call_id,
+                "source": "mcp",
+                "server": server_name,
+                "tool_name": tool.name,
+                "arguments": arguments,
+                "activity": manager.current_execution_activity(),
+            }
+            await manager._notify_execution_observer({**base_event, "status": "started"})
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException as exc:
+                if (
+                    _transport_is_closed(exc)
+                    and manager.configs.get(server_name) is source_config
+                    and manager.sessions.get(server_name) is source_session
+                    and manager.connections.get(server_name) is source_connection
+                ):
+                    manager._forget_server(server_name)
+                    logger.warning(
+                        f"MCP server '{server_name}' dropped from registry after closed transport: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                await manager._notify_execution_observer(
+                    {
+                        **base_event,
+                        "status": "error",
+                        "result_preview": f"{type(exc).__name__}: {exc}",
+                        "output": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                raise
+            result_text = _execution_result_text(result)
+            await manager._notify_execution_observer({
+                **base_event,
+                "status": "completed",
+                "result_preview": result_text,
+                "output": result_text,
+            })
+            return result
+
+        try:
+            wrapped = tool.model_copy(deep=False)
+            object.__setattr__(wrapped, "coroutine", _observed_coroutine)
+            metadata = dict(getattr(wrapped, "metadata", None) or {})
+            metadata["sage_visibility_wrapper"] = wrapper_version
+            object.__setattr__(wrapped, "metadata", metadata)
+            return wrapped
+        except Exception as exc:
+            logger.warning(
+                f"Could not wrap MCP tool {server_name}.{tool.name} for visibility; tool denied: {exc}"
+            )
+            return None
+
+    @staticmethod
+    def _is_canonical_bloodhound_config(config: MCPConnectionConfig | None) -> bool:
+        """Recognize the operator-pinned BloodHound launcher admitted to execution.
+
+        Internal consistency (``--directory == cwd``) is not an identity check: an operator or
+        concurrent channel could otherwise replace the process with another directory while retaining
+        the canonical name and execution class. Bind the config to the process-wide trusted directory
+        and command immediately before every outbound invocation.
+        """
+        configured_dir = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
+        if not configured_dir or not os.path.isabs(configured_dir):
+            return False
+        expected_dir = os.path.realpath(configured_dir)
+        expected_command = str(os.environ.get("SAGE_BLOODHOUND_MCP_COMMAND", "uv"))
+        args = list(config.args or []) if config is not None else []
+        return bool(
+            config is not None
+            and config.name == "BloodHound"
+            and normalize_execution_class(config.sage_execution_class)
+            == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
+            and config.connection_type == ConnectionType.STDIO
+            and str(config.command or "") == expected_command
+            and config.env == {}
+            and str(config.cwd or "") == configured_dir
+            and os.path.realpath(str(config.cwd or "")) == expected_dir
+            and len(args) == 4
+            and args[0] == "--directory"
+            and str(args[1]) == configured_dir
+            and os.path.realpath(str(args[1])) == expected_dir
+            and args[2:] == ["run", "main.py"]
+        )
+
+    def is_bloodhound_server(self, server_name: str) -> bool:
+        config = self.configs.get(server_name)
+        return bool(server_name == "BloodHound" and self._is_canonical_bloodhound_config(config))
+
     async def connect_server(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
+        """Serialize a server-name replacement through connection, tool load, and registry commit."""
+        lock = self._server_locks.setdefault(config.name, asyncio.Lock())
+        async with lock:
+            return await self._connect_server_locked(config)
+
+    async def _connect_server_locked(self, config: MCPConnectionConfig) -> tuple[bool, Optional[str]]:
         """
         Connect to an MCP server based on the provided configuration
 
@@ -105,6 +373,23 @@ class MCPServerManager:
         Returns:
             tuple: (success: bool, error_message: Optional[str])
         """
+        if not execution_class_allowed(getattr(config, "sage_execution_class", None)):
+            execution_class = normalize_execution_class(getattr(config, "sage_execution_class", None))
+            return (
+                False,
+                f"MCP server '{config.name}' denied before connect: execution class '{execution_class}' is not allowed",
+            )
+        if (
+            normalize_execution_class(getattr(config, "sage_execution_class", None))
+            == MCP_EXECUTION_CLASS_BLOODHOUND_CONTROL_PLANE
+            and not self._is_canonical_bloodhound_config(config)
+        ):
+            return (
+                False,
+                f"MCP server '{config.name}' denied before connect: bloodhound_control_plane requires "
+                "the canonical BloodHound stdio configuration",
+            )
+
         # Set up a temporary exception handler to capture background task errors
         captured_exceptions: List[str] = []
         loop = asyncio.get_event_loop()
@@ -138,7 +423,7 @@ class MCPServerManager:
         try:
             if config.name in self.sessions:
                 logger.warning(f"Server '{config.name}' already connected. Disconnecting first.")
-                await self.disconnect_server(config.name)
+                await self._disconnect_server_locked(config.name)
             
             # Create connection config as dictionary (TypedDict)
             connection: Connection
@@ -255,6 +540,12 @@ class MCPServerManager:
             loop.set_exception_handler(original_handler)
 
     async def disconnect_server(self, server_name: str) -> bool:
+        """Serialize disconnect with same-name connects and tool registration."""
+        lock = self._server_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            return await self._disconnect_server_locked(server_name)
+
+    async def _disconnect_server_locked(self, server_name: str) -> bool:
         """
         Disconnect from an MCP server
 
@@ -281,19 +572,8 @@ class MCPServerManager:
                         else:
                             raise
 
-                # Clean up stored references regardless of context exit success
-                if server_name in self.sessions:
-                    del self.sessions[server_name]
-                if server_name in self.connections:
-                    del self.connections[server_name]
-                if server_name in self.configs:
-                    del self.configs[server_name]
-                if server_name in self._session_contexts:
-                    del self._session_contexts[server_name]
-
-                # Remove tools for this server
-                if server_name in self.tools:
-                    del self.tools[server_name]
+                # Clean up stored references regardless of context exit success.
+                self._forget_server(server_name)
 
                 logger.info(f"Disconnected from MCP server '{server_name}'")
                 return True
@@ -307,12 +587,31 @@ class MCPServerManager:
     
     async def _load_tools_for_server(self, server_name: str):
         """Load and convert MCP tools for a specific server"""
+        config = self.configs.get(server_name)
+        session = self.sessions.get(server_name)
+        connection = self.connections.get(server_name)
+        source_identity = (config, session, connection)
         try:
-            session = self.sessions[server_name]
-            connection = self.connections[server_name]
+            if config is None or not execution_class_allowed(config.sage_execution_class):
+                logger.warning(f"MCP server '{server_name}' tool load denied: missing allowed execution class")
+                self.tools[server_name] = []
+                return
+            if session is None or connection is None:
+                logger.warning(f"MCP server '{server_name}' tool load denied: connection is incomplete")
+                self.tools[server_name] = []
+                return
 
             # Use the langchain_mcp_adapters function to load and convert tools
             langchain_tools = await load_mcp_tools(session, connection=connection)
+            if (
+                self.configs.get(server_name) is not config
+                or self.sessions.get(server_name) is not session
+                or self.connections.get(server_name) is not connection
+            ):
+                logger.warning(
+                    f"Discarded stale MCP tool refresh for '{server_name}' after its source connection changed"
+                )
+                return
 
             # Check for tool name conflicts with existing tools (warn but don't exclude)
             existing_tool_names = self._get_all_existing_tool_names()
@@ -323,8 +622,17 @@ class MCPServerManager:
                     logger.warning(f"Tool name conflict: '{tool.name}' from server '{server_name}' conflicts with existing tool. Use server_name parameter to disambiguate.")
                     conflicts_found += 1
 
-            # Store ALL tools for this server (including ones with conflicting names)
-            self.tools[server_name] = langchain_tools
+            # Store ALL tools for this server (including ones with conflicting names).
+            # Observation is installed here so every Sage caller shares the same outbound boundary.
+            wrapped_tools = [
+                self._wrap_tool_for_visibility(
+                    server_name,
+                    tool,
+                    source_identity=source_identity,
+                )
+                for tool in langchain_tools
+            ]
+            self.tools[server_name] = [tool for tool in wrapped_tools if tool is not None]
 
             if conflicts_found > 0:
                 logger.warning(f"Loaded {len(langchain_tools)} tools from server '{server_name}' ({conflicts_found} tools have name conflicts with other servers)")
@@ -333,7 +641,12 @@ class MCPServerManager:
 
         except Exception as e:
             logger.error(f"Failed to load tools for server '{server_name}': {e}")
-            self.tools[server_name] = []
+            if (
+                self.configs.get(server_name) is config
+                and self.sessions.get(server_name) is session
+                and self.connections.get(server_name) is connection
+            ):
+                self.tools[server_name] = []
 
     def _get_all_existing_tool_names(self) -> set:
         """Get a set of all existing tool names from all connected servers"""
@@ -422,13 +735,18 @@ class MCPServerManager:
             server_name: Name of server to refresh, or None for all servers
         """
         if server_name:
-            if server_name in self.sessions:
-                await self._load_tools_for_server(server_name)
-            else:
-                logger.warning(f"Server '{server_name}' not connected")
+            lock = self._server_locks.setdefault(server_name, asyncio.Lock())
+            async with lock:
+                if server_name in self.sessions:
+                    await self._load_tools_for_server(server_name)
+                else:
+                    logger.warning(f"Server '{server_name}' not connected")
         else:
-            for name in self.sessions.keys():
-                await self._load_tools_for_server(name)
+            for name in list(self.sessions):
+                lock = self._server_locks.setdefault(name, asyncio.Lock())
+                async with lock:
+                    if name in self.sessions:
+                        await self._load_tools_for_server(name)
     
     async def get_tool_by_name(self, tool_name: str, server_name: Optional[str] = None) -> Optional[BaseTool]:
         """
@@ -494,6 +812,7 @@ def create_stdio_config(name: str, command: str, args: List[str] | None,
                        encoding: str | None, encoding_error_handler: str | None,
                        session_kwargs: Dict[str, Any] | None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for STDIO MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.STDIO,
@@ -504,7 +823,8 @@ def create_stdio_config(name: str, command: str, args: List[str] | None,
         encoding=encoding,
         encoding_error_handler=encoding_error_handler,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )
 
 
@@ -513,6 +833,7 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
                      ssl_verify: bool | None = True,
                      session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for SSE MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.SSE,
@@ -522,7 +843,8 @@ def create_sse_config(name: str, url: str, headers: Dict[str, str] | None = None
         sse_read_timeout=sse_read_timeout,
         ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )
 
 
@@ -532,6 +854,7 @@ def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] |
                                  ssl_verify: bool | None = True,
                                  session_kwargs: Dict[str, Any] | None = None, **kwargs) -> MCPConnectionConfig:
     """Create a configuration for Streamable HTTP MCP connection"""
+    sage_execution_class = kwargs.pop("sage_execution_class", MCP_EXECUTION_CLASS_UNCLASSIFIED)
     return MCPConnectionConfig(
         name=name,
         connection_type=ConnectionType.STREAMABLE_HTTP,
@@ -542,5 +865,6 @@ def create_streamable_http_config(name: str, url: str, headers: Dict[str, str] |
         terminate_on_close=terminate_on_close,
         ssl_verify=ssl_verify,
         session_kwargs=session_kwargs,
-        extra_params=kwargs
+        extra_params=kwargs,
+        sage_execution_class=sage_execution_class,
     )

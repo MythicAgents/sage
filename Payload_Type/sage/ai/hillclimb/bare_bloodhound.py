@@ -22,13 +22,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 BLOODHOUND_SERVER = "BloodHound"
 
 
-# Hardcoded default so a bare run lights up BloodHound with NO env setup; the env var is just an override.
-_DEFAULT_BLOODHOUND_MCP_DIR = "/home/john/dev/bloodhound_mcp"
+# Sibling-of-Sage default so a bare run lights up BloodHound with NO env setup; the env var is
+# just an override. Encodes "bloodhound_mcp sits next to Sage", not one machine's home layout.
+_DEFAULT_BLOODHOUND_MCP_DIR = str(Path(__file__).resolve().parents[5] / "bloodhound_mcp")
 
 
 def _connections() -> dict | None:

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Bootstrap Sage and foothold callbacks after a Mythic reset.
+"""Verify Sage native chat and bootstrap the foothold after a Mythic reset.
 
 This script never deletes files or Mythic objects. It is intended for the reset window:
 active Sage/Phoenix DBs are archived, Mythic is reset, local Sage is restarted, then
-this helper creates fresh Sage/Apollo payloads before Apollo is launched on CASTELBLACK.
+this helper verifies native Sage chat and creates Apollo before it is launched on CASTELBLACK.
 Retained callback configs can be imported explicitly for any foothold payload type. The
-older baked-Apollo flow remains available behind --use-baked-apollo.
+older baked-Apollo flow remains available behind --use-baked-apollo. Reset/bootstrap
+preflight paths are control-plane only and never enqueue payload tasks.
 
 Examples:
   .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py inspect
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -34,6 +36,7 @@ from mythic import mythic
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = REPO_ROOT.parent
 LANGGRAPH_ROOT = REPO_ROOT / "Payload_Type" / "sage" / "ai" / "langgraph"
 if str(LANGGRAPH_ROOT) not in sys.path:
     sys.path.insert(0, str(LANGGRAPH_ROOT))
@@ -41,14 +44,35 @@ if str(LANGGRAPH_ROOT) not in sys.path:
 from mythic_tools import assess_callback_liveness  # noqa: E402
 
 
-MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
+# No directory-name fallback: guessing a Mythic checkout name would bake one machine's
+# layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
+# MYTHIC_ADMIN_PASSWORD directly and skip the .env entirely.
+DEFAULT_MYTHIC_ENV_PATHS: tuple[Path, ...] = ()
+
+
+def _default_mythic_env_path() -> Path:
+    configured = os.environ.get("MYTHIC_ENV_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    # `Path("")` is the "not configured" sentinel. Note it normalises to `Path(".")`, which DOES
+    # exist — so every guard must use `.is_file()`, not `.exists()`, or the sentinel sails through
+    # and something tries to read the cwd as an env file. Returning DEFAULT_MYTHIC_ENV_PATHS[0]
+    # would IndexError now that the tuple is empty.
+    return next((path for path in DEFAULT_MYTHIC_ENV_PATHS if path.is_file()), Path(""))
+
+
+MYTHIC_ENV_PATH = _default_mythic_env_path()
 SKILL_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 DEFAULT_SERVER = "127.0.0.1"
 DEFAULT_USER = "mythic_admin"
 DEFAULT_CALLBACK_CONFIG_PATH = Path(__file__).resolve().parents[1] / "apollo_callback_config.json"
 SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py"
+NATIVE_CHAT_PATH = REPO_ROOT / "skills" / "sage-live-runner" / "scripts" / "native_chat.py"
+READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
+DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
+DEFAULT_FOOTHOLD_USER_MATCH = "samwell.tarly"
 REQUIRED_RUNTIME_DBS = (
     "Payload_Type/sage/sage.db",
     "Payload_Type/sage/.phoenix/phoenix.db",
@@ -85,6 +109,22 @@ query ActiveCallbacks {
 }
 """
 
+CHAT_CONTAINER_QUERY = """
+query SageChatContainers {
+  consuming_container(
+    where: {name: {_eq: "sage"}, type: {_eq: "chat"}, deleted: {_eq: false}}
+    order_by: {id: desc}
+  ) {
+    id
+    name
+    type
+    container_running
+    deleted
+    updated_at
+  }
+}
+"""
+
 CALLBACK_ID_QUERY = """
 query CallbackIdentity($displayId: Int!) {
   callback(where: {display_id: {_eq: $displayId}}, limit: 1) {
@@ -94,12 +134,20 @@ query CallbackIdentity($displayId: Int!) {
 }
 """
 
+CALLBACK_UUID_QUERY = """
+query CallbackIdentityByUUID($agentCallbackId: String!) {
+  callback(where: {agent_callback_id: {_eq: $agentCallbackId}}, limit: 1) {
+    display_id
+    agent_callback_id
+  }
+}
+"""
+
 EXPORT_CALLBACK_CONFIG_QUERY = """
-query ExportCallbackConfig($agentCallbackId: String!) {
-  exportCallbackConfig(agent_callback_id: $agentCallbackId) {
+query ExportCallbackConfig($callbackDisplayId: Int!) {
+  exportCallbackConfig(callback_display_id: $callbackDisplayId) {
     status
     error
-    agent_callback_id
     config
   }
 }
@@ -132,7 +180,7 @@ def resolve_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
     env_value = os.environ.get("MYTHIC_ADMIN_PASSWORD")
     if env_value:
         return env_value
-    if env_path.exists():
+    if env_path.is_file():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -141,7 +189,9 @@ def resolve_password(env_path: Path = MYTHIC_ENV_PATH) -> str:
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
     raise RuntimeError(
-        "Set MYTHIC_ADMIN_PASSWORD or provide /home/john/dev/mythic/.env with MYTHIC_ADMIN_PASSWORD."
+        "Mythic auth is not configured. Set MYTHIC_ADMIN_PASSWORD, or set MYTHIC_ENV_PATH to your "
+        "Mythic install's .env (see .env.example at the repository root). No checkout location is "
+        + (f"guessed. Checked: {env_path}" if env_path.is_file() or str(env_path) != "." else "guessed.")
     )
 
 
@@ -199,6 +249,15 @@ def normalize_callback_config(value: Any) -> Any:
     if not isinstance(value, (dict, list)):
         raise ValueError("Callback config must be a JSON object or array.")
     return value
+
+
+def prepare_callback_config_for_import(config: Any) -> Any:
+    prepared = copy.deepcopy(normalize_callback_config(config))
+    if isinstance(prepared, dict):
+        callback = prepared.get("callback")
+        if isinstance(callback, dict):
+            callback["active"] = False
+    return prepared
 
 
 def build_callback_config_document(exported: dict[str, Any]) -> dict[str, Any]:
@@ -331,32 +390,11 @@ def runtime_db_status(
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
 ) -> dict[str, Any]:
-    if operator_db_cleanup_confirmed is not None:
-        runtime_dbs_archived = operator_db_cleanup_confirmed
-    required = [repo_root / rel for rel in REQUIRED_RUNTIME_DBS]
-    sage_archives = sorted((repo_root / "Payload_Type" / "sage").glob("sage_*.db"))
-    phoenix_archives = sorted((repo_root / "Payload_Type" / "sage" / ".phoenix").glob("phoenix_*.db"))
-    existing_required = [str(path.relative_to(repo_root)) for path in required if path.exists()]
-    existing_archives = [
-        str(path.relative_to(repo_root))
-        for path in (*sage_archives, *phoenix_archives)
-        if path.exists()
-    ]
-    blocks = bool(existing_required and not runtime_dbs_archived)
-    return {
-        "ready": not blocks,
-        "runtime_dbs_archived": runtime_dbs_archived,
-        "operator_db_cleanup_confirmed": runtime_dbs_archived,
-        "existing_required": existing_required,
-        "existing_archives": existing_archives,
-        "existing_session": [
-            path for path in existing_archives if Path(path).name.startswith("sage_")
-        ],
-        "note": (
-            "Archive active DBs with sage-goad-reset before Sage restart. Recreated active DB files are expected "
-            "after restart and do not block when --runtime-dbs-archived is supplied."
-        ),
-    }
+    return load_readiness_contract_module().runtime_db_status(
+        repo_root,
+        runtime_dbs_archived=runtime_dbs_archived,
+        operator_db_cleanup_confirmed=operator_db_cleanup_confirmed,
+    )
 
 
 def summarize_callback_readiness(
@@ -364,10 +402,17 @@ def summarize_callback_readiness(
     liveness_by_display_id: dict[int, dict[str, Any]],
     *,
     foothold_payload_type: str = "apollo",
+    chat_containers: list[dict[str, Any]] | None = None,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
     foothold_payload_type = str(foothold_payload_type or "").strip().casefold()
     if not foothold_payload_type:
         raise ValueError("foothold_payload_type cannot be empty")
+    foothold_host = str(foothold_host or "").strip().casefold()
+    foothold_user_match = str(foothold_user_match or "").strip().casefold()
+    if not foothold_host or not foothold_user_match:
+        raise ValueError("foothold_host and foothold_user_match cannot be empty")
     rows = []
     for callback in callbacks:
         display_id = callback.get("display_id")
@@ -383,28 +428,35 @@ def summarize_callback_readiness(
             "liveness_reason": live.get("reason"),
         })
 
-    live_sage = [
-        row for row in rows
-        if row["payloadtype"] == "sage" and row["live"]
+    live_chat = [
+        row
+        for row in (chat_containers or [])
+        if row.get("container_running") and not row.get("deleted")
     ]
     live_foothold = [
         row for row in rows
         if row["payloadtype"] == foothold_payload_type
         and row["live"]
-        and str(row.get("host") or "").casefold() == "castelblack"
-        and "samwell" in str(row.get("user") or "").casefold()
+        and str(row.get("host") or "").casefold() == foothold_host
+        and foothold_user_match in str(row.get("user") or "").casefold()
     ]
     selected_foothold_cb = max((row["display_id"] for row in live_foothold), default=None)
+    duplicate_live_footholds = [
+        row["display_id"] for row in live_foothold
+    ] if len(live_foothold) > 1 else []
     return {
-        "ready": bool(live_sage and live_foothold),
+        "ready": bool(live_chat and len(live_foothold) == 1),
         "callbacks": rows,
-        "selected_sage_cb": max((row["display_id"] for row in live_sage), default=None),
+        "selected_sage_cb": None,
+        "chat_containers": live_chat,
+        "selected_chat_container_id": live_chat[0].get("id") if live_chat else None,
         "foothold_payload_type": foothold_payload_type,
         "selected_foothold_cb": selected_foothold_cb,
         "selected_apollo_cb": selected_foothold_cb if foothold_payload_type == "apollo" else None,
+        "duplicate_live_footholds": duplicate_live_footholds,
         "required": (
-            "fresh live sage callback plus live "
-            f"{foothold_payload_type} callback on CASTELBLACK as samwell.tarly"
+            "running Sage chat container plus unique live "
+            f"{foothold_payload_type} callback on {foothold_host.upper()} as {foothold_user_match}"
         ),
     }
 
@@ -417,49 +469,113 @@ async def login(args: argparse.Namespace):
 async def inspect(client) -> dict[str, Any]:
     schemas = await mythic.execute_custom_query(client, BOOTSTRAP_SCHEMA_QUERY)
     callbacks = await mythic.execute_custom_query(client, CALLBACK_QUERY)
-    return {"schemas": schemas, "callbacks": callbacks.get("callback", [])}
+    chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+    return {
+        "schemas": schemas,
+        "callbacks": callbacks.get("callback", []),
+        "chat_containers": chat.get("consuming_container", []),
+    }
 
 
-async def resolve_agent_callback_id(client, selector: str) -> str:
+async def resolve_callback_identity(client, selector: str) -> dict[str, Any]:
     selector = str(selector).strip()
     if not selector:
         raise ValueError("Callback selector cannot be empty.")
-    if not selector.isdigit():
-        return selector
-    result = await mythic.execute_custom_query(
-        client,
-        CALLBACK_ID_QUERY,
-        variables={"displayId": int(selector)},
-    )
+    if selector.isdigit():
+        query = CALLBACK_ID_QUERY
+        variables = {"displayId": int(selector)}
+    else:
+        query = CALLBACK_UUID_QUERY
+        variables = {"agentCallbackId": selector}
+    result = await mythic.execute_custom_query(client, query, variables=variables)
     callbacks = result.get("callback") or []
-    if not callbacks or not callbacks[0].get("agent_callback_id"):
-        raise RuntimeError(f"No callback found for display ID {selector}.")
-    return str(callbacks[0]["agent_callback_id"])
+    if not callbacks:
+        raise RuntimeError(f"No callback found for selector {selector!r}.")
+    return callbacks[0]
 
 
 async def export_callback_config(client, selector: str) -> dict[str, Any]:
-    agent_callback_id = await resolve_agent_callback_id(client, selector)
+    identity = await resolve_callback_identity(client, selector)
     result = await mythic.execute_custom_query(
         client,
         EXPORT_CALLBACK_CONFIG_QUERY,
-        variables={"agentCallbackId": agent_callback_id},
+        variables={"callbackDisplayId": int(identity["display_id"])},
     )
-    return _require_success(
+    exported = _require_success(
         "callback config export",
         result.get("exportCallbackConfig") or {},
     )
+    return {**exported, "agent_callback_id": identity.get("agent_callback_id")}
 
 
 async def import_callback_config(client, config: Any) -> dict[str, Any]:
+    prepared = prepare_callback_config_for_import(config)
     result = await mythic.execute_custom_query(
         client,
         IMPORT_CALLBACK_CONFIG_MUTATION,
-        variables={"config": normalize_callback_config(config)},
+        variables={"config": prepared},
     )
-    return _require_success(
+    imported = _require_success(
         "callback config import",
         result.get("importCallbackConfig") or {},
     )
+    callback = prepared.get("callback") if isinstance(prepared, dict) else None
+    selector = ""
+    if isinstance(callback, dict):
+        selector = str(callback.get("agent_callback_id") or callback.get("display_id") or "").strip()
+    if not selector:
+        return imported
+    identity = await resolve_callback_identity(client, selector)
+    hidden = _require_success(
+        "imported callback hide",
+        await mythic.update_callback(
+            client,
+            callback_display_id=int(identity["display_id"]),
+            active=False,
+        ),
+    )
+    return {
+        **imported,
+        "callback_hidden": True,
+        "callback_display_id": int(identity["display_id"]),
+        "callback_hide": hidden,
+    }
+
+
+def load_native_chat_module():
+    spec = importlib.util.spec_from_file_location("sage_native_chat", NATIVE_CHAT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load native chat helper from {NATIVE_CHAT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_readiness_contract_module():
+    spec = importlib.util.spec_from_file_location("sage_readiness_contract", READINESS_CONTRACT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load readiness contract helper from {READINESS_CONTRACT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def ensure_sage_chat_api_token(client) -> dict[str, Any]:
+    native_chat = load_native_chat_module()
+    return await native_chat.ensure_api_token(client)
+
+
+async def prepare_sage_chat(client) -> dict[str, Any]:
+    native_chat = load_native_chat_module()
+    token = await ensure_sage_chat_api_token(client)
+    channel = await native_chat.prepare_locked_channel(
+        client,
+        api_token_id=int(token["api_token"]["id"]),
+    )
+    return {
+        "api_token": token,
+        "prepared_channel": channel,
+    }
 
 
 async def readiness(
@@ -469,6 +585,14 @@ async def readiness(
     runtime_dbs_archived: bool = False,
     operator_db_cleanup_confirmed: bool | None = None,
     foothold_payload_type: str = "apollo",
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
+    api_token_id: int | None = None,
+    ludus_observation: dict[str, Any] | None = None,
+    clock_observation: dict[str, Any] | None = None,
+    bloodhound_api_observation: dict[str, Any] | None = None,
+    bloodhound_mcp_observation: dict[str, Any] | None = None,
+    require_prepared_channel: bool = True,
 ) -> dict[str, Any]:
     if operator_db_cleanup_confirmed is not None:
         runtime_dbs_archived = operator_db_cleanup_confirmed
@@ -481,38 +605,51 @@ async def readiness(
         display_id = callback.get("display_id")
         if not isinstance(display_id, int):
             continue
-        if payload_type_name(callback).lower() not in {"sage", foothold_payload_type}:
+        if payload_type_name(callback).lower() != foothold_payload_type:
             continue
         try:
             liveness_by_display_id[display_id] = await assess_callback_liveness(client, display_id)
         except Exception as exc:
             liveness_by_display_id[display_id] = {"alive": False, "reason": f"liveness check failed: {exc}"}
 
-    runtime = runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived)
     callbacks = summarize_callback_readiness(
         observed.get("callbacks", []),
         liveness_by_display_id,
         foothold_payload_type=foothold_payload_type,
+        chat_containers=observed.get("chat_containers", []),
+        foothold_host=foothold_host,
+        foothold_user_match=foothold_user_match,
     )
-    blockers = []
-    if not runtime["ready"]:
-        blockers.append("archive stale Sage/Phoenix runtime DBs before restarting Sage")
-    if not callbacks["ready"]:
-        blockers.append(
-            f"fresh live Sage and {foothold_payload_type} callbacks are not both present"
+    native_chat = load_native_chat_module()
+    api_token = None
+    channel = None
+    try:
+        resources = await mythic.execute_custom_query(client, native_chat.READINESS_QUERY)
+        _container, api_token = native_chat.select_chat_resources(
+            resources,
+            api_token_id=api_token_id,
         )
-    return {
-        "ready": not blockers,
-        "blockers": blockers,
-        "runtime_databases": runtime,
-        "callbacks": callbacks,
-    }
-
-
-def _task_output_text(value: Any) -> str:
-    if isinstance(value, (bytes, bytearray)):
-        return value.decode("utf-8", errors="replace")
-    return str(value or "")
+    except Exception:
+        api_token = None
+    try:
+        channel = await native_chat.find_prepared_channel(client)
+    except Exception:
+        channel = None
+    contract = load_readiness_contract_module()
+    report = await contract.collect_operator_readiness(
+        repo_root=repo_root,
+        runtime_dbs_archived=runtime_dbs_archived,
+        callback_summary=callbacks,
+        chat_containers=observed.get("chat_containers", []),
+        api_token=api_token,
+        channel=channel,
+        ludus_observation=ludus_observation,
+        clock_observation=clock_observation,
+        bloodhound_api_observation=bloodhound_api_observation,
+        bloodhound_mcp_observation=bloodhound_mcp_observation,
+        require_prepared_channel=require_prepared_channel,
+    )
+    return {**report, "callbacks": callbacks}
 
 
 def _load_sync_range_time_module():
@@ -528,7 +665,7 @@ def synchronize_range_clocks(max_skew_seconds: float) -> dict[str, Any]:
     module = _load_sync_range_time_module()
     hosts = module.windows_hosts(module.load_inventory(module.DEFAULT_MCP_PATH))
     if not hosts:
-        raise RuntimeError("No GOAD Windows hosts found in Ludus inventory")
+        raise RuntimeError("No Windows hosts found in Ludus inventory")
     module.sync_clocks(hosts)
     result = module.check_clocks(hosts, max_skew_seconds)
     if not result.get("ready"):
@@ -536,12 +673,18 @@ def synchronize_range_clocks(max_skew_seconds: float) -> dict[str, Any]:
     return result
 
 
-async def wait_for_samwell_apollo_callback(
+async def wait_for_foothold_apollo_callback(
     client,
     *,
     timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
     poll_seconds: float = 3.0,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
+    foothold_host = str(foothold_host or "").strip().casefold()
+    foothold_user_match = str(foothold_user_match or "").strip().casefold()
+    if not foothold_host or not foothold_user_match:
+        raise ValueError("foothold_host and foothold_user_match cannot be empty")
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_rows: list[dict[str, Any]] = []
     while True:
@@ -551,8 +694,8 @@ async def wait_for_samwell_apollo_callback(
             callback
             for callback in last_rows
             if payload_type_name(callback).casefold() == "apollo"
-            and str(callback.get("host") or "").casefold() == "castelblack"
-            and "samwell" in str(callback.get("user") or "").casefold()
+            and str(callback.get("host") or "").casefold() == foothold_host
+            and foothold_user_match in str(callback.get("user") or "").casefold()
             and isinstance(callback.get("display_id"), int)
         ]
         for callback in sorted(
@@ -570,89 +713,41 @@ async def wait_for_samwell_apollo_callback(
                 }
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError(
-                "Timed out waiting for live Apollo callback on CASTELBLACK as samwell.tarly; "
+                f"Timed out waiting for live Apollo callback on {foothold_host.upper()} "
+                f"as {foothold_user_match}; "
                 f"last callbacks: {json.dumps(last_rows, sort_keys=True)}"
             )
         await asyncio.sleep(poll_seconds)
 
 
+async def wait_for_samwell_apollo_callback(
+    client,
+    *,
+    timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
+    poll_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the historical CASTELBLACK/Samwell bootstrap path."""
+    return await wait_for_foothold_apollo_callback(
+        client,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+    )
+
+
 wait_for_baked_apollo_callback = wait_for_samwell_apollo_callback
 
 
-async def issue_callback_task(
-    client,
-    callback_display_id: int,
-    command_name: str,
-    parameters: str,
-    *,
-    timeout_seconds: int = 60,
-) -> dict[str, Any]:
-    task = await mythic.issue_task(
-        mythic=client,
-        command_name=command_name,
-        parameters=parameters,
-        callback_display_id=callback_display_id,
-        wait_for_complete=False,
-        timeout=timeout_seconds,
-    )
-    task_display_id = task.get("display_id") if isinstance(task, dict) else None
-    if not isinstance(task_display_id, int):
-        raise RuntimeError(f"Mythic did not return a task display ID for {command_name}")
-    output = await asyncio.wait_for(
-        mythic.waitfor_for_task_output(
-            mythic=client,
-            task_display_id=task_display_id,
-            timeout=timeout_seconds,
+def task_free_preflight_metadata() -> dict[str, Any]:
+    return {
+        "preflight_scope": "control-plane-read-only",
+        "payload_tasking_performed": False,
+        "payload_tasks_issued": 0,
+        "target_identity_probed": False,
+        "kerberos_purge_performed": False,
+        "note": (
+            "No Mythic payload tasks were issued; callback liveness was observed through "
+            "Mythic control-plane state only."
         ),
-        timeout=timeout_seconds + 20,
-    )
-    return {
-        "task_display_id": task_display_id,
-        "output": _task_output_text(output),
-    }
-
-
-def parse_callback_probe(
-    output: str,
-    *,
-    max_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
-    controller_utc: datetime | None = None,
-) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    observed = None
-    for index, char in enumerate(output):
-        if char != "{":
-            continue
-        try:
-            candidate, _ = decoder.raw_decode(output[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict):
-            observed = candidate
-    if observed is None:
-        raise RuntimeError(f"Callback identity probe returned no JSON object: {output!r}")
-
-    normalized = {str(key).casefold(): value for key, value in observed.items()}
-    guest_utc_text = str(normalized.get("utc") or "")
-    domain = str(normalized.get("domain") or "").strip()
-    identity = str(normalized.get("user") or "").strip()
-    if not guest_utc_text or not domain or not identity:
-        raise RuntimeError(f"Callback identity probe was incomplete: {observed!r}")
-
-    guest_utc = datetime.fromisoformat(guest_utc_text.replace("Z", "+00:00")).astimezone(timezone.utc)
-    controller_utc = (controller_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    skew_seconds = abs((guest_utc - controller_utc).total_seconds())
-    if skew_seconds > max_skew_seconds:
-        raise RuntimeError(
-            f"Callback clock skew is {skew_seconds:.3f}s; maximum is {max_skew_seconds:.3f}s"
-        )
-    return {
-        "ready": True,
-        "guest_utc": guest_utc.isoformat(),
-        "controller_utc": controller_utc.isoformat(),
-        "skew_seconds": round(skew_seconds, 3),
-        "domain": domain,
-        "identity": identity,
     }
 
 
@@ -661,47 +756,21 @@ async def post_callback_preflight(
     *,
     timeout_seconds: int = DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
     max_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+    foothold_host: str = DEFAULT_FOOTHOLD_HOST,
+    foothold_user_match: str = DEFAULT_FOOTHOLD_USER_MATCH,
 ) -> dict[str, Any]:
-    callback = await wait_for_samwell_apollo_callback(
+    callback = await wait_for_foothold_apollo_callback(
         client,
         timeout_seconds=timeout_seconds,
+        foothold_host=foothold_host,
+        foothold_user_match=foothold_user_match,
     )
     clocks = await asyncio.to_thread(synchronize_range_clocks, max_skew_seconds)
-    callback_id = callback["display_id"]
-
-    purge = await issue_callback_task(
-        client,
-        callback_id,
-        "shell",
-        "klist purge",
-    )
-    if "purged" not in purge["output"].casefold():
-        raise RuntimeError(f"Kerberos ticket purge was not confirmed: {purge['output']!r}")
-
-    probe_command = (
-        'powershell -NoProfile -NonInteractive -Command '
-        '"$d=[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Name;'
-        "$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;"
-        "[PSCustomObject]@{Utc=(Get-Date).ToUniversalTime().ToString('o');Domain=$d;User=$u}"
-        '|ConvertTo-Json -Compress"'
-    )
-    probe_task = await issue_callback_task(
-        client,
-        callback_id,
-        "shell",
-        probe_command,
-    )
-    probe = parse_callback_probe(
-        probe_task["output"],
-        max_skew_seconds=max_skew_seconds,
-    )
     return {
         "ready": True,
         "apollo_callback": callback,
         "range_clocks": clocks,
-        "kerberos_purge_task": purge["task_display_id"],
-        "identity_probe_task": probe_task["task_display_id"],
-        "identity_probe": probe,
+        **task_free_preflight_metadata(),
     }
 
 
@@ -758,18 +827,21 @@ async def command_inspect(args: argparse.Namespace) -> None:
     print(json.dumps(await inspect(client), indent=2, sort_keys=True))
 
 
-async def command_readiness(args: argparse.Namespace) -> None:
+async def command_readiness(args: argparse.Namespace) -> int:
     client = await login(args)
-    print(json.dumps(
-        await readiness(
-            client,
-            Path(args.repo_root),
-            runtime_dbs_archived=args.runtime_dbs_archived,
-            foothold_payload_type=args.foothold_payload_type,
+    report = await readiness(
+        client,
+        Path(args.repo_root),
+        runtime_dbs_archived=args.runtime_dbs_archived,
+        foothold_payload_type=args.foothold_payload_type,
+        foothold_host=args.foothold_host,
+        foothold_user_match=args.foothold_user_match,
+        require_prepared_channel=getattr(
+            args, "require_prepared_channel", True
         ),
-        indent=2,
-        sort_keys=True,
-    ))
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report.get("ready") else 1
 
 
 async def command_export_callback_config(args: argparse.Namespace) -> None:
@@ -834,7 +906,7 @@ def fresh_apollo_bootstrap_instructions(apollo: dict[str, Any]) -> dict[str, Any
             "Launch the staged payload with --launch-method scheduled-task-interactive; the default remote path is C:\\Users\\Public\\apollo.exe.",
             "After a new callback is observed, the deploy helper disconnects the RDP session with tsdiscon by default; use --no-disconnect-interactive-session only for troubleshooting.",
             "Use --add-defender-exclusion for C:\\Users\\Public\\apollo.exe on clean-baseline; stock Apollo was quarantined by Defender in live validation.",
-            "After the callback appears, run post-callback-preflight and readiness before a solve.",
+            "After the callback appears, run task-free post-callback-preflight and readiness before a solve.",
         ],
     }
 
@@ -889,7 +961,27 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
             )
 
     client = await login(args)
-    result: dict[str, Any] = {"sage": await create_sage(client, args)}
+    chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+    running_chat = [
+        row
+        for row in chat.get("consuming_container", [])
+        if row.get("container_running") and not row.get("deleted")
+    ]
+    if not running_chat:
+        raise RuntimeError("Sage chat container is not running; restart Sage before bootstrap-reset")
+    result: dict[str, Any] = {
+        "sage_chat_container": running_chat[0],
+        "sage_payload_created": False,
+        "sage_chat": (
+            await prepare_sage_chat(client)
+            if getattr(args, "prepare_chat", True)
+            else {
+                "api_token": await ensure_sage_chat_api_token(client),
+                "prepared": False,
+                "reason": "operator_managed_chat_creation",
+            }
+        ),
+    }
     if use_baked_apollo:
         result["apollo_callback_import"] = await import_callback_config(
             client,
@@ -897,11 +989,15 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
         )
         result["apollo_callback_config"] = str(path)
         result["mode"] = "legacy-imported-baked-apollo"
-        result["post_callback_preflight"] = await post_callback_preflight(
-            client,
-            timeout_seconds=args.post_callback_timeout,
-            max_skew_seconds=args.max_clock_skew_seconds,
-        )
+        preflight_kwargs = {
+            "timeout_seconds": args.post_callback_timeout,
+            "max_skew_seconds": args.max_clock_skew_seconds,
+        }
+        if hasattr(args, "foothold_host"):
+            preflight_kwargs["foothold_host"] = args.foothold_host
+        if hasattr(args, "foothold_user_match"):
+            preflight_kwargs["foothold_user_match"] = args.foothold_user_match
+        result["post_callback_preflight"] = await post_callback_preflight(client, **preflight_kwargs)
     elif use_retained_callback:
         assert retained_path is not None
         assert retained_payload_type is not None
@@ -934,6 +1030,8 @@ async def command_post_callback_preflight(args: argparse.Namespace) -> None:
             client,
             timeout_seconds=args.post_callback_timeout,
             max_skew_seconds=args.max_clock_skew_seconds,
+            foothold_host=args.foothold_host,
+            foothold_user_match=args.foothold_user_match,
         ),
         indent=2,
         sort_keys=True,
@@ -1006,7 +1104,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = sub.add_parser("inspect", help="Print Sage/Apollo payload schemas and current callbacks.")
+    inspect_parser = sub.add_parser("inspect", help="Print Sage chat, payload schemas, and current callbacks.")
     add_common(inspect_parser)
     inspect_parser.set_defaults(func=command_inspect)
 
@@ -1024,9 +1122,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     readiness_parser.add_argument(
+        "--require-prepared-channel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the empty prepared Sage channel (default). Use "
+            "--no-require-prepared-channel when the operator will create the "
+            "demo chat manually after infrastructure readiness."
+        ),
+    )
+    readiness_parser.add_argument(
         "--foothold-payload-type",
         default=os.environ.get("FOOTHOLD_PAYLOAD_TYPE", "apollo"),
-        help="Payload type expected on CASTELBLACK as samwell.tarly (default: apollo).",
+        help="Payload type expected on the foothold callback (default: apollo).",
+    )
+    readiness_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    readiness_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
     )
     readiness_parser.set_defaults(func=command_readiness)
 
@@ -1077,7 +1198,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset_parser = sub.add_parser(
         "bootstrap-reset",
-        help="Create fresh Sage/Apollo payloads or explicitly import a retained foothold callback config.",
+        help="Verify Sage chat and create Apollo, or import a retained foothold callback config.",
     )
     add_common(reset_parser)
     add_sage_args(reset_parser)
@@ -1088,11 +1209,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Legacy retained callback config path (default: {DEFAULT_CALLBACK_CONFIG_PATH}).",
     )
     reset_parser.add_argument(
+        "--prepare-chat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Create/reuse the empty prepared Sage channel (default). Use "
+            "--no-prepare-chat when the operator will create the chat manually."
+        ),
+    )
+    reset_parser.add_argument(
         "--use-baked-apollo",
         action="store_true",
         default=env_bool("APOLLO_USE_BAKED_CALLBACK"),
         help=(
             "Legacy opt-in: import a retained baked Apollo callback config and wait for reconnect. "
+            "The follow-on preflight remains task-free. "
             "The clean-baseline workflow creates a fresh Apollo payload instead."
         ),
     )
@@ -1114,32 +1245,58 @@ def build_parser() -> argparse.ArgumentParser:
         "--post-callback-timeout",
         type=int,
         default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
-        help="Seconds to wait for the baked Apollo callback before failing.",
+        help="Seconds to wait for the baked Apollo callback observation before failing.",
     )
     reset_parser.add_argument(
         "--max-clock-skew-seconds",
         type=float,
         default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
-        help="Maximum accepted guest/controller clock skew after synchronization.",
+        help="Maximum accepted range clock skew after synchronization.",
+    )
+    reset_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require for baked-callback observation (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    reset_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the baked foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
     )
     reset_parser.set_defaults(func=command_bootstrap_reset)
 
     preflight_parser = sub.add_parser(
         "post-callback-preflight",
-        help="Wait for live Samwell Apollo, synchronize clocks, purge tickets, and verify callback identity.",
+        help="Wait for the live foothold Apollo and synchronize clocks without issuing payload tasks.",
     )
     add_common(preflight_parser)
     preflight_parser.add_argument(
         "--post-callback-timeout",
         type=int,
         default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
-        help="Seconds to wait for the Samwell Apollo callback before failing.",
+        help="Seconds to wait for the foothold Apollo callback observation before failing.",
     )
     preflight_parser.add_argument(
         "--max-clock-skew-seconds",
         type=float,
         default=DEFAULT_MAX_CLOCK_SKEW_SECONDS,
-        help="Maximum accepted guest/controller clock skew after synchronization.",
+        help="Maximum accepted range clock skew after synchronization.",
+    )
+    preflight_parser.add_argument(
+        "--foothold-host",
+        default=os.environ.get("FOOTHOLD_HOST", DEFAULT_FOOTHOLD_HOST),
+        help=f"Foothold callback host to require (default: {DEFAULT_FOOTHOLD_HOST}).",
+    )
+    preflight_parser.add_argument(
+        "--foothold-user-match",
+        default=os.environ.get("FOOTHOLD_USER_MATCH", DEFAULT_FOOTHOLD_USER_MATCH),
+        help=(
+            "Case-insensitive substring required in the foothold callback user "
+            f"(default: {DEFAULT_FOOTHOLD_USER_MATCH})."
+        ),
     )
     preflight_parser.set_defaults(func=command_post_callback_preflight)
 
@@ -1148,7 +1305,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    asyncio.run(args.func(args))
+    result = asyncio.run(args.func(args))
+    if isinstance(result, int):
+        raise SystemExit(result)
 
 
 if __name__ == "__main__":

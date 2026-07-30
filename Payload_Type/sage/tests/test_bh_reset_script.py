@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 
 
@@ -7,6 +8,14 @@ SPEC = importlib.util.spec_from_file_location("bh_reset", SCRIPT)
 bh_reset = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(bh_reset)
+
+
+def test_default_bloodhound_dir_derives_from_workspace_root():
+    expected = Path(
+        os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+        or (bh_reset.WORKSPACE_ROOT / "bloodhound_mcp")
+    )
+    assert bh_reset.DEFAULT_BLOODHOUND_MCP_DIR == expected
 
 
 def test_wait_for_empty_delays_first_poll_and_retries(monkeypatch):

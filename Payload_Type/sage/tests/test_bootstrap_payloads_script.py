@@ -26,6 +26,28 @@ run_essos_da = importlib.util.module_from_spec(RUN_ESSOS_SPEC)
 assert RUN_ESSOS_SPEC and RUN_ESSOS_SPEC.loader
 RUN_ESSOS_SPEC.loader.exec_module(run_essos_da)
 
+MCP_CHECK_SCRIPT = Path(__file__).resolve().parents[3] / "skills" / "sage-goad-reset" / "scripts" / "mcp_check.py"
+MCP_CHECK_SPEC = importlib.util.spec_from_file_location("mcp_check", MCP_CHECK_SCRIPT)
+mcp_check = importlib.util.module_from_spec(MCP_CHECK_SPEC)
+assert MCP_CHECK_SPEC and MCP_CHECK_SPEC.loader
+MCP_CHECK_SPEC.loader.exec_module(mcp_check)
+
+
+@pytest.fixture(autouse=True)
+def stub_prepared_sage_chat(monkeypatch):
+    async def fake_prepare(client):
+        return {
+            "api_token": {"created": False, "api_token": {"id": 4}},
+            "prepared_channel": {
+                "chat_channel_id": 2,
+                "chat_channel_name": "Sage GOAD Ready",
+                "prepared": True,
+                "reused": False,
+            },
+        }
+
+    monkeypatch.setattr(bootstrap_payloads, "prepare_sage_chat", fake_prepare)
+
 
 def test_sage_build_parameters_skip_empty_values():
     args = argparse.Namespace(
@@ -78,6 +100,11 @@ def test_skill_env_loader_sets_sage_defaults_without_overriding(monkeypatch, tmp
     assert os.environ["SAGE_MODEL"] == "shell-override"
     assert os.environ["SAGE_API_ENDPOINT"] == "http://127.0.0.1:8100/v1"
     assert os.environ["SAGE_API_KEY"] == "dummy-key"
+
+
+def test_no_mythic_checkout_name_is_guessed():
+    """A checkout-name default would bake one machine's layout into the repo."""
+    assert bootstrap_payloads.DEFAULT_MYTHIC_ENV_PATHS == ()
 
 
 def test_sage_arg_defaults_use_loaded_skill_env(monkeypatch, tmp_path):
@@ -215,7 +242,7 @@ def test_export_callback_config_resolves_display_id_and_uses_graphql_variables(m
 
     assert result["agent_callback_id"] == "callback-uuid"
     assert calls[0][1] == {"displayId": 7}
-    assert calls[1][1] == {"agentCallbackId": "callback-uuid"}
+    assert calls[1][1] == {"callbackDisplayId": 7}
 
 
 def test_import_callback_config_passes_jsonb_object(monkeypatch):
@@ -245,6 +272,48 @@ def test_import_callback_config_passes_jsonb_object(monkeypatch):
         "config": {"uuid": "payload-uuid", "key": "secret"}
     }
     assert "$config: jsonb!" in observed["query"]
+
+
+def test_import_callback_config_hides_retained_callback_without_mutating_source(monkeypatch):
+    observed = {}
+    updates = []
+    source = {
+        "callback": {
+            "agent_callback_id": "callback-uuid",
+            "active": True,
+        },
+        "payload_type": {"name": "apollo"},
+    }
+
+    async def fake_query(client, query, variables=None):
+        if "importCallbackConfig" not in query:
+            return {
+                "callback": [{
+                    "display_id": 7,
+                    "agent_callback_id": "callback-uuid",
+                }]
+            }
+        observed["variables"] = variables
+        return {
+            "importCallbackConfig": {
+                "status": "success",
+                "error": None,
+            }
+        }
+
+    async def fake_update(client, callback_display_id, active=None, **kwargs):
+        updates.append((callback_display_id, active))
+        return {"status": "success", "error": None}
+
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "update_callback", fake_update)
+
+    result = asyncio.run(bootstrap_payloads.import_callback_config(object(), source))
+
+    assert observed["variables"]["config"]["callback"]["active"] is False
+    assert source["callback"]["active"] is True
+    assert result["callback_hidden"] is True
+    assert updates == [(7, False)]
 
 
 def test_callback_config_payload_type_reads_exported_payload_type():
@@ -282,10 +351,23 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
 
     async def fake_preflight(client, *, timeout_seconds, max_skew_seconds):
         calls.append(("preflight", timeout_seconds, max_skew_seconds))
-        return {"ready": True}
+        return {
+            "ready": True,
+            "preflight_scope": "control-plane-read-only",
+            "payload_tasking_performed": False,
+            "payload_tasks_issued": 0,
+        }
+
+    async def fail_issue_task(*args, **kwargs):
+        raise AssertionError("legacy baked-Apollo bootstrap must remain task-free")
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
@@ -293,6 +375,7 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fail_create_apollo)
     monkeypatch.setattr(bootstrap_payloads, "post_callback_preflight", fake_preflight)
     monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "issue_task", fail_issue_task)
 
     asyncio.run(
         bootstrap_payloads.command_bootstrap_reset(
@@ -307,12 +390,14 @@ def test_bootstrap_reset_imports_baked_apollo_only_when_explicitly_requested(
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("import", {"uuid": "payload-uuid", "key": "secret"}),
         ("preflight", 180, 60.0),
     ]
     assert output["mode"] == "legacy-imported-baked-apollo"
     assert output["post_callback_preflight"]["ready"] is True
+    assert output["post_callback_preflight"]["preflight_scope"] == "control-plane-read-only"
+    assert output["post_callback_preflight"]["payload_tasking_performed"] is False
+    assert output["post_callback_preflight"]["payload_tasks_issued"] == 0
     assert "apollo" not in output
 
 
@@ -352,7 +437,12 @@ def test_bootstrap_reset_imports_retained_merlin_without_creating_apollo(
         raise AssertionError("Apollo post-callback preflight must be skipped")
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "import_callback_config", fake_import)
@@ -374,7 +464,6 @@ def test_bootstrap_reset_imports_retained_merlin_without_creating_apollo(
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("import", {
             "uuid": "payload-uuid",
             "key": "secret",
@@ -438,7 +527,12 @@ def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_c
         raise AssertionError("Baked Apollo import must be opt-in")
 
     async def fake_query(client, query, variables=None):
-        return {"callback": []}
+        return {
+            "callback": [],
+            "consuming_container": [
+                {"id": 1, "container_running": True, "deleted": False}
+            ],
+        }
 
     monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
     monkeypatch.setattr(bootstrap_payloads, "create_apollo", fake_create_apollo)
@@ -459,11 +553,11 @@ def test_bootstrap_reset_creates_fresh_interactive_apollo_by_default_even_when_c
     output = json.loads(capsys.readouterr().out)
 
     assert calls == [
-        ("sage", None),
         ("apollo", None),
         ("download", "/payloads"),
     ]
     assert output["mode"] == "fresh-interactive-apollo"
+    assert output["sage_chat"]["prepared_channel"]["chat_channel_name"] == "Sage GOAD Ready"
     assert output["apollo"]["uuid"] == "apollo-uuid"
     assert output["apollo_bootstrap"]["method"] == "interactive-rdp-scheduled-task"
     assert output["apollo_bootstrap"]["payload_uuid"] == "apollo-uuid"
@@ -724,16 +818,53 @@ def test_callback_readiness_selects_fresh_live_sage_and_castelblack_apollo():
     liveness = {
         3: {"alive": True, "reason": "old but live"},
         7: {"alive": True, "reason": "fresh"},
-        8: {"alive": True, "reason": "old but live"},
+        8: {"alive": False, "reason": "stale"},
         9: {"alive": True, "reason": "fresh"},
     }
 
-    status = bootstrap_payloads.summarize_callback_readiness(callbacks, liveness)
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
 
     assert status["ready"] is True
-    assert status["selected_sage_cb"] == 7
+    assert status["selected_sage_cb"] is None
+    assert status["selected_chat_container_id"] == 1
     assert status["selected_foothold_cb"] == 9
     assert status["selected_apollo_cb"] == 9
+
+
+def test_callback_readiness_rejects_duplicate_live_footholds():
+    callbacks = [
+        {
+            "display_id": 8,
+            "host": "CASTELBLACK",
+            "user": "samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+        {
+            "display_id": 9,
+            "host": "CASTELBLACK",
+            "user": "samwell.tarly",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+    ]
+    liveness = {
+        8: {"alive": True, "reason": "old but still live"},
+        9: {"alive": True, "reason": "fresh"},
+    }
+
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
+
+    assert status["ready"] is False
+    assert status["duplicate_live_footholds"] == [8, 9]
 
 
 def test_callback_readiness_selects_merlin_when_requested():
@@ -770,13 +901,40 @@ def test_callback_readiness_selects_merlin_when_requested():
         callbacks,
         liveness,
         foothold_payload_type="merlin",
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
     )
 
     assert status["ready"] is True
     assert status["foothold_payload_type"] == "merlin"
-    assert status["selected_sage_cb"] == 1
+    assert status["selected_sage_cb"] is None
     assert status["selected_foothold_cb"] == 2
     assert status["selected_apollo_cb"] is None
+
+
+def test_callback_readiness_accepts_alternate_foothold_selector():
+    callbacks = [
+        {
+            "display_id": 12,
+            "host": "MEEREEN",
+            "user": r"ESSOS\jorah.mormont",
+            "active": True,
+            "payload": {"payloadtype": {"name": "apollo"}},
+        },
+    ]
+    liveness = {12: {"alive": True, "reason": "fresh"}}
+
+    status = bootstrap_payloads.summarize_callback_readiness(
+        callbacks,
+        liveness,
+        foothold_host="MEEREEN",
+        foothold_user_match="jorah.mormont",
+        chat_containers=[{"id": 1, "container_running": True, "deleted": False}],
+    )
+
+    assert status["ready"] is True
+    assert status["selected_apollo_cb"] == 12
+    assert "MEEREEN" in status["required"]
+    assert "jorah.mormont" in status["required"]
 
 
 def test_callback_readiness_rejects_dead_or_wrong_foothold():
@@ -806,3 +964,113 @@ def test_callback_readiness_rejects_dead_or_wrong_foothold():
     assert status["ready"] is False
     assert status["selected_sage_cb"] is None
     assert status["selected_apollo_cb"] is None
+
+
+def test_readiness_delegates_to_shared_contract(monkeypatch):
+    callbacks = [{
+        "display_id": 9,
+        "host": "CASTELBLACK",
+        "user": "samwell.tarly",
+        "active": True,
+        "payload": {"payloadtype": {"name": "apollo"}},
+    }]
+    observed = {
+        "callbacks": callbacks,
+        "chat_containers": [{"id": 1, "container_running": True, "deleted": False}],
+    }
+
+    async def fake_inspect(_client):
+        return observed
+
+    async def fake_liveness(_client, _display_id):
+        return {"alive": True, "reason": "fresh"}
+
+    class _NativeChat:
+        READINESS_QUERY = "query readiness"
+
+        @staticmethod
+        def select_chat_resources(_resources, api_token_id=None):
+            return (
+                {"id": 1, "container_running": True, "deleted": False},
+                {"id": 3, "name": "token", "scopes": ["*"]},
+            )
+
+        @staticmethod
+        async def find_prepared_channel(_client):
+            return {"chat_channel_id": 4, "chat_channel_name": "Sage GOAD Ready"}
+
+    captured = {}
+
+    class _Contract:
+        @staticmethod
+        async def collect_operator_readiness(**kwargs):
+            captured.update(kwargs)
+            return {"schema": "sage-readiness-contract-v1", "ready": True, "blockers": []}
+
+    async def fake_query(_client, _query):
+        return {"consuming_container": [], "apitokens": []}
+
+    async def fail_issue_task(*args, **kwargs):
+        raise AssertionError("readiness must not issue Mythic payload tasks")
+
+    monkeypatch.setattr(bootstrap_payloads, "inspect", fake_inspect)
+    monkeypatch.setattr(bootstrap_payloads, "assess_callback_liveness", fake_liveness)
+    monkeypatch.setattr(bootstrap_payloads, "load_native_chat_module", lambda: _NativeChat)
+    monkeypatch.setattr(bootstrap_payloads, "load_readiness_contract_module", lambda: _Contract)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(bootstrap_payloads.mythic, "issue_task", fail_issue_task)
+
+    result = asyncio.run(
+        bootstrap_payloads.readiness(
+            object(),
+            runtime_dbs_archived=True,
+            ludus_observation={"ready": True},
+            clock_observation={"ready": True},
+            bloodhound_api_observation={"ready": True},
+            bloodhound_mcp_observation={"ready": True},
+        )
+    )
+
+    assert result["ready"] is True
+    assert captured["callback_summary"]["selected_foothold_cb"] == 9
+    assert captured["channel"]["chat_channel_id"] == 4
+
+
+def test_command_readiness_returns_nonzero_when_contract_not_ready(monkeypatch, capsys):
+    async def fake_login(_args):
+        return object()
+
+    async def fake_readiness(*_args, **_kwargs):
+        return {"ready": False, "blockers": ["not ready"]}
+
+    monkeypatch.setattr(bootstrap_payloads, "login", fake_login)
+    monkeypatch.setattr(bootstrap_payloads, "readiness", fake_readiness)
+
+    args = argparse.Namespace(
+        repo_root=str(bootstrap_payloads.REPO_ROOT),
+        runtime_dbs_archived=True,
+        foothold_payload_type="apollo",
+        foothold_host="CASTELBLACK",
+        foothold_user_match="samwell.tarly",
+    )
+    rc = asyncio.run(bootstrap_payloads.command_readiness(args))
+
+    assert rc == 1
+    assert '"ready": false' in capsys.readouterr().out
+
+
+def test_mcp_check_delegates_to_local_readiness_probe(monkeypatch):
+    captured = {}
+
+    class _Contract:
+        @staticmethod
+        async def probe_bloodhound_mcp_tools(directory=None):
+            captured["directory"] = directory
+            return {"ready": True, "directory": str(directory)}
+
+    monkeypatch.setattr(mcp_check, "_load_readiness_contract", lambda: _Contract)
+
+    result = asyncio.run(mcp_check.collect_status("/tmp/bloodhound_mcp"))
+
+    assert result == {"ready": True, "directory": "/tmp/bloodhound_mcp"}
+    assert captured["directory"] == "/tmp/bloodhound_mcp"

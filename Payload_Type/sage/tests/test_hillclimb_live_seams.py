@@ -170,6 +170,156 @@ def test_krbtgt_dumped_probe_callable_no_live_range_no_hang(monkeypatch):
     assert time.monotonic() - start < 1.0
 
 
+def test_certificate_admin_control_probe_replays_multi_task_proof(monkeypatch):
+    ticket = base64.b64encode(b"A" * 80).decode("ascii")
+    rows = [
+        {
+            "display_id": 52,
+            "callback_display_id": 2,
+            "output": (
+                "SAGE_CERT_AUTH_PROOF_administrator_essos_local_2\n"
+                " Directory of \\\\braavos.essos.local\\C$\nWindows"
+            ),
+        },
+        {
+            "display_id": 51,
+            "callback_display_id": 2,
+            "output": f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}",
+        },
+    ]
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: rows)
+
+    assert ls.certificate_admin_control_probe(
+        "administrator",
+        realm="essos.local",
+    )() is True
+
+
+def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: [{
+        "display_id": 52,
+        "callback_display_id": 2,
+        "output": (
+            "SAGE_CERT_AUTH_PROOF_administrator_north_sevenkingdoms_local_2\n"
+            "CERT_AUTH_STATUS=OK"
+        ),
+    }])
+
+    assert ls.certificate_admin_control_probe(
+        "administrator",
+        realm="essos.local",
+    )() is False
+
+
+def test_remote_execution_probe_replays_target_bound_task_proof(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_completed_task_outputs", lambda **kw: [{
+        "display_id": 61,
+        "callback_display_id": 7,
+        "output": (
+            "SAGE_REMOTE_EXEC_PROOF_east_ops01_7\n"
+            "nt authority\\system\n"
+            "EAST-OPS01\n"
+        ),
+    }])
+
+    assert ls.remote_execution_probe(
+        "east-ops01",
+        realm="east.hub.local",
+    )() is True
+
+
+def test_remote_execution_probe_rejects_other_target_proof(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_completed_task_outputs", lambda **kw: [{
+        "display_id": 61,
+        "callback_display_id": 7,
+        "output": (
+            "SAGE_REMOTE_EXEC_PROOF_west_ops01_7\n"
+            "nt authority\\system\n"
+            "WEST-OPS01\n"
+        ),
+    }])
+
+    assert ls.remote_execution_probe(
+        "east-ops01",
+        realm="east.hub.local",
+    )() is False
+
+
+def _golden_ticket_admin_task_rows():
+    return [
+        {
+            "display_id": 18,
+            "callback_display_id": 2,
+            "output": " Directory of \\\\DC01.RANGE.LOCAL\\C$\nWindows",
+        },
+        {
+            "display_id": 17,
+            "callback_display_id": 2,
+            "output": "Cached Tickets: (1)\nServer: krbtgt/RANGE.LOCAL @ RANGE.LOCAL",
+        },
+        {
+            "display_id": 16,
+            "callback_display_id": 2,
+            "output": "ticket_store_add completed",
+        },
+        {
+            "display_id": 15,
+            "callback_display_id": 2,
+            "output": "make_token completed",
+        },
+        {
+            "display_id": 14,
+            "callback_display_id": 2,
+            "output": "[*] Action: Build TGT\n[*] Building PAC",
+        },
+        {
+            "display_id": 13,
+            "callback_display_id": 2,
+            "output": " Directory of \\\\DC01.RANGE.LOCAL\\C$\nAccess is denied.",
+        },
+    ]
+
+
+def test_ticket_admin_control_probe_replays_from_forge_after_denied_preflight(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows())
+
+    assert ls.ticket_admin_control_probe(realm="range.local")() is True
+
+
+def test_ticket_admin_control_probe_rejects_other_realm(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows())
+
+    assert ls.ticket_admin_control_probe(realm="essos.local")() is False
+
+
+def test_ticket_admin_control_probe_rejects_listing_without_forge(monkeypatch):
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows()[:2])
+
+    assert ls.ticket_admin_control_probe(realm="range.local")() is False
+
+
+def test_any_probe_retries_all_paths_within_one_shared_settle_window(monkeypatch):
+    calls = {"certificate": 0, "ldap": 0}
+
+    def delayed_certificate():
+        calls["certificate"] += 1
+        return calls["certificate"] >= 2
+
+    def unchanged_ldap():
+        calls["ldap"] += 1
+        return False
+
+    monkeypatch.setattr(ls.time, "sleep", lambda _seconds: None)
+
+    assert ls.any_probe(
+        delayed_certificate,
+        unchanged_ldap,
+        settle_timeout=1,
+        settle_interval=1,
+    )() is True
+    assert calls == {"certificate": 2, "ldap": 1}
+
+
 def test_decode_mythic_response_rows_base64_with_raw_fallback():
     encoded = base64.b64encode(b"decoded output").decode("ascii")
     assert ls._decode_mythic_response_rows([{"response_text": encoded}]) == "decoded output"

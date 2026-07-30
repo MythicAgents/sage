@@ -1,8 +1,39 @@
 """CLI for the Sage eval gauge (Phase 0) and additive offline benchmarks.
 
   python -m ai.hillclimb gate-experiment --dry-run        # runnable now; synthetic runner
+  python -m ai.hillclimb null-model-factorial             # no lab or model calls
   python -m ai.hillclimb decision-benchmark run --dry-run  # no lab or model calls
   python -m ai.hillclimb operator-replay run --dry-run     # no lab or model calls
+  python -m ai.hillclimb policy-replay-selector-experiment # no lab or model calls
+  python -m ai.hillclimb policy-replay-unseen-candidate-evaluate # no lab or model calls
+  python -m ai.hillclimb policy-replay-hillclimb-iteration # no lab or model calls
+  python -m ai.hillclimb policy-replay-promotion-gate # no lab or model calls
+  python -m ai.hillclimb phase4-readiness-report      # no lab or model calls
+  python -m ai.hillclimb phase9-auto-harness-readiness # no lab or model calls
+  python -m ai.hillclimb phase10-evidence-bundle      # no lab or model calls
+  python -m ai.hillclimb phase12-proof-binding-audit  # no lab or model calls
+  python -m ai.hillclimb phase13-canonical-promotion-replay # no lab or model calls
+  python -m ai.hillclimb phase14-superseding-bundle   # no lab or model calls
+  python -m ai.hillclimb phase14-superseding-bundle-validate # no lab or model calls
+  python -m ai.hillclimb phase15-r5-retrospective-falsifiers # no lab or model calls
+  python -m ai.hillclimb phase5-full-frontier-t3      # no lab; add --run-model-matrix for weak/strong calls
+  python -m ai.hillclimb target-disambiguation-contract-audit # no lab or model calls
+  python -m ai.hillclimb target-value-census             # no lab or model calls
+  python -m ai.hillclimb target-value-proofability-screen # no lab or model calls
+  python -m ai.hillclimb target-value-runtime-decision    # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-late-blocker-contract-validate # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-late-blocker-authorization-audit # no lab or model calls
+  python -m ai.hillclimb gpo-dc-scope-live-surface-validate --evidence <json> # no model calls
+  python -m ai.hillclimb gpo-dc-scope-canary-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb gpo-dc-scope-matrix-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb laps-family-transfer-holdout-validate # no lab or model calls
+  python -m ai.hillclimb laps-family-transfer-live-surface-validate --evidence <json> # no model calls
+  python -m ai.hillclimb laps-family-transfer-canary-validate --results <jsonl> # no model calls
+  python -m ai.hillclimb laps-family-transfer-matrix-validate --forced-results <jsonl> --policy-results <jsonl> # no model calls
+  python -m ai.hillclimb trust-context-corroboration-validate # no lab or model calls
+  python -m ai.hillclimb trust-context-corroboration-control-validate --evidence <json> # no model calls
+  python -m ai.hillclimb trust-context-corroboration-live-validate --results <jsonl> --control-report <json> # no model calls
+  python -m ai.hillclimb phase8-goad-regression-validate --results <jsonl> # no lab or model calls
   python ai/hillclimb/__main__.py gate-experiment --dry-run
 
 A LIVE gate-experiment needs the GOAD lab (each config run through evals/harness.py, scored by
@@ -20,7 +51,42 @@ try:  # package import
     from . import gate_experiment as gx
     from . import gate_live
     from . import decision_benchmark
+    from . import null_model_factorial
     from . import operator_replay_benchmark
+    from . import policy_replay_calibration
+    from . import policy_replay_corpus
+    from . import policy_replay_selector_experiment
+    from . import policy_replay_unseen_candidate_evaluator
+    from . import policy_replay_hillclimb_iteration
+    from . import policy_replay_promotion_gate
+    from . import full_frontier_t3
+    from . import target_disambiguation_contract
+    from . import target_value_census
+    from . import target_value_proofability
+    from . import target_value_runtime_decision
+    from . import gpo_dc_scope_late_blocker_contract
+    from . import gpo_dc_scope_late_blocker_authorization
+    from . import gpo_dc_scope_live_surface
+    from . import gpo_dc_scope_canary
+    from . import gpo_dc_scope_matrix
+    from . import evaluation_foundation
+    from . import frontier_census
+    from . import purpose_range
+    from . import replication_purpose_range
+    from . import laps_family_transfer_holdout
+    from . import laps_family_transfer_live_surface
+    from . import laps_family_transfer_canary
+    from . import laps_family_transfer_matrix
+    from . import trust_context_corroboration
+    from . import phase8_goad_regression
+    from . import phase9_auto_harness_readiness
+    from . import phase10_evidence_bundle
+    from . import phase12_proof_binding_audit
+    from . import phase13_canonical_promotion
+    from . import phase14_superseding_bundle
+    from . import phase14_bundle_validator
+    from . import phase15_r5_retrospective_falsifiers
+    from . import replanning_benchmark
     from . import reliability
     from .scenarios import goad_scenarios
     from .range_state import Milestone
@@ -29,7 +95,42 @@ except Exception:  # script / sys.path import
     import gate_experiment as gx  # type: ignore
     import gate_live  # type: ignore
     import decision_benchmark  # type: ignore
+    import null_model_factorial  # type: ignore
     import operator_replay_benchmark  # type: ignore
+    import policy_replay_calibration  # type: ignore
+    import policy_replay_corpus  # type: ignore
+    import policy_replay_selector_experiment  # type: ignore
+    import policy_replay_unseen_candidate_evaluator  # type: ignore
+    import policy_replay_hillclimb_iteration  # type: ignore
+    import policy_replay_promotion_gate  # type: ignore
+    import full_frontier_t3  # type: ignore
+    import target_disambiguation_contract  # type: ignore
+    import target_value_census  # type: ignore
+    import target_value_proofability  # type: ignore
+    import target_value_runtime_decision  # type: ignore
+    import gpo_dc_scope_late_blocker_contract  # type: ignore
+    import gpo_dc_scope_late_blocker_authorization  # type: ignore
+    import gpo_dc_scope_live_surface  # type: ignore
+    import gpo_dc_scope_canary  # type: ignore
+    import gpo_dc_scope_matrix  # type: ignore
+    import evaluation_foundation  # type: ignore
+    import frontier_census  # type: ignore
+    import purpose_range  # type: ignore
+    import replication_purpose_range  # type: ignore
+    import laps_family_transfer_holdout  # type: ignore
+    import laps_family_transfer_live_surface  # type: ignore
+    import laps_family_transfer_canary  # type: ignore
+    import laps_family_transfer_matrix  # type: ignore
+    import trust_context_corroboration  # type: ignore
+    import phase8_goad_regression  # type: ignore
+    import phase9_auto_harness_readiness  # type: ignore
+    import phase10_evidence_bundle  # type: ignore
+    import phase12_proof_binding_audit  # type: ignore
+    import phase13_canonical_promotion  # type: ignore
+    import phase14_superseding_bundle  # type: ignore
+    import phase14_bundle_validator  # type: ignore
+    import phase15_r5_retrospective_falsifiers  # type: ignore
+    import replanning_benchmark  # type: ignore
     import reliability  # type: ignore
     from scenarios import goad_scenarios  # type: ignore
     from range_state import Milestone  # type: ignore
@@ -46,7 +147,7 @@ _DEMO_PROFILES = {
 
 
 def _print_report(report: gx.GateExperimentReport) -> None:
-    print(json.dumps({"kind": "gate_experiment", **report.__dict__}, indent=2, default=str))
+    print(json.dumps({"kind": "gate_experiment", **report.to_dict()}, indent=2, default=str))
     rho = "n/a" if report.spearman_rho is None else f"{report.spearman_rho:.3f}"
     print(
         f"\nVERDICT: {report.verdict}  (rho={rho}, "
@@ -144,6 +245,121 @@ def _cmd_noise_floor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_null_model_factorial(_args: argparse.Namespace) -> int:
+    report = null_model_factorial.run_null_model_factorial()
+    print(json.dumps(report, indent=2, default=str))
+    print(f"\nVERDICT: {report['verdict']}", flush=True)
+    return 0 if report["verdict"] == "PASS" else 1
+
+
+def _cmd_frontier_census(args: argparse.Namespace) -> int:
+    starts = frontier_census.candidate_starts()
+    if args.start:
+        wanted = set(args.start)
+        starts = [item for item in starts if item.name in wanted]
+        missing = sorted(wanted - {item.name for item in starts})
+        if missing:
+            print(f"unknown frontier census start(s): {', '.join(missing)}", file=sys.stderr)
+            return 2
+    report = frontier_census.run_live_frontier_census(
+        starts=starts,
+        ttl_seconds=args.ttl_seconds,
+        max_depth=args.max_depth,
+        max_nodes=args.max_nodes,
+    )
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(recommended_discriminator={report['recommended_discriminator']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_purpose_range_validate(args: argparse.Namespace) -> int:
+    report = purpose_range.validate_purpose_range()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(range_source={report['spec']['source_dir']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_replication_purpose_range_validate(args: argparse.Namespace) -> int:
+    report = replication_purpose_range.validate_replication_purpose_range()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(range_source={report['spec']['source_dir']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_laps_family_transfer_holdout_validate(args: argparse.Namespace) -> int:
+    report = laps_family_transfer_holdout.validate_laps_family_transfer_holdout()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(manifest_hash={report['manifest']['manifest_hash']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_replanning_benchmark_validate(args: argparse.Namespace) -> int:
+    report = replanning_benchmark.validate_replanning_benchmark()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n")
+    print(
+        f"\nVERDICT: {'PASS' if report['passes_gate'] else 'FAIL'}  "
+        f"(scenario={report['spec']['scenario']})",
+        flush=True,
+    )
+    return 0 if report["passes_gate"] else 1
+
+
+def _cmd_phase4_readiness_report(args: argparse.Namespace) -> int:
+    report = evaluation_foundation.build_phase4_provisional_report()
+    rendered = json.dumps(report, indent=2, default=str)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+    decision = ((report.get("readiness") or {}).get("readiness_decision") or "")
+    print(f"\nREADINESS: {decision}", flush=True)
+    return 0 if decision in {"auto_harness_not_ready", "eligible_for_supervised_artifact_campaign"} else 1
+
+
+def _cmd_phase9_auto_harness_readiness(args: argparse.Namespace) -> int:
+    report = phase9_auto_harness_readiness.build_phase9_readiness_report()
+    rendered = phase9_auto_harness_readiness.render_report(report)
+    print(rendered)
+    if args.output:
+        Path(args.output).write_text(rendered + "\n", encoding="utf-8")
+    decision = ((report.get("readiness") or {}).get("readiness_decision") or "")
+    print(f"\nREADINESS: {decision}", flush=True)
+    return 0 if report.get("passes_gate") is True and decision in {
+        "auto_harness_not_ready",
+        "eligible_for_supervised_artifact_campaign",
+    } else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai.hillclimb", description="Sage eval gauge (Phase 0)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -171,8 +387,94 @@ def main(argv: list[str] | None = None) -> int:
     nf.add_argument("--results", default=None, help="path to bare_vs_harness.jsonl (default: .hillclimb/results/)")
     nf.set_defaults(func=_cmd_noise_floor)
 
+    nm = sub.add_parser(
+        "null-model-factorial",
+        help="run the offline symbolic/llm/hybrid null-model policy factorial",
+    )
+    nm.set_defaults(func=_cmd_null_model_factorial)
+
+    fc = sub.add_parser(
+        "frontier-census",
+        help="run the read-only GOAD frontier census against the current BloodHound graph",
+    )
+    fc.add_argument("--ttl-seconds", type=int, default=frontier_census.DEFAULT_TTL_SECONDS)
+    fc.add_argument("--max-depth", type=int, default=frontier_census.DEFAULT_MAX_DEPTH)
+    fc.add_argument("--max-nodes", type=int, default=frontier_census.DEFAULT_MAX_NODES)
+    fc.add_argument("--start", action="append", default=None, help="restrict to one named start; repeatable")
+    fc.add_argument("--output", default=None, help="optional JSON output path")
+    fc.set_defaults(func=_cmd_frontier_census)
+
+    pr = sub.add_parser(
+        "purpose-range-validate",
+        help="validate the minimal two-lane purpose-range manifest against the current capability frontier",
+    )
+    pr.add_argument("--output", default=None, help="optional JSON report path")
+    pr.set_defaults(func=_cmd_purpose_range_validate)
+
+    rpr = sub.add_parser(
+        "replication-purpose-range-validate",
+        help="validate the GPO-vs-direct-replication second purpose-range manifest",
+    )
+    rpr.add_argument("--output", default=None, help="optional JSON report path")
+    rpr.set_defaults(func=_cmd_replication_purpose_range_validate)
+
+    lft = sub.add_parser(
+        "laps-family-transfer-holdout-validate",
+        help="validate the sealed Phase 6 cross-domain LAPS family-transfer holdout contract",
+    )
+    lft.add_argument("--output", default=None, help="optional JSON report path")
+    lft.set_defaults(func=_cmd_laps_family_transfer_holdout_validate)
+
+    rb = sub.add_parser(
+        "replanning-benchmark-validate",
+        help="validate the shared-lane late-blocker recovery benchmark contract",
+    )
+    rb.add_argument("--output", default=None, help="optional JSON report path")
+    rb.set_defaults(func=_cmd_replanning_benchmark_validate)
+
+    p4 = sub.add_parser(
+        "phase4-readiness-report",
+        help="emit the current fail-closed Phase 4 auto-harness-improvement readiness report",
+    )
+    p4.add_argument("--output", default=None, help="optional JSON report path")
+    p4.set_defaults(func=_cmd_phase4_readiness_report)
+
+    p9 = sub.add_parser(
+        "phase9-auto-harness-readiness",
+        help="emit the Phase 9 typed auto-harness-improvement readiness verdict",
+    )
+    p9.add_argument("--output", default=None, help="optional JSON report path")
+    p9.set_defaults(func=_cmd_phase9_auto_harness_readiness)
+
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)
+    policy_replay_calibration.add_cli(sub)
+    policy_replay_corpus.add_cli(sub)
+    policy_replay_selector_experiment.add_cli(sub)
+    policy_replay_unseen_candidate_evaluator.add_cli(sub)
+    policy_replay_hillclimb_iteration.add_cli(sub)
+    policy_replay_promotion_gate.add_cli(sub)
+    full_frontier_t3.add_cli(sub)
+    target_disambiguation_contract.add_cli(sub)
+    target_value_census.add_cli(sub)
+    target_value_proofability.add_cli(sub)
+    target_value_runtime_decision.add_cli(sub)
+    gpo_dc_scope_late_blocker_contract.add_cli(sub)
+    gpo_dc_scope_late_blocker_authorization.add_cli(sub)
+    gpo_dc_scope_live_surface.add_cli(sub)
+    gpo_dc_scope_canary.add_cli(sub)
+    gpo_dc_scope_matrix.add_cli(sub)
+    laps_family_transfer_live_surface.add_cli(sub)
+    laps_family_transfer_canary.add_cli(sub)
+    laps_family_transfer_matrix.add_cli(sub)
+    trust_context_corroboration.add_cli(sub)
+    phase8_goad_regression.add_cli(sub)
+    phase10_evidence_bundle.add_cli(sub)
+    phase12_proof_binding_audit.add_cli(sub)
+    phase13_canonical_promotion.add_cli(sub)
+    phase14_superseding_bundle.add_cli(sub)
+    phase14_bundle_validator.add_cli(sub)
+    phase15_r5_retrospective_falsifiers.add_cli(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

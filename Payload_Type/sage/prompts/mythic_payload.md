@@ -1,5 +1,7 @@
 ---
 name: Mythic_Payload
+color: "#A855F7"   # sub-agent card color (CSS text: #RRGGBB or named).
+icon: "box-open"   # sub-agent card icon (Font-Awesome name, rc5).
 description: Creates and configures Mythic payloads (agent, target OS, C2 profile, build options).
 variables:
   - name: installed_payloads_text
@@ -11,6 +13,9 @@ tools:
   - create_payload
   - get_all_payload_info
   - get_all_payloads
+  - get_all_command_args_for_payloadtype
+  - get_all_command_names_for_payloadtype
+  - get_all_commands_for_payloadtype
   - get_c2_profiles_for_payload
   - get_callback_c2_config
   - get_payload_c2_config

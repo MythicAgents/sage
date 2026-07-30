@@ -1,0 +1,15 @@
+manifest_version: 1
+id: sage-replication-range
+name: "Sage Replication Purpose Range"
+description: "Three-host AD benchmark with a controlled GPO detour and a cheaper direct DCSync path."
+version: 0.1.0
+config: range-config.yml
+
+tags:
+  - active-directory
+  - benchmark
+  - dcsync
+  - gpo
+  - sage
+
+min_ludus_version: "2.0.0"

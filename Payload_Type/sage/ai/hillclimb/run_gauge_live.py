@@ -18,6 +18,7 @@ Operator loop per scenario:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import time
@@ -26,20 +27,20 @@ from pathlib import Path
 
 try:
     from . import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod
-    from .scenarios import goad_scenarios, CHILD, OBJECTIVE
+    from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod  # type: ignore
-    from scenarios import goad_scenarios, CHILD, OBJECTIVE  # type: ignore
+    from scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
     from range_state import Milestone  # type: ignore
     from fitness import ScoreCard  # type: ignore
 
 
 @dataclass
 class Config:
-    sage_cb: int = 1
+    sage_cb: int | None = None  # legacy payload path only
     apollo_cb: int = 4
     engagement_op: str = "Operation_Chimera_1"
     max_steps: int = 0          # 0 = UNLIMITED steps for the bare model (parity with Sage's solve)
@@ -48,30 +49,82 @@ class Config:
     # membership changes have time to propagate before scoring — returns True the instant they appear.
     da_settle_timeout: int = 300
     da_settle_interval: int = 20
+    policy_mode: str = "llm"
+    model_provider: str | None = None
+    model_id: str | None = None
+    model_api_endpoint: str | None = None
+    model_api_key: str | None = None
+    null_model: bool = False
 
     @property
     def results_path(self) -> Path:
+        override = str(os.environ.get("SAGE_EVAL_RESULTS_PATH") or "").strip()
+        if override:
+            return Path(override).expanduser()
         return Path(__file__).resolve().parents[2] / ".hillclimb" / "results" / "bare_vs_harness.jsonl"
+
+
+def _resolved_harness_model_route(cfg: Config) -> dict[str, str | None]:
+    """Resolve the route the harness should use when no explicit treatment override is supplied.
+
+    Native chat gets its defaults from Sage's local env-backed metadata. The headless controller path bypasses
+    that channel metadata entirely, so it must carry the same provider/model/endpoint/key explicitly or it
+    constructs ``Model`` with an empty config and fails before the first controller cycle.
+    """
+    defaults = live_seams.load_sage_defaults()
+    return {
+        "provider": cfg.model_provider or defaults.get("provider"),
+        "model": cfg.model_id or defaults.get("model"),
+        "api_endpoint": cfg.model_api_endpoint or defaults.get("base_url"),
+        "api_key": cfg.model_api_key or defaults.get("api_key"),
+    }
 
 
 def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                  settle_interval: float = 20) -> dict:
-    """All collection-independent. KRBTGT via Mythic loot; DA/OBJECTIVE via AD-DIRECT OUT-OF-BAND LDAP
-    membership (escalation vs the post-reset baseline) — read by the referee `reader(domain)->set`, never
-    through the agent callback. krbtgt-loot also covers DA achieved without a membership add. Probes are
-    scoped to the scenario's milestone_subset so a scenario never builds (or needs referee creds for) a
-    milestone it does not score. The DA probes get a settling window so GPO/SYSTEM-on-DC membership
-    changes have time to propagate before scoring (krbtgt-loot is immediate, so it needs no window)."""
+    """Build ledger-independent range probes shared by harness and bare-model runs.
+
+    KRBTGT is proven from Mythic loot/task output. DA is proven from out-of-band LDAP membership delta.
+    OBJECTIVE accepts either LDAP admin membership or completed Mythic task output that independently
+    replays the certificate-auth / forged-ticket verifiers; those access paths do not mutate group
+    membership.
+    """
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
-    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=CHILD)}
+    domains = dict(getattr(scenario, "domains", {}) or {})
+    child_domain = str(domains.get("child") or CHILD)
+    objective_domain = str(domains.get("objective") or OBJECTIVE)
+    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=child_domain)}
     if Milestone.DA_CHILD in sub:
         probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
-            reader, CHILD, baseline=baseline.get(CHILD, set()),
+            reader, child_domain, baseline=baseline.get(child_domain, set()),
             settle_timeout=settle_timeout, settle_interval=settle_interval)
     if Milestone.OBJECTIVE in sub:
-        probes[Milestone.OBJECTIVE] = live_seams.ad_domain_admins_probe_via_reader(
-            reader, OBJECTIVE, baseline=baseline.get(OBJECTIVE, set()),
-            settle_timeout=settle_timeout, settle_interval=settle_interval)
+        if _objective_uses_remote_exec_probe(scenario):
+            remote_targets = _objective_remote_exec_targets(scenario)
+            if len(remote_targets) != 1:
+                raise ValueError(
+                    "remote-exec OBJECTIVE scenarios must declare exactly one host/domain target"
+                )
+            target_host, target_domain = remote_targets[0]
+            target_domain = target_domain or objective_domain
+            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
+                live_seams.remote_execution_probe(target_host, realm=target_domain),
+                settle_timeout=settle_timeout,
+                settle_interval=settle_interval,
+            )
+        else:
+            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
+                live_seams.certificate_admin_control_probe("administrator", realm=objective_domain),
+                live_seams.ticket_admin_control_probe(realm=objective_domain),
+                live_seams.ad_domain_admins_probe_via_reader(
+                    reader,
+                    objective_domain,
+                    baseline=baseline.get(objective_domain, set()),
+                    settle_timeout=0,
+                ),
+                settle_timeout=settle_timeout,
+                settle_interval=settle_interval,
+            )
     if Milestone.GRAPH_COLLECTED in sub:
         # Ground-truth, ledger-independent: BloodHound holds >=1 ingested Domain == a SharpHound
         # collection was successfully run AND uploaded. Independent of Sage's self-reported
@@ -83,10 +136,11 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
 
 
 def _scenario(cfg: Config, name: str):
-    for s in goad_scenarios(cfg.engagement_op):
+    scenarios = all_scenarios(cfg.engagement_op)
+    for s in scenarios:
         if s.name == name:
             return s
-    raise SystemExit(f"unknown scenario {name!r}; choices: {[s.name for s in goad_scenarios(cfg.engagement_op)]}")
+    raise SystemExit(f"unknown scenario {name!r}; choices: {[s.name for s in scenarios]}")
 
 
 def objective_recognizable(objective: str) -> tuple[bool, str]:
@@ -111,6 +165,9 @@ def objective_recognizable(objective: str) -> tuple[bool, str]:
     targets = _es._objective_target_domains(o)
     if targets:
         return True, f"recognizable: target-matched completion (targets={sorted(targets)})"
+    remote_exec_targets = _es._objective_remote_exec_targets(o)
+    if remote_exec_targets:
+        return True, f"recognizable: remote-exec target-matched completion (targets={remote_exec_targets})"
     return True, "recognizable: non-opaque; completion via no-next-hop/milestone fallback (no DA-phrase target)"
 
 
@@ -119,7 +176,39 @@ def _scored_referee_domains(scn) -> set:
     Mirrors run_side's baseline scope EXACTLY, so the preflight validates precisely the creds the run will
     require — no more, no less."""
     sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
-    return {d for m, d in ((Milestone.DA_CHILD, CHILD), (Milestone.OBJECTIVE, OBJECTIVE)) if m in sub}
+    domains = dict(getattr(scn, "domains", {}) or {})
+    scored: set[str] = set()
+    if Milestone.DA_CHILD in sub:
+        child = str(domains.get("child") or "").strip()
+        if child:
+            scored.add(child)
+    if Milestone.OBJECTIVE in sub and not _objective_uses_remote_exec_probe(scn):
+        objective = str(domains.get("objective") or "").strip()
+        if objective:
+            scored.add(objective)
+    return scored
+
+
+def _objective_effect_prefixes(scenario) -> tuple[str, ...]:
+    try:
+        spec = scenario.spec()
+    except Exception:
+        return ()
+    objective_spec = spec.get(Milestone.OBJECTIVE)
+    return tuple(str(prefix or "").strip().casefold() for prefix in getattr(objective_spec, "effect_prefixes", ()) or ())
+
+
+def _objective_uses_remote_exec_probe(scenario) -> bool:
+    return "remote-exec:" in _objective_effect_prefixes(scenario)
+
+
+def _objective_remote_exec_targets(scenario) -> list[tuple[str, str]]:
+    try:
+        from ..langgraph import engagement_state as _es
+    except Exception:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
+        import engagement_state as _es  # type: ignore
+    return list(_es._objective_remote_exec_targets(str(getattr(scenario, "objective", "") or "")))
 
 
 def _referee_creds_present(domain: str) -> tuple[bool, str]:
@@ -162,10 +251,101 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
     return checks
 
 
+def validate_harness_runtime_telemetry(
+    configured_policy_mode: str,
+    telemetry: dict,
+    *,
+    configured_provider: str | None = None,
+    configured_model: str | None = None,
+) -> None:
+    """Reject mislabeled or incompletely attributed harness runs."""
+    if not isinstance(telemetry, dict) or not telemetry:
+        raise RuntimeError("Sage returned no observed runtime telemetry")
+    observed = str(telemetry.get("policy_mode") or "").strip().casefold()
+    configured = str(configured_policy_mode or "").strip().casefold()
+    if observed != configured:
+        raise RuntimeError(
+            f"configured policy mode {configured!r} did not match observed mode {observed!r}"
+        )
+    if str(telemetry.get("configured_policy_mode") or "").strip().casefold() != configured:
+        raise RuntimeError("runtime telemetry did not preserve the configured policy mode")
+    switches = telemetry.get("policy_switches")
+    if not isinstance(switches, list):
+        raise RuntimeError("runtime telemetry omitted policy switch records")
+    if switches or telemetry.get("policy_identity_valid") is not True:
+        raise RuntimeError(f"runtime policy identity invalid; switches={switches!r}")
+    for label, expected, key in (
+        ("provider", configured_provider, "model_provider"),
+        ("model", configured_model, "model_id"),
+    ):
+        if not expected:
+            continue
+        actual = str(telemetry.get(key) or "").strip()
+        if actual.casefold() != str(expected).strip().casefold():
+            raise RuntimeError(
+                f"configured {label} {expected!r} did not match observed {label} {actual!r}"
+            )
+    total = int(telemetry.get("semantic_transaction_count", 0) or 0)
+    authorized = int(telemetry.get("authorized_transaction_count", 0) or 0)
+    coverage = float(telemetry.get("semantic_policy_coverage", 0.0) or 0.0)
+    if total < 0 or authorized < 0 or authorized > total:
+        raise RuntimeError(
+            f"invalid semantic transaction counts: authorized={authorized}, total={total}"
+        )
+    expected_coverage = authorized / total if total else 1.0
+    if abs(coverage - expected_coverage) > 1e-9:
+        raise RuntimeError(
+            f"semantic policy coverage {coverage} disagrees with counts "
+            f"{authorized}/{total}"
+        )
+    if authorized != total:
+        raise RuntimeError(
+            f"semantic policy provenance incomplete: {authorized}/{total} transactions authorized"
+        )
+    model_calls = int(telemetry.get("model_calls", 0) or 0)
+    if configured in {"llm", "hybrid"} and model_calls:
+        backend_requests = telemetry.get("effective_backend_requests")
+        if not isinstance(backend_requests, list):
+            raise RuntimeError("runtime telemetry omitted effective backend request records")
+        if len(backend_requests) != model_calls:
+            raise RuntimeError(
+                f"effective backend provenance incomplete: {len(backend_requests)}/{model_calls} model responses"
+            )
+        for request in backend_requests:
+            if not isinstance(request, dict):
+                raise RuntimeError("runtime telemetry contains a malformed effective backend record")
+            if not str(request.get("effective_backend") or "").strip():
+                raise RuntimeError("runtime telemetry omitted the response-derived effective backend")
+            if str(request.get("backend_provenance_source") or "").strip() in {"", "unavailable"}:
+                raise RuntimeError("runtime telemetry omitted the effective backend provenance source")
+        if telemetry.get("backend_provenance_complete") is not True:
+            raise RuntimeError("runtime telemetry marked effective backend provenance incomplete")
+
+
+def runtime_evidence_fields(telemetry: dict | None) -> dict:
+    """Persist the controller evidence needed to audit branch quality after the next lab reset."""
+    if not isinstance(telemetry, dict):
+        return {}
+    keys = (
+        "controller_status",
+        "controller_cycle_count",
+        "controller_cycles",
+        "controller_blocker",
+        "achieved_effects",
+        "model_calls",
+        "backend_provenance_complete",
+        "policy_switches",
+        "decisions",
+        "transactions",
+    )
+    return {key: telemetry[key] for key in keys if key in telemetry}
+
+
 def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     scn = _scenario(cfg, scenario_name)
     client = live_seams.default_mythic_client()
+    runtime_telemetry: dict = {}
 
     # GROUND TRUTH is read OUT-OF-BAND over LDAP (the referee), NOT through the agent's Apollo callback.
     # Routing it through that callback would (a) pollute the HARNESS — Sage reconciles the callback's task
@@ -180,7 +360,38 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
                           settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
 
     if side == "harness":
-        solve = live_seams.make_harness_solver(client, cfg.sage_cb, timeout=cfg.solve_timeout, max_steps=0)
+        harness_route = _resolved_harness_model_route(cfg)
+        if cfg.null_model or os.environ.get("SAGE_EVAL_HEADLESS"):
+            # Option A (Phase-4 migration): run the solve IN-PROCESS via the chat Model instead of tasking
+            # the PayloadType `query` on the virtual callback. Alongside path — selected only when the flag
+            # is set — so a migration run can compare in-process vs task-based on the same reset. Ledger key
+            # comes from SAGE_ENGAGEMENT_ID (the run token the reset sets) or the operation name.
+            _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or cfg.engagement_op
+            treatment = "null-model" if cfg.null_model else "headless"
+            print(
+                f"[harness/{scenario_name}] {treatment} in-process solve (engagement={_eng})",
+                flush=True,
+            )
+            solve = live_seams.make_headless_solver(client, engagement_id=_eng,
+                                                    timeout=cfg.solve_timeout, max_steps=0,
+                                                    policy_mode=cfg.policy_mode,
+                                                    provider=harness_route["provider"],
+                                                    model=harness_route["model"],
+                                                    api_endpoint=harness_route["api_endpoint"],
+                                                    api_key=harness_route["api_key"],
+                                                    null_model=cfg.null_model)
+        else:
+            solve = live_seams.make_native_chat_solver(
+                client,
+                timeout=cfg.solve_timeout,
+                provider=cfg.model_provider,
+                model=cfg.model_id,
+                api_endpoint=cfg.model_api_endpoint,
+                api_key=cfg.model_api_key,
+                eval_force_capability_prefix_json=os.environ.get(
+                    "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON"
+                ) or None,
+            )
         _start = time.time()
         _deadline = _start + cfg.solve_timeout
         print(f"[harness/{scenario_name}] started {time.strftime('%H:%M:%S', time.localtime(_start))} · "
@@ -197,10 +408,29 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
         _elapsed = int(time.time() - _start)
         print(f"[harness/{scenario_name}] solve returned {time.strftime('%H:%M:%S')} "
               f"(elapsed {_elapsed // 60}m{_elapsed % 60}s, status={solve_status})", flush=True)
+        native_result = getattr(solve, "last_result", None)
+        runtime_telemetry = (
+            dict(native_result.get("runtime_telemetry") or {})
+            if isinstance(native_result, dict)
+            else {}
+        )
+        validate_harness_runtime_telemetry(
+            cfg.policy_mode,
+            runtime_telemetry,
+            configured_provider=harness_route["provider"],
+            configured_model=harness_route["model"],
+        )
         # Record the REAL terminal status (incl. "timeout") AND the wall-clock cost in the card -> jsonl.
         # wall_seconds is the discriminating signal once capability saturates: a completion-recognized clean
         # stop (status="stopped" well under the budget) vs a churn-to-timeout shows up here, not in capability.
-        card = bare_runner.score_from_probes(scn, probes, status=solve_status, wall_seconds=_elapsed)
+        card = bare_runner.score_from_probes(
+            scn,
+            probes,
+            status=solve_status,
+            wall_seconds=_elapsed,
+            runtime_telemetry=runtime_telemetry,
+            configured_policy_mode=cfg.policy_mode,
+        )
     elif side == "bare":
         bare = build_bare_runner(cfg)            # builds its own stripped-Mythic dispatcher (all callbacks)
         result = bare.run(scn.objective)
@@ -212,13 +442,74 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     # the model from Sage's .env (bare via build_bare_runner -> load_sage_defaults; harness = whatever Sage
     # is running). When a bare-side --model override is added, record THAT for the bare side instead.
     _defs = live_seams.load_sage_defaults()
+    if cfg.model_provider:
+        _defs["provider"] = cfg.model_provider
+    if cfg.model_id:
+        _defs["model"] = cfg.model_id
+    if side == "bare":
+        card.policy_mode = "llm"
+        card.configured_policy_mode = "llm"
+        card.policy_identity_valid = True
+        card.model_provider = str(_defs.get("provider") or "")
+        card.model_id = str(_defs.get("model") or "")
     _now = time.time()
     rec = {"side": side, "scenario": scenario_name,
            "model": _defs.get("model"), "provider": _defs.get("provider"),
+           "policy_mode": card.policy_mode,
+           "configured_policy_mode": card.configured_policy_mode,
+           "policy_identity_valid": card.policy_identity_valid,
+           "request_completed": card.request_completed,
+           "objective_recognized": card.objective_recognized,
+           "objective_proven": card.objective_proven,
+           "clean_stop": card.clean_stop,
+           "controller_terminal_reason": card.controller_terminal_reason,
+           "semantic_transaction_count": card.semantic_transaction_count,
+           "authorized_transaction_count": card.authorized_transaction_count,
+           "semantic_policy_coverage": card.semantic_policy_coverage,
+           "effective_backends": list(card.effective_backends),
+           "effective_backend_requests": list(card.effective_backend_requests),
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
            "card": asdict(card)}
+    for env_key, row_key in (
+        ("SAGE_EVAL_PHASE6_MANIFEST_HASH", "phase6_manifest_hash"),
+        ("SAGE_EVAL_PHASE6_TOPOLOGY_HASH", "phase6_topology_hash"),
+        ("SAGE_EVAL_PHASE6_CANDIDATE_SET_HASH", "phase6_candidate_set_hash"),
+        ("SAGE_EVAL_PHASE6_ORDERED_FRONTIER_HASH", "phase6_ordered_frontier_hash"),
+        ("SAGE_EVAL_PHASE6_FORCED_PATH", "phase6_forced_path"),
+        ("SAGE_EVAL_PHASE6_PLANNED_ROW_ID", "phase6_planned_row_id"),
+        ("SAGE_EVAL_PHASE6_ATTEMPT_INDEX", "phase6_attempt_index"),
+        (
+            "SAGE_EVAL_PHASE6_MAX_PRE_FRONTIER_DIAGNOSTIC_RETRIES",
+            "phase6_max_pre_frontier_diagnostic_retries",
+        ),
+        ("SAGE_EVAL_PHASE7_MANIFEST_HASH", "phase7_manifest_hash"),
+        ("SAGE_EVAL_PHASE7_TOPOLOGY_HASH", "phase7_topology_hash"),
+        ("SAGE_EVAL_PHASE7_CONTROL", "phase7_control"),
+        ("SAGE_EVAL_PHASE7_ATTEMPT_INDEX", "phase7_attempt_index"),
+        ("SAGE_EVAL_PHASE8_CONTRACT_HASH", "phase8_contract_hash"),
+        ("SAGE_EVAL_PHASE8_POLICY_ARM", "phase8_policy_arm"),
+        ("SAGE_EVAL_PHASE8_PLANNED_ROW_ID", "phase8_planned_row_id"),
+        ("SAGE_EVAL_PHASE8_ATTEMPT_INDEX", "phase8_attempt_index"),
+    ):
+        value = str(os.environ.get(env_key) or "").strip()
+        if value:
+            rec[row_key] = (
+                int(value)
+                if row_key in {
+                    "phase6_attempt_index",
+                    "phase6_max_pre_frontier_diagnostic_retries",
+                    "phase7_attempt_index",
+                    "phase8_attempt_index",
+                }
+                else value
+            )
+    rec.update(runtime_evidence_fields(runtime_telemetry))
+    native_result = getattr(locals().get("solve"), "last_result", None)
+    if isinstance(native_result, dict):
+        rec["chat_channel_id"] = native_result.get("chat_channel_id")
+        rec["chat_request_id"] = native_result.get("chat_request_id")
     p = cfg.results_path
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
@@ -294,6 +585,14 @@ def main(argv=None) -> int:
     r.add_argument("--apollo-cb", type=int, default=None)
     r.add_argument("--solve-timeout", type=int, default=None,
                    help="seconds to wait for the harness solve (default 1800=30min); raise for full solves")
+    r.add_argument("--policy-mode", choices=["llm", "hybrid", "symbolic"], default="llm",
+                   help="policy identity of the running Sage harness")
+    r.add_argument("--provider", default=None,
+                   help="explicit harness model provider; required for controlled multi-model runs")
+    r.add_argument("--model", default=None,
+                   help="explicit harness model ID; required for controlled multi-model runs")
+    r.add_argument("--null-model", action="store_true",
+                   help="headless ablation: disable the policy model after Model initialization")
     r.add_argument("--da-settle-timeout", type=int, default=None,
                    help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
@@ -306,6 +605,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = Config()
+    cfg.model_api_endpoint = os.environ.get("SAGE_EVAL_API_ENDPOINT") or None
+    cfg.model_api_key = os.environ.get("SAGE_EVAL_API_KEY") or None
 
     if args.cmd == "preflight":
         # Iterate the DECLARED manifest and run every OFFLINE precondition before any expensive step.
@@ -335,6 +636,14 @@ def main(argv=None) -> int:
         cfg.solve_timeout = args.solve_timeout
     if getattr(args, "da_settle_timeout", None) is not None:
         cfg.da_settle_timeout = args.da_settle_timeout
+    if getattr(args, "policy_mode", None):
+        cfg.policy_mode = args.policy_mode
+    if getattr(args, "provider", None):
+        cfg.model_provider = args.provider
+    if getattr(args, "model", None):
+        cfg.model_id = args.model
+    if getattr(args, "null_model", False):
+        cfg.null_model = True
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
@@ -348,6 +657,8 @@ def main(argv=None) -> int:
         print(f"  probes (all collection-independent): KRBTGT_DUMPED (Mythic loot), "
               f"DA_CHILD/OBJECTIVE (AD-direct: live DC Domain Admins vs post-reset baseline)")
         print(f"  objective: {_scenario(cfg, args.scenario).objective}")
+        if cfg.null_model:
+            print("  treatment: null policy model (headless; no policy inference calls)")
         return 0
 
     try:

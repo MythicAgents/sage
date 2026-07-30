@@ -1,0 +1,52 @@
+diff --git a/ansible/range-management/tasks/windows/sysprep.yml b/ansible/range-management/tasks/windows/sysprep.yml
+index 415a3d0..2c946f6 100644
+--- a/ansible/range-management/tasks/windows/sysprep.yml
++++ b/ansible/range-management/tasks/windows/sysprep.yml
+@@ -38,6 +38,16 @@
+     }
+   ignore_errors: true
+ 
++- name: Remove Microsoft.MicrosoftEdge.Stable appx package if it exists as it prevents sysprep from working
++  ansible.windows.win_shell: |
++    Get-AppxPackage | Where-Object { $_.PackageFamilyName -eq 'Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe' } | ForEach-Object {
++      Remove-AppxPackage -Package $_.PackageFullName
++    }
++    Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq 'Microsoft.MicrosoftEdge.Stable' } | ForEach-Object {
++      Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName | Out-Null
++    }
++  ignore_errors: true
++
+ - name: Run Sysprep
+   ansible.windows.win_shell: C:\Windows\System32\Sysprep\sysprep.exe /generalize /quiet /reboot /oobe /unattend:C:\ludus\sysprep\oob-disable.xml
+ 
+@@ -67,6 +77,30 @@
+   delegate_to: localhost
+   register: wait_result
+ 
++- name: Check whether sysprep actually succeeded
++  ansible.windows.win_stat:
++    path: C:\Windows\System32\Sysprep\Sysprep_succeeded.tag
++  register: sysprep_success_tag
++
++- name: Read sysprep error log when generalization did not succeed
++  ansible.windows.win_shell: |
++    if (Test-Path 'C:\Windows\System32\Sysprep\Panther\setuperr.log') {
++      Get-Content 'C:\Windows\System32\Sysprep\Panther\setuperr.log' -Tail 40
++    } else {
++      Write-Output 'No sysprep setuperr.log found.'
++    }
++  changed_when: false
++  register: sysprep_error_log
++  when: not sysprep_success_tag.stat.exists
++
++- name: Fail if sysprep did not generalize the VM
++  ansible.builtin.fail:
++    msg: >-
++      Sysprep did not create C:\Windows\System32\Sysprep\Sysprep_succeeded.tag.
++      Latest setuperr.log:
++      {{ sysprep_error_log.stdout | default('No output') }}
++  when: not sysprep_success_tag.stat.exists
++
+ - name: Create sysprepd file
+   ansible.windows.win_file:
+     path: C:\ludus\sysprep\sysprepd

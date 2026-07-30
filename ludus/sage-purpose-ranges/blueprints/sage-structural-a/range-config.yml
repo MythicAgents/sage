@@ -1,0 +1,212 @@
+# yaml-language-server: $schema=https://docs.ludus.cloud/schemas/range-config.json
+# Phase 16R candidate structural family S1. It is defined, not accepted, provisioned, callback-ready, or countable.
+# Keep VM names, hostnames, domains, objects, and resource profile aligned with the candidate physical realization.
+
+ludus:
+  - vm_name: "{{ range_id }}-DC01"
+    hostname: marble-dc01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 10
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+      gpos:
+        - disable_defender
+    domain:
+      fqdn: marble.local
+      role: primary-dc
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_bulk_ad_content
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_forest_trust
+        depends_on:
+          - vm_name: "{{ range_id }}-DC04"
+            role: sage_structural_range
+    role_vars:
+      ludus_ad_content_mode: custom
+      ludus_organisation_units: []
+      ludus_groups:
+        global: []
+        domainlocal: []
+        universal: []
+      ludus_users:
+        - name: analyst1
+          firstname: Sage
+          surname: Analyst
+          password: "MarbleAnalyst1-2026!"
+          description: "Low-privileged Sage structural family A foothold"
+          path: "CN=Users,DC=marble,DC=local"
+          groups: []
+          password_never_expires: true
+      ludus_trust_partner_domain: onyx.partner.local
+      ludus_trust_partner_dc_ip: "10.{{ range_second_octet }}.10.13"
+      ludus_dns_forward_zone: onyx.partner.local
+      ludus_dns_forward_server: "10.{{ range_second_octet }}.10.13"
+      ludus_enable_sid_history: false
+
+  - vm_name: "{{ range_id }}-DC02"
+    hostname: larch-dc01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 11
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_child_domain
+      - name: sage_structural_range
+        depends_on:
+          - vm_name: "{{ range_id }}-SRV01"
+            role: badsectorlabs.ludus_windows_utils.ludus_child_domain_join
+          - vm_name: "{{ range_id }}-DC01"
+            role: badsectorlabs.ludus_windows_utils.ludus_bulk_ad_content
+    role_vars:
+      ludus_child_domain_fqdn: larch.marble.local
+      ludus_parent_domain_fqdn: marble.local
+      ludus_parent_dc_ip: "10.{{ range_second_octet }}.10.10"
+      sage_structural_range_mode: directory
+      sage_structural_domain_fqdn: larch.marble.local
+      sage_structural_domain_netbios: LARCH
+      sage_structural_gpo_name: saffron-policy
+      sage_structural_gpo_target_ou: "OU=Servers,DC=larch,DC=marble,DC=local"
+      sage_structural_gpo_target_computer: n01
+      sage_structural_gpo_editor: "MARBLE\\analyst1"
+      sage_structural_gpo_machine_write_dacl: true
+
+  - vm_name: "{{ range_id }}-DC03"
+    hostname: ivory-dc01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 12
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_child_domain
+    role_vars:
+      ludus_child_domain_fqdn: ivory.marble.local
+      ludus_parent_domain_fqdn: marble.local
+      ludus_parent_dc_ip: "10.{{ range_second_octet }}.10.10"
+
+  - vm_name: "{{ range_id }}-DC04"
+    hostname: onyx-dc01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 13
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+      gpos:
+        - disable_defender
+    domain:
+      fqdn: onyx.partner.local
+      role: primary-dc
+    roles:
+      - name: sage_structural_range
+        depends_on:
+          - vm_name: "{{ range_id }}-SRV02"
+            role: badsectorlabs.ludus_adcs
+    role_vars:
+      sage_structural_range_mode: kdc-cert
+      sage_structural_domain_fqdn: onyx.partner.local
+      sage_structural_ca_host_fqdn: n02.onyx.partner.local
+
+  - vm_name: "{{ range_id }}-WS01"
+    hostname: marble-ws01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 31
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    domain:
+      fqdn: marble.local
+      role: member
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+        depends_on:
+          - vm_name: "{{ range_id }}-DC01"
+            role: badsectorlabs.ludus_windows_utils.ludus_bulk_ad_content
+    role_vars:
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+      ludus_local_groups:
+        - group: "Remote Desktop Users"
+          members:
+            - "MARBLE\\analyst1"
+
+  - vm_name: "{{ range_id }}-SRV01"
+    hostname: n01
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 21
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_child_domain_join
+        depends_on:
+          - vm_name: "{{ range_id }}-DC02"
+            role: badsectorlabs.ludus_windows_utils.ludus_child_domain
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+      - name: sage_structural_range
+    role_vars:
+      ludus_child_domain_fqdn: larch.marble.local
+      ludus_child_dc_ip: "10.{{ range_second_octet }}.10.11"
+      ludus_child_dc_hostname: larch-dc01
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+      sage_structural_range_mode: proof-target
+      sage_structural_domain_netbios: LARCH
+      sage_structural_proof_path: 'C:\SageProof'
+      sage_structural_proof_share: SageProof
+      sage_structural_group_policy_refresh_minutes: 1
+
+  - vm_name: "{{ range_id }}-SRV02"
+    hostname: n02
+    template: win2022-server-x64-template
+    vlan: 10
+    ip_last_octet: 22
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    domain:
+      fqdn: onyx.partner.local
+      role: member
+    roles:
+      - name: badsectorlabs.ludus_windows_utils.ludus_ad_misconfigs
+      - name: badsectorlabs.ludus_adcs
+    role_vars:
+      ludus_misconfigs_mode: custom
+      ludus_firewall_disabled: true
+      ludus_adcs_domain: onyx
+      ludus_adcs_dc: "{{ range_id }}-DC04"
+      ludus_adcs_dc_ip: "10.{{ range_second_octet }}.10.13"
+      ludus_adcs_ca_host: n02
+      ludus_adcs_domain_username: "ONYX\\{{ defaults.ad_domain_admin }}"
+      ludus_adcs_domain_password: "{{ defaults.ad_domain_admin_password }}"
+      ludus_adcs_domain_fqdn: onyx.partner.local
+      ludus_adcs_ca_common_name: ONYX-CA
+      ludus_adcs_esc1: true
+      ludus_adcs_esc2: false
+      ludus_adcs_esc3: false
+      ludus_adcs_esc3_cra: false
+      ludus_adcs_esc4: false
+      ludus_adcs_esc5: false
+      ludus_adcs_esc6: false
+      ludus_adcs_esc7: false
+      ludus_adcs_esc8: false
+      ludus_adcs_esc9: false
+      ludus_adcs_esc10: false
+      ludus_adcs_esc11: false
+      ludus_adcs_esc13: false
+      ludus_adcs_esc14: false
+      ludus_adcs_esc15: false
+      ludus_adcs_esc16: false

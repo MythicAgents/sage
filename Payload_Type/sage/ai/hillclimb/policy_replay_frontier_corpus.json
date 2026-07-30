@@ -1,0 +1,726 @@
+{
+  "calibration_manifest": "policy_replay_calibration_manifest.json",
+  "calibration_manifest_hash": "sha256:decc6c450e0b1fea4b07f4f2822a872b9d14f9a27c49c5fcf72b1d3f451c38cd",
+  "cases": [
+    {
+      "branch_outcome_scope": {
+        "can_score_unseen_candidates": false,
+        "frontier_coverage": [
+          {
+            "frontier_index": 0,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "symbolic"
+            ],
+            "selected_capability": "gpo-controlled-system-exec",
+            "selected_target": "gpo=srv02-policy;domain=replication.local"
+          },
+          {
+            "frontier_index": 1,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "hybrid",
+              "llm"
+            ],
+            "selected_capability": "dcsync-krbtgt",
+            "selected_target": "domain=replication.local;account=krbtgt"
+          }
+        ],
+        "frontier_indices_with_live_observed_outcomes": [
+          0,
+          1
+        ],
+        "frontier_indices_without_live_observed_outcomes": [],
+        "kind": "live_observed_frontier_choices_only"
+      },
+      "decision_packet": {
+        "admissible_frontier": [
+          {
+            "effects": [
+              "system-exec:gpo:srv02-policy@replication.local"
+            ],
+            "name": "gpo-controlled-system-exec",
+            "operational_cost": {
+              "execution_scope": "domain-policy",
+              "expected_wait_seconds": 120,
+              "interaction_class": "propagation-bound",
+              "requires_propagation_wait": true,
+              "wait_reasons": [
+                "group-policy-refresh"
+              ]
+            },
+            "preconditions": [
+              "generic-write:gpo:srv02-policy",
+              "gpo-domain:srv02-policy:replication.local",
+              "live-foothold:replication.local"
+            ],
+            "reason": "controlled GPO can deliver a computer-side SYSTEM action; prove execution before chaining; BloodHound scope includes host(s): srv02, ws01",
+            "target": "gpo=srv02-policy;domain=replication.local"
+          },
+          {
+            "effects": [
+              "krbtgt-hash:replication.local"
+            ],
+            "name": "dcsync-krbtgt",
+            "operational_cost": {
+              "execution_scope": "direct",
+              "expected_wait_seconds": 0,
+              "interaction_class": "direct",
+              "requires_propagation_wait": false,
+              "wait_reasons": []
+            },
+            "preconditions": [
+              "ds-replication-rights:replication.local",
+              "live-foothold:*"
+            ],
+            "reason": "verified replication rights can extract krbtgt; record only real secret material",
+            "target": "domain=replication.local;account=krbtgt"
+          }
+        ],
+        "budgets": {
+          "max_cycles": 60,
+          "token_budget": 3000000,
+          "wall_clock_budget_s": 2700
+        },
+        "candidate_hash": "sha256:3cab326b0fda99cd",
+        "normalized_state": {
+          "achieved_effects": [
+            "graph-built:replication.local|baseline"
+          ],
+          "footholds": [
+            {
+              "agent": "apollo",
+              "alive": true,
+              "callback_id": "2",
+              "forest": "replication.local",
+              "host": "WS01",
+              "identity": "user1",
+              "integrity": "medium"
+            }
+          ],
+          "graph_facts": [
+            "domain-collected:replication.local",
+            "ds-replication-rights:replication.local",
+            "generic-write:gpo:srv02-policy",
+            "gpo-affects-computer:srv02-policy:srv02:replication.local",
+            "gpo-affects-computer:srv02-policy:ws01:replication.local",
+            "gpo-domain:srv02-policy:replication.local",
+            "gpo-guid:srv02-policy:b94245cf-182d-4cb0-8b79-3e64447ceb90"
+          ],
+          "recent_outcomes": [
+            {
+              "capability": "collect-graph",
+              "effect": "graph-built:replication.local|baseline",
+              "status": "achieved",
+              "target": "replication.local|baseline"
+            }
+          ]
+        },
+        "objective": "From the current foothold, achieve administrative control of replication.local.",
+        "prior_decisions": [
+          {
+            "capability": "collect-graph",
+            "decision_id": "decision-a94ffe9377fd42afabb7e38d09f1784e",
+            "disposition": "select",
+            "target": "replication.local|baseline"
+          }
+        ],
+        "schema_version": 1,
+        "selection_contract": "admissible_frontier"
+      },
+      "decision_packet_hash": "sha256:389a5bd3abf4d9b30c1e92cff0cd71975004b54c1dd4b3d6bf033ca75949df37",
+      "decisive_frontier_hash": "sha256:3cab326b0fda99cd",
+      "expected_candidate_count": 2,
+      "expected_policy_order": [
+        [
+          "hybrid",
+          "llm"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "id": "replication-visible-cost",
+      "metric": {
+        "direction": "lower_is_better",
+        "kind": "semantic_transaction_count"
+      },
+      "packet_source": {
+        "decision_packet_hash": "sha256:389a5bd3abf4d9b30c1e92cff0cd71975004b54c1dd4b3d6bf033ca75949df37",
+        "policy_mode": "hybrid",
+        "relative_path": "replication_purpose_range_packet_canary_20260713.jsonl",
+        "sha256": "sha256:2431a019916087d4e6e3c7a6a0b472f54396be41bc03f02eba01048e26b95c4a"
+      },
+      "policy_replays": {
+        "hybrid": {
+          "metric_mean": 3.0,
+          "metric_values": [
+            3.0,
+            3.0,
+            3.0
+          ],
+          "selected_capability": "dcsync-krbtgt",
+          "selected_target": "domain=replication.local;account=krbtgt"
+        },
+        "llm": {
+          "metric_mean": 3.0,
+          "metric_values": [
+            3.0,
+            3.0,
+            3.0
+          ],
+          "selected_capability": "dcsync-krbtgt",
+          "selected_target": "domain=replication.local;account=krbtgt"
+        },
+        "symbolic": {
+          "metric_mean": 4.0,
+          "metric_values": [
+            4.0,
+            4.0,
+            4.0
+          ],
+          "selected_capability": "gpo-controlled-system-exec",
+          "selected_target": "gpo=srv02-policy;domain=replication.local"
+        }
+      },
+      "scenario": "replication-purpose-range-visible-cost",
+      "tie_tolerance": 0.0
+    },
+    {
+      "branch_outcome_scope": {
+        "can_score_unseen_candidates": false,
+        "frontier_coverage": [
+          {
+            "frontier_index": 0,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "symbolic"
+            ],
+            "selected_capability": "gpo-controlled-system-exec",
+            "selected_target": "gpo=srv02-policy;domain=range.local"
+          },
+          {
+            "frontier_index": 1,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "hybrid",
+              "llm"
+            ],
+            "selected_capability": "endpoint-protection-adjustment",
+            "selected_target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "frontier_index": 2,
+            "live_observed": false,
+            "observed_by_policy_modes": [],
+            "selected_capability": "adcs-ca-private-key-export",
+            "selected_target": "target=ca01;target_domain=range.local;callback=2"
+          }
+        ],
+        "frontier_indices_with_live_observed_outcomes": [
+          0,
+          1
+        ],
+        "frontier_indices_without_live_observed_outcomes": [
+          2
+        ],
+        "kind": "live_observed_frontier_choices_only"
+      },
+      "decision_packet": {
+        "admissible_frontier": [
+          {
+            "effects": [
+              "system-exec:gpo:srv02-policy@range.local"
+            ],
+            "name": "gpo-controlled-system-exec",
+            "operational_cost": {
+              "execution_scope": "domain-policy",
+              "expected_wait_seconds": 120,
+              "interaction_class": "propagation-bound",
+              "requires_propagation_wait": true,
+              "wait_reasons": [
+                "group-policy-refresh"
+              ]
+            },
+            "preconditions": [
+              "generic-write:gpo:srv02-policy",
+              "gpo-domain:srv02-policy:range.local",
+              "live-foothold:range.local"
+            ],
+            "reason": "controlled GPO can deliver a computer-side SYSTEM action; prove execution before chaining; BloodHound scope includes host(s): srv02",
+            "target": "gpo=srv02-policy;domain=range.local"
+          },
+          {
+            "effects": [
+              "endpoint-protection-adjusted:ca01@range.local"
+            ],
+            "name": "endpoint-protection-adjustment",
+            "operational_cost": {
+              "execution_scope": "direct",
+              "expected_wait_seconds": 0,
+              "interaction_class": "direct",
+              "requires_propagation_wait": false,
+              "wait_reasons": []
+            },
+            "preconditions": [
+              "remote-exec:ca01@range.local",
+              "local-admin:ca01@range.local",
+              "live-callback:2"
+            ],
+            "reason": "prior endpoint-control blocker observed on this host; verify and adjust before retrying killed tooling",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "effects": [
+              "adcs-ca-private-key:ca01@range.local",
+              "adcs-ca:ca01@range.local"
+            ],
+            "name": "adcs-ca-private-key-export",
+            "operational_cost": {
+              "execution_scope": "direct",
+              "expected_wait_seconds": 0,
+              "interaction_class": "direct",
+              "requires_propagation_wait": false,
+              "wait_reasons": []
+            },
+            "preconditions": [
+              "remote-exec:ca01@range.local",
+              "local-admin:ca01@range.local",
+              "live-callback:2"
+            ],
+            "reason": "verified remote execution/local-admin access can export CA signing material; prove artifact before chaining",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          }
+        ],
+        "budgets": {
+          "max_cycles": 60,
+          "token_budget": 3000000,
+          "wall_clock_budget_s": 2700
+        },
+        "candidate_hash": "sha256:65991eab37832630",
+        "normalized_state": {
+          "achieved_effects": [
+            "admin:ca01",
+            "graph-built:range.local|baseline",
+            "host-exec:ca01",
+            "local-admin:ca01@range.local",
+            "managed-local-admin-secret:ca01@range.local",
+            "remote-exec:ca01@range.local",
+            "system-or-admin:ca01"
+          ],
+          "footholds": [
+            {
+              "agent": "apollo",
+              "alive": true,
+              "callback_id": "2",
+              "forest": "range.local",
+              "host": "WS01",
+              "identity": "user1",
+              "integrity": "medium"
+            }
+          ],
+          "graph_facts": [
+            "can-read-managed-local-admin-secret:account=user1;account_domain=range.local;target=ca01;target_domain=range.local",
+            "domain-collected:range.local",
+            "generic-write:gpo:srv02-policy",
+            "gpo-affects-computer:srv02-policy:srv02:range.local",
+            "gpo-domain:srv02-policy:range.local",
+            "gpo-guid:srv02-policy:fe5e4d0b-216c-41f2-8659-f34960b338d9"
+          ],
+          "recent_outcomes": [
+            {
+              "capability": "collect-graph",
+              "effect": "graph-built:range.local|baseline",
+              "status": "achieved",
+              "target": "range.local|baseline"
+            },
+            {
+              "capability": "capability:read-managed-local-admin-secret",
+              "effect": "managed-local-admin-secret:ca01@range.local",
+              "status": "achieved",
+              "target": "account=user1;account_domain=range.local;target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:use-managed-local-admin-secret",
+              "effect": "local-admin:ca01@range.local",
+              "status": "achieved",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:execute-as-local-admin",
+              "effect": "remote-exec:ca01@range.local",
+              "status": "achieved",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:adcs-ca-private-key-export",
+              "effect": "adcs-ca-private-key:ca01@range.local",
+              "status": "blocked",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            }
+          ]
+        },
+        "objective": "From the current foothold, achieve administrative control of range.local.",
+        "prior_decisions": [
+          {
+            "capability": "collect-graph",
+            "decision_id": "decision-8d4e33335cf74761b8addb0f76512402",
+            "disposition": "select",
+            "target": "range.local|baseline"
+          },
+          {
+            "capability": "read-managed-local-admin-secret",
+            "decision_id": "decision-67c3920dca4c4233aa76f382d509b23f",
+            "disposition": "select",
+            "target": "account=user1;account_domain=range.local;target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "use-managed-local-admin-secret",
+            "decision_id": "decision-cafa9f5a040641a6b454ea5997b7d269",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "execute-as-local-admin",
+            "decision_id": "decision-8c33228fd1f84e018ccd4ad2e903484e",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "adcs-ca-private-key-export",
+            "decision_id": "decision-15c9fce928b54ebdb9cf6ebd2fd3a6f2",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          }
+        ],
+        "schema_version": 1,
+        "selection_contract": "admissible_frontier"
+      },
+      "decision_packet_hash": "sha256:728062a682bf0825b4bd2cf52f6491376dbd1069650d37f55ab555b0a410a7f0",
+      "decisive_frontier_hash": "sha256:65991eab37832630",
+      "expected_candidate_count": 3,
+      "expected_policy_order": [
+        [
+          "hybrid",
+          "llm"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "id": "ca-export-replanning",
+      "metric": {
+        "direction": "lower_is_better",
+        "kind": "transactions_from_frontier"
+      },
+      "packet_source": {
+        "decision_packet_hash": "sha256:728062a682bf0825b4bd2cf52f6491376dbd1069650d37f55ab555b0a410a7f0",
+        "policy_mode": "hybrid",
+        "relative_path": "purpose_range_ca_export_replanning_packet_canary_v2_20260713.jsonl",
+        "sha256": "sha256:13b5d34d0b1a9a0cf7b9a36cac17bf9f77c6c375afde538fefec1136d982bcb1"
+      },
+      "policy_replays": {
+        "hybrid": {
+          "metric_mean": 3.0,
+          "metric_values": [
+            3.0,
+            3.0,
+            3.0
+          ],
+          "selected_capability": "endpoint-protection-adjustment",
+          "selected_target": "target=ca01;target_domain=range.local;callback=2"
+        },
+        "llm": {
+          "metric_mean": 3.0,
+          "metric_values": [
+            3.0,
+            3.0,
+            3.0
+          ],
+          "selected_capability": "endpoint-protection-adjustment",
+          "selected_target": "target=ca01;target_domain=range.local;callback=2"
+        },
+        "symbolic": {
+          "metric_mean": 4.0,
+          "metric_values": [
+            4.0,
+            4.0,
+            4.0
+          ],
+          "selected_capability": "gpo-controlled-system-exec",
+          "selected_target": "gpo=srv02-policy;domain=range.local"
+        }
+      },
+      "scenario": "purpose-range-ca-export-replanning",
+      "tie_tolerance": 0.0
+    },
+    {
+      "branch_outcome_scope": {
+        "can_score_unseen_candidates": false,
+        "frontier_coverage": [
+          {
+            "frontier_index": 0,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "symbolic"
+            ],
+            "selected_capability": "gpo-controlled-system-exec",
+            "selected_target": "gpo=srv02-policy;domain=range.local"
+          },
+          {
+            "frontier_index": 1,
+            "live_observed": true,
+            "observed_by_policy_modes": [
+              "hybrid",
+              "llm"
+            ],
+            "selected_capability": "gpo-controlled-system-exec",
+            "selected_target": "gpo=tier0-policy;domain=range.local"
+          }
+        ],
+        "frontier_indices_with_live_observed_outcomes": [
+          0,
+          1
+        ],
+        "frontier_indices_without_live_observed_outcomes": [],
+        "kind": "live_observed_frontier_choices_only"
+      },
+      "decision_packet": {
+        "admissible_frontier": [
+          {
+            "effects": [
+              "system-exec:gpo:srv02-policy@range.local"
+            ],
+            "name": "gpo-controlled-system-exec",
+            "operational_cost": {
+              "execution_scope": "domain-policy",
+              "expected_wait_seconds": 300,
+              "interaction_class": "propagation-bound",
+              "requires_propagation_wait": true,
+              "wait_reasons": [
+                "group-policy-refresh"
+              ]
+            },
+            "preconditions": [
+              "generic-write:gpo:srv02-policy",
+              "gpo-domain:srv02-policy:range.local",
+              "live-foothold:range.local"
+            ],
+            "reason": "controlled GPO can deliver a computer-side SYSTEM action; prove execution before chaining; BloodHound scope includes host(s): srv02",
+            "target": "gpo=srv02-policy;domain=range.local"
+          },
+          {
+            "effects": [
+              "system-exec:gpo:tier0-policy@range.local",
+              "da:range.local"
+            ],
+            "name": "gpo-controlled-system-exec",
+            "operational_cost": {
+              "execution_scope": "domain-policy",
+              "expected_wait_seconds": 300,
+              "interaction_class": "propagation-bound",
+              "requires_propagation_wait": true,
+              "wait_reasons": [
+                "group-policy-refresh"
+              ]
+            },
+            "preconditions": [
+              "generic-write:gpo:tier0-policy",
+              "gpo-domain:tier0-policy:range.local",
+              "live-foothold:range.local"
+            ],
+            "reason": "controlled GPO can deliver a computer-side SYSTEM action; prove execution before chaining; BloodHound scope includes host(s): dc01; BloodHound scope includes DC host(s): dc01",
+            "target": "gpo=tier0-policy;domain=range.local"
+          }
+        ],
+        "budgets": {
+          "max_cycles": 60,
+          "token_budget": 3000000,
+          "wall_clock_budget_s": 2700
+        },
+        "candidate_hash": "sha256:b524358fc4972777",
+        "normalized_state": {
+          "achieved_effects": [
+            "adcs-ca-private-key:ca01@range.local",
+            "adcs-ca:ca01@range.local",
+            "admin:ca01",
+            "graph-built:range.local|baseline",
+            "host-exec:ca01",
+            "local-admin:ca01@range.local",
+            "managed-local-admin-secret:ca01@range.local",
+            "remote-exec:ca01@range.local",
+            "system-or-admin:ca01"
+          ],
+          "footholds": [
+            {
+              "agent": "apollo",
+              "alive": true,
+              "callback_id": "2",
+              "forest": "range.local",
+              "host": "WS01",
+              "identity": "user1",
+              "integrity": "medium"
+            }
+          ],
+          "graph_facts": [
+            "can-read-managed-local-admin-secret:account=user1;account_domain=range.local;target=ca01;target_domain=range.local",
+            "domain-collected:range.local",
+            "generic-write:gpo:srv02-policy",
+            "generic-write:gpo:tier0-policy",
+            "gpo-affects-computer:srv02-policy:srv02:range.local",
+            "gpo-affects-computer:tier0-policy:dc01:range.local",
+            "gpo-affects-dc:tier0-policy:dc01:range.local",
+            "gpo-domain:srv02-policy:range.local",
+            "gpo-domain:tier0-policy:range.local",
+            "gpo-guid:srv02-policy:fe5e4d0b-216c-41f2-8659-f34960b338d9",
+            "gpo-guid:tier0-policy:f2e6af7c-fb3d-4567-9c6e-490a1522cde1"
+          ],
+          "recent_outcomes": [
+            {
+              "capability": "collect-graph",
+              "effect": "graph-built:range.local|baseline",
+              "status": "achieved",
+              "target": "range.local|baseline"
+            },
+            {
+              "capability": "capability:read-managed-local-admin-secret",
+              "effect": "managed-local-admin-secret:ca01@range.local",
+              "status": "achieved",
+              "target": "account=user1;account_domain=range.local;target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:use-managed-local-admin-secret",
+              "effect": "local-admin:ca01@range.local",
+              "status": "achieved",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:execute-as-local-admin",
+              "effect": "remote-exec:ca01@range.local",
+              "status": "achieved",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:adcs-ca-private-key-export",
+              "effect": "adcs-ca-private-key:ca01@range.local",
+              "status": "achieved",
+              "target": "target=ca01;target_domain=range.local;callback=2"
+            },
+            {
+              "capability": "capability:adcs-certificate-auth",
+              "effect": "certificate-auth:administrator@range.local",
+              "status": "blocked",
+              "target": "domain=range.local;account=administrator;ca_host=ca01;callback=2"
+            }
+          ]
+        },
+        "objective": "From the current foothold, achieve administrative control of range.local.",
+        "prior_decisions": [
+          {
+            "capability": "collect-graph",
+            "decision_id": "decision-49d837de1166488d96bc8d26ee28903f",
+            "disposition": "select",
+            "target": "range.local|baseline"
+          },
+          {
+            "capability": "read-managed-local-admin-secret",
+            "decision_id": "decision-ff134f30bafa4869967184365f81bcbc",
+            "disposition": "select",
+            "target": "account=user1;account_domain=range.local;target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "use-managed-local-admin-secret",
+            "decision_id": "decision-03a9665975ef4027a80356b20fdf35bf",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "execute-as-local-admin",
+            "decision_id": "decision-ff21013b469c44449a73e2aa1a0be392",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "adcs-ca-private-key-export",
+            "decision_id": "decision-df728a45439f4f6c8c9337fa812e86b2",
+            "disposition": "select",
+            "target": "target=ca01;target_domain=range.local;callback=2"
+          },
+          {
+            "capability": "adcs-certificate-auth",
+            "decision_id": "decision-63e3d7d8a76a41de80ef9e70c728e12f",
+            "disposition": "select",
+            "target": "domain=range.local;account=administrator;ca_host=ca01;callback=2"
+          }
+        ],
+        "schema_version": 1,
+        "selection_contract": "admissible_frontier"
+      },
+      "decision_packet_hash": "sha256:671944d41d59064063708789559645d22368a8c6282e76b3467ac29401206d16",
+      "decisive_frontier_hash": "sha256:b524358fc4972777",
+      "expected_candidate_count": 2,
+      "expected_policy_order": [
+        [
+          "hybrid",
+          "llm"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "id": "gpo-dc-scope-late-blocker",
+      "metric": {
+        "direction": "lower_is_better",
+        "kind": "transactions_from_frontier"
+      },
+      "packet_source": {
+        "decision_packet_hash": "sha256:671944d41d59064063708789559645d22368a8c6282e76b3467ac29401206d16",
+        "policy_mode": "hybrid",
+        "relative_path": "gpo_dc_scope_late_blocker_packet_canary_20260713.jsonl",
+        "sha256": "sha256:16423c43e9e9d159f3dcaf7cfe4a3785a9d7a2525270d9004a75490726c5b9e9"
+      },
+      "policy_replays": {
+        "hybrid": {
+          "metric_mean": 1.0,
+          "metric_values": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "selected_capability": "gpo-controlled-system-exec",
+          "selected_target": "gpo=tier0-policy;domain=range.local"
+        },
+        "llm": {
+          "metric_mean": 1.0,
+          "metric_values": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "selected_capability": "gpo-controlled-system-exec",
+          "selected_target": "gpo=tier0-policy;domain=range.local"
+        },
+        "symbolic": {
+          "metric_mean": 2.0,
+          "metric_values": [
+            2.0,
+            2.0,
+            2.0
+          ],
+          "selected_capability": "gpo-controlled-system-exec",
+          "selected_target": "gpo=srv02-policy;domain=range.local"
+        }
+      },
+      "scenario": "purpose-range-gpo-dc-scope-late-blocker",
+      "tie_tolerance": 0.0
+    }
+  ],
+  "name": "policy-replay-frontier-corpus-2026-07-13",
+  "outcome_scope": {
+    "can_score_unseen_candidates": false,
+    "kind": "live_observed_frontier_choices_only"
+  },
+  "purpose": "Freeze one packet-backed live decisive frontier for each stable calibration case so offline selector work can replay real policy inputs without claiming unseen-branch simulation.",
+  "schema_version": 1,
+  "source_manifest_hash": "sha256:25983f64a0a5334fa44a651862e37767e9138c2eb6348f0396c08b795e56ce6e"
+}

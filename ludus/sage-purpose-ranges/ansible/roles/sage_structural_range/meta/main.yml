@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: sage_structural_range
+  author: Sage
+  description: Configure generic GPO, DCSync, LAPS, proof-share, and KDC-certificate mechanics for sealed Sage structural ranges.
+  license: GPL-3.0-or-later
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Windows
+      versions:
+        - "2022"
+  galaxy_tags:
+    - windows
+    - active_directory
+    - ludus
+    - benchmark
+    - gpo
+    - dcsync
+    - laps
+    - adcs
+
+dependencies: []

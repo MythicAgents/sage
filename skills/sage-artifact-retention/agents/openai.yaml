@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sage Artifact Retention"
+  short_description: "Preserve durable Sage evidence safely"
+  default_prompt: "Use $sage-artifact-retention to preserve this Sage task’s durable evidence and identify temp-only artifacts."

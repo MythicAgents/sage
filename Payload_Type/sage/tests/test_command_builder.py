@@ -351,5 +351,514 @@ def test_classify_normal_task_output_as_success():
     assert classify_result("whoami", output) == ResultClass.SUCCESS
 
 
+def test_classify_make_token_hash_rejection_as_construction_failure():
+    output = "Credential material is not a plaintext password."
+
+    assert classify_result("make_token", output) == ResultClass.CONSTRUCTION
+
+
+def _sharphound_record(timestamp, level, message):
+    return f"{timestamp}|{level}|{message}"
+
+
+def _sharphound_completion(timestamp="2030-01-02T13:03:25.5534065-04:00", clock="1:03 PM"):
+    return _sharphound_record(
+        timestamp,
+        "INFORMATION",
+        f"SharpHound Enumeration Completed at {clock} on 1/2/2030! Happy Graphing!",
+    )
+
+
+def _sharphound_http_404(timestamp="2030-01-02T13:03:24.2252855-04:00"):
+    return _sharphound_record(
+        timestamp,
+        "ERROR",
+        "HttpRequestException occurred checking NTLM accessibility for URL: "
+        "https://host.invalid/service.svc. Exception: "
+        "Response status code does not indicate success: 404 (Not Found).",
+    )
+
+
+def _apollo_sharphound_params(**extra):
+    return {"Assembly": "SharpHound.exe", "Arguments": "-c All", **extra}
+
+
+def _merlin_sharphound_params(**extra):
+    return {
+        "assembly": "SharpHound.exe",
+        "args": "-c All",
+        "spawnto": "C:\\Windows\\System32\\notepad.exe",
+        **extra,
+    }
+
+
+def _sharphound_opsec_suffix():
+    return (
+        "[SAGE OPSEC] footprint total=6 axes={'disk_artifact': 2, 'new_beacon': 0, "
+        "'new_process': 2, 'flagged_tool': 1, 'lateral_hop': 0, 'network_signature': 0, "
+        "'reversibility': 1}. This action was recorded to the artifact ledger \u2014 clean it up "
+        "at sub-goal completion (list_open_artifacts)."
+    )
+
+
+def test_classify_sharphound_exact_marker_accepts_apollo_and_resolved_merlin():
+    cases = (
+        ("execute_assembly", _apollo_sharphound_params()),
+        ("execute-assembly", _merlin_sharphound_params()),
+    )
+    for command, parameters in cases:
+        assert classify_result(command, _sharphound_completion(), parameters=parameters) == ResultClass.SUCCESS
+
+
+def test_classify_sharphound_information_bodies_are_intentionally_open():
+    output = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T13:03:20.0000000-04:00",
+                "INFORMATION",
+                "Loaded cache with implementation-specific details",
+            ),
+            " 6 name to SID mappings.",
+            " 3 machine sid mappings.",
+            " 8 sid to domain mappings.",
+            " 0 global catalog mappings.",
+            _sharphound_record(
+                "2030-01-02T13:03:21.0000000-04:00",
+                "INFORMATION",
+                "Saving cache with a different implementation-specific format",
+            ),
+            " 1 name to SID mappings.",
+            " 2 machine sid mappings.",
+            " 3 sid to domain mappings.",
+            " 4 global catalog mappings.",
+            _sharphound_record(
+                "2030-01-02T13:03:22.0000000-04:00",
+                "INFORMATION",
+                "An unrecognized future informational message remains task output",
+            ),
+            _sharphound_completion(),
+        )
+    )
+    assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+
+
+def test_classify_sharphound_binding_failures_apply_only_to_marker_output():
+    marker = _sharphound_completion()
+    marker_cases = (
+        ("execute_assembly", {}),
+        ("execute_assembly", {"Assembly": "Seatbelt.exe"}),
+        ("execute_assembly", {"assembly": "SharpHound.exe"}),
+        (
+            "execute_assembly",
+            {"Assembly": "SharpHound.exe", "assembly_file": "SharpHound.exe"},
+        ),
+        (
+            "execute_assembly",
+            {"Assembly": "SharpHound.exe", "Assembly-Name": "SharpHound.exe"},
+        ),
+        ("execute-assembly", {}),
+        ("execute-assembly", {"assembly": "Seatbelt.exe"}),
+        ("execute-assembly", {"filename": "SharpHound.exe"}),
+        (
+            "execute-assembly",
+            {"assembly": "SharpHound.exe", "file": "SharpHound.exe"},
+        ),
+        (
+            "execute-assembly",
+            {"assembly": "SharpHound.exe", "AssemblyFile": "SharpHound.exe"},
+        ),
+    )
+    for command, parameters in marker_cases:
+        assert classify_result(command, marker, parameters=parameters) == ResultClass.TRANSIENT
+
+    unrelated = "SharpHound.exe registration completed successfully."
+    for command, parameters in marker_cases:
+        assert classify_result(command, unrelated, parameters=parameters) == ResultClass.SUCCESS
+
+
+def test_classify_sharphound_selector_keys_use_unicode_canonical_comparison():
+    cases = (
+        (
+            "execute_assembly",
+            _apollo_sharphound_params(),
+            (
+                "Assembly Name",
+                "Assembly.Name",
+                "\uff21\uff53\uff53\uff45\uff4d\uff42\uff4c\uff59",
+                "Assembly\u200bName",
+            ),
+        ),
+        (
+            "execute-assembly",
+            _merlin_sharphound_params(),
+            (
+                "Assembly Name",
+                "Assembly.Name",
+                "\uff41\uff53\uff53\uff45\uff4d\uff42\uff4c\uff59",
+                "assembly\u2060name",
+            ),
+        ),
+    )
+    for command, parameters, conflicting_keys in cases:
+        for conflicting_key in conflicting_keys:
+            conflicting = {**parameters, conflicting_key: "SharpHound.exe"}
+            assert (
+                classify_result(
+                    command,
+                    _sharphound_completion(),
+                    parameters=conflicting,
+                )
+                == ResultClass.TRANSIENT
+            )
+
+
+def test_classify_sharphound_exact_binding_requires_completion_for_structured_output():
+    outputs = (
+        _sharphound_record(
+            "2030-01-02T13:03:24.0000000-04:00",
+            "WARNING",
+            "collector stopped",
+        ),
+        "2030-01-02T13:03:24.0000000-04:00|INFORMATION|status|echo",
+        "2030-01-02T13:03:24.0000000-04:00|WARNING",
+        _sharphound_record(
+            "2030-01-02T13:03:24.0000000-04:00",
+            "INFORMATION",
+            "arbitrary information without completion",
+        ),
+    )
+    for command, parameters in (
+        ("execute_assembly", _apollo_sharphound_params()),
+        ("execute-assembly", _merlin_sharphound_params()),
+    ):
+        for output in outputs:
+            assert classify_result(command, output, parameters=parameters) == ResultClass.TRANSIENT
+        assert classify_result(command, "task 201 completed", parameters=parameters) == ResultClass.SUCCESS
+
+
+def test_classify_sharphound_unrelated_commands_retain_generic_classification():
+    marker = _sharphound_completion()
+    for command in ("inline_assembly", "execute_Assembly", " execute_assembly"):
+        assert classify_result(command, marker, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+
+    assert classify_result("inline_assembly", f"Error issuing command\n{marker}") == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_completion_record_is_raw_and_strict():
+    valid = _sharphound_completion()
+    cases = (
+        f" {valid}",
+        f"{valid} ",
+        valid.replace("|INFORMATION|", "|INFORMATION| "),
+        valid.replace("2030-01-02T13:03:25.5534065-04:00", " 2030-01-02T13:03:25.5534065-04:00"),
+        valid.replace("-04:00", ""),
+        valid.replace("2030-01-02", "2030-13-02"),
+        _sharphound_completion(clock="13:03 PM"),
+        _sharphound_completion(clock="1:04 PM"),
+        valid.replace("|INFORMATION|", "|information|"),
+        f"{valid}|echo",
+    )
+    for output in cases:
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_marker_echo_near_match_and_duplicate_fail():
+    marker_signals = (
+        "echo SharpHound Enumeration Completed",
+        "wrapper printed Happy Graphing!",
+        "sharphound enumeration completed",
+        "sharphound\t enumeration   completed",
+        "happy\tgraphing!",
+        "SharpHound\u200bEnumeration\u2060Completed",
+        "SharpHoundEnumerationCompleted",
+        "SharpHound---Enumeration...Completed",
+        "Happy\u200bGraphing",
+        "HappyGraphing",
+        "Happy---Graphing!!!",
+        "\uff33\uff48\uff41\uff52\uff50\uff28\uff4f\uff55\uff4e\uff44 "
+        "\uff25\uff4e\uff55\uff4d\uff45\uff52\uff41\uff54\uff49\uff4f\uff4e "
+        "\uff23\uff4f\uff4d\uff50\uff4c\uff45\uff54\uff45\uff44",
+    )
+    for signal in marker_signals:
+        assert (
+            classify_result(
+                "execute_assembly",
+                signal,
+                parameters=_apollo_sharphound_params(),
+            )
+            == ResultClass.TRANSIENT
+        )
+        structured = "\n".join(
+            (
+                _sharphound_record(
+                    "2030-01-02T13:03:24.0000000-04:00",
+                    "INFORMATION",
+                    signal,
+                ),
+                _sharphound_completion(),
+            )
+        )
+        assert (
+            classify_result(
+                "execute_assembly",
+                structured,
+                parameters=_apollo_sharphound_params(),
+            )
+            == ResultClass.TRANSIENT
+        )
+
+    cases = (
+        "\n".join(
+            (
+                _sharphound_record(
+                    "2030-01-02T13:03:24.0000000-04:00",
+                    "INFORMATION",
+                    "SharpHound Enumeration Completed soon",
+                ),
+                _sharphound_completion(),
+            )
+        ),
+        "\n".join((_sharphound_completion(), _sharphound_completion())),
+    )
+    for output in cases:
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_unknown_and_malformed_structured_records_fail():
+    for level in ("PANIC", "EMERGENCY", "ALERT", "SEVERE", "EXCEPTION", "ERRORS", "CRITICAL", "FATAL"):
+        output = "\n".join(
+            (
+                _sharphound_record("2030-01-02T13:03:24.0000000-04:00", level, "status"),
+                _sharphound_completion(),
+            )
+        )
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+    malformed = "\n".join(
+        (
+            "2030-01-02T13:03:24.0000000-04:00|INFORMATION|status|echo",
+            _sharphound_completion(),
+        )
+    )
+    assert classify_result("execute_assembly", malformed, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_timestamps_are_nondecreasing_by_absolute_time():
+    valid_across_offsets = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T18:00:00.0000000+01:00",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T17:01:00.0000000Z",
+                clock="5:01 PM",
+            ),
+        )
+    )
+    reversed_across_offsets = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T17:02:00.0000000Z",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T18:01:00.0000000+01:00",
+                clock="6:01 PM",
+            ),
+        )
+    )
+
+    assert (
+        classify_result(
+            "execute_assembly",
+            valid_across_offsets,
+            parameters=_apollo_sharphound_params(),
+        )
+        == ResultClass.SUCCESS
+    )
+    assert (
+        classify_result(
+            "execute_assembly",
+            reversed_across_offsets,
+            parameters=_apollo_sharphound_params(),
+        )
+        == ResultClass.TRANSIENT
+    )
+
+
+def test_classify_sharphound_timestamp_order_preserves_seventh_fractional_digit():
+    increasing = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T13:03:25.5534064-04:00",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T13:03:25.5534065-04:00",
+            ),
+        )
+    )
+    decreasing = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T13:03:25.5534065-04:00",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T13:03:25.5534064-04:00",
+            ),
+        )
+    )
+    offset_equal = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T14:03:25.5534065+01:00",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T13:03:25.5534065Z",
+            ),
+        )
+    )
+    offset_decreasing = "\n".join(
+        (
+            _sharphound_record(
+                "2030-01-02T14:03:25.5534065+01:00",
+                "INFORMATION",
+                "arbitrary information",
+            ),
+            _sharphound_completion(
+                timestamp="2030-01-02T13:03:25.5534064Z",
+            ),
+        )
+    )
+
+    for output in (increasing, offset_equal):
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+    for output in (decreasing, offset_decreasing):
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_timezone_offsets_are_bounded():
+    for offset in ("Z", "+00:00", "-00:00", "+23:59", "-23:59"):
+        output = _sharphound_completion(
+            timestamp=f"2030-01-02T13:03:25.5534065{offset}",
+        )
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+
+    for sign in ("+", "-"):
+        for offset in ("00:60", "00:99", "01:60", "24:00"):
+            output = _sharphound_completion(
+                timestamp=f"2030-01-02T13:03:25.5534065{sign}{offset}",
+            )
+            assert (
+                classify_result(
+                    "execute_assembly",
+                    output,
+                    parameters=_apollo_sharphound_params(),
+                )
+                == ResultClass.TRANSIENT
+            )
+
+
+def test_classify_sharphound_exact_404_is_optional_and_must_precede_completion():
+    for scheme in ("http", "https"):
+        error = _sharphound_http_404().replace("https://", f"{scheme}://")
+        output = "\n".join((error, _sharphound_completion()))
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+
+    cases = (
+        "\n".join((_sharphound_http_404(), _sharphound_http_404(), _sharphound_completion())),
+        "\n".join((_sharphound_completion(), _sharphound_http_404(timestamp="2030-01-02T13:03:26-04:00"))),
+        "\n".join((_sharphound_http_404().replace("404 (Not Found)", "403 (Forbidden)"), _sharphound_completion())),
+        "\n".join((_sharphound_http_404().replace("NTLM accessibility", "NTLM availability"), _sharphound_completion())),
+        "\n".join(
+            (
+                _sharphound_record(
+                    "2030-01-02T13:03:24.0000000-04:00",
+                    "ERROR",
+                    "Unknown collector error",
+                ),
+                _sharphound_completion(),
+            )
+        ),
+    )
+    for output in cases:
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_raw_line_exceptions_are_exact_and_bounded():
+    valid = "\n".join(
+        (
+            "",
+            "Closing writers",
+            " 6 name to SID mappings.",
+            " 3 machine sid mappings.",
+            " 8 sid to domain mappings.",
+            " 0 global catalog mappings.",
+            _sharphound_completion(),
+            "",
+            "",
+            _sharphound_opsec_suffix(),
+        )
+    )
+    assert classify_result("execute_assembly", valid, parameters=_apollo_sharphound_params()) == ResultClass.SUCCESS
+
+    cases = (
+        valid.replace("Closing writers", "Closing writer"),
+        valid.replace(" 6 name to SID mappings.", "6 name to SID mappings."),
+        valid.replace(" 3 machine sid mappings.", " 3 unknown mappings."),
+        f"{valid}\nClosing writers",
+        valid.replace("footprint total=6", "footprint total=7"),
+        f"{valid}\n{_sharphound_opsec_suffix()}",
+    )
+    for output in cases:
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_structured_record_after_completion_fails():
+    output = "\n".join(
+        (
+            _sharphound_completion(),
+            _sharphound_record(
+                "2030-01-02T13:03:26.0000000-04:00",
+                "INFORMATION",
+                "post-completion information",
+            ),
+        )
+    )
+    assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == ResultClass.TRANSIENT
+
+
+def test_classify_sharphound_higher_priority_failure_classes_remain_authoritative():
+    cases = (
+        (
+            "Supplied Arguments {'foo': 'bar'} don't match any parameter group for this command",
+            ResultClass.CONSTRUCTION,
+        ),
+        ("Access is denied.", ResultClass.GENUINE),
+        ("Error issuing command: Failed to create task", ResultClass.TRANSIENT),
+    )
+    for prefix, expected in cases:
+        output = "\n".join((prefix, _sharphound_completion()))
+        assert classify_result("execute_assembly", output, parameters=_apollo_sharphound_params()) == expected
+
+    assert (
+        classify_result(
+            "execute_assembly",
+            _sharphound_completion(),
+            "RuntimeError: wait failed",
+            _apollo_sharphound_params(),
+        )
+        == ResultClass.TRANSIENT
+    )
+
+
 def test_genuine_breaker_decision_stops_without_retry():
     assert breaker_decision(ResultClass.GENUINE, 0) == "stop"

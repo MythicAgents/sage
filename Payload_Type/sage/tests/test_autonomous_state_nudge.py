@@ -70,6 +70,13 @@ class _ReconcilingStubMythicClient(_StubMythicClient):
 
 
 class _GraphMustNotRun:
+    async def aget_state(self, _config):
+        class _Snapshot:
+            interrupts = ()
+            tasks = ()
+
+        return _Snapshot()
+
     async def astream(self, *args, **kwargs):
         raise AssertionError("graph.astream should not run after preflight objective completion")
         yield {}
@@ -360,6 +367,26 @@ def test_objective_completion_report_ignores_opaque_engagement_id(monkeypatch):
     assert m._objective_completion_report() is None
 
 
+def test_credential_objective_completion_report_names_matching_credential_effect():
+    Model = _load_model_class()
+    m = Model.__new__(Model)
+    m._autonomous_solve = True
+    m.mythic_client = _StubMythicClient(
+        objective="Engagement objective: obtain verified credential material for alice@lab.local.",
+        footholds=[_live_apollo_foothold("6")],
+        hops=[
+            _achieved_effect("creds:alice@lab.local", "240", technique="dcsync-account"),
+            _achieved_effect("da:lab.local", "229", technique="adcs-certificate-auth"),
+        ],
+    )
+
+    report = m._objective_completion_report()
+
+    assert "verified credential material is recorded" in report
+    assert "`creds:alice@lab.local`" in report
+    assert "administrative-control proof" not in report
+
+
 def test_objective_completion_preflight_refreshes_empty_foothold_cache(monkeypatch):
     Model = _load_model_class()
     package_mythic_tools = importlib.import_module("ai.langgraph.mythic_tools")
@@ -471,8 +498,26 @@ def test_invoke_preflight_stops_before_graph_astream(monkeypatch):
 
 def test_objective_completion_preflight_does_not_intercept_unrelated_query():
     Model = _load_model_class()
+    from ai.langgraph.request_contract import build_request_contract
+
     m = Model.__new__(Model)
     m._autonomous_solve = False
 
+    m._request_contract = build_request_contract(
+        request_id="conversation",
+        channel_id="channel",
+        operation_id="operation",
+        mode="conversation",
+        autonomous_solve=False,
+    )
     assert m._objective_completion_preflight_allowed("list active callbacks") is False
+
+    m._request_contract = build_request_contract(
+        request_id="autonomous",
+        channel_id="channel",
+        operation_id="operation",
+        mode="auto",
+        autonomous_solve=False,
+    )
     assert m._objective_completion_preflight_allowed("Continue the autonomous objective from the observed engagement state") is True
+    assert m._objective_completion_preflight_allowed("list active callbacks") is True

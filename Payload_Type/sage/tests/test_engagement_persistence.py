@@ -26,6 +26,23 @@ import engagement_state  # noqa: E402
 import mythic_tools  # noqa: E402
 
 
+def _arm_runtime_lineage(mt, task_id="450", callback_id="50", command="test-command"):
+    mt._last_issued_task_display_id = task_id
+    mt._last_issued_callback_id = callback_id
+    mt._last_issued_task_terminal_status = "completed"
+    mt._last_issued_command = command
+
+
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
 def _gpo_hop():
     state = engagement_state.record_hop_result(
         engagement_state.EngagementState(objective="test"),
@@ -100,11 +117,12 @@ def test_cross_run_resume(tmp_path, monkeypatch):
 
     # First run: fresh ledger, record an achieved hop -> write-through to disk.
     mt1 = mythic_tools.MythicTools(agent_task_id="solve-1")
+    _arm_runtime_lineage(mt1)
     assert mt1._engagement_hops == []  # nothing on disk yet
     mt1._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
-    mt1._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(mt1, "whoami\r\nnt authority\\system\r\n")
     ledger = mt1._engagement_ledger_path()
     assert Path(ledger).exists()
     # File holds the hop under the per-engagement key.
@@ -241,10 +259,11 @@ def test_fresh_instance_loads_durable_ledger_unconditionally(tmp_path, monkeypat
     monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "test-eng2")
 
     seed = mythic_tools.MythicTools(agent_task_id="seed")
+    _arm_runtime_lineage(seed)
     seed._pending_engagement_hop = (
         "gpo-abuse", "winterfell.north.sevenkingdoms.local", "2026-06-07T00:00:00Z",
     )
-    seed._record_engagement_success("whoami\r\nnt authority\\system\r\n")
+    _record_success(seed, "whoami\r\nnt authority\\system\r\n")
     assert Path(seed._engagement_ledger_path()).exists()
 
     fresh = mythic_tools.MythicTools(agent_task_id="fresh")
@@ -331,6 +350,44 @@ def test_no_seed_keeps_opaque_fallback(tmp_path, monkeypatch):
 
 
 # --- objective provenance: auto-adopted objectives are replaceable; operator/legacy ones are sticky ---
+
+def test_operator_objective_binding_reads_current_operator_ledger_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
+    mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
+    objective = "collect and ingest the graph, then read available credentials"
+
+    data = el.load("stored-trigger")
+    data["objective"] = objective
+    data["objective_source"] = "operator"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == objective
+
+    # The accessor rereads the current ledger rather than trusting the objective cached at construction.
+    data["objective"] = "a replacement operator objective"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == "a replacement operator objective"
+
+    data["objective_source"] = "autonomous_seed"
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == ""
+
+    data.pop("objective_source")
+    el.save(data, "stored-trigger")
+    assert mt.operator_objective_binding() == ""
+
+    Path(mt._engagement_ledger_path()).write_text("not json", encoding="utf-8")
+    assert mt.operator_objective_binding() == ""
+
+
+def test_operator_objective_binding_requires_resolved_operation_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mythic_tools, "SAGE_ENGAGEMENT_ID", "stored-trigger")
+    mt = mythic_tools.MythicTools(agent_task_id="solve-stored-trigger")
+    mt._engagement_key = None
+
+    assert mt.operator_objective_binding() == ""
+
 
 def test_reused_client_new_autonomous_seed_supersedes_prior_autonomous(tmp_path, monkeypatch):
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
@@ -558,12 +615,13 @@ def test_file_uuid_ingest_infers_source_callback_for_graph_ledger(tmp_path, monk
 
     async def fake_metadata(file_uuid):
         assert file_uuid == "downloaded-file-uuid"
-        return {"task": {"callback": {"display_id": 50}}}
+        return {"task": {"display_id": 772, "command_name": "download", "callback": {"display_id": 50}}}
 
     async def fake_download(*args, **kwargs):
         return content
 
-    async def fake_record_graph(callback_display_id, verified, covered_domains=None, collection_scope_domain=""):
+    async def fake_record_graph(callback_display_id, verified, covered_domains=None, collection_scope_domain="", proof_envelope=None):
+        assert proof_envelope
         recorded.append((callback_display_id, verified, covered_domains, collection_scope_domain))
 
     monkeypatch.setattr(mt, "_get_file_metadata", fake_metadata)

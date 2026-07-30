@@ -1,0 +1,450 @@
+---
+- name: Validate Sage structural range role mode
+  ansible.builtin.assert:
+    that:
+      - sage_structural_range_mode in ["directory", "directory-kdc-cert", "proof-target", "kdc-cert"]
+    fail_msg: "sage_structural_range_mode must be 'directory', 'directory-kdc-cert', 'proof-target', or 'kdc-cert'"
+
+- name: Validate structural runas identity inputs
+  when: sage_structural_range_mode in ["directory", "directory-kdc-cert", "kdc-cert"]
+  ansible.builtin.assert:
+    that:
+      - sage_structural_domain_admin is string
+      - sage_structural_domain_admin == (sage_structural_domain_admin | trim)
+      - (sage_structural_domain_admin | length) > 0
+      - (sage_structural_domain_admin | length) <= 20
+      - (sage_structural_domain_admin.split() | length) == 1
+      - >-
+        (sage_structural_domain_admin
+        | select("in", "\"/\\[]:;|=,+*?<>")
+        | list
+        | length) == 0
+      - '"@" not in sage_structural_domain_admin'
+      - sage_structural_credential_realm_netbios is string
+      - sage_structural_credential_realm_netbios == (sage_structural_credential_realm_netbios | trim)
+      - (sage_structural_credential_realm_netbios | length) > 0
+      - (sage_structural_credential_realm_netbios | length) <= 15
+      - (sage_structural_credential_realm_netbios.split() | length) == 1
+      - '"\\" not in sage_structural_credential_realm_netbios'
+      - '"/" not in sage_structural_credential_realm_netbios'
+      - '"@" not in sage_structural_credential_realm_netbios'
+      - '":" not in sage_structural_credential_realm_netbios'
+      - '"." not in sage_structural_credential_realm_netbios'
+      - sage_structural_credential_realm_fqdn is string
+      - sage_structural_credential_realm_fqdn == (sage_structural_credential_realm_fqdn | trim)
+      - (sage_structural_credential_realm_fqdn | length) > 0
+      - (sage_structural_credential_realm_fqdn.split() | length) == 1
+      - '"." in sage_structural_credential_realm_fqdn'
+      - not sage_structural_credential_realm_fqdn.startswith(".")
+      - not sage_structural_credential_realm_fqdn.endswith(".")
+      - '".." not in sage_structural_credential_realm_fqdn'
+      - '"\\" not in sage_structural_credential_realm_fqdn'
+      - '"/" not in sage_structural_credential_realm_fqdn'
+      - '"@" not in sage_structural_credential_realm_fqdn'
+      - '":" not in sage_structural_credential_realm_fqdn'
+    fail_msg: "Structural runas identity requires one bare account and explicit valid credential-realm NetBIOS and DNS names."
+
+- name: Build canonical structural runas principal
+  when: sage_structural_range_mode in ["directory", "directory-kdc-cert", "kdc-cert"]
+  ansible.builtin.set_fact:
+    sage_structural_runas_principal: '{{ sage_structural_credential_realm_netbios ~ "\\" ~ sage_structural_domain_admin }}'
+
+- name: Probe structural runas identity before mutation
+  when: sage_structural_range_mode in ["directory", "directory-kdc-cert", "kdc-cert"]
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ sage_structural_runas_principal }}"
+    ansible_become_password: "{{ sage_structural_domain_admin_password }}"
+  ansible.windows.win_whoami:
+  register: sage_structural_runas_identity
+  changed_when: false
+
+- name: Require exact structural runas identity
+  when: sage_structural_range_mode in ["directory", "directory-kdc-cert", "kdc-cert"]
+  ansible.builtin.assert:
+    that:
+      - sage_structural_runas_identity is mapping
+      - sage_structural_runas_identity.account is mapping
+      - sage_structural_runas_identity.account.account_name is string
+      - (sage_structural_runas_identity.account.account_name | lower) == (sage_structural_domain_admin | lower)
+      - sage_structural_runas_identity.account.domain_name is string
+      - (sage_structural_runas_identity.account.domain_name | lower) == (sage_structural_credential_realm_netbios | lower)
+      - sage_structural_runas_identity.dns_domain_name is string
+      - (sage_structural_runas_identity.dns_domain_name | lower) == (sage_structural_credential_realm_fqdn | lower)
+      - sage_structural_runas_identity.login_domain is string
+      - (sage_structural_runas_identity.login_domain | lower) == (sage_structural_credential_realm_netbios | lower)
+    fail_msg: "Structural runas token did not exactly match the declared account and credential realm."
+
+- name: Configure directory-side structural mechanics
+  when: sage_structural_range_mode in ["directory", "directory-kdc-cert"]
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ sage_structural_runas_principal }}"
+    ansible_become_password: "{{ sage_structural_domain_admin_password }}"
+  block:
+    - name: Apply generic structural directory mechanics
+      ansible.windows.win_powershell:
+        script: |
+          param(
+              [string]$DomainFqdn,
+              [string]$DomainNetbios,
+              [string]$FootholdUser,
+              [string]$FootholdPassword,
+              [string]$FootholdDescription,
+              [string]$GpoName,
+              [string]$GpoTargetOu,
+              [string]$GpoTargetComputer,
+              [string]$GpoEditor,
+              [bool]$GpoMachineWriteDacl,
+              [string]$DcsyncPrincipal,
+              [string]$PrincipalLookupServer,
+              [string]$PrincipalLookupUser,
+              [string]$PrincipalLookupPassword,
+              [string]$LapsReader,
+              [string]$LapsTargetComputer
+          )
+
+          $ErrorActionPreference = "Stop"
+          Import-Module ActiveDirectory
+          $changed = $false
+          $domain = Get-ADDomain -Identity $DomainFqdn
+          $domainDn = $domain.DistinguishedName
+
+          function Resolve-PrincipalSid {
+              param([string]$Principal)
+              if (-not $Principal) { return $null }
+              try {
+                  return (New-Object System.Security.Principal.NTAccount($Principal)).Translate(
+                      [System.Security.Principal.SecurityIdentifier]
+                  )
+              } catch {
+                  if (-not $PrincipalLookupServer -or -not $PrincipalLookupUser -or -not $PrincipalLookupPassword) {
+                      throw "Could not resolve principal $Principal and no lookup credentials were supplied."
+                  }
+                  $parts = $Principal -split '\\', 2
+                  $name = $parts[-1]
+                  $credential = New-Object System.Management.Automation.PSCredential(
+                      $PrincipalLookupUser,
+                      (ConvertTo-SecureString $PrincipalLookupPassword -AsPlainText -Force)
+                  )
+                  return (Get-ADUser -Identity $name -Server $PrincipalLookupServer -Credential $credential -ErrorAction Stop).SID
+              }
+          }
+
+          function Test-SidMatch {
+              param(
+                  [System.Security.Principal.IdentityReference]$IdentityReference,
+                  [System.Security.Principal.SecurityIdentifier]$Sid
+              )
+              try {
+                  return $IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $Sid.Value
+              } catch {
+                  return $IdentityReference.Value -eq $Sid.Value
+              }
+          }
+
+          if ($FootholdUser) {
+              $existingUser = Get-ADUser -Identity $FootholdUser -ErrorAction SilentlyContinue
+              if (-not $existingUser) {
+                  New-ADUser -Name $FootholdUser -SamAccountName $FootholdUser -Enabled $true `
+                      -AccountPassword (ConvertTo-SecureString $FootholdPassword -AsPlainText -Force) `
+                      -PasswordNeverExpires $true -Description $FootholdDescription
+                  Write-Output "Created foothold user $FootholdUser in $DomainFqdn"
+                  $changed = $true
+              }
+          }
+
+          if ($GpoName) {
+              Install-WindowsFeature -Name GPMC | Out-Null
+              Import-Module GroupPolicy
+              $targetOu = Get-ADOrganizationalUnit -Identity $GpoTargetOu -ErrorAction SilentlyContinue
+              if (-not $targetOu) {
+                  $ouParts = $GpoTargetOu -split ',', 2
+                  $ouName = $ouParts[0] -replace '^OU=', ''
+                  $ouPath = $ouParts[1]
+                  New-ADOrganizationalUnit -Name $ouName -Path $ouPath -ProtectedFromAccidentalDeletion $false
+                  Write-Output "Created OU $GpoTargetOu"
+                  $changed = $true
+              }
+              $computer = Get-ADComputer -Identity $GpoTargetComputer -ErrorAction Stop
+              $expectedComputerDn = "CN=$($computer.Name),$GpoTargetOu"
+              if (-not $computer.DistinguishedName.Equals($expectedComputerDn, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  Move-ADObject -Identity $computer.DistinguishedName -TargetPath $GpoTargetOu
+                  Write-Output "Moved $GpoTargetComputer into $GpoTargetOu"
+                  $changed = $true
+              }
+
+              $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+              if (-not $gpo) {
+                  $gpo = New-GPO -Name $GpoName -Comment "Sage structural benchmark controlled GPO"
+                  Write-Output "Created GPO $GpoName"
+                  $changed = $true
+              }
+              $linked = (Get-GPInheritance -Target $GpoTargetOu).GpoLinks | Where-Object { $_.DisplayName -eq $GpoName }
+              if (-not $linked) {
+                  New-GPLink -Name $GpoName -Target $GpoTargetOu | Out-Null
+                  Write-Output "Linked GPO $GpoName to $GpoTargetOu"
+                  $changed = $true
+              }
+              Set-GPRegistryValue -Name $GpoName `
+                  -Key "HKEY_LOCAL_MACHINE\Software\Policies\Microsoft\Windows NT\CurrentVersion\WinLogon" `
+                  -ValueName SyncForegroundPolicy -Type DWORD -Value 1
+              if ($GpoEditor) {
+                  Set-GPPermissions -Name $GpoName -PermissionLevel GpoEditDeleteModifySecurity `
+                      -TargetName $GpoEditor -TargetType User
+                  Write-Output "Granted GPO edit rights on $GpoName to $GpoEditor"
+                  $changed = $true
+              }
+
+              if ($GpoMachineWriteDacl) {
+                  $machineSid = (Get-ADComputer -Identity $GpoTargetComputer -Properties objectSid).SID
+                  $domainRoot = [ADSI]"LDAP://$domainDn"
+                  $domainAcl = $domainRoot.psbase.ObjectSecurity
+                  $existing = @(
+                      $domainAcl.Access | Where-Object {
+                          (Test-SidMatch -IdentityReference $_.IdentityReference -Sid $machineSid) -and
+                          (($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) -ne 0) -and
+                          $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+                      }
+                  )
+                  if ($existing.Count -eq 0) {
+                      $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                          $machineSid,
+                          [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl,
+                          [System.Security.AccessControl.AccessControlType]::Allow
+                      )
+                      $domainAcl.AddAccessRule($ace)
+                      $domainRoot.psbase.ObjectSecurity = $domainAcl
+                      $domainRoot.psbase.CommitChanges()
+                      Write-Output "Granted domain-root WriteDacl to ${GpoTargetComputer}$"
+                      $changed = $true
+                  }
+              }
+          }
+
+          if ($DcsyncPrincipal) {
+              $principalSid = Resolve-PrincipalSid -Principal $DcsyncPrincipal
+              $domainRoot = [ADSI]"LDAP://$domainDn"
+              $domainAcl = $domainRoot.psbase.ObjectSecurity
+              $replicationGuids = @(
+                  [Guid]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
+                  [Guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+              )
+              foreach ($rightGuid in $replicationGuids) {
+                  $existing = @(
+                      $domainAcl.Access | Where-Object {
+                          (Test-SidMatch -IdentityReference $_.IdentityReference -Sid $principalSid) -and
+                          $_.ObjectType -eq $rightGuid -and
+                          (($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -ne 0) -and
+                          $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+                      }
+                  )
+                  if ($existing.Count -eq 0) {
+                      $ace = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                          $principalSid,
+                          [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                          [System.Security.AccessControl.AccessControlType]::Allow,
+                          $rightGuid
+                      )
+                      $domainAcl.AddAccessRule($ace)
+                      Write-Output "Granted replication right $rightGuid to $DcsyncPrincipal"
+                      $changed = $true
+                  }
+              }
+              if ($changed) {
+                  $domainRoot.psbase.ObjectSecurity = $domainAcl
+                  $domainRoot.psbase.CommitChanges()
+              }
+          }
+
+          if ($LapsReader -and $LapsTargetComputer) {
+              $readerSid = Resolve-PrincipalSid -Principal $LapsReader
+              $schemaPath = (Get-ADRootDSE).SchemaNamingContext
+              $passwordAttribute = Get-ADObject -SearchBase $schemaPath -Filter { lDAPDisplayName -eq 'ms-Mcs-AdmPwd' } -Properties SchemaIDGUID
+              if (-not $passwordAttribute) {
+                  throw 'Legacy LAPS password attribute ms-Mcs-AdmPwd was not found in the domain schema.'
+              }
+              $passwordGuid = [Guid]$passwordAttribute.SchemaIDGUID
+              $computer = Get-ADComputer -Identity $LapsTargetComputer -Properties DistinguishedName
+              $acl = Get-Acl -Path "AD:$($computer.DistinguishedName)"
+              $readExists = @(
+                  $acl.Access | Where-Object {
+                      (Test-SidMatch -IdentityReference $_.IdentityReference -Sid $readerSid) -and
+                      $_.ActiveDirectoryRights.ToString().Contains('ReadProperty') -and
+                      $_.ObjectType -eq $passwordGuid
+                  }
+              )
+              if ($readExists.Count -eq 0) {
+                  $readRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                      $readerSid,
+                      [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty,
+                      [System.Security.AccessControl.AccessControlType]::Allow,
+                      $passwordGuid,
+                      [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+                  )
+                  $acl.AddAccessRule($readRule)
+                  $changed = $true
+              }
+              $graphExists = @(
+                  $acl.Access | Where-Object {
+                      (Test-SidMatch -IdentityReference $_.IdentityReference -Sid $readerSid) -and
+                      (($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -ne 0) -and
+                      $_.ObjectType -eq $passwordGuid
+                  }
+              )
+              if ($graphExists.Count -eq 0) {
+                  $graphRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                      $readerSid,
+                      [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
+                      [System.Security.AccessControl.AccessControlType]::Allow,
+                      $passwordGuid,
+                      [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+                  )
+                  $acl.AddAccessRule($graphRule)
+                  $changed = $true
+              }
+              Set-Acl -Path "AD:$($computer.DistinguishedName)" -AclObject $acl
+              Write-Output "Ensured object-scoped LAPS read edge for $LapsReader on $LapsTargetComputer"
+          }
+
+          if ($changed) {
+              try { repadmin.exe /syncall /AdeP | Out-Null } catch {}
+          }
+          $Ansible.Changed = $changed
+        parameters:
+          DomainFqdn: "{{ sage_structural_domain_fqdn }}"
+          DomainNetbios: "{{ sage_structural_domain_netbios }}"
+          FootholdUser: "{{ sage_structural_foothold_user }}"
+          FootholdPassword: "{{ sage_structural_foothold_password }}"
+          FootholdDescription: "{{ sage_structural_foothold_description }}"
+          GpoName: "{{ sage_structural_gpo_name }}"
+          GpoTargetOu: "{{ sage_structural_gpo_target_ou }}"
+          GpoTargetComputer: "{{ sage_structural_gpo_target_computer }}"
+          GpoEditor: "{{ sage_structural_gpo_editor }}"
+          GpoMachineWriteDacl: "{{ sage_structural_gpo_machine_write_dacl }}"
+          DcsyncPrincipal: "{{ sage_structural_dcsync_principal }}"
+          PrincipalLookupServer: "{{ sage_structural_principal_lookup_server }}"
+          PrincipalLookupUser: "{{ sage_structural_principal_lookup_user }}"
+          PrincipalLookupPassword: "{{ sage_structural_principal_lookup_password }}"
+          LapsReader: "{{ sage_structural_laps_reader }}"
+          LapsTargetComputer: "{{ sage_structural_laps_target_computer }}"
+
+- name: Configure remote GPO proof target
+  when: sage_structural_range_mode == "proof-target"
+  block:
+    - name: Configure proof share and fast Group Policy refresh
+      ansible.windows.win_powershell:
+        script: |
+          param(
+              [string]$DomainNetbios,
+              [string]$ProofPath,
+              [string]$ProofShare,
+              [int]$RefreshMinutes
+          )
+
+          $ErrorActionPreference = "Stop"
+          $changed = $false
+          $policyPath = "HKLM:\Software\Policies\Microsoft\Windows\System"
+          New-Item -Path $policyPath -Force | Out-Null
+          foreach ($setting in @{
+              GroupPolicyRefreshTime = $RefreshMinutes
+              GroupPolicyRefreshTimeOffset = 0
+          }.GetEnumerator()) {
+              $current = Get-ItemProperty -Path $policyPath -Name $setting.Key -ErrorAction SilentlyContinue
+              $currentValue = $null
+              if ($current) { $currentValue = $current.PSObject.Properties[$setting.Key].Value }
+              if ($null -eq $currentValue -or [int]$currentValue -ne [int]$setting.Value) {
+                  New-ItemProperty -Path $policyPath -Name $setting.Key -PropertyType DWord -Value $setting.Value -Force | Out-Null
+                  $changed = $true
+              }
+          }
+          if (-not (Test-Path -LiteralPath $ProofPath)) {
+              New-Item -ItemType Directory -Path $ProofPath -Force | Out-Null
+              $changed = $true
+          }
+          $domainUsers = "$DomainNetbios\Domain Users"
+          $proofAcl = Get-Acl -LiteralPath $ProofPath
+          $beforeSddl = $proofAcl.Sddl
+          $proofAcl.SetAccessRuleProtection($true, $false)
+          foreach ($rule in @($proofAcl.Access)) { $proofAcl.RemoveAccessRuleAll($rule) | Out-Null }
+          $inheritance = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+          $propagation = [System.Security.AccessControl.PropagationFlags]::None
+          $allow = [System.Security.AccessControl.AccessControlType]::Allow
+          foreach ($rule in @(
+              New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", $inheritance, $propagation, $allow)
+              New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", $inheritance, $propagation, $allow)
+              New-Object System.Security.AccessControl.FileSystemAccessRule($domainUsers, "ReadAndExecute", $inheritance, $propagation, $allow)
+          )) { $proofAcl.AddAccessRule($rule) | Out-Null }
+          if ($proofAcl.Sddl -ne $beforeSddl) {
+              Set-Acl -LiteralPath $ProofPath -AclObject $proofAcl
+              $changed = $true
+          }
+          $existingShare = Get-SmbShare -Name $ProofShare -ErrorAction SilentlyContinue
+          if ($existingShare -and -not $existingShare.Path.Equals($ProofPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+              Remove-SmbShare -Name $ProofShare -Force
+              $existingShare = $null
+              $changed = $true
+          }
+          if (-not $existingShare) {
+              New-SmbShare -Name $ProofShare -Path $ProofPath -FullAccess "BUILTIN\Administrators", "NT AUTHORITY\SYSTEM" -ReadAccess $domainUsers | Out-Null
+              $changed = $true
+          } else {
+              Grant-SmbShareAccess -Name $ProofShare -AccountName $domainUsers -AccessRight Read -Force | Out-Null
+          }
+          $Ansible.Changed = $changed
+        parameters:
+          DomainNetbios: "{{ sage_structural_domain_netbios }}"
+          ProofPath: "{{ sage_structural_proof_path }}"
+          ProofShare: "{{ sage_structural_proof_share }}"
+          RefreshMinutes: "{{ sage_structural_group_policy_refresh_minutes }}"
+
+- name: Configure DC KDC certificate after ADCS deployment
+  when: sage_structural_range_mode in ["kdc-cert", "directory-kdc-cert"]
+  vars:
+    ansible_become: true
+    ansible_become_method: runas
+    ansible_become_user: "{{ sage_structural_runas_principal }}"
+    ansible_become_password: "{{ sage_structural_domain_admin_password }}"
+  block:
+    - name: Ensure enterprise CA trust and KDC authentication certificate
+      ansible.windows.win_powershell:
+        script: |
+          param([string]$CaHostFqdn)
+          $ErrorActionPreference = "Stop"
+          Import-Module ActiveDirectory
+          $configurationNc = (Get-ADRootDSE).configurationNamingContext
+          $enrollmentBase = "CN=Enrollment Services,CN=Public Key Services,CN=Services,$configurationNc"
+          $ca = Get-ADObject -SearchBase $enrollmentBase -LDAPFilter "(objectClass=pKIEnrollmentService)" `
+              -Properties cACertificate, dNSHostName |
+              Where-Object { $_.dNSHostName -eq $CaHostFqdn } |
+              Select-Object -First 1
+          if (-not $ca -or -not $ca.cACertificate) {
+              throw "Enrollment service certificate was not found for $CaHostFqdn"
+          }
+          $caBytes = @($ca.cACertificate)[0]
+          $caCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$caBytes)
+          $rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
+          $rootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+          try {
+              if (@($rootStore.Certificates | Where-Object { $_.Thumbprint -eq $caCert.Thumbprint }).Count -eq 0) {
+                  $rootStore.Add($caCert)
+              }
+          } finally {
+              $rootStore.Close()
+          }
+          gpupdate.exe /target:computer /force | Out-Null
+          certutil.exe -pulse | Out-Null
+          $kdcAuthOid = "1.3.6.1.5.2.3.5"
+          $kdcCert = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+              $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date) -and
+              @($_.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId }) -contains $kdcAuthOid
+          } | Select-Object -First 1
+          if (-not $kdcCert) {
+              $output = & certreq.exe -enroll -machine -q KerberosAuthentication 2>&1
+              if ($LASTEXITCODE -ne 0) { throw "KerberosAuthentication enrollment failed: $($output -join ' ')" }
+          }
+          $Ansible.Changed = $true
+        parameters:
+          CaHostFqdn: "{{ sage_structural_ca_host_fqdn }}"

@@ -16,15 +16,16 @@ only when the relevant callback/lab state exists.
 4. Run focused unit tests and then:
 
 ```bash
-.venv/bin/python -m pytest Payload_Type/sage/tests -q
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
 ```
+
+One tier, no exclusions — a green run means the tree is green. The four rejected successor-portfolio suites this
+once excluded now live append-only under `.sage_history/evaluation/architecture-policy/`. A trailing `supported`
+argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 
 ## Bundled Scripts
 
 - `build_capability_smoke.py`
-- `cmd_smoke.py`
-- `diag_argfmt_merlin.py`
-- `gpo_linkage_check.py`
 - `run_focused_account_context.py`
 - `run_focused_adcs_ca_export.py`
 - `run_focused_adcs_certificate_auth.py`
@@ -36,4 +37,4 @@ only when the relevant callback/lab state exists.
 - `run_focused_parent_dcsync.py`
 - `run_focused_sid_history.py`
 - `run_focused_ticket_context_proof.py`
-- `test_validator.py`
+- `run_offline_suite.py`

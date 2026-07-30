@@ -1,6 +1,6 @@
 """Tests for ROADMAP Phase 3 — externalized agent system prompts (prompt_loader).
 
-The migration moved 5 LangGraph agent system prompts out of model.py inline
+The migration moved LangGraph agent system prompts out of model.py inline
 f-strings into editable markdown files under Payload_Type/sage/prompts/, loaded
 at agent-build time by ai/langgraph/prompt_loader.py.
 
@@ -23,7 +23,7 @@ The core guarantee these tests pin:
 model.py is deliberately NOT imported (it pulls the mythic_container runtime);
 prompt_loader is tested directly with tiny mock tool objects.
 
-Run: cd /home/john/dev/sage && .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_externalization.py -q
+Run from the repository root: .venv/bin/python -m pytest Payload_Type/sage/tests/test_prompt_externalization.py -q
 """
 import logging
 import sys
@@ -51,17 +51,19 @@ FIXTURES = {
     "bloodhound": {
         "servers_text": "\n**Currently Connected MCP Servers:** 1\n- bloodhound: 13 tools (graph_analysis, cypher_query)\n"
     },
+    "sandbox": {},
     "supervisor": {},
 }
 
 # Expected frontmatter `name` and `tools` length per agent.
 EXPECTED_META = {
     "generalist": ("Generalist", 0),
-    "mythic_operator": ("Mythic_Operator", 23),
-    "mythic_payload": ("Mythic_Payload", 10),
+    "mythic_operator": ("Mythic_Operator", 25),
+    "mythic_payload": ("Mythic_Payload", 13),
     "mcp_manager": ("MCP_Manager", 1),
     "bloodhound": ("BloodHound", 4),
-    "supervisor": ("Supervisor", 7),
+    "sandbox": ("Sandbox", 2),
+    "supervisor": ("Supervisor", 8),
 }
 
 # A distinctive, post-substitution substring per agent. Its presence proves the
@@ -73,6 +75,7 @@ DISTINCTIVE_RENDERED = {
     "mythic_payload": "- apollo\n        - merlin",
     "mcp_manager": "**Currently Connected MCP Servers:** 1",
     "bloodhound": "You are the **BloodHound Agent**",
+    "sandbox": "You are the **Sandbox Agent**",
     "supervisor": "You are a Supervisor Agent",
 }
 
@@ -212,7 +215,7 @@ def test_missing_key_placeholder_falls_back_to_raw_body(tmp_path, monkeypatch, c
 # ---------------------------------------------------------------------------
 def test_filter_keeps_frontmatter_set_drops_others_and_preserves_order():
     fm_tools = prompt_loader.get_prompt_tools("mythic_operator")
-    assert len(fm_tools) == 23
+    assert len(fm_tools) == 25
 
     # Build candidates: every frontmatter tool, reordered, plus one interloper not in
     # frontmatter ("rogue_tool"). Reversing proves order follows CANDIDATES, not frontmatter.
@@ -227,7 +230,7 @@ def test_filter_keeps_frontmatter_set_drops_others_and_preserves_order():
     assert "rogue_tool_not_in_frontmatter" not in kept_names
     # Kept exactly the frontmatter set (as a set).
     assert set(kept_names) == set(fm_tools)
-    assert len(kept_names) == 23
+    assert len(kept_names) == 25
     # Order is the CANDIDATE order (reversed frontmatter, with rogue removed) — not
     # the frontmatter order.
     assert kept_names == list(reversed(fm_tools))

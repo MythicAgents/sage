@@ -1,0 +1,17 @@
+manifest_version: 1
+id: sage-structural-b-phase17r1
+name: "Sage Structural Family B Phase 17R1 Source Candidate"
+description: "Versioned Phase 17R1 runas source-repair candidate for the four-realm partner-forest LAPS/CA and nested-child DCSync benchmark."
+version: 0.3.0
+config: range-config.yml
+
+tags:
+  - active-directory
+  - benchmark
+  - structural
+  - laps
+  - dcsync
+  - adcs
+  - sage
+
+min_ludus_version: "2.0.0"

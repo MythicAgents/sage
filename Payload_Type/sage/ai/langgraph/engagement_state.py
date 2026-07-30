@@ -34,6 +34,7 @@ class Hop:
     satisfied_effects: list[str]
     source: str
     timestamp: str
+    proof_envelope: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -42,6 +43,7 @@ class GraphFact:
     source: str
     timestamp: str
     ttl_seconds: int
+    proof_envelope: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -54,12 +56,16 @@ class EngagementState:
     # credential store was read). Lets the gate distinguish "durable hop's artifact is genuinely GONE
     # (probed, absent → re-run legit)" from "no probe available → trust the ledger, do NOT re-run".
     probed_effect_prefixes: set[str] = field(default_factory=set)
+    engagement_id: str = ""
+    runtime_scope: bool = False
 
     def achieved_effects(self) -> set[str]:
         """Return normalized effects from achieved hops."""
         effects: set[str] = set()
         for hop in self.hops:
             if _text(getattr(hop, "status", "")).casefold() != "achieved":
+                continue
+            if self.runtime_scope and not _hop_has_admissible_runtime_proof(hop, self.engagement_id):
                 continue
             for effect in getattr(hop, "satisfied_effects", []):
                 normalized = _normalize_predicate(effect)
@@ -79,6 +85,60 @@ class EngagementState:
     def satisfies_predicate(self, predicate: str) -> bool:
         """Return whether a predicate is satisfied by the current state."""
         return _normalize_predicate(predicate) in self.satisfied_predicates()
+
+
+def _hop_has_admissible_runtime_proof(hop: "Hop", engagement_id: str) -> bool:
+    try:
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+        proof = getattr(hop, "proof_envelope", {}) or {}
+        if not proof and isinstance(getattr(hop, "evidence", None), dict):
+            proof = getattr(hop, "evidence", {}).get("proof_envelope") or {}
+        admission = proof_boundary.admit_runtime_envelope(
+            proof_boundary.ProofEnvelope.from_dict(proof),
+            current_engagement_id=engagement_id,
+        )
+        return admission.admitted
+    except Exception:
+        return False
+
+
+def _graph_fact_has_admissible_runtime_proof(graph_fact: "GraphFact", engagement_id: str) -> bool:
+    try:
+        try:
+            from . import proof_boundary
+        except ImportError:
+            import proof_boundary
+        predicate = _normalize_predicate(getattr(graph_fact, "predicate", ""))
+        admission = proof_boundary.admit_runtime_envelope(
+            proof_boundary.ProofEnvelope.from_dict(getattr(graph_fact, "proof_envelope", {}) or {}),
+            current_engagement_id=engagement_id,
+        )
+        if not admission.admitted or admission.envelope is None:
+            return False
+        if admission.envelope.origin == proof_boundary.ORIGIN_BLOODHOUND_INGEST:
+            return True
+        if admission.envelope.origin == proof_boundary.ORIGIN_MYTHIC_CREDENTIAL:
+            return predicate.startswith(("creds:", "krbtgt-hash:"))
+        return False
+    except Exception:
+        return False
+
+
+def _is_admitted_achieved_hop(state: "EngagementState", hop: "Hop") -> bool:
+    if _text(getattr(hop, "status", "")).casefold() != "achieved":
+        return False
+    if not getattr(state, "runtime_scope", False):
+        return True
+    return _hop_has_admissible_runtime_proof(hop, getattr(state, "engagement_id", ""))
+
+
+def _is_admitted_graph_fact(state: "EngagementState", graph_fact: "GraphFact") -> bool:
+    if not getattr(state, "runtime_scope", False):
+        return True
+    return _graph_fact_has_admissible_runtime_proof(graph_fact, getattr(state, "engagement_id", ""))
 
 
 def access_context_key(state: "EngagementState", foothold: "Foothold") -> str:
@@ -146,7 +206,7 @@ def graph_collection_covers_scope(
         expected_domain = _normalize_key(scope_domain) or _normalize_key(getattr(foothold, "forest", ""))
         matched_verified_hop = False
         for hop in getattr(state, "hops", []) or []:
-            if _text(getattr(hop, "status", "")).casefold() != "achieved":
+            if not _is_admitted_achieved_hop(state, hop):
                 continue
             effects = {
                 _normalize_predicate(effect)
@@ -172,6 +232,7 @@ def graph_collection_covers_scope(
                 _text(getattr(fact, "predicate", ""))[len("domain-collected:"):],
             )
             for fact in getattr(state, "graph_facts", []) or []
+            if _is_admitted_graph_fact(state, fact)
             if _text(getattr(fact, "predicate", "")).casefold().startswith("domain-collected:")
         )
     except Exception:
@@ -194,7 +255,7 @@ def graph_domain_has_verified_collection(state: "EngagementState", domain: str) 
         if not expected_domain:
             return False
         for hop in getattr(state, "hops", []) or []:
-            if _text(getattr(hop, "status", "")).casefold() != "achieved":
+            if not _is_admitted_achieved_hop(state, hop):
                 continue
             effects = {
                 _normalize_predicate(effect)
@@ -215,6 +276,7 @@ def graph_domain_has_verified_collection(state: "EngagementState", domain: str) 
                 _text(getattr(fact, "predicate", ""))[len("domain-collected:"):],
             )
             for fact in getattr(state, "graph_facts", []) or []
+            if _is_admitted_graph_fact(state, fact)
             if _text(getattr(fact, "predicate", "")).casefold().startswith("domain-collected:")
         )
     except Exception:
@@ -300,6 +362,10 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         callback_id = _normalize_key(getattr(foothold, "callback_id", ""))
         host = _normalize_key(getattr(foothold, "host", ""))
         forest = _normalize_key(getattr(foothold, "forest", ""))
+        identity_account = _identity_account_for_forest(
+            getattr(foothold, "identity", ""),
+            forest,
+        )
         identity_domain = _identity_domain(getattr(foothold, "identity", ""))
         integrity = _normalize_key(getattr(foothold, "integrity", ""))
         if callback_id:
@@ -307,6 +373,8 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         if forest:
             predicates.add(f"live-foothold:{forest}")
             predicates.add(f"authenticated:{forest}")
+            if callback_id and identity_account:
+                predicates.add(f"kerberos-account-context:{identity_account}@{forest}@callback:{callback_id}")
         if identity_domain:
             predicates.add(f"authenticated:{identity_domain}")
         if host:
@@ -317,6 +385,11 @@ def foothold_predicates(state: "EngagementState") -> set[str]:
         if host and integrity == "system":
             predicates.add(f"system:{host}")
     for graph_fact in getattr(state, "graph_facts", []) or []:
+        if getattr(state, "runtime_scope", False) and not _graph_fact_has_admissible_runtime_proof(
+            graph_fact,
+            getattr(state, "engagement_id", ""),
+        ):
+            continue
         predicate = _normalize_predicate(getattr(graph_fact, "predicate", ""))
         if predicate:
             predicates.add(predicate)
@@ -660,10 +733,12 @@ TECHNIQUE_MODEL: dict[str, dict] = {
 }
 
 _ADMIN_INTEGRITY = {"admin", "administrator", "elevated", "high", "system"}
-_HOP_STATUSES = {"achieved", "failed", "blocked", "pending"}
+_HOP_STATUSES = {"achieved", "failed", "blocked", "pending", "legacy_unverified"}
 
 
 _OBJECTIVE_DOMAIN_RE = r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}"
+_OBJECTIVE_ACCOUNT_RE = r"[a-z0-9._-]+"
+_OBJECTIVE_HOST_RE = r"[a-z0-9][a-z0-9_.-]*"
 
 
 def _objective_target_domains(objective) -> set:
@@ -680,6 +755,119 @@ def _objective_target_domains(objective) -> set:
     for m in re.finditer(r"(" + _OBJECTIVE_DOMAIN_RE + r")\s+forest", o):
         targets.add(m.group(1).strip(" .'\""))
     return targets
+
+
+def _objective_credential_targets(objective: Any) -> set[tuple[str, str]]:
+    """Return explicit account@domain credential-material targets from objective prose."""
+    text = str(objective or "").casefold()
+    if not re.search(r"\b(?:credential|credentials|creds|dcsync)\b", text):
+        return set()
+    targets: set[tuple[str, str]] = set()
+    for match in re.finditer(
+        r"\b(" + _OBJECTIVE_ACCOUNT_RE + r")@(" + _OBJECTIVE_DOMAIN_RE + r")\b",
+        text,
+    ):
+        account = match.group(1).strip(" .'\"")
+        domain = match.group(2).strip(" .'\"")
+        if account and domain:
+            targets.add((account, domain))
+    return targets
+
+
+def _objective_remote_exec_targets(objective: Any) -> set[tuple[str, str]]:
+    """Return explicit host/domain targets from remote-execution objective prose.
+
+    Remote-exec objectives are intentionally narrower than generic "access" prose. The
+    objective must name remote execution and a host after ``on``/``to``/``against`` or
+    carry an explicit ``remote-exec:host@domain`` predicate. The domain is optional in
+    human prose because the host name alone is enough to distinguish a bounded host
+    proof; when supplied, it is enforced.
+    """
+    text = str(objective or "").casefold()
+    targets: set[tuple[str, str]] = set()
+    for match in re.finditer(
+        r"\bremote-exec:(" + _OBJECTIVE_HOST_RE + r")@(" + _OBJECTIVE_DOMAIN_RE + r")\b",
+        text,
+    ):
+        host = match.group(1).strip(" .'\"")
+        domain = match.group(2).strip(" .'\"")
+        if host and domain:
+            targets.add((_normalize_key(host).split(".", 1)[0], _normalize_key(domain)))
+    if not re.search(r"\bremote[- ]exec(?:ution)?\b", text):
+        return targets
+    for match in re.finditer(
+        r"\bremote[- ]exec(?:ution)?\s+(?:on|to|against)\s+(?:the\s+)?("
+        + _OBJECTIVE_HOST_RE
+        + r")(?:\s+(?:in|at)\s+("
+        + _OBJECTIVE_DOMAIN_RE
+        + r"))?",
+        text,
+    ):
+        token = match.group(1).strip(" .'\"")
+        explicit_domain = (match.group(2) or "").strip(" .'\"")
+        if not token:
+            continue
+        host = token
+        inferred_domain = ""
+        if "." in token:
+            host, inferred_domain = token.split(".", 1)
+        domain = explicit_domain or inferred_domain
+        targets.add((_normalize_key(host), _normalize_key(domain)))
+    return targets
+
+
+def _credential_effect_satisfied(account: str, domain: str, achieved: set[str]) -> bool:
+    account = _normalize_key(account).split("\\")[-1]
+    domain = _normalize_key(domain)
+    for effect in achieved:
+        if not effect.startswith("creds:"):
+            continue
+        material = effect.split(":", 1)[1].strip()
+        principal, sep, effect_domain = material.rpartition("@")
+        if not sep:
+            continue
+        effect_account = _normalize_key(principal).split("\\")[-1]
+        if effect_account == account and _domains_equivalent(effect_domain, domain):
+            return True
+    return False
+
+
+def _remote_exec_effect_satisfied(host: str, domain: str, achieved: set[str]) -> bool:
+    host = _normalize_key(host).split(".", 1)[0]
+    domain = _normalize_key(domain)
+    for effect in achieved:
+        if not effect.startswith("remote-exec:"):
+            continue
+        material = effect.split(":", 1)[1].strip()
+        effect_host, sep, effect_domain = material.partition("@")
+        if not sep:
+            continue
+        effect_host = _normalize_key(effect_host).split(".", 1)[0]
+        if effect_host != host:
+            continue
+        if not domain or _domains_equivalent(effect_domain, domain):
+            return True
+    return False
+
+
+def objective_effects_complete(state: "EngagementState") -> bool:
+    """Whether an explicit effect-backed non-admin objective is satisfied."""
+    objective = getattr(state, "objective", "")
+    credential_targets = _objective_credential_targets(objective)
+    remote_exec_targets = _objective_remote_exec_targets(objective)
+    if not credential_targets and not remote_exec_targets:
+        return False
+    try:
+        achieved = set(state.achieved_effects())
+    except Exception:
+        return False
+    return all(
+        _credential_effect_satisfied(account, domain, achieved)
+        for account, domain in credential_targets
+    ) and all(
+        _remote_exec_effect_satisfied(host, domain, achieved)
+        for host, domain in remote_exec_targets
+    )
 
 
 def _objective_required_effects(objective, domain) -> set[str]:
@@ -721,6 +909,8 @@ def _objective_is_complete(state: "EngagementState", has_next: bool) -> bool:
     'no further grounded hop advances' only for real human-readable objectives. Opaque ledger IDs are not
     objectives, so they must not turn "no modeled next hop" into mission completion. A proven INTERMEDIATE
     domain with a further hop available is a MILESTONE, not completion — so the climb continues."""
+    if objective_effects_complete(state):
+        return True
     candidates = objective_completion_candidates(state)
     if not candidates:
         return False
@@ -770,7 +960,7 @@ def engagement_phase(state: "EngagementState") -> str:
         # further hop available is a MILESTONE — keep climbing (EXPLOITATION) instead of halting on the first
         # domain reached.
         if _objective_is_complete(state, has_next):
-            return "COMPLETE-CANDIDATE — administrative-control proof for the objective's target is recorded; report the proof chain before executing a new action"
+            return "COMPLETE-CANDIDATE — proof for the objective's target is recorded; report the proof chain before executing a new action"
         if has_next:
             return "EXPLOITATION — execute a NEXT GROUNDED ACTION below; collection is COMPLETE"
         if current_access_collection_missing(state):
@@ -871,6 +1061,10 @@ def record_hop_result(
     status: str,
     evidence: dict,
     now: str,
+    *,
+    proof_envelope: dict | None = None,
+    require_admissible_proof: bool = False,
+    engagement_id: str = "",
 ) -> EngagementState:
     """Return state with a hop result appended or updated by technique and target."""
     effect = _technique_effect(technique, target)
@@ -885,6 +1079,9 @@ def record_hop_result(
         now,
         preconditions=preconditions,
         satisfied_effects=[effect],
+        proof_envelope=proof_envelope,
+        require_admissible_proof=require_admissible_proof,
+        engagement_id=engagement_id,
     )
 
 
@@ -898,6 +1095,9 @@ def record_effect_result(
     now: str,
     preconditions: list[str] | None = None,
     satisfied_effects: list[str] | None = None,
+    proof_envelope: dict | None = None,
+    require_admissible_proof: bool = False,
+    engagement_id: str = "",
 ) -> EngagementState:
     """Return state with an explicit effect recorded.
 
@@ -908,6 +1108,8 @@ def record_effect_result(
     normalized_status = _normalize_key(status)
     if normalized_status not in _HOP_STATUSES:
         raise ValueError(f"invalid hop status: {status!r}")
+    require_admissible_proof = bool(require_admissible_proof or getattr(state, "runtime_scope", False))
+    engagement_id = _text(engagement_id or getattr(state, "engagement_id", ""))
 
     normalized_effect = _normalize_predicate(effect)
     normalized_effects = [
@@ -924,18 +1126,52 @@ def record_effect_result(
         for item in (preconditions or [])
         if _normalize_predicate(item)
     ]
-    source = _text(evidence.get("source")) if isinstance(evidence, dict) else ""
+    evidence_dict = dict(evidence) if isinstance(evidence, dict) else {}
+    proof_dict = dict(proof_envelope) if isinstance(proof_envelope, dict) else {}
+    if not proof_dict and isinstance(evidence_dict.get("proof_envelope"), dict):
+        proof_dict = dict(evidence_dict["proof_envelope"])
+    admission = None
+    if proof_dict or (require_admissible_proof and normalized_status == "achieved"):
+        try:
+            try:
+                from . import proof_boundary
+            except ImportError:
+                import proof_boundary
+            attached, admission = proof_boundary.attach_proof(
+                evidence_dict,
+                proof_boundary.ProofEnvelope.from_dict(proof_dict),
+                current_engagement_id=engagement_id,
+                expected_callback_id=evidence_dict.get("callback_id") or evidence_dict.get("callback_display_id") or "",
+                expected_transaction_id=evidence_dict.get("transaction_id") or "",
+                expected_task_id=evidence_dict.get("mythic_task_id") or evidence_dict.get("task_id") or "",
+                expected_terminal_status=evidence_dict.get("terminal_task_status") or evidence_dict.get("terminal_status") or "",
+                expected_verifier_id=evidence_dict.get("verifier_id") or "",
+                expected_verifier_input_sha256=evidence_dict.get("verifier_input_sha256") or "",
+                expected_verifier_result_sha256=evidence_dict.get("verifier_result_sha256") or "",
+                expected_artifact_id=evidence_dict.get("artifact_id") or "",
+                expected_authorization=evidence_dict,
+            )
+            evidence_dict = attached
+            proof_dict = dict(attached.get("proof_envelope") or {})
+        except Exception:
+            evidence_dict["proof_persistence_state"] = "legacy_unverified"
+            evidence_dict["proof_admission_reason"] = "proof admission failed closed"
+    if require_admissible_proof and normalized_status == "achieved":
+        if admission is None or not admission.admitted:
+            normalized_status = "legacy_unverified"
+    source = _text(evidence_dict.get("source")) if isinstance(evidence_dict, dict) else ""
     hop = Hop(
         id=_hop_id(technique, target),
         technique=technique,
         target=target,
         effect=normalized_effect,
         status=normalized_status,
-        evidence=dict(evidence) if isinstance(evidence, dict) else {},
+        evidence=evidence_dict,
         preconditions=normalized_preconditions,
         satisfied_effects=normalized_effects,
         source=source or "record_effect_result",
         timestamp=now,
+        proof_envelope=proof_dict,
     )
 
     updated = False
@@ -954,6 +1190,8 @@ def record_effect_result(
         hops=hops,
         graph_facts=list(state.graph_facts),
         probed_effect_prefixes=set(getattr(state, "probed_effect_prefixes", set()) or set()),
+        engagement_id=getattr(state, "engagement_id", ""),
+        runtime_scope=bool(getattr(state, "runtime_scope", False)),
     )
 
 
@@ -988,7 +1226,7 @@ def _effect_hop(state: EngagementState, effect: str) -> "Hop | None":
     Like _effect_evidence but returns the hop so the caller can read provenance."""
     normalized_effect = _normalize_predicate(effect)
     for hop in state.hops:
-        if _text(getattr(hop, "status", "")).casefold() != "achieved":
+        if not _is_admitted_achieved_hop(state, hop):
             continue
         effects = {_normalize_predicate(item) for item in getattr(hop, "satisfied_effects", [])}
         if normalized_effect in effects:
@@ -1048,7 +1286,7 @@ def filter_hops_by_ttl(hops: Any, now: str, ttl_hours: float) -> tuple[list, int
 def _effect_evidence(state: EngagementState, effect: str) -> dict | None:
     normalized_effect = _normalize_predicate(effect)
     for hop in state.hops:
-        if _text(getattr(hop, "status", "")).casefold() != "achieved":
+        if not _is_admitted_achieved_hop(state, hop):
             continue
         effects = {
             _normalize_predicate(item)
@@ -1322,6 +1560,7 @@ def _replace_hop_id(hop: Hop, hop_id: str) -> Hop:
         satisfied_effects=hop.satisfied_effects,
         source=hop.source,
         timestamp=hop.timestamp,
+        proof_envelope=dict(getattr(hop, "proof_envelope", {}) or {}),
     )
 
 
@@ -1336,6 +1575,35 @@ def _identity_domain(identity: Any) -> str:
     if "@" in text:
         return _normalize_key(text.split("@", 1)[1])
     return ""
+
+
+def _identity_account(identity: Any) -> str:
+    text = _text(identity).strip()
+    normalized = _normalize_key(text)
+    if not normalized or normalized in {"sage", "system", "nt authority\\system"}:
+        return ""
+    if "\\" in text:
+        return _normalize_key(text.rsplit("\\", 1)[1])
+    if "@" in text:
+        return _normalize_key(text.split("@", 1)[0])
+    return normalized
+
+
+def _identity_account_for_forest(identity: Any, forest: Any) -> str:
+    """Return the current account only when its explicit domain agrees with the foothold forest.
+
+    Mythic sometimes reports a bare username for the initial callback identity; in that case the callback's
+    canonicalized forest is the only available domain witness. When Mythic does provide DOMAIN\\user or
+    user@domain, do not reinterpret a cross-domain identity as a same-forest Kerberos account context.
+    """
+    account = _identity_account(identity)
+    forest_domain = _normalize_key(forest)
+    if not account or not forest_domain:
+        return ""
+    identity_domain = _identity_domain(identity)
+    if identity_domain and not _domains_equivalent(identity_domain, forest_domain):
+        return ""
+    return account
 
 
 def _probe_all_true(probe_result: dict, keys: list[str]) -> bool:
@@ -1410,7 +1678,7 @@ def render_engagement_state(state: EngagementState) -> str:
             target = _render_value(getattr(hop, "target", "")) or "(unknown target)"
             effect = _render_value(getattr(hop, "effect", "")) or "(no effect recorded)"
             sort_key = (_normalize_key(technique), _normalize_key(target), _normalize_key(effect))
-            if status == "achieved":
+            if status == "achieved" and _is_admitted_achieved_hop(state, hop):
                 # Mark a durable (loaded-from-disk) belief that no live signal corroborates, so the
                 # operator treats it as a hint to re-check rather than ground truth after a redeploy.
                 suffix = ""
@@ -1426,7 +1694,7 @@ def render_engagement_state(state: EngagementState) -> str:
                 if _pending_hop_superseded(state, hop):
                     continue
                 pending_hops.append((sort_key, f"- pending: {technique} → {target}: {effect}"))
-            elif status in {"failed", "blocked"}:
+            elif status in {"failed", "blocked", "legacy_unverified"}:
                 blocked_hops.append((sort_key, f"- {status}: {technique} → {target}: {effect}"))
 
         if live_footholds:
@@ -1529,6 +1797,7 @@ def hops_from_dicts(items: Any) -> list["Hop"]:
                 satisfied_effects=list(d.get("satisfied_effects") or []),
                 source=_text(d.get("source")),
                 timestamp=_text(d.get("timestamp")),
+                proof_envelope=dict(d["proof_envelope"]) if isinstance(d.get("proof_envelope"), dict) else {},
             ))
         except Exception:
             continue
@@ -1563,6 +1832,7 @@ def graph_facts_from_dicts(items: Any) -> list["GraphFact"]:
                 source=_text(d.get("source")),
                 timestamp=_text(d.get("timestamp")),
                 ttl_seconds=int(d.get("ttl_seconds") or 0),
+                proof_envelope=dict(d["proof_envelope"]) if isinstance(d.get("proof_envelope"), dict) else {},
             ))
         except Exception:
             continue

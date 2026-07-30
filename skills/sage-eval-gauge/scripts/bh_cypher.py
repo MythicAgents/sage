@@ -2,15 +2,19 @@
 """Read-only BloodHound Cypher query via the MCP's own signed base client.
 
 Run through the MCP env (so it targets the exact instance the MCP/Sage reach):
-  uv --directory /home/john/dev/bloodhound_mcp run python \
-      /home/john/dev/sage/skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher query>'
+  uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python \
+      skills/sage-eval-gauge/scripts/bh_cypher.py '<cypher query>'
 
 Prints one JSON line: {"status": <code|null>, "node_count": N}. READ-ONLY; never writes.
 Grounded in bh_reset.py's client + CypherClient.run_query (POST /api/v2/graphs/cypher)."""
 import json
 import sys
 
-sys.path.insert(0, "/home/john/dev/bloodhound_mcp")
+# BloodHound MCP location: env var, else the sibling checkout beside this repo.
+import os
+from pathlib import Path
+sys.path.insert(0, os.environ.get("SAGE_BLOODHOUND_MCP_DIR")
+                or str(Path(__file__).resolve().parents[4] / "bloodhound_mcp"))
 from lib.bloodhound_api import BloodhoundBaseClient  # noqa: E402
 
 query = sys.argv[1] if len(sys.argv) > 1 else "MATCH (d:Domain) RETURN d"

@@ -11,6 +11,7 @@ own playbook with an engagement.
 | `mythic_payload.md` | Mythic_Payload | Builds/configures Mythic payloads. |
 | `mcp_manager.md` | MCP_Manager | External MCP tools (incl. BloodHound graph analysis). |
 | `generalist.md` | Generalist | General Q&A with no Mythic/TTP/tool access. |
+| `sandbox.md` | Sandbox | Local-only isolated shell/Python snippets for scratch computation. |
 
 ## How to edit a prompt
 
@@ -65,6 +66,7 @@ The body is rendered with Python's `str.format()`. That means:
 | `mythic_payload.md` | `{installed_payloads_text}`, `{installed_c2_profiles_text}` |
 | `mcp_manager.md` | `{servers_text}` — connected MCP servers + tool preview |
 | `generalist.md` | *(none)* |
+| `sandbox.md` | *(none)* |
 
 > Each file's own `variables:` frontmatter is the authoritative list for that file.
 

@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "name": "policy-replay-calibration-2026-07-13",
+  "purpose": "Freeze the current live policy evidence package and prove that offline recorded-decision replay preserves the known live ordering without inventing a winner between tied learned policies.",
+  "artifacts": [
+    {
+      "id": "purpose-range-discriminator-matrix",
+      "relative_path": "purpose_range_discriminator_v6_matrix_20260712.jsonl",
+      "sha256": "2c1d5ef85205564e4cd184e903abc102e2785ecd2f191c9bc5baf20e19642ab6",
+      "role": "diagnostic_only"
+    },
+    {
+      "id": "replication-purpose-range-matrix",
+      "relative_path": "replication_purpose_range_matrix_20260713.jsonl",
+      "sha256": "bb1e7c870767cc899e4ed7e45d9d9697d9562c9a65ecfb65187d40c6e9ebd631",
+      "role": "pairwise_calibration"
+    },
+    {
+      "id": "ca-export-replanning-repeat-matrix",
+      "relative_path": "purpose_range_ca_export_replanning_repeat_20260713.jsonl",
+      "sha256": "07a0eb51cc9e3da4b72608ec0520738d53b29ad309c43b43fa64ff96b815ff7c",
+      "role": "pairwise_calibration"
+    },
+    {
+      "id": "gpo-dc-scope-late-blocker-matrix",
+      "relative_path": "gpo_dc_scope_late_blocker_matrix_20260713.jsonl",
+      "sha256": "b7f5f0e56c6c8e3ed272bbb37d252f3c430b64d1f9799bd35bf37f4db98700d8",
+      "role": "pairwise_calibration"
+    }
+  ],
+  "cases": [
+    {
+      "id": "replication-visible-cost",
+      "artifact_id": "replication-purpose-range-matrix",
+      "scenario": "replication-purpose-range-visible-cost",
+      "decisive_frontier_hash": "sha256:3cab326b0fda99cd",
+      "expected_candidate_count": 2,
+      "expected_rows_per_policy": 3,
+      "choice_fields": [
+        "selected_capability"
+      ],
+      "metric": {
+        "kind": "semantic_transaction_count",
+        "direction": "lower_is_better"
+      },
+      "expected_policy_order": [
+        [
+          "llm",
+          "hybrid"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "tie_tolerance": 0.0
+    },
+    {
+      "id": "ca-export-replanning",
+      "artifact_id": "ca-export-replanning-repeat-matrix",
+      "scenario": "purpose-range-ca-export-replanning",
+      "decisive_frontier_hash": "sha256:65991eab37832630",
+      "expected_candidate_count": 3,
+      "expected_rows_per_policy": 3,
+      "choice_fields": [
+        "selected_capability"
+      ],
+      "metric": {
+        "kind": "transactions_from_frontier",
+        "direction": "lower_is_better"
+      },
+      "expected_policy_order": [
+        [
+          "llm",
+          "hybrid"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "tie_tolerance": 0.0
+    },
+    {
+      "id": "gpo-dc-scope-late-blocker",
+      "artifact_id": "gpo-dc-scope-late-blocker-matrix",
+      "scenario": "purpose-range-gpo-dc-scope-late-blocker",
+      "decisive_frontier_hash": "sha256:b524358fc4972777",
+      "expected_candidate_count": 2,
+      "expected_rows_per_policy": 3,
+      "choice_fields": [
+        "selected_capability",
+        "selected_target"
+      ],
+      "metric": {
+        "kind": "transactions_from_frontier",
+        "direction": "lower_is_better"
+      },
+      "expected_policy_order": [
+        [
+          "llm",
+          "hybrid"
+        ],
+        [
+          "symbolic"
+        ]
+      ],
+      "tie_tolerance": 0.0
+    }
+  ],
+  "excluded_surfaces": [
+    {
+      "id": "purpose-range-visible-cost",
+      "reason": "The final matrix is retained as diagnostic evidence, but semantic transaction count and wall-clock cost disagree on the LAPS versus GPO branch. It is not a clean pairwise calibration surface."
+    },
+    {
+      "id": "purpose-range-recovery",
+      "reason": "The blocker is encountered only by policies that select the GPO lane first, so this surface measures blocker avoidance rather than shared-frontier replanning quality."
+    },
+    {
+      "id": "direct-laps-objective",
+      "reason": "This is a linear sanity path whose pure-llm outcome changed after fairness repairs; it is useful for regression diagnosis but not a stable policy-order calibration surface."
+    }
+  ]
+}

@@ -28,9 +28,14 @@ SAGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = SAGE_ROOT / "evals" / "cases.yaml"
 DEFAULT_RESULTS = SAGE_ROOT / "evals" / "results"
 DEFAULT_DB = SAGE_ROOT / ".phoenix" / "phoenix.db"
-MYTHIC_ENV_PATH = Path("/home/john/dev/mythic/.env")
+# Empty when unset: no checkout-name guess. resolve_password fails closed naming the variable.
+MYTHIC_ENV_PATH = Path(os.environ.get("MYTHIC_ENV_PATH") or "")
 MYTHIC_SERVER = "127.0.0.1"
 MYTHIC_USER = "mythic_admin"
+NATIVE_CHAT_SCRIPTS = REPO_ROOT / "skills" / "sage-live-runner" / "scripts"
+if str(NATIVE_CHAT_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CHAT_SCRIPTS))
+from native_chat import run_native_chat_turn  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -61,7 +66,7 @@ def load_cases(path: str | Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("cases file must contain a mapping")
 
-    for key in ("sage_cb", "apollo_cb", "default_timeout", "forbid", "cases"):
+    for key in ("apollo_cb", "default_timeout", "forbid", "cases"):
         if key not in data:
             raise ValueError(f"cases file missing required key: {key}")
     if not isinstance(data["forbid"], list) or not data["forbid"]:
@@ -103,7 +108,7 @@ def resolve_password(env_path: str | Path = MYTHIC_ENV_PATH) -> str:
         return env_value
 
     path = Path(env_path)
-    if path.exists():
+    if path.is_file():
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
@@ -113,7 +118,7 @@ def resolve_password(env_path: str | Path = MYTHIC_ENV_PATH) -> str:
                 return value.strip().strip("'\"")
 
     raise RuntimeError(
-        "MYTHIC_ADMIN_PASSWORD is not set and no MYTHIC_ADMIN_PASSWORD entry was found in /home/john/dev/mythic/.env"
+        f"MYTHIC_ADMIN_PASSWORD is not set and no entry was found in {path}"
     )
 
 
@@ -123,6 +128,37 @@ async def login_to_mythic(password: str) -> Any:
     from mythic import mythic
 
     return await mythic.login(server_ip=MYTHIC_SERVER, username=MYTHIC_USER, password=password)
+
+
+_phoenix_ready = False
+
+
+def ensure_phoenix_instrumentation(db_path: str | Path) -> None:
+    """Instrument LangChain → Phoenix in THIS process so an in-process (headless) solve emits the traces
+    the scorer reads from ``db_path`` — ``main.py`` does exactly this for the container, but a headless
+    eval runs the Model here, not there. Idempotent; points ``PHOENIX_WORKING_DIR`` at ``db_path``'s parent
+    so the traces land where ``phoenix_reader`` reads them.
+
+    NOTE [DEFERRED-VERIFY]: the working-dir ↔ phoenix.db ↔ OTLP-collector alignment can't be checked
+    offline — it MUST be confirmed on the first headless eval run (if traces don't land, every case reads
+    empty and scores 0). This is the one piece of the evals headless path that needs a live look.
+    """
+    global _phoenix_ready
+    if _phoenix_ready:
+        return
+    os.environ.setdefault("PHOENIX_WORKING_DIR", str(Path(db_path).resolve().parent))
+    os.environ.setdefault("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "131072")
+    import phoenix as px
+    from phoenix.otel import register
+    from openinference.instrumentation.langchain import LangChainInstrumentor
+
+    try:
+        px.launch_app(use_temp_dir=False)  # standalone collector+db when no container is running
+    except Exception as exc:  # a container's app may already own the port — instrumentation still works
+        print(f"[headless-eval] phoenix launch_app skipped ({exc}); relying on an existing collector", flush=True)
+    tracer_provider = register(project_name="Sage", auto_instrument=False, batch=False)
+    LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+    _phoenix_ready = True
 
 
 async def issue_chat_task(client: Any, prompt: str, sage_cb: int) -> Any:
@@ -293,7 +329,7 @@ async def run_case(
     *,
     seed: int = 0,
     db_path: str | Path,
-    sage_cb: int,
+    sage_cb: int | None = None,
     timeout_seconds: int,
     poll_interval_seconds: float,
     forbid: Sequence[str],
@@ -326,6 +362,8 @@ async def run_case(
         "tool_outputs_snippet": "",
         "trace_ids": [],
         "spans": [],
+        "chat_channel_id": None,
+        "chat_request_id": None,
     }
 
     try:
@@ -336,19 +374,58 @@ async def run_case(
                 return base
 
         pre_rowid = phoenix_reader.max_trace_rowid(db_path)
-        task = await issue_chat_task(client, case["prompt"], sage_cb)
-        display_id = _extract_task_display_id(task)
-        try:
-            await wait_for_task_complete(client, display_id, timeout_seconds, poll_interval_seconds)
-        except TimeoutError as exc:
-            base["status"] = "incomplete"
-            base["errors"] = [f"incomplete: {exc}"]
+        if os.environ.get("SAGE_EVAL_HEADLESS"):
+            # Option A (Phase-4 migration): run the solve IN-PROCESS via the chat Model instead of tasking
+            # the PayloadType `query`. The scorer reads Phoenix traces, so instrument THIS process first
+            # (see the [DEFERRED-VERIFY] note on ensure_phoenix_instrumentation). Ledger key from
+            # SAGE_ENGAGEMENT_ID or the eval operation name.
+            ensure_phoenix_instrumentation(db_path)
+            from ai.hillclimb.headless_solver import run_headless_solve
+
+            _eng = os.environ.get("SAGE_ENGAGEMENT_ID") or "Operation_Chimera_1"
+            status = await run_headless_solve(
+                case["prompt"], client=client, operation_id=0, engagement_id=_eng,
+                timeout=timeout_seconds,
+            )
+            if str(status).startswith("timeout"):
+                base["status"] = "incomplete"
+                base["errors"] = [f"incomplete: {status}"]
+                base["wall_seconds"] = round(time.monotonic() - start, 3)
+                return base
+        elif os.environ.get("SAGE_EVAL_LEGACY_PAYLOAD") or sage_cb is not None:
+            if sage_cb is None:
+                raise RuntimeError("SAGE_EVAL_LEGACY_PAYLOAD requires a Sage callback ID")
+            task = await issue_chat_task(client, case["prompt"], sage_cb)
+            display_id = _extract_task_display_id(task)
             try:
-                await wait_for_task_complete(client, display_id, max(1, timeout_seconds // 2), poll_interval_seconds)
-            except TimeoutError:
-                print(f"WARN case still running after grace wait; display_id={display_id}", flush=True)
-            base["wall_seconds"] = round(time.monotonic() - start, 3)
-            return base
+                await wait_for_task_complete(client, display_id, timeout_seconds, poll_interval_seconds)
+            except TimeoutError as exc:
+                base["status"] = "incomplete"
+                base["errors"] = [f"incomplete: {exc}"]
+                try:
+                    await wait_for_task_complete(client, display_id, max(1, timeout_seconds // 2), poll_interval_seconds)
+                except TimeoutError:
+                    print(f"WARN case still running after grace wait; display_id={display_id}", flush=True)
+                base["wall_seconds"] = round(time.monotonic() - start, 3)
+                return base
+        else:
+            chat_result = await run_native_chat_turn(
+                client,
+                case["prompt"],
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                metadata={"eval_case": case["id"], "seed": seed},
+            )
+            base["chat_channel_id"] = chat_result.get("chat_channel_id")
+            base["chat_request_id"] = chat_result.get("chat_request_id")
+            status = str(chat_result.get("status") or "").casefold()
+            if status not in {"complete", "completed"}:
+                base["status"] = "incomplete"
+                base["errors"] = [
+                    f"incomplete: chat request status={chat_result.get('status')!r} "
+                    f"error={chat_result.get('error')!r}"
+                ]
+                return base
 
         summaries = await wait_for_settled_traces(db_path, pre_rowid, timeout_seconds, poll_interval_seconds)
         trace_rowids = [summary.rowid for summary in summaries]
@@ -412,7 +489,12 @@ async def run_eval(
 
     config = load_cases(cases_path)
     selected = select_cases(config["cases"], only)
-    resolved_sage_cb = int(sage_cb if sage_cb is not None else config["sage_cb"])
+    configured_sage_cb = config.get("sage_cb")
+    resolved_sage_cb = (
+        int(sage_cb if sage_cb is not None else configured_sage_cb)
+        if sage_cb is not None or configured_sage_cb is not None
+        else None
+    )
     resolved_apollo_cb = int(config["apollo_cb"])
     resolved_timeout = int(timeout_seconds if timeout_seconds is not None else config["default_timeout"])
     resolved_db = Path(db_path or os.environ.get("PHOENIX_DB", DEFAULT_DB))
@@ -446,7 +528,7 @@ async def run_eval(
             print(f"{status} {case['id']} seed={seed} score={record['score']} tokens={record['total_tokens']}", flush=True)
         records.append(aggregate_case_runs(case, seed_records))
 
-    report = build_report_v2(started, utc_timestamp(), resolved_sage_cb, seeds, records)
+    report = build_report_v2(started, utc_timestamp(), seeds, records)
     write_reports(report, out_dir)
     return report
 
@@ -508,7 +590,6 @@ def aggregate_case_runs(case: dict[str, Any], seed_records: list[dict[str, Any]]
 def build_report_v2(
     started: str,
     finished: str,
-    sage_cb: int,
     seeds: int,
     cases: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -520,7 +601,7 @@ def build_report_v2(
     return {
         "started": started,
         "finished": finished,
-        "sage_cb": sage_cb,
+        "execution_surface": "mythic-v4-chat",
         "schema_version": 2,
         "seeds": seeds,
         "pass_rate": statistics.mean(scorable_pass_fractions) if scorable_pass_fractions else 0.0,
@@ -582,7 +663,7 @@ def render_markdown_v2(report: dict[str, Any]) -> str:
         "",
         f"- Started: {report['started']}",
         f"- Finished: {report['finished']}",
-        f"- Sage callback: {report['sage_cb']}",
+        f"- Execution surface: {report.get('execution_surface', 'mythic-v4-chat')}",
         f"- Schema version: {report['schema_version']}",
         f"- Seeds: {report['seeds']}",
         f"- Pass rate: {pass_rate_cell}",

@@ -1,0 +1,16 @@
+---
+sage_replication_range_mode: ""
+
+sage_replication_domain_fqdn: "{{ ludus_domain_fqdn | default('replication.local') }}"
+sage_replication_domain_netbios: "{{ ludus_domain_netbios_name | default('REPLICATION') }}"
+sage_replication_domain_admin: "{{ defaults.ad_domain_admin | default('Administrator') }}"
+sage_replication_domain_admin_password: "{{ defaults.ad_domain_admin_password | default('password') }}"
+
+sage_replication_foothold_user: "user1"
+sage_replication_gpo_name: "SRV02-Policy"
+sage_replication_target_ou: "OU=Servers,DC=replication,DC=local"
+sage_replication_target_computer: "SRV02"
+
+sage_replication_proof_path: 'C:\SageProof'
+sage_replication_proof_share: "SageProof"
+sage_replication_group_policy_refresh_minutes: 1

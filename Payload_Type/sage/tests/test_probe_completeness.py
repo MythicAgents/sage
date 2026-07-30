@@ -55,3 +55,12 @@ def test_child_da_does_not_score_graph_collected():
 def test_cross_forest_still_scores_graph_collected():
     xf = next(s for s in scenarios.goad_scenarios() if s.name == "cross-forest-objective")
     assert Milestone.GRAPH_COLLECTED in xf.milestone_subset  # path genuinely needs the graph
+
+
+def test_direct_laps_holdout_scores_only_its_measurable_path():
+    holdout = next(s for s in scenarios.goad_scenarios() if s.name == "direct-laps-objective")
+    assert holdout.milestone_subset == (
+        Milestone.FOOTHOLD,
+        Milestone.GRAPH_COLLECTED,
+        Milestone.OBJECTIVE,
+    )

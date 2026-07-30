@@ -42,6 +42,11 @@ gotchas: |
   WMI event subscriptions for persistence require admin and leave Registry artifacts.
   Remote WMI requires credentials in DOMAIN\user format or explicit domain specification.
   Lateral movement creates a WmiPrvSE.exe child process on the target — high detection signal.
+  A target-side DistributedCOM Event 10036 after a valid elevated network logon means
+  DCOM activation authentication was below packet integrity; it is not by itself a bad-password
+  or WMI namespace ACL signal. Apollo's native explicit-credential `wmiexecute` branch can hit
+  this on hardened targets; use `make_token`, then passwordless `wmiexecute`, prove via readback,
+  and `rev2self`.
 related_ttps: [seatbelt, sharphound, sharpersist]
 alternatives: [impacket-wmiexec, crackmapexec-wmi]
 common_args:
@@ -61,7 +66,7 @@ common_args:
   command:
     description: Command to execute (for exec action)
     typical_values: ["cmd.exe /c whoami"]
-last_updated: 2026-05-29
+last_updated: 2026-07-11
 ---
 
 # SharpWMI
@@ -84,3 +89,33 @@ inline_assembly avoids needing to drop additional tools.
 ## Output
 Command execution output captured to a file on the target (use `> output.txt` and then
 download). WMI event subscription operations report success/failure to stdout.
+
+## DCOM Hardening Triage
+
+When remote WMI returns `0x80070005`, separate authentication from activation:
+
+1. Confirm the target logged a successful elevated Type 3 logon for the intended account.
+2. Check the target System log for DistributedCOM Event 10036 at the same timestamp.
+3. If Event 10036 is present, the client activation request was below
+   `RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`; changing the password or WMI namespace ACL is the wrong fix.
+4. For Apollo native WMI, use a NetOnly token first and omit explicit credential fields from
+   `wmiexecute` so the agent takes its current-token COM activation path.
+
+Apply that same transport choice to WMI-backed follow-on operations such as remote CA export;
+an explicit-credential retry can recreate the same DCOM activation failure.
+
+Always verify a target-side proof artifact and revert the temporary token context after readback.
+
+## Public Source Trail
+
+Microsoft KB5004442 documents the relevant DCOM hardening signal: Event 10036 is emitted when a client
+tries to activate a DCOM server below `RPC_C_AUTHN_LEVEL_PKT_INTEGRITY`. Microsoft also documents that
+`System.Management.ConnectionOptions.Authentication` controls the COM authentication level used for a
+WMI connection.
+
+Apollo's public `wmiexecute.cs` source confirms that it has two materially different remote paths:
+the explicit-credential path uses `System.Management.ManagementScope` plus `ConnectionOptions`, while
+the current-token path uses direct COM activation and applies `CoSetProxyBlanket(..., PKT_PRIVACY, ...)`.
+In this lab the explicit-credential path still produced Event 10036 while the token-backed path succeeded.
+The public sources explain the mechanism and the branch split, but I did not find a public Apollo-specific
+write-up that explains that exact failure pair; keep that part labeled as lab-observed behavior.

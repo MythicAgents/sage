@@ -223,6 +223,7 @@ def test_replay_scores_historical_repair_match(tmp_path):
     result = replay_score(
         [TransitionRecord.from_dict(json.loads(line)) for line in train.read_text().splitlines()],
         [TransitionRecord.from_dict(json.loads(line)) for line in eval_path.read_text().splitlines()],
+        include_diagnostic=True,
     )
 
     assert result.total == 1
