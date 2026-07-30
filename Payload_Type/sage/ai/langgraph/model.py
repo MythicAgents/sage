@@ -7644,7 +7644,6 @@ class Model:
             return ""
 
         approved = _hitl_is_approved(response)
-        decision_word = "approve" if approved else "deny"
         tool = str(pending.get("tool") or "unknown")
         display_name = str(pending.get("display_name") or tool)
         args = pending.get("args") if isinstance(pending.get("args"), dict) else {}
@@ -7653,7 +7652,6 @@ class Model:
             "display_name": str(pending.get("display_name") or ""),
             "args": args,
         }], expected_action_digest)
-        self._write_hitl_audit(tool, args, decision_word)
 
         objective = str(pending.get("objective") or getattr(self, "_controller_hitl_objective", "") or "")
         key = str(pending.get("key") or "")
@@ -10590,10 +10588,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                         or approval_action_fingerprint(ar) in selected_ids
                     )
                 )
-                action_decision = "approve" if action_approved else (
-                    "steer" if steer else "deny"
-                )
-                self._write_hitl_audit(tool_name, tool_args, action_decision)
                 if action_approved:
                     decisions.append({"type": "approve"})
                 else:
@@ -10682,27 +10676,6 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         except Exception:
             pass
         return True
-
-    def _write_hitl_audit(self, tool: str, args: dict, decision: str) -> None:
-        """Append one JSON line to MEMORY/audit.jsonl recording an approve/deny decision. Best-effort:
-        a failure to write the audit log must never crash the resume path."""
-        try:
-            from pathlib import Path
-            from datetime import datetime, timezone
-            audit_dir = Path("MEMORY")
-            audit_dir.mkdir(parents=True, exist_ok=True)
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "operator": getattr(self, "operator", None) or "unknown",
-                "tool": tool,
-                "args": args,
-                "decision": "approve" if decision == "approve" else "deny",
-                "mode": "supervised",
-            }
-            with (audit_dir / "audit.jsonl").open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-        except Exception as e:
-            logger.warning(f"HITL: failed to write audit line ({e})")
 
     async def _surface_hitl_interrupt(self, event: dict) -> bool:
         """If an astream event carries a HumanInTheLoopMiddleware approval interrupt, stream a clear

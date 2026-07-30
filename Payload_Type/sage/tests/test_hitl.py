@@ -321,7 +321,6 @@ def test_hitl_resume_rejects_malformed_checkpoint_before_command_resume():
 
     model = _bare_model("supervised")
     model.graph = _Graph()
-    model._write_hitl_audit = lambda *_args: None
 
     with pytest.raises(RuntimeError, match="exact guarded request is unavailable and the session must be replaced"):
         _run(model.handle_hitl_resume("approve", "thread-1", expected_action_digest="attacker"))
@@ -485,10 +484,7 @@ def test_controller_hitl_approve_resumes_exact_pending_move():
     m = _controller_hitl_model()
     pending = _capability_pending(m)
     m._controller_hitl_pending = pending
-    audit = []
     seen = {}
-
-    m._write_hitl_audit = lambda tool, args, decision: audit.append((tool, args, decision))
     m._seed_autonomous_objective = lambda objective: seen.setdefault("seeded", objective)
 
     async def _run_controller(objective):
@@ -499,7 +495,6 @@ def test_controller_hitl_approve_resumes_exact_pending_move():
     m._run_autonomous_controller = _run_controller
 
     assert _run(m.handle_controller_hitl_resume("approve")) == "resumed"
-    assert audit == [("execute_capability", pending["args"], "approve")]
     assert seen["seeded"] == "obtain administrative control of lab.local"
     assert seen["objective"] == "obtain administrative control of lab.local"
     assert seen["approved_key"] == pending["key"]
@@ -529,11 +524,8 @@ def test_controller_hitl_default_deny_executes_nothing_and_halts():
     m = _controller_hitl_model()
     pending = _capability_pending(m)
     m._controller_hitl_pending = pending
-    audit = []
     sent = []
     ran = {"controller": False}
-
-    m._write_hitl_audit = lambda tool, args, decision: audit.append((tool, args, decision))
 
     async def _stream(msg):
         sent.append(msg)
@@ -547,7 +539,6 @@ def test_controller_hitl_default_deny_executes_nothing_and_halts():
     m._run_autonomous_controller = _run_controller
 
     assert _run(m.handle_controller_hitl_resume("maybe")) == ""
-    assert audit == [("execute_capability", pending["args"], "deny")]
     assert ran["controller"] is False
     assert m._controller_hitl_pending is None
     assert m._controller_hitl_approved_key == ""

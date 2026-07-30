@@ -355,7 +355,6 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
     m._controller_hitl_approved_key = ""
     m._controller_hitl_approved_pending = None
     m._controller_hitl_objective = ""
-    m._write_hitl_audit = lambda *_args, **_kwargs: None
 
     class FakeLLM:
         async def ainvoke(self, _messages):
@@ -468,7 +467,6 @@ def test_supervised_controller_deny_is_sage_owned_not_controller_prefixed():
         return True
 
     m._stream_message_to_mythic = _stream
-    m._write_hitl_audit = lambda *_args, **_kwargs: None
 
     assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
     assert calls == []

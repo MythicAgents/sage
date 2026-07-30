@@ -4909,7 +4909,6 @@ def test_plain_hitl_rejection_preserves_turn_and_blocks_identical_reproposal():
     model._graph_run_config = lambda thread_id: {
         "configurable": {"thread_id": thread_id}
     }
-    model._write_hitl_audit = lambda *_args: None
     model._process_stream_event = lambda _event: asyncio.sleep(0)
 
     class Graph:
@@ -4976,7 +4975,6 @@ def test_hitl_steering_retains_proposal_authority_for_a_different_action():
     model._graph_run_config = lambda thread_id: {
         "configurable": {"thread_id": thread_id}
     }
-    model._write_hitl_audit = lambda *_args: None
 
     class Graph:
         async def aget_state(self, _config):
@@ -5027,7 +5025,6 @@ def test_hitl_multi_action_selection_approves_only_exact_selected_id():
     model._graph_run_config = lambda thread_id: {
         "configurable": {"thread_id": thread_id}
     }
-    model._write_hitl_audit = lambda *_args: None
     model._process_stream_event = lambda _event: asyncio.sleep(0)
 
     class Graph:
