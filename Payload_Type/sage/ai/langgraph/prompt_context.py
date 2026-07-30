@@ -12,7 +12,7 @@ its ``{name}`` in the prompt body, and list it under that file's ``variables:`` 
 
 DEFERRED (Layer 2, post-demo): a pluggable system that auto-discovers operator-supplied provider
 functions from a drop-in location. That is arbitrary code execution inside the Sage container and
-needs a deliberate security model + context contract — see Plans/PROMPT_FORMAT.md and the
+needs a deliberate security model + context contract — see the
 Phase-3 ISA. For now the provider set is fixed and code-reviewed.
 """
 

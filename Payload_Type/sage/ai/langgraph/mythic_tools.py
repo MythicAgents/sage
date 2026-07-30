@@ -17835,7 +17835,7 @@ class MythicTools:
 
         All isolation is applied here at create time: no privileges, all caps dropped,
         no-new-privileges, read-only rootfs, size-capped tmpfs work dir, network disabled,
-        mem/pids caps, non-root user, hard timeout + force-remove. See Plans/SANDBOX_DESIGN.md.
+        mem/pids caps, non-root user, hard timeout + force-remove.
         """
         import docker
         from docker.errors import ImageNotFound

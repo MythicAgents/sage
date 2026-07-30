@@ -19,7 +19,7 @@ placeholders (e.g. ``{commands_text}``) and any LITERAL brace in the prompt text
 doubled (``{{`` / ``}}``) — exactly the same escaping a Python f-string uses, because these
 bodies were lifted verbatim from the original f-strings in model.py.
 
-Design notes (see Plans/PROMPT_FORMAT.md):
+Design notes:
 - Files are read at agent-build time (each ``_*_agent()`` call), so editing a prompt file +
   restarting Sage changes behavior with no code edit (T3.3).
 - ``load_prompt`` renders the template and ``.strip()``s the result — this matches today's

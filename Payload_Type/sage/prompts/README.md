@@ -90,5 +90,5 @@ only Sage's own built-in tools.
   session is created. A conversation already in progress keeps its original prompts until you
   start a fresh chat. (Restarting Sage is only for *code* changes.)
 
-See also `Plans/PROMPT_FORMAT.md` (developer notes) and the loader at
+See also the loader at
 `ai/langgraph/prompt_loader.py`.

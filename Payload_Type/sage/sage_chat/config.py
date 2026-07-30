@@ -112,7 +112,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
 
-    # The overnight local-test env (Plans/OVERNIGHT-RUN.md) supplies provider/model under those
+    # A local-test env may supply provider/model under those
     # exact lowercase keys plus API_ENDPOINT/API_KEY — resolve under the same names the legacy
     # get_secret path used so the local loopback endpoint keeps working with no ChatRequest.
     provider = _resolve(config, secrets, "provider", env_key="provider", default="openai").lower()

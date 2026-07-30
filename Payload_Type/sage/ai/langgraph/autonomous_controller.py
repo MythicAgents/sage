@@ -1,6 +1,6 @@
 """Deterministic execution kernel for policy-selected capability transactions.
 
-THE PROBLEM (Plans/SAGE_AUTONOMOUS_CONTROLLER_DESIGN_2026-06-22.md): autonomous control is diffuse —
+THE PROBLEM: autonomous control is diffuse —
 selection / sequencing / polling / termination are owned by the Supervisor+worker LLMs negotiating in text.
 Locally-correct components form globally-incorrect loops (the `1116` 461K-token redelegation tail; the latest
 canary's poll/ingest/recon wander). The execution substrate is deterministic and guided-proven, and the

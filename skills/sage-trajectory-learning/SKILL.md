@@ -62,4 +62,5 @@ builders, Mythic adapters, and verifiers still perform exact command constructio
 
 ## Reference
 
-Read `Plans/TRAJECTORY_LEARNING_RUNTIME.md` for architecture and acceptance criteria.
+Architecture and acceptance criteria are documented in the module docstrings under
+`Payload_Type/sage/ai/trajectory/`.

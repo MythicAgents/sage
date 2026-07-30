@@ -181,7 +181,7 @@ def test_maintained_operator_helpers_have_no_personal_absolute_paths():
 
 # A path that encodes ONE developer's SOURCE-CHECKOUT location. `~/dev/...` and `$HOME/dev/...` are
 # the same defect as `/home/<user>/dev/...` wearing a portable-looking hat — a sweep for
-# `/home/john` alone passes them, which is exactly how five survived a cleanup pass.
+# `/home/<user>` alone passes them, which is exactly how five survived a cleanup pass.
 #
 # Deliberately NOT "any /home/ path": the repo legitimately contains target-side paths that only
 # look similar. `ttps/` documents victim-host tradecraft (`/home/user/.ssh/id_rsa`), and several
@@ -205,6 +205,10 @@ _LAYOUT_PATH_DEBT = 13
 #   test_hillclimb_operator_replay_benchmark.py — feeds a personal path in to prove redaction strips it
 #   test_repository_boundaries.py               — this file; the pattern is the thing being searched for
 _LAYOUT_PATH_EXEMPT = {
+    # Redaction tests: this file asserts that home-directory paths are scrubbed from operator
+    # replay packets, so it must contain them as fixture input to have anything to scrub. Same
+    # reason as the entry below. The fixtures use a placeholder username, not a real one — an
+    # exemption is a licence to contain the shape, never a licence to leak an identity.
     "Payload_Type/sage/tests/test_hillclimb_operator_replay_benchmark.py",
     # This file. It must name the forbidden shapes in order to search for them, and it moved here
     # from Payload_Type/sage/tests/test_repository_boundaries.py when the hygiene suite was split

@@ -2,7 +2,7 @@
 
 ``Model`` streams at *message* granularity: its single egress ``_stream_message_to_mythic``
 is called once per complete ``AIMessage``/``ToolMessage`` with a pre-formatted blob (see
-fork [F2] in Plans/OVERNIGHT-QUESTIONS.md). This emitter maps each such blob to one visible
+fork [F2]). This emitter maps each such blob to one visible
 Mythic response block with its own ``response_key`` — satisfying the response_key discipline
 (one key per assistant block) without pretending to token-stream. True token streaming is a
 follow-up that adds an ``on_llm_new_token`` hook feeding ``send_delta`` on a stable key.

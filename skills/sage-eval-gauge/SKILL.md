@@ -6,9 +6,9 @@ description: Repo-local Sage eval-gauge / hill-climbing Phase-0 toolkit. Use whe
 # Sage Eval Gauge (hill-climbing Phase 0)
 
 **Package:** `Payload_Type/sage/ai/hillclimb/` — gauge modules, additive offline benchmarks, and a live driver. Hermetic tests across `tests/test_hillclimb_*.py`, `test_gate_live.py`, `test_hermetic.py`, `test_clean_stop_signal.py`, `test_probe_completeness.py`, `test_completion_recognition_phase1.py`, `test_unproductive_loop_guard.py` (full offline suite green).
-**Why (canonical):** `Plans/Archived/SAGE_HILL_CLIMBING_DESIGN.md` +
-`Plans/Archived/SAGE_HILL_CLIMBING_SPEC.md`. **Build spec/ISA:**
-`Plans/Archived/SAGE_EVAL_GAUGE_PHASE0_ISA.md`.
+**Why:** substring-match eval scores are gameable, so the gauge is validated against real range state
+via the Gate Experiment rather than against trace text. The original design and spec documents are
+maintainer-private.
 
 ## What it is
 A measurement instrument: VERIFIED milestones (ground truth) → a vector `ScoreCard` (C2) carrying a Goodhart gap + a `verifier_hash`; a noise floor (C3, `min_detectable_effect`); the **Gate Experiment** (Spearman ρ of eval-vs-ground-truth + the high-eval/low-truth count, with a PASS/FAIL verdict); ledger-independent **probes** (so a non-Sage agent is scoreable); a **bare-model runner**; and a **live driver**.

@@ -6,8 +6,8 @@ unit-tested offline. ``MythicTools`` wraps these with the runtime Mythic-agent
 join and file-store upload (those parts need a live Mythic client).
 
 Schemas:
-  - TTP files          -> Plans/TTP_SCHEMA.md
-  - Mythic-agent files -> Plans/MYTHIC_AGENT_SCHEMA.md
+  - TTP files          -> see the schema documented in this module
+  - Mythic-agent files -> see the schema documented in this module
 
 Progressive disclosure (mirrors Claude Code's SKILL.md pattern):
   - ``get_ttp_guidance``      returns frontmatter + body UP TO "## Full Reference"

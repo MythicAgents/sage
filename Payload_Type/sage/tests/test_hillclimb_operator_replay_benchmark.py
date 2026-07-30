@@ -91,14 +91,14 @@ def test_fixture_rejects_unredacted_secret_like_text():
 
 def test_freeze_redacts_secret_material_and_local_home_paths():
     raw = _minimal_case()
-    raw["packet"]["state_summary"] = "The prior operator wrote password=Hunter2 into /home/john/dev/sage/private.log."
-    raw["source"]["note"] = "Imported from /home/john/dev/sage/Plans/private.out."
+    raw["packet"]["state_summary"] = "The prior operator wrote password=Hunter2 into /home/operator/dev/sage/private.log."
+    raw["source"]["note"] = "Imported from a maintainer-private benchmark export."
 
     frozen = orb.freeze_fixture_document({"cases": [raw]})
     serialized = json.dumps(frozen)
 
     assert "Hunter2" not in serialized
-    assert "/home/john" not in serialized
+    assert "/home/operator" not in serialized
     assert "<password:redacted>" in serialized
     assert "<local-path:redacted>" in serialized
     assert orb.load_cases_from_data(frozen)[0].id == "minimal_case"
@@ -144,7 +144,7 @@ def test_score_response_rejects_extra_schema_keys():
 def test_cases_from_transitions_only_emits_visible_evidence_matches():
     good = TransitionRecord(
         run_id="run-visible",
-        source_files=("/home/john/dev/sage/private/solve.out",),
+        source_files=("/home/operator/dev/sage/private/solve.out",),
         objective="Obtain the target secret material.",
         capability="dcsync-account",
         observations=(

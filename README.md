@@ -1,8 +1,16 @@
 # Sage
 
-Sage is a native Mythic v4 chat capability that gives operators an AI/LangGraph interface to Mythic callbacks,
-payloads, tasks, credentials, files, and BloodHound. Sage runs on the control plane; it is not an implant and does
-not create a Sage payload callback.
+**Sage is a chat container for [Mythic](https://github.com/its-a-feature/Mythic).** It is not a standalone
+tool — it installs into a Mythic server the same way a payload type or C2 profile does, and it has no function
+outside one.
+
+> **Requires Mythic v4.0.0 or later.** Native chat containers do not exist before v4.0.0. As of this writing
+> that release lives on Mythic's [`Mythic-v4.0.0`](https://github.com/its-a-feature/Mythic/tree/Mythic-v4.0.0)
+> branch and has not been merged to the default branch, so you must install Mythic from that branch. Once it
+> merges, a normal Mythic installation will satisfy this requirement and this note becomes obsolete.
+
+Sage gives operators an AI/LangGraph interface to Mythic callbacks, payloads, tasks, credentials, files, and
+BloodHound. It runs on the control plane; it is not an implant and does not create a Sage payload callback.
 
 Sage can answer scoped operator questions or run an explicitly configured autonomous objective. Target-facing
 activity always executes through a live Mythic payload callback. The Sage process may query Mythic and BloodHound
@@ -53,7 +61,8 @@ belong in the product runtime.
 
 ## Requirements
 
-- A working Mythic v4 installation with native chat-container support.
+- **Mythic v4.0.0 or later**, currently the [`Mythic-v4.0.0`](https://github.com/its-a-feature/Mythic/tree/Mythic-v4.0.0)
+  branch. Earlier Mythic versions have no native chat-container support and cannot run Sage at all.
 - Python 3.13 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For BloodHound-backed graph analysis, BloodHound CE plus a compatible BloodHound MCP checkout.
@@ -63,8 +72,12 @@ Create the development environment from the repository root:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r Payload_Type/sage/requirements.txt
+.venv/bin/pip install -r Payload_Type/sage/requirements-dev.txt
 ```
+
+`requirements-dev.txt` pulls in `requirements.txt` and adds the test dependencies, so this one command
+covers both running Sage and running its suite. Install `requirements.txt` alone only when you want the
+runtime without the tests — that is what the container image does.
 
 Do not put credentials in tracked files. Use process environment variables, a local gitignored `.env`, Mythic
 user secrets, or a secret manager.
@@ -290,10 +303,6 @@ python3 skills/sage-architecture-governor/scripts/check_arch_budget.py --changed
 
 Live range execution is a separate verification lifecycle. A successful live solve does not replace offline
 tests, and an evaluation claim requires its own prospective contract and evidence gates.
-
-Project-local Codex specialist profiles are optional development infrastructure. If publishing them, keep their
-configuration, profile files, fallback runner, and routing documentation together as described in
-[Optional Codex Agent Profiles](docs/development/CODEX_AGENT_PROFILES.md).
 
 ## Operator workflows
 

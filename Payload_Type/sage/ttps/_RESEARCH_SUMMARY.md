@@ -3,7 +3,7 @@
 > **Session:** Overnight population pass + quality/BOF expansion + continued depth
 > **Date:** 2026-05-29
 > **Files created:** 230 TTP files + 4 Mythic agent files + this summary
-> **Brief:** `Plans/TTP_RESEARCH_BRIEF.md`
+> **Brief:** maintainer-private research notes; the corpus in this directory is the public record.
 
 ---
 

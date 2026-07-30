@@ -17,7 +17,7 @@ property being asserted. Do not add an import of driver or product code to it.
 
 ## Governing criteria
 
-`Plans/SAGE_ISC49R_NATIVE_CANARY_ATTESTATION_2026-07-26.md`, criteria 49R-07 through 49R-10, 49R-16 through
+the ISC49R native-canary attestation criteria 49R-07 through 49R-10, 49R-16 through
 49R-18, and 49R-21.
 
 ## Credential
@@ -48,7 +48,7 @@ kernel assertions, and 49R-10 forces `FAIL`:
 ```bash
 .venv/bin/python skills/sage-canary-attestation/scripts/attest_canary.py \
   --channel-id 22 --request-id 37 --case-id C01-greeting --since-task-id 10 \
-  --decision-record Payload_Type/sage/.sage_engagement/decision_records/chat_22_request_37.jsonl
+  --decision-record Payload_Type/sage/.sage_engagement/decision_records/chat_<id>_request_<id>.jsonl
 ```
 
 The seal sidecar is derived from the record path (`<name>.seal.json`). The attester **re-implements**
@@ -88,7 +88,7 @@ internet destinations must be refused. Run it from the foothold host during a sc
 ```
 
 As of 2026-07-28 the GOAD range returns `undeclared_reachable` (no egress firewall); closing 49R-20 needs a
-Ludus range egress deny-rule — see `Plans/SAGE_ISC49R_49R20_EGRESS_PROBE_AND_FALSIFICATION_2026-07-28.md`.
+Ludus range egress deny-rule.
 
 ## Verdict rules
 
