@@ -21,10 +21,25 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir uv
 # Clone the BloodHound MCP and pre-sync its deps so first connect needs no network.
-# Pin/override the ref at build time: --build-arg BLOODHOUND_MCP_REF=<branch|tag> (default: main).
-# This is also how to build against a feature branch (e.g. the bytes-upload branch) for testing.
-ARG BLOODHOUND_MCP_REF=main
-RUN git clone --depth 1 --branch ${BLOODHOUND_MCP_REF} https://github.com/mwnickerson/bloodhound_mcp.git /opt/bloodhound_mcp && \
+# Override at build time: --build-arg BLOODHOUND_MCP_REF=<branch|tag> --build-arg BLOODHOUND_MCP_REPO=<url>
+#
+# Neither `main` nor `master` works here, for different reasons:
+#   - `main` (the previous default) does not exist upstream — the default branch is `master`. Every
+#     build failed at this step.
+#   - `master` lacks the byte-upload path. Sage calls `file_upload` with `info_type="upload_bytes"`
+#     (mythic_tools.py) and lists that tool in REQUIRED_BLOODHOUND_TOOLS (bloodhound_config.py), so a
+#     `master` build produces a green image whose BloodHound ingest fails at runtime. The mode exists
+#     only on this branch, and there is no upstream PR proposing it.
+#
+# Cost of tracking this branch: it is 6 commits behind `master` (all 2026-07-22), so the image lacks
+# the CE 9.1 edge-schema alignment, the opt-in TLS verification override, and the unused-FastMCP
+# removal. Fixing that means rebasing onto `master` in a fork and pointing BLOODHOUND_MCP_REPO at it.
+#
+# Branch refs move; this one has not since 2026-06-01. Verified 2026-07-30 to resolve to
+# e84fb3622faab326e5521ef41a504e5d28bbf79a — compare against that if a later build behaves differently.
+ARG BLOODHOUND_MCP_REPO=https://github.com/mwnickerson/bloodhound_mcp.git
+ARG BLOODHOUND_MCP_REF=feature/byte-code-upload
+RUN git clone --depth 1 --branch ${BLOODHOUND_MCP_REF} ${BLOODHOUND_MCP_REPO} /opt/bloodhound_mcp && \
     cd /opt/bloodhound_mcp && uv sync --no-dev
 # Tell Sage where the baked-in BloodHound MCP lives. Native chat connects it in the serving event loop before
 # model initialization; autonomous sessions additionally require exact tool admission. Local development can
