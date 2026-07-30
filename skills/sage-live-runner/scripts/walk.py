@@ -4,7 +4,8 @@ callback (bypassing Sage's LLM), wait, print decoded output. Usage:
   python skills/sage-live-runner/scripts/walk.py <cb> <command> '<json-or-string params>' [wait_iters]
 """
 import asyncio, sys, base64
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic
 from mythic import mythic
 

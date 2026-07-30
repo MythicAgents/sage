@@ -8,7 +8,9 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from mythic import mythic  # noqa: E402
 

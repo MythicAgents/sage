@@ -4,8 +4,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from ai.hillclimb import policy_replay_hillclimb_iteration as iteration
+import pytest  # noqa: E402
 
 
+@pytest.mark.pinned_policy_rows
 def test_hillclimb_iteration_halts_when_claimed_mechanism_needs_unscorable_behavior():
     report = iteration.run_hillclimb_iteration()
 
@@ -31,6 +33,7 @@ def test_hillclimb_iteration_halts_when_claimed_mechanism_needs_unscorable_behav
     assert report["iteration"]["verifier_hash"].startswith("sha256:")
 
 
+@pytest.mark.pinned_policy_rows
 def test_hillclimb_iteration_reverts_when_threshold_is_not_cleared():
     report = iteration.run_hillclimb_iteration(acceptance_threshold=2.0)
 

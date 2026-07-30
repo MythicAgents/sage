@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from ai.hillclimb import policy_replay_unseen_candidate_evaluator as evaluator
+import pytest  # noqa: E402
 
 
+@pytest.mark.pinned_policy_rows
 def test_unseen_candidate_evaluator_marks_unobserved_branches_unscorable():
     report = evaluator.run_unseen_candidate_evaluator()
 
@@ -25,6 +27,7 @@ def test_unseen_candidate_evaluator_marks_unobserved_branches_unscorable():
     assert branch["synthetic_score_is_ground_truth"] is False
 
 
+@pytest.mark.pinned_policy_rows
 def test_unseen_candidate_evaluator_preserves_live_observed_scores():
     report = evaluator.run_unseen_candidate_evaluator()
 

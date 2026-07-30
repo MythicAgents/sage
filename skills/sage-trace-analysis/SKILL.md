@@ -39,7 +39,6 @@ Audit solve steps or task IDs:
 
 ```bash
 .venv/bin/python skills/sage-trace-analysis/scripts/step_audit.py --help
-.venv/bin/python skills/sage-trace-analysis/scripts/backfill_task_ids.py --help
 ```
 
 Use `$sage-trajectory-learning` when the output should become normalized transition records or replay data.
@@ -47,12 +46,5 @@ Use `$sage-trajectory-learning` when the output should become normalized transit
 ## Bundled Scripts
 
 - `trace_audit.py` (parameterized and read-only)
-- `backfill_task_ids.py`
-- `diag_ingest_narration.py`
-- `diag_ingest_run4.py`
-- `drycall_stage.py`
-- `ingest_verify.py`
-- `mcp_timing.py`
 - `mine_failures.py`
-- `probe_filemeta.py`
 - `step_audit.py`

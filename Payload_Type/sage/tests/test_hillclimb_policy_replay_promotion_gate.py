@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from ai.hillclimb import policy_replay_promotion_gate as promotion_gate
+import pytest  # noqa: E402
 
 
+@pytest.mark.pinned_policy_rows
 def test_promotion_gate_relabels_known_synthetic_row_and_blocks_runtime_promotion():
     report = promotion_gate.run_promotion_gate()
 
@@ -27,6 +29,7 @@ def test_promotion_gate_relabels_known_synthetic_row_and_blocks_runtime_promotio
     )
 
 
+@pytest.mark.pinned_policy_rows
 def test_promotion_gate_never_counts_same_family_synthetic_row_as_transfer():
     report = promotion_gate.run_promotion_gate(held_out_surface_id="same-domain-gpo-dc-scope")
 

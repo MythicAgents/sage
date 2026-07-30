@@ -5,12 +5,14 @@ import subprocess
 from pathlib import Path
 
 from ai.hillclimb import phase15_r5_retrospective_falsifiers as phase15
+import pytest  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = ROOT.parents[1] / ".venv" / "bin" / "python"
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase15_rejects_h3_when_predecision_deterministic_controls_reproduce_hybrid():
     report = phase15.build_phase15_report(generated_at="2026-07-16T00:00:00+00:00")
 
@@ -30,6 +32,7 @@ def test_phase15_rejects_h3_when_predecision_deterministic_controls_reproduce_hy
     assert report["conclusion"]["positive_promotion_gate_opened"] is False
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase15_keeps_controls_predecision_only_and_records_llm_hybrid_strategic_equivalence():
     report = phase15.build_phase15_report(generated_at="2026-07-16T00:00:00+00:00")
 
@@ -58,6 +61,7 @@ def test_phase15_keeps_controls_predecision_only_and_records_llm_hybrid_strategi
     assert identifiability["singleton_ownership_audit"]["model_call_counts"] == {"llm": 1, "hybrid": 0}
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase15_cli_writes_negative_only_report(tmp_path):
     output = tmp_path / "phase15.json"
     result = subprocess.run(

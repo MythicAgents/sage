@@ -26,10 +26,13 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEST_ROOT = REPO_ROOT / "Payload_Type" / "sage" / "tests"
+# Repository hygiene (portability, privacy, build context) lives outside the Sage suite because it
+# tests the repo rather than the product. It still runs here — a guard nobody executes is not a guard.
+HYGIENE_ROOT = REPO_ROOT / "tests" / "repo_hygiene"
 
 
 def command_for(pytest_args: list[str]) -> list[str]:
-    command = [sys.executable, "-m", "pytest", str(TEST_ROOT)]
+    command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT)]
     command.extend(pytest_args or ["-q"])
     return command
 

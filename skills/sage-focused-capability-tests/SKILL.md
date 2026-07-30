@@ -26,9 +26,6 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 ## Bundled Scripts
 
 - `build_capability_smoke.py`
-- `cmd_smoke.py`
-- `diag_argfmt_merlin.py`
-- `gpo_linkage_check.py`
 - `run_focused_account_context.py`
 - `run_focused_adcs_ca_export.py`
 - `run_focused_adcs_certificate_auth.py`
@@ -41,4 +38,3 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 - `run_focused_sid_history.py`
 - `run_focused_ticket_context_proof.py`
 - `run_offline_suite.py`
-- `test_validator.py`

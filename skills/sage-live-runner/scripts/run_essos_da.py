@@ -16,12 +16,14 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/home/john/dev/sage/Payload_Type/sage")
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
 from evals.harness import resolve_password, login_to_mythic  # noqa: E402
 from evals import phoenix_reader  # noqa: E402
 from mythic import mythic  # noqa: E402
 
-DB = "/home/john/dev/sage/Payload_Type/sage/.phoenix/phoenix.db"
+DB = str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage" / ".phoenix" / "phoenix.db")
 DEADLINE_S = 1500
 AUTO_GOAD_MAX_STEPS = 0
 GUIDED_ESSOS_ROUTE_FACTS = (

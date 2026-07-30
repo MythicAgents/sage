@@ -6,8 +6,10 @@ from copy import deepcopy
 from ai.hillclimb import policy_replay_selector_experiment as selector_experiment
 from ai.hillclimb import target_value_census
 from ai.hillclimb import target_value_runtime_decision as decision
+import pytest  # noqa: E402
 
 
+@pytest.mark.pinned_policy_rows
 def test_target_value_runtime_decision_prefers_eval_only_downstream_scoring():
     report = decision.run_target_value_runtime_decision()
 
@@ -20,6 +22,7 @@ def test_target_value_runtime_decision_prefers_eval_only_downstream_scoring():
     assert report["evidence"]["selector_any_improves_over_lowest_visible_wait"] is False
 
 
+@pytest.mark.pinned_policy_rows
 def test_target_value_runtime_decision_fails_closed_without_multi_family_evidence():
     census_report = deepcopy(target_value_census.run_target_value_census())
     census_report["aggregate"]["naturally_asymmetric_families"] = ["gpo-directory"]

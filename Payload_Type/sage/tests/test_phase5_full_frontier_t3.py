@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai.hillclimb import full_frontier_t3
 from ai.langgraph import policy
+import pytest  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +87,7 @@ def _invoker_factory(*, include_metadata: bool = True):
     return factory
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase5_offline_falsifier_enumerates_all_permutations_and_fails_closed_on_current_corpus():
     report = full_frontier_t3.build_phase5_report()
 
@@ -130,6 +132,7 @@ def test_phase5_null_branch_seam_proves_branch_stop_and_singleton_kernel_ownersh
     }
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase5_t3_matrix_uses_semantic_ids_distinct_response_backends_and_empirical_only_scoring():
     report = full_frontier_t3.build_phase5_report(
         run_model_matrix=True,
@@ -164,6 +167,7 @@ def test_phase5_t3_matrix_uses_semantic_ids_distinct_response_backends_and_empir
     assert all(row["selected_candidate_id"] for row in t3["rows"])
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase5_t3_rejects_configured_only_backend_labels_without_response_provenance():
     report = full_frontier_t3.build_phase5_report(
         run_model_matrix=True,
@@ -200,6 +204,7 @@ def test_phase5_t3_invoker_reuses_existing_sage_ca_bundle_without_overriding_exp
     ) == "/operator/explicit.pem"
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase5_cli_emits_offline_negative_verdict_without_model_calls():
     result = subprocess.run(
         [str(PY), "-m", "ai.hillclimb", "phase5-full-frontier-t3"],

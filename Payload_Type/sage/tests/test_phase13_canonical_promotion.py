@@ -331,6 +331,7 @@ def test_missing_metrics_are_reported_as_not_estimable():
     }
 
 
+@pytest.mark.pinned_policy_rows
 def test_phase13_replay_invalidates_retained_phase8_recommendation_without_retrofit():
     report = phase13.build_phase13_status_map()
 
