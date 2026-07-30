@@ -36,7 +36,7 @@ SLASH_COMMANDS = [
     ),
     ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
-    ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the baked-in BloodHound MCP: /bloodhound [directory]."),
+    ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the BloodHound MCP: /bloodhound [directory] | /bloodhound force [directory] to rebind an existing connection with current credentials."),
     ChatSlashCommandDefinition(Name="sandbox", Description="Run a local-only isolated snippet: /sandbox [shell|python] <code>."),
 ]
 
@@ -615,13 +615,44 @@ async def _mcp_call(spec: str) -> str:
     )
 
 
-async def _handle_bloodhound(arg: str) -> str:
+_BLOODHOUND_FORCE_TOKENS = frozenset({"force", "-force", "--force", "reconnect"})
+
+
+def _parse_bloodhound_arg(arg: str) -> tuple[bool, str | None]:
+    """Split `/bloodhound [force] [directory]` into (force, directory).
+
+    Only the FIRST token is treated as a force flag, so a directory that happens to be named
+    `force` is still reachable as `/bloodhound ./force`. Plain `/bloodhound` stays idempotent —
+    it is also the cheap way to ask whether BloodHound is connected, and must not tear down a
+    working session to answer that.
+    """
+    tokens = (arg or "").split()
+    if not tokens:
+        return False, None
+    if tokens[0].lower() in _BLOODHOUND_FORCE_TOKENS:
+        remainder = " ".join(tokens[1:]).strip()
+        return True, remainder or None
+    return False, " ".join(tokens).strip() or None
+
+
+async def _handle_bloodhound(request: ChatRequest, arg: str) -> str:
+    """Operator-facing one-shot connect.
+
+    Takes the request so credentials resolve through the same Config → Secret → env chain the
+    auto-connect path uses. Without it this command connected with no credentials at all, which
+    is the exact failure an operator reaches for it to fix.
+    """
     try:
         from ai.bloodhound_config import ensure_bloodhound_connected
     except ImportError:  # pragma: no cover
         from ..ai.bloodhound_config import ensure_bloodhound_connected  # type: ignore
-    directory = (arg or "").strip() or None
-    _connected, msg = await ensure_bloodhound_connected(directory)
+    try:
+        from .config import build_bloodhound_env
+    except ImportError:  # pragma: no cover
+        from config import build_bloodhound_env  # type: ignore
+    force, directory = _parse_bloodhound_arg(arg)
+    env = build_bloodhound_env(request) if request is not None else {}
+    _connected, msg = await ensure_bloodhound_connected(directory, env=env or None, force=force)
     return msg
 
 
@@ -761,7 +792,7 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     elif name == "mcp":
         text = await _handle_mcp(arg)
     elif name == "bloodhound":
-        text = await _handle_bloodhound(arg)
+        text = await _handle_bloodhound(request, arg)
     elif name == "sandbox":
         text = await _handle_sandbox(model, request, arg)
     else:

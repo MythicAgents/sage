@@ -24,15 +24,71 @@ from ai.mcp import (
 BLOODHOUND_SERVER_NAME = "BloodHound"
 REQUIRED_BLOODHOUND_TOOLS = frozenset({"file_upload", "domain_info", "cypher_query"})
 
+# Canonical list, defined here so the resolver (sage_chat/config.py), the UI declaration
+# (sage_chat/models.py) and this diagnostic cannot drift apart. sage_chat depends on ai, never
+# the reverse, so this is the correct home.
+BLOODHOUND_CREDENTIAL_KEYS = (
+    "BLOODHOUND_DOMAIN",
+    "BLOODHOUND_PORT",
+    "BLOODHOUND_SCHEME",
+    "BLOODHOUND_TOKEN_ID",
+    "BLOODHOUND_TOKEN_KEY",
+)
+# The MCP server refuses to start without these three; PORT and SCHEME have defaults.
+BLOODHOUND_REQUIRED_CREDENTIAL_KEYS = (
+    "BLOODHOUND_DOMAIN",
+    "BLOODHOUND_TOKEN_ID",
+    "BLOODHOUND_TOKEN_KEY",
+)
+
+
+def credential_diagnostic(env: Optional[dict] = None) -> str:
+    """Explain a connect failure in terms an operator can act on. Never emits a credential value.
+
+    The raw failure is `McpError: Connection closed` — the MCP server exits during startup and the
+    real reason (a missing BLOODHOUND_* variable) is only visible in the container log. This turns
+    that into a statement of which credentials arrived, which did not, and where to set them.
+    """
+    supplied = sorted(k for k in (env or {}) if k in BLOODHOUND_CREDENTIAL_KEYS)
+    missing = [k for k in BLOODHOUND_REQUIRED_CREDENTIAL_KEYS if k not in supplied]
+    lines = [
+        "Credentials Sage resolved for this attempt: "
+        + (", ".join(supplied) if supplied else "NONE"),
+    ]
+    if missing:
+        lines.append("Missing (required): " + ", ".join(missing))
+        lines.append(
+            "Set them in the chat configuration when creating the chat, or as Mythic user secrets, "
+            "or as environment variables on the Sage container. Resolution order is chat config → "
+            "user secret → container env."
+        )
+        lines.append(
+            "If you would rather keep credentials in the BloodHound MCP server's own .env, that "
+            "file must live in the directory SAGE_BLOODHOUND_MCP_DIR points at — note the image's "
+            "baked /opt/bloodhound_mcp is not on the Mythic bind mount, so a .env written there is "
+            "lost on rebuild. See README 'Using a .env file instead, under a Mythic install'."
+        )
+    else:
+        lines.append(
+            "All required credentials were supplied, so the failure is upstream of configuration: "
+            "check that BloodHound CE is reachable from the Sage container at that host/port and "
+            "that the API token is still valid. The container log has the server's own traceback."
+        )
+    return "\n".join(lines)
+
 BLOODHOUND_SETUP_STEPS = (
     "BloodHound is NOT connected, so attack-graph ingest and analysis are unavailable — and BloodHound "
     "is central to Sage. To enable it:\n"
-    "1. Ensure BloodHound CE is running (web/API + neo4j) and reachable from the Sage host.\n"
-    "2. Put your BloodHound API token (id + key) in the BloodHound MCP server's .env.\n"
-    "3. Set SAGE_BLOODHOUND_MCP_DIR to the BloodHound MCP directory so Sage auto-connects on startup, OR "
-    "run the `bloodhound-connect` command (optionally `-directory <path>`), OR connect manually with "
-    "`mcp-connect`.\n"
-    "Full steps: Sage payload documentation -> \"Connecting BloodHound to Sage\"."
+    "1. Ensure BloodHound CE is running (web/API + neo4j) and reachable from the Sage container.\n"
+    "2. Supply BLOODHOUND_DOMAIN, BLOODHOUND_TOKEN_ID and BLOODHOUND_TOKEN_KEY (plus BLOODHOUND_PORT "
+    "and BLOODHOUND_SCHEME if they are not 443/https). Set them in the chat configuration when you "
+    "create the chat, as Mythic user secrets, or as environment variables on the Sage container — "
+    "resolution order is chat config → user secret → container env. Alternatively put them in the "
+    "BloodHound MCP server's own .env, in the directory SAGE_BLOODHOUND_MCP_DIR points at.\n"
+    "3. SAGE_BLOODHOUND_MCP_DIR must locate the MCP server; the container image bakes "
+    "/opt/bloodhound_mcp by default.\n"
+    "4. Then run the `/bloodhound` command to connect, or start a new chat to auto-connect. The "
+    "connection is process-global: once it succeeds, every later chat in this container reuses it."
 )
 
 
@@ -201,6 +257,7 @@ def bloodhound_tool_admission() -> dict[str, Any]:
 async def ensure_bloodhound_connected(
     directory: Optional[str] = None,
     env: Optional[dict[str, str]] = None,
+    force: bool = False,
 ) -> tuple[bool, str]:
     """Connect the BloodHound MCP if not already connected. Idempotent. Returns (connected, message).
 
@@ -208,21 +265,34 @@ async def ensure_bloodhound_connected(
     creates it) — i.e. from a task handler or the agent run, NOT a throwaway loop at import time.
 
     ``env`` supplies BloodHound credentials to the server subprocess (see ``bloodhound_mcp_config``).
-    Because the connection is process-global, the FIRST caller to actually connect establishes the
-    credentials for the container; later callers short-circuit on the already-connected check and
-    their ``env`` is not applied. Reconnect (or restart the container) to change credentials.
+    The connection is process-global: the FIRST caller to connect establishes it for the container,
+    and later callers short-circuit on the already-connected check so their ``env`` is not applied.
+    That idempotence is deliberate — a new chat must not tear down a working session.
+
+    ``force=True`` skips the short-circuit and rebinds with the supplied directory/credentials.
+    ``MCPManager.connect_server`` already disconnects a same-named server before connecting, so no
+    separate teardown is needed here. Reserve this for an explicit operator action: if the rebind
+    fails, the previous working connection is gone, because the disconnect happens first.
     """
-    if bloodhound_connected():
+    if bloodhound_connected() and not force:
         return True, "BloodHound MCP already connected."
+    replacing = force and bloodhound_connected()
     config = bloodhound_mcp_config(directory, env)
     if config is None:
         return False, ("BloodHound MCP not connected and no connection params configured "
                        "(set SAGE_BLOODHOUND_MCP_DIR or pass a directory).")
+    lost = (
+        "\n\nThe previous BloodHound connection was replaced before this attempt and is now gone — "
+        "a forced reconnect disconnects first. Fix the above and run the command again."
+        if replacing
+        else ""
+    )
     try:
         success, err = await MCPManager.connect_server(config)
     except Exception as e:
-        return False, f"BloodHound MCP connect raised: {e}"
+        return False, f"BloodHound MCP connect raised: {e}\n\n{credential_diagnostic(env)}{lost}"
     if success:
         n = len(MCPManager.get_tools_by_server(BLOODHOUND_SERVER_NAME))
-        return True, f"Connected to BloodHound MCP ({n} tools)."
-    return False, f"Failed to connect to BloodHound MCP: {err}"
+        verb = "Reconnected to" if replacing else "Connected to"
+        return True, f"{verb} BloodHound MCP ({n} tools)."
+    return False, f"Failed to connect to BloodHound MCP: {err}\n\n{credential_diagnostic(env)}{lost}"

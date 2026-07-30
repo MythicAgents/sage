@@ -139,9 +139,36 @@ Sage forwards whatever it resolves into the MCP subprocess. Anything you leave u
 forwarded, so the server falls back to its own `.env` — which is what keeps the file-based workflow
 below working unchanged.
 
-The BloodHound connection is **process-global**: the first chat that actually connects establishes
-the credentials for the whole container, and later chats reuse that connection. Changing credentials
-means restarting the container, not just opening a new chat.
+### Configure once, not per chat
+
+The BloodHound connection is **process-global**. The first chat that connects successfully
+establishes it for the whole container, and every later chat reuses that connection — so **you only
+fill these fields in once, and can leave them blank in subsequent chats**. There is no per-chat
+BloodHound setup to repeat.
+
+Three consequences worth knowing:
+
+- **A failed connect establishes nothing.** If the first attempt fails — wrong port, unreachable
+  host, missing token — the next chat tries again from scratch. You are not stuck with a bad
+  connection, and you do not need to restart to retry.
+
+- **Connect on demand with `/bloodhound`.** New chats auto-connect before the graph is built. If you
+  want to retry after fixing something, run `/bloodhound` in the chat. Plain `/bloodhound` is
+  idempotent — it reports an existing connection rather than replacing it, so it is also a safe way
+  to ask whether BloodHound is connected.
+
+- **Rebind without a restart using `/bloodhound force`.** To point an already-connected container at
+  different credentials or a different BloodHound, run `/bloodhound force` (`reconnect` and
+  `--force` also work) in a chat configured the way you want. It rebinds using that chat's resolved
+  credentials, and the new connection is then the process-global one every later chat reuses.
+  `/bloodhound force <directory>` also changes the MCP directory.
+
+  One caveat: the rebind disconnects before it connects, so if the new settings are wrong you are
+  left with no BloodHound connection rather than the old one. The failure message says so
+  explicitly. Plain `/bloodhound` will then connect again once you have fixed the configuration.
+
+If a connect fails, the returned message names which credentials Sage resolved and which required
+ones were missing, so you do not have to read the container log to find out.
 
 ### Using a `.env` file instead, under a Mythic install
 
@@ -209,6 +236,10 @@ of collapsing partial checks into a misleading global success.
 After the container registers, create a Mythic chat channel using the `Sage` model. Configure provider, model,
 mode, policy, and credentials in the channel or user-secret views. Mythic renders Sage output as markdown and
 renders tool executions as updating, collapsible cards.
+
+BloodHound is the exception to per-chat configuration: its connection is process-global, so fill the
+`BLOODHOUND_*` fields in once and leave them blank in later chats. See
+[Configure once, not per chat](#configure-once-not-per-chat).
 
 Supervised mode is appropriate for interactive work and guarded actions. Autonomous mode is intended for an
 explicit objective with a prepared callback and verified graph integration.

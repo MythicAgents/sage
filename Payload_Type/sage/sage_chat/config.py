@@ -70,13 +70,10 @@ def _resolve_bool(
     return default
 
 
-BLOODHOUND_ENV_KEYS = (
-    "BLOODHOUND_DOMAIN",
-    "BLOODHOUND_PORT",
-    "BLOODHOUND_SCHEME",
-    "BLOODHOUND_TOKEN_ID",
-    "BLOODHOUND_TOKEN_KEY",
-)
+try:
+    from ai.bloodhound_config import BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS
+except ImportError:  # pragma: no cover
+    from ..ai.bloodhound_config import BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS  # type: ignore
 
 
 def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:

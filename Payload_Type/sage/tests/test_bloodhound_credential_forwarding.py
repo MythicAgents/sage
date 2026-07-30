@@ -118,6 +118,196 @@ def test_every_resolved_key_is_declared_to_mythic():
         )
 
 
+def test_slash_bloodhound_forwards_resolved_credentials(monkeypatch):
+    """The `/bloodhound` command is what an operator reaches for when BloodHound is not connected.
+
+    It previously called `ensure_bloodhound_connected(directory)` with no credentials at all, so it
+    could never fix the condition it exists to fix — the auto-connect path had been wired but this
+    one had not.
+    """
+    import asyncio
+
+    from ai import bloodhound_config
+    from sage_chat import slash
+
+    captured: dict = {}
+
+    async def _fake_connect(directory=None, env=None, force=False):
+        captured["directory"] = directory
+        captured["env"] = env
+        return False, "stub"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _fake_connect)
+
+    req = _request(
+        config={"BLOODHOUND_DOMAIN": "bh.range.local"},
+        secrets={"BLOODHOUND_TOKEN_ID": "tid", "BLOODHOUND_TOKEN_KEY": "tkey"},
+    )
+    asyncio.run(slash._handle_bloodhound(req, ""))
+
+    assert captured["env"] is not None, "slash path must forward credentials, not None"
+    assert captured["env"]["BLOODHOUND_DOMAIN"] == "bh.range.local"
+    assert captured["env"]["BLOODHOUND_TOKEN_ID"] == "tid"
+    assert captured["env"]["BLOODHOUND_TOKEN_KEY"] == "tkey"
+
+
+def test_slash_bloodhound_still_honours_an_explicit_directory(monkeypatch):
+    """`/bloodhound <dir>` must keep overriding the directory."""
+    import asyncio
+
+    from ai import bloodhound_config
+    from sage_chat import slash
+
+    captured: dict = {}
+
+    async def _fake_connect(directory=None, env=None, force=False):
+        captured["directory"] = directory
+        return True, "ok"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _fake_connect)
+    asyncio.run(slash._handle_bloodhound(_request(), "  /Mythic/bloodhound_mcp  "))
+    assert captured["directory"] == "/Mythic/bloodhound_mcp"
+
+
+def test_credential_diagnostic_names_gaps_without_leaking_values():
+    """The diagnostic must be actionable and must never print a token."""
+    from ai.bloodhound_config import credential_diagnostic
+
+    text = credential_diagnostic({"BLOODHOUND_DOMAIN": "bh.range.local", "BLOODHOUND_TOKEN_ID": "SUPERSECRET"})
+    assert "BLOODHOUND_TOKEN_KEY" in text, "must name the missing required key"
+    assert "SUPERSECRET" not in text, "must never echo a credential value"
+    assert "bh.range.local" not in text, "must never echo a credential value"
+
+    none_supplied = credential_diagnostic({})
+    assert "NONE" in none_supplied
+    for key in ("BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY"):
+        assert key in none_supplied
+
+    complete = credential_diagnostic(
+        {k: "x" for k in ("BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY")}
+    )
+    assert "Missing" not in complete, "no gap to report when all required keys are present"
+    assert "upstream of configuration" in complete
+
+
+def test_bloodhound_arg_parser_splits_force_from_directory():
+    from sage_chat.slash import _parse_bloodhound_arg as parse
+
+    assert parse("") == (False, None)
+    assert parse("   ") == (False, None)
+    assert parse("force") == (True, None)
+    assert parse("--force") == (True, None)
+    assert parse("RECONNECT") == (True, None)
+    assert parse("/Mythic/bh") == (False, "/Mythic/bh")
+    assert parse("force /Mythic/bh") == (True, "/Mythic/bh")
+    # only the first token is a flag, so a directory named "force" stays reachable
+    assert parse("./force") == (False, "./force")
+    assert parse("force ./force") == (True, "./force")
+
+
+def _patch_connected(monkeypatch, *, connected: bool, sink: list):
+    """Pretend BloodHound is/isn't connected and record any connect attempt."""
+    from ai import bloodhound_config as bh
+
+    monkeypatch.setattr(bh, "bloodhound_connected", lambda: connected)
+
+    class _FakeManager:
+        @staticmethod
+        async def connect_server(config):
+            sink.append(config)
+            return True, ""
+
+        @staticmethod
+        def get_tools_by_server(_name):
+            return ["file_upload", "domain_info", "cypher_query"]
+
+    monkeypatch.setattr(bh, "MCPManager", _FakeManager)
+
+
+def test_default_call_is_idempotent_when_already_connected(monkeypatch):
+    """A new chat must never tear down a working session — this is the property force overrides."""
+    import asyncio
+
+    from ai.bloodhound_config import ensure_bloodhound_connected
+
+    attempts: list = []
+    _patch_connected(monkeypatch, connected=True, sink=attempts)
+
+    ok, msg = asyncio.run(ensure_bloodhound_connected("/opt/bloodhound_mcp", {"BLOODHOUND_DOMAIN": "x"}))
+
+    assert ok is True
+    assert attempts == [], "must short-circuit, not reconnect"
+    assert "already connected" in msg
+
+
+def test_force_rebinds_an_existing_connection(monkeypatch):
+    """The override: reconnect without a container restart, carrying the new credentials."""
+    import asyncio
+
+    from ai.bloodhound_config import ensure_bloodhound_connected
+
+    attempts: list = []
+    _patch_connected(monkeypatch, connected=True, sink=attempts)
+
+    ok, msg = asyncio.run(
+        ensure_bloodhound_connected(
+            "/Mythic/bloodhound_mcp", {"BLOODHOUND_DOMAIN": "new.range.local"}, force=True
+        )
+    )
+
+    assert ok is True
+    assert len(attempts) == 1, "force must actually reconnect"
+    assert attempts[0].env == {"BLOODHOUND_DOMAIN": "new.range.local"}
+    assert attempts[0].args == ["--directory", "/Mythic/bloodhound_mcp", "run", "main.py"]
+    assert "Reconnected" in msg, "message must distinguish a rebind from a first connect"
+
+
+def test_forced_failure_warns_the_previous_connection_is_gone(monkeypatch):
+    """connect_server disconnects before connecting, so a failed rebind leaves nothing behind."""
+    import asyncio
+
+    from ai import bloodhound_config as bh
+
+    monkeypatch.setattr(bh, "bloodhound_connected", lambda: True)
+
+    class _FailingManager:
+        @staticmethod
+        async def connect_server(_config):
+            return False, "boom"
+
+        @staticmethod
+        def get_tools_by_server(_name):
+            return []
+
+    monkeypatch.setattr(bh, "MCPManager", _FailingManager)
+
+    ok, msg = asyncio.run(bh.ensure_bloodhound_connected("/opt/bloodhound_mcp", {"BLOODHOUND_DOMAIN": "x"}, force=True))
+    assert ok is False
+    assert "previous BloodHound connection was replaced" in msg
+
+
+def test_slash_force_reaches_the_connect_call(monkeypatch):
+    import asyncio
+
+    from ai import bloodhound_config
+    from sage_chat import slash
+
+    seen: dict = {}
+
+    async def _fake(directory=None, env=None, force=False):
+        seen["directory"] = directory
+        seen["force"] = force
+        return True, "ok"
+
+    monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _fake)
+
+    asyncio.run(slash._handle_bloodhound(_request(), "force /Mythic/bh"))
+    assert seen == {"directory": "/Mythic/bh", "force": True}
+
+    asyncio.run(slash._handle_bloodhound(_request(), ""))
+    assert seen["force"] is False, "plain /bloodhound must stay idempotent"
+
+
 def test_stdio_client_does_not_inherit_bloodhound_vars_by_default():
     """The premise the forwarding exists for.
 
