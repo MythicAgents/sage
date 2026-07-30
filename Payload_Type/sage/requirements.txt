@@ -1,6 +1,11 @@
 langchain==1.2.13
 langchain-core==1.2.31
 langchain-mcp-adapters==0.2.2
+# langchain-mcp-adapters 0.2.2 imports `mcp.server.fastmcp`, which mcp 2.0.0 removed, and it declares
+# `mcp` with no upper bound — so a fresh resolve takes 2.0.0 and every module that reaches ai/mcp.py
+# dies at import. Observed 2026-07-29 on a rebuilt venv: 24 collection errors, whole suite red.
+# 1.25.0 is the version the green baseline was built against. Revisit when adapters gains mcp 2 support.
+mcp==1.25.0
 langchain-anthropic==1.4.0
 langchain-aws==1.4.1
 langchain-openai==1.1.12

@@ -19,6 +19,7 @@ wrong, and a green run means the tree is green.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -29,12 +30,30 @@ TEST_ROOT = REPO_ROOT / "Payload_Type" / "sage" / "tests"
 # Repository hygiene (portability, privacy, build context) lives outside the Sage suite because it
 # tests the repo rather than the product. It still runs here — a guard nobody executes is not a guard.
 HYGIENE_ROOT = REPO_ROOT / "tests" / "repo_hygiene"
+DEV_REQUIREMENTS = REPO_ROOT / "Payload_Type" / "sage" / "requirements-dev.txt"
 
 
 def command_for(pytest_args: list[str]) -> list[str]:
     command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT)]
     command.extend(pytest_args or ["-q"])
     return command
+
+
+def pytest_missing_message() -> str | None:
+    """Return actionable guidance if this interpreter has no pytest, else None.
+
+    Without this the subprocess emits a bare `No module named pytest`, which gives no hint that
+    test dependencies live in a manifest separate from the runtime one — a fresh venv built from
+    requirements.txt alone reaches exactly that dead end.
+    """
+    if importlib.util.find_spec("pytest") is not None:
+        return None
+    return (
+        f"pytest is not installed in {sys.executable}\n\n"
+        "Test dependencies are declared separately from runtime ones, because the container image\n"
+        "installs only requirements.txt. Install both with:\n\n"
+        f"  {sys.executable} -m pip install -r {DEV_REQUIREMENTS}\n"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,6 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     print(" ".join(command), flush=True)
     if args.print_command:
         return 0
+    missing = pytest_missing_message()
+    if missing is not None:
+        print(missing, file=sys.stderr)
+        return 1
     return subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
 
 

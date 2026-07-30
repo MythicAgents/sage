@@ -1,0 +1,15 @@
+# Development and test dependencies.
+#
+# Kept separate from requirements.txt because the Dockerfile installs only the runtime manifest
+# (`COPY requirements.txt .` → `pip install -r requirements.txt`); nothing here belongs in the
+# shipped image. Installing this file also installs the runtime deps, so one command is enough:
+#
+#   .venv/bin/python -m pip install -r Payload_Type/sage/requirements-dev.txt
+#
+# Deliberately absent: pytest-asyncio. The suite does not configure it and writes async tests
+# against explicit event loops instead — several test modules state this convention directly.
+# Adding it would silently change collection semantics for those tests.
+
+-r requirements.txt
+
+pytest==9.1.1

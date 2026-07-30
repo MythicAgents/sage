@@ -7,7 +7,11 @@ package-lock.json
 # CLAUDE.md is committed (it imports AGENTS.md and adds the Claude-specific subset).
 # Personal, machine-specific notes go in CLAUDE.local.md, which Claude Code loads right after it.
 CLAUDE.local.md
+# Both spellings: `venv/` does not match `.venv/`. Until now the only thing keeping a ~865MB
+# `.venv/` out of git was the `.gitignore` containing `*` that Python's venv module writes inside
+# it — invisible here, and absent if the venv is built by a Python older than 3.11.
 venv/
+.venv/
 Notes
 Plans
 sage.db*
