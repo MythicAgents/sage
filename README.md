@@ -226,6 +226,29 @@ Autonomous sessions fail closed if BloodHound cannot connect with the graph tool
 kernel. Ordinary supervised chat remains available in a degraded, fail-soft state so an operator can diagnose or
 configure the integration.
 
+## Custom TLS certificates
+
+If BloodHound CE, Mythic, or a model endpoint presents a certificate signed by a private CA, put the CA
+bundle at `certs/bundle.pem` inside Sage's directory. At startup Sage concatenates it with the system CA
+store, writes `certs/combined-bundle.pem`, and points `SSL_CERT_FILE` at the result — so private CAs are
+trusted *in addition to* the public roots, not instead of them. Without a `bundle.pem` Sage logs that it is
+using system defaults and carries on.
+
+Under a Mythic install the file goes in the mounted service directory, and **`mythic-cli install` creates
+that tree owned by root**, so writing to it needs elevation:
+
+```bash
+sudo cp your-ca-bundle.pem <mythic>/InstalledServices/sage/certs/bundle.pem
+```
+
+Restart the Sage container to pick it up. The same root ownership applies to anything else you place in
+that directory, including the BloodHound MCP `.env` route described above.
+
+For local development there is no bind mount — write directly to `Payload_Type/sage/certs/bundle.pem`.
+
+`combined-bundle.pem` is generated on every start and is gitignored along with `bundle.pem`; neither is
+ever baked into the image.
+
 ## Start Sage locally
 
 The supported development workflow runs Sage in a local `sage` tmux session while Mythic remains Docker-backed.
