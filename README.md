@@ -72,12 +72,24 @@ Create the development environment from the repository root:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r Payload_Type/sage/requirements-dev.txt
+.venv/bin/pip install -r Payload_Type/sage/requirements-dev.txt -c Payload_Type/sage/constraints.txt
 ```
 
-`requirements-dev.txt` pulls in `requirements.txt` and adds the test dependencies, so this one command
-covers both running Sage and running its suite. Install `requirements.txt` alone only when you want the
-runtime without the tests — that is what the container image does.
+Three files, three jobs:
+
+| File | Role |
+|---|---|
+| `requirements.txt` | **Intent** — the packages Sage depends on directly. This is what the container image installs. |
+| `requirements-dev.txt` | Pulls in `requirements.txt` and adds test dependencies. Use this for development. |
+| `constraints.txt` | **Resolution** — every transitive package pinned to a version a green suite was observed against. |
+
+The `-c` flag is what makes your environment match the one the tests passed on, and match the image.
+Without it pip resolves transitives fresh: a rebuild on 2026-07-29 moved 83 packages, one of which
+(`mcp` 1.25.0 → 2.0.0) removed a module Sage imports and produced 24 collection errors from a manifest
+nobody had edited.
+
+Regenerate `constraints.txt` after any intentional dependency change, from a venv whose suite is green —
+the header in that file carries the exact command.
 
 Do not put credentials in tracked files. Use process environment variables, a local gitignored `.env`, Mythic
 user secrets, or a secret manager.

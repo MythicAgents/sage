@@ -5,9 +5,13 @@ RUN apt-get update && \
       g++ \
       && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# constraints.txt pins every transitive dependency to the versions a green suite was observed
+# against, so the image resolves identically to a developer venv instead of taking whatever PyPI
+# serves on build day. It only constrains — it installs nothing, so the dev-only entries in it are
+# not selected here.
+COPY requirements.txt constraints.txt ./
 
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt -c constraints.txt
 
 FROM python:3.13-slim-bookworm
 

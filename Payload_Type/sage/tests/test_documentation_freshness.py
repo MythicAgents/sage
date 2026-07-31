@@ -46,8 +46,23 @@ def test_runtime_packaging_comments_match_native_chat_and_pinned_sdk():
     requirements = (REPO_ROOT / "Payload_Type" / "sage" / "requirements.txt").read_text(encoding="utf-8")
     assert "alongside ``container``" not in chat_init
     assert "first query" not in dockerfile
-    assert "mythic 0.3.0rc4" not in requirements
-    assert "mythic==0.3.0rc5" in requirements
+
+    # The invariant is that the prose in requirements.txt names the version actually pinned there —
+    # not that the pin is any particular version. Derived rather than hardcoded because the previous
+    # form asserted a literal `mythic==0.3.0rc5`, so every SDK bump failed this test on the pin
+    # itself rather than on the thing it exists to catch. The 0.3.0rc6/rc9 bump landed with the tree
+    # red and both comments still saying rc5, which is exactly the stale prose this guards against.
+    pinned = re.search(r"^mythic==(\S+)", requirements, re.MULTILINE)
+    assert pinned, "requirements.txt must pin the mythic SDK explicitly"
+    pinned_version = pinned.group(1)
+
+    commented = set(re.findall(r"\bmythic (\d[\w.]*)", requirements))
+    assert commented, "the SDK comments must name a version, so drift is detectable"
+    stale = commented - {pinned_version}
+    assert not stale, (
+        f"requirements.txt comments name mythic {sorted(stale)} but the pin is {pinned_version} — "
+        "update the prose alongside the pin"
+    )
 
 
 def test_reset_docs_distinguish_logical_baseline_from_snapshot_identity():
