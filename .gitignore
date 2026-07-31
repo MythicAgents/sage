@@ -18,6 +18,16 @@ sage.db*
 Payload_Type/sage/sage*.db*
 .claude/
 .env
+# ...except Sage's own runtime env, which is committed deliberately. It ships fully commented out so
+# it sets nothing, and exists in the repo so a Mythic operator can edit it in place from the web UI
+# instead of needing a shell inside the container to copy an example file. The negation must come
+# after the `.env` rule above to take effect.
+# Your local edits to it will still show in `git status` — .gitignore does not apply to a tracked
+# file. Use `git update-index --skip-worktree Payload_Type/sage/.env` if you want them hidden.
+!Payload_Type/sage/.env
+# Local overrides beside it stay private — only the committed template is tracked.
+.env.*
+!.env.example
 skills/sage-callback-bootstrap/*_callback_config.json
 .evals/
 .mcp.json

@@ -146,7 +146,11 @@ Rules 5 and 6 are prose only; if they recur, that is the signal to build a probe
    living code, and it does not belong under `Payload_Type/`.
 
 6. **Keep the two `.env` files distinct.** `Payload_Type/sage/.env` is the deployed container's runtime
-   environment (RabbitMQ, Bedrock credentials, `SAGE_RUN_AS_PASSWORD`). The repo-root `.env` is operator-tooling
+   environment, loaded by `dotenv_bootstrap.py` at startup. It is **tracked**, and ships fully commented out
+   so a clone configures nothing — an operator edits it in place from the Mythic web UI rather than needing a
+   shell to copy an example. Two invariants: a variable already in the environment wins (Mythic's injected
+   values are never shadowable), and an empty value sets nothing. Never commit a real value into it; keys
+   Mythic manages belong only in its local-development section. The repo-root `.env` is operator-tooling
    discovery only. No key belongs in both, and nothing auto-loads the root one — see `.env.example`.
 
 Lab identifiers are **not** covered by this contract. GOAD names as overridable CLI defaults

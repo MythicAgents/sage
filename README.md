@@ -91,8 +91,13 @@ nobody had edited.
 Regenerate `constraints.txt` after any intentional dependency change, from a venv whose suite is green —
 the header in that file carries the exact command.
 
-Do not put credentials in tracked files. Use process environment variables, a local gitignored `.env`, Mythic
-user secrets, or a secret manager.
+Do not put credentials in tracked files. Use Mythic user secrets, the per-chat configuration, process
+environment variables, or a secret manager.
+
+`Payload_Type/sage/.env` is the one deliberate exception to "no tracked env file", and it ships **empty** —
+every line commented out, so a fresh clone configures nothing. See
+[The `.env` file](#the-env-file). Anything you uncomment there becomes a local edit to a tracked file;
+keep credentials in Mythic user secrets rather than in it.
 
 ## Configuration load order
 
@@ -101,8 +106,44 @@ chain, first non-empty wins:
 
 1. **Mythic channel configuration** — the per-chat fields you fill in when creating a Sage chat.
 2. **Mythic user secrets** — the operator's stored secrets. Preferred home for tokens and API keys.
-3. **Sage process environment** — the container's environment, or your shell for local development.
+3. **Sage process environment** — what Mythic injects into the container, your shell for local
+   development, and anything Sage loads from [`Payload_Type/sage/.env`](#the-env-file) at startup.
 4. **Safe defaults**, where one exists.
+
+### The `.env` file
+
+`Payload_Type/sage/.env` is **committed on purpose**, which is unusual and deliberate. Most projects ship
+a `.env.example` you copy — under Mythic that would mean getting a shell inside the container. Shipping the
+real file means you open it from the **Mythic web UI**, browse the Sage chat container's files, edit, save,
+and restart the container. No shell, no `docker cp`, no `sudo`.
+
+It ships with every line commented out, so cloning Sage sets nothing.
+
+Two rules govern how it loads, both enforced in `dotenv_bootstrap.py`:
+
+- **A variable already in the environment wins.** Mythic injects 21 variables into the container. Nothing in
+  this file can override them, so a stale entry cannot break your broker connection. That is why
+  `RABBITMQ_HOST`, `MYTHIC_SERVER_HOST`, `RABBITMQ_PASSWORD` and `DEBUG_LEVEL` sit in a clearly-marked
+  local-development section — set them only when running Sage as a bare process outside Docker.
+
+- **An empty value is ignored.** `KEY=` sets nothing. Uncommenting a line and leaving it blank is identical
+  to leaving it commented, so you cannot accidentally define an empty variable that later reads as
+  "configured" and disables a fallback.
+
+Use it for values you want shared by *every* chat in the container. Use the chat configuration for per-chat
+values, and Mythic user secrets for anything sensitive.
+
+Because the file is tracked, your edits appear in `git status` — `.gitignore` does not apply to tracked
+files. If you are contributing back and want your copy left alone:
+
+```bash
+git update-index --skip-worktree Payload_Type/sage/.env
+```
+
+That is a per-clone setting and cannot be committed on your behalf. Undo it with `--no-skip-worktree`.
+
+The file is excluded from the image (`.dockerignore`), so it never bakes in — under Mythic it reaches the
+container through the bind mount, which is also why your edits survive a rebuild.
 
 Implemented once in `Payload_Type/sage/sage_chat/config.py` (`_resolve`); adding a setting means
 adding a lookup, not a new mechanism.
@@ -134,15 +175,17 @@ Never infer the effective backend from the model name alone; record the provider
 ## BloodHound MCP
 
 Set the MCP checkout directory before starting Sage. This is Sage **runtime** config — the process reads it
-to auto-connect BloodHound at startup — so its home is the Sage runtime env file, not the operator-tooling
-`.env` at the repository root:
+to auto-connect BloodHound at startup — so its home is [`Payload_Type/sage/.env`](#the-env-file), not the
+operator-tooling `.env` at the repository root. The key already exists there, commented; uncomment it and
+fill in your path:
 
-```bash
-echo 'SAGE_BLOODHOUND_MCP_DIR=/path/to/bloodhound_mcp' >> Payload_Type/sage/.env
+```
+SAGE_BLOODHOUND_MCP_DIR=/path/to/bloodhound_mcp
 ```
 
-The container image bakes its own `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp`; the line above is the
-local-development equivalent. Exporting it in your shell also works for a single session.
+The container image bakes its own `ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp`, so leave it commented
+under Mythic unless you are pointing at your own checkout. Exporting it in your shell also works for a
+single local session.
 
 The default launcher uses `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run main.py` for the stdio MCP server.
 

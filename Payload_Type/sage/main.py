@@ -1,11 +1,25 @@
+import os
+
+# MUST run before importing mythic_container, which builds its Dynaconf settings at import time and
+# would not see anything loaded afterwards. Under Mythic this file lives in the bind-mounted service
+# directory, so an operator edits it from the web UI container file browser — no shell, no sudo.
+# Precedence and empty-value rules live in the module. See README "Configuration load order".
+from dotenv_bootstrap import load_sage_dotenv
+
+_dotenv_applied = load_sage_dotenv()
+
 import mythic_container
 from mythic_container.logging import logger
 import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__().
                  # Phase 4 complete: the PayloadType (`container`) has been removed — Sage is chat-only.
-import os
 import phoenix as px
 from phoenix.otel import register
 from openinference.instrumentation.langchain import LangChainInstrumentor
+
+# Names only — never values. Silence here means either no .env, or every setting already came from
+# the container environment, which is the normal Mythic case.
+if _dotenv_applied:
+    logger.info(f"Loaded {len(_dotenv_applied)} setting(s) from .env: {sorted(_dotenv_applied)}")
 
 # Configure SSL certificate bundle if present
 # Combines system CA certs with any custom certs so both public APIs and internal services work

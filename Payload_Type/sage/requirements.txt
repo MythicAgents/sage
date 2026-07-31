@@ -36,3 +36,6 @@ arize-phoenix-evals==2.11.0
 openinference-instrumentation-langchain==0.1.61
 docker==7.1.0
 ldap3==2.9.1
+# Sage reads its own .env at startup (main.py) so a Mythic operator can configure the container
+# from the web UI file browser. Explicit rather than relying on pydantic-settings pulling it in.
+python-dotenv==1.2.2
