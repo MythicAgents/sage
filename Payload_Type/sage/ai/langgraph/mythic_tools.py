@@ -9162,7 +9162,18 @@ class MythicTools:
                 }, action_obj, input_values, callback_id, issued=all_issued)
 
             if self._capability_needs_runtime_materialization(action_obj, input_values):
-                materialized_raw = await self.materialize_capability_inputs(action_obj, input_values)
+                # `materialize_capability_inputs` declares `action: dict | str`, and its
+                # request-contract guard canonicalizes whatever it is handed
+                # (`request_contract.canonical_action_arguments`), which refuses any non-JSON
+                # value. Passing the dataclass straight through therefore denies Sage's own
+                # internal call with `arguments.action contains non-JSON value CapabilityAction`,
+                # which halted `adcs-certificate-auth` on a serialization mismatch rather than on
+                # anything to do with the capability. Hand it the JSON form the signature asks for;
+                # `_capability_tool_action` rebuilds the dataclass on the other side.
+                materialized_raw = await self.materialize_capability_inputs(
+                    asdict(action_obj) if is_dataclass(action_obj) else action_obj,
+                    input_values,
+                )
                 try:
                     materialized_payload = json.loads(materialized_raw)
                 except Exception:

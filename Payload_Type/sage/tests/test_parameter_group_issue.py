@@ -181,7 +181,7 @@ def test_raw_credential_material_never_declares_a_group():
     declare = mythic_tools.MythicTools._parameter_group_to_declare
     raw = {
         "Credential": {
-            "id": "12", "account": "cersei.lannister", "realm": "sevenkingdoms.local",
+            "id": "12", "account": "alice", "realm": "lab.local",
             "credential": "<secret>", "type": "plaintext",
         },
         "netOnly": True,
