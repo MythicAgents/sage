@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import ssl
 import sys
+import time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import urllib.request
@@ -255,6 +256,56 @@ def build_clock_sync_script(target: str) -> str:
     )
 
 
+DEFAULT_AUTH_WAIT_SECONDS = 300.0
+DEFAULT_AUTH_POLL_SECONDS = 15.0
+
+
+def wait_for_winrm_auth(
+    hosts: list[dict[str, Any]],
+    *,
+    timeout_seconds: float = DEFAULT_AUTH_WAIT_SECONDS,
+    poll_seconds: float = DEFAULT_AUTH_POLL_SECONDS,
+    sleep: Any = time.sleep,
+    now: Any = time.monotonic,
+) -> dict[str, Any]:
+    """Block until every host answers WinRM, or the budget runs out.
+
+    A rolled-back guest reports its IP through the Ludus agent well before AD is ready to
+    authenticate a domain account, so a caller that waits only for IPs and then syncs gets
+    `InvalidCredentialsError: 401` from a machine whose credentials are perfectly correct.
+    Observed 2026-08-01: `sync` died on DC01 that way, and a read-only `check` minutes later
+    authenticated to all five hosts. This waits on the condition that actually matters.
+    """
+    deadline = now() + timeout_seconds
+    attempts = 0
+    last_error = ""
+    while True:
+        attempts += 1
+        pending = []
+        for host in hosts:
+            try:
+                run_ps(winrm_session(host), "$null")
+            except Exception as exc:
+                pending.append(str(host.get("inventory_hostname") or host.get("ansible_host")))
+                last_error = f"{type(exc).__name__}: {exc}"
+        if not pending:
+            return {"ready": True, "attempts": attempts, "pending": [], "last_error": ""}
+        remaining = deadline - now()
+        if remaining <= 0:
+            return {
+                "ready": False,
+                "attempts": attempts,
+                "pending": pending,
+                "last_error": last_error,
+            }
+        print(
+            f"waiting for WinRM auth on {', '.join(pending)} "
+            f"({remaining:.0f}s budget left)",
+            file=sys.stderr,
+        )
+        sleep(min(poll_seconds, remaining))
+
+
 def sync_clocks(hosts: list[dict[str, Any]]) -> None:
     for host in hosts:
         target = datetime.now(timezone.utc).isoformat()
@@ -277,6 +328,15 @@ def parse_args() -> argparse.Namespace:
         help=f"Ludus MCP server entry (default: ${MCP_SERVER_ENV} or {DEFAULT_MCP_SERVER}).",
     )
     parser.add_argument("--max-skew-seconds", type=float, default=DEFAULT_MAX_SKEW_SECONDS)
+    parser.add_argument(
+        "--auth-wait-seconds",
+        type=float,
+        default=DEFAULT_AUTH_WAIT_SECONDS,
+        help=(
+            "how long to wait for every host to answer WinRM before syncing. A freshly rolled-back"
+            " guest reports its IP long before AD can authenticate. 0 disables the wait."
+        ),
+    )
     parser.add_argument("--yes", action="store_true")
     return parser.parse_args()
 
@@ -290,6 +350,14 @@ def main() -> int:
         if not args.yes:
             print("sync changes guest clocks; pass --yes", file=sys.stderr)
             return 2
+        if args.auth_wait_seconds > 0:
+            auth = wait_for_winrm_auth(hosts, timeout_seconds=args.auth_wait_seconds)
+            if not auth["ready"]:
+                print(
+                    json.dumps({"ready": False, "winrm_auth": auth}, indent=2, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
         sync_clocks(hosts)
     result = check_clocks(hosts, args.max_skew_seconds)
     print(json.dumps(result, indent=2, sort_keys=True))

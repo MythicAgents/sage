@@ -35,3 +35,18 @@ else
   mythic_cli database reset -f
 fi
 mythic_cli start
+
+# `mythic_cli start` above starts EVERY registered service, including the Sage container. Which
+# Sage should actually serve Mythic is a deployment decision, not a side effect of a reset: this
+# repo's workflow runs Sage locally in the `sage` tmux session, so the container must come back
+# down. Left running, both register as `sage`, one wins the RabbitMQ queue, and requests are
+# answered by whichever won — on 2026-08-01 that was the container, using its baked image instead
+# of the working tree and with no BloodHound MCP directory.
+#
+# Override with SAGE_DEPLOYMENT_MODE=container to keep the container and stop the local process
+# instead. Failing here is deliberate: a reset that leaves two Sages registered is worse than one
+# that stops.
+#
+# `--conflict-only`: Sage itself is restarted later in the reset order, so only the unintended
+# side must be down here, not the intended one up.
+"$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only

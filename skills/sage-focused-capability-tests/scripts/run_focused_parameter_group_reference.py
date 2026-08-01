@@ -81,12 +81,10 @@ async def _credential_row(tools: "mythic_tools.MythicTools", credential_id: int)
 def _admin_password() -> str:
     """`MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`, per AGENTS.md.
 
-    `sage_task.resolve_password` defaults to an empty search list on purpose — guessing a Mythic
-    checkout name would bake one machine's layout into the repo — so the env path is supplied here
-    rather than defaulted anywhere.
+    Both are handled by `sage_task.resolve_password`; kept as a named seam so the intent is
+    greppable from this script.
     """
-    env_path = os.environ.get("MYTHIC_ENV_PATH", "").strip()
-    return resolve_password((Path(env_path),) if env_path else ())
+    return resolve_password()
 
 
 async def run(args: argparse.Namespace) -> int:

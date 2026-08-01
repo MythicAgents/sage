@@ -261,5 +261,33 @@ does not treat `SyncLAPSPassword` as equivalent to `ReadLAPSPassword`.
 - `mythic_reset.sh`
 - `pkinit_padata_probe.py`
 - `reset_orchestrator.py` (resumable canonical reset with observed zero-task proof)
+- `sage_deployment.py` (enforce that exactly one Sage serves Mythic — see below)
 - `sage_restart.sh`
 - `sage_stop.sh`
+
+## Which Sage Serves Mythic
+
+`mythic-cli start` starts **every** registered service, so resetting Mythic brings the Sage
+container up whether or not it is wanted. If a tmux Sage is also running, both register as `sage`,
+one wins the RabbitMQ queue, and Mythic requests are answered by whichever won. The loser logs
+`Another instance of this service, sage, is running` on a loop.
+
+That is not theoretical. On 2026-08-01 the container answered an autonomous chat request using its
+baked image rather than the working tree, and failed with `BloodHound MCP is not connected` because
+it had no `SAGE_BLOODHOUND_MCP_DIR` — while the readiness contract still reported `ready: true`,
+because nothing looked for a second instance.
+
+`SAGE_DEPLOYMENT_MODE` names the intended deployment: `local` (default, this repo's workflow) or
+`container`. `mythic_reset.sh` enforces it automatically after `mythic-cli start`. To check or
+enforce by hand:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py check
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py enforce
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py enforce --mode container
+```
+
+`enforce` only ever stops the **unintended** Sage; starting the intended one belongs to
+`sage_restart.sh` or `mythic-cli`, which own its environment. Add `--conflict-only` when the
+intended Sage is legitimately not up yet, which is the mid-reset state. The readiness contract
+carries the same rule as its `sage_deployment` section, so a solve cannot start into a split brain.

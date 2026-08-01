@@ -38,6 +38,13 @@ range/snapshot context, callback/channel/request identity, tasks/proofs, and art
 available. Allocate that path with `sage-artifact-retention` and record it after the run; a decision-bearing demo
 manifest must not live only in `/tmp`.
 
+**`--manifest-path` has two preconditions, and both fail the run in under a second if unmet.** It
+requires `--runtime-dbs-archived`, and it runs a demo-manifest preflight that requires the *whole*
+shared readiness contract to be ready — including a prepared chat channel, which unlike the
+`readiness` subcommand it will not waive. So a manifest-writing run needs `native_chat.py prepare`
+first. Without `--manifest-path`, `run` creates its own locked channel and neither precondition
+applies.
+
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
 and messages. A prepared channel is reused only when its stored configuration is actually `mode=auto` with

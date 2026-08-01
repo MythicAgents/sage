@@ -589,6 +589,41 @@ def test_sage_task_password_resolver_requires_secret(monkeypatch, tmp_path):
         sage_task.resolve_password(tmp_path / "missing.env")
 
 
+def _reload_sage_task():
+    """Re-execute sage_task so its module-level env-derived default is recomputed."""
+    spec = importlib.util.spec_from_file_location("sage_task_reloaded", SAGE_TASK_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_sage_task_password_resolver_defaults_to_mythic_env_path(monkeypatch, tmp_path):
+    """No-argument callers must find the secret via MYTHIC_ENV_PATH.
+
+    Eleven focused-capability scripts call `resolve_password()` with no argument. Before this,
+    the default search list was empty regardless of environment, so every one of them failed with
+    `Authentication Failed` unless the operator had separately exported the secret — the inverse
+    of the order AGENTS.md documents.
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text("MYTHIC_ADMIN_PASSWORD='from-mythic-env-path'\n", encoding="utf-8")
+    monkeypatch.delenv("MYTHIC_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("MYTHIC_ENV_PATH", str(env_file))
+
+    assert _reload_sage_task().resolve_password() == "from-mythic-env-path"
+
+
+def test_sage_task_password_resolver_guesses_no_checkout_location(monkeypatch):
+    """Unset MYTHIC_ENV_PATH must fail closed naming both variables, never probe for a checkout."""
+    monkeypatch.delenv("MYTHIC_ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("MYTHIC_ENV_PATH", raising=False)
+
+    module = _reload_sage_task()
+    assert module.MYTHIC_ENV_PATHS == (), "no directory name may be guessed"
+    with pytest.raises(RuntimeError, match="MYTHIC_ENV_PATH"):
+        module.resolve_password()
+
+
 def test_sage_task_forces_verbose_for_query_and_chat():
     assert sage_task.normalize_task_parameters("query", {"prompt": "status"}) == {
         "prompt": "status",
