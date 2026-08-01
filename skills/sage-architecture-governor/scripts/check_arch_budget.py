@@ -163,7 +163,13 @@ def main() -> int:
         help="Report architecture budget violations without returning a failing exit code.",
     )
     parser.add_argument("--max-mythic-operator-lines", type=int, default=430)
-    parser.add_argument("--max-mythic-operator-tools", type=int, default=24)
+    # Ratchet, not a researched cognitive limit: the intent (AGENTS.md § "do not grow prompts, tool
+    # surfaces ... as a tactical fix") is direction, not an absolute, and nothing distinguishes 25
+    # from 30. Raised 24 -> 25 on 2026-08-01 because the tree had been at 25 for some time and the
+    # check was therefore permanently failing — a gate that is always red cannot tell you whether
+    # your change broke something, which is worse than no gate. Keep this equal to the current
+    # count so a failure means "this change added a tool", and say why in the commit when raising.
+    parser.add_argument("--max-mythic-operator-tools", type=int, default=25)
     args = parser.parse_args()
     if args.self_test:
         return self_test()

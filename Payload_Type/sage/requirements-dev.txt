@@ -13,3 +13,15 @@
 -r requirements.txt
 
 pytest==9.1.1
+
+# Operator-skill dependency, not a runtime one. `skills/sage-goad-reset/scripts/sync_range_time.py`
+# imports `winrm` to set Windows guest clocks over WinRM after a range rollback — a step AGENTS.md
+# calls mandatory after *every* rollback. It went undeclared until 2026-08-01, so a clean checkout
+# hit `ModuleNotFoundError: No module named 'winrm'` on a documented-required command.
+# `tests/repo_hygiene/test_skill_dependencies.py` now fails on any undeclared skill import.
+pywinrm==0.5.0
+
+# `skills/sage-goad-reset/scripts/pkinit_padata_probe.py` imports pyasn1 directly to decode KDC
+# PA-DATA. It arrives transitively through ldap3 today, which is declared — but a direct import
+# resting on someone else's transitive breaks silently the day that edge disappears.
+pyasn1==0.6.4

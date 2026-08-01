@@ -354,6 +354,11 @@ try:
 except ImportError:
     from footprint import footprint
 
+try:
+    from . import command_parameter_schema
+except ImportError:  # allow running this module directly for manual testing
+    import command_parameter_schema
+
 
 def _summarize_footprint(axes: dict) -> str:
     axes_total = sum(axes.values())
@@ -3414,9 +3419,12 @@ class MythicTools:
         """
         # HITL: free
 
+        # Parameterized, matching the schema path. Same defect class as the command-schema queries:
+        # a malformed query returns nothing, which reads identically to a payload type that
+        # genuinely exposes no C2 profiles.
         query = """
-            query PayloadC2Profiles {
-                payloadtypec2profile(where: {payloadtype: {name: {_eq: "PLACEHOLDER"}}}) {
+            query PayloadC2Profiles($payload_type_name: String!) {
+                payloadtypec2profile(where: {payloadtype: {name: {_eq: $payload_type_name}}}) {
                     payloadtype {
                     name
                     }
@@ -3436,12 +3444,13 @@ class MythicTools:
                 }
             }
         """
-        query = query.replace("PLACEHOLDER", payload)
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling get_c2_profiles_for_payload tool for: {payload}")
-            results = await mythic.execute_custom_query(self.client, query,)
+            results = await mythic.execute_custom_query(
+                self.client, query, variables={"payload_type_name": payload}
+            )
             return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error executing query: {e}"
@@ -3702,24 +3711,24 @@ class MythicTools:
             str: JSON string containing all commands and their detailed information
         """
         # HITL: free
+        # ISC-2.5: parameterized. This was the last schema-path query built by substituting a
+        # model-influenced value into query text, where a malformed result is indistinguishable
+        # from a payload type that genuinely has no commands.
         query = """
-            query SageCommandNames {
-                command(where: {payloadtype: {name: {_eq: "PLACEHOLDER"}}}) {
+            query SageCommandNames($payload_type_name: String!) {
+                command(where: {payloadtype: {name: {_eq: $payload_type_name}}}) {
                     cmd
                     description
                 }
             }
         """
-        query = query.replace("PLACEHOLDER", payload)
-        attr = """
-        cmd
-        description
-        """
         try:
             if self.client is None:
                 raise Exception("MythicAPIClient not initialized. Call create() first.")
             logger.debug(f"🛠️ Calling get_all_command_names_for_payloadtype tool for: {payload}")
-            results =  await mythic.execute_custom_query(self.client, query)
+            results =  await mythic.execute_custom_query(
+                self.client, query, variables={"payload_type_name": payload}
+            )
             return json.dumps(results, sort_keys=True)
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
@@ -3739,36 +3748,102 @@ class MythicTools:
             str: JSON string containing all commands and their detailed information
         """
         # HITL: free
+        # Parameters come from the shared resolver, which returns them ALREADY GROUPED by parameter
+        # group. That is the substance of this tool's change: the groups are mutually exclusive
+        # tasking forms, so handing the model a flat list made it re-derive the partition from a
+        # `parameter_group_name` field and pick by prose. It also carries `LLM_Help` for the three
+        # reference-typed parameters, which is the exact `@cred:` / `@link:` form Mythic expects —
+        # in front of the model while it is choosing a value, rather than after a rejected task.
+        #
+        # Command-level metadata stays on a separate parameterized query. `needs_admin` is not
+        # decoration: footprint.py reads it out of schema items to score Mythic-native risk.
+        try:
+            if self.client is None:
+                raise Exception("MythicAPIClient not initialized. Call create() first.")
+            logger.debug(f"🛠️ Calling get_all_command_args_for_payloadtype tool for: {payload}")
+
+            groups = await command_parameter_schema.get_command_schema(
+                self.client, payload, command
+            )
+            if groups is None:
+                # Deliberately not an empty schema: an unknown command and a parameterless one are
+                # different answers, and only one of them means "go ahead and task with no args".
+                return (
+                    f"Error: no parameter schema found for command '{command}' on payload type "
+                    f"'{payload}'. Check the command name with "
+                    f"get_all_command_names_for_payloadtype."
+                )
+
+            result: dict[str, Any] = {
+                "command": command,
+                "payload_type": payload,
+                "parameter_groups": groups,
+            }
+            metadata = await self._fetch_command_metadata(payload, command)
+            if metadata.get("needs_admin"):
+                result["needs_admin"] = True
+            if metadata.get("help_cmd"):
+                result["help_cmd"] = metadata["help_cmd"]
+            return json.dumps(result, sort_keys=True)
+        except Exception as e:
+            return f"Error getting command {command} args for payload type {payload}: {e}"
+
+    async def _fetch_command_metadata(self, payload: str, command: str) -> dict:
+        """Command-level fields the parameter resolver does not own.
+
+        Parameterized rather than interpolated: this used to be built with `.replace("COMMAND", ...)`
+        on model-influenced input, where a malformed query returns nothing and the caller cannot
+        tell that from a real empty answer. Failure here is non-fatal — the parameters are the
+        point, and losing `needs_admin` should degrade the response, not fail the tool.
+        """
         query = """
-            query SageCommandArgs {
-                command(where: {cmd: {_eq: "COMMAND"}, payloadtype: {name: {_eq: "PAYLOAD"}}}) {
+            query SageCommandMetadata($command_name: String!, $payload_type_name: String!) {
+                command(where: {
+                    cmd: {_eq: $command_name},
+                    payloadtype: {name: {_eq: $payload_type_name}}
+                }) {
                     cmd
-                    commandparameters {
-                    cli_name
-                    name
-                    type
-                    description
-                    default_value
-                    choices
-                    parameter_group_name
-                    required
-                    }
                     help_cmd
                     needs_admin
                 }
             }
         """
-        query = query.replace("COMMAND", command).replace("PAYLOAD", payload)
- 
         try:
-            if self.client is None:
-                raise Exception("MythicAPIClient not initialized. Call create() first.")
-            logger.debug(f"🛠️ Calling get_all_command_args_for_payloadtype tool for: {payload}")
-            results =  await mythic.execute_custom_query(self.client, query)
-            return json.dumps(results, sort_keys=True)
-        except Exception as e:
-            return f"Error getting command {command} args for payload type {payload}: {e}"
+            response = await mythic.execute_custom_query(
+                self.client,
+                query,
+                variables={"command_name": command, "payload_type_name": payload},
+            )
+            rows = (response or {}).get("command") or []
+            return rows[0] if rows else {}
+        except Exception as exc:
+            logger.debug(f"command metadata lookup failed for {payload}/{command}: {exc}")
+            return {}
     
+    @staticmethod
+    def _grouped_command_view(results: Any) -> Any:
+        """Model-facing copy of the command list with parameters grouped.
+
+        Returns a NEW structure. The caller's `results` is cached and shared with
+        `_fetch_live_command_surface` and `mechanic_repair`, both of which expect the flat
+        `commandparameters` key, so this must not mutate it. Anything unexpected passes through
+        untouched rather than raising — a listing tool that returns nothing is worse than one that
+        returns the old shape.
+        """
+        if not isinstance(results, list):
+            return results
+        view = []
+        for command in results:
+            if not isinstance(command, dict):
+                view.append(command)
+                continue
+            entry = {k: v for k, v in command.items() if k != "commandparameters"}
+            rows = command.get("commandparameters")
+            if isinstance(rows, list):
+                entry["parameter_groups"] = command_parameter_schema.group_flat_parameters(rows)
+            view.append(entry)
+        return view
+
     async def get_all_commands_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
         """Get all available commands for a specific payload type (agent).
         
@@ -3833,7 +3908,21 @@ class MythicTools:
                     self._command_schema_cache[payload] = results
             except Exception:
                 pass
-            return json.dumps(results, sort_keys=True)
+            # ISC-2.6: the model sees parameters GROUPED, through the resolver's field selection, so
+            # there is one definition of what reaches it. Deliberately no extra fetch — the upstream
+            # call above already returned every command's rows, and routing 81 Apollo commands
+            # through the per-command resolver would be 81 round trips to re-learn what one call
+            # just delivered.
+            #
+            # Built as a separate view rather than by mutating `results`, because `results` is what
+            # goes into `_command_schema_cache`, which `_fetch_live_command_surface` reads and
+            # `mechanic_repair.compact_command_surface` walks looking for `commandparameters`.
+            # Dropping that key in place would have silently broken repair on the live path.
+            #
+            # `example` and `LLM_Help` are absent here by construction: upstream produces them per
+            # command, and this tool is breadth. Depth — including the `@cred:`/`@link:` reference
+            # forms — is `get_all_command_args_for_payloadtype`'s job.
+            return json.dumps(self._grouped_command_view(results), sort_keys=True)
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
 
@@ -16858,6 +16947,45 @@ class MythicTools:
             "reason": reason,
         }
 
+    def _seed_command_schema_cache(self, payload_type: str, commands) -> None:
+        """ISC-2.4: reuse one surface fetch as the per-command schema for every loaded command.
+
+        Both branches of `_fetch_live_command_surface` already return every command's parameters,
+        so a later `_fetch_command_schema` for any of them is a round trip to re-learn what is
+        already in hand. Seeding turns those into cache hits.
+
+        Entries are built through the shared field policy rather than by storing the raw rows, so
+        they are byte-identical to what `_fetch_command_schema` would produce for the same key.
+        Previously only the fallback branch seeded, and it stored raw rows — meaning the cached
+        shape depended on which branch ran first. Never raises: this is an optimisation, and a
+        failure here must not take down command enumeration.
+        """
+        try:
+            if not payload_type or not isinstance(commands, list):
+                return
+            if not hasattr(self, "_cmd_schema_cache"):
+                self._cmd_schema_cache = {}
+            for item in commands:
+                if not isinstance(item, dict):
+                    continue
+                name = self._capability_text(item.get("cmd"))
+                if not name:
+                    continue
+                rows = item.get("commandparameters")
+                if not isinstance(rows, list):
+                    continue
+                self._cmd_schema_cache[(payload_type, name)] = (
+                    command_parameter_schema.flatten_groups(
+                        command_parameter_schema.group_flat_parameters(
+                            rows,
+                            fields=command_parameter_schema.INTERNAL_SCHEMA_FIELDS,
+                            drop_empty=False,
+                        )
+                    )
+                )
+        except Exception:
+            pass
+
     async def _fetch_live_command_surface(self, callback_display_id) -> tuple[str, list[dict] | None, str]:
         """Fetch the callback-loaded command surface, falling back to payload commands when needed."""
         payload_type = ""
@@ -16869,26 +16997,39 @@ class MythicTools:
                 if isinstance(cached_surface, list):
                     return self._capability_text(cached_payload), cached_surface, ""
             if self.client is not None:
-                callback_query = f"""
-                    query CallbackLoadedCommandSurface {{
-                      callback(where: {{display_id: {{_eq: {int(callback_display_id)}}}}}) {{
-                        payload {{ payloadtype {{ name }} }}
-                        loadedcommands {{
-                          command {{
+                # ISC-2.4 / ISC-2.5: parameterized, not interpolated. This one was never injectable
+                # — `int()` coerced the only substituted value — but it was the last f-string-built
+                # query in the schema path, and the failure mode being removed is a class rather
+                # than an injection: a malformed query returns nothing, which the caller cannot
+                # distinguish from a callback that genuinely has no loaded commands.
+                #
+                # The query itself stays. `get_command_parameter_options` is payload-type scoped and
+                # cannot answer "which commands are loaded on THIS callback", so consolidation here
+                # is per-command schema reuse, not query elimination.
+                callback_query = """
+                    query CallbackLoadedCommandSurface($display_id: Int!) {
+                      callback(where: {display_id: {_eq: $display_id}}) {
+                        payload { payloadtype { name } }
+                        loadedcommands {
+                          command {
                             cmd
-                            commandparameters {{
+                            commandparameters {
                               name cli_name type description default_value choices parameter_group_name required
-                            }}
+                            }
                             description
                             help_cmd
                             needs_admin
-                          }}
-                        }}
-                      }}
-                    }}
+                          }
+                        }
+                      }
+                    }
                 """
                 try:
-                    callback_result = await mythic.execute_custom_query(self.client, callback_query)
+                    callback_result = await mythic.execute_custom_query(
+                        self.client,
+                        callback_query,
+                        variables={"display_id": int(callback_display_id)},
+                    )
                     callbacks = callback_result.get("callback") if isinstance(callback_result, dict) else None
                     if isinstance(callbacks, list) and callbacks:
                         callback = callbacks[0] if isinstance(callbacks[0], dict) else {}
@@ -16904,6 +17045,7 @@ class MythicTools:
                             if isinstance(row, dict) and isinstance(row.get("command"), dict)
                         ]
                         self._callback_command_surface_cache[callback_key] = (payload_type, surface)
+                        self._seed_command_schema_cache(payload_type, surface)
                         return payload_type, surface, ""
                 except Exception:
                     pass
@@ -16935,14 +17077,7 @@ class MythicTools:
             if not isinstance(results, list):
                 return payload_type, None, "live payload command enumeration returned no command list"
             self._command_schema_cache[payload_type] = results
-            if not hasattr(self, "_cmd_schema_cache"):
-                self._cmd_schema_cache = {}
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                name = self._capability_text(item.get("cmd"))
-                if name:
-                    self._cmd_schema_cache[(payload_type, name)] = list(item.get("commandparameters") or [])
+            self._seed_command_schema_cache(payload_type, results)
             return payload_type, results, ""
         except Exception as exc:
             return payload_type, None, f"live payload command enumeration failed: {exc}"
@@ -17155,12 +17290,19 @@ class MythicTools:
     async def _fetch_command_schema(self, command, callback_display_id):
         """Resolve the parameter-group schema for `command` on the callback's payload type.
 
-        Single in-module schema source shared by the resolver pre-flight and
-        `_validate_command_parameters`. Reuses the same `command(...) { commandparameters {...} }`
-        query that backs `get_all_commands_for_payloadtype`, lazily populating `self._cmd_schema_cache`
-        keyed by (payload_type, command). Returns the list of param dicts, or None when the schema
-        cannot be fetched (no client / no payload type / no schema / query error) so callers FAIL OPEN
-        and fall through to today's behavior byte-identically. Never raises."""
+        ISC-2.2: the fetch is delegated to the shared resolver, which removes the f-string-built
+        GraphQL this used to carry — a malformed query there returned nothing, which the caller
+        could not distinguish from a real empty answer, so validation silently failed open.
+
+        The RETURN CONTRACT is deliberately unchanged: a flat list of parameter dicts carrying the
+        same seven keys the old query selected, empty values included. That is not a preference —
+        this function has nine production callers and is stubbed in roughly seventy tests, all of
+        which expect that shape. Grouping is consumed directly from the resolver by
+        `_validate_command_parameters`, which is the one caller that wants it.
+
+        Returns None when the schema cannot be fetched (no client / no payload type / no schema /
+        query error) so callers FAIL OPEN. A real zero-parameter command still returns `[]`, which
+        is a different answer from None and is distinguished by at least one caller. Never raises."""
         try:
             if self.client is None:
                 return None
@@ -17172,27 +17314,94 @@ class MythicTools:
 
             cache_key = (payload_type, command)
             if cache_key not in self._cmd_schema_cache:
-                query = f"""
-                    query CmdParamSchema {{
-                      command(where: {{payloadtype: {{name: {{_eq: "{payload_type}"}}}}, cmd: {{_eq: "{command}"}}}}) {{
-                        cmd
-                        commandparameters {{ name cli_name type parameter_group_name required choices default_value }}
-                      }}
-                    }}
-                """
-                try:
-                    result = await mythic.execute_custom_query(self.client, query)
-                    commands = result.get("command") if isinstance(result, dict) else None
-                    if not commands:
-                        self._cmd_schema_cache[cache_key] = None
-                    else:
-                        self._cmd_schema_cache[cache_key] = commands[0].get("commandparameters")
-                except Exception:
+                groups = await command_parameter_schema.get_command_schema(
+                    self.client,
+                    payload_type,
+                    command,
+                    include_example=False,
+                    fields=command_parameter_schema.INTERNAL_SCHEMA_FIELDS,
+                    drop_empty=False,
+                )
+                if groups is None:
                     self._cmd_schema_cache[cache_key] = None
+                else:
+                    # Flattened back deliberately. `[]` survives as `[]` rather than collapsing to
+                    # None: upstream returns a Default group with no parameters for a real
+                    # zero-parameter command, and that is a different answer from "no schema".
+                    self._cmd_schema_cache[cache_key] = command_parameter_schema.flatten_groups(
+                        groups
+                    )
 
             return self._cmd_schema_cache.get(cache_key)
         except Exception:
             return None
+
+    #: ISC-4.3. `advisory` surfaces `verifier_regex` to the model and rejects nothing; `reject`
+    #: additionally refuses a mismatch. Advisory is the default, and an unrecognised value falls
+    #: back to it rather than erroring, because a typo in an env var must not silently arm a gate
+    #: that blocks live tasks.
+    VERIFIER_REGEX_MODE_ENV = "SAGE_VERIFIER_REGEX_MODE"
+
+    @classmethod
+    def _verifier_regex_mode(cls) -> str:
+        return (
+            "reject"
+            if os.environ.get(cls.VERIFIER_REGEX_MODE_ENV, "").strip().casefold() == "reject"
+            else "advisory"
+        )
+
+    def _verifier_regex_rejection(
+        self, command, parameters, supplied, selected_params, payload_type
+    ) -> str | None:
+        """ISC-4.2: the rejection arm. Returns a correction string, or None to permit.
+
+        Off unless `SAGE_VERIFIER_REGEX_MODE=reject`. It is off by default deliberately: Mythic
+        does **not** enforce this field on the task-creation path — the only implementation in the
+        product is the React task dialog — so an armed Sage is *stricter* than Mythic rather than
+        aligned with it. Evidence: `.sage_history/2026/08/evidence/isc-5-verifier-regex-enforcement.md`.
+
+        Matching mirrors that one implementation exactly. The UI does
+        `RegExp(verifier_regex).test(value)`, which is an UNANCHORED search, so this uses
+        `re.search` rather than `re.fullmatch`. Anchoring would reject values Mythic's own UI
+        accepts, which is the failure ISC-4.5 exists to forbid.
+
+        Fails open on a malformed pattern. A regex an agent author typed wrong is not a reason to
+        block an operator's task.
+        """
+        if self._verifier_regex_mode() != "reject":
+            return None
+        for supplied_key in supplied:
+            param = next(
+                (
+                    item for item in selected_params
+                    if item.get("name") == supplied_key or item.get("cli_name") == supplied_key
+                ),
+                None,
+            )
+            if not param:
+                continue
+            pattern = str(param.get("verifier_regex") or "").strip()
+            if not pattern:
+                continue
+            value = str(parameters[supplied_key])
+            try:
+                if re.search(pattern, value):
+                    continue
+            except re.error:
+                logger.info(
+                    f"🛡️ ARGVAL verifier_regex unusable command={command} "
+                    f"param={param.get('name')} — permitting"
+                )
+                continue
+            logger.info(
+                f"🛡️ ARGVAL rejected mode=D command={command} payload_type={payload_type} "
+                f"param={param.get('name')}"
+            )
+            return (
+                f"Parameter '{param.get('name')}' for command '{command}' must match the pattern "
+                f"{pattern} declared by the agent. You passed a value that does not."
+            )
+        return None
 
     async def _validate_command_parameters(self, command, parameters, callback_display_id):
         """Pre-flight: validate a dict of params against the command's parameter-group schema.
@@ -17216,18 +17425,26 @@ class MythicTools:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
                 return None
 
-            groups = {}
+            # ISC-2.3: consume the grouped structure from the shared resolver's policy instead of
+            # re-deriving it here. Mythic already knows which parameters are mutually exclusive;
+            # this function had its own copy of that partitioning, which is a second definition
+            # able to drift from the one the model is shown. `drop_empty=False` keeps every key the
+            # old inline grouping saw, so rejection strings are built from identical inputs — a
+            # dropped empty `type` would render as `None` in a parameter label instead of ``.
+            grouped = command_parameter_schema.group_flat_parameters(
+                [param for param in param_list if isinstance(param, dict)],
+                fields=command_parameter_schema.VALIDATION_FIELDS,
+                drop_empty=False,
+            )
+            groups = {name: group["parameters"] for name, group in grouped.items()}
             valid_names = set()
             valid_cli = set()
-            for param in param_list:
-                if not isinstance(param, dict):
-                    continue
-                group_name = param.get("parameter_group_name") or "Default"
-                groups.setdefault(group_name, []).append(param)
-                if param.get("name"):
-                    valid_names.add(param.get("name"))
-                if param.get("cli_name"):
-                    valid_cli.add(param.get("cli_name"))
+            for params in groups.values():
+                for param in params:
+                    if param.get("name"):
+                        valid_names.add(param.get("name"))
+                    if param.get("cli_name"):
+                        valid_cli.add(param.get("cli_name"))
 
             if not groups:
                 logger.info(f"🛡️ ARGVAL failed_open command={command} reason=no_schema")
@@ -17342,6 +17559,12 @@ class MythicTools:
                         f"selectable DISPLAY STRING (e.g. for a payload selector: \"<filename> - <description> - <uuid>\" as "
                         f"returned by get_all_payloads), NOT a bare UUID. You passed a bare UUID."
                     )
+            verifier_rejection = self._verifier_regex_rejection(
+                command, parameters, supplied, selected_params, payload_type
+            )
+            if verifier_rejection:
+                return verifier_rejection
+
             logger.info(f"🛡️ ARGVAL validated command={command} payload_type={payload_type} group={selected_group}")
             return None
         except Exception as e:

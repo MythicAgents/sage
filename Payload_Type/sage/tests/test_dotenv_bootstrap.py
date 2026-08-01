@@ -17,9 +17,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dotenv_bootstrap import apply_dotenv, load_sage_dotenv  # noqa: E402
+from dotenv_bootstrap import apply_dotenv, dotenv_paths, load_sage_dotenv  # noqa: E402
 
 SAGE_ROOT = Path(__file__).resolve().parents[1]
 DOTENV = SAGE_ROOT / ".env"
@@ -76,6 +78,77 @@ def test_loader_reads_a_real_file(tmp_path):
     finally:
         for key in ("BLOODHOUND_DOMAIN", "BLOODHOUND_PORT"):
             os.environ.pop(key, None)
+
+
+def test_local_override_is_searched_before_the_committed_file(tmp_path):
+    (tmp_path / ".env").touch()
+    (tmp_path / ".env.local").touch()
+
+    assert [Path(p).name for p in dotenv_paths(str(tmp_path))] == [".env.local", ".env"], (
+        "load order IS the precedence rule; reversing it silently hands the tracked template "
+        "authority over an operator's local configuration"
+    )
+
+
+def test_missing_files_are_omitted_from_the_search(tmp_path):
+    assert dotenv_paths(str(tmp_path)) == []
+
+    (tmp_path / ".env").touch()
+    assert [Path(p).name for p in dotenv_paths(str(tmp_path))] == [".env"]
+
+
+def test_local_override_wins_over_the_committed_file(tmp_path):
+    """The whole point of the split: `.env.local` carries local/secret values, `.env` ships inert."""
+    (tmp_path / ".env").write_text("provider=anthropic\nmodel=shipped\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("provider=openai\n", encoding="utf-8")
+
+    import os
+
+    for key in ("provider", "model"):
+        os.environ.pop(key, None)
+    try:
+        load_sage_dotenv(str(tmp_path))
+        assert os.environ["provider"] == "openai", ".env.local must win on keys it sets"
+        assert os.environ["model"] == "shipped", ".env must still fill keys .env.local omits"
+    finally:
+        for key in ("provider", "model"):
+            os.environ.pop(key, None)
+
+
+def test_real_environment_still_beats_both_files(tmp_path):
+    """Mythic's injected configuration outranks every file, `.env.local` included."""
+    (tmp_path / ".env").write_text("provider=anthropic\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("provider=openai\n", encoding="utf-8")
+
+    import os
+
+    os.environ["provider"] = "injected-by-mythic"
+    try:
+        applied = load_sage_dotenv(str(tmp_path))
+        assert os.environ["provider"] == "injected-by-mythic"
+        assert "provider" not in applied
+    finally:
+        os.environ.pop("provider", None)
+
+
+def test_local_override_file_is_gitignored():
+    """It holds real credentials, so a rule change that made it committable must fail loudly."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None or not (SAGE_ROOT.parents[1] / ".git").exists():
+        pytest.skip("not a git checkout; nothing to assert about ignore rules")
+
+    result = subprocess.run(
+        ["git", "check-ignore", "-v", "Payload_Type/sage/.env.local"],
+        cwd=SAGE_ROOT.parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0 and result.stdout.strip(), (
+        "Payload_Type/sage/.env.local is NOT gitignored; it is the documented home for API keys "
+        "and machine-specific paths, so it must never be committable"
+    )
 
 
 def test_committed_dotenv_sets_nothing():

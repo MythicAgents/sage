@@ -16,6 +16,15 @@ Two rules, both load-bearing:
   `os.environ.get(KEY)` and treats presence as "configured", so an empty string would silently
   disable a fallback rather than leave it alone — the operator uncomments a line, leaves it blank,
   and the setting they were trying to enable stops resolving from anywhere else.
+
+Two files are read, `.env.local` before `.env`, and **load order alone is the precedence rule** —
+because "already set wins", whatever `.env.local` sets first is what `.env` cannot overwrite. No
+override flag, no merge logic. The split exists because the two files answer to different owners:
+`.env` is tracked so a Mythic operator can edit it in the container from the web UI without a shell,
+which means it must ship inert and free of credentials; `.env.local` is gitignored and belongs to
+whoever is running Sage outside a container. Before the split, configuring local development meant
+editing the tracked file, which put a real API key in a public repository's working tree and turned
+three guard tests red.
 """
 
 from __future__ import annotations
@@ -25,7 +34,10 @@ from typing import Iterable
 
 from dotenv import dotenv_values
 
-__all__ = ["apply_dotenv", "load_sage_dotenv"]
+__all__ = ["apply_dotenv", "dotenv_paths", "load_sage_dotenv"]
+
+#: Filenames in precedence order, highest first. Order IS the precedence — see module docstring.
+DOTENV_FILENAMES = (".env.local", ".env")
 
 
 def apply_dotenv(values: dict[str, str | None], environ: dict[str, str]) -> list[str]:
@@ -45,14 +57,29 @@ def apply_dotenv(values: dict[str, str | None], environ: dict[str, str]) -> list
     return applied
 
 
-def load_sage_dotenv(directory: str | None = None) -> list[str]:
-    """Load `<directory>/.env` (default: this file's directory) into ``os.environ``.
+def dotenv_paths(directory: str | None = None) -> list[str]:
+    """Existing dotenv files under ``directory``, highest precedence first.
 
-    A missing file is a no-op, so a deployment that configures everything through Mythic never
-    needs one. Returns the variable names set, for logging — never the values.
+    Shared with the relaunch helper's identity recorder so the search order has exactly one
+    definition. When that recorder knew only about `.env`, it reported a locally-configured Sage as
+    having no provider or model while the process was correctly configured — a gate blind to the
+    thing it gates. A second copy of this list would reintroduce that by drift.
     """
     base = directory or os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base, ".env")
-    if not os.path.isfile(path):
-        return []
-    return apply_dotenv(dotenv_values(path), os.environ)
+    return [
+        path
+        for path in (os.path.join(base, name) for name in DOTENV_FILENAMES)
+        if os.path.isfile(path)
+    ]
+
+
+def load_sage_dotenv(directory: str | None = None) -> list[str]:
+    """Load `<directory>/.env.local` then `<directory>/.env` into ``os.environ``.
+
+    Both files are optional, so a deployment configured entirely through Mythic needs neither.
+    Returns the variable names set, for logging — never the values.
+    """
+    applied: list[str] = []
+    for path in dotenv_paths(directory):
+        applied.extend(apply_dotenv(dotenv_values(path), os.environ))
+    return applied

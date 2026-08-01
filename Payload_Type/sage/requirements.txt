@@ -9,7 +9,7 @@ mcp==1.25.0
 langchain-anthropic==1.4.0
 langchain-aws==1.4.1
 langchain-openai==1.1.12
-# mythic 0.3.0rc6 (Mythic v4) pulls gql 4.0.0 + websockets 15 + aiohttp 3.14 transitively.
+# mythic 0.3.0rc8 (Mythic v4) pulls gql 4.0.0 + websockets 15 + aiohttp 3.14 transitively.
 # langchain-google-genai stays disabled: google-genai caps websockets<15.1.0, which the v4 SDK line exceeds.
 #langchain-google-genai==4.1.3
 langchain-groq==1.1.2
@@ -19,13 +19,13 @@ langgraph==1.1.3
 langgraph-prebuilt==1.0.8
 langgraph-checkpoint-sqlite==3.0.3
 langsmith==0.7.22
-mythic==0.3.0rc6
+mythic==0.3.0rc8
 mythic-container==0.7.0rc9
 # mythic-container 0.7.0rc1's generated gRPC stubs require grpcio>=1.78.0 (its metadata leaves grpcio
 # unpinned). Pin both so the container build is deterministic and doesn't regress to 1.76.x.
 grpcio==1.78.0
 grpcio-tools==1.78.0
-# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc6 (Mythic v4);
+# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc8 (Mythic v4);
 # pinning to the versions the pytest baseline is green against avoids silent drift on rebuild.
 gql==4.0.0
 websockets==15.0.1
@@ -36,6 +36,11 @@ arize-phoenix-evals==2.11.0
 openinference-instrumentation-langchain==0.1.61
 docker==7.1.0
 ldap3==2.9.1
+# Direct runtime import (`ai/langgraph/ttp_library.py`, `ai/langgraph/prompt_loader.py`), declared
+# 2026-08-01. It had only ever arrived transitively via arize-phoenix and langchain-core, so any
+# future bump that dropped it would have broken the shipped image at import time. Depending on a
+# transitive you import directly is the same defect class as the pruned-dependency incident.
+PyYAML==6.0.3
 # Sage reads its own .env at startup (main.py) so a Mythic operator can configure the container
 # from the web UI file browser. Explicit rather than relying on pydantic-settings pulling it in.
 python-dotenv==1.2.2
