@@ -5,7 +5,16 @@ import importlib.util
 from pathlib import Path
 import sys
 
-from tests.conversation_contract import CASES
+# `tests.conversation_contract` lives under Payload_Type/sage, so it resolves only once that is on
+# sys.path. The script under test does this before its own import; this module has to as well, or
+# it fails at COLLECTION — which is worse than a failing test, because pytest then aborts the whole
+# run rather than reporting one red module.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SAGE_ROOT = REPO_ROOT / "Payload_Type" / "sage"
+if str(SAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SAGE_ROOT))
+
+from tests.conversation_contract import CASES  # noqa: E402
 
 
 SCRIPT = (

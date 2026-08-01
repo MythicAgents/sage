@@ -15,6 +15,7 @@ def test_build_readiness_report_requires_every_section_and_redacts_secrets(tmp_p
     artifact = tmp_path / "artifact.txt"
     artifact.write_text("payload", encoding="utf-8")
     report = MODULE.build_readiness_report(
+        sage_deployment={"ready": True, "blockers": []},
         runtime_identity={
             "ready": True,
             "provider": "openai",
@@ -282,3 +283,73 @@ def test_channel_status_can_defer_chat_creation_to_operator():
     assert status["required"] is False
     assert status["prepared"] is False
     assert status["blockers"] == []
+
+
+# --- Sage deployment mode: exactly one Sage may serve Mythic's `sage` queue -------------------
+#
+# `mythic-cli start` starts every registered service, so a Mythic reset brings the Sage container
+# up alongside a tmux Sage. Both register as `sage`, one wins the RabbitMQ queue, and requests are
+# answered by whichever won. On 2026-08-01 that was the container, running its baked image instead
+# of the working tree and with no BloodHound MCP directory, while readiness reported `ready: true`.
+
+
+def _deployment(**kwargs):
+    kwargs.setdefault("container_running", False)
+    kwargs.setdefault("local_running", False)
+    return MODULE.sage_deployment_status(**kwargs)
+
+
+def test_local_mode_is_ready_only_with_the_local_sage_alone():
+    assert _deployment(mode="local", local_running=True)["ready"] is True
+
+
+def test_local_mode_blocks_when_the_container_is_also_up():
+    status = _deployment(mode="local", local_running=True, container_running=True)
+    assert status["ready"] is False
+    assert any("container is running in local mode" in b for b in status["blockers"])
+
+
+def test_container_mode_blocks_when_a_local_sage_is_also_up():
+    status = _deployment(mode="container", container_running=True, local_running=True)
+    assert status["ready"] is False
+    assert any("local Sage process is running in container mode" in b for b in status["blockers"])
+
+
+def test_container_mode_is_ready_with_the_container_alone():
+    assert _deployment(mode="container", container_running=True)["ready"] is True
+
+
+def test_missing_intended_sage_blocks_by_default_but_not_in_conflict_only():
+    """Mid-reset, Mythic restarts long before Sage does; demanding a live Sage there fails resets."""
+    assert _deployment(mode="local")["ready"] is False
+    assert _deployment(mode="local", require_intended_running=False)["ready"] is True
+    assert _deployment(mode="container", require_intended_running=False)["ready"] is True
+
+
+def test_conflict_only_still_blocks_the_actual_conflict():
+    status = _deployment(mode="local", container_running=True, require_intended_running=False)
+    assert status["ready"] is False
+
+
+def test_undetectable_container_state_fails_closed():
+    """`cannot tell` must never collapse into `no container` — that is the whole failure mode."""
+    status = _deployment(mode="local", container_running=None, local_running=True)
+    assert status["ready"] is False
+    assert any("could not determine" in b for b in status["blockers"])
+
+
+def test_unknown_mode_is_refused_not_coerced():
+    status = _deployment(mode="kubernetes", local_running=True)
+    assert status["ready"] is False
+    assert any("unknown SAGE_DEPLOYMENT_MODE" in b for b in status["blockers"])
+
+
+def test_local_sage_probe_ignores_the_calling_shell(tmp_path, monkeypatch):
+    """`pgrep -f main.py` matches the shell that ran it; the /proc scan must not."""
+    proc = tmp_path / "proc"
+    (proc / "10").mkdir(parents=True)
+    (proc / "10" / "cmdline").write_bytes(b"/bin/bash\0-c\0grep main.py\0")
+    assert MODULE.probe_local_sage_running(Path("/repo"), proc) is False
+    (proc / "20").mkdir()
+    (proc / "20" / "cmdline").write_bytes(b"/repo/.venv/bin/python\0-u\0main.py\0")
+    assert MODULE.probe_local_sage_running(Path("/repo"), proc) is True

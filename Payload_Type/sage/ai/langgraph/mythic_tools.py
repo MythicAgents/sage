@@ -333,7 +333,7 @@ import re
 import uuid
 from typing import Annotated, Any, List, Dict, TypedDict
 import aiohttp
-from mythic import mythic, mythic_classes
+from mythic import graphql_queries, mythic, mythic_classes, mythic_utilities
 from mythic_container.MythicGoRPC import SendMythicRPCAPITokenCreate, MythicRPCAPITokenCreateMessage
 from mythic_container.logging import logger
 from langchain.tools import tool, BaseTool
@@ -390,6 +390,11 @@ def _summarize_footprint(axes: dict) -> str:
 # purpose — these feed the issue_task circuit breaker, where a false positive on a SUCCESSFUL command
 # (whose output merely quotes one of these strings as data) would wrongly count toward a STOP and
 # block legitimate tasking. Do NOT add generic phrases here (see _READ_FAILURE_SIGNATURES).
+# A Mythic task reference: the `@<keyword>:` form the server expands into a full object before the
+# agent sees it. `cred` and `link` are the two providers Mythic registers
+# (rabbitmq/task_reference_credential.go, task_reference_link.go).
+_TASK_REFERENCE_VALUE_RE = re.compile(r"^@(?:cred|link)[:(]", re.I)
+
 _TASK_FAILURE_SIGNATURES = (
     "failed to parse arguments",
     "don't match any parameters",
@@ -4840,6 +4845,12 @@ class MythicTools:
         if registered_file_blocker:
             return registered_file_blocker
 
+        # Parameter group the pre-flight below resolves for this task. Whether it is actually
+        # DECLARED to Mythic is decided per issue attempt by `_parameter_group_to_declare`, because
+        # the answer depends on the parameters as they stand at that moment: the credential repair
+        # path can turn raw material into a reference between the first attempt and the retry.
+        resolved_parameter_group = None
+
         # Deterministic pre-flight: first repair prior-key names and group mixes against the
         # live schema, then keep the existing validator as the conservative hard stop.
         if isinstance(parameters, dict) and parameters:
@@ -4850,6 +4861,7 @@ class MythicTools:
                     resolved = command_builder.resolve_params(param_schema, parameters, command=command)
                     if resolved.ok:
                         parameters = resolved.params
+                        resolved_parameter_group = resolved.group
                         parameters = await self._bind_mythic_credential_parameters(
                             command,
                             parameters,
@@ -5027,9 +5039,11 @@ class MythicTools:
                             )
                             parameters = "{}"
                     try:
-                        task = await mythic.issue_task(
-                            mythic=self.client, command_name=command, parameters=parameters,
-                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        task = await self._issue_mythic_task(
+                            command, parameters, callback_display_id, timeout=timeout,
+                            parameter_group_name=self._parameter_group_to_declare(
+                                resolved_parameter_group, parameters, command=command
+                            ),
                         )  # token_id=token_id
                     except Exception as exc:
                         if not self._is_mythic_credential_reference_rejection(exc):
@@ -5066,9 +5080,11 @@ class MythicTools:
                         )
                         if contract_binding_blocker:
                             raise PermissionError(contract_binding_blocker)
-                        task = await mythic.issue_task(
-                            mythic=self.client, command_name=command, parameters=parameters,
-                            callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+                        task = await self._issue_mythic_task(
+                            command, parameters, callback_display_id, timeout=timeout,
+                            parameter_group_name=self._parameter_group_to_declare(
+                                resolved_parameter_group, parameters, command=command
+                            ),
                         )  # token_id=token_id
                     tdid = task.get("display_id") if isinstance(task, dict) else None
                     if tdid is None:
@@ -9235,7 +9251,18 @@ class MythicTools:
                 }, action_obj, input_values, callback_id, issued=all_issued)
 
             if self._capability_needs_runtime_materialization(action_obj, input_values):
-                materialized_raw = await self.materialize_capability_inputs(action_obj, input_values)
+                # `materialize_capability_inputs` declares `action: dict | str`, and its
+                # request-contract guard canonicalizes whatever it is handed
+                # (`request_contract.canonical_action_arguments`), which refuses any non-JSON
+                # value. Passing the dataclass straight through therefore denies Sage's own
+                # internal call with `arguments.action contains non-JSON value CapabilityAction`,
+                # which halted `adcs-certificate-auth` on a serialization mismatch rather than on
+                # anything to do with the capability. Hand it the JSON form the signature asks for;
+                # `_capability_tool_action` rebuilds the dataclass on the other side.
+                materialized_raw = await self.materialize_capability_inputs(
+                    asdict(action_obj) if is_dataclass(action_obj) else action_obj,
+                    input_values,
+                )
                 try:
                     materialized_payload = json.loads(materialized_raw)
                 except Exception:
@@ -17285,7 +17312,121 @@ class MythicTools:
     @staticmethod
     def _is_mythic_credential_reference_rejection(value) -> bool:
         text = str(value or "").casefold()
-        return "cred parameters require @cred task references" in text
+        # Mythic's actual text is "credential parameters require @cred:<id> task references"
+        # (mythic-docker/src/rabbitmq/task_reference_credential.go:55). The original literal
+        # required "@cred task" where the real message reads "@cred:<id> task", so it never matched
+        # the one message it exists to catch and the repair path below could not fire. Both
+        # spellings are matched because a predicate whose silent False disables an entire repair
+        # path earns the wider net, and the historical literal is still asserted by a passing test.
+        return (
+            "cred parameters require @cred task references" in text
+            or "credential parameters require @cred" in text
+        )
+
+    @classmethod
+    def _carries_task_reference(cls, value) -> bool:
+        """True when any value in this parameter blob is a `@cred:`/`@link:` task reference."""
+        if isinstance(value, str):
+            return bool(_TASK_REFERENCE_VALUE_RE.match(value.strip()))
+        if isinstance(value, dict):
+            return any(cls._carries_task_reference(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(cls._carries_task_reference(item) for item in value)
+        return False
+
+    @classmethod
+    def _parameter_group_to_declare(cls, group, parameters, *, command: str = "") -> str | None:
+        """The parameter group worth declaring to Mythic, or None when declaring it would hurt.
+
+        Two independent reasons to stay silent, and the second is the important one.
+
+        `"Default"` is what Mythic substitutes for a task that declares no group
+        (`rabbitmq/util_create_task.go:678-681`), so declaring it is a provable no-op. Returning
+        None keeps every such task on exactly the call it made before this existed.
+
+        More consequentially, a declared group is what makes Mythic register that group's
+        structured parameters as reference-bearing, and a registered structured parameter then
+        *requires* a reference: raw credential material is refused with `Error: processing
+        arguments`. Sage must keep the raw form available, because an agent whose credentials are
+        not in Mythic's store (Merlin, unlike Apollo) can only be tasked that way. So the group is
+        declared only when the blob actually carries a reference for Mythic to expand. Raw
+        material takes the same path it always took.
+        """
+        name = str(group or "").strip()
+        carries_reference = cls._carries_task_reference(parameters)
+        if not name or name == "Default":
+            if carries_reference and not name:
+                # A reference with no group to scope it is the original defect: the server falls
+                # back to "Default", the referenced parameter is not found there, and the token
+                # reaches the agent literally. Nothing can be done at issue time, but it must not
+                # be silent — this is the one path where the fix cannot take effect.
+                logger.warning(
+                    f"🔗 [task-reference] {command or 'command'} carries a task reference but no "
+                    "parameter group could be resolved; Mythic will look it up under 'Default' "
+                    "and the reference may reach the agent unresolved"
+                )
+            return None
+        if not carries_reference:
+            return None
+        return name
+
+    async def _issue_mythic_task(
+        self, command, parameters, callback_display_id, *, timeout=None, parameter_group_name=None
+    ):
+        """Issue one Mythic task, declaring its parameter group when that group is not the default.
+
+        Without a group, `@cred:`/`@link:` references are unusable for any parameter outside the
+        `Default` group: reference expansion looks the command's parameters up filtered by group
+        (`rabbitmq/task_reference.go:167-174`, `WHERE command_id=$1 AND parameter_group_name=$2`),
+        so a parameter living elsewhere is never registered as reference-bearing, the reference
+        reaches the agent as a literal string, and nothing binds it. Observed as Apollo rejecting
+        `make_token` with `Supplied Arguments, []`, its `credential` parameter sitting in
+        `credential_store`.
+        """
+        if not parameter_group_name:
+            return await mythic.issue_task(
+                mythic=self.client, command_name=command, parameters=parameters,
+                callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
+            )
+        return await self._issue_task_with_parameter_group(
+            command, parameters, callback_display_id, parameter_group_name,
+        )
+
+    async def _issue_task_with_parameter_group(
+        self, command, parameters, callback_display_id, parameter_group_name
+    ):
+        """Post the upstream `createTask` mutation with the one variable `issue_task` never fills.
+
+        `mythic.issue_task` does not expose `parameter_group_name` and omits the key from its
+        variables entirely, but the mutation it posts already declares `$parameter_group_name`
+        (`mythic/graphql_queries.py:22-23`). This reuses that same mutation rather than inventing a
+        second query, and mirrors `issue_task`'s own variable set and success handling so the
+        caller sees the identical `createTask` payload and the identical failure exception.
+        """
+        parameter_string = parameters
+        if isinstance(parameters, dict):
+            parameter_string = json.dumps(parameters)
+        submission_status = await mythic_utilities.graphql_post(
+            mythic=self.client,
+            gql_query=graphql_queries.create_task,
+            variables={
+                "callback_display_id": callback_display_id,
+                "command": command,
+                "params": parameter_string,
+                "token_id": None,
+                "is_interactive_task": False,
+                "interactive_task_type": None,
+                "parent_task_display_id": None,
+                "tasking_location": "command_line" if isinstance(parameters, str) else "scripting",
+                "files": None,
+                "payload_type": None,
+                "parameter_group_name": parameter_group_name,
+            },
+        )
+        status = (submission_status or {}).get("createTask") or {}
+        if status.get("status") != "success":
+            raise Exception(f"Failed to create task: {status.get('error')}")
+        return status
 
     async def _fetch_command_schema(self, command, callback_display_id):
         """Resolve the parameter-group schema for `command` on the callback's payload type.

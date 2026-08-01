@@ -19,10 +19,18 @@ from mythic import mythic
 
 SERVER = "127.0.0.1"
 USER = "mythic_admin"
-# No directory-name fallback: guessing a Mythic checkout name would bake one machine's
-# layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
-# MYTHIC_ADMIN_PASSWORD directly and skip the .env entirely.
-MYTHIC_ENV_PATHS: tuple[Path, ...] = ()
+# `MYTHIC_ENV_PATH` and nothing else. No directory-name fallback: guessing a Mythic checkout name
+# would bake one machine's layout into the repo and silently read the wrong install where two
+# exist. Empty when the variable is unset, and `resolve_password` then fails closed naming both
+# variables. Mirrors `Payload_Type/sage/evals/harness.py`, which reads the same variable — this
+# resolver previously read neither, so every caller that passes no argument (eleven focused
+# capability scripts) died with `Authentication Failed` unless the operator had already exported
+# the secret by hand, which inverts the order AGENTS.md documents.
+MYTHIC_ENV_PATHS: tuple[Path, ...] = (
+    (Path(os.environ["MYTHIC_ENV_PATH"]),)
+    if os.environ.get("MYTHIC_ENV_PATH", "").strip()
+    else ()
+)
 
 
 def resolve_password(env_paths: Path | tuple[Path, ...] = MYTHIC_ENV_PATHS) -> str:
@@ -42,7 +50,8 @@ def resolve_password(env_paths: Path | tuple[Path, ...] = MYTHIC_ENV_PATHS) -> s
             if key.strip() == "MYTHIC_ADMIN_PASSWORD" and value.strip():
                 return value.strip().strip("'\"")
     raise RuntimeError(
-        "Set MYTHIC_ADMIN_PASSWORD or provide a Mythic .env with MYTHIC_ADMIN_PASSWORD."
+        "Set MYTHIC_ADMIN_PASSWORD, or point MYTHIC_ENV_PATH at your Mythic install's .env "
+        "(see .env.example). Neither is set, and no checkout location is guessed."
     )
 
 

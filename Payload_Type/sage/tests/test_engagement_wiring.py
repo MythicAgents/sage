@@ -107,21 +107,57 @@ def _bloodhound_proof(task_id, callback_id="13", *, engagement_id=None):
 @contextmanager
 def _split_issue(output, calls=None, display_id=4242):
     """Patch the split issue path (issue_task + waitfor_for_task_output). issue_task increments
-    calls['issue'] (if given) and returns a task with `display_id`; the wait returns `output`."""
+    calls['issue'] (if given) and returns a task with `display_id`; the wait returns `output`.
+
+    There are two issue seams, not one. A task whose parameters resolve to a non-`Default`
+    parameter group is posted through `mythic_utilities.graphql_post` so it can declare that group
+    — Mythic resolves `@cred:` references against parameters filtered by group and otherwise
+    assumes `Default`, which is why `make_token`'s `credential_store` parameter never bound. Both
+    seams record into the same `calls` shape, with `parameter_group` carrying the declared group
+    (None on the legacy path), so a test asserts on what was issued without caring which path
+    carried it."""
+    def _record(command_name, parameters, callback_display_id, parameter_group):
+        if calls is None:
+            return
+        calls["issue"] = calls.get("issue", 0) + 1
+        calls.setdefault("issued", []).append({
+            "command_name": command_name,
+            "parameters": parameters,
+            "callback_display_id": callback_display_id,
+            "parameter_group": parameter_group,
+        })
+
     async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
-        if calls is not None:
-            calls["issue"] = calls.get("issue", 0) + 1
-            calls.setdefault("issued", []).append({
-                "command_name": command_name,
-                "parameters": parameters,
-                "callback_display_id": callback_display_id,
-            })
+        _record(command_name, parameters, callback_display_id, None)
         return {"display_id": display_id}
+
+    real_graphql_post = mythic_tools.mythic_utilities.graphql_post
+
+    async def fake_graphql_post(mythic, gql_query=None, query=None, variables=None):
+        # `graphql_post` is a shared upstream seam, not a task-issue seam — callback liveness and
+        # credential lookups reach it too. Intercept ONLY the createTask mutation and delegate the
+        # rest, or patching it silently answers every unrelated query with a task submission.
+        if gql_query is not mythic_tools.graphql_queries.create_task:
+            return await real_graphql_post(
+                mythic=mythic, gql_query=gql_query, query=query, variables=variables
+            )
+        variables = variables or {}
+        params = variables.get("params")
+        if variables.get("tasking_location") == "scripting":
+            params = json.loads(params)
+        _record(
+            variables.get("command"),
+            params,
+            variables.get("callback_display_id"),
+            variables.get("parameter_group_name"),
+        )
+        return {"createTask": {"status": "success", "display_id": display_id}}
 
     async def fake_waitfor(mythic, task_display_id, timeout=None):
         return output() if callable(output) else output
 
     with patch.object(mythic_tools.mythic, "issue_task", fake_issue_task), \
+         patch.object(mythic_tools.mythic_utilities, "graphql_post", fake_graphql_post), \
          patch.object(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor):
         yield
 
@@ -8615,12 +8651,31 @@ def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypat
         assert command == "make_token"
         return _apollo_make_token_schema()
 
-    async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+    # `make_token`'s credential parameter lives in the `credential_store` group, so this task is
+    # This test walks both issue seams, which is the point of it. `delayed_bind` below suppresses
+    # the credential binder on the first attempt, so attempt 1 sends RAW material and takes the
+    # unchanged `mythic.issue_task` path — a group is declared only for a blob that actually
+    # carries a reference, because declaring one makes Mythic refuse raw material and agents
+    # without a Mythic credential store can only be tasked that way. The repair turns the raw
+    # object into `@cred:91`, so attempt 2 posts createTask with `credential_store` declared.
+    real_graphql_post = mythic_tools.mythic_utilities.graphql_post
+
+    def _record(params, group):
         calls["issue"] += 1
-        calls.setdefault("parameters", []).append(parameters)
-        if calls["issue"] == 1:
-            raise Exception("Failed to process task references: cred parameters require @cred task references")
-        return {"display_id": 7300}
+        calls.setdefault("parameters", []).append(params)
+        calls.setdefault("groups", []).append(group)
+
+    async def fake_issue_task(mythic, command_name, parameters, callback_display_id, wait_for_complete=True, timeout=None):
+        _record(parameters, None)
+        raise Exception("Failed to process task references: cred parameters require @cred task references")
+
+    async def fake_graphql_post(mythic, gql_query=None, query=None, variables=None):
+        if gql_query is not mythic_tools.graphql_queries.create_task:
+            return await real_graphql_post(
+                mythic=mythic, gql_query=gql_query, query=query, variables=variables
+            )
+        _record(json.loads(variables["params"]), variables.get("parameter_group_name"))
+        return {"createTask": {"status": "success", "display_id": 7300}}
 
     async def fake_waitfor(mythic, task_display_id, timeout=None):
         return "Successfully impersonated ws01\\Administrator for remote access."
@@ -8634,6 +8689,7 @@ def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypat
         "credential_text": "CorrectHorseBatteryStaple!",
     }])
     monkeypatch.setattr(mythic_tools.mythic, "issue_task", fake_issue_task)
+    monkeypatch.setattr(mythic_tools.mythic_utilities, "graphql_post", fake_graphql_post)
     monkeypatch.setattr(mythic_tools.mythic, "waitfor_for_task_output", fake_waitfor)
     original_bind = mt._bind_mythic_credential_parameters
     bind_calls = {"count": 0}
@@ -8667,6 +8723,12 @@ def test_issue_path_repairs_mythic_credential_reference_rejection_once(monkeypat
     assert calls["issue"] == 2
     assert isinstance(calls["parameters"][0]["Credential"], dict)
     assert calls["parameters"][1]["Credential"] == "@cred:91"
+    # The group follows the parameters, not the command: raw material on attempt 1 declares
+    # nothing (so Mythic still accepts it), and the repaired reference on attempt 2 declares
+    # `credential_store` (so Mythic can expand it). A reference issued without its group would be
+    # looked up under "Default", not found, and reach the agent as a literal string — the exact
+    # defect this path exists to recover from.
+    assert calls["groups"] == [None, "credential_store"]
 
 
 def test_bound_credential_contexts_keep_distinct_make_token_identities(monkeypatch):
@@ -8846,6 +8908,9 @@ def test_issue_path_wraps_merlin_shell_command_line_from_live_schema(monkeypatch
         "command_name": "shell",
         "parameters": {"args": r"type \\north.local\SYSVOL\north.local\Policies\{GUID}\ScheduledTasks.xml"},
         "callback_display_id": 2,
+        # Merlin's `shell` resolves to the Default group, which Mythic already assumes, so this
+        # task declares no group and takes the unchanged `issue_task` path.
+        "parameter_group": None,
     }]
 
 
@@ -9332,6 +9397,8 @@ def test_native_dcsync_issue_path_qualifies_before_mythic_task():
             "DC": "winterfell.north.sevenkingdoms.local",
         },
         "callback_display_id": 2,
+        # Default group — declared nowhere, so the legacy issue path carries it unchanged.
+        "parameter_group": None,
     }]
 
 

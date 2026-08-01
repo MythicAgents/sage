@@ -87,3 +87,58 @@ def test_ludus_creds_selects_named_mcp_server_without_changing_default(monkeypat
 
     monkeypatch.setenv(MODULE.MCP_SERVER_ENV, "ludus_sagerepl")
     assert MODULE.ludus_creds(mcp_path) == ("https://sagerepl", "sagerepl.key")
+
+
+# --- WinRM auth readiness ---------------------------------------------------------------------
+#
+# A rolled-back guest reports its IP through the Ludus agent well before AD can authenticate a
+# domain account. On 2026-08-01 the reset waited only for IPs, then synced, and DC01 answered
+# `InvalidCredentialsError: 401` with perfectly correct credentials; a read-only check minutes
+# later reached all five hosts. The wait below is on the condition that actually gates the sync.
+
+
+def _hosts(*names):
+    return [{"inventory_hostname": name, "ansible_host": f"10.0.0.{i}"} for i, name in enumerate(names, 1)]
+
+
+def test_auth_wait_returns_immediately_when_every_host_answers(monkeypatch):
+    monkeypatch.setattr(MODULE, "winrm_session", lambda host: host)
+    monkeypatch.setattr(MODULE, "run_ps", lambda session, script: "")
+    result = MODULE.wait_for_winrm_auth(_hosts("dc01", "dc02"), sleep=lambda _s: None)
+    assert result == {"ready": True, "attempts": 1, "pending": [], "last_error": ""}
+
+
+def test_auth_wait_retries_until_a_late_host_authenticates(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky(session, script):
+        calls["n"] += 1
+        if session["inventory_hostname"] == "dc01" and calls["n"] < 3:
+            raise RuntimeError("the specified credentials were rejected by the server")
+        return ""
+
+    monkeypatch.setattr(MODULE, "winrm_session", lambda host: host)
+    monkeypatch.setattr(MODULE, "run_ps", flaky)
+    result = MODULE.wait_for_winrm_auth(_hosts("dc01"), sleep=lambda _s: None)
+    assert result["ready"] is True
+    assert result["attempts"] == 3
+
+
+def test_auth_wait_gives_up_within_its_budget_and_names_the_pending_hosts(monkeypatch):
+    clock = {"t": 0.0}
+
+    def never(session, script):
+        raise RuntimeError("the specified credentials were rejected by the server")
+
+    monkeypatch.setattr(MODULE, "winrm_session", lambda host: host)
+    monkeypatch.setattr(MODULE, "run_ps", never)
+    result = MODULE.wait_for_winrm_auth(
+        _hosts("dc01", "dc02"),
+        timeout_seconds=30,
+        poll_seconds=10,
+        sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+        now=lambda: clock["t"],
+    )
+    assert result["ready"] is False
+    assert result["pending"] == ["dc01", "dc02"]
+    assert "rejected by the server" in result["last_error"]

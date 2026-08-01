@@ -30,11 +30,16 @@ TEST_ROOT = REPO_ROOT / "Payload_Type" / "sage" / "tests"
 # Repository hygiene (portability, privacy, build context) lives outside the Sage suite because it
 # tests the repo rather than the product. It still runs here — a guard nobody executes is not a guard.
 HYGIENE_ROOT = REPO_ROOT / "tests" / "repo_hygiene"
+# The operator skills carry their own tests and were outside this tier until 2026-08-01, so 215
+# tests covering the reset, bootstrap, live-runner and governor tooling gated nothing. That is a
+# large part of why those skills drifted out from under the workflow while the product suite stayed
+# green. "One tier, no exclusions" is only true with this root included.
+SKILLS_ROOT = REPO_ROOT / "skills"
 DEV_REQUIREMENTS = REPO_ROOT / "Payload_Type" / "sage" / "requirements-dev.txt"
 
 
 def command_for(pytest_args: list[str]) -> list[str]:
-    command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT)]
+    command = [sys.executable, "-m", "pytest", str(TEST_ROOT), str(HYGIENE_ROOT), str(SKILLS_ROOT)]
     command.extend(pytest_args or ["-q"])
     return command
 

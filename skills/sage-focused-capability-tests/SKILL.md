@@ -34,6 +34,10 @@ argument is still accepted and ignored. See `docs/development/TEST_TIERS.md`.
 - `run_focused_local_admin_access.py`
 - `run_focused_local_admin_remote_exec.py`
 - `run_focused_managed_secret_read.py`
+- `run_focused_parameter_group_reference.py` — proves a `@cred:`/`@link:` task reference resolves
+  for a parameter outside the `Default` group. `--mode reference` is the proof; `--mode raw-control`
+  sends raw credential material instead, which a declared group causes Mythic to reject. Verdict is
+  taken from decoded agent output, never from Mythic's `completed` status.
 - `run_focused_parent_dcsync.py`
 - `run_focused_sid_history.py`
 - `run_focused_ticket_context_proof.py`

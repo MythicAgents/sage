@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
@@ -507,8 +508,129 @@ def channel_status(
     }
 
 
+# "not supplied, go and probe" must not share a value with "probed, and the answer is unknown".
+# Collapsing them is how a fail-closed branch becomes unreachable.
+_UNSET: Any = object()
+
+SAGE_DEPLOYMENT_MODES = ("local", "container")
+DEFAULT_SAGE_DEPLOYMENT_MODE = "local"
+SAGE_CONTAINER_NAME = "sage"
+
+
+def resolve_sage_deployment_mode(value: Any = None) -> str:
+    """Which Sage is meant to serve Mythic: the tmux process or the Docker container."""
+    return str(
+        value or os.environ.get("SAGE_DEPLOYMENT_MODE") or DEFAULT_SAGE_DEPLOYMENT_MODE
+    ).strip().casefold()
+
+
+def probe_sage_container_running(name: str = SAGE_CONTAINER_NAME) -> bool | None:
+    """True/False when docker answers, None when it cannot be asked.
+
+    None is deliberately distinct from False: "no container" and "cannot tell" must not collapse,
+    because the second is a reason to refuse rather than to proceed.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return name in {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def probe_local_sage_running(repo_root: Path = REPO_ROOT, proc_root: Path = Path("/proc")) -> bool:
+    """A host process running this repo's own `main.py`, found through /proc.
+
+    Deliberately not `pgrep -f main.py`: that matches the shell which invoked it, which is exactly
+    how a cwd check once reported the calling command instead of Sage.
+    """
+    marker = str(repo_root / ".venv")
+    if not proc_root.is_dir():
+        return False
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except Exception:
+            continue
+        if "main.py" in cmdline and marker in cmdline:
+            return True
+    return False
+
+
+def sage_deployment_status(
+    *,
+    mode: Any = None,
+    container_running: bool | None = _UNSET,
+    local_running: bool | None = _UNSET,
+    repo_root: Path = REPO_ROOT,
+    require_intended_running: bool = True,
+) -> dict[str, Any]:
+    """Exactly one Sage may serve Mythic's `sage` service queue.
+
+    `require_intended_running=False` narrows this to the conflict alone: the unintended Sage must
+    be down, but the intended one need not be up yet. That is the mid-reset state — Mythic is
+    restarted long before Sage is, so demanding a live local Sage there would fail every reset.
+
+    `mythic-cli start` starts EVERY registered service, so resetting Mythic silently brings the
+    Sage container up alongside a tmux Sage. Both register as `sage`, one wins the RabbitMQ queue,
+    and requests are answered by whichever won. Observed 2026-08-01: the container answered a chat
+    request using code that was not the working tree and had no BloodHound MCP directory, while the
+    losing tmux process logged `Another instance of this service, sage, is running` on a loop.
+    Nothing in this contract could see that, so it reported `ready: true`.
+    """
+    resolved = resolve_sage_deployment_mode(mode)
+    if container_running is _UNSET:
+        container_running = probe_sage_container_running()
+    if local_running is _UNSET:
+        local_running = probe_local_sage_running(repo_root)
+    blockers: list[str] = []
+    if resolved not in SAGE_DEPLOYMENT_MODES:
+        blockers.append(
+            f"unknown SAGE_DEPLOYMENT_MODE {resolved!r}; expected one of "
+            f"{', '.join(SAGE_DEPLOYMENT_MODES)}"
+        )
+    elif container_running is None:
+        blockers.append(
+            "could not determine whether the Sage container is running; docker did not answer"
+        )
+    elif resolved == "local":
+        if container_running:
+            blockers.append(
+                "Sage docker container is running in local mode; stop it "
+                "(`mythic-cli stop sage`) or set SAGE_DEPLOYMENT_MODE=container"
+            )
+        if require_intended_running and not local_running:
+            blockers.append("no local Sage process is running in local mode")
+    else:
+        if require_intended_running and not container_running:
+            blockers.append("Sage docker container is not running in container mode")
+        if local_running:
+            blockers.append(
+                "a local Sage process is running in container mode; stop it "
+                "(`sage_stop.sh`) or set SAGE_DEPLOYMENT_MODE=local"
+            )
+    return {
+        "ready": not blockers,
+        "mode": resolved,
+        "container_running": container_running,
+        "local_process_running": bool(local_running),
+        "require_intended_running": require_intended_running,
+        "blockers": blockers,
+    }
+
+
 def build_readiness_report(
     *,
+    sage_deployment: dict[str, Any],
     runtime_identity: dict[str, Any],
     runtime_databases: dict[str, Any],
     ludus: dict[str, Any],
@@ -520,6 +642,7 @@ def build_readiness_report(
     channel: dict[str, Any],
 ) -> dict[str, Any]:
     sections = {
+        "sage_deployment": sage_deployment,
         "runtime_identity": runtime_identity,
         "runtime_databases": runtime_databases,
         "ludus": ludus,
@@ -606,6 +729,7 @@ async def collect_operator_readiness(
     bloodhound_api_observation: dict[str, Any] | None = None,
     bloodhound_mcp_observation: dict[str, Any] | None = None,
     require_prepared_channel: bool = True,
+    sage_deployment_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ludus_section = ludus_observation if ludus_observation is not None else probe_ludus_status()
     clock_section = clock_observation if clock_observation is not None else probe_clock_status()
@@ -620,6 +744,11 @@ async def collect_operator_readiness(
         else await probe_bloodhound_mcp_tools()
     )
     return build_readiness_report(
+        sage_deployment=(
+            sage_deployment_observation
+            if sage_deployment_observation is not None
+            else sage_deployment_status(repo_root=repo_root)
+        ),
         runtime_identity=startup_identity_from_env(),
         runtime_databases=runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived),
         ludus=ludus_section,
