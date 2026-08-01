@@ -247,3 +247,54 @@ def test_no_interpolated_graphql_remains_in_the_args_tool():
     assert "$command_name" in metadata_source, (
         "the replacement path must be parameterized, not merely free of .replace()"
     )
+
+
+def test_needs_admin_reaches_footprints_scoring_through_the_plural_tool(monkeypatch):
+    """ISC-2.6 — `needs_admin` is carried so footprint can score from it, not for decoration.
+
+    The command-level flag lives *outside* `commandparameters`, which makes it exactly the kind of
+    field a regrouping drops without anything noticing. Asserting the key is present would not
+    catch that: `footprint._extract_command_metadata` reads `needs_admin` off the schema *items*,
+    so production has to splice it into the list footprint walks. If that splice is removed the
+    field still appears in the output and only the score changes.
+
+    So this compares two commands identical except for the flag and requires the scores to differ.
+    A dropped splice makes the two footprints equal and turns this red.
+
+    Range-agnostic on purpose: generic names, no GOAD identifiers, so a range-coupled branch could
+    not pass here by accident.
+    """
+    from ai.langgraph import mythic_tools as mt
+
+    def _cmd(name, needs_admin):
+        return {
+            "cmd": name,
+            "needs_admin": needs_admin,
+            "description": "",
+            "help_cmd": "",
+            "commandparameters": [
+                {"name": "path", "type": "String", "parameter_group_name": "Default"}
+            ],
+        }
+
+    async def fake_commands(client, payload, attr):
+        return [_cmd("alpha", False), _cmd("bravo", True)]
+
+    monkeypatch.setattr(mt.mythic, "get_all_commands_for_payloadtype", fake_commands)
+
+    tool = MythicTools.__new__(MythicTools)
+    tool.client = object()
+    tool._command_schema_cache = {}
+
+    parsed = json.loads(asyncio.run(tool.get_all_commands_for_payloadtype("agent")))
+    by_cmd = {entry["cmd"]: entry for entry in parsed}
+
+    plain = by_cmd["alpha"]["footprint"]
+    admin = by_cmd["bravo"]["footprint"]
+
+    assert admin["new_process"] > plain["new_process"], (
+        "needs_admin must raise new_process; equal scores mean the flag never reached footprint"
+    )
+    assert admin["reversibility"] > plain["reversibility"], (
+        "needs_admin must raise reversibility for the same reason"
+    )
