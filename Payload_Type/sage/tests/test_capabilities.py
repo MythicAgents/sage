@@ -4408,15 +4408,20 @@ def test_adcs_certificate_auth_probe_requires_service_proof():
     assert achieved["certificate_auth_proven"] is True
 
 
-def test_adcs_certificate_auth_probe_accepts_schannel_ldap_domain_admin_proof():
+def test_adcs_certificate_auth_probe_rejects_schannel_ldap_self_read_as_control():
+    """A Schannel bind that only authenticates and reads the account's own group membership is
+    authentication, not usable domain control. It must NOT close the da: effect (RCA 2026-08-01:
+    a bind-only self-read certified da:essos.local with no usable credential)."""
     output = "\n".join([
         "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
         "CERT_AUTH_METHOD=schannel-ldap",
         "CERT_AUTH_DOMAIN=lab.local",
         "CERT_AUTH_ACCOUNT=administrator",
         "CERT_AUTH_LDAP_BIND=True",
+        "CERT_AUTH_WHOAMI=u:LAB\\Administrator",
         "CERT_AUTH_USER_DN=CN=Administrator,CN=Users,DC=lab,DC=local",
         "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
+        "CERT_AUTH_DOMAIN_ADMIN=True",
         "CERT_AUTH_STATUS=OK",
     ])
 
@@ -4429,10 +4434,42 @@ def test_adcs_certificate_auth_probe_accepts_schannel_ldap_domain_admin_proof():
     probe["callback_id"] = "13"
     verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
 
-    assert verdict.verdict == "achieved"
+    # Authentication signals are still recognized...
     assert probe["schannel_ldap_bind"] is True
     assert probe["domain_admin"] is True
+    # ...but a self-read is not control: not proven, not achieved.
+    assert probe["service_access_proven"] is False
+    assert probe["certificate_auth_proven"] is False
+    assert verdict.verdict == "partial"
+
+
+def test_adcs_certificate_auth_probe_accepts_schannel_bind_with_privileged_action():
+    """A Schannel-authenticated cert that then performs a reproducible privileged action (DC C$
+    listing) is genuine control and closes the effect."""
+    output = "\n".join([
+        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+        "CERT_AUTH_METHOD=schannel-ldap",
+        "CERT_AUTH_DOMAIN=lab.local",
+        "CERT_AUTH_ACCOUNT=administrator",
+        "CERT_AUTH_LDAP_BIND=True",
+        "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
+        " Directory of \\\\dc01.lab.local\\C$",
+        "Windows",
+        "CERT_AUTH_STATUS=OK",
+    ])
+
+    probe = capabilities.extract_adcs_certificate_auth_probe(
+        output,
+        "administrator",
+        "lab.local",
+        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+    )
+    probe["callback_id"] = "13"
+    verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
+
+    assert probe["service_access_proven"] is True
     assert probe["certificate_auth_proven"] is True
+    assert verdict.verdict == "achieved"
 
 
 def test_adcs_certificate_auth_probe_classifies_pkinit_not_supported():
@@ -4449,6 +4486,84 @@ def test_adcs_certificate_auth_probe_classifies_pkinit_not_supported():
     assert probe["pkinit_not_supported"] is True
     assert verdict.verdict == "blocked"
     assert verdict.reason == "pkinit not supported"
+
+
+def test_adcs_certificate_auth_probe_accepts_da_only_read_negative_control():
+    """A DA-only read (domain SACL) that the cert-DA session retrieved and an authenticated
+    non-admin control session was DENIED is a privileged-operation proof and closes the effect."""
+    output = "\n".join([
+        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+        "CERT_AUTH_METHOD=schannel-ldap",
+        "CERT_AUTH_DOMAIN=lab.local",
+        "CERT_AUTH_ACCOUNT=administrator",
+        "CERT_AUTH_LDAP_BIND=True",
+        "CERT_AUTH_WHOAMI=u:LAB\\Administrator",
+        "DA_ONLY_READ_OP=domain-sacl",
+        "DA_SACL_STATUS=sacl",
+        "DA_SACL_ACE_COUNT=4",
+        "CONTROL_BIND=True",
+        "CONTROL_WHOAMI=u:LAB\\lowpriv",
+        "CONTROL_SACL_STATUS=no-sacl",
+        "DA_ONLY_READ_PROVEN=True",
+        "CERT_AUTH_STATUS=OK",
+    ])
+
+    probe = capabilities.extract_adcs_certificate_auth_probe(
+        output, "administrator", "lab.local", "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+    )
+    probe["callback_id"] = "13"
+    verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
+
+    assert probe["da_only_read_proven"] is True
+    assert probe["certificate_auth_proven"] is True
+    assert verdict.verdict == "achieved"
+
+
+def test_adcs_certificate_auth_probe_rejects_da_only_read_when_control_not_denied():
+    """If the non-admin control session was NOT denied the same read, the operation is not
+    DA-exclusive, so the emitter reports DA_ONLY_READ_PROVEN=False and it must not close the
+    effect. This is the 'not something everyone can do' falsifier."""
+    output = "\n".join([
+        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+        "CERT_AUTH_METHOD=schannel-ldap",
+        "CERT_AUTH_DOMAIN=lab.local",
+        "CERT_AUTH_ACCOUNT=administrator",
+        "CERT_AUTH_LDAP_BIND=True",
+        "DA_ONLY_READ_OP=domain-sacl",
+        "DA_SACL_STATUS=sacl",
+        "CONTROL_BIND=True",
+        "CONTROL_SACL_STATUS=sacl",
+        "DA_ONLY_READ_PROVEN=False",
+        "CERT_AUTH_STATUS=OK",
+    ])
+
+    probe = capabilities.extract_adcs_certificate_auth_probe(
+        output, "administrator", "lab.local", "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+    )
+    probe["callback_id"] = "13"
+    verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
+
+    assert probe["da_only_read_proven"] is False
+    assert probe["certificate_auth_proven"] is False
+    assert verdict.verdict == "partial"
+
+
+def test_adcs_certificate_auth_plan_prefers_schannel_when_pkinit_unsupported_observed():
+    """Observation-driven selection: with no explicit method, an observed pkinit_not_supported
+    signal routes to the Schannel plan (no forced Rubeus); absent the signal the generic PKINIT
+    default stands."""
+    action = capabilities._adcs_certificate_auth_action("lab.local", "ca01", "administrator", "13")
+
+    observed = capabilities.build_capability_execution_plan(
+        action, {"pkinit_not_supported": True, "certificate_already_forged": True},
+    )
+    assert any(step.operation == "certificate-schannel-ldap-proof" for step in observed.steps)
+    assert all(step.operation != "certificate-pkinit-tgt" for step in observed.steps)
+
+    default = capabilities.build_capability_execution_plan(
+        action, {"certificate_already_forged": True},
+    )
+    assert any(step.operation == "certificate-pkinit-tgt" for step in default.steps)
 
 
 def test_remote_execution_probe_requires_target_side_marker():

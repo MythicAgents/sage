@@ -1146,29 +1146,48 @@ def verify_adcs_certificate_auth(probe_result: dict[str, Any]) -> CapabilityVeri
     account = _normalize(_input_text(probe_result, "account", "user", "principal", "target_account"))
     domain = _normalize(_input_text(probe_result, "domain", "realm", "target_domain"))
     auth_specific = _adcs_certificate_auth_specific_signal(probe_result)
-    access_signal = _any_true(
+    # A control signal proves *usable* domain control: captured credential material (the NTLM hash
+    # Rubeus /getcredentials returns on real PKINIT success), a reproducible privileged action on
+    # the target (DC C$ listing, remote exec, DC-side write), or a DA-only read confirmed by a
+    # deny/allow negative control (`da_only_read_proven`: an admin-gated read the DA session gets and
+    # an authenticated non-admin is denied). These are the only signals that may close a da: effect.
+    # Authentication-only markers are NOT control and must not close it: a
+    # Schannel LDAP bind that reads the account's own group membership, and a bare `base64(ticket.kirbi)`
+    # TGT marker, are both self-reported auth evidence — a real TGT must be *used* (service access) or
+    # accompanied by the credential material to count.
+    # RCA 2026-08-01: a bind-only self-read certified da:essos.local with no usable credential
+    # (PKINIT had failed KDC_ERR_PADATA_TYPE_NOSUPP); a follow-up `dir \\DC\C$` was Access Denied.
+    control_signal = _any_true(
         probe_result,
         (
             "service_access_proven",
-            "domain_admin",
-            "schannel_ldap_bind",
             "ntlm_hash_present",
+            "da_only_read_proven",
         ),
     )
-    access_proven = auth_specific and access_signal
-    if access_proven and callback_id and account and domain:
+    # Authentication-only: the certificate binds/maps to the account and the directory attests
+    # membership, but no privileged effect was demonstrated.
+    auth_only_signal = _any_true(
+        probe_result,
+        (
+            "schannel_ldap_bind",
+            "domain_admin",
+        ),
+    )
+    control_proven = auth_specific and control_signal
+    if control_proven and callback_id and account and domain:
         return CapabilityVerification(
             "achieved",
-            "ADCS certificate authentication proved usable access",
+            "ADCS certificate authentication proved usable domain control",
             _selected_probe(probe_result),
         )
-    if access_proven:
+    if control_proven:
         return CapabilityVerification(
             "partial",
-            "certificate-auth access was proven, but callback/account/domain identity is incomplete",
+            "certificate-auth control was proven, but callback/account/domain identity is incomplete",
             _selected_probe(probe_result),
         )
-    if access_signal and not auth_specific:
+    if control_signal and not auth_specific:
         return CapabilityVerification(
             "partial",
             "service access was proven, but no certificate-auth-specific proof was present",
@@ -1194,13 +1213,20 @@ def verify_adcs_certificate_auth(probe_result: dict[str, Any]) -> CapabilityVeri
     if blocker:
         return CapabilityVerification("blocked", blocker.replace("_", " "), _selected_probe(probe_result))
 
+    if auth_only_signal:
+        return CapabilityVerification(
+            "partial",
+            "certificate authenticated (schannel bind / directory membership), but no usable domain "
+            "control was demonstrated; capture credential material or perform a privileged action",
+            _selected_probe(probe_result),
+        )
+
     if _any_true(
         probe_result,
         (
             "certificate_forged",
             "forged_certificate_present",
             "pkinit_tgt_present",
-            "schannel_ldap_bind",
             "tgt_present",
             "ticket_imported",
             "ticket_context_created",
@@ -2360,6 +2386,11 @@ def extract_adcs_certificate_auth_probe(
     cert_auth_method = _first_output_field(text, "CERT_AUTH_METHOD").casefold()
     cert_auth_ldap_bind = _parse_probe_bool(_first_output_field(text, "CERT_AUTH_LDAP_BIND"))
     cert_auth_domain_admin = _parse_probe_bool(_first_output_field(text, "CERT_AUTH_DOMAIN_ADMIN"))
+    # DA-only read proof: the emitter set DA_ONLY_READ_PROVEN=True only when the DA session
+    # retrieved a directory read (domain SACL) that an authenticated non-admin control session was
+    # denied. That deny/allow differential is a privileged-operation proof a self-read cannot forge.
+    da_only_read_proven = _parse_probe_bool(_first_output_field(text, "DA_ONLY_READ_PROVEN")) is True
+    da_only_read_op = _first_output_field(text, "DA_ONLY_READ_OP")
     pfx_path = _first_output_field(text, "FORGED_PFX_PATH") or _first_output_field(text, "CERT_PFX_PATH")
     ntlm_hash = _first_output_field(text, "NTLM") or _first_output_field(text, "NTLM_HASH")
     if not ntlm_hash:
@@ -2375,12 +2406,12 @@ def extract_adcs_certificate_auth_probe(
         or ticket_b64
         or _has_any(low, ("tgt request successful", "base64(ticket.kirbi)"))
     )
-    service_access = bool(
-        ticket_probe.get("service_access_proven")
-        or cert_auth_status == "ok"
-        or cert_auth_ldap_bind is True
-        or _has_any(low, ("certificate_auth_proven=true", "cert_auth_status=ok"))
-    )
+    # Genuine privileged service access only — a reproducible action proof (DC C$ listing, remote
+    # exec, DC-side write) surfaced by the ticket probe. The Schannel script's own CERT_AUTH_STATUS=OK
+    # and CERT_AUTH_LDAP_BIND=True are self-reports of a successful bind + directory read; they are
+    # authentication, not service access, and must not stand in for a privileged action (RCA
+    # 2026-08-01). They still drive `auth_specific` and `schannel_ldap_bind` below.
+    service_access = bool(ticket_probe.get("service_access_proven"))
     schannel_domain_admin = bool(
         cert_auth_domain_admin is True
         or re.search(r"(?im)^\s*CERT_AUTH_MEMBER_OF\s*[:=]\s*CN=Domain Admins,", text)
@@ -2419,7 +2450,13 @@ def extract_adcs_certificate_auth_probe(
         "tgt_present": bool(pkinit_tgt or ticket_probe.get("tgt_present")),
         "ticket_valid": bool((ticket_probe.get("ticket_valid") or service_access) and auth_specific),
         "service_access_proven": service_access,
-        "certificate_auth_proven": bool(auth_specific and (service_access or domain_admin)),
+        # Proven == usable control: credential material, a privileged action, or a DA-only read
+        # confirmed by the deny/allow negative control. NOT a directory self-read or a bare TGT
+        # marker. `domain_admin` here is a membership attestation and `pkinit_tgt` a self-reported
+        # marker; neither makes certificate-auth "proven" on its own (RCA 2026-08-01).
+        "certificate_auth_proven": bool(auth_specific and (service_access or ntlm_hash_present or da_only_read_proven)),
+        "da_only_read_proven": da_only_read_proven,
+        "da_only_read_op": da_only_read_op,
         "domain_admin": domain_admin,
         "member_of": ticket_probe.get("member_of", []),
         "ticket_imported": _has_any(low, ("added ticket", "ticket successfully imported", "ticket_store_add")),
@@ -4536,8 +4573,18 @@ def _build_adcs_certificate_auth_execution_plan(
     dc = _input_text(inputs, "dc", "domain_controller")
     auth_method = _normalize(
         _input_text(inputs, "certificate_auth_method", "adcs_certificate_auth_method", "auth_method")
-        or "pkinit-kerberos"
     )
+    if not auth_method:
+        # Observation-driven selection: prefer Schannel LDAP when the KDC is observed to not support
+        # PKINIT (a DC with no KDC-authentication certificate, e.g. the stock-GOAD ESSOS case, where
+        # a cert->PKINIT attempt can only return KDC_ERR_PADATA_TYPE_NOSUPP). PKINIT stays the generic
+        # default and a first-class capability wherever the KDC supports it, so this never forces a
+        # doomed Rubeus task once the engagement has learned the KDC cannot PKINIT. An explicit
+        # certificate_auth_method input always wins over this heuristic.
+        if _input_bool(inputs, "pkinit_not_supported") or _input_bool(inputs, "kdc_pkinit_unsupported"):
+            auth_method = "schannel-ldap"
+        else:
+            auth_method = "pkinit-kerberos"
     schannel_ldap = auth_method in {"schannel", "schannel-ldap", "ldap-schannel", "ldaps", "certificate-ldap"}
     missing = []
     if not domain:
@@ -5447,7 +5494,7 @@ def _adcs_certificate_auth_action(
             ],
         },
         verifier={
-            "achieved_any": ["certificate_auth_proven", "schannel_ldap_bind", "ntlm_hash_present"],
+            "achieved_any": ["certificate_auth_proven", "ntlm_hash_present"],
             "required": ["callback_id", "account", "domain"],
             "partial_any": [
                 "certificate_forged",
@@ -5613,7 +5660,7 @@ def _adcs_certificate_auth_from_enrolled_certificate_action(
             ],
         },
         verifier={
-            "achieved_any": ["certificate_auth_proven", "schannel_ldap_bind", "ntlm_hash_present"],
+            "achieved_any": ["certificate_auth_proven", "ntlm_hash_present"],
             "required": ["callback_id", "account", "domain"],
             "partial_any": [
                 "pkinit_tgt_present",

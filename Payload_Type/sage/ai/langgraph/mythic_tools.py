@@ -11867,13 +11867,15 @@ class MythicTools:
                 or method in {"pkinit", "schannel-ldap", "schannel_ldap", "certipy", "cert-auth", "certificate-auth"}
                 or status == "ok"
             )
-            access_signal = (
+            # Control == usable domain control (credential material or a privileged action), NOT a
+            # Schannel bind + directory membership self-read and NOT a bare TGT marker. Mirrors
+            # verify_adcs_certificate_auth and extract_adcs_certificate_auth_probe so no copy of this
+            # formula can certify a self-read as proven (RCA 2026-08-01).
+            control_signal = (
                 bool(merged.get("service_access_proven"))
-                or bool(merged.get("domain_admin"))
-                or bool(merged.get("schannel_ldap_bind"))
                 or bool(merged.get("ntlm_hash_present"))
             )
-            merged["certificate_auth_proven"] = bool(auth_specific and access_signal)
+            merged["certificate_auth_proven"] = bool(auth_specific and control_signal)
             merged["ticket_valid"] = bool((merged.get("ticket_valid") or merged.get("service_access_proven")) and auth_specific)
         return merged
 

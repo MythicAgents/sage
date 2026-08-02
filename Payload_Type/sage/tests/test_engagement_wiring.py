@@ -6950,10 +6950,15 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
             {"proof_host": "dc01.lab.local", "timeout": 5},
         )))
 
-    assert result["ok"] is True, result
+    # A Schannel bind that only authenticates and reads the account's own group membership is
+    # authentication, not usable domain control. After the PKINIT failure, the fallback must NOT
+    # close the objective off a self-read (RCA 2026-08-01): the effect stays unverified and da: is
+    # never recorded. Genuine control (a privileged action or captured credential) is still required.
+    assert result["ok"] is False, result
     assert result["fallback"] == "schannel-ldap"
-    assert result["stopped_after"] == "schannel_ldap_fallback_verified_proof"
-    assert calls["issue"] == 5
+    assert result["stopped_after"] == "effect_unverified"
+    assert not result.get("achieved_effects")
+    assert "no usable domain control" in result["reason"]
     assert sum(
         1
         for item in calls["issued"]
@@ -6963,8 +6968,6 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
     assert result["issued"][-1]["command"] == "powerpick"
     assert result["issued"][-1]["fallback"] == "schannel-ldap"
     assert "$server='dc01.lab.local'" in result["issued"][-1]["parameters"]
-    assert "da:lab.local" in result["achieved_effects"]
-    assert "certificate-auth:administrator@lab.local" in result["achieved_effects"]
 
 
 def test_adcs_certificate_auth_does_not_fallback_for_unrelated_pkinit_error():

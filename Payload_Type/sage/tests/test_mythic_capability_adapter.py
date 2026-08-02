@@ -2543,7 +2543,8 @@ def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
     assert "QueryClientCertificate" in script
     assert "StartTransportLayerSecurity" in script
     assert "ReferralChasingOptions]::None" in script
-    assert ".Bind();" not in script
+    # The DA (cert) session authenticates via External auth + SendRequest, never an explicit Bind.
+    assert "$candidate.Bind()" not in script
     assert "$searchResponse=$candidate.SendRequest($probeRequest)" in script
     assert "X509KeyStorageFlags]::Exportable" in script
     assert "MachineKeySet" not in script
@@ -2554,3 +2555,13 @@ def test_adapter_translates_adcs_certificate_auth_to_schannel_ldap_proof():
     assert "CERT_AUTH_DOMAIN_ADMIN=" in script
     assert r"C:\Windows\Temp\admin.pfx" in script
     assert "dc01.lab.local" in script
+    # DA-only read + negative control: the DA session and a Negotiate-bound non-admin control
+    # session run the same SACL read, and DA_ONLY_READ_PROVEN reflects the deny/allow differential.
+    assert "SecurityDescriptorFlagControl" in script
+    assert "SecurityMasks]::Sacl" in script
+    assert "RawSecurityDescriptor" in script
+    assert "DA_SACL_STATUS=" in script
+    assert "AuthType]::Negotiate" in script
+    assert "$controlConn.Bind();" in script
+    assert "CONTROL_SACL_STATUS=" in script
+    assert "DA_ONLY_READ_PROVEN=" in script
