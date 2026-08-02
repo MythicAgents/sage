@@ -9,7 +9,8 @@ own playbook with an engagement.
 | `supervisor.md` | Supervisor | Routes your request to the right specialist; drives the autonomous solve loop. |
 | `mythic_operator.md` | Mythic_Operator | All Mythic C2 operations + in-memory offensive tradecraft. |
 | `mythic_payload.md` | Mythic_Payload | Builds/configures Mythic payloads. |
-| `mcp_manager.md` | MCP_Manager | External MCP tools (incl. BloodHound graph analysis). |
+| `bloodhound.md` | BloodHound | Dedicated BloodHound graph agent: ingest a collection, verify it, query attack paths via the BloodHound MCP server. |
+| `mcp_manager.md` | MCP_Manager | Arbitrary third-party MCP servers (web fetch, external APIs, custom integrations). BloodHound is not handled here. |
 | `generalist.md` | Generalist | General Q&A with no Mythic/TTP/tool access. |
 | `sandbox.md` | Sandbox | Local-only isolated shell/Python snippets for scratch computation. |
 
@@ -64,6 +65,7 @@ The body is rendered with Python's `str.format()`. That means:
 | `supervisor.md` | *(none)* |
 | `mythic_operator.md` | `{commands_text}` — installed-payload command reference, auto-injected |
 | `mythic_payload.md` | `{installed_payloads_text}`, `{installed_c2_profiles_text}` |
+| `bloodhound.md` | `{servers_text}` — connected MCP servers + tool preview |
 | `mcp_manager.md` | `{servers_text}` — connected MCP servers + tool preview |
 | `generalist.md` | *(none)* |
 | `sandbox.md` | *(none)* |
