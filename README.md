@@ -22,6 +22,11 @@ activity always executes through a live Mythic payload callback. The Sage proces
 control-plane data, but it must not connect directly to target LDAP, SMB, Kerberos, WinRM, RPC, HTTP, or similar
 services, and Sage-local attack artifacts are not admissible proof of an objective.
 
+<p align="center">
+  <img src="docs/assets/sage-ledger-solve.gif" alt="Sage autonomously solving GOAD" width="900">
+  <br><em>An autonomous GOAD solve: the engagement ledger fills in as each hop is verified, through to domain compromise.</em>
+</p>
+
 > **⚠️ Authorized use only, and still maturing.** Use Sage only for activity you are explicitly authorized to
 > perform. It is under active development, and its behavior in a production environment is not yet well
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
@@ -131,6 +136,11 @@ streaming emitter and terminal lifecycle.
 An LLM does not remember your engagement between turns. Sage keeps that memory outside the model, in a durable
 **engagement ledger**: a running record of what has actually been achieved, so a multi-day assessment survives
 context resets, restarts, and even a change of model.
+
+<p align="center">
+  <img src="docs/assets/engagement-ledger.png" alt="The /state engagement ledger" width="820">
+  <br><em><code>/state</code> renders the hop ledger: each proven effect with its status, task, and evidence.</em>
+</p>
 
 - **What it is.** One JSON file per Mythic operation — a table of hops toward the objective, each with a status.
   You read and edit it in chat with [`/state`](#slash-commands).
@@ -311,6 +321,11 @@ you do not pick is denied. Read-only tools (`list_*`, `get_*`, downloads) never 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
 up front rather than failing mid-run.
+
+<p align="center">
+  <img src="docs/assets/supervised-approval.png" alt="Supervised approval card in Mythic" width="820">
+  <br><em>In supervised mode a guarded action pauses for approval: Accept, Reject, or Respond.</em>
+</p>
 
 ### Slash commands
 
@@ -539,6 +554,11 @@ Sage can drive **any** MCP server, not just BloodHound. Connect one from chat:
 
 Transports: `stdio` (default), `sse`, and `http` / `streamable_http`.
 
+<p align="center">
+  <img src="docs/assets/mcp-connect.png" alt="Connecting a third-party MCP server with /mcp connect" width="820">
+  <br><em>Connecting a third-party server (Nemesis) with <code>/mcp connect</code>: note the required <code>sage_execution_class</code> and the <code>read_only_tools</code> allowlist.</em>
+</p>
+
 Two rules will otherwise trip you up:
 
 - **`sage_execution_class` is required.** A connect with no execution class defaults to `unclassified` and is
@@ -601,7 +621,14 @@ Mythic, range, clock, BloodHound, Sage, payload, callback, and final readiness g
 Sage embeds [Arize Phoenix](https://github.com/Arize-ai/phoenix). On startup it launches a local Phoenix
 instance and instruments the whole LangChain stack through OpenInference, so **every model call, tool call,
 prompt, output, token count, and error is captured as a trace** — with no configuration, and nothing leaving the
-host. This gives you:
+host.
+
+<p align="center">
+  <img src="docs/assets/phoenix-trace.png" alt="Embedded Phoenix trace view" width="820">
+  <br><em>The embedded Phoenix UI: every run traced span by span, with token counts, cost, and latency.</em>
+</p>
+
+This gives you:
 
 - **See exactly what the agent did and why.** Open the Phoenix UI (by default `http://localhost:6006`) and walk
   any run span by span: which agent ran, what it sent the model, what came back, which tools fired, and where a
