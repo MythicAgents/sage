@@ -450,7 +450,7 @@ A ground-truthed measurement instrument lives at `Payload_Type/sage/ai/hillclimb
 
 ## Common Pitfalls
 
-- RESUME can be stale; trust but verify against code and tests.
+- Planning and handoff docs can be stale; trust but verify against code and tests.
 - BloodHound ingest is asynchronous. Use job status verification, not an immediate domain list.
 - `query` auto-connects BloodHound; `chat` currently does not share that preflight.
 - The latest saved eval markdown files are single-case smoke baselines; do not overclaim them as a fresh 10-case sweep.
