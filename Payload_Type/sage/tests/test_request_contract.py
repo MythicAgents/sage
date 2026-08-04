@@ -780,20 +780,16 @@ def test_multi_action_native_selection_creates_typed_subtraction_revision():
     rebound = model.apply_request_action_selection(context, (selected_id,))
     narrowed = model._request_contract
 
-    assert narrowed.digest != proposed.digest
-    assert rebound["parent_request_contract_digest"] == proposed.digest
-    assert rebound["request_contract_digest"] == narrowed.digest
-    assert narrowed.requested_actions == (
-        action_spec_from_tool_call(action_a),
-        action_spec_from_tool_call(action_b),
-    )
-    assert narrowed.permitted_actions == (action_spec_from_tool_call(action_a),)
+    # Pick-one (exact_one) cards do NOT add unselected actions to prohibited_actions.
+    # The contract stays unchanged — unselected actions can be re-proposed next delegation.
+    assert narrowed.digest == proposed.digest
+    assert narrowed.prohibited_actions == ()
     assert rebound["approved_action_ids"] == [selected_id]
     assert rebound["approved_actions"] == [action_a]
-    assert "prohibited" in model._request_contract_block_reason(
+    assert model._request_contract_block_reason(
         action_b["name"],
         action_b["args"],
-    )
+    ) == ""
     client = MythicTools(agent_task_id=1)
     client.set_request_contract(narrowed)
     client.set_turn_authority(authority_from_request_contract(narrowed))

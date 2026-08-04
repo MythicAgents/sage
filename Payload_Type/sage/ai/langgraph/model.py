@@ -1552,6 +1552,38 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
         if last_ai is None:
             return None
         original_calls = list(last_ai.tool_calls)
+        # Supervised one-at-a-time: if multiple guarded tool calls are proposed, keep only the
+        # first and reject the rest. The model sequences its work — one approval, one execution,
+        # then the next proposal. This prevents batch HITL cards and their decision-count/
+        # lifecycle/denial-binding edge cases.
+        if (
+            getattr(self._model, "mode", "") == "supervised"
+            and getattr(self._model, "_native_chat_explicit_hitl", False)
+        ):
+            guarded_indices = [
+                i for i, tc in enumerate(original_calls)
+                if isinstance(tc, dict) and str(tc.get("name") or "") in GUARDED_TOOLS
+            ]
+            if len(guarded_indices) > 1:
+                keep_idx = guarded_indices[0]
+                deferred = []
+                for idx in guarded_indices[1:]:
+                    tc = original_calls[idx]
+                    name = str(tc.get("name") or "unknown")
+                    deferred.append(ToolMessage(
+                        content=(
+                            f"[Queued] {name} will be proposed for approval after the current "
+                            "action completes. Supervised mode approves one action at a time."
+                        ),
+                        name=name,
+                        tool_call_id=str(tc.get("id") or ""),
+                    ))
+                last_ai.tool_calls = [
+                    tc for i, tc in enumerate(original_calls) if i not in guarded_indices[1:]
+                ]
+                if deferred:
+                    return {"messages": [last_ai, *deferred]}
+                original_calls = list(last_ai.tool_calls)
         batch_error = _tool_call_envelope_error(last_ai)
         if not original_calls and not batch_error:
             return None
@@ -4176,16 +4208,23 @@ class Model:
         ):
             raise ValueError("action selection is not an exact proposal subset")
         rejected_ids = set(action_ids) - set(selected)
-        selectors = list(contract.prohibited_actions)
-        existing = {selector.action_id for selector in selectors if selector.action_id}
-        selectors.extend(
-            ActionSelector(action_id=action_id)
-            for action_id in sorted(rejected_ids - existing)
-        )
-        if len(selectors) != len(contract.prohibited_actions):
-            self.install_request_contract(
-                contract.amend(prohibited_actions=tuple(selectors))
+        # Pick-one (exact_one) cards: the operator selected one from a menu, not explicitly
+        # rejected the others. Do NOT add unselected actions to prohibited_actions — the operator
+        # chose an order, not a prohibition. Adding them here permanently blocks them for the rest
+        # of the request, which prevents the model from ever running them. The model already gets
+        # reject decisions via handle_hitl_resume for THIS cycle; it can re-propose them next time.
+        selection_mode = str(context.get("selection_mode") or "")
+        if selection_mode != "exact_one":
+            selectors = list(contract.prohibited_actions)
+            existing = {selector.action_id for selector in selectors if selector.action_id}
+            selectors.extend(
+                ActionSelector(action_id=action_id)
+                for action_id in sorted(rejected_ids - existing)
             )
+            if len(selectors) != len(contract.prohibited_actions):
+                self.install_request_contract(
+                    contract.amend(prohibited_actions=tuple(selectors))
+                )
         narrowed = self._request_contract
         rebound = dict(context)
         if narrowed.digest != contract.digest:
@@ -10828,8 +10867,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 if action_approved:
                     decisions.append({"type": "approve"})
                 else:
-                    message = (f"[Operator steering] {steer}" if steer
-                               else f"[DENIED by operator] {tool_name} was not executed.")
+                    if steer:
+                        message = f"[Operator steering] {steer}"
+                    elif is_pick_one:
+                        message = (
+                            f"[Not selected] The operator chose a different action first. "
+                            f"`{tool_name}` was not executed this round but may be proposed again."
+                        )
+                    else:
+                        message = f"[DENIED by operator] {tool_name} was not executed."
                     decisions.append({"type": "reject", "message": message})
         logger.info(f"HITL resume on thread {thread_id}: {decision_word} for {len(decisions)} tool call(s)")
 

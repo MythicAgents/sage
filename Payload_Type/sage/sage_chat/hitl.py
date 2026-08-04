@@ -12,9 +12,8 @@ requests`):
 - **surface** — `build_approval_request` + `make_card_emitter`: emit the same normalized `input_requested`
   block as `send_approval_request`, with `complete_request=False`. That release (NOT a terminal `complete`)
   frees the channel while the graph waits on disk — so the chat handler returns None and adds no terminal.
-- **decision** — one action uses exact accept/reject; a guarded batch uses Mythic's typed
-  single-choice response so exactly one canonical action ID can be approved and every unselected action is
-  denied. Batch accept, malformed/unknown choices, and all other responses deny by default.
+- **decision** — Accept approves all guarded actions in the batch; Reject denies all.
+  Default-deny: malformed and unknown responses are treated as reject.
 """
 
 from __future__ import annotations
@@ -255,22 +254,17 @@ def build_approval_request(action_requests: list[dict[str, Any]]) -> dict[str, A
         "title": (
             f"Approve: {display_name}"
             if count == 1
-            else f"Select 1 of {count} guarded actions"
+            else f"Approve {count} guarded actions"
         ),
         "prompt": (
             (
                 f"Sage wants to run the guarded action {display_name}. "
                 if count == 1
                 else (
-                    f"Sage proposed {count} guarded actions. Select exactly one to approve; "
-                    f"every unselected action will be denied for this request revision. "
+                    f"Sage proposed {count} guarded actions. "
                 )
             )
-            + (
-                "Accept approves this action; Reject denies it."
-                if count == 1
-                else "Reject or Respond denies all."
-            )
+            + "Accept approves; Reject denies."
         ),
         "description": "\n\n".join(description_blocks),
         "data": {
@@ -322,9 +316,7 @@ def make_card_emitter(
             "approval_id": uuid4().hex,
             "tool_name": kwargs["data"].get("tool_name", ""),
             "actions": approval_claim_actions(action_requests),
-            "selection_mode": (
-                "exact_one" if len(action_requests) > 1 else "single"
-            ),
+            "selection_mode": "single",
             "action_digest": kwargs["data"]["action_digest"],
         })
         contract_digest = str(
@@ -347,25 +339,14 @@ def make_card_emitter(
                 logger.debug(f"approval delegation lookup failed (non-fatal): {e}")
         # Store the resumable context only after Mythic confirms that it surfaced the card. A failed send
         # must propagate so the caller can rotate the inaccessible paused checkpoint.
-        if len(action_requests) > 1:
-            await chat.send_single_choice_request(
-                request,
-                title=kwargs["title"],
-                prompt=kwargs["prompt"],
-                choices=kwargs["choices"],
-                description=kwargs["description"],
-                data=kwargs["data"],
-                metadata=metadata or None,
-            )
-        else:
-            await chat.send_approval_request(
-                request,
-                title=kwargs["title"],
-                prompt=kwargs["prompt"],
-                description=kwargs["description"],
-                data=kwargs["data"],
-                metadata=metadata or None,
-            )
+        await chat.send_approval_request(
+            request,
+            title=kwargs["title"],
+            prompt=kwargs["prompt"],
+            description=kwargs["description"],
+            data=kwargs["data"],
+            metadata=metadata or None,
+        )
         if approval_context_store is not None:
             approval_context_store(dict(approval_context))
     return _emit
@@ -545,7 +526,7 @@ def approved_action_ids_for_request(
         return ()
     selection_mode = str(expected_context.get("selection_mode") or "")
     if selection_mode == "single":
-        return action_ids if len(action_ids) == 1 and action == "accept" else ()
+        return action_ids if action == "accept" else ()
     if selection_mode != "exact_one" or len(action_ids) < 2 or action != "select":
         return ()
     choice = getattr(response, "Choice", None)

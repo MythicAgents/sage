@@ -2720,8 +2720,8 @@ def test_approval_request_discloses_every_guarded_action_and_exact_arguments():
         {"name": "execute_capability", "args": {"action": {"name": "dcsync-krbtgt"}}},
     ])
 
-    assert req["title"] == "Select 1 of 2 guarded actions"
-    assert "Select exactly one" in req["prompt"]
+    assert req["title"] == "Approve 2 guarded actions"
+    assert "proposed 2 guarded actions" in req["prompt"]
     assert "Action 1: create_payload" in req["description"]
     assert "os: windows" in req["description"]
     assert "Action 2: dcsync-krbtgt" in req["description"]
@@ -2842,7 +2842,8 @@ def test_hitl_reject_resumes_deny():
     assert len(chat.terminal_emissions) == 1
 
 
-def test_multi_action_native_card_selects_one_and_denies_batch_accept():
+def test_multi_action_native_card_uses_batch_approval():
+    """Multi-action HITL cards use send_approval_request (batch Accept/Reject), not single_choice."""
     model = _MultiHitlModel()
     chat = _HitlDriverChat(model)
     _run(chat.chat(build_chat_request(
@@ -2855,22 +2856,16 @@ def test_multi_action_native_card_selects_one_and_denies_batch_accept():
         if item.get("metadata", {}).get("special_type") == "input_requested"
     )
     input_request = card["metadata"]["input_requested"]
-    assert input_request["input_type"] == "single_choice"
-    assert len(input_request["choices"]) == 2
+    assert input_request["input_type"] == "approval"
     context = dict(model._pending_approval_context)
-    selected_id = input_request["choices"][0]["id"]
+    assert context["selection_mode"] == "single"
 
     response = build_chat_request("", channel_id=105, request_id=2)
-    response.InputResponse = _input_response_for_context(
-        "select",
-        context,
-        choice={"id": selected_id},
-    )
+    response.InputResponse = _input_response_for_context("accept", context)
     _run(chat.chat(response))
     assert model.resumed_with == "approve"
-    assert model.selected_action_ids == (selected_id,)
-    assert model.approval_claims[0]["approved_action_ids"] == [selected_id]
 
+    # Batch accept approves all actions in the batch.
     model = _MultiHitlModel()
     chat = _HitlDriverChat(model)
     _run(chat.chat(build_chat_request(
@@ -2882,9 +2877,7 @@ def test_multi_action_native_card_selects_one_and_denies_batch_accept():
     response = build_chat_request("", channel_id=107, request_id=2)
     response.InputResponse = _input_response_for_context("accept", context)
     _run(chat.chat(response))
-    assert model.resumed_with == "deny"
-    assert model.selected_action_ids == ()
-    assert model.approval_claims == []
+    assert model.resumed_with == "approve"
 
 
 def test_replayed_approval_response_resumes_checkpoint_only_once():

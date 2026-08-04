@@ -22,10 +22,9 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 In supervised mode every **guarded** action — issuing a command, executing a capability, creating a payload,
 adding a credential — pauses as a native Mythic approval request before it runs. Approval is **default-deny**:
-only an explicit approve response ("approve", "yes", "proceed", …) lets it through. When a card offers multiple
-actions ("select one"), choose the action to run; unselected actions are **deferred** (Sage may propose them
-again later), not permanently denied. An explicit Reject permanently blocks that action for the remainder of the
-request. Read-only tools never prompt.
+only an explicit Accept lets it through. **One action, one card** — when the model proposes multiple guarded
+actions, Sage presents them one at a time. Accept runs the action; Reject denies it. After the action
+completes, the next guarded action is proposed. Read-only tools never prompt.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
