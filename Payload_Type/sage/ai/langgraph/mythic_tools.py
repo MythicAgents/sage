@@ -1010,11 +1010,49 @@ def _is_failed_read_output(output: str) -> bool:
     return any(sig in low for sig in _READ_FAILURE_SIGNATURES)
 
 
-# HITL: single source of truth for which MythicTools methods are state-changing/offensive and
-# therefore gated in supervised mode. Read-only get_*/list_*/download_file and
-# the routing/transfer/respond tools are intentionally absent (free). model.py imports this set to
-# build the HumanInTheLoopMiddleware interrupt_on map. Note: file_upload is a BloodHound MCP tool
-# (not a MythicTools method) — included by name so supervised mode also gates it if/when connected.
+# ── Tool safety classification ─────────────────────────────────────────────────
+# Every MythicTools method MUST carry a @tool_safety decorator declaring its
+# classification. An undecorated method defaults to GUARDED at enforcement time.
+#
+# GUARDED: state-changing or offensive — HITL-gated in supervised mode, denied in
+#          conversational mode. The safe default for any unclassified tool.
+# READ_ONLY: read-only control-plane query — freely available in all modes.
+#
+# model.py reads the classification at enforcement time via tool_safety_of().
+# The GUARDED_TOOLS set below is derived from decorators for backwards compat
+# with HITL middleware and SCOPE_REQUIREMENTS; do not edit it directly.
+
+TOOL_SAFETY_GUARDED = "guarded"
+TOOL_SAFETY_READ_ONLY = "read_only"
+_TOOL_SAFETY_VALUES = frozenset((TOOL_SAFETY_GUARDED, TOOL_SAFETY_READ_ONLY))
+_TOOL_SAFETY_ATTR = "_tool_safety"
+
+
+def tool_safety(classification: str):
+    """Declare a MythicTools method as TOOL_SAFETY_GUARDED or TOOL_SAFETY_READ_ONLY."""
+    if classification not in _TOOL_SAFETY_VALUES:
+        raise ValueError(
+            f"tool_safety must be {TOOL_SAFETY_GUARDED!r} or {TOOL_SAFETY_READ_ONLY!r}, "
+            f"got {classification!r}"
+        )
+    def decorator(func):
+        setattr(func, _TOOL_SAFETY_ATTR, classification)
+        return func
+    return decorator
+
+
+def tool_safety_of(tool_name: str, source: object = None) -> str:
+    """Return the safety classification for a tool. Defaults to GUARDED if undecorated."""
+    if source is not None:
+        method = getattr(source, tool_name, None)
+        if method is not None:
+            return getattr(method, _TOOL_SAFETY_ATTR, TOOL_SAFETY_GUARDED)
+    return TOOL_SAFETY_GUARDED if tool_name in GUARDED_TOOLS else TOOL_SAFETY_READ_ONLY
+
+
+# Derived from @tool_safety decorators for backwards compatibility with HITL middleware
+# and SCOPE_REQUIREMENTS. file_upload is a BloodHound MCP tool (not a MythicTools method)
+# — included by name so supervised mode also gates it if/when connected.
 GUARDED_TOOLS: set[str] = {
     "issue_task_and_waitfor_task_output",
     "upload_file_by_file_uuid",
@@ -3228,6 +3266,7 @@ class MythicTools:
         suffix = f" reason={reason}" if reason else ""
         return f"waited {wait_seconds} seconds{suffix}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def wait_for_seconds(self, seconds: int, reason: str = "") -> str:
         """
         Pause Sage-side LLM execution for a bounded number of seconds, without tasking or changing any Mythic
@@ -3236,12 +3275,13 @@ class MythicTools:
         """
         return await self._bounded_wait_for_seconds(seconds, reason)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_active_callbacks(self) -> str:
 
         """
         Retrieve detailed information about all active Mythic agents.
 
-        This tool provides comprehensive details about all active Mythic agents, including their operating systems, network information, 
+        This tool provides comprehensive details about all active Mythic agents, including their operating systems, network information,
         process details, and user contexts. The returned information includes:
 
         - **architecture**: The architecture of the operating system (e.g., 386, amd64, arm, mips).
@@ -3261,13 +3301,13 @@ class MythicTools:
         Returns:
             str: JSON string containing the agent's detailed information.
         """
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_all_active_callbacks tool")
         resp = await mythic.get_all_active_callbacks(self.client)
         return json.dumps(resp, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def list_callbacks(self) -> str:
         """SLIM callback status — ONE cheap query returning, per active callback, only the minimum needed
         to answer 'is there a new callback?' and 'is each one still alive?': {id, agent, user, host,
@@ -3275,7 +3315,6 @@ class MythicTools:
         computed liveness (same logic as check_callback_alive), so for routine situational awareness it
         replaces BOTH. Use get_all_active_callbacks ONLY when you need full host detail (pid, process_name,
         IPs, external_ip); use check_callback_alive for a deep single-callback crash assessment."""
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling list_callbacks (slim)")
@@ -3342,9 +3381,9 @@ class MythicTools:
             pass
         return json.dumps(out, default=str, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_payload_info(self) -> str:
         """ Get information about ALL payload types in Mythic. """
-        # HITL: free
         query = """
             query PayloadInfo {
                 payloadtype {
@@ -3371,18 +3410,18 @@ class MythicTools:
         except Exception as e:
             return f"Error executing query: {e}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_payloads(self) -> str:
         """Get information about all payloads currently registered (already built) with Mythic."""
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call create() first.")
         logger.debug("🛠️ Calling get_all_payloads tool")
         resp = await mythic.get_all_payloads(self.client)
         return json.dumps(resp, sort_keys=True)
         
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_payload_names(self) -> List[str]:
         """Get a list of all payload type names."""
-        # HITL: free
         query = """
             query SagePayloadNames {
                 payloadtype {
@@ -3397,9 +3436,9 @@ class MythicTools:
         # Payload names response: {'payloadtype': [{'name': 'sage'}, {'name': 'merlin'}]}, type: <class 'dict'>
         return [p['name'] for p in resp['payloadtype']]
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_c2_profile_names(self) -> List[dict[str, str]]:
         """Get a list of all C2 profile names."""
-        # HITL: free
         query = """
             query C2ProfileNames {
                 c2profile {
@@ -3415,6 +3454,7 @@ class MythicTools:
         # C2 profile names response: {'c2profile': [{'name': 'http', 'description': 'HTTP/S C2 Profile'}, {'name': 'websocket', 'description': 'WebSocket C2 Profile'}, {'name': 'dns', 'description': 'DNS C2 Profile'}]}, type: <class 'dict'>
         return [{'name': c['name'], 'description': c['description']} for c in resp['c2profile']] if resp.get('c2profile') else []
     
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_c2_profiles_for_payload(self, payload: Annotated[str, "The name of the payload type to retrieve C2 profiles for such as 'merlin', 'apollo', etc."]):
         """Get C2 profiles for a specific payload type.
         Args:
@@ -3422,7 +3462,6 @@ class MythicTools:
         Returns:
             str: JSON string containing C2 profile information for the specified payload type.
         """
-        # HITL: free
 
         # Parameterized, matching the schema path. Same defect class as the command-schema queries:
         # a malformed query returns nothing, which reads identically to a payload type that
@@ -3460,6 +3499,7 @@ class MythicTools:
         except Exception as e:
             return f"Error executing query: {e}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_callback_c2_config(self, display_id: Annotated[int, "The callback display_id to inspect for configured C2 values"]) -> str:
         """Get the actual configured C2 parameter values for a live callback, not just the C2 schema.
 
@@ -3468,7 +3508,6 @@ class MythicTools:
         Returns:
             str: JSON string containing callback host/user and configured C2 values such as callback_host, callback_port, and post_uri.
         """
-        # HITL: free
         query = """
             query CB($id: Int!) {
               callback(where: {display_id: {_eq: $id}}) {
@@ -3508,6 +3547,7 @@ class MythicTools:
         except Exception as e:
             return f"Error executing query: {e}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_payload_c2_config(self, payload_uuid: Annotated[str, "The Mythic payload UUID to inspect for configured C2 values and file reference"]) -> str:
         """Get the actual configured C2 parameter values and file reference for an existing built payload.
 
@@ -3516,7 +3556,6 @@ class MythicTools:
         Returns:
             str: JSON string containing payload metadata, file reference, and configured C2 values.
         """
-        # HITL: free
         custom_attributes = """
         uuid
         file_id
@@ -3561,6 +3600,7 @@ class MythicTools:
         except Exception as e:
             return f"Error getting payload C2 config for {payload_uuid}: {e}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def download_payload(self, payload_uuid: Annotated[str, "The Mythic payload UUID to download/reuse"]) -> str:
         """Download a built payload for reuse and return the Mythic file reference to redeploy it.
 
@@ -3569,7 +3609,6 @@ class MythicTools:
         Returns:
             str: JSON string containing the payload UUID, filename, Mythic agent_file_id, and downloaded byte count.
         """
-        # HITL: free
         custom_attributes = """
         uuid
         file_id
@@ -3604,6 +3643,7 @@ class MythicTools:
         except Exception as e:
             return f"Error downloading payload {payload_uuid}: {e}"
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def delete_payload(
         self,
         payload_uuid: Annotated[str, "The Mythic payload UUID to soft-delete"],
@@ -3705,6 +3745,7 @@ class MythicTools:
                 "reason": f"error while deleting payload: {e}",
             }, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_command_names_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
         """Get all available command names for a specific payload type (agent).
         
@@ -3715,7 +3756,6 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
-        # HITL: free
         # ISC-2.5: parameterized. This was the last schema-path query built by substituting a
         # model-influenced value into query text, where a malformed result is indistinguishable
         # from a payload type that genuinely has no commands.
@@ -3738,6 +3778,7 @@ class MythicTools:
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_command_args_for_payloadtype(
             self, 
             payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"],
@@ -3752,7 +3793,6 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
-        # HITL: free
         # Parameters come from the shared resolver, which returns them ALREADY GROUPED by parameter
         # group. That is the substance of this tool's change: the groups are mutually exclusive
         # tasking forms, so handing the model a flat list made it re-derive the partition from a
@@ -3849,6 +3889,7 @@ class MythicTools:
             view.append(entry)
         return view
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_commands_for_payloadtype(self, payload: Annotated[str, "The name of the payload type (e.g., 'sage', 'apollo', 'poseidon') to get its available commands"]) -> str:
         """Get all available commands for a specific payload type (agent).
         
@@ -3860,7 +3901,6 @@ class MythicTools:
         Returns:
             str: JSON string containing all commands and their detailed information
         """
-        # HITL: free
         # Command schemas are STATIC per payloadtype — serve repeats from cache as a terse pointer instead
         # of re-dumping the full schema (27× re-fetches bloated context + burned steps in a 2026-06-09 solve).
         cached = self._command_schema_cache.get(payload)
@@ -3931,6 +3971,7 @@ class MythicTools:
         except Exception as e:
             return f"Error getting commands for payload type {payload}: {e}"
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def create_payload(
         self,
         payload_type_name: str,
@@ -4691,6 +4732,7 @@ class MythicTools:
             return repaired, "rebuild_with_payload_schema"
         return None
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def issue_task_and_waitfor_task_output(
         self,
         command: str,
@@ -8775,6 +8817,7 @@ class MythicTools:
                 import capabilities
             return capabilities.CapabilityExecutionPlan(False, missing=["builder"], reason=str(exc))
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def build_capability_commands(
         self,
         action: Annotated[dict | str, (
@@ -9063,6 +9106,7 @@ class MythicTools:
             source_facts=source_facts,
         )
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def execute_capability(
         self,
         action: Annotated[dict | str, (
@@ -9840,6 +9884,7 @@ class MythicTools:
             }, action, inputs, callback_id, record_failed=True, failure_probe=probe)
         return None
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def materialize_capability_inputs(
         self,
         action: Annotated[dict | str, (
@@ -16044,14 +16089,14 @@ class MythicTools:
             json.dump(payload, fh, default=str)
         os.replace(tmp, path)  # atomic on POSIX — never leaves a half-written ledger
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def list_open_artifacts(self) -> str:
         """List artifacts this run has created (files dropped, beacons planted) that have NOT been cleaned up, so you can remove them at sub-goal completion for OPSEC. Returns a JSON list."""
-        # HITL: free
         return json.dumps([e for e in self._artifact_ledger if not e.get("cleaned")], default=str)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_task_history_for_callback(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to retrieve task history for"]) -> str:
         """Return a callback's full task history as JSON (per task: id, operator, status, completed, original_params, timestamp, command_name)."""
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_task_history_for_callback tool on callback_display_ids: {callback_display_id}")
@@ -16061,9 +16106,9 @@ class MythicTools:
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
         return json.dumps(resp, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def check_callback_alive(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to assess for liveness"]) -> str:
         """Determine whether a callback is alive, dead, or likely crashed, using its last check-in vs its effective sleep interval (NOT Mythic's 'active' flag, which is unreliable). Use this before re-tasking a callback that has gone silent, or after issuing a command that may have crashed the agent."""
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling check_callback_alive tool on callback_display_id: {callback_display_id}")
@@ -16073,6 +16118,7 @@ class MythicTools:
         suspect_text = f" (suspect: {suspect!r})" if suspect else ""
         return f"callback {callback_display_id} status={status}{suspect_text} — {result.get('reason', '')}"
     
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_task_output_by_task_id(self, task_id: Annotated[int, "The Mythic task ID to retrieve output for"]) -> str:
         """Get all output associated with a specific Mythic task ID.
 
@@ -16085,7 +16131,6 @@ class MythicTools:
         Returns:
             str: JSON string containing all output for the specified task ID, with response_text decoded from base64.
         """
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {task_id}")
@@ -16152,6 +16197,7 @@ class MythicTools:
         except Exception:
             return False
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_all_uploaded_files(self) -> str:
         """
         Get a list of all files uploaded to Mythic.
@@ -16159,7 +16205,6 @@ class MythicTools:
         Excludes files downloaded by Mythic agents, screenshots, and Mythic payload files.
         Call the download_file() method to download a specific file by its Mythic file UUID.
         """
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_all_uploaded_files tool")
@@ -16276,6 +16321,7 @@ class MythicTools:
                 return row
         return None
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def upload_file_by_file_uuid(
             self,
             command: Annotated[str, "The name of the command for a Mythic agent that has upload functionality, typically the \"upload\" command, to execute on the target agent"],
@@ -16337,6 +16383,7 @@ class MythicTools:
         ) 
         return resp
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def download_file(self, file_uuid: Annotated[str, "The Mythic file UUID of the file to download from Mythic"]) -> str:
         """Download a file from Mythic by its Mythic file UUID.
 
@@ -16348,7 +16395,6 @@ class MythicTools:
         Returns:
             str: Base64-encoded string of the downloaded file content.
         """
-        # HITL: free
         # Not sure what I'm going to use this for because I don't want to send the file data back to the LLM
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
@@ -16386,6 +16432,7 @@ class MythicTools:
         """Record a VERIFIED ingest so the identical artifact is not re-uploaded. Best-effort; never raises."""
         self._ingested_collection_hashes[content_hash] = str(job_id) if job_id is not None else "complete"
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def ingest_collection(
         self,
         file_uuid: Annotated[str, "The Mythic file UUID of the downloaded SharpHound/AzureHound collection to ingest. PREFERRED. Optional if callback_display_id is given."] = "",
@@ -16784,15 +16831,16 @@ class MythicTools:
                                    f"BloodHound ingest job {job_id_bh} remains '{status_msg}'. Report the pending status."
                                ))}, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_operations(self) -> str:
         """Get a list of all operations in Mythic."""
-        # HITL: free
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
         logger.debug("🛠️ Calling get_operations tool")
         resp = await mythic.get_operations(mythic=self.client)
         return json.dumps(resp, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def read_credentials(self, realm: str = "", account: str = "") -> str:
         """Read credentials from Mythic's credential store for the current operation.
 
@@ -16801,7 +16849,6 @@ class MythicTools:
         Optionally filter by `realm` (domain) and/or `account` (username) — case-insensitive substring.
         Returns account, realm, type, the secret value, and any comment. Read-only.
         """
-        # HITL: free (read-only)
         authority = getattr(self, "_turn_authority", None)
         contract_bound = bool(getattr(authority, "enforces_objective_tool_allowlist", False))
         if contract_bound:
@@ -16868,6 +16915,7 @@ class MythicTools:
         self._mark_contract_outcome("credentials_reported")
         return report
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def add_credential(self, credential: str, account: str = "", realm: str = "",
                              credential_type: str = "plaintext", comment: str = "") -> str:
         """Add a credential to Mythic's credential store for the current operation.
@@ -17717,6 +17765,7 @@ class MythicTools:
                 pass
             return None
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_ttp_guidance(
         self,
         goal: Annotated[str, "The tradecraft goal in plain language, e.g. 'enumerate the domain', 'dump LSASS', 'abuse a GPO', 'request an ADCS cert'."],
@@ -17727,7 +17776,6 @@ class MythicTools:
         Caveat: progressive disclosure — rely on common_args/usage_examples; call
         get_ttp_full_reference(slug) only for an uncommon flag or exact output format.
         """
-        # HITL: free
         logger.debug(f"🛠️ Calling get_ttp_guidance tool (goal={goal!r}, callback={callback_display_id})")
         matches = ttp_library.match_goal(goal)
         if not matches:
@@ -17851,6 +17899,7 @@ class MythicTools:
         except Exception:
             return None
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_ttp_full_reference(
         self,
         slug: Annotated[str, "The TTP slug (filename without .md), e.g. 'sharphound', returned as 'slug' by get_ttp_guidance."],
@@ -17866,7 +17915,6 @@ class MythicTools:
         Returns:
             str: JSON with the full reference text, or a not_found / no_full_reference status.
         """
-        # HITL: free
         logger.debug(f"🛠️ Calling get_ttp_full_reference tool (slug={slug!r})")
         frontmatter, body = ttp_library.load_ttp(slug)
         if body is None:
@@ -17881,6 +17929,7 @@ class MythicTools:
             }, sort_keys=True)
         return json.dumps({"slug": slug, "full_reference": reference}, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def list_ttp_categories(self) -> str:
         """List Sage's TTP knowledge library grouped by category.
 
@@ -17890,7 +17939,6 @@ class MythicTools:
         Returns:
             str: JSON mapping each category to a list of {slug, name}, or an empty status.
         """
-        # HITL: free
         logger.debug("🛠️ Calling list_ttp_categories tool")
         categories = ttp_library.list_categories()
         if not categories:
@@ -18019,6 +18067,7 @@ class MythicTools:
         file_uuid = await self._register_file(filename, content)
         return file_uuid, False
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def ensure_tool_uploaded(
         self,
         binary_filename: Annotated[str, "The tool binary filename, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
@@ -18028,7 +18077,6 @@ class MythicTools:
         Caveat: call this and retry when a by-name assembly call fails with "0 files were found" /
         "file not found by name" — the file is just unregistered, not unavailable.
         """
-        # HITL: free
         self._require_request_contract_effect(
             "ensure_tool_uploaded",
             {"binary_filename": binary_filename},
@@ -18107,6 +18155,7 @@ class MythicTools:
         except Exception as e:
             return json.dumps({"status": "error", "binary_filename": binary_filename, "error": str(e)}, sort_keys=True)
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def download_tool(
         self,
         binary_filename: Annotated[str, "The tool binary filename to fetch from its pinned TTP source, e.g. 'SharpHound.exe' (matches a TTP's binary_filename)."],
@@ -18262,6 +18311,7 @@ class MythicTools:
             "truncated": len(stdout) > cap or len(stderr) > cap,
         }
 
+    @tool_safety(TOOL_SAFETY_GUARDED)
     async def sandbox_exec(
         self,
         code_or_command: Annotated[str, "The code or shell command to run in the isolated sandbox."],

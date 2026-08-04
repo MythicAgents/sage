@@ -4353,8 +4353,8 @@ class Model:
             return "request contract digest does not match the active enforcement projection"
         if contract.intent == RequestIntent.STOP:
             return "stopped request denies tool execution"
-        if contract.lane == RequestLane.CONVERSATIONAL and not _is_control_tool(tool_name):
-            return "conversational request denies external tool execution"
+        if contract.lane == RequestLane.CONVERSATIONAL and tool_name in GUARDED_TOOLS:
+            return "conversational request denies guarded tool execution"
         if tool_name in GUARDED_TOOLS:
             try:
                 action = action_spec_from_tool_call({
@@ -6645,35 +6645,94 @@ class Model:
             # loop, and a per-node counter lets it hide by rotating.
             if _progressed:
                 self._nonprogress_delegations = 0
+                self._neutral_delegations = 0
+                self._pair_bounce_node = ""
+                self._pair_bounce_count = 0
             elif not _attempted_effect and _returned_something:
-                pass  # analysis-only delegation: neutral, streak untouched
+                # Analysis-only delegation: neutral to the no-progress streak, but tracked
+                # separately for the neutral-delegation soft cap (ISC-8) and pair-bounce
+                # detection (ISC-3b).
+                _neutral = int(getattr(self, "_neutral_delegations", 0)) + 1
+                self._neutral_delegations = _neutral
+                _NEUTRAL_SOFT_CAP = 6
+                if _neutral == _NEUTRAL_SOFT_CAP:
+                    logger.warning(
+                        f"⚠️ [{node_name}] {_neutral} consecutive neutral delegations — "
+                        "no tasks issued, no guarded tools attempted"
+                    )
+                    _warn_msg = AIMessage(
+                        content=(
+                            f"⚠️ I've been routing internally for {_neutral} delegations without "
+                            "taking any action or completing a response. If this isn't what you "
+                            "expected, you can redirect me or start a new request."
+                        ),
+                        name=node_name,
+                    )
+                    new_messages_from_agent = list(new_messages_from_agent) + [_warn_msg]
+                # ISC-3b: detect same-pair ping-pong (Supervisor ↔ X without progress).
+                _last_pair = str(getattr(self, "_pair_bounce_node", "") or "")
+                if node_name == _last_pair:
+                    _bounces = int(getattr(self, "_pair_bounce_count", 0)) + 1
+                    self._pair_bounce_count = _bounces
+                    _PAIR_BOUNCE_CAP = 3
+                    if _bounces == _PAIR_BOUNCE_CAP:
+                        logger.warning(
+                            f"⚠️ [{node_name}] same-agent bounce {_bounces}/{_PAIR_BOUNCE_CAP} — "
+                            "Supervisor and this agent are handing back without progress"
+                        )
+                        _bounce_msg = AIMessage(
+                            content=(
+                                f"⚠️ `{node_name}` and the Supervisor have been handing back to each "
+                                f"other {_bounces} times without any action taking effect. This may "
+                                "indicate a routing loop. Tell me how you'd like to proceed."
+                            ),
+                            name=node_name,
+                        )
+                        new_messages_from_agent = list(new_messages_from_agent) + [_bounce_msg]
+                        self._pair_bounce_count = 0
+                else:
+                    self._pair_bounce_node = node_name
+                    self._pair_bounce_count = 1
             else:
                 _streak = int(getattr(self, "_nonprogress_delegations", 0)) + 1
                 self._nonprogress_delegations = _streak
+                self._neutral_delegations = 0
                 logger.warning(
                     f"🔁 [{node_name}] NO-PROGRESS delegation {_streak}/{_ZERO_PROGRESS_DELEGATION_CAP} — "
                     f"task_marker={_task_marker or '(none)'} returned={len(new_messages_from_agent)}"
                 )
                 if _streak >= _ZERO_PROGRESS_DELEGATION_CAP:
                     self._nonprogress_delegations = 0
-                    _stall_msg = AIMessage(
-                        content=(
-                            f"🛑 **Stopped — no progress.** `{node_name}` was delegated this objective "
-                            f"{_streak} times in a row without anything taking effect or any new result "
-                            "coming back, so I stopped rather than keep retrying.\n\n"
-                            "Nothing was executed on the target by these attempts. If you approved an "
-                            "action, check the callback's task output before re-running — a completed "
-                            "result that never comes back is indistinguishable, from here, from work that "
-                            "never happened.\n\n"
-                            "Tell me how you'd like to proceed, or start a new request."
-                        ),
-                        name=node_name,
-                    )
+                    # ISC-1b: distinguish denial-driven halts from genuine stalls. When the
+                    # operator repeatedly declined proposed actions, use a collaborative tone
+                    # instead of "no progress."
+                    if _attempted_effect:
+                        _stall_msg = AIMessage(
+                            content=(
+                                f"I've proposed {_streak} actions that weren't approved. Rather than "
+                                "keep suggesting similar approaches, I'd like your direction on how "
+                                "to proceed.\n\n"
+                                "You can tell me what you'd like me to try instead, ask me to explain "
+                                "my reasoning, or start a new request."
+                            ),
+                            name=node_name,
+                        )
+                    else:
+                        _stall_msg = AIMessage(
+                            content=(
+                                f"🛑 **Stopped — no progress.** `{node_name}` was delegated this "
+                                f"objective {_streak} times in a row without anything taking effect "
+                                "or any new result coming back, so I stopped rather than keep "
+                                "retrying.\n\n"
+                                "Nothing was executed on the target by these attempts. If you "
+                                "approved an action, check the callback's task output before "
+                                "re-running — a completed result that never comes back is "
+                                "indistinguishable, from here, from work that never happened.\n\n"
+                                "Tell me how you'd like to proceed, or start a new request."
+                            ),
+                            name=node_name,
+                        )
                     new_messages_from_agent = [_stall_msg]
-                    # Halt the graph the same way the global step limit does, so the Supervisor
-                    # cannot simply re-delegate past this message — which is what happens when the
-                    # backstop only injects text. The operator gets this reason instead of a bare
-                    # step-limit `error` (ISC-75 A3).
                     self._stop_requested = True
                     self._stop_reason = STOP_REASON_NO_PROGRESS
                     logger.warning(

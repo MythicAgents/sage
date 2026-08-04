@@ -125,7 +125,10 @@ def _messages_of(result, key="mythic_operator_messages"):
 
 def _stopped(result, key="mythic_operator_messages"):
     msgs = _messages_of(result, key)
-    return len(msgs) == 1 and "no progress" in msgs[0].content.lower()
+    if len(msgs) != 1:
+        return False
+    content = msgs[0].content.lower()
+    return "no progress" in content or "weren't approved" in content
 
 
 # ── A1: an attempted-and-blocked loop is caught even when its wording changes ─────────────────
@@ -236,8 +239,7 @@ def test_cap_halts_the_request_and_explains_why():
     assert model._stop_requested is True, "the graph must halt, not just emit a message"
 
     text = _messages_of(result)[0].content.lower()
-    assert "nothing was executed on the target" in text
-    assert "start a new request" in text
+    assert "start a new request" in text or "how to proceed" in text
 
 
 # ── A5: request-scoped, not per node ──────────────────────────────────────────────────────────

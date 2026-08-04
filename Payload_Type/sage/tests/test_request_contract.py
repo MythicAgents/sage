@@ -458,7 +458,7 @@ def test_model_tool_boundary_fails_closed_on_contract_digest_mismatch():
     )
 
 
-def test_conversation_contract_blocks_non_control_model_tools():
+def test_conversation_contract_allows_read_only_but_blocks_guarded_tools():
     from ai.langgraph.model import Model
     from ai.langgraph.turn_authority import authority_from_request_contract
 
@@ -468,8 +468,10 @@ def test_conversation_contract_blocks_non_control_model_tools():
     model._request_contract = contract
     model._turn_authority = authority_from_request_contract(contract)
 
-    assert "conversational" in model._request_contract_block_reason("list_callbacks")
+    assert model._request_contract_block_reason("list_callbacks") == ""
     assert model._request_contract_block_reason("respond_to_user") == ""
+    assert "conversational" in model._request_contract_block_reason("issue_task_and_waitfor_task_output")
+    assert "conversational" in model._request_contract_block_reason("execute_capability")
 
 
 def test_supervised_guarded_action_reservation_is_exact_and_single_use():
