@@ -4355,6 +4355,20 @@ class Model:
             return "stopped request denies tool execution"
         if contract.lane == RequestLane.CONVERSATIONAL and tool_name in GUARDED_TOOLS:
             return "conversational request denies guarded tool execution"
+        if contract.lane == RequestLane.CONVERSATIONAL and tool_name not in GUARDED_TOOLS:
+            try:
+                from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
+                from ai.mcp import MCPManager
+                for server in MCPManager.get_connected_servers():
+                    if any(
+                        getattr(t, "name", None) == tool_name
+                        for t in MCPManager.get_tools_by_server(server)
+                    ):
+                        if is_mcp_tool_guarded(str(server), tool_name):
+                            return "conversational request denies guarded MCP tool execution"
+                        break
+            except Exception:
+                pass
         if tool_name in GUARDED_TOOLS:
             try:
                 action = action_spec_from_tool_call({
@@ -9870,10 +9884,20 @@ class Model:
         # HITL (supervised mode only): gate guarded tool calls behind an operator approve/deny
         # interrupt. AUTO mode appends nothing here, so its behavior is byte-identical to before.
         if getattr(self, "mode", "auto") == "supervised":
+            hitl_tools = set(GUARDED_TOOLS)
+            try:
+                from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
+                for server in MCPManager.get_connected_servers():
+                    for tool in MCPManager.get_tools_by_server(server):
+                        name = getattr(tool, "name", None)
+                        if name and is_mcp_tool_guarded(str(server), str(name)):
+                            hitl_tools.add(str(name))
+            except Exception:
+                pass
             mw.append(HumanInTheLoopMiddleware(
                 interrupt_on={
                     t: InterruptOnConfig(allowed_decisions=["approve", "reject"])
-                    for t in GUARDED_TOOLS
+                    for t in hitl_tools
                 },
                 description_prefix="Sage supervised mode — approve or deny this guarded tool call",
             ))

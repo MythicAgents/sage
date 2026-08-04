@@ -415,10 +415,31 @@ async def _handle_mcp(arg: str) -> str:
         return await _mcp_connect(rest)
     if sub == "call":
         return await _mcp_call(rest)
+    if sub == "policy":
+        try:
+            from ai.langgraph.mcp_tool_policy import effective_policy_summary, policy_path
+        except ImportError:
+            from ..ai.langgraph.mcp_tool_policy import effective_policy_summary, policy_path
+        path = policy_path()
+        summary = effective_policy_summary()
+        lines_out: list[str] = []
+        lines_out.append(f"**MCP Tool Policy**" + (f" (`{path}`)" if path else " (no file, all guarded)"))
+        for entry in summary:
+            scope = entry.get("scope", "?")
+            default = entry.get("default", "guarded")
+            if scope == "global":
+                lines_out.append(f"\nDefault: **{default}**")
+            else:
+                server = scope.replace("server:", "")
+                lines_out.append(f"\n**{server}** — default: {default}")
+                tools = entry.get("tools", {})
+                for tname, tclass in sorted(tools.items()):
+                    lines_out.append(f"- `{tname}`: {tclass}")
+        return "\n".join(lines_out)
     return (
         "Usage: `/mcp list` · `/mcp tools [server]` · "
         "`/mcp call <server> <tool> <json-object>` · "
-        "`/mcp connect <json>` · `/mcp disconnect <name>`"
+        "`/mcp connect <json>` · `/mcp disconnect <name>` · `/mcp policy`"
     )
 
 

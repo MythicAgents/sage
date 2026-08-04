@@ -4,11 +4,14 @@ chapter = false
 weight = 40
 +++
 
-Sage exposes **32 Mythic tools** to its agents — **22 read-only** (enumerate callbacks, payloads, tasks, files,
-and credentials; retrieve tradecraft guidance) and **10 guarded/offensive** (issue a command, execute a
-capability, create a payload, add a credential, ingest a collection, run in the sandbox). The read-only/guarded
-split is the safety story: only the guarded ten are approval-gated in supervised mode, and only they can change
-target or Mythic state. For a per-tool breakdown, see the [Tools Reference](/agents/sage/tools-reference/).
+Sage exposes **37 classified Mythic tools** to its agents — **26 read-only** (enumerate callbacks, payloads,
+tasks, files, and credentials; retrieve tradecraft guidance; build capability plans) and **11
+guarded/offensive** (issue a command, execute a capability, create a payload, add a credential, ingest a
+collection, run in the sandbox). Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
+`TOOL_SAFETY_GUARDED`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
+guarded at runtime. The read-only/guarded split determines behavior across modes: guarded tools are
+approval-gated in supervised mode, denied in conversation mode, and only they can change target or Mythic state.
+For a per-tool breakdown, see the [Tools Reference](/agents/sage/tools-reference/).
 
 | Area | Example tools | |
 |---|---|---|

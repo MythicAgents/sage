@@ -12,7 +12,7 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 | Mode | What Sage can do | When to use |
 |---|---|---|
-| `conversation` (default) | Reads Mythic and BloodHound state and answers. Cannot fire an offensive action. | Asking questions, reviewing the graph, planning. The safe default. |
+| `conversation` (default) | Reads Mythic and BloodHound state, queries read-only tools (callbacks, graph, credentials, tradecraft), and answers. Cannot fire a guarded/offensive action. | Asking questions, reviewing the graph, getting tradecraft advice, planning. The safe default. |
 | `supervised` | Proposes guarded actions; each one waits for your approval before it runs. | Interactive engagement work where you want Sage to act but keep a hand on every trigger. |
 | `auto` | Runs the autonomous kernel (observe, select, execute, verify) with no per-action approval. | A prepared, scoped objective with a live callback and an ingested graph. |
 
@@ -22,8 +22,10 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 In supervised mode every **guarded** action — issuing a command, executing a capability, creating a payload,
 adding a credential — pauses as a native Mythic approval request before it runs. Approval is **default-deny**:
-only an explicit approve response ("approve", "yes", "proceed", …) lets it through, and in a batch every action
-you do not pick is denied. Read-only tools never prompt.
+only an explicit approve response ("approve", "yes", "proceed", …) lets it through. When a card offers multiple
+actions ("select one"), choose the action to run; unselected actions are **deferred** (Sage may propose them
+again later), not permanently denied. An explicit Reject permanently blocks that action for the remainder of the
+request. Read-only tools never prompt.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
@@ -41,5 +43,5 @@ up front rather than failing mid-run.
 | `/list` | List active Sage chat sessions |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the [BloodHound MCP](/agents/sage/bloodhound/) |
-| `/mcp <list\|tools\|call\|connect\|disconnect>` | Manage [MCP servers](/agents/sage/connecting-mcp-servers/) |
+| `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage [MCP servers](/agents/sage/connecting-mcp-servers/) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |

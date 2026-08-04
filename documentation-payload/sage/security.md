@@ -27,6 +27,17 @@ risk of unintended impact on a live network. Weigh production use very carefully
 - No capability effect or objective completion may be recorded from Sage-host target I/O or Sage-local artifact
   generation. See [The Engagement Ledger](/agents/sage/engagement-ledger/) for how proof is enforced.
 
+## Livelock detection
+
+Sage includes structural guards against delegation loops that would otherwise spin indefinitely:
+
+- **No-progress backstop.** Halts after 3 consecutive delegations where a guarded tool was attempted but no
+  Mythic task was issued. The halt message distinguishes a genuine stall from operator-denied actions.
+- **Neutral-delegation soft cap.** Warns the operator after 6 consecutive delegations that return content but
+  neither attempt a guarded tool nor issue a task. Does not halt — the operator decides.
+- **Pair-bounce detector.** Warns when the same agent is delegated 3 times in a row without progress,
+  catching Supervisor ↔ sub-agent routing loops.
+
 ## Handling secrets
 
 - `read_credentials` can place raw secrets into the model context and traces; use it deliberately.

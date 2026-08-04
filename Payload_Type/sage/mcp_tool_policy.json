@@ -1,0 +1,21 @@
+{
+  "default": "guarded",
+  "servers": {
+    "bloodhound-ce": {
+      "default": "guarded",
+      "tools": {
+        "domain_info": "read_only",
+        "user_info": "read_only",
+        "group_info": "read_only",
+        "computer_info": "read_only",
+        "ou_info": "read_only",
+        "gpo_info": "read_only",
+        "graph_analysis": "read_only",
+        "adcs_info": "read_only",
+        "data_quality": "read_only",
+        "cypher_query": "read_only",
+        "file_upload": "guarded"
+      }
+    }
+  }
+}

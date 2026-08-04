@@ -305,7 +305,7 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 | Mode | What Sage can do | When to use |
 |---|---|---|
-| `conversation` (default) | Reads Mythic and BloodHound state and answers. Cannot fire an offensive action. | Asking questions, reviewing the graph, planning. The safe default. |
+| `conversation` (default) | Reads Mythic and BloodHound state, queries read-only tools (callbacks, graph, credentials, tradecraft), and answers. Cannot fire a guarded/offensive action. | Asking questions, reviewing the graph, getting tradecraft advice, planning. The safe default. |
 | `supervised` | Proposes guarded actions; each one waits for your approval before it runs. | Interactive engagement work where you want Sage to act but keep a hand on every trigger. |
 | `auto` | Runs the autonomous kernel — observe → select → execute → verify — with no per-action approval. | A prepared, scoped objective with a live callback and an ingested graph. |
 
@@ -315,8 +315,10 @@ Set `mode` when you create the channel, or switch it live with `/mode`:
 
 In supervised mode every **guarded** action — issuing a command, executing a capability, creating a payload,
 adding a credential — pauses as a native Mythic approval request before it runs. Approval is **default-deny**:
-only an explicit approve response ("approve", "yes", "proceed", …) lets it through, and in a batch every action
-you do not pick is denied. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
+only an explicit approve response ("approve", "yes", "proceed", …) lets it through. When a card offers multiple
+actions ("select one"), choose the action to run; unselected actions are **deferred** (Sage may propose them
+again later), not permanently denied. An explicit Reject permanently blocks that action for the remainder of the
+request. Read-only tools (`list_*`, `get_*`, downloads) never prompt.
 
 Guarded tools are also **scope-preflighted**: each maps to a required Mythic bot-token scope (`callback.write`,
 `payload.write`, `credential.write`, `file.write`), and a tool whose scope your channel token lacks is disabled
@@ -339,16 +341,18 @@ up front rather than failing mid-run.
 | `/list` | List active Sage chat sessions |
 | `/stop` | Cooperatively stop the running agent on this channel |
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the BloodHound MCP — see [BloodHound](#bloodhound) |
-| `/mcp <list\|tools\|call\|connect\|disconnect>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
+| `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage MCP servers — see [Connecting other MCP servers](#connecting-other-mcp-servers) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
 
 ## Tools and capabilities
 
-Sage exposes **32 Mythic tools** to its agents — **22 read-only** (enumerate callbacks, payloads, tasks, files,
-and credentials; retrieve tradecraft guidance) and **10 guarded/offensive** (issue a command, execute a
-capability, create a payload, add a credential, ingest a collection, run in the sandbox). The read-only/guarded
-split is the safety story: only the guarded ten are approval-gated in supervised mode, and only they can change
-target or Mythic state.
+Sage exposes **37 classified Mythic tools** to its agents — **26 read-only** (enumerate callbacks, payloads,
+tasks, files, and credentials; retrieve tradecraft guidance; build capability plans) and **11
+guarded/offensive** (issue a command, execute a capability, create a payload, add a credential, ingest a
+collection, run in the sandbox). Every tool carries a `@tool_safety` decorator (`TOOL_SAFETY_READ_ONLY` or
+`TOOL_SAFETY_GUARDED`) and CI enforces that no tool ships unclassified — an undecorated method defaults to
+guarded at runtime. The read-only/guarded split determines behavior across modes: guarded tools are
+approval-gated in supervised mode, denied in conversation mode, and only they can change target or Mythic state.
 
 | Area | Example tools | |
 |---|---|---|
@@ -566,12 +570,40 @@ Two rules will otherwise trip you up:
   `"sage_execution_class":"non_target_control_plane"`. This is deliberate: MCP servers are **control-plane
   only** — Sage never reaches a target through one.
 
-- **Tools are read-only by default.** For an agent to call an MCP tool, the tool must be on that server's
-  `read_only_tools` allowlist, and a tool the server annotates as write/destructive is vetoed regardless. MCP
-  tools are also withheld entirely during autonomous runs.
+- **MCP tools default to guarded.** An MCP tool not explicitly classified is treated as guarded: it requires
+  HITL approval in supervised mode and is denied in conversation mode. Classify tools via the
+  `mcp_tool_policy.json` file in the Sage payload root (`Payload_Type/sage/`). Set `SAGE_MCP_TOOL_POLICY` to
+  override the file path.
 
-Other `/mcp` subcommands: `/mcp list` (connected servers and tool counts), `/mcp tools [server]` (tool names),
-`/mcp call <server> <tool> <json>` (invoke one allowlisted tool directly, 60-second timeout), and
+### MCP tool policy
+
+The policy file classifies MCP tools as `read_only` (freely available) or `guarded` (HITL-gated in
+supervised, denied in conversation). BloodHound CE ships pre-classified.
+
+```json
+{
+  "default": "guarded",
+  "servers": {
+    "bloodhound-ce": {
+      "default": "guarded",
+      "tools": {
+        "domain_info": "read_only",
+        "graph_analysis": "read_only",
+        "file_upload": "guarded"
+      }
+    }
+  }
+}
+```
+
+Lookup order: tool-level override → server default → global default → guarded (hardcoded fallback).
+A missing or malformed file falls back to all-guarded. Use `/mcp policy` to view the effective policy.
+
+### Other `/mcp` subcommands
+
+`/mcp list` (connected servers and tool counts), `/mcp tools [server]` (tool names),
+`/mcp call <server> <tool> <json>` (invoke one allowlisted tool directly, 60-second timeout),
+`/mcp policy` (show effective tool safety classifications), and
 `/mcp disconnect <name>`. For an agent to use a server during a turn, name it in your message — for example
 "using my-server, fetch …".
 
@@ -723,6 +755,10 @@ part of the shipped Sage capability.
 - Re-discover live callback identities after every reset.
 - A configured or provisioned range is not automatically callback-ready.
 - A live evaluation attempt with a setup or measurement defect is burned, not retroactively repaired.
+- **Livelock detection.** A no-progress backstop halts after 3 consecutive delegations where a guarded tool was
+  attempted but no Mythic task was issued. A neutral-delegation soft cap warns the operator after 6 consecutive
+  non-tasking delegations. A pair-bounce detector warns when the same agent is delegated 3 times in a row
+  without progress.
 
 ## Development guidance
 

@@ -1041,12 +1041,29 @@ def tool_safety(classification: str):
     return decorator
 
 
-def tool_safety_of(tool_name: str, source: object = None) -> str:
-    """Return the safety classification for a tool. Defaults to GUARDED if undecorated."""
+def tool_safety_of(
+    tool_name: str,
+    source: object = None,
+    mcp_server: str = "",
+) -> str:
+    """Return the safety classification for a tool.
+
+    Lookup order:
+    1. MythicTools @tool_safety decorator (if source is a MythicTools instance)
+    2. MCP tool policy (if mcp_server is provided)
+    3. GUARDED_TOOLS set membership (backwards compat)
+    4. TOOL_SAFETY_GUARDED (hardcoded fallback for unknown tools)
+    """
     if source is not None:
         method = getattr(source, tool_name, None)
         if method is not None:
             return getattr(method, _TOOL_SAFETY_ATTR, TOOL_SAFETY_GUARDED)
+    if mcp_server:
+        try:
+            from .mcp_tool_policy import classify_mcp_tool
+        except ImportError:
+            from mcp_tool_policy import classify_mcp_tool
+        return classify_mcp_tool(mcp_server, tool_name)
     return TOOL_SAFETY_GUARDED if tool_name in GUARDED_TOOLS else TOOL_SAFETY_READ_ONLY
 
 
