@@ -664,6 +664,9 @@ class SageChat(Chat):
                                     approval_claim_context.get("action_digest") or ""
                                 ),
                                 approved_action_ids=approved_action_ids,
+                                selection_mode=str(
+                                    approval_claim_context.get("selection_mode") or ""
+                                ),
                             )
                         )
                     else:

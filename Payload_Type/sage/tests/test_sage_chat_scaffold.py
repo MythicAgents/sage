@@ -2502,8 +2502,9 @@ class _HitlModel:
         operator_message="",
         expected_action_digest="",
         approved_action_ids=None,
+        selection_mode="",
     ):
-        del expected_action_digest, approved_action_ids
+        del expected_action_digest, approved_action_ids, selection_mode
         self.resumed_with = decision
         self.steered_with = operator_message
         self._pending = False
@@ -2569,8 +2570,9 @@ class _MultiHitlModel(_HitlModel):
         operator_message="",
         expected_action_digest="",
         approved_action_ids=None,
+        selection_mode="",
     ):
-        del thread_id, operator_message, expected_action_digest
+        del thread_id, operator_message, expected_action_digest, selection_mode
         self.resumed_with = decision
         self.selected_action_ids = tuple(approved_action_ids or ())
         self._pending = False
@@ -2898,8 +2900,9 @@ def test_replayed_approval_response_resumes_checkpoint_only_once():
             operator_message="",
             expected_action_digest="",
             approved_action_ids=None,
+            selection_mode="",
         ):
-            del expected_action_digest, approved_action_ids
+            del expected_action_digest, approved_action_ids, selection_mode
             self.resume_calls += 1
             await asyncio.sleep(0.02)
             self.resumed_with = decision

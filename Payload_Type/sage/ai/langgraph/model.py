@@ -10714,6 +10714,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         operator_message: str = "",
         expected_action_digest: str = "",
         approved_action_ids: tuple[str, ...] | None = None,
+        selection_mode: str = "",
     ) -> str:
         """Resume a graph paused on a guarded-tool approval interrupt with a DEFAULT-DENY decision map.
 
@@ -10776,7 +10777,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # very action they just said yes to, which is worse than the loop this fix exists to stop.
             # A bare reject carries no such ambiguity: no guidance, nothing to replan from, and a
             # re-proposal of the identical action is exactly the pathology.
-            self._record_hitl_denials(rejected_actions, bind_action=not steer)
+            #
+            # Pick-one (exact_one) cards: the operator selected one action from a menu. The unselected
+            # actions are NOT denied — the operator chose an order, not a prohibition. Binding them
+            # would prevent the model from ever proposing them again, which defeats the purpose of
+            # offering a choice. The unselected actions are rejected for THIS cycle (HITL gets a reject
+            # decision) but not bound for the rest of the request.
+            is_pick_one = str(selection_mode or "").strip().casefold() == "exact_one"
+            bind = not steer and not is_pick_one
+            self._record_hitl_denials(rejected_actions, bind_action=bind)
 
         # One audit line + one Decision per interrupted tool call. On a steer, the guarded action is still
         # rejected (never blind-run), but the operator's text becomes the rejection message.
