@@ -44,3 +44,8 @@ PyYAML==6.0.3
 # Sage reads its own .env at startup (main.py) so a Mythic operator can configure the container
 # from the web UI file browser. Explicit rather than relying on pydantic-settings pulling it in.
 python-dotenv==1.2.2
+# Direct runtime import (`ai/langgraph/kernel_tracing.py`), declared 2026-08-03 when the deterministic
+# kernel gained first-party spans. It arrives transitively via arize-phoenix and openinference today;
+# same defect class as the two entries above, so it is declared rather than borrowed. The module
+# degrades to a null span if the import fails, but a shipped image should not rely on that path.
+opentelemetry-api==1.44.0

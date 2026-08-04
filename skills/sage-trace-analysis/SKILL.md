@@ -43,6 +43,31 @@ Audit solve steps or task IDs:
 
 Use `$sage-trajectory-learning` when the output should become normalized transition records or replay data.
 
+## Phoenix Tracing Verdict
+
+Answers "is the autonomous path actually traced, and is the trace structured?" in one command. A span count
+cannot answer it: the untraced-kernel signature was 13 spans that each looked fine, every one a root with
+nothing above it.
+
+```bash
+python3 skills/sage-trace-analysis/scripts/phoenix_verdict.py --latest-episode
+```
+
+Reads WAL-inclusively, because reading the bare `.db` misses everything not yet checkpointed. Scope with
+`--since 'YYYY-MM-DD HH:MM:SS'` (UTC), `--latest-episode`, or `--db <path>` for an archive. `--json` for
+machine use. Exit status is 0 only on `TRACED`, so it can gate a check.
+
+| Verdict | Meaning |
+|---|---|
+| `TRACED` | kernel spans present and every tool span has a parent |
+| `PARTIAL` | kernel spans present but some tool spans are parentless |
+| `UNTRACED` | no `sage.kernel.*` spans; the autonomous path emitted nothing of its own |
+| `EMPTY` | no spans in scope — check `--since`, or whether the run wrote to this database |
+
+Worked contrast, both reproducible today: the 2026-08-01 database reports `UNTRACED`, 101 spans / 101 roots /
+0 kernel spans; a current autonomous run reports `TRACED`, 32 spans / 1 root / 17 kernel spans / 0 parentless
+tool spans.
+
 ## Callback Dispatch Probe
 
 Use when CHAIN spans are missing from `phoenix.db` while LLM or TOOL spans survive as parentless

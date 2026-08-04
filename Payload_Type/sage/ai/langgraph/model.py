@@ -1196,6 +1196,39 @@ def _max_seq_reducer(a: int, b: int) -> int:
 _HITL_APPROVE_WORDS = frozenset({"approve", "approved", "yes", "y", "ok", "okay", "go", "proceed"})
 _HITL_GUARDED_REQUEST_UNAVAILABLE = "The exact guarded request is unavailable and the session must be replaced."
 
+# Why a session halted. Only STOP_REASON_OPERATOR describes something the operator actually did; the
+# others are Sage's own safety mechanisms. Keeping them distinct is what stops an internal halt being
+# reported as an operator action.
+STOP_REASON_OPERATOR = "operator"
+STOP_REASON_NO_PROGRESS = "no_progress"
+STOP_REASON_TERMINAL_BLOCKER = "terminal_blocker"
+
+_STOP_NOTICE_BY_REASON = {
+    STOP_REASON_OPERATOR: "\n🛑 Session stopped by operator.\n",
+    # Self-contained ON PURPOSE. The backstop composes a fuller explanation at the Supervisor node,
+    # but the halt ends the graph before it streams, so an operator sees only this. A first version
+    # said "see the explanation above" and pointed at nothing — Russel caught it in channel 23. A
+    # halt notice cannot depend on another message surviving a code path that just terminated.
+    STOP_REASON_NO_PROGRESS: (
+        "\n🛑 **Halted: no progress.** The last three delegations issued no new Mythic task, which is "
+        "how Sage detects a stalled loop. Nothing was executed on the target by those attempts.\n\n"
+        "If you are chatting rather than tasking, this is expected — Sage only counts an issued task "
+        "as progress. Start a new request, or ask for an action that tasks a callback.\n"
+    ),
+    STOP_REASON_TERMINAL_BLOCKER: (
+        "\n🛑 Halted: the same blocker recurred with no progress, so Sage stopped instead of retrying.\n"
+    ),
+}
+
+
+def stop_notice_for(reason: str) -> str:
+    """Operator-facing text for a halt, chosen by why it happened.
+
+    An unknown or unset reason must NOT fall back to the operator wording. Blaming the operator for a
+    halt they had no part in is the exact defect this exists to prevent, so the default is neutral.
+    """
+    return _STOP_NOTICE_BY_REASON.get(str(reason or ""), "\n🛑 Session halted.\n")
+
 
 def _hitl_is_approved(text: str) -> bool:
     """True only if the operator reply is an exact-match approval token (case-insensitive). Default-deny."""
@@ -3416,6 +3449,12 @@ class Model:
         # and cancelled so a stop interrupts long awaits inside tools before they can issue delayed
         # follow-up tasks.
         self._stop_requested = False
+        # WHY the stop was requested. `_stop_requested` alone is a boolean with no provenance, so three
+        # different halts — an operator pressing stop, the no-progress backstop, the loop-breaker's
+        # terminal blocker — all reached the same emitter and told the operator *they* stopped the
+        # session. Found 2026-08-03: a repeated prompt tripped the backstop and the operator was blamed
+        # for a halt he had no part in, which sends someone hunting for their own mistake.
+        self._stop_reason = ""
         self._running_tasks = set()
         self._max_steps = int(max_steps) if max_steps else 0  # 0 = unlimited
         self._global_step_count = 0
@@ -3936,6 +3975,18 @@ class Model:
             or prior.stop_condition != contract.stop_condition
         ):
             self._request_dynamic_proposals = not bool(contract.requested_actions)
+            # A NEW request clears any halt left by the previous one. Native chat reuses a per-channel
+            # Model and `_stop_requested` was otherwise set to False exactly once, in __init__, so a
+            # single halt poisoned every later request on that channel: the node's kill-switch check
+            # breaks before `result` is assigned, and the request either crashed (pre-guard) or did
+            # nothing at all (post-guard). Observed live 2026-08-03 as a repeating four-turn cycle.
+            #
+            # This sits inside the changed-request branch deliberately. Clearing only when the request
+            # id or stop condition actually changes means an operator stop landing mid-request is NOT
+            # undone by a re-install of that same request; a genuinely new message is consent to
+            # proceed, a retry of the stopped one is not.
+            self._stop_requested = False
+            self._stop_reason = ""
             lock = getattr(self, "_subgoal_authority_lock", None)
             if lock is None:
                 lock = threading.Lock()
@@ -6552,6 +6603,7 @@ class Model:
                     # backstop only injects text. The operator gets this reason instead of a bare
                     # step-limit `error` (ISC-75 A3).
                     self._stop_requested = True
+                    self._stop_reason = STOP_REASON_NO_PROGRESS
                     logger.warning(
                         f"🛑 [{node_name}] no-progress backstop fired after {_streak} consecutive "
                         f"non-progressing delegations — halting the request (ISC-59/ISC-75)"
@@ -6619,9 +6671,11 @@ class Model:
                         "supervisor_messages": [final_msg],
                         "_message_seq": next_seq,
                     }
-                    for flag in ("recursion_summary_requested", "recursion_handback"):
-                        if flag in result:
-                            terminal_update[flag] = result[flag]
+                    # Same None hazard as the flag copy further down: a halting node returns nothing.
+                    if isinstance(result, dict):
+                        for flag in ("recursion_summary_requested", "recursion_handback"):
+                            if flag in result:
+                                terminal_update[flag] = result[flag]
                     terminal_update["recursion_summary_requested"] = False
                     terminal_update["recursion_handback"] = True
                     logger.info(
@@ -6810,9 +6864,14 @@ class Model:
                     else:
                         logger.debug(f"⏭️  No substantive messages from {node_name} to copy to Supervisor")
 
-            for flag in ("recursion_summary_requested", "recursion_handback"):
-                if flag in result:
-                    update[flag] = result[flag]
+            # `result` is the node's return value and CAN be None — a node that halts (e.g. the
+            # no-progress backstop) returns nothing, and `flag in None` raises
+            # `TypeError: argument of type 'NoneType' is not iterable`. Observed live 2026-08-03 on the
+            # Supervisor node, which turned a clean halt into an operator-facing crash.
+            if isinstance(result, dict):
+                for flag in ("recursion_summary_requested", "recursion_handback"):
+                    if flag in result:
+                        update[flag] = result[flag]
             return update
         _ainvoke.__name__ = node_name
         return _ainvoke
@@ -7052,6 +7111,7 @@ class Model:
                 self._loop_breaker, str(payload.get("capability") or ""), payload, turn_key)
             if should_halt and not getattr(self, "_stop_requested", False):
                 self._stop_requested = True
+                self._stop_reason = STOP_REASON_TERMINAL_BLOCKER
                 logger.warning(
                     "🛑 [terminal-blocker] same blocker recurred with no progress — halting the solve instead of "
                     "re-delegating it (control-state P0; kills the supervisor↔worker loop).")
@@ -10392,6 +10452,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
+        self._stop_reason = STOP_REASON_OPERATOR  # the only path an operator actually drives
         try:
             from .subgoal_state import SubgoalState, cancel
 
@@ -10978,10 +11039,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             try:
                 return await self._run_autonomous_controller(effective_objective)
             except asyncio.CancelledError:
-                logger.info("🛑 Autonomous controller cancelled — clean stop")
-                await self._run_operator_stop_shielded(
-                    "\n🛑 Session stopped by operator.\n"
-                )
+                # A cancel is usually `request_stop()` cancelling the task, which labels the reason.
+                # If nothing labelled it, the cancel came from elsewhere and must not be blamed on the
+                # operator.
+                reason = getattr(self, "_stop_reason", "")
+                logger.info(f"🛑 Autonomous controller cancelled (reason={reason or 'unlabelled'}) — clean stop")
+                await self._run_operator_stop_shielded(stop_notice_for(reason))
                 raise
             except Exception as e:
                 logger.error(f"Autonomous controller failed: {e}", exc_info=True)
@@ -11001,10 +11064,14 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this
                 # Model; halt before driving the next super-step so the session can't run away.
                 if self._stop_requested:
-                    logger.info("🛑 Stop requested — terminating graph execution (main loop)")
-                    await self._run_operator_stop_shielded(
-                        "\n🛑 Session stopped by operator.\n"
+                    # No `or STOP_REASON_OPERATOR` fallback: an unset reason means an internal path we
+                    # have not labelled, and guessing "operator" is precisely the bug being fixed.
+                    reason = getattr(self, "_stop_reason", "")
+                    logger.info(
+                        f"🛑 Stop requested (reason={reason or 'unlabelled'}) — terminating graph execution "
+                        "(main loop)"
                     )
+                    await self._run_operator_stop_shielded(stop_notice_for(reason))
                     break
 
                 # HITL: in supervised mode a guarded tool call interrupts here. The outer graph
@@ -11141,8 +11208,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # request_stop() cancels the active invoke task to interrupt long-running tool awaits
             # immediately. Treat that as an operator stop, not as an invocation failure.
             self._stop_requested = True
-            stop_message = "\n🛑 Session stopped by operator.\n"
-            logger.info("🛑 Operator stop cancelled active invoke task — terminating session")
+            # Preserve a reason an internal halt already recorded; a bare cancel here is request_stop().
+            self._stop_reason = getattr(self, "_stop_reason", "") or STOP_REASON_OPERATOR
+            stop_message = stop_notice_for(self._stop_reason)
+            logger.info(
+                f"🛑 Invoke task cancelled (reason={self._stop_reason}) — terminating session"
+            )
             # Hard cancel: shield the stop notice + card-close so the tearing-down task can't cut
             # the emits off before they reach Mythic (which left the sub-agent card stuck "running").
             await self._run_operator_stop_shielded(stop_message)
@@ -11166,8 +11237,9 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     f"{self._global_step_count} model steps"
                 )
             else:
-                stop_message = "\n🛑 Session stopped by operator.\n"
-                logger.info("🛑 Operator stop honored inside agent loop — terminating session")
+                reason = getattr(self, "_stop_reason", "") or STOP_REASON_OPERATOR
+                stop_message = stop_notice_for(reason)
+                logger.info(f"🛑 Stop honored inside agent loop (reason={reason}) — terminating session")
             await self._run_operator_stop_shielded(stop_message)
             return ""
         except GraphRecursionError as e:

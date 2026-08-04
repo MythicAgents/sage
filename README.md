@@ -619,28 +619,61 @@ Mythic, range, clock, BloodHound, Sage, payload, callback, and final readiness g
 ## Observability
 
 Sage embeds [Arize Phoenix](https://github.com/Arize-ai/phoenix). On startup it launches a local Phoenix
-instance and instruments the whole LangChain stack through OpenInference, so **every model call, tool call,
-prompt, output, token count, and error is captured as a trace** — with no configuration, and nothing leaving the
-host.
+instance, instruments the LangChain stack through OpenInference, and emits its own spans from the deterministic
+execution kernel — with no configuration, and nothing leaving the host.
+
+Sage has **two execution paths**, and they produce different traces. Knowing which one you ran is the difference
+between reading a trace and misreading it.
+
+| | Chat and supervised runs (LangGraph agent) | Autonomous runs (deterministic kernel) |
+|---|---|---|
+| What runs | the agent graph: supervisor, sub-agents, middleware | the controller loop: observe, select, execute, verify |
+| Span tree | `Sage` → `Supervisor` → `model` / `tools` → tool spans | `sage.kernel.episode` → `sage.kernel.cycle` → `sage.kernel.seam.*` → tool spans |
+| Model calls | one `ChatOpenAI` span per call, with token counts | one per **policy** call, nested under `seam.policy_select` |
+| Tool calls | nested under the agent step that issued them | nested under the kernel seam that issued them |
+
+**A run with no LLM spans is not necessarily a broken trace.** The kernel's policy backend runs in `symbolic`,
+`hybrid`, or `llm` mode (`SAGE_POLICY_MODE`), and the first two can resolve a whole run from the deterministic
+admissible frontier without consulting a model. When that happens the run legitimately contains zero `ChatOpenAI`
+spans. Compare against the run's own `model_calls` in its runtime telemetry rather than assuming loss.
+
+Every `seam.policy_select` span carries the decision it produced — `sage.policy.disposition`,
+`sage.policy.rationale`, and `sage.policy.model_response_observed` — so a run that stopped because the model was
+unreachable says so in the trace instead of only in a failed leaf span.
 
 <p align="center">
   <img src="docs/assets/phoenix-trace.png" alt="Embedded Phoenix trace view" width="820">
-  <br><em>The embedded Phoenix UI: every run traced span by span, with token counts, cost, and latency.</em>
+  <br><em>The embedded Phoenix UI: an agent-path run traced span by span, with token counts, cost, and latency.</em>
 </p>
 
 This gives you:
 
-- **See exactly what the agent did and why.** Open the Phoenix UI (by default `http://localhost:6006`) and walk
-  any run span by span: which agent ran, what it sent the model, what came back, which tools fired, and where a
+- **See exactly what ran and why.** Open the Phoenix UI (by default `http://localhost:6006`) and walk a run span
+  by span: which agent or kernel step ran, what it sent the model, what came back, which tools fired, and where a
   step failed.
 
 - **Token accounting** per run and per step — how you catch a context blow-up or a runaway loop before it burns
-  your budget.
+  your budget. An autonomous run is a single trace rooted at `sage.kernel.episode`, so summing
+  `llm_token_count_*` over that trace gives the whole run's cost.
 
 - **The evidence base for evaluation.** The trace store (`.phoenix/phoenix.db`) is what the eval harness reads to
   score runs, so debugging and measurement share one source of truth.
 
-Traces persist in `.phoenix/phoenix.db` and are retained like the rest of the runtime state above.
+Traces persist in `.phoenix/phoenix.db` and are retained like the rest of the runtime state above. Read them
+WAL-inclusively: copying `phoenix.db` without its `-wal` sidecar silently drops everything not yet checkpointed.
+
+To check whether a run is traced at all, rather than reading span counts by eye:
+
+```bash
+python3 skills/sage-trace-analysis/scripts/phoenix_verdict.py --latest-episode
+```
+
+It reports `TRACED`, `PARTIAL`, `UNTRACED`, or `EMPTY`, and exits non-zero on anything but `TRACED`.
+
+**Known limits.** Kernel spans cover the controller's own steps; a Mythic task issue and its wait are traced as
+part of the `execute` seam rather than as separate spans. Span attribute values are capped at 128 KB
+(`OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`), so a very large prompt or tool output is truncated in the trace, not
+dropped. Set `SAGE_KERNEL_TRACING=0` to disable kernel spans; LangChain instrumentation is unaffected by it.
 
 ## Verification
 

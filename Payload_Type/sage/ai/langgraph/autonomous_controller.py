@@ -38,9 +38,11 @@ from uuid import uuid4
 try:
     from . import capabilities as cap
     from . import worker_outcome as wo
+    from . import kernel_tracing as _tracing
 except ImportError:  # flat-import runtimes (mirrors the codebase's relative-then-flat pattern)
     import capabilities as cap
     import worker_outcome as wo
+    import kernel_tracing as _tracing
 
 
 # NOTE: progress/milestone "wall checkpoints" are deliberately NOT defined here. They are scenario-specific
@@ -338,6 +340,34 @@ class AutonomousController:
         self._collection_attempts: dict[str, int] = {}
         self._no_effect = 0
 
+    @staticmethod
+    def _annotate_policy_span(span: Any, status: str, decision: Any) -> None:
+        """Put the policy decision itself on the `policy_select` span.
+
+        A failed model call is not an exception here: `policy.py:716-731` converts it into a structured
+        stop decision carrying the reason, and the seam correctly reports `ok` because the backend did
+        return a decision. That is the right behaviour, but it left the trace understating severity —
+        a green seam over an ERROR `ChatOpenAI` child, with the reason visible nowhere in the tree.
+
+        These attributes close that gap without touching the seam's `ok|timeout|error` vocabulary, which
+        means "did the callable complete", not "was the outcome good". `model_response_observed` is the
+        unambiguous one: false with `disposition=stop` is exactly the model-never-answered case.
+        """
+        if decision is None or status != "ok":
+            return
+        fields = {
+            "sage.policy.disposition": getattr(decision, "disposition", None),
+            "sage.policy.rationale": getattr(decision, "rationale", None),
+            "sage.policy.mode": getattr(decision, "policy_mode", None),
+            "sage.policy.model_response_observed": getattr(decision, "model_response_observed", None),
+            "sage.policy.selected_capability": getattr(decision, "selected_capability", None) or None,
+            "sage.policy.selected_target": getattr(decision, "selected_target", None) or None,
+        }
+        for key, value in fields.items():
+            if value is None or value == "":
+                continue
+            span.set_attribute(key, value if isinstance(value, bool) else str(value)[:1024])
+
     async def _policy_select(
         self,
         state: Any,
@@ -360,6 +390,7 @@ class AutonomousController:
                 },
             ),
             "policy_select",
+            annotate=self._annotate_policy_span,
         )
         if status != "ok" or decision is None:
             return None, None
@@ -389,22 +420,46 @@ class AutonomousController:
         so the controller's progress diff agrees with the frontier's notion of 'already achieved'."""
         return {cap._canonical_effect(e) for e in (state.achieved_effects() or [])}
 
-    async def _seam(self, thunk: Callable[[], Any], name: str) -> tuple[str, Any]:
+    async def _seam(
+        self,
+        thunk: Callable[[], Any],
+        name: str,
+        annotate: Callable[[Any, str, Any], None] | None = None,
+    ) -> tuple[str, Any]:
         """Call an injected seam (sync or async) with exception->diagnostic and an optional per-seam deadline.
         Returns (status, value): status is 'ok' | 'timeout' | 'error'. This is what makes the 'NEVER a 2-hour
-        timeout, always a clean halt' promise true even when a live seam hangs or raises."""
-        try:
-            value = thunk()
-            if inspect.isawaitable(value):
-                if self.config.seam_timeout_s:
-                    value = await asyncio.wait_for(value, self.config.seam_timeout_s)
-                else:
-                    value = await value
-            return ("ok", value)
-        except asyncio.TimeoutError:
-            return ("timeout", f"{name} exceeded seam_timeout_s={self.config.seam_timeout_s}")
-        except Exception as e:  # a live observe/execute WILL occasionally throw; convert, don't crash the loop
-            return ("error", f"{name} raised {type(e).__name__}: {e}")
+        timeout, always a clean halt' promise true even when a live seam hangs or raises.
+
+        Every controller operation funnels through here, so this is also the one place kernel spans need to be
+        emitted from to cover observe/execute/collect/verify/policy_select. The span is emission-only: the
+        (status, value) contract below is untouched, and a seam that fails still returns its diagnostic rather
+        than raising. `policy_select` in particular runs the model call inside this span, which is what gives
+        the otherwise-parentless LLM span a parent."""
+        status, value = "ok", None
+        with _tracing.kernel_span(
+            f"sage.kernel.seam.{name}",
+            **{"sage.seam.name": name, "sage.cycle.index": getattr(self, "_current_cycle", 0)},
+        ) as span:
+            try:
+                value = thunk()
+                if inspect.isawaitable(value):
+                    if self.config.seam_timeout_s:
+                        value = await asyncio.wait_for(value, self.config.seam_timeout_s)
+                    else:
+                        value = await value
+            except asyncio.TimeoutError:
+                status = "timeout"
+                value = f"{name} exceeded seam_timeout_s={self.config.seam_timeout_s}"
+            except Exception as e:  # a live observe/execute WILL occasionally throw; convert, don't crash the loop
+                status = "error"
+                value = f"{name} raised {type(e).__name__}: {e}"
+            _tracing.record_seam_outcome(span, status, None if status == "ok" else value)
+            if annotate is not None:
+                try:
+                    annotate(span, status, value)
+                except Exception:  # an annotator is telemetry; it must never affect the seam
+                    pass
+        return (status, value)
 
     async def _budget_exceeded(self) -> str:
         # FAIL CLOSED: budgets are the last-resort guard against a runaway run, so a meter that errors/times out
@@ -451,9 +506,30 @@ class AutonomousController:
             return False
 
     async def run(self) -> ControllerResult:
+        """Trace one autonomous episode, then delegate unchanged to the controller loop.
+
+        A wrapper rather than a `with` around the loop body: `_run` has many `return done(...)` paths, and
+        re-indenting ~190 lines of kernel control flow to add a span is a poor trade against the risk of a
+        mis-indent. This covers every exit path, including exceptions, without touching one line of the loop.
+        """
+        with _tracing.kernel_span(
+            "sage.kernel.episode",
+            **{"sage.episode.id": self._episode_id, "sage.episode.objective": self._objective},
+        ) as span:
+            result = await self._run()
+            try:
+                span.set_attribute("sage.episode.status", str(getattr(result, "status", "")))
+                span.set_attribute("sage.episode.cycle_count", int(getattr(result, "cycle_count", 0) or 0))
+                span.set_attribute("sage.episode.effect_count", len(getattr(result, "achieved_effects", ()) or ()))
+            except Exception:
+                pass
+            return result
+
+    async def _run(self) -> ControllerResult:
         # Per-solve reset (a Sage Model may reuse one controller across solves; never leak a prior objective's
         # blockers/counters — the cross-solve leak Forge caught in the earlier P0 wiring).
         self._loop = wo.LoopBreakerState()
+        self._current_cycle = 0  # span attribute only; never read by control flow
         self._collections = 0
         self._collection_attempts = {}
         self._no_effect = 0
@@ -486,241 +562,251 @@ class AutonomousController:
         achieved = self._achieved(state)
 
         for cycle in range(1, self.config.max_cycles + 1):
-            # 0) cooperative kill switch — honor an operator stop BETWEEN cycles (a hung in-cycle seam is bounded
-            #    separately by seam_timeout_s). Cheap; checked before any expensive step.
-            if self._should_abort is not None:
-                st, ab = await self._seam(lambda: self._should_abort(), "should_abort")
-                if st == "ok" and bool(ab):
-                    return done(STATUS_ABORTED, "operator requested stop")
+            # One span per controller cycle. The seams below nest beneath it, and because the
+            # LangChain instrumentor falls back to ambient context for a parentless run, the
+            # policy model call and MCP tool calls land under the cycle that caused them.
+            with _tracing.kernel_span(
+                    "sage.kernel.cycle", **{"sage.cycle.index": cycle}
+            ):
+                # Stamp the cycle onto every seam span opened below. A true per-cycle span would need this whole
+                # body re-indented inside a `with`, which is not worth a mis-indent in kernel control flow; the
+                # attribute groups a cycle's seams in Phoenix without touching the loop.
+                self._current_cycle = cycle
+                # 0) cooperative kill switch — honor an operator stop BETWEEN cycles (a hung in-cycle seam is bounded
+                #    separately by seam_timeout_s). Cheap; checked before any expensive step.
+                if self._should_abort is not None:
+                    st, ab = await self._seam(lambda: self._should_abort(), "should_abort")
+                    if st == "ok" and bool(ab):
+                        return done(STATUS_ABORTED, "operator requested stop")
 
-            # 1) completion
-            if self._objective_met is not None:
-                st, met = await self._seam(lambda: self._objective_met(state), "objective_met")
-                if st == "ok" and bool(met):
-                    return done(STATUS_COMPLETE, "objective satisfied")
+                # 1) completion
+                if self._objective_met is not None:
+                    st, met = await self._seam(lambda: self._objective_met(state), "objective_met")
+                    if st == "ok" and bool(met):
+                        return done(STATUS_COMPLETE, "objective satisfied")
 
-            # 2) budget stop-loss (before any expensive step)
-            over = await self._budget_exceeded()
-            if over:
-                return done(STATUS_BUDGET, over)
+                # 2) budget stop-loss (before any expensive step)
+                over = await self._budget_exceeded()
+                if over:
+                    return done(STATUS_BUDGET, over)
 
-            # 3) Compute collection and capability candidates once so policy sees the complete peer set.
-            frontier = list(self._frontier_fn(state) or [])
-            action = None
-            decision = None
-            phase = ""
-            need = False
-            if self._needs_collection is not None and self._collect is not None:
-                st, requested = await self._seam(lambda: self._needs_collection(state), "needs_collection")
-                if st == "ok":
-                    need = requested
-                if bool(need):
-                    collect_candidate = _CollectionCandidate(
-                        target=_collection_request_key(need),
-                    )
-                    if self._policy is None:
-                        selected, decision = collect_candidate, None
-                    else:
-                        selected, decision = await self._policy_select(
-                            state,
-                            [collect_candidate, *frontier],
-                            decisions,
+                # 3) Compute collection and capability candidates once so policy sees the complete peer set.
+                frontier = list(self._frontier_fn(state) or [])
+                action = None
+                decision = None
+                phase = ""
+                need = False
+                if self._needs_collection is not None and self._collect is not None:
+                    st, requested = await self._seam(lambda: self._needs_collection(state), "needs_collection")
+                    if st == "ok":
+                        need = requested
+                    if bool(need):
+                        collect_candidate = _CollectionCandidate(
+                            target=_collection_request_key(need),
                         )
-                    if decision is not None:
-                        decisions.append(decision)
-                    if selected is None:
-                        rationale = str(getattr(decision, "rationale", "") or "policy did not authorize collection")
-                        blocker = {"reason": rationale, "policy_mode": str(getattr(decision, "policy_mode", "") or "")}
+                        if self._policy is None:
+                            selected, decision = collect_candidate, None
+                        else:
+                            selected, decision = await self._policy_select(
+                                state,
+                                [collect_candidate, *frontier],
+                                decisions,
+                            )
+                        if decision is not None:
+                            decisions.append(decision)
+                        if selected is None:
+                            rationale = str(getattr(decision, "rationale", "") or "policy did not authorize collection")
+                            blocker = {"reason": rationale, "policy_mode": str(getattr(decision, "policy_mode", "") or "")}
+                            cycles.append(CycleRecord(
+                                cycle,
+                                "collect",
+                                action="collect-graph",
+                                ok=False,
+                                note=rationale,
+                                decision_id=str(getattr(decision, "decision_id", "") or ""),
+                                policy_mode=str(getattr(decision, "policy_mode", "") or ""),
+                            ))
+                            return done(STATUS_NO_ACTION, "policy declined graph collection")
+                        if selected is collect_candidate:
+                            request_key = _collection_request_key(need) or "__anonymous_collection_request__"
+                            attempts = self._collection_attempts.get(request_key, 0)
+                            if attempts >= self.config.max_collection_attempts_per_request:
+                                blocker = {
+                                    "reason": "collection retry budget exhausted",
+                                    "collection_key": request_key,
+                                    "attempts": attempts,
+                                    "achieved": sorted(achieved),
+                                }
+                                return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
+                            if self.config.max_collections is not None and self._collections >= self.config.max_collections:
+                                blocker = {
+                                    "reason": "configured global collection emergency cap exhausted",
+                                    "collection_key": request_key,
+                                    "attempts": attempts,
+                                    "achieved": sorted(achieved),
+                                }
+                                return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
+                            transactions.append(_transaction_record("collection", "collect-graph", request_key, decision))
+                            cst, cres = await self._collect_seam(state, decision)
+                            self._collections += 1
+                            attempts += 1
+                            self._collection_attempts[request_key] = attempts
+                            res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
+                            collection_ok = res.get("ok") is True
+                            note = str(res.get("status") or res.get("reason") or "")
+                            collection_reason = str(res.get("collection_reason") or "")
+                            if collection_reason:
+                                note = f"{collection_reason}: {note}" if note else collection_reason
+                            cycles.append(CycleRecord(
+                                cycle,
+                                "collect",
+                                action="collect_graph",
+                                ok=collection_ok,
+                                note=note,
+                                decision_id=str(getattr(decision, "decision_id", "") or ""),
+                                policy_mode=str(getattr(decision, "policy_mode", "") or ""),
+                            ))
+                            if not collection_ok and attempts >= self.config.max_collection_attempts_per_request:
+                                blocker = {
+                                    "reason": note or "collection failed",
+                                    "collection_key": request_key,
+                                    "attempts": attempts,
+                                    "achieved": sorted(achieved),
+                                }
+                                return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
+                            ost, state = await self._seam(lambda: self._observe(), "observe")
+                            if ost != "ok" or state is None:
+                                blocker = {"reason": f"observe unavailable after collect: {state}"}
+                                return done(STATUS_NO_ACTION, "could not observe after collection")
+                            achieved = self._achieved(state)
+                            continue
+                        action = selected
+                        phase = "execute"
+
+                # 4) Resolve the already-computed capability frontier when collection was absent or not selected.
+                if action is None and not frontier:
+                    if self._policy is not None:
+                        blocker = {
+                            "reason": "no admissible capability action from observed state",
+                            "policy_mode": str(getattr(self._policy, "mode", "") or ""),
+                            "achieved": sorted(achieved),
+                        }
                         cycles.append(CycleRecord(
                             cycle,
-                            "collect",
-                            action="collect-graph",
+                            "policy",
+                            ok=False,
+                            note="empty frontier; explicit policy cannot use legacy route discovery",
+                            policy_mode=str(getattr(self._policy, "mode", "") or ""),
+                        ))
+                        return done(STATUS_NO_ACTION, "empty frontier under explicit policy")
+                    # 5) empty frontier -> bounded LLM route discovery (precondition-checked), else clean halt.
+                    candidate = None
+                    if self._route_discovery is not None:
+                        st, cand = await self._seam(lambda: self._route_discovery(state), "route_discovery")
+                        if st == "ok" and cand is not None and self._candidate_admissible(state, cand):
+                            candidate = cand
+                        elif st == "ok" and cand is not None:
+                            self._log("route_discovery candidate failed precondition check; rejected")
+                    if candidate is None:
+                        blocker = {"reason": "no admissible capability action from observed state",
+                                   "achieved": sorted(achieved)}
+                        cycles.append(CycleRecord(cycle, "route_discovery", ok=False,
+                                                  note="empty frontier; no admissible route-discovery candidate"))
+                        return done(STATUS_NO_ACTION, "empty frontier and no admissible route-discovery move")
+                    action = candidate
+                    phase = "route_discovery"
+                elif action is None:
+                    action, decision = await self._policy_select(state, frontier, decisions)
+                    if decision is not None:
+                        decisions.append(decision)
+                    if action is None:
+                        rationale = str(getattr(decision, "rationale", "") or "policy produced no executable selection")
+                        blocker = {
+                            "reason": rationale,
+                            "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
+                            "decision_id": str(getattr(decision, "decision_id", "") or ""),
+                            "achieved": sorted(achieved),
+                        }
+                        cycles.append(CycleRecord(
+                            cycle,
+                            "policy",
                             ok=False,
                             note=rationale,
                             decision_id=str(getattr(decision, "decision_id", "") or ""),
                             policy_mode=str(getattr(decision, "policy_mode", "") or ""),
                         ))
-                        return done(STATUS_NO_ACTION, "policy declined graph collection")
-                    if selected is collect_candidate:
-                        request_key = _collection_request_key(need) or "__anonymous_collection_request__"
-                        attempts = self._collection_attempts.get(request_key, 0)
-                        if attempts >= self.config.max_collection_attempts_per_request:
-                            blocker = {
-                                "reason": "collection retry budget exhausted",
-                                "collection_key": request_key,
-                                "attempts": attempts,
-                                "achieved": sorted(achieved),
-                            }
-                            return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
-                        if self.config.max_collections is not None and self._collections >= self.config.max_collections:
-                            blocker = {
-                                "reason": "configured global collection emergency cap exhausted",
-                                "collection_key": request_key,
-                                "attempts": attempts,
-                                "achieved": sorted(achieved),
-                            }
-                            return done(STATUS_BLOCKED, "configured global collection emergency cap exhausted")
-                        transactions.append(_transaction_record("collection", "collect-graph", request_key, decision))
-                        cst, cres = await self._collect_seam(state, decision)
-                        self._collections += 1
-                        attempts += 1
-                        self._collection_attempts[request_key] = attempts
-                        res = _parse_result(cres) if cst == "ok" else {"ok": False, "reason": cres}
-                        collection_ok = res.get("ok") is True
-                        note = str(res.get("status") or res.get("reason") or "")
-                        collection_reason = str(res.get("collection_reason") or "")
-                        if collection_reason:
-                            note = f"{collection_reason}: {note}" if note else collection_reason
-                        cycles.append(CycleRecord(
-                            cycle,
-                            "collect",
-                            action="collect_graph",
-                            ok=collection_ok,
-                            note=note,
-                            decision_id=str(getattr(decision, "decision_id", "") or ""),
-                            policy_mode=str(getattr(decision, "policy_mode", "") or ""),
-                        ))
-                        if not collection_ok and attempts >= self.config.max_collection_attempts_per_request:
-                            blocker = {
-                                "reason": note or "collection failed",
-                                "collection_key": request_key,
-                                "attempts": attempts,
-                                "achieved": sorted(achieved),
-                            }
-                            return done(STATUS_BLOCKED, "collection retry budget exhausted for one request")
-                        ost, state = await self._seam(lambda: self._observe(), "observe")
-                        if ost != "ok" or state is None:
-                            blocker = {"reason": f"observe unavailable after collect: {state}"}
-                            return done(STATUS_NO_ACTION, "could not observe after collection")
-                        achieved = self._achieved(state)
-                        continue
-                    action = selected
+                        return done(STATUS_NO_ACTION, "policy selected no offensive capability")
                     phase = "execute"
 
-            # 4) Resolve the already-computed capability frontier when collection was absent or not selected.
-            if action is None and not frontier:
-                if self._policy is not None:
+                name = cap._normalize(getattr(action, "name", ""))
+                target = str(getattr(action, "target", ""))
+                expected = _action_effects(action)
+
+                # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
+                transactions.append(_transaction_record("capability", name, target, decision))
+                est, eres = await self._execute_seam(action, decision)
+                result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
+
+                # 7) verify — re-observe and diff achieved effects; PROGRESS is attributed to THIS action's expected
+                #    effect (not global drift, which unrelated effects could fake — Forge #4).
+                prev = achieved
+                ost, state = await self._seam(lambda: self._observe(), "observe")
+                if ost != "ok" or state is None:
+                    blocker = {"reason": f"observe unavailable after execute: {state}", "last_action": name}
+                    return done(STATUS_NO_ACTION, "could not observe after execute")
+                achieved = self._achieved(state)
+                new_effects = sorted(achieved - prev)
+                # PROGRESS is attributed to THIS action's own declared (canonical) effect — NOT to global drift
+                # (unrelated effects landing could otherwise fake progress, Forge #4) and NOT via a global-drift
+                # fallback for effectless actions (Forge NEW-3): an action with no declared effect cannot progress
+                # by definition, so it must register as no-progress and be caught by the loop-breaker / no-effect cap.
+                progressed = bool(expected & set(new_effects))
+
+                cycles.append(CycleRecord(cycle, phase, action=name, target=target,
+                                          ok=bool(result.get("ok", True)), new_effects=new_effects,
+                                          note=str(result.get("reason", ""))[:160],
+                                          decision_id=str(getattr(decision, "decision_id", "") or ""),
+                                          policy_mode=str(getattr(decision, "policy_mode", "") or "")))
+                self._log(f"cycle {cycle}: {phase} {name}->{target} ok={result.get('ok')} "
+                          f"progressed={progressed} new_effects={new_effects}")
+
+                zero_retry_blocker = _trajectory_zero_retry_blocker(result, progressed=progressed)
+                if zero_retry_blocker is not None:
                     blocker = {
-                        "reason": "no admissible capability action from observed state",
-                        "policy_mode": str(getattr(self._policy, "mode", "") or ""),
+                        "capability": name,
                         "achieved": sorted(achieved),
+                        "trajectory_repair": zero_retry_blocker,
                     }
-                    cycles.append(CycleRecord(
-                        cycle,
-                        "policy",
-                        ok=False,
-                        note="empty frontier; explicit policy cannot use legacy route discovery",
-                        policy_mode=str(getattr(self._policy, "mode", "") or ""),
-                    ))
-                    return done(STATUS_NO_ACTION, "empty frontier under explicit policy")
-                # 5) empty frontier -> bounded LLM route discovery (precondition-checked), else clean halt.
-                candidate = None
-                if self._route_discovery is not None:
-                    st, cand = await self._seam(lambda: self._route_discovery(state), "route_discovery")
-                    if st == "ok" and cand is not None and self._candidate_admissible(state, cand):
-                        candidate = cand
-                    elif st == "ok" and cand is not None:
-                        self._log("route_discovery candidate failed precondition check; rejected")
-                if candidate is None:
-                    blocker = {"reason": "no admissible capability action from observed state",
+                    return done(
+                        STATUS_BLOCKED,
+                        f"terminal trajectory blocker on {name}: retry budget exhausted",
+                    )
+
+                # 8) loop-breaker (worker_outcome): the EPOCH advances on VERIFIED progress (decoupled from the
+                #    self-reported `ok`, Forge #3/NEW-4) while the OUTCOME is classified from the REAL result — so a
+                #    real retry after a verified state change is not over-suppressed, a self-reported success with no
+                #    verified effect cannot mask a loop, AND a slow/idempotent real success is not mislabeled a
+                #    blocker. Same blocker + same epoch -> STOP (kills the 1116 redelegation tail).
+                should_stop = wo.observe_capability_outcome(self._loop, name or target, result,
+                                                            turn_key=str(cycle), progressed=progressed)
+                if should_stop:
+                    blocker = {"capability": name, "reason": str(result.get("reason") or result.get("error") or ""),
+                               "suggested_capability": str(result.get("suggested_capability")
+                                                           or result.get("run_first")
+                                                           or result.get("next_capability") or ""),
                                "achieved": sorted(achieved)}
-                    cycles.append(CycleRecord(cycle, "route_discovery", ok=False,
-                                              note="empty frontier; no admissible route-discovery candidate"))
-                    return done(STATUS_NO_ACTION, "empty frontier and no admissible route-discovery move")
-                action = candidate
-                phase = "route_discovery"
-            elif action is None:
-                action, decision = await self._policy_select(state, frontier, decisions)
-                if decision is not None:
-                    decisions.append(decision)
-                if action is None:
-                    rationale = str(getattr(decision, "rationale", "") or "policy produced no executable selection")
-                    blocker = {
-                        "reason": rationale,
-                        "policy_mode": str(getattr(decision, "policy_mode", "") or ""),
-                        "decision_id": str(getattr(decision, "decision_id", "") or ""),
-                        "achieved": sorted(achieved),
-                    }
-                    cycles.append(CycleRecord(
-                        cycle,
-                        "policy",
-                        ok=False,
-                        note=rationale,
-                        decision_id=str(getattr(decision, "decision_id", "") or ""),
-                        policy_mode=str(getattr(decision, "policy_mode", "") or ""),
-                    ))
-                    return done(STATUS_NO_ACTION, "policy selected no offensive capability")
-                phase = "execute"
+                    return done(STATUS_BLOCKED, f"terminal blocker on {name}: same blocker recurred without progress")
 
-            name = cap._normalize(getattr(action, "name", ""))
-            target = str(getattr(action, "target", ""))
-            expected = _action_effects(action)
-
-            # 6) execute (exception/timeout -> a blocker result, never a crash or a silent success)
-            transactions.append(_transaction_record("capability", name, target, decision))
-            est, eres = await self._execute_seam(action, decision)
-            result = _parse_result(eres) if est == "ok" else {"ok": False, "reason": f"{est}: {eres}"}
-
-            # 7) verify — re-observe and diff achieved effects; PROGRESS is attributed to THIS action's expected
-            #    effect (not global drift, which unrelated effects could fake — Forge #4).
-            prev = achieved
-            ost, state = await self._seam(lambda: self._observe(), "observe")
-            if ost != "ok" or state is None:
-                blocker = {"reason": f"observe unavailable after execute: {state}", "last_action": name}
-                return done(STATUS_NO_ACTION, "could not observe after execute")
-            achieved = self._achieved(state)
-            new_effects = sorted(achieved - prev)
-            # PROGRESS is attributed to THIS action's own declared (canonical) effect — NOT to global drift
-            # (unrelated effects landing could otherwise fake progress, Forge #4) and NOT via a global-drift
-            # fallback for effectless actions (Forge NEW-3): an action with no declared effect cannot progress
-            # by definition, so it must register as no-progress and be caught by the loop-breaker / no-effect cap.
-            progressed = bool(expected & set(new_effects))
-
-            cycles.append(CycleRecord(cycle, phase, action=name, target=target,
-                                      ok=bool(result.get("ok", True)), new_effects=new_effects,
-                                      note=str(result.get("reason", ""))[:160],
-                                      decision_id=str(getattr(decision, "decision_id", "") or ""),
-                                      policy_mode=str(getattr(decision, "policy_mode", "") or "")))
-            self._log(f"cycle {cycle}: {phase} {name}->{target} ok={result.get('ok')} "
-                      f"progressed={progressed} new_effects={new_effects}")
-
-            zero_retry_blocker = _trajectory_zero_retry_blocker(result, progressed=progressed)
-            if zero_retry_blocker is not None:
-                blocker = {
-                    "capability": name,
-                    "achieved": sorted(achieved),
-                    "trajectory_repair": zero_retry_blocker,
-                }
-                return done(
-                    STATUS_BLOCKED,
-                    f"terminal trajectory blocker on {name}: retry budget exhausted",
-                )
-
-            # 8) loop-breaker (worker_outcome): the EPOCH advances on VERIFIED progress (decoupled from the
-            #    self-reported `ok`, Forge #3/NEW-4) while the OUTCOME is classified from the REAL result — so a
-            #    real retry after a verified state change is not over-suppressed, a self-reported success with no
-            #    verified effect cannot mask a loop, AND a slow/idempotent real success is not mislabeled a
-            #    blocker. Same blocker + same epoch -> STOP (kills the 1116 redelegation tail).
-            should_stop = wo.observe_capability_outcome(self._loop, name or target, result,
-                                                        turn_key=str(cycle), progressed=progressed)
-            if should_stop:
-                blocker = {"capability": name, "reason": str(result.get("reason") or result.get("error") or ""),
-                           "suggested_capability": str(result.get("suggested_capability")
-                                                       or result.get("run_first")
-                                                       or result.get("next_capability") or ""),
-                           "achieved": sorted(achieved)}
-                return done(STATUS_BLOCKED, f"terminal blocker on {name}: same blocker recurred without progress")
-
-            # 9) no-progress stop-loss
-            if progressed:
-                self._no_effect = 0
-            else:
-                self._no_effect += 1
-                if self._no_effect >= self.config.max_no_effect_cycles:
-                    blocker = {"reason": "no new verified effect", "last_action": name,
-                               "achieved": sorted(achieved)}
-                    return done(STATUS_NO_PROGRESS,
-                                f"{self._no_effect} consecutive cycles produced no new verified effect")
+                # 9) no-progress stop-loss
+                if progressed:
+                    self._no_effect = 0
+                else:
+                    self._no_effect += 1
+                    if self._no_effect >= self.config.max_no_effect_cycles:
+                        blocker = {"reason": "no new verified effect", "last_action": name,
+                                   "achieved": sorted(achieved)}
+                        return done(STATUS_NO_PROGRESS,
+                                    f"{self._no_effect} consecutive cycles produced no new verified effect")
 
         return done(STATUS_MAX_CYCLES, f"reached max_cycles={self.config.max_cycles}")
 
