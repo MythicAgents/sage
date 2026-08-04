@@ -264,3 +264,100 @@ def test_streak_does_not_leak_between_requests():
     model_b = _fresh_model(_FakeMythicClient())
     assert not hasattr(model_b, "_nonprogress_delegations")
     assert not _stopped(_run_once(model_b, _BlockedActionAgent(model_b)))
+
+
+# ── ISC-8: neutral delegation soft cap ──────────────────────────────────────────────────────────
+
+def test_neutral_soft_cap_warns_at_six():
+    """After 6 consecutive neutral delegations, a warning is appended to the output."""
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AnalysisAgent()
+
+    for i in range(5):
+        result = _run_once(model, agent)
+        msgs = _messages_of(result)
+        assert not any("routing internally" in m.content for m in msgs), (
+            f"warning fired too early on delegation {i + 1}"
+        )
+
+    result = _run_once(model, agent)
+    msgs = _messages_of(result)
+    assert any("routing internally" in m.content for m in msgs), (
+        "neutral soft cap warning must fire on the 6th consecutive neutral delegation"
+    )
+
+
+def test_neutral_soft_cap_resets_on_progress():
+    """A progressing delegation resets the neutral counter."""
+    client = _FakeMythicClient()
+    model = _fresh_model(client)
+    agent = _AnalysisAgent()
+
+    for _ in range(5):
+        _run_once(model, agent)
+
+    tasking = _TaskingAgent(client, model)
+    _run_once(model, tasking)
+    assert getattr(model, "_neutral_delegations", 0) == 0, "progress must reset the neutral counter"
+
+    for i in range(5):
+        result = _run_once(model, agent)
+        msgs = _messages_of(result)
+        assert not any("routing internally" in m.content for m in msgs), (
+            f"warning fired too early after reset, delegation {i + 1}"
+        )
+
+
+# ── ISC-3b: same-agent pair-bounce detection ────────────────────────────────────────────────────
+
+def test_pair_bounce_warns_at_three():
+    """When the same node is delegated 3 times in a row without progress, a warning fires."""
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AnalysisAgent()
+
+    for i in range(2):
+        result = _run_once(model, agent, "BloodHound", "bloodhound_messages")
+        msgs = _messages_of(result, "bloodhound_messages")
+        assert not any("handing back to each other" in m.content for m in msgs), (
+            f"pair-bounce warning fired too early on bounce {i + 1}"
+        )
+
+    result = _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    msgs = _messages_of(result, "bloodhound_messages")
+    assert any("handing back to each other" in m.content for m in msgs), (
+        "pair-bounce warning must fire on the 3rd consecutive same-agent delegation"
+    )
+
+
+def test_pair_bounce_resets_on_different_node():
+    """Delegating to a different node resets the pair-bounce counter."""
+    model = _fresh_model(_FakeMythicClient())
+    agent = _AnalysisAgent()
+
+    _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    _run_once(model, agent, "Generalist", "generalist_messages")
+    result = _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    msgs = _messages_of(result, "bloodhound_messages")
+    assert not any("handing back to each other" in m.content for m in msgs), (
+        "pair-bounce counter must reset when a different node is delegated"
+    )
+
+
+def test_pair_bounce_resets_on_progress():
+    """A progressing delegation resets the pair-bounce counter."""
+    client = _FakeMythicClient()
+    model = _fresh_model(client)
+    agent = _AnalysisAgent()
+
+    _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    _run_once(model, agent, "BloodHound", "bloodhound_messages")
+
+    tasking = _TaskingAgent(client, model)
+    _run_once(model, tasking)
+
+    result = _run_once(model, agent, "BloodHound", "bloodhound_messages")
+    msgs = _messages_of(result, "bloodhound_messages")
+    assert not any("handing back to each other" in m.content for m in msgs), (
+        "pair-bounce counter must reset after progress"
+    )
