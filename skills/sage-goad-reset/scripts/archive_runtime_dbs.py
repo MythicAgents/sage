@@ -38,6 +38,10 @@ def archive_runtime_dbs(
 
     for source, destination in moves:
         source.replace(destination)
+        for suffix in ("-wal", "-shm"):
+            sidecar = source.with_name(source.name + suffix)
+            if sidecar.exists():
+                sidecar.replace(destination.with_name(destination.name + suffix))
     return moves
 
 

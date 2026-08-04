@@ -521,6 +521,9 @@ class AutonomousController:
                 span.set_attribute("sage.episode.status", str(getattr(result, "status", "")))
                 span.set_attribute("sage.episode.cycle_count", int(getattr(result, "cycle_count", 0) or 0))
                 span.set_attribute("sage.episode.effect_count", len(getattr(result, "achieved_effects", ()) or ()))
+                reason = str(getattr(result, "reason", "") or "")
+                if reason:
+                    span.set_attribute("sage.stop.reason", reason)
             except Exception:
                 pass
             return result

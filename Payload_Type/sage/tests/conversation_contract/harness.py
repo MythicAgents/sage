@@ -67,7 +67,7 @@ class _BehaviorProbeModel:
     async def _hitl_interrupt_pending(self, _thread_id):
         return False
 
-    def request_stop(self):
+    def request_stop(self, reason: str = "unspecified"):
         self._stop_requested = True
 
     async def _close_all_delegations(self, status="finished"):

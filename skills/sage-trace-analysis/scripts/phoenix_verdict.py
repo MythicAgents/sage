@@ -85,8 +85,16 @@ def collect(conn: sqlite3.Connection, where: str, params: list) -> dict:
         params,
     ).fetchone()
 
+    orphans = conn.execute(
+        f"SELECT COUNT(*) FROM spans s1 WHERE s1.parent_id IS NOT NULL AND {where} "
+        "AND NOT EXISTS (SELECT 1 FROM spans s2 WHERE s2.span_id = s1.parent_id)",
+        params,
+    ).fetchone()[0]
+
     if total == 0:
         verdict = "EMPTY"
+    elif kernel == 0 and orphans:
+        verdict = "ORPHANED"
     elif kernel == 0:
         verdict = "UNTRACED"
     elif tool_total and tool_roots:
@@ -101,6 +109,7 @@ def collect(conn: sqlite3.Connection, where: str, params: list) -> dict:
         "kernel_spans": kernel,
         "tool_spans": tool_total,
         "tool_spans_parentless": tool_roots,
+        "orphan_spans": orphans,
         "prompt_tokens": tokens[0],
         "completion_tokens": tokens[1],
         "by_name": [
@@ -115,6 +124,7 @@ def render(report: dict) -> str:
         f"spans / roots      {report['spans']} / {report['roots']}",
         f"kernel spans       {report['kernel_spans']}",
         f"tool spans         {report['tool_spans']} ({report['tool_spans_parentless']} parentless)",
+        f"orphan spans       {report['orphan_spans']}",
         f"tokens             prompt={report['prompt_tokens']} completion={report['completion_tokens']}",
         "",
         "  count  roots  kind    name",
@@ -125,6 +135,9 @@ def render(report: dict) -> str:
         "TRACED": "kernel spans present and every tool span has a parent",
         "PARTIAL": "kernel spans present but some tool spans are parentless",
         "UNTRACED": "no sage.kernel.* spans: the autonomous path emitted nothing of its own",
+        "ORPHANED": "tool spans have parent_id set but the parent span is absent — the run was "
+                    "likely killed before the episode/cycle span ended and exported; the trace "
+                    "tree will materialise when the run completes normally",
         "EMPTY": "no spans in scope (check --since, or whether the run wrote to this database)",
     }[report["verdict"]]
     lines += ["", explanation]

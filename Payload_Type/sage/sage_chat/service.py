@@ -297,7 +297,7 @@ class SageChat(Chat):
         try:
             model.request_stop(reason)
         except Exception:
-            logger.debug("request_stop() failed during lifecycle cleanup", exc_info=True)
+            logger.warning("request_stop() failed during lifecycle cleanup", exc_info=True)
         emit_terminal = getattr(model, "_emit_operator_stop", None)
         if callable(emit_terminal) and status in {"stopped", "cancelled"}:
             try:
@@ -307,7 +307,7 @@ class SageChat(Chat):
                 )
                 return
             except Exception:
-                logger.debug(
+                logger.warning(
                     "request lifecycle terminalization failed",
                     exc_info=True,
                 )
@@ -318,7 +318,7 @@ class SageChat(Chat):
             try:
                 await close_all(status=status)
             except Exception:
-                logger.debug("request lifecycle cleanup failed", exc_info=True)
+                logger.warning("request lifecycle cleanup failed", exc_info=True)
 
     async def _rotate_auth_changed_session(self, request: ChatRequest, model: Any | None) -> Any | None:
         if model is None:

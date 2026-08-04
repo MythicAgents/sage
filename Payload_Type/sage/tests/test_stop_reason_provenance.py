@@ -23,6 +23,7 @@ from ai.langgraph.model import (
     STOP_REASON_RUNTIME_ERROR,
     STOP_REASON_SESSION_ROTATED,
     STOP_REASON_TERMINAL_BLOCKER,
+    STOP_REASON_UNSPECIFIED,
     stop_notice_for,
 )
 
@@ -54,6 +55,7 @@ def test_halt_notices_are_self_contained():
         STOP_REASON_SESSION_ROTATED,
         STOP_REASON_RESUME_REFUSED,
         STOP_REASON_RUNTIME_ERROR,
+        STOP_REASON_UNSPECIFIED,
         "",
     ):
         notice = stop_notice_for(reason).lower()
@@ -101,11 +103,9 @@ def test_refused_resume_does_not_blame_the_operator():
     assert "pending" in notice.lower()
 
 
-def test_request_stop_defaults_to_operator_but_accepts_a_reason():
-    """`request_stop` is both the operator's kill switch AND the service's cleanup entry point.
-
-    Assuming the former was wrong: `_stop_and_close_request_lifecycles` calls it during rotation and
-    refused resumes, so a bare call must keep operator wording while a labelled call must not.
+def test_request_stop_defaults_to_neutral_and_accepts_a_reason():
+    """`request_stop` defaults to neutral wording so a caller that forgets a reason degrades
+    to "Session halted" rather than blaming the operator. The operator path passes the reason explicitly.
     """
     def _stoppable():
         model = _bare_model()
@@ -117,7 +117,12 @@ def test_request_stop_defaults_to_operator_but_accepts_a_reason():
 
     model = _stoppable()
     model.request_stop()
-    assert model._stop_reason == STOP_REASON_OPERATOR
+    assert model._stop_reason == STOP_REASON_UNSPECIFIED
+    assert OPERATOR_PHRASE not in stop_notice_for(model._stop_reason)
+
+    model_op = _stoppable()
+    model_op.request_stop(STOP_REASON_OPERATOR)
+    assert model_op._stop_reason == STOP_REASON_OPERATOR
 
     model2 = _stoppable()
     model2.request_stop(STOP_REASON_SESSION_ROTATED)

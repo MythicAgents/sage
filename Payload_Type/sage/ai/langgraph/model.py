@@ -1210,6 +1210,10 @@ STOP_REASON_RESUME_REFUSED = "resume_refused"
 # A graph/runtime exception also tears the lifecycle down. Its status is `error`, so this wording is
 # not normally emitted, but the flag must still carry the truth rather than inheriting "operator".
 STOP_REASON_RUNTIME_ERROR = "runtime_error"
+# Default for callers that do not state their intent. A new caller that forgets to pass a reason
+# degrades to neutral wording rather than silently blaming the operator. Callers that genuinely ARE
+# the operator (request_stop_for_sessions, the /stop slash command) pass STOP_REASON_OPERATOR explicitly.
+STOP_REASON_UNSPECIFIED = "unspecified"
 
 _STOP_NOTICE_BY_REASON = {
     STOP_REASON_OPERATOR: "\n🛑 Session stopped by operator.\n",
@@ -1240,6 +1244,7 @@ _STOP_NOTICE_BY_REASON = {
         "\n🛑 **Session ended on an internal error.** This was a fault in Sage, not something you did. "
         "The request's error output has the detail.\n"
     ),
+    STOP_REASON_UNSPECIFIED: "\n🛑 Session halted.\n",
 }
 
 
@@ -2485,6 +2490,41 @@ class _ToolSchemaSlimMiddleware(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         return await handler(self._slim_request(request))
+
+
+class _LoggingSummarizationMiddleware(SummarizationMiddleware):
+    """Thin wrapper: logs when summarization actually fires."""
+
+    async def abefore_model(self, state, runtime):
+        messages = state.get("messages", [])
+        msg_count_before = len(messages)
+        total_tokens = self.token_counter(messages)
+
+        result = await super().abefore_model(state, runtime)
+
+        if result is not None:
+            new_msgs = result.get("messages", [])
+            kept = sum(1 for m in new_msgs if type(m).__name__ != "RemoveMessage")
+            summary_id = next(
+                (getattr(m, "id", None) for m in new_msgs if isinstance(m, SystemMessage)),
+                None,
+            )
+            logger.warning(
+                f"📝 [SummarizationMiddleware] FIRED: "
+                f"trigger={self.trigger}, "
+                f"messages_in={msg_count_before}, "
+                f"tokens_estimated={total_tokens}, "
+                f"messages_out={kept}, "
+                f"summary_id={summary_id}"
+            )
+        else:
+            logger.debug(
+                f"📝 [SummarizationMiddleware] checked: "
+                f"messages={msg_count_before}, tokens={total_tokens}, "
+                f"trigger={self.trigger} — no summarization needed"
+            )
+
+        return result
 
 
 class SageState(MessagesState):
@@ -6491,11 +6531,21 @@ class Model:
                 if not _is_internal_human_message(msg)
             ]
 
-            # LangGraph's returned sequence is the sole normal-path persistence
-            # authority. Callback capture is completion-timed observability only:
-            # it may render progress, but it must never supplement, deduplicate,
-            # or reorder framework state.
+            # LangGraph's returned sequence is the normal-path persistence authority.
+            # Callback capture supplements it in exactly ONE case: SummarizationMiddleware
+            # rewrote the channel (RemoveMessage + new ids), which breaks both the id-diff
+            # and the positional-slice fallback in _messages_added_by_agent. The callback
+            # already filters out summarization's own internal model call (via
+            # _summarization_run_ids), so captured_messages contains only the agent's real
+            # AIMessages and their ToolMessages.
             captured = callback_handler.captured_messages
+            if not returned_messages and captured:
+                returned_messages = [m for m in captured if isinstance(m, AIMessage)]
+                logger.warning(
+                    f"📎 [{node_name}] id-diff returned 0 but callback captured "
+                    f"{len(captured)} — recovering {len(returned_messages)} AIMessage(s) "
+                    "(SummarizationMiddleware likely rewrote the channel)"
+                )
             logger.info(f"🎯 [{node_name}] Callback captured {len(captured)} messages, agent returned {len(returned_messages)}")
             new_messages_from_agent = returned_messages
 
@@ -6890,7 +6940,13 @@ class Model:
             # no-progress backstop) returns nothing, and `flag in None` raises
             # `TypeError: argument of type 'NoneType' is not iterable`. Observed live 2026-08-03 on the
             # Supervisor node, which turned a clean halt into an operator-facing crash.
-            if isinstance(result, dict):
+            if result is None:
+                logger.warning(
+                    f"⚠️ [{node_name}] node returned None — the turn produced no output. "
+                    f"stop_requested={getattr(self, '_stop_requested', False)}, "
+                    f"stop_reason={getattr(self, '_stop_reason', '')}"
+                )
+            elif isinstance(result, dict):
                 for flag in ("recursion_summary_requested", "recursion_handback"):
                     if flag in result:
                         update[flag] = result[flag]
@@ -9745,7 +9801,7 @@ class Model:
             mw.insert(1, _MCPManagerNoProgressStopMiddleware(self))
         summ_model = self._get_base_chat_model()
         if summ_model is not None:
-            mw.append(SummarizationMiddleware(
+            mw.append(_LoggingSummarizationMiddleware(
                 model=summ_model,
                 # Safety net only — sits well above the ~75k system-prompt+tool-schema floor so it does
                 # not fire every step. Raised from 55000 (which thrashed) after trace evidence. ~200k ctx.
@@ -10466,20 +10522,21 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         return "\n\n".join(summaries)
 
-    def request_stop(self, reason: str = STOP_REASON_OPERATOR) -> None:
+    def request_stop(self, reason: str = STOP_REASON_UNSPECIFIED) -> None:
         """Kill switch for a running Sage session.
 
         `reason` exists because this is NOT only the operator's entry point — the service's request
         lifecycle calls it during session rotation and refused resumes, where saying the operator
-        stopped the session is false. Callers state their intent; the default stays `operator` so the
-        actual stop button, and any caller that predates this argument, keep their wording.
+        stopped the session is false. Callers state their intent; the default is neutral so a caller
+        that forgets to pass a reason degrades to "Session halted" rather than blaming the operator.
+        The operator stop button passes STOP_REASON_OPERATOR explicitly.
 
         Sets the cooperative flag checked by middleware/astream loops and cancels any registered
         invoke() task so long-running tool awaits cannot survive after Mythic marks the run stopped.
         """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
-        self._stop_reason = str(reason or STOP_REASON_OPERATOR)
+        self._stop_reason = str(reason or STOP_REASON_UNSPECIFIED)
         try:
             from .subgoal_state import SubgoalState, cancel
 
@@ -11236,7 +11293,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # immediately. Treat that as an operator stop, not as an invocation failure.
             self._stop_requested = True
             # Preserve a reason an internal halt already recorded; a bare cancel here is request_stop().
-            self._stop_reason = getattr(self, "_stop_reason", "") or STOP_REASON_OPERATOR
+            self._stop_reason = getattr(self, "_stop_reason", "") or STOP_REASON_UNSPECIFIED
             stop_message = stop_notice_for(self._stop_reason)
             logger.info(
                 f"🛑 Invoke task cancelled (reason={self._stop_reason}) — terminating session"
@@ -11264,7 +11321,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                     f"{self._global_step_count} model steps"
                 )
             else:
-                reason = getattr(self, "_stop_reason", "") or STOP_REASON_OPERATOR
+                reason = getattr(self, "_stop_reason", "") or STOP_REASON_UNSPECIFIED
                 stop_message = stop_notice_for(reason)
                 logger.info(f"🛑 Stop honored inside agent loop (reason={reason}) — terminating session")
             await self._run_operator_stop_shielded(stop_message)
@@ -13632,7 +13689,7 @@ async def request_stop_for_sessions(session_id: str | None = None) -> dict[str, 
         if target and target not in {str(key), model_task_id, model_display_id}:
             continue
         try:
-            model.request_stop()
+            model.request_stop(reason=STOP_REASON_OPERATOR)
             emit_stop = getattr(model, "_emit_operator_stop", None)
             if callable(emit_stop):
                 await emit_stop("\n🛑 Session stopped by operator.\n")

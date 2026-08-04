@@ -178,7 +178,7 @@ async def run_headless_solve(
         status = "completed"
     except asyncio.TimeoutError:
         try:
-            llm.request_stop()
+            llm.request_stop(reason="timeout")
         except Exception:
             pass
         status = "timeout"
