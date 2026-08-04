@@ -119,7 +119,7 @@ def test_session_stop_helper_requests_stop_by_display_id():
         def __init__(self):
             self.stopped = False
 
-        def request_stop(self):
+        def request_stop(self, reason: str = "operator"):
             self.stopped = True
 
     async def _case():

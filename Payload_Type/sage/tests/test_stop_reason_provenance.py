@@ -12,11 +12,16 @@ silently reintroducing the accusation.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from ai.langgraph.model import (
     STOP_REASON_NO_PROGRESS,
     STOP_REASON_OPERATOR,
+    STOP_REASON_RESUME_REFUSED,
+    STOP_REASON_RUNTIME_ERROR,
+    STOP_REASON_SESSION_ROTATED,
     STOP_REASON_TERMINAL_BLOCKER,
     stop_notice_for,
 )
@@ -42,7 +47,15 @@ def test_halt_notices_are_self_contained():
     the fuller explanation never reached the chat, because the halt ends the graph before it streams.
     Pointing an operator at absent text is worse than terse text.
     """
-    for reason in (STOP_REASON_OPERATOR, STOP_REASON_NO_PROGRESS, STOP_REASON_TERMINAL_BLOCKER, ""):
+    for reason in (
+        STOP_REASON_OPERATOR,
+        STOP_REASON_NO_PROGRESS,
+        STOP_REASON_TERMINAL_BLOCKER,
+        STOP_REASON_SESSION_ROTATED,
+        STOP_REASON_RESUME_REFUSED,
+        STOP_REASON_RUNTIME_ERROR,
+        "",
+    ):
         notice = stop_notice_for(reason).lower()
         for dangling in ("above", "below", "see the explanation", "as described"):
             assert dangling not in notice, (
@@ -74,8 +87,96 @@ def test_no_internal_reason_blames_the_operator(reason):
     assert OPERATOR_PHRASE not in stop_notice_for(reason)
 
 
+def test_session_rotation_does_not_blame_the_operator():
+    """`service.py` rotates a session when the Mythic token, operation, or config changes."""
+    notice = stop_notice_for(STOP_REASON_SESSION_ROTATED)
+    assert OPERATOR_PHRASE not in notice
+    assert "replaced" in notice.lower()
+
+
+def test_refused_resume_does_not_blame_the_operator():
+    """A fresh prompt over a pending approval drops the session; the operator cancelled nothing."""
+    notice = stop_notice_for(STOP_REASON_RESUME_REFUSED)
+    assert OPERATOR_PHRASE not in notice
+    assert "pending" in notice.lower()
+
+
+def test_request_stop_defaults_to_operator_but_accepts_a_reason():
+    """`request_stop` is both the operator's kill switch AND the service's cleanup entry point.
+
+    Assuming the former was wrong: `_stop_and_close_request_lifecycles` calls it during rotation and
+    refused resumes, so a bare call must keep operator wording while a labelled call must not.
+    """
+    def _stoppable():
+        model = _bare_model()
+        model.task_id = 0            # request_stop logs it
+        model._running_tasks = set()  # and cancels registered invoke tasks
+        model._subgoal_authority_lock = None
+        model._subgoal_authority = None
+        return model
+
+    model = _stoppable()
+    model.request_stop()
+    assert model._stop_reason == STOP_REASON_OPERATOR
+
+    model2 = _stoppable()
+    model2.request_stop(STOP_REASON_SESSION_ROTATED)
+    assert model2._stop_reason == STOP_REASON_SESSION_ROTATED
+    assert OPERATOR_PHRASE not in stop_notice_for(model2._stop_reason)
+
+
+def test_service_lifecycle_call_sites_state_a_reason():
+    """Every `_stop_and_close_request_lifecycles` call must state a known reason.
+
+    Not "none may claim operator": one of the five sites — the `asyncio.CancelledError` handler — IS a
+    genuine operator cancel and correctly says so. What must not happen is a site staying silent and
+    inheriting a default, or naming a reason that has no wording behind it.
+
+    Source-level on purpose: constructing the chat service to exercise rotation is far more machinery
+    than the property needs, and the failure mode being guarded is regression by omission — a new
+    call site added without a reason. The equivalent source guard on the flag-copy loop found a second
+    unguarded site I had missed, so this is a pattern that has already paid for itself here.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1] / "sage_chat" / "service.py"
+    ).read_text()
+
+    known = {
+        STOP_REASON_OPERATOR,
+        STOP_REASON_SESSION_ROTATED,
+        STOP_REASON_RESUME_REFUSED,
+        STOP_REASON_RUNTIME_ERROR,
+    }
+    # `self.`-prefixed so the `async def` signature is not parsed as one of its own call sites.
+    call = "self._stop_and_close_request_lifecycles("
+    sites = source.count(call)
+    assert sites >= 5, (
+        f"expected at least 5 call sites, found {sites}; this guard is looking at the wrong thing. "
+        "The original sweep assumed 3 and this assertion is what revealed the other two."
+    )
+
+    for chunk in source.split(call)[1:]:
+        invocation = chunk[: chunk.index(")")]
+        assert "reason=" in invocation, (
+            f"a lifecycle teardown does not state its reason and will fall back silently: {invocation!r}"
+        )
+        match = re.search(r'reason=["\']([a-z_]+)["\']', invocation)
+        assert match, f"lifecycle teardown's reason is not a plain literal: {invocation!r}"
+        assert match.group(1) in known, (
+            f"lifecycle teardown uses an unknown stop reason {match.group(1)!r}"
+        )
+
+
 def test_every_known_reason_has_distinct_wording():
-    reasons = [STOP_REASON_OPERATOR, STOP_REASON_NO_PROGRESS, STOP_REASON_TERMINAL_BLOCKER]
+    reasons = [
+        STOP_REASON_OPERATOR,
+        STOP_REASON_NO_PROGRESS,
+        STOP_REASON_TERMINAL_BLOCKER,
+        STOP_REASON_SESSION_ROTATED,
+        STOP_REASON_RESUME_REFUSED,
+    ]
     notices = [stop_notice_for(r) for r in reasons]
     assert len(set(notices)) == len(reasons), f"halt reasons share wording: {notices}"
     assert all(n.strip() for n in notices), "a halt must always say something"

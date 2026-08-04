@@ -45,7 +45,7 @@ class _FakeModel:
         self.invoked_with = None
         self.installed_request_contracts = []
 
-    def request_stop(self):
+    def request_stop(self, reason: str = "operator"):
         self.stop_called = True
 
     async def _close_all_delegations(self, status="finished"):
@@ -693,7 +693,7 @@ def test_reused_auto_session_is_recreated_for_current_supervised_request(monkeyp
         apitoken_id = request.APITokenID
         operation_id = request.OperationID
 
-        def request_stop(self):
+        def request_stop(self, reason: str = "operator"):
             stopped.append(True)
 
     existing = _Existing()
@@ -906,7 +906,7 @@ def test_base_request_config_change_rotates_session_and_clears_slash_mode_overri
         operation_id = current_request.OperationID
         _chat_request_config_signature = service._model_config_signature(prior_kwargs)
 
-        def request_stop(self):
+        def request_stop(self, reason: str = "operator"):
             stopped.append(True)
 
     existing = _Existing()
@@ -2510,7 +2510,7 @@ class _HitlModel:
         await self._response_emitter(f"🤖> resume:{decision}")
         return ""
 
-    def request_stop(self):
+    def request_stop(self, reason: str = "operator"):
         pass
 
 
@@ -3435,7 +3435,7 @@ def test_token_change_rotates_the_entire_channel_session():
             self.stopped = False
             self.closed = []
 
-        def request_stop(self):
+        def request_stop(self, reason: str = "operator"):
             self.stopped = True
 
         async def _close_all_request_lifecycles(self, status):
@@ -3467,7 +3467,7 @@ def test_operation_change_cannot_reuse_old_model_state():
             self.requested_stop = False
             self.sensitive_cache = {"credential": "old-operation"}
 
-        def request_stop(self):
+        def request_stop(self, reason: str = "operator"):
             self.requested_stop = True
 
     request = build_chat_request("x", channel_id=178, request_id=1)

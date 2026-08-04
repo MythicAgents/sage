@@ -1202,6 +1202,14 @@ _HITL_GUARDED_REQUEST_UNAVAILABLE = "The exact guarded request is unavailable an
 STOP_REASON_OPERATOR = "operator"
 STOP_REASON_NO_PROGRESS = "no_progress"
 STOP_REASON_TERMINAL_BLOCKER = "terminal_blocker"
+# The service's request lifecycle also ends sessions, and none of those endings is an operator action:
+# a changed Mythic token/operation or Sage config rotates the session, and a fresh prompt arriving over
+# a pending approval drops it rather than silently resuming. Both used to report an operator stop.
+STOP_REASON_SESSION_ROTATED = "session_rotated"
+STOP_REASON_RESUME_REFUSED = "resume_refused"
+# A graph/runtime exception also tears the lifecycle down. Its status is `error`, so this wording is
+# not normally emitted, but the flag must still carry the truth rather than inheriting "operator".
+STOP_REASON_RUNTIME_ERROR = "runtime_error"
 
 _STOP_NOTICE_BY_REASON = {
     STOP_REASON_OPERATOR: "\n🛑 Session stopped by operator.\n",
@@ -1217,6 +1225,20 @@ _STOP_NOTICE_BY_REASON = {
     ),
     STOP_REASON_TERMINAL_BLOCKER: (
         "\n🛑 Halted: the same blocker recurred with no progress, so Sage stopped instead of retrying.\n"
+    ),
+    STOP_REASON_SESSION_ROTATED: (
+        "\n🛑 **Session replaced.** Your Mythic token, operation, or Sage configuration changed, so this "
+        "channel started a fresh session rather than continuing a stale one. Nothing was executed on the "
+        "target. Re-send your request to continue.\n"
+    ),
+    STOP_REASON_RESUME_REFUSED: (
+        "\n🛑 **Session ended without resuming.** A previous approval or controller step was still "
+        "pending when this prompt arrived, and Sage will not silently resume one request under another. "
+        "Nothing was executed on the target. Re-send your request to start a fresh one.\n"
+    ),
+    STOP_REASON_RUNTIME_ERROR: (
+        "\n🛑 **Session ended on an internal error.** This was a fault in Sage, not something you did. "
+        "The request's error output has the detail.\n"
     ),
 }
 
@@ -10444,15 +10466,20 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 
         return "\n\n".join(summaries)
 
-    def request_stop(self) -> None:
+    def request_stop(self, reason: str = STOP_REASON_OPERATOR) -> None:
         """Kill switch for a running Sage session.
+
+        `reason` exists because this is NOT only the operator's entry point — the service's request
+        lifecycle calls it during session rotation and refused resumes, where saying the operator
+        stopped the session is false. Callers state their intent; the default stays `operator` so the
+        actual stop button, and any caller that predates this argument, keep their wording.
 
         Sets the cooperative flag checked by middleware/astream loops and cancels any registered
         invoke() task so long-running tool awaits cannot survive after Mythic marks the run stopped.
         """
         logger.info(f"🛑 Stop requested for session task_id={self.task_id}")
         self._stop_requested = True
-        self._stop_reason = STOP_REASON_OPERATOR  # the only path an operator actually drives
+        self._stop_reason = str(reason or STOP_REASON_OPERATOR)
         try:
             from .subgoal_state import SubgoalState, cancel
 

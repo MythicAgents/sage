@@ -280,16 +280,29 @@ class SageChat(Chat):
         model: Any,
         *,
         status: str,
+        reason: str = "session_rotated",
     ) -> None:
+        """End a session's request lifecycle and tell the operator why.
+
+        `reason` defaults to session rotation rather than to an operator stop, because **no caller of
+        this helper is an operator pressing stop** — they are identity/config rotation and refused
+        resumes. It previously emitted "Session stopped by operator" on all of them, which sent
+        operators looking for a stop they never issued.
+        """
         try:
-            model.request_stop()
+            from ai.langgraph.model import stop_notice_for
+        except ImportError:  # matches the lazy relative-import fallback used elsewhere in this file
+            from ..ai.langgraph.model import stop_notice_for  # type: ignore
+
+        try:
+            model.request_stop(reason)
         except Exception:
             logger.debug("request_stop() failed during lifecycle cleanup", exc_info=True)
         emit_terminal = getattr(model, "_emit_operator_stop", None)
         if callable(emit_terminal) and status in {"stopped", "cancelled"}:
             try:
                 await emit_terminal(
-                    "\n🛑 Session stopped by operator.\n",
+                    stop_notice_for(reason),
                     status=status,
                 )
                 return
@@ -315,7 +328,9 @@ class SageChat(Chat):
             and getattr(model, "operation_id", None) == request.OperationID
         ):
             return model
-        await self._stop_and_close_request_lifecycles(model, status="stopped")
+        await self._stop_and_close_request_lifecycles(
+            model, status="stopped", reason="session_rotated"
+        )
         await drop_channel_session(request, expected_model=model)
         logger.info("Rotated Sage channel session after Mythic token/operation identity changed")
         return None
@@ -347,6 +362,7 @@ class SageChat(Chat):
             await self._stop_and_close_request_lifecycles(
                 existing,
                 status="stopped",
+                reason="session_rotated",
             )
             await drop_channel_session(request, expected_model=existing)
             logger.info("Rotated Sage channel session after ChatRequest configuration changed")
@@ -447,6 +463,7 @@ class SageChat(Chat):
                 await self._stop_and_close_request_lifecycles(
                     model,
                     status="stopped",
+                    reason="resume_refused",
                 )
                 await drop_channel_session(request, expected_model=model)
                 model, preexisted = await self._get_or_create_model(request)
@@ -679,6 +696,7 @@ class SageChat(Chat):
                 await self._stop_and_close_request_lifecycles(
                     model,
                     status="cancelled",
+                    reason="operator",  # genuinely the operator: this is the cancel path
                 )
                 finalize_visibility = getattr(
                     model,
@@ -704,6 +722,7 @@ class SageChat(Chat):
                 await self._stop_and_close_request_lifecycles(
                     model,
                     status="error",
+                    reason="runtime_error",  # a fault in Sage, not an operator action
                 )
                 await drop_channel_session(request, expected_model=model)
                 record_terminal = getattr(model, "record_request_terminal", None)
