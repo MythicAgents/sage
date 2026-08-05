@@ -1069,6 +1069,27 @@ def _cap_message_for_copy(msg, cap=SUPERVISOR_COPY_TOOL_RESULT_CAP):
     )
     return msg.model_copy(update={"content": preview})
 
+_SUPERVISED_STRIP_HEADINGS = re.compile(
+    r"(?:^|\n)\s*\*{0,2}"
+    r"(?:REMAINING|Remaining\s*Tasks?|Next\s*(?:Steps?|Actions?)|Prioritized\s*(?:Next\s*)?Actions?"
+    r"|Suggested?\s*(?:Next\s*)?(?:Steps?|Actions?)|Follow[\s-]*(?:up|on)\s*(?:Steps?|Actions?)?)"
+    r"\s*(?::|—|\*{0,2})"
+    r".*?(?=\n\s*\*{0,2}(?:DONE|FAILED|BLOCKER|Status|$)|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_supervised_engagement_context(text: str) -> str:
+    """Remove REMAINING/next-steps sections from specialist summaries before they reach the Supervisor.
+
+    In supervised mode the operator's request IS the scope — engagement-level
+    next-steps from a specialist are irrelevant and have repeatedly caused the
+    Supervisor to re-delegate with objectives the operator never asked for.
+    """
+    stripped = _SUPERVISED_STRIP_HEADINGS.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+
 def _fix_payload_empty_content(payload: dict) -> dict:
     """Fix OpenAI-format payload dicts to prevent Bedrock blank text field errors.
 
@@ -6437,6 +6458,70 @@ class Model:
             except Exception as e:
                 logger.debug(f"delegation lifecycle entry failed (non-fatal): {e}")
 
+            # ── ISC-2 / ISC-13: Supervised plan-and-execute gate ────────────────────────────
+            # Research (30+ papers, 8 frameworks) converges: the Supervisor's stop problem is
+            # solved by making it an executor, not a decider. In supervised mode:
+            #
+            # 1. The Supervisor's FIRST invocation runs the LLM freely (this IS the planning
+            #    step — it decides which specialist to delegate to).
+            # 2. After a specialist returns, the Supervisor gets ONE more LLM invocation to
+            #    either delegate to a DIFFERENT specialist (legitimate cross-specialist routing)
+            #    or call respond_to_user (done).
+            # 3. After TWO specialist returns, the gate forces respond_to_user without invoking
+            #    the LLM. This handles: single-specialist (gate at return 1 if Supervisor calls
+            #    respond_to_user), cross-specialist A→B (gate at return 2), and prevents
+            #    unbounded scope-creep (no third delegation possible).
+            # 4. The operator extends scope by sending a new message (new request, new plan).
+            #
+            # This is a bounded plan-and-execute: the Supervisor's react loop is the planner,
+            # specialist returns decrement a budget, and budget=0 forces structural termination.
+            # No replanning in supervised mode (D5: replanning IS scope creep).
+            #
+            # Defense layers: (1) this gate, (2) channel separation (_strip_supervised_engagement_context),
+            # (3) SCOPED EXECUTION prompt in supervisor.md.
+            if node_name == "Supervisor":
+                try:
+                    from .request_contract import RequestContract, RequestLane
+                    _rc = getattr(self, "_request_contract", None)
+                    if isinstance(_rc, RequestContract) and _rc.lane == RequestLane.SUPERVISED_WORKFLOW:
+                        _specialist_returns = sum(
+                            1 for msg in channel
+                            if isinstance(msg, AIMessage)
+                            and msg.additional_kwargs.get("_is_completion_header")
+                        )
+                        _SUPERVISED_DELEGATION_CAP = 2
+                        if _specialist_returns >= _SUPERVISED_DELEGATION_CAP:
+                            _last_summary = ""
+                            for msg in reversed(channel):
+                                if (
+                                    isinstance(msg, AIMessage)
+                                    and not msg.additional_kwargs.get("_is_completion_header")
+                                    and isinstance(msg.content, str)
+                                    and msg.content.strip()
+                                    and not msg.additional_kwargs.get("_is_final_report")
+                                ):
+                                    _last_summary = msg.content.strip()
+                                    break
+                            if not _last_summary:
+                                _last_summary = "The requested actions have been completed."
+                            _final = AIMessage(
+                                content=_last_summary,
+                                name="Supervisor",
+                                additional_kwargs={"_is_final_report": True},
+                            )
+                            _tag_msg(_final, self._next_seq())
+                            logger.info(
+                                f"🔒 [Supervisor] Plan-and-execute gate: {_specialist_returns} specialist "
+                                f"returns >= cap {_SUPERVISED_DELEGATION_CAP} — bypassing LLM, ending request"
+                            )
+                            update = {
+                                "messages": [_final],
+                                "supervisor_messages": [_final],
+                            }
+                            return Command(goto="__end__", update=update, graph=Command.PARENT)
+                except Exception as _gate_err:
+                    logger.debug(f"supervised plan-and-execute gate check failed (non-fatal): {_gate_err}")
+
             # Create callback handler to capture ALL messages during agent execution
             # This captures the first AIMessage (with tool_calls) that LangChain's react agent
             # would otherwise "consume" during its internal tool execution loop
@@ -7016,8 +7101,24 @@ class Model:
                         if handoff_outcome is not None:
                             handoff_metadata, summary_text = handoff_outcome
                             summary_kwargs["_worker_outcome"] = handoff_metadata
+                        supervisor_summary_text = summary_text
+                        _supervised_lane = False
+                        try:
+                            from .request_contract import RequestContract, RequestLane
+                            _rc = getattr(self, "_request_contract", None)
+                            if isinstance(_rc, RequestContract) and _rc.lane == RequestLane.SUPERVISED_WORKFLOW:
+                                _supervised_lane = True
+                                supervisor_summary_text = _strip_supervised_engagement_context(summary_text)
+                                if len(supervisor_summary_text) < len(summary_text):
+                                    logger.info(
+                                        f"🔇 [{node_name}] Stripped engagement context from supervised summary "
+                                        f"({len(summary_text)} → {len(supervisor_summary_text)} chars)"
+                                    )
+                        except Exception:
+                            pass  # fail-open: copy unmodified summary
+
                         summary_ai_msg = AIMessage(
-                            content=summary_text,
+                            content=supervisor_summary_text,
                             name=node_name,
                             additional_kwargs=summary_kwargs,
                         )
@@ -7025,7 +7126,7 @@ class Model:
 
                         # ALWAYS copy to Supervisor channel (only the NEW messages with operator.add)
                         update["supervisor_messages"] = [response_header, summary_ai_msg]
-                        logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(summary_text)} chars)")
+                        logger.info(f"✅ Copied summary from {node_name} to Supervisor channel ({len(supervisor_summary_text)} chars)")
 
                         # ALSO copy to calling agent channel if this was a worker-to-worker handoff
                         calling_agent = state.get("_last_calling_agent")
@@ -11052,7 +11153,15 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 self._hitl_card_pending = True
             except Exception as e:
                 logger.warning(f"HITL: failed to emit confirmation card ({e})")
-                raise RuntimeError("Failed to surface the guarded-action approval card") from e
+                tool_names = ", ".join(
+                    str(a.get("name", "?")) for a in action_requests if isinstance(a, dict)
+                )
+                await self._stream_message_to_mythic(
+                    f"⚠️ **Could not surface approval card** for: {tool_names}\n\n"
+                    f"Error: {e}\n\n"
+                    "This tool call was blocked. Tell me how you'd like to proceed."
+                )
+                return True
             # ISC-75: surfacing a card is an attempt to cross the effect boundary — the delegation
             # asked to act and is waiting on the operator. Counts the same as a blocked guarded call.
             self._guarded_attempt_pending = True
@@ -12312,18 +12421,47 @@ def _create_handoff_tool(
         input_payload: str = "",
         input_type: str = "",
     ) -> Command:
-        # ISC-70 probe: routing is a model choice — `transfer_to_<Agent>` is a tool the Supervisor's LLM
-        # calls, and the instruction is whatever it put in the args. Nothing inspects whether that
-        # instruction merely restates a prior worker's own narration, which is how channel 58 sent the
-        # Mythic_Operator's deliberation to the Generalist and got a policy essay back. The text lives
-        # only in the tool-call args and was invisible at INFO, so log it. Read-only; no behaviour change.
+        # ISC-70 / ISC-70a: the Supervisor's handoff_instruction is whatever the LLM put in its
+        # tool-call args. It can fabricate operator attributions ("the operator asked X") from
+        # specialist context. In supervised mode, prepend the actual operator message as ground
+        # truth so the receiving specialist sees what was really asked.
         try:
             logger.info(
                 f"🧭 [handoff] → {agent_name} | title={str(handoff_title or '')[:120]!r} | "
                 f"instruction={str(handoff_instruction or '')[:600]!r}"
             )
-        except Exception:  # pragma: no cover - diagnostics must never break routing
+        except Exception:  # pragma: no cover
             pass
+        try:
+            from .request_contract import RequestContract, RequestLane
+            _rc_ref = runtime.state.get("_model_ref")
+            if _rc_ref is None:
+                _rc_ref = runtime.state
+            _rc_obj = None
+            for _src in [_rc_ref, runtime.state]:
+                if isinstance(_src, dict):
+                    _rc_obj = _src.get("_request_contract_ref")
+                if _rc_obj is None and hasattr(_src, "_request_contract"):
+                    _rc_obj = getattr(_src, "_request_contract", None)
+            if _rc_obj is None:
+                _supervisor_msgs = runtime.state.get("supervisor_messages", [])
+                for _msg in _supervisor_msgs:
+                    if isinstance(_msg, HumanMessage) and not _msg.additional_kwargs.get("_synthetic_nudge"):
+                        _operator_text = str(_msg.content or "").strip()
+                        if _operator_text and len(_operator_text) < 500:
+                            _rc_lane = str(runtime.state.get("_request_stop_condition") or "")
+                            if _rc_lane == "actions_complete":
+                                handoff_instruction = (
+                                    f"[OPERATOR REQUEST (verbatim)]: {_operator_text}\n\n"
+                                    f"[SUPERVISOR ROUTING NOTE]: {handoff_instruction}"
+                                )
+                                logger.info(
+                                    f"🔒 [handoff] ISC-70a: prepended operator verbatim to supervised "
+                                    f"handoff instruction ({len(_operator_text)} chars)"
+                                )
+                        break
+        except Exception:
+            pass  # fail-open
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
         raw_subgoal = runtime.state.get("_subgoal_state")

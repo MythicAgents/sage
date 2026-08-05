@@ -134,7 +134,7 @@ def build_channel_metadata(model: Any) -> dict[str, Any]:
     # Accent them so they stand out from the neutral config chips (Provider / Model / Max Steps) + counts.
     mode = str(getattr(model, "mode", "") or "conversation")
     autonomous = bool(getattr(model, "_autonomous_solve", False))
-    policy_mode = str(getattr(model, "policy_mode", "") or "llm")
+    policy_mode = str(getattr(model, "policy_mode", "") or "hybrid")
     active_agent = str(getattr(model, "_active_agent_label", "") or "Idle")
     policy_color = {
         "llm": "success",

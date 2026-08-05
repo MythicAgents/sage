@@ -165,8 +165,8 @@ def test_shipped_bloodhound_policy():
         "data_quality", "cypher_query",
     ]
     for tool in bh_read_only:
-        assert classify_mcp_tool("bloodhound-ce", tool) == TOOL_SAFETY_READ_ONLY, (
-            f"{tool} should be read_only in bloodhound-ce"
+        assert classify_mcp_tool("BloodHound", tool) == TOOL_SAFETY_READ_ONLY, (
+            f"{tool} should be read_only in BloodHound"
         )
-    assert classify_mcp_tool("bloodhound-ce", "file_upload") == TOOL_SAFETY_GUARDED
-    assert classify_mcp_tool("bloodhound-ce", "unknown_new_tool") == TOOL_SAFETY_GUARDED
+    assert classify_mcp_tool("BloodHound", "file_upload") == TOOL_SAFETY_GUARDED
+    assert classify_mcp_tool("BloodHound", "unknown_new_tool") == TOOL_SAFETY_GUARDED

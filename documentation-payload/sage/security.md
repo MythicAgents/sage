@@ -27,9 +27,32 @@ risk of unintended impact on a live network. Weigh production use very carefully
 - No capability effect or objective completion may be recorded from Sage-host target I/O or Sage-local artifact
   generation. See [The Engagement Ledger](/agents/sage/engagement-ledger/) for how proof is enforced.
 
-## Livelock detection
+## Scope and termination controls
 
-Sage includes structural guards against delegation loops that would otherwise spin indefinitely:
+Sage uses structural controls — not just prompt instructions — to stay within the operator's request.
+
+### Supervised-mode delegation cap
+
+In supervised mode the Supervisor may delegate to at most two specialists per request. After both return,
+the graph terminates structurally without re-consulting the LLM. This prevents the Supervisor from
+inferring follow-on work from specialist output (the "scope-creep" class of bug). The operator extends
+scope by sending a new message.
+
+### Channel separation
+
+Specialist summaries passed to the Supervisor in supervised mode are filtered: engagement-level context
+(REMAINING items, next-step proposals, prioritized-action lists) is stripped before the Supervisor sees
+them. The Supervisor routes from the operator's request, not from the specialist's attack-path suggestions.
+
+### Handoff provenance
+
+In supervised mode, every delegation carries the operator's verbatim message alongside the Supervisor's
+routing note. The receiving specialist sees the actual request, preventing fabricated operator attributions
+from driving work.
+
+### Livelock detection
+
+Structural guards against delegation loops that would otherwise spin indefinitely:
 
 - **No-progress backstop.** Halts after 3 consecutive delegations where a guarded tool was attempted but no
   Mythic task was issued. The halt message distinguishes a genuine stall from operator-denied actions.

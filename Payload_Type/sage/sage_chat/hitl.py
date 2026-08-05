@@ -43,7 +43,25 @@ def _guarded_tool_names() -> set[str]:
         from ai.langgraph.mythic_tools import GUARDED_TOOLS
     except ImportError:  # pragma: no cover
         from ..ai.langgraph.mythic_tools import GUARDED_TOOLS  # type: ignore
-    return GUARDED_TOOLS
+    names = set(GUARDED_TOOLS)
+    try:
+        from ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded
+        from ai.mcp import MCPManager
+    except ImportError:  # pragma: no cover
+        try:
+            from ..ai.langgraph.mcp_tool_policy import is_mcp_tool_guarded  # type: ignore
+            from ..ai.mcp import MCPManager  # type: ignore
+        except ImportError:
+            return names
+    try:
+        for server in MCPManager.get_connected_servers():
+            for tool in MCPManager.get_tools_by_server(server):
+                tool_name = getattr(tool, "name", None)
+                if tool_name and is_mcp_tool_guarded(str(server), str(tool_name)):
+                    names.add(str(tool_name))
+    except Exception:
+        pass
+    return names
 
 
 def _canonical_json_native(value: Any, path: str = "value") -> Any:

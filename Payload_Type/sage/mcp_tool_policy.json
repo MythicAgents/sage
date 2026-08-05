@@ -1,7 +1,7 @@
 {
   "default": "guarded",
   "servers": {
-    "bloodhound-ce": {
+    "BloodHound": {
       "default": "guarded",
       "tools": {
         "domain_info": "read_only",
