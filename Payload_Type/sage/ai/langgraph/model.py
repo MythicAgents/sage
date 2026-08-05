@@ -3408,8 +3408,17 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                     except Exception as e:
                         logger.debug(f"tool_use finished card failed (non-fatal): {e}")
 
-                # Stream message immediately to Mythic
-                if self._stream_func and self._format_func:
+                # Stream message immediately to Mythic.
+                # Suppress respond_to_user and request_continuation tool results: these
+                # return Command objects that LangGraph wraps as ToolMessages with
+                # content=str(Command(...)). The actual content is emitted via the
+                # _is_final_report AIMessage in _process_stream_event; streaming the
+                # raw Command repr here duplicates it as operator-facing garbage.
+                _suppress_tool_stream = output.name in (
+                    "respond_to_user", "request_continuation",
+                    "summarize_and_handback", "handback_to_supervisor",
+                )
+                if self._stream_func and self._format_func and not _suppress_tool_stream:
                     formatted = self._format_func(output, agent_name=self.agent_name)
                     if formatted:
                         await self._stream_func(formatted)

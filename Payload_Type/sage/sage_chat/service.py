@@ -811,9 +811,12 @@ class SageChat(Chat):
             if runtime_telemetry:
                 terminal_metadata["runtime_telemetry"] = runtime_telemetry
             response_key = stream_emitter.last_response_key or turn.response_key
+            _last_streamed = stream_emitter.last_content
+            if _last_streamed and _last_streamed.lstrip().startswith("Command("):
+                _last_streamed = ""
             response_content = (
                 native_response_text
-                or stream_emitter.last_content
+                or _last_streamed
                 or "Completed."
             )
             record_final = getattr(model, "record_final_response", None)
