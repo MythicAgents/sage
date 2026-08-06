@@ -71,6 +71,14 @@ _ZERO_PROGRESS_DELEGATION_CAP = 3
 _AUTONOMOUS_STALL_LIMIT = 6
 _MCP_NO_PROGRESS_LIMIT = 6
 _MCP_EMPTY_VARIANT_LIMIT = 16
+# Identical recon re-reads (same tool, same target, no command issued since) that end a worker's
+# turn. `_recon_reread_guard` starts nudging at 3, so this leaves three ignored nudges before the
+# structural stop — far above any legitimate pattern, since issuing any command resets the epoch.
+_RECON_REREAD_STOP_LIMIT = 6
+# Back-to-back re-delegations refused before the request is closed with the result it already had.
+# One hand-back gives the Supervisor a chance to use the prior result; a second means it is not
+# listening, and trading refusals until the step budget dies helps nobody.
+_SUPERVISED_REPEAT_REFUSAL_CAP = 2
 _BLOODHOUND_AGENT_TOOL_ALLOWLIST = frozenset({
     "domain_info",
     "user_info",
@@ -1236,6 +1244,11 @@ STOP_REASON_RUNTIME_ERROR = "runtime_error"
 # degrades to neutral wording rather than silently blaming the operator. Callers that genuinely ARE
 # the operator (request_stop_for_sessions, the /stop slash command) pass STOP_REASON_OPERATOR explicitly.
 STOP_REASON_UNSPECIFIED = "unspecified"
+# A request that exhausts its model-step budget is a DELIBERATE halt with a known cause, but it used
+# to reach the operator as the bare fallback "Sage request failed." — indistinguishable from a crash,
+# after the requested work had actually completed. `_StopCheckMiddleware` sets `_stop_requested`
+# directly rather than going through `request_stop()`, so no reason was ever recorded.
+STOP_REASON_STEP_LIMIT = "step_limit"
 
 _STOP_NOTICE_BY_REASON = {
     STOP_REASON_OPERATOR: "\n🛑 Session stopped by operator.\n",
@@ -1267,16 +1280,33 @@ _STOP_NOTICE_BY_REASON = {
         "The request's error output has the detail.\n"
     ),
     STOP_REASON_UNSPECIFIED: "\n🛑 Session halted.\n",
+    # Self-contained for the same reason as the no-progress notice: the halt ends the graph, so this
+    # may be the only thing the operator sees. It must say what stopped Sage, that the stop was
+    # deliberate, and what to do — none of which "Sage request failed." conveyed.
+    STOP_REASON_STEP_LIMIT: (
+        "\n🛑 **Halted: step budget exhausted.** Sage reached this request's model-step limit and "
+        "stopped deliberately — this is not a crash. Any work shown above already happened; nothing "
+        "further was executed.\n\n"
+        "Re-send with a larger step budget (`max_steps`) if the request legitimately needs more "
+        "steps, or narrow the request so it finishes inside the current one.\n"
+    ),
 }
 
 
-def stop_notice_for(reason: str) -> str:
+def stop_notice_for(reason: str, detail: str = "") -> str:
     """Operator-facing text for a halt, chosen by why it happened.
 
     An unknown or unset reason must NOT fall back to the operator wording. Blaming the operator for a
     halt they had no part in is the exact defect this exists to prevent, so the default is neutral.
+
+    `detail` appends caller-supplied specifics (e.g. the actual step count and limit). It is optional
+    so every existing call site keeps its current behaviour unchanged.
     """
-    return _STOP_NOTICE_BY_REASON.get(str(reason or ""), "\n🛑 Session halted.\n")
+    notice = _STOP_NOTICE_BY_REASON.get(str(reason or ""), "\n🛑 Session halted.\n")
+    extra = str(detail or "").strip()
+    if not extra:
+        return notice
+    return f"{notice.rstrip()}\n\n{extra}\n"
 
 
 def _hitl_is_approved(text: str) -> bool:
@@ -1323,7 +1353,20 @@ class _OperatorStopRequested(Exception):
     stop, manual kill; the log shows request_stop DID fire). This exception, raised by
     _StopCheckMiddleware at each model/tool boundary inside the agent, breaks out promptly; the outer
     invoke() try/except catches it and ends the session cleanly.
+
+    It carries WHY it halted, because the service's error path used to render every one of these as
+    the generic "Sage request failed." — a deliberate, fully-understood stop presented to the operator
+    as an unexplained crash, in one case after the requested work had already succeeded.
+
+    `super().__init__()` is called with NO arguments on purpose: the reason travels as attributes, so
+    `str(exc)` stays empty and `operator_error_text` behaves exactly as before. A reason token like
+    "step_limit" must never leak out as raw operator-facing error text.
     """
+
+    def __init__(self, reason: str = STOP_REASON_UNSPECIFIED, detail: str = ""):
+        super().__init__()
+        self.stop_reason = str(reason or STOP_REASON_UNSPECIFIED)
+        self.stop_detail = str(detail or "")
 
 
 class _ControllerHitlPause(BaseException):
@@ -1348,6 +1391,26 @@ class _StopCheckMiddleware(AgentMiddleware):
         super().__init__()
         self._model = model
 
+    def _halt(self) -> "_OperatorStopRequested":
+        """Build the halt carrying WHY it fired, so the operator is not told a bare 'failed'.
+
+        A step-limit halt sets `_stop_requested` here rather than through `request_stop()`, so it
+        records its own reason. Every other halt already had one recorded by whoever requested the
+        stop; an unset reason stays neutral rather than being attributed to the operator.
+        """
+
+        if getattr(self._model, "_global_step_limit_hit", False):
+            return _OperatorStopRequested(
+                STOP_REASON_STEP_LIMIT,
+                detail=(
+                    f"Step budget: {getattr(self._model, '_global_step_count', 0)} model steps used, "
+                    f"limit {getattr(self._model, '_max_steps', 0)}."
+                ),
+            )
+        return _OperatorStopRequested(
+            getattr(self._model, "_stop_reason", "") or STOP_REASON_UNSPECIFIED
+        )
+
     def before_model(self, state, runtime):
         self._model._global_step_count = getattr(self._model, "_global_step_count", 0) + 1
         if (getattr(self._model, "_max_steps", 0)
@@ -1355,22 +1418,23 @@ class _StopCheckMiddleware(AgentMiddleware):
                 and not getattr(self._model, "_stop_requested", False)):
             self._model._global_step_limit_hit = True
             self._model._stop_requested = True
+            self._model._stop_reason = STOP_REASON_STEP_LIMIT
             logger.warning(
                 f"🛑 Global step limit ({self._model._max_steps}) reached after "
                 f"{self._model._global_step_count} model steps — halting to prevent a runaway loop."
             )
         if getattr(self._model, "_stop_requested", False):
-            raise _OperatorStopRequested()
+            raise self._halt()
         return None
 
     async def awrap_tool_call(self, request, handler):
         if getattr(self._model, "_stop_requested", False):
-            raise _OperatorStopRequested()
+            raise self._halt()
         return await handler(request)
 
     def wrap_tool_call(self, request, handler):
         if getattr(self._model, "_stop_requested", False):
-            raise _OperatorStopRequested()
+            raise self._halt()
         return handler(request)
 
 
@@ -2441,6 +2505,128 @@ class _MCPManagerNoProgressStopMiddleware(AgentMiddleware):
             )
         result = handler(request)
         return self._observe_result(request, result)
+
+
+class _ReconRereadStopMiddleware(AgentMiddleware):
+    """End a worker's turn once it is only re-reading the same recon target.
+
+    `MythicTools._recon_reread_guard` already detects this and appends a "STOP re-reading" nudge
+    to the tool result, but a nudge is prose the model may ignore — and one live request ignored
+    it 33 consecutive times, calling `list_callbacks` until the graph hit its 250-step recursion
+    limit. The loop never crossed a delegation boundary, so the no-progress and pair-bounce
+    detectors, which fire when a specialist RETURNS, were structurally blind to it.
+
+    This is the same shape as `_MCPManagerNoProgressStopMiddleware`: read the counter that
+    already exists, and once it passes the limit, block further tool calls and jump the inner
+    react loop to end so the wrapper can synthesize a handback from what was already collected.
+    The counter is epoch-scoped, so issuing any command resets it and a legitimate post-action
+    re-read never trips this.
+    """
+
+    def __init__(self, model: "Model", agent_name: str, limit: int = _RECON_REREAD_STOP_LIMIT):
+        super().__init__()
+        self._model = model
+        self._agent_name = agent_name or "worker"
+        self._limit = max(2, int(limit))
+        self._delegation_key = ""
+        self._tripped = False
+        self._trip_streak = 0
+
+    def _current_delegation_key(self) -> str:
+        try:
+            value = self._model.current_delegation_id(self._agent_name)
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        return self._agent_name
+
+    def _reset_for_delegation(self) -> None:
+        current = self._current_delegation_key()
+        if current == self._delegation_key:
+            return
+        self._delegation_key = current
+        self._tripped = False
+        self._trip_streak = 0
+
+    def _current_streak(self) -> int:
+        client = getattr(self._model, "mythic_client", None)
+        reader = getattr(client, "_max_recon_reread_in_epoch", None)
+        if not callable(reader):
+            return 0
+        try:
+            return int(reader())
+        except Exception:
+            return 0
+
+    def _blocked_tool_message(self, request: Any) -> ToolMessage:
+        tool_name = _tool_name_from_request(request) or "unknown_tool"
+        payload = {
+            "ok": False,
+            "verdict": "blocked",
+            "capability": "recon-reread-boundary",
+            "reason": (
+                f"the same recon target has been re-read {self._trip_streak} times with no "
+                f"command issued since (limit {self._limit}); re-reading is not progress"
+            ),
+            "next_action": "handback_to_supervisor",
+            "tool_name": tool_name,
+        }
+        return ToolMessage(
+            content=json.dumps(payload, sort_keys=True),
+            name=tool_name,
+            tool_call_id=_tool_call_id_from_request(request),
+        )
+
+    def _observe(self) -> None:
+        if self._tripped:
+            return
+        streak = self._current_streak()
+        if streak < self._limit:
+            return
+        self._tripped = True
+        self._trip_streak = streak
+        try:
+            logger.info(
+                "🛑 [recon-reread-boundary] ending %s after %s identical recon re-reads "
+                "with no command issued in delegation %r",
+                self._agent_name,
+                streak,
+                self._delegation_key,
+            )
+        except Exception:
+            pass
+
+    def _before_model_update(self) -> dict[str, str] | None:
+        self._reset_for_delegation()
+        self._observe()
+        if self._tripped:
+            return {"jump_to": "end"}
+        return None
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime):
+        return self._before_model_update()
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(self, state, runtime):
+        return self._before_model_update()
+
+    async def awrap_tool_call(self, request, handler):
+        self._reset_for_delegation()
+        if self._tripped:
+            return self._blocked_tool_message(request)
+        result = await handler(request)
+        self._observe()
+        return result
+
+    def wrap_tool_call(self, request, handler):
+        self._reset_for_delegation()
+        if self._tripped:
+            return self._blocked_tool_message(request)
+        result = handler(request)
+        self._observe()
+        return result
 
 
 class _ToolResultCompactionMiddleware(AgentMiddleware):
@@ -4125,6 +4311,8 @@ class Model:
                 )
                 self._subgoal_authority = subgoal
                 self._subgoal_evidence_records = set()
+                # Request-scoped, like the subgoal itself: a new operator message is a new plan.
+                self._supervised_repeat_refusals = 0
             state = getattr(self, "state", None)
             if isinstance(state, dict):
                 state["_request_id"] = contract.request_id
@@ -4487,6 +4675,62 @@ class Model:
                 return {}
             return canonical.to_dict()
 
+    def _supervised_back_to_back_refusal(self, candidate: Any, owner: str) -> str | None:
+        """Prior result to hand back when a supervised handoff repeats the last executor.
+
+        `assign_and_admit` already refuses a duplicate execution tuple, but its key includes
+        `state_revision`, and the revision advances on accumulated evidence — so finishing the
+        work is precisely what makes a repeat look new. A live request re-delegated the whole
+        SharpHound-collect-and-ingest job to `Mythic_Operator` immediately after it reported
+        DONE, and every guard in the system waved it through: the delegation cap counts returns
+        rather than identity, and the no-progress backstops reset because the repeat issued real
+        Mythic tasks.
+
+        The check here is deliberately typed — the requested owner against the owner of the most
+        recent admitted execution. It reads no instruction text, because the two handoffs in that
+        request were paraphrases of one objective sharing almost no wording, and a text digest
+        would have missed it entirely.
+
+        Returns None (allow) unless this is a supervised back-to-back repeat. A→B→A stays legal:
+        hitting the same specialist twice in a request is fine, doing it consecutively is not.
+        """
+
+        try:
+            from .request_contract import RequestLane
+
+            # Supervised lane ONLY, by exact enum identity. In autonomous mode a consecutive
+            # re-delegation to the same specialist is the recovery path after a blocker, so
+            # refusing it would take away the agent's ability to retry. Anything that is not
+            # provably the supervised lane — including a missing or unreadable contract — is
+            # left alone rather than gated.
+            contract = getattr(self, "_request_contract", None)
+            if getattr(contract, "lane", None) is not RequestLane.SUPERVISED_WORKFLOW:
+                return None
+        except Exception:  # pragma: no cover - a lane we cannot read is not one we gate
+            return None
+
+        target = str(owner or "")
+        if not target or target == "Supervisor":
+            return None
+
+        last_admitted = ""
+        for transition in reversed(tuple(getattr(candidate, "transitions", ()) or ())):
+            if str(getattr(transition, "kind", "")) == "execution_admitted":
+                last_admitted = str(getattr(transition, "owner", "") or "")
+                break
+        if not last_admitted or last_admitted != target:
+            return None
+
+        for message in reversed(list(getattr(self, "state", {}).get("supervisor_messages", []) or [])):
+            if (
+                isinstance(message, AIMessage)
+                and message.additional_kwargs.get("_is_completion_header")
+                and isinstance(message.content, str)
+                and message.content.strip()
+            ):
+                return message.content.strip()
+        return ""
+
     def _schedule_subgoal_transition(
         self,
         *,
@@ -4560,6 +4804,29 @@ class Model:
                         "summary": summary,
                     }
                 owner = candidate.owner
+
+            repeat_summary = self._supervised_back_to_back_refusal(candidate, owner)
+            if repeat_summary is not None:
+                # Persist the handback that genuinely happened, but admit no execution — ISC-7.
+                self._subgoal_authority = candidate
+                self._subgoal_evidence_records = evidence_records
+                self._record_subgoal_control_events(candidate)
+                self._supervised_repeat_refusals = (
+                    int(getattr(self, "_supervised_repeat_refusals", 0)) + 1
+                )
+                logger.info(
+                    "🔒 [Supervisor] back-to-back re-delegation to %s refused (%s); "
+                    "handing the prior result back",
+                    owner,
+                    self._supervised_repeat_refusals,
+                )
+                return {
+                    "disposition": "repeat",
+                    "owner": owner,
+                    "state": candidate.to_dict(),
+                    "summary": repeat_summary or summary,
+                    "refusals": self._supervised_repeat_refusals,
+                }
 
             try:
                 scheduled = assign_and_admit(
@@ -9974,6 +10241,7 @@ class Model:
             inject_engagement_state: bool = False,
             bounded_execute_stop: bool = False,
             mcp_no_progress_stop: bool = False,
+            recon_reread_stop: bool = False,
     ) -> list:
         """Bounded-context middleware for every create_agent.
         Strategy: ClearToolUsesEdit does the cheap, routine bounding every step (no LLM call);
@@ -10031,6 +10299,12 @@ class Model:
             # is not progress; stop the worker turn and synthesize a handback from the evidence
             # already collected instead of letting retrieval churn consume the whole request.
             mw.insert(1, _MCPManagerNoProgressStopMiddleware(self))
+        if recon_reread_stop:
+            # The Mythic workers own the recon reads (`list_callbacks`, task history) that a
+            # blocked agent falls back on when every forward action is denied. Without a
+            # structural stop that fallback consumes the whole recursion budget — see the
+            # class docstring for the live request it did exactly that on.
+            mw.insert(1, _ReconRereadStopMiddleware(self, agent_name))
         summ_model = self._get_base_chat_model()
         if summ_model is not None:
             mw.append(_LoggingSummarizationMiddleware(
@@ -10171,6 +10445,7 @@ class Model:
                 agent_name=name,
                 inject_engagement_state=True,
                 bounded_execute_stop=True,
+                recon_reread_stop=True,
             ),
         )
         return self._wrap_create_agent(agent, "mythic_operator_messages", name)
@@ -10218,7 +10493,7 @@ class Model:
             model=llm,
             tools=tools,
             name=name,
-            middleware=self._context_middleware(agent_name=name),
+            middleware=self._context_middleware(agent_name=name, recon_reread_stop=True),
         )
         return self._wrap_create_agent(agent, "mythic_payload_messages", name)
 
@@ -12541,6 +12816,63 @@ def _create_handoff_tool(
             )
             disposition = str(decision.get("disposition") or "invalid")
             subgoal_state = decision.get("state")
+            if disposition == "repeat":
+                # Hand the prior result back INTO the Supervisor's own react loop: no goto, no
+                # PARENT, no `_is_final_report`. The Supervisor keeps control and can answer the
+                # operator or route somewhere genuinely different. Terminating here instead would
+                # throw away a request whose work had actually succeeded.
+                prior = str(decision.get("summary") or "").strip()
+                refusals = int(decision.get("refusals") or 0)
+                if refusals >= _SUPERVISED_REPEAT_REFUSAL_CAP:
+                    # It ignored the hand-back. Stop asking and close the request with the result
+                    # it already had, rather than trading refusals until the step budget dies.
+                    max_seq = max(
+                        (
+                            _get_seq(message)
+                            for channel_key in channel_map.values()
+                            for message in runtime.state.get(channel_key, [])
+                        ),
+                        default=0,
+                    )
+                    tool_message = ToolMessage(
+                        content=(
+                            f"`{actual_agent_name}` has already completed this work in this "
+                            "request and was re-delegated again; ending with the existing result."
+                        ),
+                        name=name,
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                    final_message = AIMessage(
+                        content=prior or "The requested actions have been completed.",
+                        name="Supervisor",
+                        additional_kwargs={"_is_final_report": True},
+                    )
+                    _tag_msg(tool_message, max_seq + 1)
+                    _tag_msg(final_message, max_seq + 2)
+                    update = {
+                        "messages": [tool_message, final_message],
+                        "supervisor_messages": [tool_message, final_message],
+                        "_message_seq": max_seq + 3,
+                        "recursion_handback": True,
+                    }
+                    if isinstance(subgoal_state, dict):
+                        update["_subgoal_state"] = subgoal_state
+                    return Command(goto="__end__", update=update, graph=Command.PARENT)
+
+                handback = ToolMessage(
+                    content=(
+                        f"`{actual_agent_name}` was the last agent to execute and has already "
+                        "returned for this request, so it was NOT delegated to again. Its result "
+                        "is below — use it.\n\nRespond to the operator with it, or delegate to a "
+                        f"DIFFERENT specialist if something genuinely remains.\n\n{prior}".rstrip()
+                    ),
+                    name=name,
+                    tool_call_id=runtime.tool_call_id,
+                )
+                repeat_update: dict[str, Any] = {"messages": [handback]}
+                if isinstance(subgoal_state, dict):
+                    repeat_update["_subgoal_state"] = subgoal_state
+                return Command(update=repeat_update)
             if disposition == "route":
                 actual_agent_name = str(decision.get("owner") or "")
                 if admitted is not None:

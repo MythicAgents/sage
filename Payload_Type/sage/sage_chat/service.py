@@ -750,12 +750,26 @@ class SageChat(Chat):
                     # repr, so an escaped langgraph control-flow exception would publish an
                     # entire Command(update={...}) as this turn's operator-facing error.
                     try:
+                        from ai.langgraph.model import stop_notice_for
                         from ai.langgraph.operator_error import operator_error_text
                     except ImportError:  # pragma: no cover - packaged import fallback
+                        from ..ai.langgraph.model import stop_notice_for  # type: ignore
                         from ..ai.langgraph.operator_error import (  # type: ignore
                             operator_error_text,
                         )
-                    error_text = operator_error_text(error) or "Sage request failed."
+                    # A DELIBERATE halt (step budget exhausted, operator stop) arrives here as an
+                    # argless exception, so it used to render the bare "Sage request failed." — an
+                    # intentional stop presented as an unexplained crash, once after the requested
+                    # work had already completed. When the exception states why it halted, render
+                    # that reason through the same notice table `/stop` and session rotation use.
+                    halt_reason = str(getattr(error, "stop_reason", "") or "")
+                    if halt_reason:
+                        error_text = stop_notice_for(
+                            halt_reason,
+                            str(getattr(error, "stop_detail", "") or ""),
+                        ).strip()
+                    else:
+                        error_text = operator_error_text(error) or "Sage request failed."
                     preterminal = await finalize_visibility(require_final=False)
                     if not preterminal.get("ok", False):
                         logger.error(

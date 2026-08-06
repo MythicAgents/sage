@@ -2057,6 +2057,33 @@ class MythicTools:
             raise ValueError("effective action arguments are not an object")
         return canonical
 
+    @staticmethod
+    def _registered_file_named_by_root(
+        root_args: dict[str, Any] | None,
+        actual_args: dict[str, Any] | None,
+    ) -> bool:
+        """True when the approved root's parameters name this exact registered file.
+
+        Positive provenance, fail closed: a root that does not name the file returns False, so a
+        path with no filename to bind against stays denied rather than inheriting authority.
+        """
+
+        name = str((actual_args or {}).get("binary_filename") or "").strip().casefold()
+        if not name:
+            return False
+        params = (root_args or {}).get("parameters")
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (TypeError, ValueError):
+                return name == params.strip().casefold()
+        if not isinstance(params, dict):
+            return False
+        return any(
+            isinstance(value, str) and value.strip().casefold() == name
+            for value in params.values()
+        )
+
     def _approved_workflow_child(
         self,
         root_name: str,
@@ -2085,6 +2112,18 @@ class MythicTools:
             if tool_name == "ingest_collection":
                 return not transaction.reserve_ingest(actual_args, visibility_context)
             return False
+        # This map is a ONE-HOP declaration, so it must carry the transitive closure of what a
+        # root actually reaches — not just its direct callees. `ensure_tool_uploaded` is reached
+        # from `issue_task_and_waitfor_task_output`'s own registered-file preflight
+        # (`_ensure_registered_file_available`, called at :4893), and the two roots below reach
+        # that preflight through it. Omitting those three edges deadlocked a live request: the
+        # operator approved `issue_task_and_waitfor_task_output` for `execute_assembly`, its
+        # preflight tried to register the assembly, coverage denied `ensure_tool_uploaded` as a
+        # `name_mismatch`, and the preflight's own "do not retry until registered" blocker closed
+        # the other exit. Every entry here is bounded by audited reachability over the MythicTools
+        # call graph and by the callback binding checked below — see
+        # `tests/test_approval_child_coverage.py`, which recomputes that graph and fails if this
+        # map drifts from it in either direction.
         children = {
             "execute_capability": {
                 "materialize_capability_inputs",
@@ -2094,10 +2133,15 @@ class MythicTools:
             },
             "materialize_capability_inputs": {
                 "upload_file_by_file_uuid",
+                "ensure_tool_uploaded",
                 "issue_task_and_waitfor_task_output",
             },
             "upload_file_by_file_uuid": {
+                "ensure_tool_uploaded",
                 "issue_task_and_waitfor_task_output",
+            },
+            "issue_task_and_waitfor_task_output": {
+                "ensure_tool_uploaded",
             },
         }
         if tool_name not in children.get(root_name, set()):
@@ -2113,6 +2157,17 @@ class MythicTools:
             return False
         root_callback = root_bindings.callback_id
         actual_callback = actual_bindings.callback_id
+        if tool_name == "ensure_tool_uploaded" and root_name != "execute_capability":
+            # `ensure_tool_uploaded` registers a file in Mythic's operation-scoped filemeta and
+            # takes no callback argument, so the generic callback binding below can never match a
+            # task-issuing root and would deny every one of them. Bind it on what actually ties it
+            # to the approval instead: the child's binary_filename must be named verbatim in the
+            # approved root's own parameters. That is strictly TIGHTER than a callback match — it
+            # admits registering exactly the file the approved command runs, and nothing else.
+            # `execute_capability` keeps its existing capability-bound path below unchanged.
+            if not (root_callback or root_bindings.capability):
+                return False
+            return self._registered_file_named_by_root(root_args, actual_args)
         if root_callback and actual_callback != root_callback:
             return False
         if root_name == "upload_file_by_file_uuid":
@@ -17915,6 +17970,28 @@ class MythicTools:
             return None
         except Exception:
             return None
+
+    def _max_recon_reread_in_epoch(self) -> int:
+        """Highest identical-recon-read count in the CURRENT epoch, across all targets.
+
+        The nudge above is advice the model is free to ignore — a live request ignored it 33
+        times and burned the whole recursion budget on one repeated read. This exposes the same
+        counter as a number so a middleware can turn it into a structural stop. Epoch-scoped, so
+        it drops back to zero the moment a command is actually issued.
+
+        Deliberately private: every PUBLIC method on this class is a tool surface and must carry
+        an explicit `@tool_safety` classification (`test_tool_safety_classification.py`). This is
+        an internal accessor for the loop-breaker, not a tool the model may call.
+        """
+
+        try:
+            epoch = self._recon_epoch
+            return max(
+                (count for key, count in self._recon_call_log.items() if key[2] == epoch),
+                default=0,
+            )
+        except Exception:  # pragma: no cover - diagnostics must never break a tool call
+            return 0
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def get_ttp_full_reference(
