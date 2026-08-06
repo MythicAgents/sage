@@ -43,6 +43,7 @@ from .turn_authority import (
 )
 from .request_events import RequestEventLedger, stable_event_id
 from .decision_record import seal_request_decision_record
+from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
@@ -6527,7 +6528,16 @@ class Model:
                                 "messages": [_final],
                                 "supervisor_messages": [_final],
                             }
-                            return Command(goto="__end__", update=update, graph=Command.PARENT)
+                            # NO graph=Command.PARENT here. This runs in `_ainvoke`, which is the
+                            # top-level node body registered via add_node on the "Sage" graph — it
+                            # has no parent. Command.PARENT is correct only inside the handoff/
+                            # control TOOLS (they execute in the inner react subgraph, whose parent
+                            # IS this graph). From a top-level node, langgraph raises ParentCommand,
+                            # _retry.py rewrites graph to the empty parent namespace, nothing catches
+                            # it, and the escaped exception's str() — the whole Command repr — was
+                            # rendered to the operator as the turn's error. Match the two sibling
+                            # terminal returns in this same function instead.
+                            return Command(goto=END, update=update)
                 except Exception as _gate_err:
                     logger.debug(f"supervised plan-and-execute gate check failed (non-fatal): {_gate_err}")
 
@@ -11838,8 +11848,12 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
                 all_messages = self.state.get("messages", [])
                 logger.info(f"Using {len(all_messages)} messages from current state")
 
-            # Create error message that includes partial work
-            error_msg = str(e)
+            # Create error message that includes partial work.
+            # str(e) is NOT safe here: a single-arg exception stringifies to its payload's
+            # repr, so an escaped langgraph control-flow exception would publish an entire
+            # Command(update={...}) — messages included — into the operator's chat. Full
+            # detail is already in the log line above.
+            error_msg = operator_error_text(e)
             error_type = type(e).__name__
 
             error_message = AIMessage(content=f"""❌ **Error: {error_type}**

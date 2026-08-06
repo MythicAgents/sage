@@ -746,7 +746,16 @@ class SageChat(Chat):
                     record_projection,
                     finalize_visibility,
                 )):
-                    error_text = str(error) or "Sage request failed."
+                    # Not str(error): a single-arg exception stringifies to its payload's
+                    # repr, so an escaped langgraph control-flow exception would publish an
+                    # entire Command(update={...}) as this turn's operator-facing error.
+                    try:
+                        from ai.langgraph.operator_error import operator_error_text
+                    except ImportError:  # pragma: no cover - packaged import fallback
+                        from ..ai.langgraph.operator_error import (  # type: ignore
+                            operator_error_text,
+                        )
+                    error_text = operator_error_text(error) or "Sage request failed."
                     preterminal = await finalize_visibility(require_final=False)
                     if not preterminal.get("ok", False):
                         logger.error(
