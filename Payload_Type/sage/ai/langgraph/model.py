@@ -55,7 +55,7 @@ except ImportError:
     from logging_fix import ensure_logger_initialized, force_flush_all_handlers
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
-from langgraph.errors import GraphRecursionError, ParentCommand
+from langgraph.errors import GraphRecursionError, NodeCancelledError, NodeError, ParentCommand
 import operator
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
@@ -1376,6 +1376,22 @@ class _ControllerHitlPause(BaseException):
     diagnostic blockers. A pending operator approval is neither a blocker nor a failure, so it must escape that
     catch boundary and return control to Mythic without touching loop-breaker/no-progress state.
     """
+
+
+#: Exceptions that carry CONTROL authority rather than report a node failure, and must therefore
+#: never be absorbed by a node error handler.
+#:
+#: LangGraph's runner already keeps `GraphBubbleUp` subclasses away from error handlers, which covers
+#: HITL interrupts and `ParentCommand`; `_ControllerHitlPause` is a `BaseException` and is likewise
+#: never caught by the runner's `except Exception`. These three are NOT covered by either mechanism:
+#: `_OperatorStopRequested` is a plain Exception, `GraphRecursionError` has a dedicated summary path
+#: in `invoke()`, and `NodeCancelledError` is what LangGraph converts a node-raised
+#: `asyncio.CancelledError` into. Absorbing the first would disable the operator kill-switch.
+_NODE_FAILURE_CONTROL_EXCEPTIONS = (
+    _OperatorStopRequested,
+    GraphRecursionError,
+    NodeCancelledError,
+)
 
 
 class _StopCheckMiddleware(AgentMiddleware):
@@ -5082,13 +5098,60 @@ class Model:
             else "Supervisor"
         )
 
+    def _handle_node_failure(self, state: SageState, error: NodeError) -> Command:
+        """Hand a failed specialist back to Supervisor instead of ending the run.
+
+        Registered through `add_node(..., error_handler=...)`. Before this existed, any exception out
+        of a specialist unwound `graph.astream` entirely: `invoke()` caught it, recovered partial work
+        from the checkpoint and reported, but the session was over. Supervisor never learned that one
+        assignment had failed and so could not reassign it or tell the operator what was blocked.
+
+        Control exceptions are re-raised UNCHANGED so their existing handling in `invoke()` still
+        runs — see `_NODE_FAILURE_CONTROL_EXCEPTIONS`. The kill-switch arrives here as an ordinary
+        exception, and absorbing it would mean `exit` silently resumed the run.
+
+        Deliberately NOT a retry: this reports the failure once and returns authority to Supervisor.
+        Retrying infrastructure blips is a separate concern (ISA 9D) and must not be smuggled in here,
+        because a handler that retries turns a hard blocker into a loop.
+        """
+        exc = error.error
+        if isinstance(exc, _NODE_FAILURE_CONTROL_EXCEPTIONS):
+            raise exc
+
+        logger.error(
+            f"Node {error.node} failed; handing back to Supervisor: {type(exc).__name__}: {exc}",
+            exc_info=exc,
+        )
+        failure_message = AIMessage(
+            content=(
+                f"⚠️ **{error.node} could not complete its assignment**\n\n"
+                f"`{type(exc).__name__}: {exc}`\n\n"
+                "Decide what to do next: reassign this work, take a different approach, or report "
+                "the blocker to the operator. Do not simply reissue the identical request."
+            )
+        )
+        seq = self._next_seq()
+        _tag_msg(failure_message, seq)
+        return Command(
+            goto="Supervisor",
+            update={
+                "messages": [failure_message],
+                "supervisor_messages": [failure_message],
+                "_message_seq": seq,
+            },
+        )
+
     def _rebuild_graph(self) -> None:
         start_node = self._graph_start_node_for_turn()
         self.graph = (
             StateGraph(SageState)
             .add_node("Supervisor", self._supervisor_agent())
             .add_node("Generalist", self._generalist_agent())
-            .add_node("Mythic_Operator", self._mythic_operator_agent())
+            .add_node(
+                "Mythic_Operator",
+                self._mythic_operator_agent(),
+                error_handler=self._handle_node_failure,
+            )
             .add_node("Mythic_Payload", self._mythic_payload_agent())
             .add_node("BloodHound", self._bloodhound_agent())
             .add_node("MCP_Manager", self._mcp_manager_agent())
