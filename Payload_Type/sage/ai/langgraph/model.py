@@ -60,6 +60,7 @@ except ImportError:
     from logging_fix import ensure_logger_initialized, force_flush_all_handlers
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
+from langchain_core.exceptions import ContextOverflowError
 from langgraph.errors import GraphRecursionError, NodeCancelledError, NodeError, ParentCommand
 import operator
 
@@ -10411,7 +10412,18 @@ class Model:
             mw.append(_LoggingSummarizationMiddleware(
                 model=summ_model,
                 # Safety net only — sits well above the ~75k system-prompt+tool-schema floor so it does
-                # not fire every step. Raised from 55000 (which thrashed) after trace evidence. ~200k ctx.
+                # not fire every step. Raised from 55000 (which thrashed) after trace evidence.
+                #
+                # This literal assumes a context window around 200k. That assumption is UNVERIFIED and
+                # nothing reads the model's real limit: `model.profile` is None here, and behind a
+                # LiteLLM proxy the configured model name is a label rather than a fact about the
+                # backend actually serving the request. Deriving the trigger was considered and
+                # rejected 2026-08-10 (ISA 9E) because a wrong-but-confident context window is worse
+                # than a fixed one: too low summarizes every step, too high never fires at all.
+                #
+                # It is a safety net that has never been reached. Phoenix evidence 2026-07-28: 247
+                # SummarizationMiddleware.before_model spans, zero LLM descendants, all-time peak
+                # per-call prompt 80,839 tokens. The 50k digest below is what actually holds the line.
                 trigger=("tokens", 150000),
                 keep=("messages", 12),
             ))
@@ -12232,6 +12244,26 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             error_msg = operator_error_text(e)
             error_type = type(e).__name__
 
+            # ISA 9F: name a context-window overflow for what it is. Both langchain-openai and
+            # langchain-anthropic raise provider subclasses of `ContextOverflowError`
+            # (`OpenAIContextOverflowError`, `AnthropicContextOverflowError`), so this is live on the
+            # LiteLLM-proxy path and the native Anthropic path alike. Measured 2026-08-10 across all
+            # six installed providers: openai and anthropic translate; langchain-aws, -groq, -ollama
+            # and -xai do not, so a context error on those falls through to the generic guidance
+            # below — correct rather than misleading. `test_context_overflow_reporting.py` pins that
+            # split so it cannot drift unnoticed in either direction.
+            #
+            # Worth distinguishing because the generic advice ("adjust your approach") is unactionable
+            # here: the operator needs to know the input outgrew the model, not that something failed.
+            if isinstance(e, ContextOverflowError):
+                next_steps = """• The conversation outgrew the model's context window — this is not a tool or target failure
+• Start a fresh chat to reset the accumulated history, or scope the next request more narrowly
+• If this recurs at modest scope, the summarization safety net is set for a larger context window than the model actually has"""
+            else:
+                next_steps = """• Review the conversation history to see what was accomplished
+• Adjust your approach (e.g., use a smaller scope, different model, or break into smaller tasks)
+• Try again with modified parameters"""
+
             error_message = AIMessage(content=f"""❌ **Error: {error_type}**
 
 **Error Details:**
@@ -12241,9 +12273,7 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
 The conversation history below shows all work completed before the error occurred. This has been saved and you can continue from here.
 
 **Next Steps:**
-• Review the conversation history to see what was accomplished
-• Adjust your approach (e.g., use a smaller scope, different model, or break into smaller tasks)
-• Try again with modified parameters
+{next_steps}
 """
             )
 
