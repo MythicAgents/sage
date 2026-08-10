@@ -206,7 +206,7 @@ strategy.
 
 - **Mythic v4.0.0 or later**, currently the [`Mythic-v4.0.0`](https://github.com/its-a-feature/Mythic/tree/Mythic-v4.0.0)
   branch. Earlier Mythic versions have no native chat-container support and cannot run Sage at all.
-- Python 3.13 and a repository virtual environment.
+- Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
 - For BloodHound-backed graph analysis, BloodHound CE plus a compatible [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp) checkout.
 - For target activity, a live supported Mythic payload callback.

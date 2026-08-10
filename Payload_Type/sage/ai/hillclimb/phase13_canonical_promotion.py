@@ -47,8 +47,13 @@ DEFAULT_PHASE6_POLICY_ROWS_PATH = DEFAULT_RESULTS_ROOT / "laps_family_transfer_p
 DEFAULT_PHASE7_REPORT_PATH = DEFAULT_RESULTS_ROOT / "trust_context_corroboration_live_validation_v2_20260715.json"
 DEFAULT_PHASE8_ROWS_PATH = DEFAULT_RESULTS_ROOT / "phase8_goad_regression_rows_v2_20260715.jsonl"
 DEFAULT_PHASE8_LEGACY_REPORT_PATH = DEFAULT_RESULTS_ROOT / "phase8_goad_regression_validation_v2_20260716.json"
-DEFAULT_PHASE12_AUDIT_PATH = DEFAULT_REPO_ROOT / "Plans" / "SAGE_ARCHITECTURE_POLICY_EVAL_PHASE12_PROOF_BINDING_AUDIT_2026-07-16.json"
-DEFAULT_OUTPUT_PATH = DEFAULT_REPO_ROOT / "Plans" / "SAGE_ARCHITECTURE_POLICY_EVAL_PHASE13_CANONICAL_PROMOTION_STATUS_2026-07-16.json"
+# The architecture-policy campaign was archived after it closed; both its Phase 12 input and this
+# module's Phase 13 output moved under Plans/Archived/architecture-policy-eval/ while these constants
+# kept pointing at the Plans/ root. That left the default replay path reading a file that no longer
+# existed there, which is why the no-argument replay test had been failing.
+DEFAULT_ARCHIVED_CAMPAIGN_DIR = DEFAULT_REPO_ROOT / "Plans" / "Archived" / "architecture-policy-eval"
+DEFAULT_PHASE12_AUDIT_PATH = DEFAULT_ARCHIVED_CAMPAIGN_DIR / "SAGE_ARCHITECTURE_POLICY_EVAL_PHASE12_PROOF_BINDING_AUDIT_2026-07-16.json"
+DEFAULT_OUTPUT_PATH = DEFAULT_ARCHIVED_CAMPAIGN_DIR / "SAGE_ARCHITECTURE_POLICY_EVAL_PHASE13_CANONICAL_PROMOTION_STATUS_2026-07-16.json"
 
 
 class Phase13CanonicalPromotionError(ValueError):

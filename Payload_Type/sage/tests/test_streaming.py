@@ -615,17 +615,22 @@ class TestRegressionChecks:
         only works correctly with 'updates' mode (incremental deltas).
         With 'values' mode (full state), extend would duplicate everything.
         """
-        # Check langgraph source for default stream_mode
-        state_graph_py = SAGE_ROOT / ".." / ".." / ".venv" / "lib" / "python3.13" / \
-            "site-packages" / "langgraph" / "graph" / "state.py"
-        if state_graph_py.exists():
-            state_graph_source = state_graph_py.read_text()
-            assert 'stream_mode="updates"' in state_graph_source, (
-                "LangGraph StateGraph must default to stream_mode='updates'. "
-                "If this changes, the entire state update logic in invoke() breaks."
-            )
-        else:
-            pytest.skip("LangGraph source not found at expected path")
+        # Check langgraph source for default stream_mode. Ask the installed package where it
+        # lives instead of naming an interpreter version in the path: the previous
+        # `.venv/lib/python3.13/site-packages/...` literal stopped resolving the moment the venv
+        # moved to another Python, and the skip below turned that into a silent green pass rather
+        # than a failure. Deriving the path keeps this able to fail.
+        import langgraph.graph.state as langgraph_state
+
+        state_graph_py = Path(langgraph_state.__file__)
+        assert state_graph_py.exists(), (
+            f"LangGraph state.py should exist at {state_graph_py}"
+        )
+        state_graph_source = state_graph_py.read_text()
+        assert 'stream_mode="updates"' in state_graph_source, (
+            "LangGraph StateGraph must default to stream_mode='updates'. "
+            "If this changes, the entire state update logic in invoke() breaks."
+        )
 
     def test_invoke_signature_has_is_interactive_default(self):
         """Verify invoke() has is_interactive parameter with default value."""

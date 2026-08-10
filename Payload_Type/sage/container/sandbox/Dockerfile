@@ -7,7 +7,7 @@
 # See Plans/SANDBOX_DESIGN.md.
 #
 # Built on first use by sandbox_exec (docker-py images.build) if absent, tagged sage-sandbox:latest.
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # Non-root sandbox user (uid 10001) and the tmpfs mountpoint.
 RUN useradd -m -u 10001 sandbox && \

@@ -1,40 +1,40 @@
-langchain==1.2.13
-langchain-core==1.2.31
-langchain-mcp-adapters==0.2.2
-# langchain-mcp-adapters 0.2.2 imports `mcp.server.fastmcp`, which mcp 2.0.0 removed, and it declares
-# `mcp` with no upper bound — so a fresh resolve takes 2.0.0 and every module that reaches ai/mcp.py
-# dies at import. Observed 2026-07-29 on a rebuilt venv: 24 collection errors, whole suite red.
-# 1.25.0 is the version the green baseline was built against. Revisit when adapters gains mcp 2 support.
+langchain==1.3.14
+langchain-core==1.5.3
+langchain-mcp-adapters==0.3.2
+# langchain-mcp-adapters 0.3.2 still imports `mcp.server.fastmcp` and declares `mcp<2.0.0,>=1.24.0`.
+# mcp 2.0.0 removed that module, so mcp must stay below 2.0 until adapters drops the fastmcp import.
+# Track: https://github.com/langchain-ai/langchain-mcp-adapters/issues/578
 mcp==1.25.0
-langchain-anthropic==1.4.0
-langchain-aws==1.4.1
-langchain-openai==1.1.12
+langchain-anthropic==1.5.4
+langchain-aws==1.7.0
+langchain-openai==1.4.2
 # mythic 0.3.0rc8 (Mythic v4) pulls gql 4.0.0 + websockets 15 + aiohttp 3.14 transitively.
 # langchain-google-genai stays disabled: google-genai caps websockets<15.1.0, which the v4 SDK line exceeds.
 #langchain-google-genai==4.1.3
-langchain-groq==1.1.2
-langchain-ollama==1.0.1
-langchain-xai==1.2.2
-langgraph==1.1.3
-langgraph-prebuilt==1.0.8
-langgraph-checkpoint-sqlite==3.0.3
-langsmith==0.7.22
+langchain-groq==1.1.3
+langchain-ollama==1.1.0
+langchain-xai==1.3.0
+langgraph==1.2.10
+langgraph-prebuilt==1.1.0
+langgraph-checkpoint-sqlite==3.1.1
+langsmith==0.10.16
 mythic==0.3.0rc8
 mythic-container==0.7.0rc9
 # mythic-container 0.7.0rc1's generated gRPC stubs require grpcio>=1.78.0 (its metadata leaves grpcio
 # unpinned). Pin both so the container build is deterministic and doesn't regress to 1.76.x.
-grpcio==1.78.0
-grpcio-tools==1.78.0
-# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc8 (Mythic v4);
-# pinning to the versions the pytest baseline is green against avoids silent drift on rebuild.
+grpcio==1.83.0
+grpcio-tools==1.83.0
+# Pinned for deterministic image builds — these are pulled transitively by mythic 0.3.0rc8 (Mythic v4).
+# websockets stays at 15.x: mythic 0.3.0rc8 pins gql[aiohttp,websockets]==4.0, and gql 4.0.0 declares
+# websockets<16. Blocked until mythic ships a release allowing gql 4.1+.
 gql==4.0.0
 websockets==15.0.1
-aiohttp==3.14.1
+aiohttp==3.14.3
 aiosqlite==0.22.1
-arize-phoenix==13.17.0
-arize-phoenix-evals==2.11.0
-openinference-instrumentation-langchain==0.1.61
-docker==7.1.0
+arize-phoenix==19.19.0
+arize-phoenix-evals==3.3.0
+openinference-instrumentation-langchain==0.1.70
+docker==7.2.0
 ldap3==2.9.1
 # Direct runtime import (`ai/langgraph/ttp_library.py`, `ai/langgraph/prompt_loader.py`), declared
 # 2026-08-01. It had only ever arrived transitively via arize-phoenix and langchain-core, so any
