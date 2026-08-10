@@ -53,6 +53,13 @@ ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp
 #   command="uv", args=["--directory", "/opt/bloodhound_mcp", "run", "main.py"]
 # See Payload_Type/sage/ttps/bloodhound-mcp.md for the full standup + connection guidance.
 
+# Restrict LangGraph checkpoint deserialization to its known-safe type allowlist. LangGraph's own
+# default is false, and false means any Python callable stored in checkpoint data is imported and
+# executed on load — so an attacker able to write sage.db gets execution inside the Sage process.
+# Set here as well as in .env so the shipped image is hardened even if that file is replaced; a
+# value Mythic injects still wins over this, which keeps a per-deployment override possible.
+ENV LANGGRAPH_STRICT_MSGPACK=true
+
 WORKDIR /Mythic/
 
 COPY [".", "."]

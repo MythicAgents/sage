@@ -26,6 +26,15 @@ from dotenv_bootstrap import apply_dotenv, dotenv_paths, load_sage_dotenv  # noq
 SAGE_ROOT = Path(__file__).resolve().parents[1]
 DOTENV = SAGE_ROOT / ".env"
 
+# The one class of value allowed to ship SET rather than commented: a security default whose absence
+# is itself the unsafe state. LangGraph defaults LANGGRAPH_STRICT_MSGPACK to false, and false means a
+# callable stored in checkpoint data is imported and executed on load, so a commented line here would
+# ship the vulnerable configuration. Everything else in the file stays inert.
+#
+# This is an allowlist, not a relaxation: the value is pinned exactly, so a second uncommented
+# variable, a different value for this one, or any credential still fails.
+DOTENV_ALLOWED_ACTIVE = {"LANGGRAPH_STRICT_MSGPACK": "true"}
+
 
 def test_existing_environment_wins():
     """Mythic injects RABBITMQ_HOST and friends; a stale file must never shadow them."""
@@ -158,22 +167,29 @@ def test_committed_dotenv_sets_nothing():
     from dotenv import dotenv_values
 
     values = dotenv_values(DOTENV)
-    assert values == {}, f"the committed .env must define nothing, found: {sorted(values)}"
+    assert values == DOTENV_ALLOWED_ACTIVE, (
+        "the committed .env must define nothing beyond the security-hardening allowlist "
+        f"{DOTENV_ALLOWED_ACTIVE}, found: {dict(sorted(values.items()))}"
+    )
 
     environ: dict[str, str] = {}
-    assert apply_dotenv(values, environ) == []
-    assert environ == {}
+    assert apply_dotenv(values, environ) == list(DOTENV_ALLOWED_ACTIVE)
+    assert environ == DOTENV_ALLOWED_ACTIVE
 
 
 def test_committed_dotenv_carries_no_credentials():
     """It is committed to a public repository, so a real value here is a published secret."""
     text = DOTENV.read_text(encoding="utf-8")
 
+    allowed_lines = {f"{key}={value}" for key, value in DOTENV_ALLOWED_ACTIVE.items()}
     for line_number, line in enumerate(text.splitlines(), 1):
         stripped = line.strip()
+        if stripped in allowed_lines:
+            continue
         assert not stripped or stripped.startswith("#"), (
             f".env line {line_number} is uncommented ({stripped!r}); the committed template must "
-            "ship inert — an operator uncomments what they need after cloning"
+            "ship inert apart from the security-hardening allowlist "
+            f"({sorted(allowed_lines)}) — an operator uncomments what they need after cloning"
         )
 
     # Shapes that indicate a pasted credential rather than documentation.
