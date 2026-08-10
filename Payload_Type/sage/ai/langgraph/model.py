@@ -16,7 +16,7 @@ from langgraph.prebuilt import tools_condition
 from langgraph.managed.is_last_step import RemainingSteps
 from langchain.agents import create_agent
 from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit, SummarizationMiddleware, HumanInTheLoopMiddleware, InterruptOnConfig, AgentMiddleware, hook_config
-from langgraph.types import Command
+from langgraph.types import Command, TimeoutPolicy
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.runnables.config import RunnableConfig
@@ -33,7 +33,12 @@ from mythic_container.MythicRPC import (
 from typing import Annotated, Any, Awaitable, Callable, Literal
 from typing_extensions import NotRequired
 from uuid import UUID, uuid4
-from .mythic_tools import MythicTools, GUARDED_TOOLS
+from .mythic_tools import (
+    MythicTools,
+    GUARDED_TOOLS,
+    SAGE_TASK_HEARTBEAT_INTERVAL,
+    _env_positive_int,
+)
 from .tool_cache import ToolCache
 from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
 from .turn_authority import (
@@ -57,6 +62,22 @@ from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 from langgraph.errors import GraphRecursionError, NodeCancelledError, NodeError, ParentCommand
 import operator
+
+#: Seconds a graph node may go without observable progress before LangGraph cancels the attempt.
+#:
+#: This is a pure STALL DETECTOR and is deliberately independent of how long any callback sleeps.
+#: An earlier revision derived it from the Mythic task budget, which was wrong: sleep length decides
+#: how long a wait is *allowed* to be, not how long silence should be *tolerated*. Tying the two meant
+#: a session touching one six-hour sleeper bought a six-hour blindness window on every node, including
+#: ones that genuinely hang.
+#:
+#: What makes a flat value safe is `_graph_heartbeat` in mythic_tools: a Mythic wait announces itself
+#: for as long as it lasts, so silence past this window means stalled rather than patient. Sleep
+#: length is bounded by the derived Mythic budget instead, where it belongs.
+#:
+#: `run_timeout` is deliberately NOT set: it is never refreshed by progress signals, so it would cap
+#: legitimately long work rather than catching a stall.
+SAGE_NODE_IDLE_TIMEOUT = _env_positive_int("SAGE_NODE_IDLE_TIMEOUT", 300)
 
 SUPERVISOR_COPY_TOOL_RESULT_CAP = 2000  # max chars of a ToolMessage's string content when copied to OTHER agents' channels
 _AUTONOMOUS_OPERATOR_CONTINUE_CAP = 6  # max autonomous re-invocations of Mythic_Operator per node entry
@@ -5143,8 +5164,25 @@ class Model:
 
     def _rebuild_graph(self) -> None:
         start_node = self._graph_start_node_for_turn()
+        # The only relationship this value must still respect: it has to survive the gap between two
+        # heartbeats, or a legitimately waiting node is cancelled between beats. It no longer needs to
+        # clear the Mythic budget — that is what the heartbeat decoupled.
+        heartbeat_floor = SAGE_TASK_HEARTBEAT_INTERVAL * 2
+        if SAGE_NODE_IDLE_TIMEOUT <= heartbeat_floor:
+            logger.warning(
+                f"⚠️ SAGE_NODE_IDLE_TIMEOUT={SAGE_NODE_IDLE_TIMEOUT}s leaves no room between "
+                f"heartbeats (SAGE_TASK_HEARTBEAT_INTERVAL={SAGE_TASK_HEARTBEAT_INTERVAL}s). A "
+                f"waiting node can be cancelled between beats. Raise it above {heartbeat_floor}s or "
+                "lower SAGE_TASK_HEARTBEAT_INTERVAL."
+            )
         self.graph = (
             StateGraph(SageState)
+            .set_node_defaults(
+                timeout=TimeoutPolicy(
+                    idle_timeout=SAGE_NODE_IDLE_TIMEOUT,
+                    refresh_on="auto",
+                )
+            )
             .add_node("Supervisor", self._supervisor_agent())
             .add_node("Generalist", self._generalist_agent())
             .add_node(

@@ -1,5 +1,7 @@
 import copy
 import os
+import asyncio
+import contextlib
 import contextvars
 import inspect
 from dataclasses import asdict, is_dataclass, replace
@@ -16,6 +18,100 @@ except ImportError:
 # Key per-ENGAGEMENT (broader than the per-solve ParentTaskID/agent_task_id) so separate solves resume.
 SAGE_ENGAGEMENT_ID = os.environ.get("SAGE_ENGAGEMENT_ID", "").strip() or "default"
 SAGE_ENGAGEMENT_OBJECTIVE = os.environ.get("SAGE_ENGAGEMENT_OBJECTIVE", "").strip()
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a positive integer from the environment, falling back on anything unusable.
+
+    Deliberately silent about bad input rather than raising: a typo in an operator-edited `.env` must
+    not stop the container from starting. The fallback is always the safe published default.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+#: Base wall-clock budget, in seconds, for one Mythic task issued through
+#: `issue_task_and_waitfor_task_output`. 300 was a lab number: on a range a callback answers within
+#: seconds, so nothing ever exercised it. On a real engagement an agent sleeping for OPSEC reasons
+#: cannot answer inside five minutes at all, so this has to be an operator knob rather than a constant.
+SAGE_MYTHIC_TASK_TIMEOUT = _env_positive_int("SAGE_MYTHIC_TASK_TIMEOUT", 300)
+
+#: How many sleep cycles a task is allowed to wait through before the budget is considered spent.
+#: A task needs at least one full cycle to be picked up and one to return, plus jitter, so anything
+#: below 2 would time out on a healthy callback. Only ever RAISES the budget above the base above.
+SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER = _env_positive_int("SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER", 3)
+
+#: Seconds between graph heartbeats emitted while a Mythic task wait is legitimately outstanding.
+#: See `_graph_heartbeat` for why this exists at all.
+SAGE_TASK_HEARTBEAT_INTERVAL = _env_positive_int("SAGE_TASK_HEARTBEAT_INTERVAL", 30)
+
+
+def _resolve_graph_heartbeat():
+    """The current graph node's heartbeat callable, or None when not running inside a graph.
+
+    Returns None rather than raising: `get_runtime()` raises `RuntimeError: Called get_config outside
+    of a runnable context` on the headless, eval, and direct-tool paths. Those paths have no node
+    timeout to refresh either, so no heartbeat is the correct behaviour rather than a degraded one.
+    """
+    try:
+        from langgraph.runtime import get_runtime
+
+        runtime = get_runtime()
+    except Exception:
+        return None
+    beat = getattr(runtime, "heartbeat", None)
+    return beat if callable(beat) else None
+
+
+@contextlib.asynccontextmanager
+async def _graph_heartbeat(interval: int | None = None):
+    """Keep the graph node's idle timer alive while the body waits ON PURPOSE.
+
+    Why this exists: `TimeoutPolicy.idle_timeout` is answering two different questions at once. "Has
+    this node stalled?" wants a short window. "Is this node allowed to be waiting?" wants a window as
+    long as the wait. Sleep interval only decides the second, so any idle timeout derived from sleep
+    gets stall detection wrong — a session touching one six-hour sleeper would otherwise need a
+    six-hour blindness window on every node, including ones that genuinely hang.
+
+    Emitting a heartbeat separates the two. The idle timeout becomes a flat stall detector that knows
+    nothing about sleep, and a deliberate wait says so explicitly for as long as it lasts.
+
+    A periodic pump is required because the Mythic wait is a GraphQL **subscription**, not a poll
+    loop: it emits `on_tool_start`, then nothing at all until the task returns. There is no natural
+    tick to hang a progress signal on.
+    """
+    beat = _resolve_graph_heartbeat()
+    if beat is None:
+        yield
+        return
+
+    period = interval if interval and interval > 0 else SAGE_TASK_HEARTBEAT_INTERVAL
+
+    async def _pump() -> None:
+        while True:
+            await asyncio.sleep(period)
+            try:
+                beat()
+            except Exception:
+                # A failed heartbeat must never take down the task it is protecting; the worst case
+                # is the idle timeout firing, which is the pre-heartbeat behaviour.
+                return
+
+    pump = asyncio.create_task(_pump())
+    try:
+        yield
+    finally:
+        pump.cancel()
+        try:
+            await pump
+        except (asyncio.CancelledError, Exception):
+            pass
 _task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_mythic_task_visibility_context",
     default=None,
@@ -4656,6 +4752,47 @@ class MythicTools:
             key = key + ("kerberos_context_epoch", self._kerberos_context_epoch(callback_display_id))
         return key
 
+    def _record_callback_sleep(self, callback_display_id: int, liveness: dict) -> None:
+        """Cache what the liveness assessment believes this callback's sleep interval is.
+
+        Recorded here rather than fetched again at timeout-derivation time because the tasking path
+        already runs a liveness assessment immediately before issuing, so this costs no extra API call.
+        """
+        sleep_seconds = liveness.get("effective_sleep_seconds")
+        source = str(liveness.get("sleep_source") or "unknown")
+        if not isinstance(sleep_seconds, (int, float)) or sleep_seconds <= 0:
+            return
+        if not hasattr(self, "_callback_sleep_cache"):
+            self._callback_sleep_cache: dict[int, tuple[int, str]] = {}
+        self._callback_sleep_cache[int(callback_display_id)] = (int(sleep_seconds), source)
+
+    def _derive_task_timeout(self, callback_display_id: int) -> int:
+        """Budget for one task: the configured base, RAISED when this callback is known to sleep long.
+
+        Only ever raises. A derived value below the operator's configured base would silently shorten
+        tasking on a callback whose sleep we merely think we understand, and that understanding is
+        weaker than it looks: `_compute_liveness` finds sleep-command changes by matching the literal
+        `command_name == "sleep"` and an Apollo-shaped `interval` parameter, so a payload type naming
+        either differently falls back to the C2 profile value without saying so. Treating the sleep as
+        a floor-raiser makes a wrong reading harmless in the dangerous direction — the worst case is a
+        longer wait, never a task cut short.
+
+        A sleep we could not establish leaves the base untouched, which is the pre-9A behaviour.
+        """
+        base = SAGE_MYTHIC_TASK_TIMEOUT
+        cached = getattr(self, "_callback_sleep_cache", {}).get(int(callback_display_id))
+        if not cached:
+            return base
+        sleep_seconds, source = cached
+        derived = sleep_seconds * SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER + 60
+        if derived <= base:
+            return base
+        logger.info(
+            f"⏱️ Callback {callback_display_id} sleeps ~{sleep_seconds}s (source={source}); "
+            f"raising task timeout {base}s → {derived}s"
+        )
+        return derived
+
     async def _callback_tasking_liveness_blocker(self, callback_display_id: int) -> str:
         """Return a STOP message when a callback is known not to be taskable."""
         try:
@@ -4664,6 +4801,7 @@ class MythicTools:
             result = await assess_callback_liveness(self.client, int(callback_display_id))
             if not isinstance(result, dict):
                 return ""
+            self._record_callback_sleep(int(callback_display_id), result)
             status = self._capability_text(result.get("status")).casefold()
             reason = self._capability_text(result.get("reason"))
             # Assessment transport errors should not become a hard tasking veto. Concrete Mythic facts
@@ -4878,7 +5016,9 @@ class MythicTools:
 
         # HITL: guarded
         if timeout is None:
-            timeout = 300  # Default timeout of 5 minutes
+            # Was a hardcoded 300. Now the operator-configured base, raised when the liveness check
+            # above established that this specific callback sleeps longer than that base allows.
+            timeout = self._derive_task_timeout(callback_display_id)
 
         # Normalize "no arguments" to an empty string. Trace evidence (2026-06-01) shows
         # argument-less Apollo commands (rev2self, whoami) SUCCEED with parameters="" but
@@ -5282,7 +5422,13 @@ class MythicTools:
                     })
                     return result
 
-                results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
+                # Heartbeat for the whole wait. Without it the graph's idle timer sees nothing between
+                # on_tool_start and on_tool_end (the wait is a subscription, not a poll loop), so a
+                # legitimately long task would be cancelled by the node timeout no matter how generous
+                # the Mythic budget is. The budget above still bounds the wait; this only asserts the
+                # wait is deliberate. No-ops outside a graph run.
+                async with _graph_heartbeat():
+                    results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
                 fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
                 timeout_result = (
