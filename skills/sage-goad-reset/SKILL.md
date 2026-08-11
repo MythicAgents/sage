@@ -291,3 +291,43 @@ enforce by hand:
 `sage_restart.sh` or `mythic-cli`, which own its environment. Add `--conflict-only` when the
 intended Sage is legitimately not up yet, which is the mid-reset state. The readiness contract
 carries the same rule as its `sage_deployment` section, so a solve cannot start into a split brain.
+
+### Deploying into the container (explicit ask only)
+
+Local tmux is the default workflow and nothing below changes it. Use these only when container
+deployment is what you actually want:
+
+```bash
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py parity
+.venv/bin/python skills/sage-goad-reset/scripts/sage_deployment.py deploy --mode container
+```
+
+`deploy` refuses unless the resolved mode is `container`, so it cannot fire while you believe you
+are working locally. It mirrors the working tree into Mythic's installed copy, **stops a running
+local Sage before the container comes back**, restarts the container, and then proves parity rather
+than assuming it. The stop is not optional politeness: two Sages both register as the `sage`
+service, one wins the RabbitMQ queue, and parity would otherwise happily go green while measuring a
+container that is not the process answering Mythic. The final result therefore reports the
+deployment contract alongside parity, and is `ready` only when both hold.
+
+**The thing worth understanding: the Docker image does not hold the code that runs.** Mythic's
+generated compose file bind-mounts the installed service directory over `/Mythic/`, shadowing what
+the image baked in. At runtime the image supplies only the Python environment, which lives outside
+that path. Two consequences:
+
+- A Python change needs a sync plus a restart. It does **not** need an image rebuild, and
+  rebuilding to pick one up changes a layer nothing reads.
+- `requirements.txt`, `constraints.txt` and the `Dockerfile` DO need a rebuild, because they
+  produce the environment the mount does not shadow.
+
+`parity` asks the container, never the host, and checks two independent things: that the files it
+sees match the working tree, and that none is newer than the process that imported them. Python
+does not reload changed modules, so matching files plus an older start time still means stale code
+is executing. Both failure modes have happened — a container answering an autonomous run from a
+stale tree on 2026-08-01, and a fixed defect sitting undeployed while the repo was green.
+
+Two mechanical notes. The sync excludes every database spelling, because the container writes its
+live `sage.db` into that same directory and `rsync --delete` would otherwise be destructive
+(rsync protects excluded files on the receiver, which is what makes this safe). And the installed
+directory is resolved from `MYTHIC_ENV_PATH`, never guessed by name — a guess silently deploys into
+the wrong install on a machine with two Mythic checkouts.

@@ -5120,13 +5120,21 @@ class Model:
             else "Supervisor"
         )
 
-    def _handle_node_failure(self, state: SageState, error: NodeError) -> Command:
+    async def _handle_node_failure(self, state: SageState, error: NodeError) -> Command:
         """Hand a failed specialist back to Supervisor instead of ending the run.
 
         Registered through `add_node(..., error_handler=...)`. Before this existed, any exception out
         of a specialist unwound `graph.astream` entirely: `invoke()` caught it, recovered partial work
         from the checkpoint and reported, but the session was over. Supervisor never learned that one
         assignment had failed and so could not reassign it or tell the operator what was blocked.
+
+        **MUST stay `async def`.** LangGraph registers this as its own node
+        (`__error_handler__Mythic_Operator`), and that node inherits the graph's
+        `set_node_defaults(timeout=TimeoutPolicy(...))`. LangGraph refuses to apply a node timeout to
+        a sync callable, because sync Python cannot be safely cancelled in-process. Shipping this as
+        `def` therefore broke EVERY request at graph-build time — not at the point of a failure, and
+        without reaching a model at all. There is nothing to await in this body; the keyword is load-
+        bearing purely to satisfy that contract. See `tests/test_graph_builds.py`.
 
         Control exceptions are re-raised UNCHANGED so their existing handling in `invoke()` still
         runs — see `_NODE_FAILURE_CONTROL_EXCEPTIONS`. The kill-switch arrives here as an ordinary

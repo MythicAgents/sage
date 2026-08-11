@@ -168,6 +168,41 @@ Run this from repo root before and after code changes:
 There is one tier and no exclusions: a green run means the tree is green. The trailing `supported` argument is
 accepted and ignored so older handoffs keep working.
 
+### Test the assembled artifact, not only its parts
+
+A green suite proves the tree is green. It does not prove Sage runs. On 2026-08-10 two features that were each
+correct and each covered by passing tests were fatally incompatible in combination: every request — including a
+bare "Hello" — failed at graph-build time in about five seconds, before reaching a model, while the suite sat at
+3955 green. It was found by a human typing into the chat window.
+
+Four layers, defined in full at `docs/development/TEST_TIERS.md` § Test layers:
+
+| Layer | May touch | Answers |
+|---|---|---|
+| **build** | nothing external — dummy key, mocked Mythic | does the real thing assemble? |
+| **scripted** | a fake chat model + `InMemorySaver` | given this model output, does Sage behave? |
+| **recorded** | replayed HTTP cassettes | does it handle real provider responses? |
+| **live** | real provider, Mythic, range | does it work for real? |
+
+**Build and scripted require no API key, no VPN and no AWS session**, so an unreachable provider is never a
+reason to skip them. `GenericFakeChatModel`, `FakeListChatModel` and `InMemorySaver` are already installed; a
+fake model scripts exact responses including tool calls, so agent routing, middleware, handoffs, HITL and
+streaming are all testable offline and deterministically.
+
+Worked examples: `tests/test_graph_builds.py` (build) and `tests/test_scripted_handoff.py` (scripted — the
+Supervisor→Mythic_Operator handoff driven end to end in under a second). Copy the second one's harness rather
+than reinventing it; `docs/development/TEST_TIERS.md` § Writing a scripted (layer 1) test records the four traps
+that cost hours to find, two of which make a test **hang** rather than fail.
+
+Two rules with teeth, both learned from that outage:
+
+- **If you touch anything the graph is built from** — a node, edge, middleware, node default, error handler or
+  checkpointer — `tests/test_graph_builds.py` must pass, and a new configuration branch needs a new case there.
+- **Never assert on source text when you can assert on the built object.** A test that parses a function with
+  `ast` and checks a string appears in it can only fail if someone deletes the line; it cannot fail for a reason
+  that lives in behaviour. Likewise, a hand-built stand-in for a real structure only tests the parts you
+  remembered to copy, and stops matching silently when the real one changes.
+
 The four rejected successor-portfolio suites this command used to exclude are rejected *evaluation evidence*, and
 per § Durable Artifact Retention that belongs in `.sage_history/`, not the product tree. They are preserved
 append-only at `.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`. Do not rewrite or

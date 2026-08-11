@@ -56,6 +56,18 @@ Run focused tests first, then the maintained offline tier:
 One tier, no exclusions. The four rejected successor-portfolio suites moved to `.sage_history/` as retained
 evaluation evidence. See `docs/development/TEST_TIERS.md`.
 
+**Test the assembled artifact, not only its parts.** Component tests cannot prove wiring, and wiring is where
+individually-correct features collide. Four layers, defined in `docs/development/TEST_TIERS.md` § Test layers:
+**build** (real graph, dummy key, mocked Mythic — no network), **scripted** (fake chat model), **recorded**
+(replayed HTTP), **live** (real provider and range). Build and scripted need no API key, no VPN and no AWS
+session, so there is never a reason to skip them.
+
+If you touch anything the graph is built from — node, edge, middleware, node default, error handler,
+checkpointer — `tests/test_graph_builds.py` must pass, and a new configuration branch needs a new case in it.
+For agent routing and handoffs, copy the harness in `tests/test_scripted_handoff.py` instead of reinventing it.
+Never assert on source text (`ast` string matching) when you can assert on the built object; that exact
+substitution shipped a total outage on 2026-08-10 with 3955 tests green.
+
 ## Mythic output
 
 Native chat renders markdown and updating tool-use cards. Use tables for enumerations and fenced blocks for
