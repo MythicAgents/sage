@@ -117,11 +117,9 @@ git clone https://github.com/mwnickerson/bloodhound_mcp.git
 cd bloodhound_mcp
 uv sync
 # .env (or pass as Sage build/secret params — do NOT hardcode the token):
-#   BLOODHOUND_DOMAIN=<bloodhound-host>     # e.g. 127.0.0.1 or the CE host reachable from Sage
+#   BLOODHOUND_URL=<scheme://host:port>     # e.g. http://localhost:8080 for a stock CE
 #   BLOODHOUND_TOKEN_ID=<token id>
 #   BLOODHOUND_TOKEN_KEY=<token key>
-#   BLOODHOUND_PORT=8080                    # optional; MCP default is 443
-#   BLOODHOUND_SCHEME=http                  # optional; MCP default is https
 ```
 Run command (this is what Sage's `mcp_connect` STDIO entry invokes):
 ```bash
@@ -137,7 +135,7 @@ MCP as a STDIO server:
 - transport: `stdio`
 - command: `uv`
 - args: `["--directory", "/path/to/bloodhound_mcp", "run", "main.py"]`
-- env: `BLOODHOUND_DOMAIN`, `BLOODHOUND_TOKEN_ID`, `BLOODHOUND_TOKEN_KEY` (+ optional `BLOODHOUND_PORT`, `BLOODHOUND_SCHEME`)
+- env: `BLOODHOUND_URL`, `BLOODHOUND_TOKEN_ID`, `BLOODHOUND_TOKEN_KEY`
 
 After connecting, confirm the 13 tools surface via `MCP_Manager.get_tools_summary()`.
 
@@ -169,11 +167,9 @@ After connecting, confirm the 13 tools surface via `MCP_Manager.get_tools_summar
 
 | Variable | Required | Default | Meaning |
 |----------|----------|---------|---------|
-| `BLOODHOUND_DOMAIN` | yes | — | BloodHound instance hostname reachable from the Sage container |
+| `BLOODHOUND_URL` | yes | — | Where BloodHound is, as `scheme://host:port`. Sage expands it into the `DOMAIN`/`PORT`/`SCHEME` the MCP server reads; scheme defaults to `http`, port to the scheme default. |
 | `BLOODHOUND_TOKEN_ID` | yes | — | API token identifier (BloodHound UI → Administration → API Tokens) |
 | `BLOODHOUND_TOKEN_KEY` | yes | — | API token secret (shown once at creation) |
-| `BLOODHOUND_PORT` | no | 443 | BloodHound API port (CE web UI defaults to 8080) |
-| `BLOODHOUND_SCHEME` | no | https | http or https |
 
 ### Transport & run
 

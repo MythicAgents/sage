@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -98,7 +99,16 @@ _RUNTIME_PATHS = ("ai", "sage_chat", "prompts", "main.py", "mcp_tool_policy.json
 # Never sync: archived/live databases (the container writes its own into this directory, and rsync
 # --delete deliberately does NOT remove excluded files on the receiver, so the live one survives),
 # bytecode, and developer-local virtualenvs.
-_SYNC_EXCLUDES = ("sage*.db", "sage*.db-*", "sage*.db.zst", "__pycache__", ".venv", ".phoenix")
+_SYNC_EXCLUDES = (
+    "sage*.db", "sage*.db-*", "sage*.db.zst", "__pycache__", ".venv", ".phoenix",
+    # `.env` is OPERATOR-OWNED state in the installed copy, exactly like the live database above.
+    # Sage ships it tracked and inert precisely so a Mythic operator can open it from the web UI,
+    # fill in credentials, and restart — no shell, no `docker cp`. Syncing the repo's blank copy
+    # over it deletes that configuration on every deploy, and silently: the container comes back
+    # up, chat still answers, and BloodHound is simply gone. Seeded on first deploy below, so a
+    # fresh install still receives the documented template.
+    ".env", ".env.local",
+)
 
 # One program, run on both sides, so the two digests cannot disagree through implementation drift.
 # Sorted relative paths keep it order-independent; the content hash makes it exact.
@@ -252,11 +262,31 @@ def _sync_into_mythic() -> dict:
     # Trailing slashes: copy the CONTENTS of source into destination, not source itself.
     command += [f"{source}/", f"{destination}/"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=1800, check=False)
+    seeded = _seed_missing_env_files(source, destination)
     return {
         "action": "sync-working-tree-into-mythic",
         "returncode": result.returncode,
         "stderr_tail": result.stderr.strip()[-400:],
+        "seeded_env_files": seeded,
     }
+
+
+def _seed_missing_env_files(source: Path, destination: Path) -> list:
+    """Copy an excluded env file only when the installed copy does not have one yet.
+
+    Excluding `.env` from the sync protects an operator's edits, but on a FIRST deploy it would
+    leave the container with no env file at all — and the shipped one is not merely a template: it
+    carries `LANGGRAPH_STRICT_MSGPACK=true`, which is a security default that is unsafe when absent
+    rather than merely unset. Seeding when absent keeps both properties, and never overwrites.
+    """
+    seeded = []
+    for name in (".env",):
+        src = source / name
+        dst = destination / name
+        if src.is_file() and not dst.exists():
+            shutil.copy2(src, dst)
+            seeded.append(name)
+    return seeded
 
 
 def _restart_container() -> dict:

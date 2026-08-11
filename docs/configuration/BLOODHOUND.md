@@ -18,7 +18,7 @@ Put your own MCP checkout inside the mounted service directory and point Sage at
 ```bash
 # On the Mythic host — <mythic> is your Mythic installation directory
 git clone https://github.com/mwnickerson/bloodhound_mcp.git <mythic>/InstalledServices/sage/bloodhound_mcp
-printf 'BLOODHOUND_DOMAIN=%s\nBLOODHOUND_TOKEN_ID=%s\nBLOODHOUND_TOKEN_KEY=%s\n' "$BH_DOMAIN" "$BH_TOKEN_ID" "$BH_TOKEN_KEY" > <mythic>/InstalledServices/sage/bloodhound_mcp/.env
+printf 'BLOODHOUND_URL=%s\nBLOODHOUND_TOKEN_ID=%s\nBLOODHOUND_TOKEN_KEY=%s\n' "$BH_URL" "$BH_TOKEN_ID" "$BH_TOKEN_KEY" > <mythic>/InstalledServices/sage/bloodhound_mcp/.env
 ```
 
 Then set `SAGE_BLOODHOUND_MCP_DIR=/Mythic/bloodhound_mcp` — the **container-side** path for that directory —

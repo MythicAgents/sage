@@ -493,21 +493,63 @@ stdio MCP server.
 
 ### BloodHound credentials
 
-The MCP server needs to reach your BloodHound CE instance. These resolve through the standard load
-order, so the usual place to put them is the Mythic chat configuration or your Mythic user secrets —
-the same place your model API key already lives:
+The MCP server needs to reach your BloodHound CE instance. These resolve through the standard load order, so there are two places an operator can
+set them without a shell:
+
+1. **The Mythic chat configuration**, when you create the chat — per-chat, and the same place your
+   model API key already lives. Mythic **user secrets** work too and keep the token out of plaintext
+   channel config.
+2. **Sage's own `.env`**, which Mythic maps into the container. Open it from the Mythic
+   installed-services page, fill it in, save, restart the container. Shared by every chat in that
+   container, and no shell, `docker cp`, or sudo required. This is why that file ships tracked and
+   fully commented out rather than as a `.env.example` you would need a shell to copy.
+
+Full order, highest first: chat config → user secret → container env → `.env.local` → `.env`.
+
+A third place exists and is the least durable: the BloodHound MCP server also reads its own `.env`
+from the directory `SAGE_BLOODHOUND_MCP_DIR` points at. Under Mythic that is the image's baked
+`/opt/bloodhound_mcp`, which is **not** on the bind mount — anything written there is lost on the
+next rebuild and cannot be edited from the UI. Prefer either option above.
 
 | Setting | Purpose |
 |---|---|
-| `BLOODHOUND_DOMAIN` | BloodHound CE host |
+| `BLOODHOUND_URL` | Where BloodHound CE is, as one address: `scheme://host:port` (e.g. `http://localhost:8080`). Sage expands it into the three variables the MCP server reads. |
 | `BLOODHOUND_TOKEN_ID` | API token ID |
 | `BLOODHOUND_TOKEN_KEY` | API token key |
-| `BLOODHOUND_PORT` | Optional; MCP default `443`, BloodHound CE web UI is commonly `8080` |
-| `BLOODHOUND_SCHEME` | Optional; default `https` |
 
 Sage forwards whatever it resolves into the MCP subprocess. Anything you leave unset is simply not
 forwarded, so the server falls back to its own `.env` — which is what keeps the file-based workflow
 (documented in [docs/configuration/BLOODHOUND.md](docs/configuration/BLOODHOUND.md)) working unchanged.
+
+## When BloodHound is not connected
+
+**Sage still works.** BloodHound is central to Sage but it is not Sage's life support, and a missing
+optional dependency degrades a capability rather than the product:
+
+- **Ordinary chat is unaffected.** Conversation and supervised chats answer normally with no
+  BloodHound credentials, no MCP directory, and no MCP server on disk. A `hello` gets a reply.
+- **Autonomous solves fail closed, on purpose.** A solve reasons over the attack graph to choose and
+  verify each step, so running one without the graph would mean acting blind. An autonomous request
+  is refused with a message that names BloodHound and repeats the setup steps.
+- **Nothing is retried pointlessly.** When a required credential resolves nowhere, Sage does not
+  spawn an MCP server it knows will exit, and it does not repeat that attempt on every request. Fix
+  the configuration and the next request tries again.
+
+### What you will see
+
+In the Sage container log, at `WARNING` so it survives Mythic's default log level:
+
+```
+BloodHound auto-connect (chat): BloodHound MCP connect not attempted: required credentials are unset,
+so the server would exit during startup.
+
+Credentials Sage resolved for this attempt: NONE
+Missing (required): BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY
+```
+
+It names which credentials arrived and which did not — never their values. A bare
+`McpError: Connection closed` with no explanation means you are on a build from before this was
+fixed.
 
 ### Configure once, not per chat
 

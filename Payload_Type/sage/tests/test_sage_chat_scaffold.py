@@ -361,7 +361,11 @@ def test_autonomous_native_chat_fails_closed_without_exact_bloodhound_tools(monk
     monkeypatch.setattr("ai.langgraph.model.Model", _Model)
     chat = SageChat()
 
-    with pytest.raises(RuntimeError, match="requires BloodHound MCP exact-tool admission"):
+    # Matches the operator-facing wording, not the old internal phrase "exact-tool admission".
+    # D6 (2026-08-11) kept this fail-closed behaviour exactly and changed only what the refusal
+    # SAYS: a message naming an internal invariant left an operator unable to tell that BloodHound
+    # was the subject. `test_bloodhound_autonomous_refusal.py` pins the message's full contract.
+    with pytest.raises(RuntimeError, match="BloodHound is not connected"):
         _run(
             chat._get_or_create_model(
                 build_chat_request(
@@ -3494,8 +3498,12 @@ _EXPECTED_CONFIG_OPTIONS = {
     # BloodHound MCP connection (added 2026-07-30). Kept in this exact-equality inventory rather
     # than relaxing the assertion to a subset: the point of the set is that every option Mythic
     # renders is deliberate, so an accidental addition should fail here just as a removal does.
-    "BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY",
-    "BLOODHOUND_PORT", "BLOODHOUND_SCHEME",
+    # One address field, not three. BLOODHOUND_DOMAIN/PORT/SCHEME were collapsed into
+    # BLOODHOUND_URL (2026-08-11): they expressed a single fact, and DOMAIN was a HOSTNAME, which is
+    # a confusing name inside a tool whose subject is Active Directory domains. Sage still expands
+    # the URL into those three at the subprocess boundary, so the MCP server is unaffected — what
+    # changed is what a human is asked to fill in. Removals here are as deliberate as additions.
+    "BLOODHOUND_URL", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY",
 }
 
 

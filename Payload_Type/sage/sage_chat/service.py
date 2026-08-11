@@ -176,6 +176,27 @@ def _build_request_contract(
     )
 
 
+def _bloodhound_unavailable_message(reason: str | None = None) -> str:
+    """Compose the operator-facing autonomous refusal, with a fallback that still names BloodHound.
+
+    Lazy import to match this module's convention of keeping `ai.*` off the import path. The
+    fallback matters: if the import fails, the refusal must still say what is wrong rather than
+    reverting to an internal phrase like "exact-tool admission", which is the defect D6 fixes.
+    """
+    try:
+        from ai.bloodhound_config import autonomous_unavailable_message
+    except ImportError:  # pragma: no cover
+        try:
+            from ..ai.bloodhound_config import autonomous_unavailable_message  # type: ignore
+        except ImportError:
+            detail = f" {reason.strip()}" if reason and reason.strip() else ""
+            return (
+                "Autonomous execution is unavailable because BloodHound is not connected."
+                f"{detail} Connect BloodHound and start a new chat."
+            )
+    return autonomous_unavailable_message(reason)
+
+
 class SageChat(Chat):
     name = "sage"
     description = "Sage — AI red-team operator assistant (native Mythic v4.0.0 chat container)."
@@ -215,11 +236,13 @@ class SageChat(Chat):
         try:
             from ai.bloodhound_config import (
                 bloodhound_tool_admission,
+                credential_diagnostic,
                 ensure_bloodhound_connected,
             )
         except ImportError:  # pragma: no cover
             from ..ai.bloodhound_config import (  # type: ignore
                 bloodhound_tool_admission,
+                credential_diagnostic,
                 ensure_bloodhound_connected,
             )
         bloodhound_env: dict[str, str] = {}
@@ -234,10 +257,18 @@ class SageChat(Chat):
                 logger.debug(f"BloodHound credential resolution skipped: {exc}")
         try:
             connected, message = await ensure_bloodhound_connected(env=bloodhound_env or None)
-            logger.info(
-                f"BloodHound auto-connect (chat): {message}"
-                + (f" [credentials supplied: {sorted(bloodhound_env)}]" if bloodhound_env else "")
+            summary = f"BloodHound auto-connect (chat): {message}" + (
+                f" [credentials supplied: {sorted(bloodhound_env)}]" if bloodhound_env else ""
             )
+            if connected:
+                logger.info(summary)
+            else:
+                # WARNING, not INFO, because Mythic runs this container at DEBUG_LEVEL=warning and
+                # sets that level itself. An INFO diagnostic here is discarded before it reaches
+                # anyone: the container showed four `McpError: Connection closed` failures and ZERO
+                # explanations, because the one line that named the missing variable was filtered
+                # out. Success stays at INFO — a working connect is not news.
+                logger.warning(f"{summary}\n{credential_diagnostic(bloodhound_env)}")
             admission = bloodhound_tool_admission()
             admitted = bool(
                 connected
@@ -246,21 +277,25 @@ class SageChat(Chat):
             )
             if autonomous_required and not admitted:
                 raise RuntimeError(
-                    (
-                        "BloodHound MCP is not bound to SAGE_BLOODHOUND_MCP_DIR and the configured launcher."
-                        if connected and admission.get("ready")
-                        else admission.get("reason")
+                    _bloodhound_unavailable_message(
+                        (
+                            "The connected BloodHound MCP is not the one "
+                            "SAGE_BLOODHOUND_MCP_DIR and the configured launcher point at."
+                            if connected and admission.get("ready")
+                            else admission.get("reason")
+                        )
                     )
-                    or "BloodHound MCP exact-tool admission failed for autonomous chat."
                 )
             return admitted
         except Exception as exc:
             if autonomous_required:
-                raise RuntimeError(
-                    f"Autonomous native chat requires BloodHound MCP exact-tool admission before "
-                    f"Model.initialize(): {exc}"
-                ) from exc
-            logger.debug(f"BloodHound auto-connect (chat) skipped: {exc}")
+                raise RuntimeError(_bloodhound_unavailable_message(str(exc))) from exc
+            # Same reasoning as the not-connected branch above: this path swallows the failure so
+            # conversation chat stays fail-soft, and at DEBUG it swallowed the reason too.
+            logger.warning(
+                f"BloodHound auto-connect (chat) skipped: {exc}\n"
+                f"{credential_diagnostic(bloodhound_env)}"
+            )
             return False
 
     async def _refresh_auth_context(self, model: Any, request: ChatRequest) -> None:
@@ -377,12 +412,18 @@ class SageChat(Chat):
                 )
                 if not getattr(existing, "_bloodhound_exact_admission_at_initialize", False):
                     raise RuntimeError(
-                        "Autonomous native chat requires a fresh channel/session because this "
-                        "session graph initialized without BloodHound exact-tool admission."
+                        _bloodhound_unavailable_message(
+                            "This session's graph was built while BloodHound was unavailable, so it "
+                            "has no attack-graph tools; start a new chat once BloodHound is "
+                            "connected."
+                        )
                     )
                 if not admitted:
                     raise RuntimeError(
-                        "Autonomous native chat requires BloodHound MCP exact-tool admission on every turn."
+                        _bloodhound_unavailable_message(
+                            "BloodHound was connected when this session started but is not "
+                            "available on this turn."
+                        )
                     )
             else:
                 # Fail-soft keep-warm. Previously only the autonomous branch attempted this, so a
@@ -427,6 +468,50 @@ class SageChat(Chat):
         model.set_verbose(True)
         await put_channel_session(request, model)
         return model, False
+
+    async def _notify_bloodhound_degraded_once(self, model: Any, request: ChatRequest) -> None:
+        """Tell the operator, in the chat, that the attack graph is unavailable. Once per session.
+
+        The diagnostic this ISA raised to WARNING lands in the container log, which an operator has
+        to go and look for. This puts it where they already are. Once per session rather than per
+        turn (D5): they saw it on the first degraded turn, and Mythic renders a live
+        BloodHound-connected chip at the top of the chat, so repeating it would be the third copy of
+        a fact already on screen.
+
+        The flag lives on the session model, so a NEW chat notifies again — which is right, because
+        a new chat is a new operator context and the connection is process-global, meaning the answer
+        may have changed since the last one.
+
+        Fail-soft in the strongest sense: any failure here is swallowed. A notice about a degraded
+        optional dependency must never be the thing that breaks a working turn.
+        """
+        if getattr(model, "_bloodhound_degraded_notice_sent", False):
+            return
+        try:
+            try:
+                from ai.bloodhound_config import bloodhound_tool_admission, degraded_chat_notice
+            except ImportError:  # pragma: no cover
+                from ..ai.bloodhound_config import (  # type: ignore
+                    bloodhound_tool_admission,
+                    degraded_chat_notice,
+                )
+            if bloodhound_tool_admission().get("ready"):
+                return
+            try:
+                from .config import build_bloodhound_env
+            except ImportError:  # pragma: no cover
+                from config import build_bloodhound_env  # type: ignore
+            await self.send_response(
+                request,
+                response_key=f"bloodhound_degraded:{request.ChannelID}",
+                content=degraded_chat_notice(build_bloodhound_env(request)),
+                status="complete",
+                complete=False,
+                metadata={},
+            )
+            model._bloodhound_degraded_notice_sent = True
+        except Exception as exc:  # pragma: no cover - never break a turn over a notice
+            logger.warning(f"BloodHound degraded notice not delivered: {exc}")
 
     async def chat(self, request: ChatRequest) -> None:
         prompt = request.Prompt or ""
@@ -517,6 +602,7 @@ class SageChat(Chat):
             # so we then return None and let run_chat_turn skip its own terminal completion.
             stream_emitter = ChatStreamEmitter(self, request)
             model._response_emitter = stream_emitter
+            await self._notify_bloodhound_degraded_once(model, request)
 
             def approval_context() -> dict[str, str]:
                 authority = getattr(model, "_turn_authority", None)

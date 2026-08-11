@@ -63,16 +63,35 @@ require_bloodhound_dir() {
   # No sibling-checkout guess. readiness_contract.py lists this in REQUIRED_STARTUP_ENV, so a wrong
   # silent default yields a Sage that starts, passes readiness, and is bound to a BloodHound
   # checkout the operator never chose.
-  local configured
-  configured="$(snapshot_last_value SAGE_BLOODHOUND_MCP_DIR)"
-  if [[ -z "$configured" && -f "$SAGE_RUNTIME_ENV_PATH" ]]; then
-    configured="$(grep -E '^SAGE_BLOODHOUND_MCP_DIR=' "$SAGE_RUNTIME_ENV_PATH" | tail -1 | cut -d= -f2- | tr -d "\"'")"
-    [[ -n "$configured" ]] && append_snapshot_override "SAGE_BLOODHOUND_MCP_DIR" "$configured"
+  # Search the SAME files, in the same order, that Sage's own loader uses at startup
+  # (dotenv_bootstrap.DOTENV_FILENAMES = `.env.local`, then `.env`). Reading only `.env` made this
+  # launcher refuse to start a Sage whose variable was set in `.env.local` — the file the runtime
+  # actually prefers — and then tell the operator to add it to the other file.
+  #
+  # Every pipeline below carries `|| true`, and the append is a full `if` rather than a
+  # `[[ ... ]] && cmd` one-liner. Both are load-bearing under this script's `set -euo pipefail`: a
+  # non-matching `grep` fails its pipeline, and a trailing `&&` list whose test is false returns 1,
+  # and either one made the shell exit **silently, before reaching the error message below**. That
+  # is exactly the failure the message exists to prevent, so the guard was mute in the one case it
+  # was written for (found 2026-08-11: an operator sees only `exit 1` and no reason).
+  local configured=""
+  local env_file
+  configured="$(snapshot_last_value SAGE_BLOODHOUND_MCP_DIR || true)"
+  if [[ -z "$configured" ]]; then
+    for env_file in "${SAGE_RUNTIME_ENV_PATH%/*}/.env.local" "$SAGE_RUNTIME_ENV_PATH"; do
+      [[ -f "$env_file" ]] || continue
+      configured="$(grep -E '^SAGE_BLOODHOUND_MCP_DIR=' "$env_file" | tail -1 | cut -d= -f2- | tr -d "\"'" || true)"
+      if [[ -n "$configured" ]]; then
+        append_snapshot_override "SAGE_BLOODHOUND_MCP_DIR" "$configured"
+        break
+      fi
+    done
   fi
   if [[ -z "$configured" ]]; then
-    echo "ERR: SAGE_BLOODHOUND_MCP_DIR is not set. Add it to $SAGE_RUNTIME_ENV_PATH (Sage runtime env)" >&2
-    echo "     or pass SAGE_BLOODHOUND_MCP_DIR=<dir> to this script. Sage cannot auto-connect" >&2
-    echo "     BloodHound without it, and readiness requires it." >&2
+    echo "ERR: SAGE_BLOODHOUND_MCP_DIR is not set. Add it to ${SAGE_RUNTIME_ENV_PATH%/*}/.env.local" >&2
+    echo "     or $SAGE_RUNTIME_ENV_PATH (Sage runtime env), or pass SAGE_BLOODHOUND_MCP_DIR=<dir>" >&2
+    echo "     to this script. Sage cannot auto-connect BloodHound without it, and readiness" >&2
+    echo "     requires it." >&2
     exit 1
   fi
 }

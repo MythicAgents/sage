@@ -23,6 +23,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ai.bloodhound_config import bloodhound_mcp_config  # noqa: E402
+from ai.bloodhound_config import BLOODHOUND_OPERATOR_CONFIG_KEYS  # noqa: E402
 from sage_chat.config import BLOODHOUND_ENV_KEYS, build_bloodhound_env  # noqa: E402
 
 
@@ -32,21 +33,50 @@ def _request(config: dict | None = None, secrets: dict | None = None) -> SimpleN
 
 
 def test_config_beats_secret_beats_env(monkeypatch):
-    """Per-chat Config → Mythic user Secret → container env, first non-empty wins."""
-    monkeypatch.setenv("BLOODHOUND_DOMAIN", "from-env")
+    """Per-chat Config → Mythic user Secret → container env, first non-empty wins.
+
+    Precedence is asserted on the OPERATOR key (`BLOODHOUND_URL`) and observed through the expanded
+    output, because the collapse means the thing a human sets and the thing the MCP server reads are
+    no longer the same key.
+    """
+    monkeypatch.setenv("BLOODHOUND_URL", "http://from-env:9999")
     monkeypatch.setenv("BLOODHOUND_TOKEN_ID", "env-token-id")
-    monkeypatch.setenv("BLOODHOUND_SCHEME", "http")
 
     resolved = build_bloodhound_env(
         _request(
-            config={"BLOODHOUND_DOMAIN": "from-config"},
-            secrets={"BLOODHOUND_DOMAIN": "from-secret", "BLOODHOUND_TOKEN_ID": "secret-token-id"},
+            config={"BLOODHOUND_URL": "http://from-config:8080"},
+            secrets={"BLOODHOUND_URL": "http://from-secret:7070", "BLOODHOUND_TOKEN_ID": "secret-token-id"},
         )
     )
 
     assert resolved["BLOODHOUND_DOMAIN"] == "from-config", "per-chat Config must win"
+    assert resolved["BLOODHOUND_PORT"] == "8080", "the winning URL supplies the whole address"
     assert resolved["BLOODHOUND_TOKEN_ID"] == "secret-token-id", "Secret must beat env"
-    assert resolved["BLOODHOUND_SCHEME"] == "http", "env is the last resort, not ignored"
+
+
+def test_env_url_is_the_last_resort_not_ignored(monkeypatch):
+    """The container env layer still works, which is what Sage's UI-editable .env feeds."""
+    monkeypatch.setenv("BLOODHOUND_URL", "https://from-env.example")
+
+    resolved = build_bloodhound_env(_request())
+
+    assert resolved["BLOODHOUND_DOMAIN"] == "from-env.example"
+    assert resolved["BLOODHOUND_SCHEME"] == "https"
+    assert resolved["BLOODHOUND_PORT"] == "443", "https default when the URL omits a port"
+
+
+def test_an_unparseable_url_does_not_masquerade_as_unset(monkeypatch, caplog):
+    """A bad URL is a different problem from a missing one and must not be reported as missing."""
+    import logging
+
+    monkeypatch.delenv("BLOODHOUND_URL", raising=False)
+    caplog.set_level(logging.DEBUG)
+
+    resolved = build_bloodhound_env(_request(config={"BLOODHOUND_URL": "http://host:8080/ui/login"}))
+
+    assert "BLOODHOUND_DOMAIN" not in resolved
+    emitted = "\n".join(r.getMessage() for r in caplog.records)
+    assert "BLOODHOUND_URL" in emitted and "a path" in emitted
 
 
 def test_unset_keys_are_omitted_so_dotenv_fallback_survives(monkeypatch):
@@ -54,18 +84,25 @@ def test_unset_keys_are_omitted_so_dotenv_fallback_survives(monkeypatch):
     for key in BLOODHOUND_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
 
-    resolved = build_bloodhound_env(_request(config={"BLOODHOUND_DOMAIN": "bh.example.local"}))
+    monkeypatch.delenv("BLOODHOUND_URL", raising=False)
 
-    assert resolved == {"BLOODHOUND_DOMAIN": "bh.example.local"}
-    for key in BLOODHOUND_ENV_KEYS:
-        if key != "BLOODHOUND_DOMAIN":
-            assert key not in resolved
+    resolved = build_bloodhound_env(_request(config={"BLOODHOUND_URL": "http://bh.example.local"}))
+
+    # The URL expands to exactly the address triple and nothing else; unset tokens stay absent so
+    # the MCP server's own .env can still supply them.
+    assert resolved == {
+        "BLOODHOUND_DOMAIN": "bh.example.local",
+        "BLOODHOUND_PORT": "80",
+        "BLOODHOUND_SCHEME": "http",
+    }
+    for key in ("BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY"):
+        assert key not in resolved
 
 
 def test_empty_values_do_not_shadow_lower_layers(monkeypatch):
     """An empty Config value must fall through, not resolve to ''."""
-    monkeypatch.setenv("BLOODHOUND_DOMAIN", "from-env")
-    resolved = build_bloodhound_env(_request(config={"BLOODHOUND_DOMAIN": ""}))
+    monkeypatch.setenv("BLOODHOUND_URL", "http://from-env")
+    resolved = build_bloodhound_env(_request(config={"BLOODHOUND_URL": ""}))
     assert resolved["BLOODHOUND_DOMAIN"] == "from-env"
 
 
@@ -101,13 +138,20 @@ def test_every_resolved_key_is_declared_to_mythic():
     them in `ChatModelMetadata`, so Mythic rendered no fields and never populated `request.Config`.
     The credential path worked and could not be reached. This ties the two sides together — a key
     added to the resolver but not to the UI declaration (or vice versa) fails here.
+
+    Iterates the OPERATOR-settable keys rather than the subprocess allowlist, because as of the
+    URL collapse those are no longer the same list. `BLOODHOUND_CREDENTIAL_KEYS` is what reaches the
+    MCP server (DOMAIN/PORT/SCHEME plus the tokens); `BLOODHOUND_OPERATOR_CONFIG_KEYS` is what a
+    human types (URL plus the tokens). Asserting the old list here after the collapse would demand a
+    UI field for `BLOODHOUND_DOMAIN`, which is exactly the three-fields-for-one-address problem the
+    collapse removed. The invariant is unchanged: whatever an operator can set must be reachable.
     """
     from sage_chat.models import SAGE_MODELS, _CONFIG_OPTIONS
 
     declared_options = {opt.Name for opt in _CONFIG_OPTIONS}
     declared_secrets = set(SAGE_MODELS[0].Metadata.OptionalUserSecrets)
 
-    for key in BLOODHOUND_ENV_KEYS:
+    for key in BLOODHOUND_OPERATOR_CONFIG_KEYS:
         assert key in declared_options, (
             f"{key} is resolved by build_bloodhound_env but not declared as a chat configuration "
             "option — the operator would have no field to fill in"
@@ -140,13 +184,14 @@ def test_slash_bloodhound_forwards_resolved_credentials(monkeypatch):
     monkeypatch.setattr(bloodhound_config, "ensure_bloodhound_connected", _fake_connect)
 
     req = _request(
-        config={"BLOODHOUND_DOMAIN": "bh.range.local"},
+        config={"BLOODHOUND_URL": "http://bh.range.local:8080"},
         secrets={"BLOODHOUND_TOKEN_ID": "tid", "BLOODHOUND_TOKEN_KEY": "tkey"},
     )
     asyncio.run(slash._handle_bloodhound(req, ""))
 
     assert captured["env"] is not None, "slash path must forward credentials, not None"
     assert captured["env"]["BLOODHOUND_DOMAIN"] == "bh.range.local"
+    assert captured["env"]["BLOODHOUND_PORT"] == "8080", "the slash path must expand the URL too"
     assert captured["env"]["BLOODHOUND_TOKEN_ID"] == "tid"
     assert captured["env"]["BLOODHOUND_TOKEN_KEY"] == "tkey"
 
@@ -180,8 +225,12 @@ def test_credential_diagnostic_names_gaps_without_leaking_values():
 
     none_supplied = credential_diagnostic({})
     assert "NONE" in none_supplied
-    for key in ("BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY"):
+    # Names the OPERATOR key, not the internal one: the resolver expands one BLOODHOUND_URL into
+    # the address triple, so reporting a missing BLOODHOUND_DOMAIN would send a reader looking for
+    # a field that exists in no UI, no .env and no document.
+    for key in ("BLOODHOUND_URL", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY"):
         assert key in none_supplied
+    assert "BLOODHOUND_DOMAIN" not in none_supplied
 
     complete = credential_diagnostic(
         {k: "x" for k in ("BLOODHOUND_DOMAIN", "BLOODHOUND_TOKEN_ID", "BLOODHOUND_TOKEN_KEY")}
@@ -205,6 +254,21 @@ def test_bloodhound_arg_parser_splits_force_from_directory():
     assert parse("force ./force") == (True, "./force")
 
 
+class _ProbeTool:
+    """A `domain_info` that answers, so a mocked connect also passes the ISC-27 reachability read.
+
+    Since 2026-08-11 a successful handshake is not on its own a successful connect: Sage calls one
+    real read before claiming BloodHound is usable. A fixture that returns bare tool NAMES therefore
+    describes a server that connected and cannot answer, which is now correctly reported as not
+    connected.
+    """
+
+    name = "domain_info"
+
+    async def ainvoke(self, args):
+        return '{"domains": [{"name": "TEST.LOCAL"}]}'
+
+
 def _patch_connected(monkeypatch, *, connected: bool, sink: list):
     """Pretend BloodHound is/isn't connected and record any connect attempt."""
     from ai import bloodhound_config as bh
@@ -219,7 +283,7 @@ def _patch_connected(monkeypatch, *, connected: bool, sink: list):
 
         @staticmethod
         def get_tools_by_server(_name):
-            return ["file_upload", "domain_info", "cypher_query"]
+            return [_ProbeTool()]
 
     monkeypatch.setattr(bh, "MCPManager", _FakeManager)
 

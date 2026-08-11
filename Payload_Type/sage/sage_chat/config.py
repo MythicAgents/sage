@@ -15,6 +15,7 @@ re-resolve these every turn and never cache them across turns.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -71,9 +72,23 @@ def _resolve_bool(
 
 
 try:
-    from ai.bloodhound_config import BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS
+    from ai.bloodhound_config import (
+        BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS,
+        BLOODHOUND_OPERATOR_CONFIG_KEYS,
+        BLOODHOUND_URL_KEY,
+        BloodHoundURLError,
+        parse_bloodhound_url,
+    )
 except ImportError:  # pragma: no cover
-    from ..ai.bloodhound_config import BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS  # type: ignore
+    from ..ai.bloodhound_config import (  # type: ignore
+        BLOODHOUND_CREDENTIAL_KEYS as BLOODHOUND_ENV_KEYS,
+        BLOODHOUND_OPERATOR_CONFIG_KEYS,
+        BLOODHOUND_URL_KEY,
+        BloodHoundURLError,
+        parse_bloodhound_url,
+    )
+
+logger = logging.getLogger(__name__)
 
 
 def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:
@@ -94,7 +109,22 @@ def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
     resolved: dict[str, str] = {}
-    for key in BLOODHOUND_ENV_KEYS:
+
+    # The operator configures ONE address, `BLOODHOUND_URL`, and it is expanded here — at the
+    # subprocess-env boundary and nowhere else — into the three keys the MCP server actually reads.
+    # Parsing at the edge means nothing downstream learns about the new shape: the allowlist, the
+    # canonical-config guard and the server all keep seeing exactly what they saw before.
+    url = _resolve(config, secrets, BLOODHOUND_URL_KEY, env_key=BLOODHOUND_URL_KEY, default="")
+    if url:
+        try:
+            resolved.update(parse_bloodhound_url(url))
+        except BloodHoundURLError as exc:
+            # Deliberately not swallowed into an empty dict: an unparseable URL is a configuration
+            # error the operator can fix in seconds, and dropping it here would surface later as
+            # "credentials are unset", which sends them looking for the wrong thing entirely.
+            logger.warning(f"{BLOODHOUND_URL_KEY} could not be used: {exc}")
+
+    for key in (k for k in BLOODHOUND_OPERATOR_CONFIG_KEYS if k != BLOODHOUND_URL_KEY):
         value = _resolve(config, secrets, key, env_key=key, default="")
         if value:
             resolved[key] = value

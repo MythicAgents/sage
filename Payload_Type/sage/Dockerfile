@@ -46,9 +46,9 @@ RUN git clone --depth 1 --branch ${BLOODHOUND_MCP_REF} ${BLOODHOUND_MCP_REPO} /o
 ENV SAGE_BLOODHOUND_MCP_DIR=/opt/bloodhound_mcp
 # Connection is configured at RUNTIME (never bake the token). Required env, injected by the
 # operator via Mythic container env / build params:
-#   BLOODHOUND_DOMAIN, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY
-#   BLOODHOUND_PORT  (optional; MCP default 443, BloodHound CE web UI is 8080)
-#   BLOODHOUND_SCHEME (optional; default https)
+#   BLOODHOUND_URL, BLOODHOUND_TOKEN_ID, BLOODHOUND_TOKEN_KEY
+#   BLOODHOUND_URL is one address (scheme://host:port), e.g. http://localhost:8080 for a
+#   stock BloodHound CE. Sage expands it into the three variables the MCP server reads.
 # Sage connects via its MCP subsystem (stdio):
 #   command="uv", args=["--directory", "/opt/bloodhound_mcp", "run", "main.py"]
 # See Payload_Type/sage/ttps/bloodhound-mcp.md for the full standup + connection guidance.
