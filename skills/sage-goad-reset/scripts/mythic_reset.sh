@@ -49,4 +49,18 @@ mythic_cli start
 #
 # `--conflict-only`: Sage itself is restarted later in the reset order, so only the unintended
 # side must be down here, not the intended one up.
-"$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only
+#
+# SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE exists for ONE caller: a test exercising this script's
+# environment handling, which fakes `mythic-cli` but cannot fake `docker`. Without it such a test
+# reads whatever Sage happens to be running on the developer's machine and fails or passes on that
+# alone. Declaring the deployment check out of scope is not the same as declaring a mode: setting
+# SAGE_DEPLOYMENT_MODE=container instead would make enforce stop the "unintended" LOCAL Sage by
+# running sage_stop.sh for real, so a test run would kill a teammate's tmux session.
+#
+# NEVER set this for an operational reset. The split-brain guard is the entire point of the step:
+# two Sages registered as `sage` means one silently wins the RabbitMQ queue.
+if [[ "${SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE:-0}" == "1" ]]; then
+  echo "▶ deployment enforcement SKIPPED (SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE=1) — tests only" >&2
+else
+  "$REPO_ROOT/.venv/bin/python" "$HERE/sage_deployment.py" enforce --conflict-only
+fi

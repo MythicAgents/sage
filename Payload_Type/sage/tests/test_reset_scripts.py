@@ -23,6 +23,14 @@ def test_mythic_reset_drops_container_only_host_overrides(tmp_path):
         "RABBITMQ_HOST": "127.0.0.1",
         "MYTHIC_SERVER_HOST": "127.0.0.1",
         "NGINX_HOST": "127.0.0.1",
+        # This test is about the script DROPPING container-only host variables before calling
+        # mythic-cli. Its last step asks which Sage deployment is running, and that check reads real
+        # Docker rather than the fake CLI above — so without this the result depends on whatever
+        # happens to be running on the machine, which is why it failed on any box with a Sage
+        # container up. Declaring the check out of scope rather than declaring a MODE is deliberate:
+        # SAGE_DEPLOYMENT_MODE=container would make enforce run sage_stop.sh for real and kill a
+        # developer's local tmux Sage as a side effect of running the test suite.
+        "SAGE_RESET_SKIP_DEPLOYMENT_ENFORCE": "1",
     }
 
     subprocess.run(
