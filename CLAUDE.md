@@ -36,6 +36,23 @@ from a clone, it is absent and nothing here should require it. Russel's own poin
 `skills/README.md` is the operator-tool index. Reusable scripts belong in an existing or new skill, not in
 `Plans/`.
 
+Claude Code does not discover `skills/` on its own — it reads `.claude/skills/`. **That directory is committed,
+so on Linux and macOS a fresh clone has every skill the moment you start Claude Code. No setup step.**
+
+If you are on Windows without Developer Mode, git will have materialized those symlinks as inert text files
+containing their target paths (`core.symlinks=false`, the Git-for-Windows default; it does this silently). Delete
+the directory and re-create the links from an elevated shell:
+
+```
+for d in skills/*/; do n=$(basename "$d"); ln -sfn "../../skills/$n" ".claude/skills/$n"; done
+```
+
+Link, never copy — a hand-made copy drifts, and the last set of them silently reintroduced absolute paths this
+repo's contract forbids. `.claude/settings.json` is also committed, carrying the same guardrail hooks Codex gets
+from `.codex/config.toml`; that gate hard-denies only `Payload_Type/sage/prompts/**` and advises elsewhere, see
+`AGENTS.md` § Operating Rules. `.claude/settings.local.json` is **not** committed and must not be: it accretes
+personal absolute paths and private model pins.
+
 ## Hard boundaries
 
 - Sage may query Mythic and BloodHound control-plane data.

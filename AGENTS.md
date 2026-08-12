@@ -108,6 +108,24 @@ Verify important claims against source, tests, Mythic, BloodHound, and the curre
 - `Payload_Type/sage/tests/`: fast offline unit/regression suite.
 - `Payload_Type/sage/ai/trajectory/`: trajectory corpus/export/replay/runtime bridge tooling for data-backed repair policy.
 - `skills/`: repo-local Sage skills. Reusable operator/Codex/Claude tooling belongs here, not in `Plans/`. **Read `skills/README.md` first** — it indexes every skill (name, purpose, entry script); tool-agnostic.
+  Neither assistant discovers this directory on its own: Codex looks in `$CODEX_HOME/skills`, Claude Code in
+  `.claude/skills/`. The two are handled differently, because only one of them can live in the repo.
+
+  **Claude Code needs nothing.** `.claude/skills/` is committed as of 2026-08-11, so a Linux or macOS clone has
+  every skill discoverable on first launch. The accepted cost is Windows: without Developer Mode git writes each
+  symlink out as an inert text file (`core.symlinks=false`, silently), and the fix is to delete the directory and
+  re-run the loop below from an elevated shell.
+
+  **Codex needs one command**, because `$CODEX_HOME` is outside the repo and nothing committed can reach it:
+
+  ```
+  for d in skills/*/; do n=$(basename "$d"); ln -sfn "$PWD/skills/$n" "$CODEX_HOME/skills/$n"; done
+  ```
+
+  The Claude-side equivalent, needed only to repair a Windows checkout, is the same loop with a relative target
+  into `.claude/skills/$n`. Use `skills/*/` rather than `skills/sage-*/`: not every skill here is named `sage-`,
+  and the narrower glob silently skipped `phoenix-traces` for months. Link, never copy — a hand-made copy drifts,
+  and the last set of them silently reintroduced absolute paths this repo's own contract forbids.
 
 ## Publishable-By-Default Contract
 
@@ -275,9 +293,18 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Do not grow prompts, tool surfaces, GOAD-specific live code, or symbolic planning/gating logic as a
   tactical fix without first comparing a thinner verifier/retrieval/data-backed alternative. The third
   tactical patch to the same subsystem requires RCA before more code.
-- Project hooks in `.codex/config.toml` enforce the architecture gate for high-risk edits. If a legitimate
-  high-risk edit is blocked, prepare the gate brief, get explicit user approval, then open a short-lived
-  scoped token with `python3 skills/sage-architecture-governor/scripts/open_gate.py open ...`.
+- Project hooks enforce the gate at edit time under both harnesses: `.codex/config.toml` for Codex,
+  `.claude/settings.json` for Claude Code. They run the same scripts. **The edit-time hook hard-denies only
+  `Payload_Type/sage/prompts/**`;** every other high-risk path gets a named advisory instead of a block, because
+  the rule worth enforcing is the RCA-before-the-third-patch rule above, not a toll on every touch. The full
+  `HIGH_RISK_PATTERNS` list is unchanged and still governs `open_gate.py`, the review lease, and
+  `check_arch_budget.py`. If a legitimate edit is blocked, prepare the gate brief, get explicit user approval,
+  then open a short-lived scoped token with
+  `python3 skills/sage-architecture-governor/scripts/open_gate.py open ...`.
+  Verify the hook itself with `python3 skills/sage-architecture-governor/scripts/pre_tool_use_arch_gate.py
+  --self-test`, which exercises both event dialects. That self-test exists because the hook read only
+  `tool_input["command"]` — the Codex `apply_patch` shape — and so inspected **zero** paths under Claude Code's
+  `Edit`/`Write`, while still exiting 0.
 
 ## Mythic Chat Container — Output Rendering
 

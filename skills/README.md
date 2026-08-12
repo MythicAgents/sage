@@ -23,6 +23,19 @@ operational tooling (per `CLAUDE.md` / `AGENTS.md`); do **not** put helper scrip
 | **sage-artifact-retention** | Keep high-value Sage contracts, handoffs, reviews, transcripts, and evidence in private project-local history; warn when durable artifacts remain only in `/tmp`. | `scripts/artifact_retention.py`, `scripts/retention_guard.py` |
 | **sage-architecture-governor** | Falsifiable architecture gate + scoped edit token for high-risk Sage harness/prompt/planner/adapter changes — guards against prompt bloat, symbolic-planner creep, and GOAD coupling. | `scripts/open_gate.py`, `scripts/check_arch_budget.py` |
 | **sage-forge-ops** | Sage-specific Forge/Codex helper automation. Sage offensive-security code must use the cyber-capable model config in `CLAUDE.md`; do not change global Forge defaults from here. | `scripts/sage_forge.sh` |
+| **sage-canary-attestation** | Independently attest a bounded native Mythic canary by reconstructing the run from Mythic's own records with a read-only Spectator credential, then diffing them against the frozen conversation-case expected trace — a verdict that does not trust the driver's own manifest. | `scripts/attest_canary.py`, `scripts/egress_probe.py` |
+| **phoenix-traces** | Read-only analysis of Sage's Phoenix/OpenInference trace store: latest run, per-call token usage, errors, tool-call frequency, and before/after trace comparison. Opens the DB read-only, so it is safe during a live run. | `analyze.ts` (no `scripts/` dir — see note below) |
 
 > Keep this index in sync when adding/removing a skill: a skill is a directory under `skills/` with a `SKILL.md`
 > (frontmatter `name` + `description`) and a `scripts/` directory. Update the row here when you add one.
+>
+> Two rows above were added on 2026-08-11 after a count found 13 rows against 14 directories.
+> `sage-canary-attestation` had simply never been indexed. `phoenix-traces` is the newer arrival: it lived at
+> `.claude/skills/phoenix-traces/` — inside a gitignored directory — so it was untracked, absent from every
+> clone, and reachable by Claude Code alone. Moving it here made it one source both assistants link to, which is
+> the whole point of this directory. It is also the one skill whose entry point is a top-level `analyze.ts`
+> rather than a `scripts/` directory; that is a deviation from the convention above, not a licence to add more.
+>
+> If you move a skill in or out of here, **its depth changes and relative paths move with it.** `analyze.ts`
+> resolved its default database with `../../../`, correct at three levels deep and wrong at two. Run the skill
+> after any such move; a file that still parses is not a file that still works.

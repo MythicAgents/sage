@@ -16,7 +16,37 @@ Notes
 Plans
 sage.db*
 Payload_Type/sage/sage*.db*
-.claude/
+# Claude Code's project directory ships two of its three entries, and hides the third.
+#
+# `settings.json` is committed: plain JSON carrying the same two guardrail hooks as
+# `.codex/config.toml`. Without it a Claude Code contributor gets no architecture gate and no
+# retention guard at all.
+#
+# `skills/` is committed as of 2026-08-11, reversing the original call. It holds one symlink per
+# entry in this repo's own `skills/` tree, so committing it means a Linux or macOS clone has every
+# Sage skill discoverable the moment Claude Code starts, with no setup step. That was the whole
+# point of putting them in `skills/` in the first place, and a link loop a contributor has to find
+# and run is a setup step most will skip.
+#
+# The known cost, accepted deliberately: under `core.symlinks=false` — the Git-for-Windows default
+# without Developer Mode — git materializes each link as a small text file containing its target
+# path, silently. A Windows contributor sees 15 inert files rather than 15 skills. The fix there is
+# to delete `.claude/skills/` and re-create the links, which needs Developer Mode or an elevated
+# shell; `AGENTS.md` carries the loop. Every other platform pays nothing.
+#
+# `settings.local.json` stays ignored, and this is the load-bearing half of the rule. It accretes
+# personal absolute paths, private model pins, and hundreds of one-off command approvals — real
+# violations of the Publishable-By-Default Contract in `AGENTS.md`, not merely noise. Claude Code's
+# own convention already draws this line: `settings.json` is shared, `settings.local.json` is not.
+# It needs no rule of its own; the `.claude/*` wildcard below already excludes it, and the two
+# negations deliberately do not bring it back.
+#
+# Git cannot re-include a file underneath an excluded directory, so the rule is `.claude/*` rather
+# than `.claude/`: the wildcard matches only the three entries at that one level, letting the
+# negations re-admit two of them along with everything inside `skills/`.
+.claude/*
+!.claude/settings.json
+!.claude/skills
 .env
 # ...except Sage's own runtime env, which is committed deliberately. It ships fully commented out so
 # it sets nothing, and exists in the repo so a Mythic operator can edit it in place from the web UI

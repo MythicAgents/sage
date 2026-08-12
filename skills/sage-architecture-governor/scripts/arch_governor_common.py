@@ -37,6 +37,22 @@ HIGH_RISK_PATTERNS = (
     "skills/sage-live-runner/scripts/**",
 )
 
+# Subset of HIGH_RISK_PATTERNS that a PreToolUse hook may HARD-DENY without an approval token.
+# Everything else in HIGH_RISK_PATTERNS is advisory at edit time: the hook names the subsystem and
+# asks the doctrine's real question ("is this the third tactical patch here?") without blocking.
+#
+# Why the split (decision D1, 2026-08-11): the gate was a no-op under Claude Code for weeks of
+# substantial work — commit recovery, Mythic schema consolidation, the cred-reference fix — and the
+# failure it exists to prevent (tactical prompt growth, planner sprawl) did not recur in that window.
+# That natural experiment is evidence that a 20-glob toll booth over most of the actively-worked
+# surface costs more velocity than it buys. `prompts/**` keeps the hard deny because that is the one
+# place the documented failure actually happened.
+#
+# HIGH_RISK_PATTERNS itself is deliberately UNCHANGED: `open_gate.py`'s default scope, the review
+# lease, and `check_arch_budget.py`'s pre-edit brief check all stay strict. Only the interactive
+# edit-time hook softens.
+GATE_DENY_PATTERNS = ("Payload_Type/sage/prompts/**",)
+
 GOAD_LITERALS = (
     "GOAD",
     "Trust Walker",
@@ -132,6 +148,17 @@ def high_risk_paths(paths: Iterable[str], root: str | Path) -> list[str]:
     for path in paths:
         clean = normalize_repo_path(path, root)
         if clean and matches_any(clean, HIGH_RISK_PATTERNS):
+            out.append(clean)
+    return sorted(dict.fromkeys(out))
+
+
+def gate_deny_paths(paths: Iterable[str], root: str | Path) -> list[str]:
+    """Return the subset of paths the interactive edit-time hook may hard-deny."""
+
+    out: list[str] = []
+    for path in paths:
+        clean = normalize_repo_path(path, root)
+        if clean and matches_any(clean, GATE_DENY_PATTERNS):
             out.append(clean)
     return sorted(dict.fromkeys(out))
 

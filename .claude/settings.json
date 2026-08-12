@@ -1,0 +1,61 @@
+{
+  "$comment": [
+    "Project-scoped Claude Code settings for the Sage repository. The committed twin of .codex/config.toml:",
+    "same two guardrails, same scripts, same portable path resolution, so the two harnesses behave the same",
+    "way instead of one silently enforcing nothing.",
+    "",
+    "Scope rule matches the Codex file: only settings useful to *anyone* working on Sage belong here.",
+    "Personal permissions, MCP toggles, and machine-specific preferences stay in the gitignored",
+    ".claude/settings.local.json beside this file.",
+    "",
+    "History: this file did not exist until 2026-08-11. .claude/settings.local.json had no hooks section at",
+    "all, so the architecture gate and the retention guard ran under Codex and nowhere else. The gate script",
+    "also read only tool_input.command, which is the Codex apply_patch shape -- pointing Claude Code at it",
+    "unchanged would have installed a guard that inspected zero paths and exited 0. Both halves are fixed;",
+    "`python3 skills/sage-architecture-governor/scripts/pre_tool_use_arch_gate.py --self-test` exercises",
+    "both event dialects and both verdict lanes."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/skills/sage-architecture-governor/scripts/pre_tool_use_arch_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/skills/sage-architecture-governor/scripts/check_arch_budget.py\" --quiet --changed --warn-only",
+            "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/skills/sage-artifact-retention/scripts/retention_guard.py\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/skills/sage-artifact-retention/scripts/retention_guard.py\"",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
