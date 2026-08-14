@@ -89,23 +89,33 @@ def test_short_sleep_never_lowers_the_operator_base():
     assert tools._derive_task_timeout(7) == SAGE_MYTHIC_TASK_TIMEOUT
 
 
-def test_long_sleep_raises_the_budget():
-    """A callback sleeping past the base gets a budget covering several cycles plus round trip."""
+def test_long_sleep_no_longer_raises_the_budget():
+    """INVERTED 2026-08-12 by sage-task-deferral-receipt ISC-1, and the inversion IS the fix.
+
+    This test used to assert `3600 * multiplier + 60`, and passed for as long as the defect existed:
+    nothing bounded how far the derivation raised, so a four-hour sleep produced a ~12-hour wait that
+    held the Mythic chat composer disabled for the whole time. A long sleep is now answered by
+    deferring with a receipt naming the task, not by waiting for it.
+    """
     tools = _tools()
     tools._record_callback_sleep(7, {"effective_sleep_seconds": 3600, "sleep_source": "sleep_task"})
 
-    expected = 3600 * SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER + 60
-    assert tools._derive_task_timeout(7) == expected
-    assert expected > SAGE_MYTHIC_TASK_TIMEOUT
+    old_behaviour = 3600 * SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER + 60
+    assert old_behaviour > SAGE_MYTHIC_TASK_TIMEOUT, "sanity: this case really did raise before"
+    assert tools._derive_task_timeout(7) == SAGE_MYTHIC_TASK_TIMEOUT
 
 
-def test_derivation_is_per_callback():
-    """Two callbacks with different sleeps must not share a budget."""
+def test_the_budget_is_the_same_for_every_callback():
+    """INVERTED with the test above: a per-callback budget was the mechanism that ran away.
+
+    Previously two callbacks with different sleeps got different budgets, and the assertion was that
+    the sleepier one waited longer. One configured grace period now bounds every callback.
+    """
     tools = _tools()
     tools._record_callback_sleep(1, {"effective_sleep_seconds": 3600, "sleep_source": "sleep_task"})
     tools._record_callback_sleep(2, {"effective_sleep_seconds": 5, "sleep_source": "sleep_task"})
 
-    assert tools._derive_task_timeout(1) > tools._derive_task_timeout(2)
+    assert tools._derive_task_timeout(1) == tools._derive_task_timeout(2)
     assert tools._derive_task_timeout(2) == SAGE_MYTHIC_TASK_TIMEOUT
 
 

@@ -6871,10 +6871,17 @@ class Model:
                     from .request_contract import RequestContract, RequestLane
                     _rc = getattr(self, "_request_contract", None)
                     if isinstance(_rc, RequestContract) and _rc.lane == RequestLane.SUPERVISED_WORKFLOW:
+                        _current_request_id = str(
+                            state.get("_request_id") or _rc.request_id or ""
+                        ).strip()
                         _specialist_returns = sum(
                             1 for msg in channel
                             if isinstance(msg, AIMessage)
                             and msg.additional_kwargs.get("_is_completion_header")
+                            and (
+                                not _current_request_id
+                                or msg.additional_kwargs.get("_request_id") == _current_request_id
+                            )
                         )
                         _SUPERVISED_DELEGATION_CAP = 2
                         if _specialist_returns >= _SUPERVISED_DELEGATION_CAP:
@@ -7430,10 +7437,14 @@ class Model:
                         capped_messages = [_cap_message_for_copy(m) for m in substantive_messages]
                         # Create a header message to show which agent responded
                         # Mark with _is_completion_header for semantic filtering (vs string matching)
+                        response_header_kwargs: dict[str, Any] = {"_is_completion_header": True}
+                        _completion_request_id = str(state.get("_request_id") or "").strip()
+                        if _completion_request_id:
+                            response_header_kwargs["_request_id"] = _completion_request_id
                         response_header = AIMessage(
                             content=f"[{node_name} completed task]",
                             name=node_name,
-                            additional_kwargs={"_is_completion_header": True}
+                            additional_kwargs=response_header_kwargs,
                         )
                         _tag_msg(response_header, self._next_seq())
 
@@ -11801,10 +11812,54 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             # unbounded autonomous budget while LangGraph still receives a valid positive limit.
             logger.debug(f"🚀 Before astream: self.state._message_seq={self.state.get('_message_seq')}, Model._message_seq={self._message_seq}")
 
+            # A channel-stable checkpoint already contains the prior reducer-backed message
+            # channels.  A distinct typed request therefore contributes only its new input plus
+            # current scalar control state; replaying ``self.state`` would append all local history
+            # a second time under ``operator.add``.  Keep the full seed for a thread's first graph
+            # request and for legacy callers that do not provide distinct request identities.
+            _current_graph_request = str(self.state.get("_request_id") or "").strip()
+            _graph_input: dict[str, Any] = self.state
+            _get_checkpoint = getattr(self.graph, "aget_state", None)
+            _checkpoint_state: dict[str, Any] = {}
+            if _current_graph_request and callable(_get_checkpoint):
+                _checkpoint_snapshot = await _get_checkpoint(self._graph_run_config(thread_id))
+                _checkpoint_state = getattr(_checkpoint_snapshot, "values", {}) or {}
+            if _current_graph_request and _checkpoint_state:
+                _message_channels = {
+                    "messages",
+                    "supervisor_messages",
+                    "generalist_messages",
+                    "mythic_operator_messages",
+                    "mythic_payload_messages",
+                    "mcp_manager_messages",
+                    "bloodhound_messages",
+                    "sandbox_messages",
+                    "autonomous_executor_messages",
+                }
+                _graph_input = {
+                    key: value
+                    for key, value in self.state.items()
+                    if key not in _message_channels
+                }
+                for key in _message_channels:
+                    _checkpoint_messages = Counter(
+                        _msg_id(message)
+                        for message in (_checkpoint_state.get(key, []) or [])
+                    )
+                    _delta_messages = []
+                    for message in self.state.get(key, []) or []:
+                        message_id = _msg_id(message)
+                        if _checkpoint_messages[message_id]:
+                            _checkpoint_messages[message_id] -= 1
+                        else:
+                            _delta_messages.append(message)
+                    if _delta_messages:
+                        _graph_input[key] = _delta_messages
+
             # Stream graph execution and process events incrementally
             hitl_interrupted = False
             async for event in self.graph.astream(
-                self.state,
+                _graph_input,
                 self._graph_run_config(self._session_thread_id())
             ):
                 # Cooperative kill switch: an operator `exit`/stop set _stop_requested on this

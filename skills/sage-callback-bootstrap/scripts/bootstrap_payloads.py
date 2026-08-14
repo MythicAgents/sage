@@ -26,6 +26,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -70,6 +71,7 @@ SYNC_RANGE_TIME_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "s
 NATIVE_CHAT_PATH = REPO_ROOT / "skills" / "sage-live-runner" / "scripts" / "native_chat.py"
 READINESS_CONTRACT_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS = 180
+DEFAULT_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
 DEFAULT_FOOTHOLD_USER_MATCH = "samwell.tarly"
@@ -737,6 +739,53 @@ async def wait_for_samwell_apollo_callback(
 wait_for_baked_apollo_callback = wait_for_samwell_apollo_callback
 
 
+def _finite_non_negative_float(value: str | float) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError("registration wait controls must be finite non-negative values")
+    return parsed
+
+
+def validate_registration_wait_controls(
+    timeout_seconds: str | float,
+    poll_seconds: str | float,
+) -> tuple[float, float]:
+    return (
+        _finite_non_negative_float(timeout_seconds),
+        _finite_non_negative_float(poll_seconds),
+    )
+
+
+async def wait_for_running_sage_chat_container(
+    client,
+    *,
+    timeout_seconds: float = DEFAULT_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS,
+    poll_seconds: float = 1.0,
+) -> dict[str, Any]:
+    timeout_seconds, poll_seconds = validate_registration_wait_controls(
+        timeout_seconds,
+        poll_seconds,
+    )
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_rows: list[dict[str, Any]] = []
+    while True:
+        chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+        last_rows = chat.get("consuming_container", [])
+        running_chat = [
+            row
+            for row in last_rows
+            if row.get("container_running") and not row.get("deleted")
+        ]
+        if running_chat:
+            return running_chat[0]
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                "Timed out waiting for Sage chat container registration after restart; "
+                f"last containers: {json.dumps(last_rows, sort_keys=True)}"
+            )
+        await asyncio.sleep(poll_seconds)
+
+
 def task_free_preflight_metadata() -> dict[str, Any]:
     return {
         "preflight_scope": "control-plane-read-only",
@@ -961,16 +1010,21 @@ async def command_bootstrap_reset(args: argparse.Namespace) -> None:
             )
 
     client = await login(args)
-    chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
-    running_chat = [
-        row
-        for row in chat.get("consuming_container", [])
-        if row.get("container_running") and not row.get("deleted")
-    ]
-    if not running_chat:
-        raise RuntimeError("Sage chat container is not running; restart Sage before bootstrap-reset")
+    running_chat = await wait_for_running_sage_chat_container(
+        client,
+        timeout_seconds=getattr(
+            args,
+            "sage_chat_registration_timeout",
+            DEFAULT_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS,
+        ),
+        poll_seconds=getattr(
+            args,
+            "sage_chat_registration_poll_seconds",
+            1.0,
+        ),
+    )
     result: dict[str, Any] = {
-        "sage_chat_container": running_chat[0],
+        "sage_chat_container": running_chat,
         "sage_payload_created": False,
         "sage_chat": (
             await prepare_sage_chat(client)
@@ -1246,6 +1300,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_POST_CALLBACK_TIMEOUT_SECONDS,
         help="Seconds to wait for the baked Apollo callback observation before failing.",
+    )
+    reset_parser.add_argument(
+        "--sage-chat-registration-timeout",
+        type=_finite_non_negative_float,
+        default=DEFAULT_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS,
+        help="Seconds to wait for freshly restarted Sage chat container registration before foothold bootstrap.",
     )
     reset_parser.add_argument(
         "--max-clock-skew-seconds",

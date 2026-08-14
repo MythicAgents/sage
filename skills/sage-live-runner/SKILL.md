@@ -92,6 +92,11 @@ The canary never reuses a prepared Auto channel and never posts an approval resp
 control-plane reads needed to construct the proposed action. Approval or rejection remains an explicit Mythic UI
 action. The existing `run` command remains Auto and autonomous by default, and since 2026-07-28 it **refuses without an explicit `--autonomous` acknowledgement** (exit 2) and points at `canary`. That guard exists because this warning, and the matching one in `AGENTS.md`, were both already written and neither prevented a `run` invoked as a "read-only probe" from executing a full autonomous solve against the live range.
 
+For an explicitly authorized engineering check of real-provider invocation and same-channel memory, use
+`scripts/live_model_smoke.py --live-test`. It creates one fresh supervised/non-autonomous channel, posts two
+harmless nonce prompts, refuses on HITL/task/identity/trace drift, and manifests both transcripts plus its report.
+It never submits an approval response.
+
 ## BHUSA Demo Helpers
 
 Create a locked BHUSA demo channel owned by the current operation's unique active bot account. The helper selects or creates

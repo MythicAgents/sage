@@ -1644,6 +1644,11 @@ class MythicTools:
         self._execution_observer = None
         self._turn_authority = None
         self._turn_authority_sink_reservation = ""
+        # Set when a task's grace period expires and the turn deferred with a receipt. While it is
+        # set, no further target-facing task issues in this turn (ISC-4). It is state about THIS
+        # turn's tasking, not a handle on the deferred task: nothing reads it to adjudicate a late
+        # result, and nothing may (ISC-6).
+        self._deferred_task_receipt: dict[str, Any] | None = None
         self._request_contract = None
         # Native chat makes this explicit through ``set_request_contract``/``require_request_contract``.
         # A channel id alone is also used by older test/eval adapters and is not an authority claim.
@@ -1848,6 +1853,10 @@ class MythicTools:
         next_turn_id = str(getattr(authority, "turn_id", "") or "")
         if next_turn_id != prior_turn_id:
             self._turn_authority_sink_reservation = ""
+            # A deferral bounds the turn that deferred, not the operator's next one. Clearing it on
+            # the same turn-id change that clears the sink reservation keeps one definition of "a new
+            # turn" rather than inventing a second.
+            self._deferred_task_receipt = None
         self._turn_authority = authority
 
     def set_request_contract(self, contract) -> None:
@@ -2108,7 +2117,7 @@ class MythicTools:
                 pass
         if tool_name == "issue_task_and_waitfor_task_output":
             if values.get("timeout") is None:
-                values["timeout"] = 300
+                values["timeout"] = SAGE_MYTHIC_TASK_TIMEOUT
             if values.get("parameters") in (None, {}, "", "{}", '""', "''"):
                 values["parameters"] = ""
             elif _normalize_command_name(values.get("command")) == "shell":
@@ -4767,31 +4776,97 @@ class MythicTools:
         self._callback_sleep_cache[int(callback_display_id)] = (int(sleep_seconds), source)
 
     def _derive_task_timeout(self, callback_display_id: int) -> int:
-        """Budget for one task: the configured base, RAISED when this callback is known to sleep long.
+        """The one configured grace period for every task. Nothing derived may extend it.
 
-        Only ever raises. A derived value below the operator's configured base would silently shorten
-        tasking on a callback whose sleep we merely think we understand, and that understanding is
-        weaker than it looks: `_compute_liveness` finds sleep-command changes by matching the literal
-        `command_name == "sleep"` and an Apollo-shaped `interval` parameter, so a payload type naming
-        either differently falls back to the C2 profile value without saying so. Treating the sleep as
-        a floor-raiser makes a wrong reading harmless in the dangerous direction — the worst case is a
-        longer wait, never a task cut short.
+        This used to be a floor-raiser: it started at the configured base and multiplied a callback's
+        observed sleep on top, never lowering. The reasoning was that a misread sleep should fail in
+        the safe direction, and a longer wait looked like the safe direction. It was not. Nothing
+        bounded how far it raised, `_graph_heartbeat` keeps the node alive for the whole wait, and
+        Mythic disables the chat composer for a request in `pending` or `streaming` — so a callback
+        sleeping four hours produced a ~12-hour wait and locked the operator out of the channel for
+        that entire time over a single "enumerate this host".
 
-        A sleep we could not establish leaves the base untouched, which is the pre-9A behaviour.
+        A long sleep is now answered by deferring with a receipt naming the task, not by waiting. The
+        receipt is strictly more useful than the wait was: the operator learns the task id immediately
+        and keeps the channel, and the task itself is untouched and still queued on the agent.
+
+        The cached sleep is kept and still read, but only to say so out loud. It no longer moves the
+        deadline.
         """
         base = SAGE_MYTHIC_TASK_TIMEOUT
         cached = getattr(self, "_callback_sleep_cache", {}).get(int(callback_display_id))
         if not cached:
             return base
         sleep_seconds, source = cached
-        derived = sleep_seconds * SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER + 60
-        if derived <= base:
-            return base
-        logger.info(
-            f"⏱️ Callback {callback_display_id} sleeps ~{sleep_seconds}s (source={source}); "
-            f"raising task timeout {base}s → {derived}s"
+        would_have_waited = sleep_seconds * SAGE_MYTHIC_SLEEP_TIMEOUT_MULTIPLIER + 60
+        if would_have_waited > base:
+            logger.info(
+                f"⏱️ Callback {callback_display_id} sleeps ~{sleep_seconds}s (source={source}); "
+                f"holding the task budget at {base}s instead of waiting ~{would_have_waited}s. "
+                f"Output arriving after {base}s is deferred with a task receipt."
+            )
+        return base
+
+    def _defer_task_with_receipt(
+        self,
+        command: str,
+        callback_display_id: int,
+        task_display_id: Any,
+        waited_seconds: int,
+    ) -> str:
+        """Record the deferral for this turn and return the operator-facing receipt (ISC-2).
+
+        Shape matters as much as content. The old text opened with "Timed out" and read as a failure
+        for a task that is queued and healthy, which is both wrong and actively misleading to the
+        model deciding what to do next.
+        """
+        self._deferred_task_receipt = {
+            "command": command,
+            "callback_display_id": int(callback_display_id),
+            "task_display_id": task_display_id,
+            "waited_seconds": int(waited_seconds),
+        }
+        if task_display_id is None:
+            # The grace expired before the issue itself completed, so there is no id this call can
+            # honestly name. Saying so is the only correct move: a guessed id is worse than none.
+            return (
+                f"DEFERRED: '{command}' on callback {callback_display_id} did not confirm a task id "
+                f"within {waited_seconds}s, so it is unknown whether Mythic accepted the task. This "
+                f"is not a failure of the command. Check with get_task_history_for_callback before "
+                f"considering a re-issue, and do not re-issue blindly."
+            )
+        return (
+            f"DEFERRED: task {task_display_id} ('{command}') is issued and queued on callback "
+            f"{callback_display_id}, and did not return output within the {waited_seconds}s grace "
+            f"period. This is expected for an agent that sleeps longer than the grace period; it is "
+            f"NOT an error and the task has NOT failed. The agent will run it on its next check-in. "
+            f"Read the result later with get_task_output for task {task_display_id}, or "
+            f"get_task_history_for_callback for callback {callback_display_id}. Do NOT re-issue it."
         )
-        return derived
+
+    def _deferred_task_issue_blocker(self, command: str, callback_display_id: int) -> str:
+        """ISC-4: after a deferral, no further target-facing task issues in this turn.
+
+        Load-bearing rather than tidy. Blocking on the wait was the ONLY pre-issue cap in the general
+        supervised path: the circuit breaker keys on a classified result and the loop guard on
+        normalized output, and neither exists before output does. Shortening the wait without this
+        would be a net safety regression, trading a locked channel for an unbounded issue rate.
+
+        Control-plane reads are untouched. They do not come through this method.
+        """
+        receipt = getattr(self, "_deferred_task_receipt", None)
+        if not receipt:
+            return ""
+        deferred_id = receipt.get("task_display_id")
+        named = f"task {deferred_id}" if deferred_id is not None else "a task"
+        return (
+            f"BLOCKED: this turn already deferred {named} ('{receipt.get('command')}') on callback "
+            f"{receipt.get('callback_display_id')}, so no further command may be issued to an agent "
+            f"in this turn. Waiting on that task is what the deferral ended; issuing another one now "
+            f"would stack tasks the operator has not seen the result of. Report the deferral and let "
+            f"the operator decide. Control-plane reads (task history, callbacks, BloodHound) remain "
+            f"available."
+        )
 
     async def _callback_tasking_liveness_blocker(self, callback_display_id: int) -> str:
         """Return a STOP message when a callback is known not to be taskable."""
@@ -4971,6 +5046,10 @@ class MythicTools:
         if authority_blocker:
             self._pending_task_backed_transition = None
             return self._note_effect_denial(authority_blocker)
+        deferral_blocker = self._deferred_task_issue_blocker(command, callback_display_id)
+        if deferral_blocker:
+            self._pending_task_backed_transition = None
+            return self._note_effect_denial(deferral_blocker)
         self._pending_task_backed_transition = None
         collection_reservation_blocker = self._reserve_contract_collection_attempt(
             command,
@@ -5427,27 +5506,29 @@ class MythicTools:
                 # legitimately long task would be cancelled by the node timeout no matter how generous
                 # the Mythic budget is. The budget above still bounds the wait; this only asserts the
                 # wait is deliberate. No-ops outside a graph run.
+                # Snapshot before the wait so the receipt can only ever name a task THIS call issued.
+                # `_last_issued_task_display_id` is a single slot that survives across calls, so if the
+                # grace expires before the issue completes it still holds the PREVIOUS task's id, and a
+                # receipt naming it would send the operator to look at the wrong task.
+                task_id_before_wait = getattr(self, "_last_issued_task_display_id", None)
                 async with _graph_heartbeat():
                     results = await asyncio.wait_for(_issue_and_wait(), timeout=timeout + 20)
                 fail_key = self._task_failure_key(command, callback_display_id, parameters)
             except asyncio.TimeoutError:
-                timeout_result = (
-                    f"Timed out after ~{timeout}s waiting for output of '{command}' on callback "
-                    f"{callback_display_id}. The task was issued but did not return output in time "
-                    f"(the agent may be slow/long-running, or unresponsive). Use check_callback_alive "
-                    f"and get_task_history_for_callback to check status; do NOT blindly re-issue."
+                # Grace expired. This is a normal operating condition with a receipt, not a failure:
+                # the task is queued and fine, and the agent will run it on its next check-in. So it
+                # deliberately does NOT go through classify_result/_apply_task_result_class — counting
+                # a healthy queued task as a failure would walk the circuit breaker toward STOP and
+                # teach the model that the command is broken.
+                issued_task_id = getattr(self, "_last_issued_task_display_id", None)
+                if issued_task_id == task_id_before_wait:
+                    issued_task_id = None
+                return self._defer_task_with_receipt(
+                    command,
+                    callback_display_id,
+                    issued_task_id,
+                    timeout,
                 )
-                result_class = command_builder.classify_result(command, timeout_result)
-                decision = self._apply_task_result_class(fail_key, result_class)
-                if decision == "stop":
-                    return self._format_task_stop(
-                        fail_key,
-                        command,
-                        callback_display_id,
-                        result_class,
-                        timeout_result,
-                    )
-                return timeout_result
             if results is None:
                 result_class = command_builder.classify_result(command, "No output returned from task.")
                 decision = self._apply_task_result_class(fail_key, result_class)
