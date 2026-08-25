@@ -569,11 +569,8 @@ async def ensure_sage_chat_api_token(client) -> dict[str, Any]:
 
 async def prepare_sage_chat(client) -> dict[str, Any]:
     native_chat = load_native_chat_module()
+    channel = await native_chat.prepare_locked_channel(client)
     token = await ensure_sage_chat_api_token(client)
-    channel = await native_chat.prepare_locked_channel(
-        client,
-        api_token_id=int(token["api_token"]["id"]),
-    )
     return {
         "api_token": token,
         "prepared_channel": channel,

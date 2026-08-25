@@ -66,3 +66,21 @@ Structural guards against delegation loops that would otherwise spin indefinitel
 - `read_credentials` can place raw secrets into the model context and traces; use it deliberately.
 - Never put credentials in tracked files. Use Mythic user secrets, the per-chat configuration, process
   environment variables, or a secret manager.
+
+## Background findings watcher
+
+- Watcher scans are operation-scoped Mythic control-plane reads. They do not create payload tasks or connect to
+  targets. A bounded, tool-free model call occurs only when durable evidence changes.
+- `SAGE_WATCHER_APITOKEN` is a persistent bot credential. Keep it in Sage's runtime environment, `.env.local`, or
+  a secret manager; never place a real value in a tracked file. Its background read/delivery scopes must match
+  the documented exact set; wildcard or excess authority fails closed.
+- The locked `Sage Watcher` owner resolves only `SAGE_WATCHER_*` model keys. User-secret values remain request-only
+  and are never copied into operation memory, channel metadata, logs, or findings. After restart a generation that
+  used one reports `credentials-required` until the exact owner runs `/watcher apply` again.
+- Watcher conversation uses a separate stateless, tool-free, no-checkpointer graph. It receives only the admitted
+  canonical view and has no callback, task, approval, validation, BloodHound, MCP, or sandbox authority.
+- Full findings and evidence remain inside access-controlled Mythic and are posted to `#sage-findings`. The
+  optional Slack hook accepts only the fixed message `Sage findings changed. Open Mythic to review.` plus an
+  optional operator-configured legacy C/G channel ID. It rejects operation, finding, host, user, domain,
+  credential, task-output, and file values at its input boundary. Modern Slack app incoming webhooks cannot
+  override their installed channel; use one webhook URL per modern destination.

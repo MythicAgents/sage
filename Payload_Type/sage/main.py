@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 # MUST run before importing mythic_container, which builds its Dynaconf settings at import time and
 # would not see anything loaded afterwards. Under Mythic this file lives in the bind-mounted service
@@ -44,7 +45,9 @@ if os.path.exists(cert_bundle_path):
 else:
     logger.info(f"No custom SSL certificate bundle found at {cert_bundle_path}, using system defaults")
 
-os.environ["PHOENIX_WORKING_DIR"] = "./.phoenix"
+_phoenix_working_dir = Path(__file__).resolve().parent / ".phoenix"
+_phoenix_working_dir.mkdir(parents=True, exist_ok=True)
+os.environ["PHOENIX_WORKING_DIR"] = str(_phoenix_working_dir)
 
 # Cap span attribute value size BEFORE the tracer provider is built (register() reads
 # OTel SpanLimits from env at SDK init). With register(batch=False) each span exports

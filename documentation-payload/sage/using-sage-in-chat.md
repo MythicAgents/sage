@@ -34,6 +34,11 @@ up front rather than failing mid-run.
 
 | Command | What it does |
 |---|---|
+| `/findings` | Show the operation's canonical evidence-backed findings plus watcher health (`/finding` remains a compatibility alias) |
+| `/watcher status` | From either model, show the redacted owner generation, route sources, cadence, scheduler health, poll count, pending notices, and last scans without creating a watcher |
+| `/watcher apply` | From the exact active locked `Sage Watcher` channel, claim or advance the immutable operation profile and rehydrate any requesting-user secret after restart |
+| `/watcher scan` · `/watcher pause` · `/watcher resume` | From the exact owner only, request an immediate read-only poll, pause the scheduler, or resume it |
+| `/watcher interval <seconds>` · `/watcher interval default` | From the exact owner only, persist cadence for the applied profile; accepted range is 5–86,400 integer seconds |
 | `/state` | Show the [engagement ledger](/agents/sage/engagement-ledger/) — the hop table of proven effects for this channel |
 | `/state objective <text>` | Set the engagement objective |
 | `/state reconcile [task_id] [apply]` | Import verified effects and credentials from completed Mythic tasks — dry-run unless `apply` is given |
@@ -44,3 +49,22 @@ up front rather than failing mid-run.
 | `/bloodhound [force] [dir]` | Connect, report, or rebind the [BloodHound MCP](/agents/sage/bloodhound/) |
 | `/mcp <list\|tools\|call\|connect\|disconnect\|policy>` | Manage [MCP servers](/agents/sage/connecting-mcp-servers/) |
 | `/sandbox [shell\|python] <code>` | Run an isolated local snippet (requires the `callback.write` scope) |
+
+## Background findings watcher
+
+`Sage Watcher` is a separate Mythic AI model. Creating its channel is inert: configure it, lock it, and run
+`/watcher apply` to establish the sole owner generation for the beta deployment's one supported operation. A
+**scan** is one read-only poll of Mythic callbacks, tasks, responses/task output, credentials, and files. It never
+issues a payload task or contacts a target. Every poll attempt increments `scans`, but it is not automatically an
+LLM inference: unchanged durable evidence is reconciled without a model call. When evidence changes, Sage may use
+one bounded, tool-free direct-reasoner call to rank already-admitted candidates. Watcher conversation is a separate
+stateless one-node graph with no tools, checkpoint, mode, tasking, validation proposal, or ordinary Sage fallback.
+
+Watcher LLM settings are the eight collision-free `SAGE_WATCHER_*` provider/model/endpoint/credential keys. They
+use Sage Chat's config → declared user secret → environment → default algorithm and never read ordinary Sage's
+unprefixed keys. Cadence defaults to 300 seconds and pause/cadence persist across restart. UI/environment-backed
+profiles auto-resume; a user-secret-backed generation reports `credentials-required` until the locked owner
+reapplies it. Full updates remain in `#sage-findings`; Slack receives only the fixed generic change notice.
+Modern Slack app incoming webhooks always use the channel selected when that webhook was installed, so provision
+one webhook URL per destination. Only a legacy custom-integration webhook may honor the optional
+`SAGE_FINDINGS_SLACK_CHANNEL_ID` C/G channel override.

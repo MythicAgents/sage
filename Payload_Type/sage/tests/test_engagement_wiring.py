@@ -6918,8 +6918,18 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         "CERT_AUTH_DOMAIN=lab.local",
         "CERT_AUTH_ACCOUNT=administrator",
         "CERT_AUTH_LDAP_BIND=True",
+        r"CERT_AUTH_WHOAMI=u:LAB\otheradmin",
         "CERT_AUTH_USER_DN=CN=Administrator,CN=Users,DC=lab,DC=local",
         "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
+        "DA_ONLY_READ_OP=domain-sacl",
+        "DA_SACL_STATUS=sacl",
+        "DA_SACL_ACE_COUNT=4",
+        "CONTROL_BIND=True",
+        r"CONTROL_WHOAMI=u:LAB\lowpriv",
+        "CONTROL_SACL_STATUS=no-sacl",
+        "DA_ONLY_READ_PROVEN=True",
+        r"Directory of \\dc01.other.local\C$",
+        "Windows",
         "CERT_AUTH_STATUS=OK",
     ])
     calls = {"issue": 0}
@@ -6951,9 +6961,9 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
         )))
 
     # A Schannel bind that only authenticates and reads the account's own group membership is
-    # authentication, not usable domain control. After the PKINIT failure, the fallback must NOT
-    # close the objective off a self-read (RCA 2026-08-01): the effect stays unverified and da: is
-    # never recorded. Genuine control (a privileged action or captured credential) is still required.
+    # authentication, not usable domain control. A privileged listing from another domain also
+    # cannot prove this action's lab.local effect. After the PKINIT failure, the fallback must NOT
+    # close the objective off either signal: the effect stays unverified and da: is never recorded.
     assert result["ok"] is False, result
     assert result["fallback"] == "schannel-ldap"
     assert result["stopped_after"] == "effect_unverified"

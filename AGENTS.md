@@ -14,6 +14,33 @@ This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that o
 Nothing in this guide should require them; if you find a pointer into `Plans/`, treat it as a bug in this file.
 Verify important claims against source, tests, Mythic, BloodHound, and the current range — not against prose.
 
+## Product Contracts And Runtime Authority
+
+Sage has two product contracts and three runtime authority modes. Keep them distinct when changing prompts,
+configuration, chat lifecycle, operation memory, autonomous execution, tests, or public claims.
+
+- **Assisted mode** is the consultant-facing umbrella over `conversation` and `supervised`. Conversation observes
+  and answers without guarded activity. Supervised may propose guarded work, but only the exact action accepted by
+  the consultant may execute. Assisted is not a fourth runtime mode.
+- **Auto mode** is the experimental autonomous CTF contract. It pursues an explicitly bound objective without an
+  operator approving each action. Its current validation is GOAD-only and does not establish reliability or
+  generalization outside that benchmark.
+- The only runtime authority modes are `conversation`, `supervised`, and `auto`. Product wording must not turn the
+  assisted umbrella into another enum value or let auto authority leak into conversation/background observation.
+- `Sage Watcher` is a separate locked profile and stateless explanation console, not another authority mode or an
+  ordinary Sage session. Only its exact owner may apply or mutate the operation scheduler; it has no tasking,
+  validation, tools, BloodHound, MCP, sandbox, checkpoint, supervised, or auto surface.
+
+Documentation is not behavioral evidence. Changes to either contract must be verified at the assembled chat
+lifecycle, including exact operation/callback scope and guarded-action emissions.
+
+For the beta public contract, treat all Mythic-derived values as client data inside the trusted Mythic/Sage
+deployment. Full finding content belongs in native Mythic Chat. The optional Slack findings hook is a separate
+egress boundary and may emit only the fixed generic change notice; never pass operation, finding, host, user,
+domain, credential, task-output, or file values to that seam. Keep `README.md`, this guide,
+`docs/SECURITY_AND_DATA_HANDLING.md`, and the current release note mutually consistent, and qualify every
+provider, model, payload, range, or platform configuration not backed by the release evidence.
+
 ## Durable Artifact Retention
 
 - Treat `/tmp` as scratch space, never as the source of truth for a durable Sage artifact.
@@ -27,7 +54,7 @@ Verify important claims against source, tests, Mythic, BloodHound, and the curre
   credentials, and reproducible intermediates in `/tmp`. Never promote secrets or payloads automatically.
 - For Sage panel review, allocate `--output-dir` under `.sage_history/` and record the completed directory with
   `sage-artifact-retention`; do not use a `/tmp` panel directory for a decision-bearing review.
-- Native Codex session and sub-agent transcripts remain in `~/.codex/sessions`. Keep bounded cyber-runner workers
+- Native Codex session and sub-agent transcripts remain in the operator's Codex user-scope session store. Keep bounded cyber-runner workers
   ephemeral, but persist their validated contracts and final structured handoffs under `.sage_history/`.
 - `.sage_history/` is private, gitignored local state and is not a system backup. Raw history may contain sensitive
   operator or lab material even when obvious auth files are excluded.
@@ -99,8 +126,11 @@ Verify important claims against source, tests, Mythic, BloodHound, and the curre
 - `Payload_Type/sage/sage_chat/`: native Mythic v4 chat container, request lifecycle, config, streaming, and sessions.
 - `Payload_Type/sage/ai/langgraph/intent_classifier.py`: maps Mythic tool calls to modeled engagement techniques.
 - `Payload_Type/sage/sage_chat/service.py`: native Mythic request lifecycle, session reuse, HITL resume, visibility
-  reconciliation, and channel metadata.
-- `Payload_Type/sage/sage_chat/slash.py`: `/state`, `/list`, `/mode`, `/stop`, MCP, and BloodHound chat commands.
+  reconciliation, channel metadata, and background findings-watcher lifecycle.
+- `Payload_Type/sage/sage_chat/watcher_control.py`: exact locked-owner selection and redacted profile metadata.
+- `Payload_Type/sage/sage_chat/watcher_graph.py`: one-node stateless explanation graph with no tools/checkpointer.
+- `Payload_Type/sage/sage_chat/slash.py`: `/findings`, `/watcher`, `/state`, `/list`, `/mode`, `/stop`, MCP,
+  BloodHound, and sandbox chat commands.
 - `Payload_Type/sage/sage_chat/headless.py`: non-UI chat entrypoint for tests, evals, and trajectory tooling.
 - `Payload_Type/sage/prompts/`: externalized agent prompts.
 - `Payload_Type/sage/ttps/`: TTP/tradecraft corpus and pinned tool metadata.
@@ -155,7 +185,7 @@ Rules 5 and 6 are prose only; if they recur, that is the signal to build a probe
    there is a dead link for everyone but the maintainer.
 
 4. **No maintainer-only tooling.** Personal agent profiles, model pins, and workflow shortcuts belong in the
-   operator's own `~/.codex/` or `CLAUDE.local.md`, not here. Test: would this help someone who is not the
+   operator's user-scope Codex configuration or `CLAUDE.local.md`, not here. Test: would this help someone who is not the
    maintainer run or develop Sage? If no, it is not repository content.
 
 5. **No completed-campaign artifacts in the product tree.** Sealed evaluation source and evidence go to

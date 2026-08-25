@@ -4452,6 +4452,7 @@ def test_adcs_certificate_auth_probe_accepts_schannel_bind_with_privileged_actio
         "CERT_AUTH_DOMAIN=lab.local",
         "CERT_AUTH_ACCOUNT=administrator",
         "CERT_AUTH_LDAP_BIND=True",
+        r"CERT_AUTH_WHOAMI=u:LAB\Administrator",
         "CERT_AUTH_MEMBER_OF=CN=Domain Admins,CN=Users,DC=lab,DC=local",
         " Directory of \\\\dc01.lab.local\\C$",
         "Windows",
@@ -4470,6 +4471,145 @@ def test_adcs_certificate_auth_probe_accepts_schannel_bind_with_privileged_actio
     assert probe["service_access_proven"] is True
     assert probe["certificate_auth_proven"] is True
     assert verdict.verdict == "achieved"
+
+
+def test_adcs_certificate_auth_probe_rejects_wrong_domain_privileged_action():
+    output = "\n".join([
+        "SAGE_CERT_AUTH_PROOF_administrator_essos_local_14",
+        "CERT_AUTH_METHOD=schannel-ldap",
+        "CERT_AUTH_DOMAIN=north.sevenkingdoms.local",
+        "CERT_AUTH_LDAP_BIND=True",
+        r"Directory of \\winterfell.north.sevenkingdoms.local\C$",
+        "Windows",
+        "CERT_AUTH_STATUS=OK",
+    ])
+
+    probe = capabilities.extract_adcs_certificate_auth_probe(
+        output,
+        "administrator",
+        "essos.local",
+        "SAGE_CERT_AUTH_PROOF_administrator_essos_local_14",
+    )
+    probe["callback_id"] = "14"
+    verdict = capabilities.verify_capability("adcs-certificate-auth", probe)
+
+    assert probe["service_access_proven"] is False
+    assert probe["certificate_auth_proven"] is False
+    assert verdict.verdict != "achieved"
+
+
+def test_adcs_certificate_auth_probe_domain_binding_matrix():
+    cases = [
+        ("branch.local", "DC01.BRANCH.LOCAL", True),
+        ("branch.local", "dc01.zeta.branch.local", False),
+        ("zeta.branch.local", "dc01.branch.local", False),
+        ("root.example.local", "dc01.child.root.example.local", False),
+    ]
+
+    for domain, proof_host, expected in cases:
+        marker = "SAGE_CERT_AUTH_PROOF_administrator_" + domain.replace(".", "_") + "_14"
+        output = "\n".join([
+            marker,
+            "CERT_AUTH_METHOD=schannel-ldap",
+            "CERT_AUTH_LDAP_BIND=True",
+            f"CERT_AUTH_WHOAMI=u:{domain.split('.', 1)[0].upper()}\\administrator",
+            f"Directory of \\\\{proof_host}\\C$",
+            "Windows",
+            "CERT_AUTH_STATUS=OK",
+        ])
+        probe = capabilities.extract_adcs_certificate_auth_probe(
+            output,
+            "administrator",
+            domain,
+            marker,
+        )
+        probe["callback_id"] = "14"
+
+        assert probe["service_access_proven"] is expected
+        assert probe["certificate_auth_proven"] is expected
+        assert (capabilities.verify_capability("adcs-certificate-auth", probe).verdict == "achieved") is expected
+
+
+def test_adcs_certificate_auth_probe_schannel_identity_binding_matrix():
+    cases = [
+        ("u:CORP\\operator", "corp.local", "operator", True),
+        ("u:corp\\OPERATOR", "CORP.LOCAL.", "operator", True),
+        ("u:CORP\\other", "corp.local", "operator", False),
+        ("u:OTHER\\operator", "corp.local", "operator", False),
+        ("u:CHILD.CORP.LOCAL\\operator", "corp.local", "operator", False),
+        ("u:ZETA.BRANCH.LOCAL\\operator", "branch.local", "operator", False),
+        ("u:BRANCH.LOCAL\\operator", "zeta.branch.local", "operator", False),
+        (None, "corp.local", "operator", False),
+        ("", "corp.local", "operator", False),
+        ("u:CORP/operator", "corp.local", "operator", False),
+        ("u:CORP\\operator\\extra", "corp.local", "operator", False),
+        ("dn:CN=operator,CN=Users,DC=corp,DC=local", "corp.local", "operator", False),
+        ("g:CORP\\operator", "corp.local", "operator", False),
+        ("I am u:CORP\\operator", "corp.local", "operator", False),
+    ]
+
+    for whoami, domain, account, expected in cases:
+        marker = "SAGE_CERT_AUTH_PROOF_operator_corp_local_14"
+        lines = [
+            marker,
+            "CERT_AUTH_METHOD=schannel-ldap",
+            "CERT_AUTH_LDAP_BIND=True",
+        ]
+        if whoami is not None:
+            lines.append(f"CERT_AUTH_WHOAMI={whoami}")
+        lines.extend([
+            "DA_ONLY_READ_PROVEN=True",
+            "CERT_AUTH_STATUS=OK",
+        ])
+        probe = capabilities.extract_adcs_certificate_auth_probe(
+            "\n".join(lines), account, domain, marker,
+        )
+        probe["callback_id"] = "14"
+
+        assert probe["schannel_identity_matches"] is expected
+        assert probe["certificate_auth_proven"] is expected
+        assert (capabilities.verify_capability("adcs-certificate-auth", probe).verdict == "achieved") is expected
+
+
+def test_record_adcs_certificate_auth_rejects_false_schannel_identity_effect():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=corp.local;account=operator;ca_host=ca.corp.local;callback=14",
+        effects=["da:corp.local", "certificate-auth:operator@corp.local"],
+    )
+    probe = {
+        "account": "operator",
+        "domain": "corp.local",
+        "callback_id": "14",
+        "certificate_auth_method": "schannel-ldap",
+        "certificate_auth_status": "ok",
+        "schannel_ldap_bind": True,
+        "certificate_auth_whoami": "u:CORP\\other",
+        "schannel_identity_matches": True,
+        "da_only_read_proven": True,
+    }
+    state, verification = capabilities.record_capability_result(
+        es.EngagementState(objective="administrative control of corp.local"),
+        action,
+        probe,
+        NOW,
+    )
+
+    assert verification.verdict != "achieved"
+    assert state.achieved_effects() == set()
+
+
+def test_adcs_certificate_auth_pkinit_proof_does_not_require_schannel_whoami():
+    probe = {
+        "account": "operator",
+        "domain": "corp.local",
+        "callback_id": "14",
+        "certificate_auth_method": "pkinit",
+        "pkinit_tgt_present": True,
+        "service_access_proven": True,
+    }
+
+    assert capabilities.verify_capability("adcs-certificate-auth", probe).verdict == "achieved"
 
 
 def test_adcs_certificate_auth_probe_classifies_pkinit_not_supported():
@@ -4517,6 +4657,36 @@ def test_adcs_certificate_auth_probe_accepts_da_only_read_negative_control():
     assert probe["da_only_read_proven"] is True
     assert probe["certificate_auth_proven"] is True
     assert verdict.verdict == "achieved"
+
+
+def test_adcs_certificate_auth_probe_rejects_da_only_read_for_wrong_whoami_identity():
+    output = "\n".join([
+        "SAGE_CERT_AUTH_PROOF_administrator_essos_local_14",
+        "CERT_AUTH_METHOD=schannel-ldap",
+        "CERT_AUTH_DOMAIN=essos.local",
+        "CERT_AUTH_ACCOUNT=administrator",
+        "CERT_AUTH_LDAP_BIND=True",
+        r"CERT_AUTH_WHOAMI=u:ESSOS\otheradmin",
+        "DA_ONLY_READ_OP=domain-sacl",
+        "DA_SACL_STATUS=sacl",
+        "DA_SACL_ACE_COUNT=4",
+        "CONTROL_BIND=True",
+        r"CONTROL_WHOAMI=u:ESSOS\lowpriv",
+        "CONTROL_SACL_STATUS=no-sacl",
+        "DA_ONLY_READ_PROVEN=True",
+        "CERT_AUTH_STATUS=OK",
+    ])
+
+    probe = capabilities.extract_adcs_certificate_auth_probe(
+        output,
+        "administrator",
+        "essos.local",
+        "SAGE_CERT_AUTH_PROOF_administrator_essos_local_14",
+    )
+    probe["callback_id"] = "14"
+
+    assert probe["certificate_auth_proven"] is False
+    assert capabilities.verify_capability("adcs-certificate-auth", probe).verdict != "achieved"
 
 
 def test_adcs_certificate_auth_probe_rejects_da_only_read_when_control_not_denied():

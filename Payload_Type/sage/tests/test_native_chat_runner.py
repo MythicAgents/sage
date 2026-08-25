@@ -78,15 +78,16 @@ def test_ensure_api_token_creates_wildcard_for_autonomous_operations(monkeypatch
                 "scopes": ["*"],
                 "status": "success",
                 "error": "",
+                "operator_id": 7,
             }
         }
 
     monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
 
-    result = asyncio.run(native_chat.ensure_api_token(object()))
+    result = asyncio.run(native_chat.ensure_api_token(object(), operator_id=7))
 
     assert result["created"] is True
-    assert calls[-1]["operatorId"] is None
+    assert calls[-1]["operatorId"] == 7
     assert calls[-1]["scopes"] == ["*"]
 
 
@@ -202,6 +203,48 @@ def test_ensure_api_token_creates_wildcard_for_exact_operation_bot_owner(monkeyp
     assert result["api_token"]["operator_id"] == 7
 
 
+def test_fresh_bot_token_backs_channel_while_human_remains_creator(monkeypatch):
+    admin_client = type("Client", (), {
+        "server_ip": "mythic.test", "server_port": 7443, "ssl": True,
+        "global_timeout": -1, "current_operation_id": 12,
+    })()
+    channel_creator = []
+    readiness_calls = 0
+
+    async def fake_query(client, query, variables=None):
+        nonlocal readiness_calls
+        if query == native_chat.OPERATION_BOT_QUERY:
+            return {"operator": [{"id": 7, "account_type": "bot", "active": True, "deleted": False}]}
+        if query == native_chat.READINESS_QUERY:
+            readiness_calls += 1
+            return {
+                "consuming_container": [{"id": 1, "container_running": True, "deleted": False}],
+                "apitokens": [{"id": 99, "operator_id": 1, "scopes": ["*"]}],
+            }
+        if query == native_chat.CREATE_TOKEN_MUTATION:
+            return {"createAPIToken": {"id": 55, "operator_id": 7, "scopes": ["*"], "status": "success"}}
+        if query == native_chat.CREATE_CHANNEL_MUTATION:
+            channel_creator.append(client)
+            assert variables["tokenId"] == 55
+            return {"chatCreateChannel": {"status": "success", "channel_id": 88}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    result = asyncio.run(native_chat.create_locked_channel(admin_client))
+
+    assert channel_creator == [admin_client]
+    assert result["api_token_id"] == 55
+    assert "token_value" not in native_chat.CREATE_TOKEN_MUTATION
+
+
+def test_existing_admin_token_cannot_be_selected_for_bot_channel(monkeypatch):
+    async def fake_query(_client, _query, variables=None):
+        return {"apitokens": [{"id": 99, "operator_id": 1, "scopes": ["*"]}]}
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    with pytest.raises(RuntimeError, match="owned by the current operation bot"):
+        asyncio.run(native_chat.ensure_api_token(object(), operator_id=7, api_token_id=99))
+
+
 def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -218,6 +261,26 @@ def test_default_ai_metadata_is_autonomous(monkeypatch, tmp_path):
     assert metadata["config"]["max_steps"] == 0
     assert metadata["config"]["model"] == "test-model"
     assert metadata["config"]["provider"] == "openai"
+    assert metadata["channel_metadata_display"] == {"display": "expanded; max=15"}
+
+
+def test_ai_metadata_preserves_explicit_display_override():
+    display_override = {"display": "compact; max=3"}
+
+    metadata = native_chat.default_ai_metadata(
+        {"channel_metadata_display": display_override}
+    )
+
+    assert metadata["channel_metadata_display"] == display_override
+
+
+def test_canary_metadata_inherits_display_without_changing_authority():
+    metadata = native_chat.canary_ai_metadata(max_steps=8)
+
+    assert metadata["channel_metadata_display"] == {"display": "expanded; max=15"}
+    assert metadata["config"]["mode"] == "supervised"
+    assert metadata["config"]["autonomous_solve"] is False
+    assert metadata["config"]["max_steps"] == 8
 
 
 def test_bhusa_demo_metadata_is_exactly_supervised_hybrid():
@@ -257,6 +320,14 @@ def test_create_locked_channel_returns_sanitized_effective_chat_identity(monkeyp
         return {"chatCreateChannel": {"status": "success", "error": "", "channel_id": 10}}
 
     monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    monkeypatch.setattr(
+        native_chat,
+        "resolve_operation_bot",
+        lambda _client: asyncio.sleep(0, result={"id": 7}),
+    )
+    async def fake_token(*_args, **_kwargs):
+        return {"created": False, "api_token": {"id": 2, "operator_id": 7}}
+    monkeypatch.setattr(native_chat, "ensure_api_token", fake_token)
 
     result = asyncio.run(
         native_chat.create_locked_channel(
@@ -274,6 +345,9 @@ def test_create_locked_channel_returns_sanitized_effective_chat_identity(monkeyp
     )
 
     assert observed["metadata"]["config"]["API_KEY"] == "secret"
+    assert observed["metadata"]["channel_metadata_display"] == {
+        "display": "expanded; max=15"
+    }
     assert result["chat_runtime_identity"] == {
         "provider": "bedrock",
         "model": "test-model",
@@ -712,6 +786,7 @@ def test_prepare_locked_channel_reuses_empty_prepared_channel(monkeypatch):
 
     monkeypatch.setattr(native_chat, "find_prepared_channel", fake_find)
     monkeypatch.setattr(native_chat, "create_locked_channel", fail_create)
+    monkeypatch.setattr(native_chat, "validate_prepared_channel_bot_ownership", lambda *_args: asyncio.sleep(0))
 
     result = asyncio.run(native_chat.prepare_locked_channel(object()))
 
@@ -748,6 +823,7 @@ def test_run_native_chat_turn_prefers_prepared_channel(monkeypatch):
     monkeypatch.setattr(native_chat, "create_locked_channel", fail_create)
     monkeypatch.setattr(native_chat, "create_message", fake_message)
     monkeypatch.setattr(native_chat, "wait_for_request", fake_wait)
+    monkeypatch.setattr(native_chat, "validate_prepared_channel_bot_ownership", lambda *_args: asyncio.sleep(0))
 
     result = asyncio.run(native_chat.run_native_chat_turn(object(), "objective"))
 
@@ -767,13 +843,13 @@ def test_prepare_bhusa_demo_channel_uses_operation_bot_token_and_exact_metadata(
             "deleted": False,
         }
 
-    async def fake_ensure_api_token(client, *, name, operator_id=None):
+    async def fake_ensure_api_token(client, *, name, operator_id=None, api_token_id=None):
         observed["token"] = {"name": name, "operator_id": operator_id}
         return {"created": False, "api_token": {"id": 55, "operator_id": operator_id}}
 
     async def fake_create_locked_channel(client, **kwargs):
         observed["channel"] = kwargs
-        return {"chat_channel_id": 88, "chat_channel_name": kwargs["name"]}
+        return {"chat_channel_id": 88, "chat_channel_name": kwargs["name"], "api_token_id": 55}
 
     monkeypatch.setattr(native_chat, "resolve_operation_bot", fake_resolve_operation_bot)
     monkeypatch.setattr(native_chat, "ensure_api_token", fake_ensure_api_token)

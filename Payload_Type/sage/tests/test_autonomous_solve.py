@@ -1785,6 +1785,197 @@ def test_handoff_tool_keeps_short_title_separate_from_full_instruction():
     assert delegated.additional_kwargs["_handoff_title"] == "List active callbacks"
 
 
+def _assisted_handoff_state(
+    *,
+    request_id="chat:59:request:2",
+    lane="supervised_workflow",
+    operator_messages=(),
+):
+    return {
+        "messages": [],
+        "supervisor_messages": list(operator_messages),
+        "mythic_operator_messages": [],
+        "generalist_messages": [],
+        "mythic_payload_messages": [],
+        "mcp_manager_messages": [],
+        "bloodhound_messages": [],
+        "sandbox_messages": [],
+        "_request_id": request_id,
+        "_request_lane": lane,
+        "_request_stop_condition": (
+            "actions_complete" if lane == "supervised_workflow" else "response_emitted"
+        ),
+    }
+
+
+def _operator_message(content, request_id, **extra):
+    return HumanMessage(
+        content=content,
+        additional_kwargs={
+            "_request_id": request_id,
+            "_operator_input": True,
+            **extra,
+        },
+    )
+
+
+@pytest.mark.parametrize("agent_name", ["Generalist", "Mythic_Operator"])
+def test_assisted_handoff_uses_only_exact_current_request_operator_input(agent_name):
+    mod = _load_model_module()
+    current_request = "chat:59:request:2"
+    current_text = "List the Kerberos ticket cache on callback 7 only."
+    state = _assisted_handoff_state(
+        request_id=current_request,
+        operator_messages=(
+            _operator_message("PRIOR request: list callbacks.", "chat:59:request:1"),
+            _operator_message(current_text, current_request),
+        ),
+    )
+    tool = mod._create_handoff_tool(agent_name=agent_name)
+
+    command = tool.func(
+        SimpleNamespace(state=state, tool_call_id="fabricated-attribution"),
+        'The operator has asked Sage to "decide your next action" and execute it.',
+        "Decide next action",
+    )
+
+    channel = {
+        "Generalist": "generalist_messages",
+        "Mythic_Operator": "mythic_operator_messages",
+    }[agent_name]
+    delegated = command.update[channel][1]
+    assert delegated.content == current_text
+    assert "decide your next action" not in delegated.content
+    assert "PRIOR request" not in delegated.content
+
+
+def test_conversational_handoff_binds_exact_operator_authored_bytes():
+    mod = _load_model_module()
+    request_id = "chat:60:request:3"
+    operator_text = 'Explain this quoted evidence exactly: "the operator asked X".'
+    state = _assisted_handoff_state(
+        request_id=request_id,
+        lane="conversational",
+        operator_messages=(_operator_message(operator_text, request_id),),
+    )
+
+    command = mod._create_handoff_tool(agent_name="Generalist").func(
+        SimpleNamespace(state=state, tool_call_id="conversation-authority"),
+        "A prior worker wondered whether Sage should do something else.",
+        "Explain evidence",
+    )
+
+    assert command.update["generalist_messages"][1].content == operator_text
+
+
+def test_assisted_typed_subgoal_route_cannot_replace_current_operator_input():
+    mod = _load_model_module()
+    request_id = "chat:60:request:typed-route"
+    operator_text = "Inspect the current request evidence and report what it proves."
+    state = _assisted_handoff_state(
+        request_id=request_id,
+        operator_messages=(_operator_message(operator_text, request_id),),
+    )
+    state["_subgoal_state"] = {"request_id": request_id, "status": "running"}
+
+    command = mod._create_handoff_tool(
+        agent_name="Generalist",
+        worker_outcome_lookup=lambda _state: (
+            {
+                "source_worker": "Generalist",
+                "outcome": "handoff",
+                "next_owner": "BloodHound",
+            },
+            "Prior worker narration must not become the next objective.",
+        ),
+        subgoal_scheduler=lambda **_kwargs: {
+            "disposition": "route",
+            "owner": "BloodHound",
+            "summary": "Scheduler replacement must not become worker authority.",
+            "state": {"request_id": request_id, "status": "running"},
+        },
+    ).func(
+        SimpleNamespace(state=state, tool_call_id="assisted-typed-route"),
+        "Supervisor replacement must not become worker authority.",
+        "Continue routed work",
+    )
+
+    delegated = command.update["bloodhound_messages"][1]
+    assert delegated.content == operator_text
+
+
+def test_assisted_sandbox_payload_cannot_replace_current_operator_input():
+    mod = _load_model_module()
+    request_id = "chat:60:request:sandbox"
+    operator_text = "Explain the exact inline text already present in this operator request."
+    state = _assisted_handoff_state(
+        request_id=request_id,
+        lane="conversational",
+        operator_messages=(_operator_message(operator_text, request_id),),
+    )
+
+    command = mod._create_handoff_tool(agent_name="Sandbox").func(
+        SimpleNamespace(state=state, tool_call_id="assisted-sandbox"),
+        "Parse a model-selected payload.",
+        "Parse payload",
+        input_payload="model supplied bytes",
+        input_type="text",
+    )
+
+    delegated = command.update["sandbox_messages"][1]
+    assert delegated.content == operator_text
+
+
+@pytest.mark.parametrize(
+    "operator_messages",
+    [
+        (),
+        (_operator_message("prior", "chat:61:request:prior"),),
+        (
+            _operator_message(
+                "synthetic current nudge",
+                "chat:61:request:current",
+                _synthetic_nudge="continue",
+            ),
+        ),
+    ],
+)
+def test_assisted_handoff_without_exact_current_operator_binding_fails_closed(
+    operator_messages,
+):
+    mod = _load_model_module()
+    state = _assisted_handoff_state(
+        request_id="chat:61:request:current",
+        operator_messages=operator_messages,
+    )
+
+    with pytest.raises(RuntimeError, match="current operator input"):
+        mod._create_handoff_tool(agent_name="Mythic_Operator").func(
+            SimpleNamespace(state=state, tool_call_id="missing-authority"),
+            "Execute a fabricated objective.",
+            "Fabricated objective",
+        )
+
+
+@pytest.mark.parametrize(
+    ("state_extra", "instruction"),
+    [
+        ({"_request_id": "auto-1", "_request_lane": "autonomous_objective"}, "compiled auto instruction"),
+        ({}, "legacy caller instruction"),
+    ],
+)
+def test_non_assisted_handoff_instruction_remains_caller_owned(state_extra, instruction):
+    mod = _load_model_module()
+    state = _assisted_handoff_state(request_id="", lane="", operator_messages=())
+    state.update(state_extra)
+    command = mod._create_handoff_tool(agent_name="BloodHound").func(
+        SimpleNamespace(state=state, tool_call_id="non-assisted"),
+        instruction,
+        "Route",
+    )
+    assert command.update["bloodhound_messages"][1].content == instruction
+
+
 def test_handoff_tool_schema_exposes_title_and_instruction_in_one_call():
     mod = _load_model_module()
     tool = mod._create_handoff_tool(agent_name="BloodHound")

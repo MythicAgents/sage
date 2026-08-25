@@ -23,10 +23,16 @@ import os
 from pathlib import Path
 from typing import Any
 
-from mythic_container.ChatBase import Chat, ChatRequest
+from mythic_container.ChatBase import (
+    Chat,
+    ChatRequest,
+    ContainerOnStartMessage,
+    ContainerOnStartMessageResponse,
+)
 from mythic_container.logging import logger
 
 from .config import build_bloodhound_env, build_model_kwargs
+from .findings_watcher import FindingsWatcherManager, render_watcher_status
 from .hitl import (
     approved_action_ids_for_request,
     approval_response_matches,
@@ -35,6 +41,13 @@ from .hitl import (
 )
 from .metadata import build_channel_metadata
 from .models import SAGE_MODELS
+from .operation_memory_runtime import (
+    OperationMemoryRuntime,
+    assess_finding_id,
+    render_assessment_markdown,
+    render_findings_markdown,
+)
+from .operation_memory import WatcherOwnerConflict
 from .session import (
     bind_channel_thread_id,
     channel_session_key,
@@ -44,10 +57,13 @@ from .session import (
 )
 from .slash import handle_slash
 from .streaming import ChatStreamEmitter
+from .watcher_control import WatcherControlBoundaryError
+from .watcher_graph import build_watcher_graph, render_watcher_explanation
 
 
 _CHANNEL_METADATA_HEARTBEAT_SECONDS = 2.0
 _CHANNEL_TURN_LOCKS: dict[str, asyncio.Lock] = {}
+_WATCHER_TURN_TASKS: dict[tuple[int, int], asyncio.Task[Any]] = {}
 
 
 def _nonempty_native_response_text(value: Any) -> str:
@@ -56,6 +72,23 @@ def _nonempty_native_response_text(value: Any) -> str:
         return ""
     text = value if isinstance(value, str) else str(value)
     return text if text.strip() else ""
+
+
+def _with_task_provenance(model: Any, content: str) -> str:
+    """Compose one native terminal narrative with exact request/task lineage."""
+    provenance_getter = getattr(
+        model,
+        "current_request_task_provenance_notice",
+        None,
+    )
+    provenance_notice = (
+        str(provenance_getter() or "").strip()
+        if callable(provenance_getter)
+        else ""
+    )
+    if provenance_notice and provenance_notice not in content:
+        return f"{content.rstrip()}\n\n{provenance_notice}"
+    return content
 
 
 def _model_config_signature(
@@ -207,6 +240,99 @@ class SageChat(Chat):
     dark_mode_agent_icon_path = str(Path(__file__).resolve().parent.parent / "sage.svg")
     models = SAGE_MODELS
 
+    def _findings_watcher(self) -> FindingsWatcherManager:
+        watcher = getattr(self, "_findings_watcher_manager", None)
+        if watcher is None:
+            watcher = FindingsWatcherManager(
+                runtime=getattr(self, "_operation_memory_runtime", None)
+            )
+            self._findings_watcher_manager = watcher
+        return watcher
+
+    def _operation_memory(self) -> OperationMemoryRuntime:
+        runtime = getattr(self, "_operation_memory_runtime", None)
+        return runtime if runtime is not None else self._findings_watcher().runtime
+
+    async def on_container_start(
+        self, message: ContainerOnStartMessage
+    ) -> ContainerOnStartMessageResponse:
+        watcher = self._findings_watcher()
+        try:
+            await watcher.restore_operation(
+                message.OperationID,
+                server_name=message.ServerName,
+                bootstrap_token=message.APIToken,
+            )
+        except Exception as exc:
+            return ContainerOnStartMessageResponse(
+                ContainerName=self.name,
+                EventLogErrorMessage=(
+                    "Sage findings watcher startup failed before scheduling: "
+                    f"{type(exc).__name__}."
+                ),
+            )
+        return ContainerOnStartMessageResponse(
+            ContainerName=self.name,
+            EventLogInfoMessage=(
+                "Sage Watcher startup profile reconciliation completed for operation "
+                f"{message.OperationID}; use /watcher status to inspect the exact state."
+            ),
+        )
+
+    async def handle_finding_command(
+        self,
+        request: ChatRequest,
+        model: Any | None,
+    ) -> str:
+        """Render the watcher-owned current view without entering the model runtime."""
+        try:
+            view, snapshot = await self._operation_memory().current_view(
+                str(request.OperationID)
+            )
+            watcher = self._findings_watcher().status(str(request.OperationID))
+            return (
+                render_findings_markdown(view, snapshot)
+                + "\n\n---\n\n"
+                + render_watcher_status(watcher)
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Operation-memory view failed for operation "
+                f"{request.OperationID}: {exc}"
+            )
+            return (
+                "Operation findings are unavailable because Sage could not read "
+                "the watcher-owned operation evidence index."
+            )
+
+    async def handle_watcher_command(self, request: ChatRequest, argument: str) -> str:
+        action = str(argument or "status").strip().casefold() or "status"
+        try:
+            if action == "apply":
+                channel = await self._findings_watcher().control_plane.inspect_request_channel(request)
+                record = await self._findings_watcher().apply_profile(request, channel)
+                return (
+                    f"Watcher profile generation `{record.generation}` applied from locked owner "
+                    f"`{record.owner_channel_name}` (`{record.owner_channel_id}`).\n\n"
+                    + render_watcher_status(self._findings_watcher().status(str(request.OperationID)))
+                )
+            owner_channel_id: int | None = None
+            if action != "status":
+                channel = await self._findings_watcher().control_plane.inspect_request_channel(request)
+                if not channel.valid_owner_candidate:
+                    raise WatcherOwnerConflict("Watcher control channel is not active and locked")
+                owner_channel_id = channel.channel_id
+            status = await self._findings_watcher().command(
+                str(request.OperationID), action, owner_channel_id=owner_channel_id
+            )
+        except (ValueError, WatcherOwnerConflict, WatcherControlBoundaryError) as exc:
+            return (
+                f"Watcher control denied: `{type(exc).__name__}`. "
+                "Use `/watcher status`; apply or mutate only from the exact active locked `Sage Watcher` owner. "
+                "Valid controls: `/watcher apply|scan|pause|resume|interval <seconds>|interval default`."
+            )
+        return render_watcher_status(status)
+
     @staticmethod
     def _bloodhound_connection_locally_pinned(server: Any) -> bool:
         try:
@@ -337,7 +463,7 @@ class SageChat(Chat):
         if callable(emit_terminal) and status in {"stopped", "cancelled"}:
             try:
                 await emit_terminal(
-                    stop_notice_for(reason),
+                    _with_task_provenance(model, stop_notice_for(reason)),
                     status=status,
                 )
                 return
@@ -513,15 +639,120 @@ class SageChat(Chat):
         except Exception as exc:  # pragma: no cover - never break a turn over a notice
             logger.warning(f"BloodHound degraded notice not delivered: {exc}")
 
+    async def _chat_watcher(self, request: ChatRequest) -> None:
+        """Serve one stateless Watcher control/explanation turn without a Sage session."""
+
+        async def _handler(_turn) -> None:
+            slash = getattr(request, "SlashCommand", None)
+            slash_name = str(getattr(slash, "Name", "") or "").lower().lstrip("/")
+            watcher_key = (int(request.OperationID), int(request.ChannelID))
+            if slash_name == "stop":
+                active = _WATCHER_TURN_TASKS.get(watcher_key)
+                if active is not None and active is not asyncio.current_task() and not active.done():
+                    active.cancel()
+                    content = "Stop requested for the active Watcher explanation on this channel."
+                else:
+                    content = "No running Watcher explanation to stop on this channel."
+                await self.send_complete(
+                    request,
+                    f"watcher-slash:{request.RequestID}",
+                    content=content,
+                    complete_request=True,
+                )
+                return None
+            if slash is not None and slash_name not in {"findings", "watcher"}:
+                await self.send_complete(
+                    request,
+                    f"watcher-slash:{request.RequestID}",
+                    content=(
+                        f"`/{slash_name or 'unknown'}` is not available to Sage Watcher. "
+                        "Available controls: `/findings`, `/watcher`, and `/stop`."
+                    ),
+                    complete_request=True,
+                )
+                return None
+            if slash is not None:
+                if await handle_slash(self, request, None, f"watcher-slash:{request.RequestID}"):
+                    return None
+            try:
+                channel = await self._findings_watcher().control_plane.inspect_request_channel(request)
+                if not channel.valid_owner_candidate:
+                    raise WatcherOwnerConflict("Watcher explanation requires the active locked owner channel")
+                profile = self._findings_watcher().console_profile(
+                    str(request.OperationID), request.ChannelID
+                )
+                view, _snapshot = await self._operation_memory().current_view(
+                    str(request.OperationID)
+                )
+                findings = [
+                    {
+                        "finding_id": item.finding_id,
+                        "title": item.title,
+                        "state": item.state.value,
+                        "confidence": item.confidence,
+                        "observed_at_utc": item.observed_at_utc,
+                        "evidence": [dict(pointer) for pointer in item.evidence],
+                        "missing_assumptions": list(item.missing_assumptions),
+                        "rationale": item.rationale,
+                    }
+                    for item in view
+                ]
+                graph = build_watcher_graph(profile)
+                current = asyncio.current_task()
+                if current is None:  # pragma: no cover - asyncio always binds a running task here
+                    raise RuntimeError("Watcher explanation has no active asyncio task")
+                _WATCHER_TURN_TASKS[watcher_key] = current
+                try:
+                    result = await graph.ainvoke(
+                        {
+                            "request": str(request.Prompt or ""),
+                            "findings": findings,
+                            "summary": "",
+                            "citations": [],
+                        }
+                    )
+                finally:
+                    if _WATCHER_TURN_TASKS.get(watcher_key) is current:
+                        _WATCHER_TURN_TASKS.pop(watcher_key, None)
+                content = render_watcher_explanation(
+                    str(result.get("summary") or ""),
+                    list(result.get("citations") or []),
+                )
+            except (WatcherOwnerConflict, WatcherControlBoundaryError, ValueError) as exc:
+                content = (
+                    f"Watcher explanation unavailable: `{type(exc).__name__}`. "
+                    "Use `/watcher status`; the exact locked owner may use `/watcher apply` to recover."
+                )
+            await self.send_complete(
+                request,
+                f"watcher:{request.RequestID}:turn",
+                content=content,
+                complete_request=True,
+            )
+            return None
+
+        await self.run_chat_turn(
+            request,
+            _handler,
+            response_key=f"watcher:{request.RequestID}:turn",
+            model=request.Model,
+            complete_content="Watcher turn completed.",
+        )
+
     async def chat(self, request: ChatRequest) -> None:
+        if str(request.Model or "") == "Sage Watcher":
+            await self._chat_watcher(request)
+            return
         prompt = request.Prompt or ""
+        assessment_finding_id = assess_finding_id(prompt)
 
         async def _serialized_handler(turn) -> dict[str, Any] | None:
             model: Any | None = None
             native_response_text = ""
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
-            # An undeclared/unhandled command falls through to normal prompt handling.
+            # Unknown structured slash commands also terminate locally; control input is never
+            # reinterpreted as a model prompt.
             if getattr(request, "SlashCommand", None) is not None:
                 existing = await get_channel_session(request)
                 existing = await self._rotate_auth_changed_session(request, existing)
@@ -719,7 +950,43 @@ class SageChat(Chat):
                             "Native supervised approval cannot reach the final effect sink."
                         )
                 try:
-                    if stale_approval_response:
+                    if assessment_finding_id is not None and not has_input_response:
+                        if str(getattr(model, "mode", "") or "") != "supervised":
+                            native_response_text = (
+                                "Finding assessment requires `supervised` mode. Run "
+                                "`/mode supervised`, then submit the exact "
+                                f"`assess {assessment_finding_id}` command. No action was issued."
+                            )
+                        else:
+                            try:
+                                finding_view, _ = await self._operation_memory().current_view(
+                                    str(request.OperationID)
+                                )
+                                selected = next(
+                                    (
+                                        item
+                                        for item in finding_view
+                                        if item.finding_id == assessment_finding_id
+                                    ),
+                                    None,
+                                )
+                                native_response_text = (
+                                    render_assessment_markdown(
+                                        selected,
+                                        str(request.OperationID),
+                                    )
+                                    if selected is not None
+                                    else (
+                                        f"`{assessment_finding_id}` is not an active finding in "
+                                        f"operation `{request.OperationID}`. No action was issued."
+                                    )
+                                )
+                            except Exception:
+                                native_response_text = (
+                                    "Operation findings are unavailable because Sage could not "
+                                    "read the watcher-owned operation evidence index."
+                                )
+                    elif stale_approval_response:
                         await stream_emitter(
                             "That approval request is no longer active. No action was executed; "
                             "submit the instruction again if it is still needed."
@@ -856,6 +1123,7 @@ class SageChat(Chat):
                         ).strip()
                     else:
                         error_text = operator_error_text(error) or "Sage request failed."
+                    error_text = _with_task_provenance(model, error_text)
                     preterminal = await finalize_visibility(require_final=False)
                     if not preterminal.get("ok", False):
                         logger.error(
@@ -928,6 +1196,10 @@ class SageChat(Chat):
                 or _last_streamed
                 or "Completed."
             )
+            # ISC-71: model prose is not the provenance authority. Apply one deterministic
+            # request/task-lineage composer to every service-owned terminal narrative, including
+            # normal, handled-error, and lifecycle stop/cancel paths.
+            response_content = _with_task_provenance(model, response_content)
             record_final = getattr(model, "record_final_response", None)
             record_terminal = getattr(model, "record_request_terminal", None)
             record_projection = getattr(

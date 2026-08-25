@@ -25,7 +25,7 @@ DEFAULT_OBJECTIVE = "From the current foothold, achieve administrative control o
 DEFAULT_PREPARED_CHANNEL_NAME = "Sage GOAD Ready"
 PREPARED_CHANNEL_MARKER = "sage-goad-one-shot"
 DEFAULT_BHUSA_DEMO_CHANNEL_NAME = "BHUSA Demo"
-BHUSA_DEMO_METADATA_DISPLAY = "expanded; max=15"
+DEFAULT_CHANNEL_METADATA_DISPLAY = "expanded; max=15"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE_ROOT = REPO_ROOT.parent
 SAGE_PYTHON_ROOT = REPO_ROOT / "Payload_Type" / "sage"
@@ -387,7 +387,10 @@ def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         resolved = value(key)
         if resolved:
             config[key] = resolved
-    metadata = {"config": config}
+    metadata = {
+        "config": config,
+        "channel_metadata_display": {"display": DEFAULT_CHANNEL_METADATA_DISPLAY},
+    }
     if extra:
         metadata.update(extra)
     return metadata
@@ -444,7 +447,7 @@ def bhusa_demo_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any
         }
     )
     metadata["config"] = config
-    metadata["channel_metadata_display"] = {"display": BHUSA_DEMO_METADATA_DISPLAY}
+    metadata["channel_metadata_display"] = {"display": DEFAULT_CHANNEL_METADATA_DISPLAY}
     if extra:
         extra_copy = dict(extra)
         extra_config = extra_copy.pop("config", None)
@@ -455,7 +458,7 @@ def bhusa_demo_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any
         config["autonomous_solve"] = False
         config["policy_mode"] = "hybrid"
         config["max_steps"] = 200
-        metadata["channel_metadata_display"] = {"display": BHUSA_DEMO_METADATA_DISPLAY}
+        metadata["channel_metadata_display"] = {"display": DEFAULT_CHANNEL_METADATA_DISPLAY}
     return metadata
 
 
@@ -589,12 +592,14 @@ async def ensure_api_token(
     *,
     name: str = "Sage native chat",
     operator_id: int | None = None,
+    api_token_id: int | None = None,
 ) -> dict[str, Any]:
-    expected_operator_id = (
-        _require_exact_int(operator_id, "Requested API token operator id")
-        if operator_id is not None
-        else None
-    )
+    if operator_id is None:
+        operator_id = _require_exact_int(
+            (await resolve_operation_bot(client)).get("id"),
+            "Current operation bot operator id",
+        )
+    expected_operator_id = _require_exact_int(operator_id, "Requested API token operator id")
     observed = await mythic.execute_custom_query(client, READINESS_QUERY)
     usable = [
         row
@@ -604,6 +609,14 @@ async def ensure_api_token(
             and AUTONOMOUS_TOKEN_SCOPES.issubset(_scopes(row))
         )
     ]
+    if api_token_id is not None:
+        selected_id = _require_exact_int(api_token_id, "Requested API token id")
+        usable = [row for row in usable if row.get("id") == selected_id]
+        if not usable:
+            raise RuntimeError(
+                "Requested backing API token is not an active wildcard token owned by "
+                "the current operation bot."
+            )
     if usable:
         return {"created": False, "api_token": usable[0]}
     result = await mythic.execute_custom_query(
@@ -615,7 +628,7 @@ async def ensure_api_token(
             "scopes": sorted(AUTONOMOUS_TOKEN_SCOPES),
         },
     )
-    token = _require_success("API token creation", result.get("createAPIToken") or {})
+    token = dict(_require_success("API token creation", result.get("createAPIToken") or {}))
     if expected_operator_id is not None and token.get("operator_id") != expected_operator_id:
         raise RuntimeError("Mythic API token creation returned the wrong operator_id.")
     return {"created": True, "api_token": token}
@@ -635,6 +648,7 @@ async def create_locked_channel(
     model: str = "Sage",
     api_token_id: int | None = None,
     metadata: dict[str, Any] | None = None,
+    token_name: str = "Sage native chat",
 ) -> dict[str, Any]:
     # ISC-49R 49R-18 option 1: under a scoped driver token, the session cannot run the wildcard-token
     # readiness query (it lacks apitoken.read). When SAGE_BACKING_APITOKEN_ID is set, bind the channel
@@ -645,10 +659,17 @@ async def create_locked_channel(
         container_id = int(os.environ["SAGE_CHAT_CONTAINER_ID"])
         token_id = int(backing_token_id)
     else:
+        operation_bot = await resolve_operation_bot(client)
+        token_result = await ensure_api_token(
+            client,
+            name=token_name,
+            operator_id=int(operation_bot["id"]),
+            api_token_id=api_token_id,
+        )
         observed = await mythic.execute_custom_query(client, READINESS_QUERY)
-        container, token = select_chat_resources(observed, api_token_id=api_token_id)
+        container, _token = select_chat_resources(observed)
         container_id = int(container["id"])
-        token_id = int(token["id"])
+        token_id = int(token_result["api_token"]["id"])
     channel_name = name or (
         f"sage-one-shot-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
     )
@@ -669,13 +690,14 @@ async def create_locked_channel(
     channel_id = created.get("channel_id") or created.get("id")
     if channel_id is None:
         raise RuntimeError(f"Mythic chat channel creation returned no channel ID: {created}")
-    return {
+    sanitized = {
         "chat_channel_id": int(channel_id),
         "chat_channel_name": channel_name,
         "chat_container_id": container_id,
         "api_token_id": token_id,
         "chat_runtime_identity": _chat_runtime_identity_from_metadata(built_metadata),
     }
+    return sanitized
 
 
 def _prepared_channel_result(channel: dict[str, Any], *, reused: bool) -> dict[str, Any]:
@@ -733,6 +755,7 @@ async def prepare_locked_channel(
 ) -> dict[str, Any]:
     existing = await find_prepared_channel(client)
     if existing:
+        await validate_prepared_channel_bot_ownership(client, existing)
         return existing
     prepared_metadata = {"prepared_for": PREPARED_CHANNEL_MARKER}
     if metadata:
@@ -745,6 +768,20 @@ async def prepare_locked_channel(
         metadata=prepared_metadata,
     )
     return {**created, "prepared": True, "reused": False}
+
+
+async def validate_prepared_channel_bot_ownership(
+    client: Any, channel: dict[str, Any]
+) -> None:
+    bot = await resolve_operation_bot(client)
+    await ensure_api_token(
+        client,
+        name="Sage prepared channel validation",
+        operator_id=int(bot["id"]),
+        api_token_id=_require_exact_int(
+            channel.get("api_token_id"), "Prepared channel backing API token id"
+        ),
+    )
 
 
 async def prepare_bhusa_demo_channel(
@@ -765,6 +802,7 @@ async def prepare_bhusa_demo_channel(
         description="BHUSA demo supervised channel",
         api_token_id=int(token["api_token"]["id"]),
         metadata=bhusa_demo_ai_metadata(),
+        token_name=token_name,
     )
     return {
         "operation_bot": operation_bot,
@@ -1593,6 +1631,8 @@ async def run_native_chat_turn(
             or identity.get("autonomous_solve") is not True
         ):
             channel = None
+        elif channel is not None:
+            await validate_prepared_channel_bot_ownership(client, channel)
     if channel is None:
         channel = await create_locked_channel(
             client,
@@ -1698,14 +1738,10 @@ async def _run(args: argparse.Namespace) -> int:
     elif args.command == "ensure-token":
         result = await ensure_api_token(client, name=args.name)
     elif args.command == "prepare":
-        token = await ensure_api_token(client, name=args.token_name)
+        prepared_channel = await prepare_locked_channel(client, name=args.channel_name)
         result = {
-            "api_token": token,
-            "prepared_channel": await prepare_locked_channel(
-                client,
-                name=args.channel_name,
-                api_token_id=int(token["api_token"]["id"]),
-            ),
+            "api_token": await ensure_api_token(client, name=args.token_name),
+            "prepared_channel": prepared_channel,
         }
     elif args.command == "demo-prepare":
         result = await prepare_bhusa_demo_channel(

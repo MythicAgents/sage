@@ -29,6 +29,42 @@ def test_public_readme_does_not_advertise_removed_payload_commands():
     assert "Sage payload type" not in readme
 
 
+def test_public_watcher_documentation_matches_runtime_contract():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    security = (REPO_ROOT / "docs" / "SECURITY_AND_DATA_HANDLING.md").read_text(
+        encoding="utf-8"
+    )
+    getting_started = (
+        REPO_ROOT / "documentation-payload" / "sage" / "getting-started.md"
+    ).read_text(encoding="utf-8")
+    using_chat = (
+        REPO_ROOT / "documentation-payload" / "sage" / "using-sage-in-chat.md"
+    ).read_text(encoding="utf-8")
+    public_security = (
+        REPO_ROOT / "documentation-payload" / "sage" / "security.md"
+    ).read_text(encoding="utf-8")
+    agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+    for document in (readme, security, using_chat):
+        assert "300 seconds" in document
+        assert "86,400" in document
+        assert "Sage Watcher" in document
+        assert "credentials-required" in document
+        assert "/watcher apply" in document
+
+    assert "SAGE_WATCHER_APITOKEN" in getting_started
+    assert "SAGE_WATCHER_INTERVAL_SECONDS" in getting_started
+    assert "SAGE_FINDINGS_WATCHER_INTERVAL_SECONDS" not in getting_started
+    assert "wildcard and excess scopes fail closed" in getting_started
+    assert "SAGE_WATCHER_MODEL" in getting_started
+    assert "/findings" in using_chat
+    assert "`/finding` remains a compatibility alias" in using_chat
+    assert "stateless one-node graph" in using_chat
+    assert "Sage findings changed. Open Mythic to review." in public_security
+    assert "no-checkpointer graph" in public_security
+    assert "`/findings`, `/watcher`" in agents
+
+
 def test_repository_boundary_document_states_one_way_dependency():
     boundary = (REPO_ROOT / "docs" / "architecture" / "REPOSITORY_BOUNDARIES.md").read_text(
         encoding="utf-8"

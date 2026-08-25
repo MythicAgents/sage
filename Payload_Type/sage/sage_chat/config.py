@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from mythic_container.ChatBase import ChatConfigView, ChatRequest, ChatSecretView
@@ -91,6 +93,179 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+SAGE_LLM_KEY_MAP = MappingProxyType(
+    {
+        "provider": "provider",
+        "model": "model",
+        "api_endpoint": "API_ENDPOINT",
+        "api_key": "API_KEY",
+        "aws_access_key_id": "AWS_ACCESS_KEY_ID",
+        "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
+        "aws_session_token": "AWS_SESSION_TOKEN",
+        "region": "AWS_DEFAULT_REGION",
+    }
+)
+WATCHER_LLM_KEY_MAP = MappingProxyType(
+    {
+        "provider": "SAGE_WATCHER_PROVIDER",
+        "model": "SAGE_WATCHER_MODEL",
+        "api_endpoint": "SAGE_WATCHER_API_ENDPOINT",
+        "api_key": "SAGE_WATCHER_API_KEY",
+        "aws_access_key_id": "SAGE_WATCHER_AWS_ACCESS_KEY_ID",
+        "aws_secret_access_key": "SAGE_WATCHER_AWS_SECRET_ACCESS_KEY",
+        "aws_session_token": "SAGE_WATCHER_AWS_SESSION_TOKEN",
+        "region": "SAGE_WATCHER_AWS_DEFAULT_REGION",
+    }
+)
+WATCHER_OPTIONAL_USER_SECRETS = (
+    WATCHER_LLM_KEY_MAP["api_endpoint"],
+    WATCHER_LLM_KEY_MAP["api_key"],
+    WATCHER_LLM_KEY_MAP["aws_access_key_id"],
+    WATCHER_LLM_KEY_MAP["aws_secret_access_key"],
+    WATCHER_LLM_KEY_MAP["aws_session_token"],
+    WATCHER_LLM_KEY_MAP["region"],
+)
+
+
+@dataclass(frozen=True)
+class ResolvedLLMProfile:
+    """One active-process LLM configuration with redaction-safe source labels."""
+
+    provider: str
+    model: str
+    api_endpoint: str = ""
+    api_key: str = ""
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_session_token: str = ""
+    region: str = ""
+    sources: tuple[tuple[str, str], ...] = ()
+
+    def configurable(self) -> dict[str, str]:
+        if self.provider == "bedrock":
+            values = {
+                "aws_access_key_id": self.aws_access_key_id,
+                "aws_secret_access_key": self.aws_secret_access_key,
+                "aws_session_token": self.aws_session_token,
+                "region": self.region,
+            }
+        else:
+            values = {
+                "api_key": self.api_key,
+                "base_url": self.api_endpoint,
+            }
+        return {key: value for key, value in values.items() if value}
+
+    def init_chat_model_kwargs(self) -> dict[str, str]:
+        return {
+            "model_provider": self.provider,
+            "model": self.model,
+            **self.configurable(),
+        }
+
+    def source_for(self, logical_field: str) -> str:
+        return dict(self.sources).get(logical_field, "default")
+
+
+def _nonblank(value: Any) -> str:
+    text = value if isinstance(value, str) else str(value or "")
+    return text if text.strip() else ""
+
+
+def _resolve_with_source(
+    config: ChatConfigView,
+    secrets: ChatSecretView,
+    key: str,
+    *,
+    env_key: str,
+    default: str = "",
+    allow_secret: bool = True,
+    include_secrets: bool = True,
+) -> tuple[str, str]:
+    if config.has(key):
+        value = _nonblank(config.text(key, ""))
+        if value:
+            return value, "ui-config"
+    if include_secrets and allow_secret and secrets.has(key):
+        value = _nonblank(secrets.text(key, ""))
+        if value:
+            return value, "user-secret"
+    value = _nonblank(os.environ.get(env_key, ""))
+    if value:
+        return value, "environment"
+    return default, "default"
+
+
+def resolve_llm_profile(
+    request: ChatRequest,
+    *,
+    key_map: MappingProxyType[str, str] | dict[str, str] = SAGE_LLM_KEY_MAP,
+    include_secrets: bool = True,
+    provider_model_secrets: bool = True,
+) -> ResolvedLLMProfile:
+    """Resolve either role through one first-non-empty algorithm and field projection."""
+
+    config = ChatConfigView.from_request(request)
+    secrets = ChatSecretView.from_request(request)
+    resolved: dict[str, str] = {}
+    sources: list[tuple[str, str]] = []
+    for logical_field, key in key_map.items():
+        value, source = _resolve_with_source(
+            config,
+            secrets,
+            key,
+            env_key=key,
+            default="openai" if logical_field == "provider" else "",
+            allow_secret=(provider_model_secrets or logical_field not in {"provider", "model"}),
+            include_secrets=include_secrets,
+        )
+        resolved[logical_field] = value
+        sources.append((logical_field, source))
+    resolved["provider"] = resolved["provider"].strip().casefold() or "openai"
+    resolved["model"] = resolved["model"].strip()
+    resolved["api_endpoint"] = resolved["api_endpoint"].strip()
+    return ResolvedLLMProfile(**resolved, sources=tuple(sources))
+
+
+def resolve_watcher_llm_profile(
+    request: ChatRequest,
+    *,
+    include_secrets: bool = True,
+) -> ResolvedLLMProfile:
+    return resolve_llm_profile(
+        request,
+        key_map=WATCHER_LLM_KEY_MAP,
+        include_secrets=include_secrets,
+        provider_model_secrets=False,
+    )
+
+
+def init_chat_model_from_profile(profile: ResolvedLLMProfile) -> Any:
+    """Construct either role's base model from the shared normalized field projection."""
+
+    if not profile.model:
+        raise ValueError("model is not configured")
+    from langchain.chat_models import init_chat_model
+
+    kwargs = profile.init_chat_model_kwargs()
+    if profile.provider == "bedrock":
+        missing = tuple(
+            field
+            for field in (
+                "aws_access_key_id",
+                "aws_secret_access_key",
+                "aws_session_token",
+            )
+            if not kwargs.get(field)
+        )
+        if missing:
+            raise ValueError(
+                "Bedrock model configuration is missing: " + ", ".join(missing)
+            )
+        kwargs.setdefault("region", "us-east-1")
+    return init_chat_model(**kwargs)
+
+
 def build_bloodhound_env(request: ChatRequest) -> dict[str, str]:
     """Resolve BloodHound MCP credentials through the standard Config → Secret → env chain.
 
@@ -141,12 +316,13 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     """
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
+    llm_profile = resolve_llm_profile(request)
 
     # A local-test env may supply provider/model under those
     # exact lowercase keys plus API_ENDPOINT/API_KEY — resolve under the same names the legacy
     # get_secret path used so the local loopback endpoint keeps working with no ChatRequest.
-    provider = _resolve(config, secrets, "provider", env_key="provider", default="openai").lower()
-    model = _resolve(config, secrets, "model", env_key="model").lower()
+    provider = llm_profile.provider
+    model = llm_profile.model
     system_prompt = _resolve(config, secrets, "system_prompt", env_key="system_prompt", default="")
 
     mode = _resolve(config, secrets, "mode", env_key="mode", default="conversation").lower()
@@ -184,30 +360,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
     except (TypeError, ValueError):
         max_steps = 200
 
-    configurable: dict[str, Any] = {}
-    api_key = _resolve(config, secrets, "API_KEY", env_key="API_KEY", default="")
-    if api_key:
-        configurable["api_key"] = api_key
-    base_url = _resolve(config, secrets, "API_ENDPOINT", env_key="API_ENDPOINT", default="")
-    if base_url:
-        configurable["base_url"] = base_url
-
-    if provider == "bedrock":
-        # Keep the Bedrock branch: AWS quad from secrets/env, mapped to the same configurable keys
-        # Model._get_base_chat_model() reads (aws_access_key_id / aws_secret_access_key /
-        # aws_session_token / region).
-        aws_access_key_id = _resolve(config, secrets, "AWS_ACCESS_KEY_ID", env_key="AWS_ACCESS_KEY_ID", default="")
-        if aws_access_key_id:
-            configurable["aws_access_key_id"] = aws_access_key_id
-        aws_secret_access_key = _resolve(config, secrets, "AWS_SECRET_ACCESS_KEY", env_key="AWS_SECRET_ACCESS_KEY", default="")
-        if aws_secret_access_key:
-            configurable["aws_secret_access_key"] = aws_secret_access_key
-        aws_session_token = _resolve(config, secrets, "AWS_SESSION_TOKEN", env_key="AWS_SESSION_TOKEN", default="")
-        if aws_session_token:
-            configurable["aws_session_token"] = aws_session_token
-        aws_region = _resolve(config, secrets, "AWS_DEFAULT_REGION", env_key="AWS_DEFAULT_REGION", default="")
-        if aws_region:
-            configurable["region"] = aws_region
+    configurable: dict[str, Any] = llm_profile.configurable()
 
     return {
         "provider": provider,

@@ -48,8 +48,12 @@ applies.
 The first invocation after a full reset consumes the empty `Sage GOAD Ready` channel created by bootstrap.
 Later invocations create fresh locked channels and report `chat_channel_id`, `chat_request_id`, terminal status,
 and messages. A prepared channel is reused only when its stored configuration is actually `mode=auto` with
-`autonomous_solve=true`; otherwise the run creates a fresh correctly configured channel. Use `--new-channel` to
+`autonomous_solve=true` and its wildcard backing token belongs to the current operation's unique active bot;
+otherwise the run creates a fresh correctly configured channel. Fresh channels remain locked by the invoking
+operator, while their backing token belongs to that bot so derived chat credentials and callback tasks are
+attributed to Sage. Use `--new-channel` to
 bypass a prepared channel. The helper configures autonomous mode explicitly.
+New channels default to Mythic's `expanded; max=15` metadata display; an explicit caller override remains authoritative.
 It resolves credentials in this order:
 `MYTHIC_ADMIN_PASSWORD`, then `MYTHIC_ENV_PATH`. No checkout-name default — see `.env.example`.
 

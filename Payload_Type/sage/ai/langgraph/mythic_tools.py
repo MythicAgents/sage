@@ -1830,10 +1830,20 @@ class MythicTools:
         # the 75-step budget was exhausted. First failed fetch returns the full output so the agent sees
         # the error once. This is independent of the issue_task circuit breaker (do not touch that).
         self._failed_read_counts: dict[int, int] = {}
-        # Completed-task output cache: a COMPLETED task's output is immutable, so cache it (keyed by
-        # task_display_id) so re-reads of the same finished task don't re-fetch its (often large) output.
-        # Only populated for completed tasks — a running task's output still changes and is never cached.
+        # Plain-text capability cache used by deterministic verifiers. Keep it separate from the
+        # structured read-tool cache below: sharing one string cache let a verifier's flattened text
+        # replace `get_all_task_output_by_task_id`'s JSON response shape.
         self._task_output_cache: dict[int, str] = {}
+        # Request-neutral decoded task-output records. Provenance is deliberately added after a cache
+        # lookup, because the same immutable Mythic output may be current in request A and historical
+        # when the reused channel reads it in request B.
+        self._task_output_record_cache: dict[int, object] = {}
+        # Exact Mythic display-id lineage for tasks this Sage process created. A mapping survives
+        # request changes within the reused channel model so a later request can identify a prior Sage
+        # task. Absence is conservatively historical/external (for manual tasks and process restarts).
+        self._task_source_request_ids: dict[int, str] = {}
+        self._historical_task_output_reads: dict[str, set[int]] = {}
+        self._historical_task_history_reads: set[str] = set()
 
     def set_mechanic_repair_resolver(self, resolver) -> None:
         """Install the bounded payload-mechanic resolver used by deterministic capability execution."""
@@ -1872,6 +1882,92 @@ class MythicTools:
             self._active_approval_claim = None
         self._request_contract_required = True
         self._request_contract = contract
+
+    @staticmethod
+    def _exact_task_display_id(value: Any) -> int | None:
+        """Normalize one Mythic display ID without substring or truthiness matching."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit():
+                return int(text)
+        return None
+
+    def _current_request_id(self) -> str:
+        contract = getattr(self, "_request_contract", None)
+        return str(getattr(contract, "request_id", "") or "").strip() or "request:unbound"
+
+    def _record_current_request_task(self, task_id: Any) -> None:
+        """Bind a successfully created Mythic task to the exact active request."""
+        exact = self._exact_task_display_id(task_id)
+        if exact is not None:
+            self._task_source_request_ids[exact] = self._current_request_id()
+
+    def _task_request_provenance(self, task_id: Any) -> dict[str, Any]:
+        exact = self._exact_task_display_id(task_id)
+        current = self._current_request_id()
+        if exact is None:
+            return {
+                "task_id": None,
+                "current_request_id": current,
+                "source_request_id": None,
+                "issued_by_current_request": False,
+                "origin": "unknown_task_identity",
+            }
+        source = self._task_source_request_ids.get(exact)
+        is_current = source == current
+        return {
+            "task_id": exact,
+            "current_request_id": current,
+            "source_request_id": source,
+            "issued_by_current_request": is_current,
+            "origin": (
+                "current_request"
+                if is_current
+                else "prior_sage_request"
+                if source
+                else "historical_or_external"
+            ),
+        }
+
+    def _note_task_output_read(self, task_id: Any) -> dict[str, Any]:
+        provenance = self._task_request_provenance(task_id)
+        exact = provenance["task_id"]
+        if exact is not None and not provenance["issued_by_current_request"]:
+            self._historical_task_output_reads.setdefault(
+                provenance["current_request_id"],
+                set(),
+            ).add(exact)
+        return provenance
+
+    def _current_request_task_provenance_notice(self) -> str:
+        """Deterministic operator note for prior/external task data read this request."""
+        request_id = self._current_request_id()
+        task_ids = sorted(self._historical_task_output_reads.get(request_id, ()))
+        inspected_history = request_id in self._historical_task_history_reads
+        lines: list[str] = []
+        if task_ids:
+            if len(task_ids) == 1:
+                label = f"Mythic task {task_ids[0]} was"
+                source = "its output"
+            else:
+                label = f"Mythic tasks {', '.join(str(item) for item in task_ids)} were"
+                source = "their output"
+            lines.append(
+                f"{label} not issued by this request; {source} came from prior or external "
+                "Mythic task history."
+            )
+        if inspected_history:
+            lines.append(
+                "This request also inspected prior or external Mythic task history; those historical "
+                "tasks were not issued by this request."
+            )
+        if not lines:
+            return ""
+        return "**Task provenance:** " + " ".join(lines)
 
     def require_request_contract(self) -> None:
         """Mark this client as native so absence of a contract cannot inherit legacy authority."""
@@ -5423,6 +5519,9 @@ class MythicTools:
                     if tdid is None:
                         raise Exception("Failed to create task")
                     self._last_issued_task_display_id = tdid
+                    # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
+                    # subscription failure, or failed command cannot make an accepted Mythic task look manual.
+                    self._record_current_request_task(tdid)
                     self._commit_task_backed_transition(command, parameters, callback_display_id, tdid)
                     event_id = f"mythic-task:{callback_display_id}:{tdid}"
                     context = (
@@ -16403,7 +16502,33 @@ class MythicTools:
         if guard:
             return json.dumps({"status": "unchanged", "note": guard, "callback_display_id": callback_display_id}, sort_keys=True)
         resp = await mythic.get_all_tasks(mythic=self.client, callback_display_id=callback_display_id)
-        return json.dumps(resp, sort_keys=True)
+        annotated = copy.deepcopy(resp)
+        rows = annotated if isinstance(annotated, list) else None
+        if isinstance(annotated, dict):
+            for key in ("tasks", "task"):
+                if isinstance(annotated.get(key), list):
+                    rows = annotated[key]
+                    break
+        saw_historical = False
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                task_identity = None
+                for key in ("display_id", "task_id", "id"):
+                    if key in row:
+                        task_identity = row[key]
+                        break
+                provenance = self._task_request_provenance(task_identity)
+                row["request_provenance"] = provenance
+                if provenance["origin"] in {
+                    "prior_sage_request",
+                    "historical_or_external",
+                }:
+                    saw_historical = True
+        if saw_historical:
+            self._historical_task_history_reads.add(self._current_request_id())
+        return json.dumps(annotated, sort_keys=True)
 
     @tool_safety(TOOL_SAFETY_READ_ONLY)
     async def check_callback_alive(self, callback_display_id: Annotated[int, "The callback_display_id of the target agent to assess for liveness"]) -> str:
@@ -16432,15 +16557,25 @@ class MythicTools:
         """
         if self.client is None:
             raise Exception("MythicAPIClient not initialized. Call login() first.")
-        logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {task_id}")
-        # A completed task's output is immutable — serve a prior fetch from cache instead of re-fetching it.
-        if task_id in self._task_output_cache:
-            logger.debug(f"task {task_id} output served from completed-task cache")
-            return self._task_output_cache[task_id]
-        resp = await mythic.get_all_task_output_by_id(mythic=self.client, task_display_id=task_id)
+        exact_task_id = self._exact_task_display_id(task_id)
+        if exact_task_id is None:
+            raise ValueError("task_id must be an exact non-negative Mythic display ID")
+        logger.debug(f"🛠️ Calling get_all_task_output_by_task_id tool for task IDs: {exact_task_id}")
+        # A completed task's output is immutable. Cache only request-neutral decoded rows; attach
+        # current/historical provenance after lookup so a reused channel cannot inherit stale lineage.
+        cache_hit = exact_task_id in self._task_output_record_cache
+        if cache_hit:
+            logger.debug(f"task {exact_task_id} output served from completed-task record cache")
+            resp = copy.deepcopy(self._task_output_record_cache[exact_task_id])
+        else:
+            resp = await mythic.get_all_task_output_by_id(
+                mythic=self.client,
+                task_display_id=exact_task_id,
+            )
+            resp = copy.deepcopy(resp)
 
         # Decode base64 response_text fields for easier LLM processing
-        if isinstance(resp, list):
+        if isinstance(resp, list) and not cache_hit:
             for item in resp:
                 if isinstance(item, dict) and "response_text" in item:
                     try:
@@ -16456,14 +16591,15 @@ class MythicTools:
                         pass
 
         result = json.dumps(resp, sort_keys=True)
+        output_payload: object = resp
         # No-progress guard (see __init__): clamp repeated re-reads of a statically-FAILED task.
         # Uses the BROADER read-scope check (not the breaker's) — see _READ_FAILURE_SIGNATURES.
         if _is_failed_read_output(result):
-            count = self._failed_read_counts.get(task_id, 0) + 1
-            self._failed_read_counts[task_id] = count
+            count = self._failed_read_counts.get(exact_task_id, 0) + 1
+            self._failed_read_counts[exact_task_id] = count
             if count >= 2:
-                return (
-                    f"STOP RE-READING — task {task_id} FAILED and its output is unchanged from your "
+                output_payload = (
+                    f"STOP RE-READING — task {exact_task_id} FAILED and its output is unchanged from your "
                     f"earlier fetch this session (re-read {count}x). The command did not succeed; re-reading "
                     f"it just refills context and wastes a step. Either try a DIFFERENT command/technique, or "
                     f"report this failure to the operator. Do not re-fetch this task again."
@@ -16471,15 +16607,24 @@ class MythicTools:
         else:
             # A later SUCCESSful fetch of the same task_id clears the failed-read counter so a genuinely
             # changed/succeeded task is never clamped.
-            self._failed_read_counts.pop(task_id, None)
+            self._failed_read_counts.pop(exact_task_id, None)
             # Cache the output if the task is COMPLETED (its output is then immutable) so subsequent
             # re-reads return instantly without re-fetching. Running tasks are never cached.
             try:
-                if await self._is_task_completed(task_id):
-                    self._task_output_cache[task_id] = result
+                if (
+                    exact_task_id not in self._task_output_record_cache
+                    and await self._is_task_completed(exact_task_id)
+                ):
+                    self._task_output_record_cache[exact_task_id] = copy.deepcopy(resp)
             except Exception:
                 pass
-        return result
+        return json.dumps(
+            {
+                "provenance": self._note_task_output_read(exact_task_id),
+                "task_output": output_payload,
+            },
+            sort_keys=True,
+        )
 
     async def _is_task_completed(self, task_display_id: int) -> bool:
         """True if the Mythic task is in a terminal (completed) state — gates completed-task output caching."""

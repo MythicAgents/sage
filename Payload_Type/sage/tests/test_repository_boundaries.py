@@ -26,6 +26,44 @@ def _product_python_files() -> list[Path]:
     return sorted(path for path in files if path.is_file())
 
 
+def _publishable_product_files() -> list[Path]:
+    files = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "docs" / "SECURITY_AND_DATA_HANDLING.md",
+        REPO_ROOT / "docs" / "releases" / "v0.1.0-beta.md",
+        SAGE_ROOT / "Dockerfile",
+        SAGE_ROOT / ".env",
+        *_product_python_files(),
+    ]
+    return sorted(path for path in files if path.is_file())
+
+
+_MACHINE_PATH_PATTERNS = {
+    "posix_user_home": re.compile(r"(?<![A-Za-z0-9_])/(?:home|Users)/[A-Za-z0-9._-]+/"),
+    "windows_user_home": re.compile(
+        r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/])Users[\\/]"
+        r"(?!(?:Public|Default|Default User|All Users)(?:[\\/]|$))[^\\/\s:]+[\\/]"
+    ),
+    "tilde_home": re.compile(r"(?<![A-Za-z0-9_])~[\\/]"),
+    "home_variable": re.compile(r"\$(?:HOME\b|\{HOME\})"),
+    "windows_userprofile_variable": re.compile(r"(?i)%USERPROFILE%(?:[\\/]|$)"),
+    "powershell_userprofile_variable": re.compile(r"(?i)\$env:USERPROFILE(?:[\\/]|$)"),
+}
+
+
+def _machine_path_hits(text: str) -> list[str]:
+    return [name for name, pattern in _MACHINE_PATH_PATTERNS.items() if pattern.search(text)]
+
+
+def _machine_path_violations(paths: list[Path]) -> list[str]:
+    violations = []
+    for path in paths:
+        for kind in _machine_path_hits(path.read_text(encoding="utf-8")):
+            violations.append(f"{path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path.name}: {kind}")
+    return violations
+
+
 def _imports(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imported: list[str] = []
@@ -71,3 +109,37 @@ def test_reset_and_bootstrap_helpers_do_not_use_callback_task_apis():
                     offenders.append(f"{path.relative_to(REPO_ROOT)} uses {token}")
 
     assert not offenders, "callback task APIs remain in reset/bootstrap helpers: " + ", ".join(offenders)
+
+
+def test_publishable_product_files_have_no_machine_specific_home_paths():
+    assert _machine_path_violations(_publishable_product_files()) == []
+
+
+def test_machine_path_guard_rejects_complete_platform_class_and_accepts_near_matches(tmp_path):
+    defect_class = (
+        ("posix", "/" + "home/alice/dev/sage"),
+        ("macos", "/" + "Users/alice/dev/sage"),
+        ("windows_backslash", "C:" + r"\Users\alice\dev\sage"),
+        ("windows_forward_slash", "D:" + "/" + "Users/alice/dev/sage"),
+        ("tilde_posix", "~" + "/.config/sage"),
+        ("tilde_windows", "~" + r"\.config\sage"),
+        ("home_bare", "$" + "HOME/dev/sage"),
+        ("home_braced", "$" + "{HOME}/dev/sage"),
+        ("userprofile", "%" + r"USERPROFILE%\dev\sage"),
+        ("powershell_userprofile", "$" + r"env:USERPROFILE\dev\sage"),
+    )
+    negatives = (
+        "/Mythic/sage.db",
+        "Path(__file__).resolve().parent",
+        "<mythic>/InstalledServices/sage",
+        "C:" + r"\Users\Public\payload.exe",
+        "C:" + "/ProgramData/Sage",
+        "%" + r"PUBLIC%\Sage",
+    )
+    assert all(_machine_path_hits(value) for _, value in defect_class)
+    assert all(_machine_path_hits(value) == [] for value in negatives)
+
+    planted = tmp_path / "README.md"
+    for name, value in defect_class:
+        planted.write_text(f"candidate path: {value}\n", encoding="utf-8")
+        assert _machine_path_violations([planted]), f"guard missed planted {name} defect"

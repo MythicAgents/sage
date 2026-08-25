@@ -1146,6 +1146,16 @@ def verify_adcs_certificate_auth(probe_result: dict[str, Any]) -> CapabilityVeri
     account = _normalize(_input_text(probe_result, "account", "user", "principal", "target_account"))
     domain = _normalize(_input_text(probe_result, "domain", "realm", "target_domain"))
     auth_specific = _adcs_certificate_auth_specific_signal(probe_result)
+    schannel_auth = (
+        _normalize(_input_text(probe_result, "certificate_auth_method", "auth_method"))
+        in {"schannel-ldap", "schannel_ldap"}
+        or _any_true(probe_result, ("schannel_ldap_bind",))
+    )
+    schannel_identity_matches = _schannel_whoami_matches(
+        _input_text(probe_result, "certificate_auth_whoami"),
+        account,
+        domain,
+    )
     # A control signal proves *usable* domain control: captured credential material (the NTLM hash
     # Rubeus /getcredentials returns on real PKINIT success), a reproducible privileged action on
     # the target (DC C$ listing, remote exec, DC-side write), or a DA-only read confirmed by a
@@ -1174,7 +1184,9 @@ def verify_adcs_certificate_auth(probe_result: dict[str, Any]) -> CapabilityVeri
             "domain_admin",
         ),
     )
-    control_proven = auth_specific and control_signal
+    control_proven = auth_specific and control_signal and (
+        not schannel_auth or schannel_identity_matches
+    )
     if control_proven and callback_id and account and domain:
         return CapabilityVerification(
             "achieved",
@@ -1256,6 +1268,28 @@ def _adcs_certificate_auth_specific_signal(probe_result: dict[str, Any]) -> bool
             "schannel_ldap_bind",
             "ntlm_hash_present",
         ),
+    )
+
+
+def _schannel_whoami_matches(whoami: Any, account: Any, domain: Any) -> bool:
+    """Match the existing typed ``u:DOMAIN\\account`` Schannel identity exactly."""
+    identity = _normalize(whoami)
+    requested_account = _normalize(account)
+    requested_domain = _normalize(domain)
+    if not identity.startswith("u:") or not requested_account or not requested_domain:
+        return False
+    principal = identity[2:]
+    if principal.count("\\") != 1:
+        return False
+    actual_domain, actual_account = principal.split("\\", 1)
+    if "\\" in requested_account:
+        requested_account = requested_account.rsplit("\\", 1)[1]
+    elif "@" in requested_account:
+        requested_account = requested_account.split("@", 1)[0]
+    return bool(
+        actual_account
+        and actual_account == requested_account
+        and _domains_equivalent(actual_domain, requested_domain)
     )
 
 
@@ -2376,7 +2410,7 @@ def extract_adcs_certificate_auth_probe(
             from . import credential_artifacts
         except ImportError:
             import credential_artifacts
-        ticket_probe = dict(credential_artifacts.extract_ticket_probe(text))
+        ticket_probe = dict(credential_artifacts.extract_ticket_probe(text, expected_domain=domain))
     except Exception:
         ticket_probe = {}
 
@@ -2386,6 +2420,9 @@ def extract_adcs_certificate_auth_probe(
     cert_auth_method = _first_output_field(text, "CERT_AUTH_METHOD").casefold()
     cert_auth_ldap_bind = _parse_probe_bool(_first_output_field(text, "CERT_AUTH_LDAP_BIND"))
     cert_auth_domain_admin = _parse_probe_bool(_first_output_field(text, "CERT_AUTH_DOMAIN_ADMIN"))
+    cert_auth_whoami = _first_output_field(text, "CERT_AUTH_WHOAMI")
+    schannel_identity_matches = _schannel_whoami_matches(cert_auth_whoami, account, domain)
+    schannel_auth = cert_auth_method in {"schannel-ldap", "schannel_ldap"} or cert_auth_ldap_bind is True
     # DA-only read proof: the emitter set DA_ONLY_READ_PROVEN=True only when the DA session
     # retrieved a directory read (domain SACL) that an authenticated non-admin control session was
     # denied. That deny/allow differential is a privileged-operation proof a self-read cannot forge.
@@ -2446,6 +2483,8 @@ def extract_adcs_certificate_auth_probe(
         "certificate_auth_status": cert_auth_status,
         "certificate_auth_method": cert_auth_method,
         "schannel_ldap_bind": cert_auth_ldap_bind is True,
+        "certificate_auth_whoami": cert_auth_whoami,
+        "schannel_identity_matches": schannel_identity_matches,
         "pkinit_tgt_present": pkinit_tgt,
         "tgt_present": bool(pkinit_tgt or ticket_probe.get("tgt_present")),
         "ticket_valid": bool((ticket_probe.get("ticket_valid") or service_access) and auth_specific),
@@ -2454,7 +2493,11 @@ def extract_adcs_certificate_auth_probe(
         # confirmed by the deny/allow negative control. NOT a directory self-read or a bare TGT
         # marker. `domain_admin` here is a membership attestation and `pkinit_tgt` a self-reported
         # marker; neither makes certificate-auth "proven" on its own (RCA 2026-08-01).
-        "certificate_auth_proven": bool(auth_specific and (service_access or ntlm_hash_present or da_only_read_proven)),
+        "certificate_auth_proven": bool(
+            auth_specific
+            and (service_access or ntlm_hash_present or da_only_read_proven)
+            and (not schannel_auth or schannel_identity_matches)
+        ),
         "da_only_read_proven": da_only_read_proven,
         "da_only_read_op": da_only_read_op,
         "domain_admin": domain_admin,

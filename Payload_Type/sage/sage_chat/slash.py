@@ -2,8 +2,8 @@
 
 The server natively parses `/state`, `/list`, ... against the model's declared commands and delivers a
 structured `ChatRequest.SlashCommand{Name, Argument, Raw, Source}` (PRD Section 8). Sage declares its
-commands in `ChatModelMetadata.SlashCommands` (see models.py) and dispatches on `Name` here. Undeclared
-input falls through to normal chat.
+commands in `ChatModelMetadata.SlashCommands` (see models.py) and dispatches on `Name` here. An unknown
+structured slash command terminates locally instead of being reinterpreted as a model prompt.
 
 These are lightweight chat-native re-homes of the old PayloadType `state`/`list`/`stop` commands — enough
 to be useful without porting the full task-bound implementations. They grow later; `mcp_*` /
@@ -26,19 +26,39 @@ except Exception:  # pragma: no cover
     import logging
     logger = logging.getLogger(__name__)
 
-# Declared to Mythic via model metadata. Names have no leading slash.
-SLASH_COMMANDS = [
+# Declared to Mythic via model metadata. Names have no leading slash. The Watcher role receives
+# only its explanation/control surface; ordinary Sage keeps its existing operational commands.
+_FINDINGS_COMMAND = ChatSlashCommandDefinition(
+    Name="findings",
+    Description="Show Sage's operation-scoped findings view: /findings.",
+)
+_WATCHER_COMMAND = ChatSlashCommandDefinition(
+    Name="watcher",
+    Description=(
+        "Inspect or control the findings watcher: "
+        "/watcher status|apply|scan|pause|resume|interval."
+    ),
+)
+_STOP_COMMAND = ChatSlashCommandDefinition(
+    Name="stop", Description="Cooperatively stop the running agent on this channel."
+)
+
+SAGE_SLASH_COMMANDS = [
+    _FINDINGS_COMMAND,
+    _WATCHER_COMMAND,
     ChatSlashCommandDefinition(Name="state", Description="Show/edit Sage's engagement state (hop ledger): /state, /state reconcile|remove|set|objective|wipe."),
     ChatSlashCommandDefinition(Name="list", Description="List active Sage chat sessions."),
     ChatSlashCommandDefinition(
         Name="mode",
         Description="Show or set the agent mode: /mode [conversation|supervised|auto].",
     ),
-    ChatSlashCommandDefinition(Name="stop", Description="Cooperatively stop the running agent on this channel."),
+    _STOP_COMMAND,
     ChatSlashCommandDefinition(Name="mcp", Description="Manage MCP servers: /mcp list | /mcp tools [server] | /mcp call <server> <tool> <json-object> | /mcp connect <json> | /mcp disconnect <name>."),
     ChatSlashCommandDefinition(Name="bloodhound", Description="Connect the BloodHound MCP: /bloodhound [directory] | /bloodhound force [directory] to rebind an existing connection with current credentials."),
     ChatSlashCommandDefinition(Name="sandbox", Description="Run a local-only isolated snippet: /sandbox [shell|python] <code>."),
 ]
+WATCHER_SLASH_COMMANDS = [_FINDINGS_COMMAND, _WATCHER_COMMAND, _STOP_COMMAND]
+SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 
 _MCP_CALL_TIMEOUT_SECONDS = 60
 
@@ -795,7 +815,8 @@ async def _handle_stop(request: ChatRequest, model: Any = None) -> str:
 async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key: str) -> bool:
     """Dispatch a declared slash command. Returns True (and sends the terminal) if handled.
 
-    Returns False for a non-sage command so `chat()` falls back to normal prompt handling.
+    Returns False only when the request has no structured slash invocation. Once Mythic marks input as
+    a slash command, an unknown name remains control input and must never fall through to a model turn.
     """
     sc = getattr(request, "SlashCommand", None)
     if sc is None:
@@ -804,6 +825,13 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     arg = getattr(sc, "Argument", "") or ""
     if name == "mode":
         text = _handle_mode(model, arg)
+    elif name in {"finding", "findings"}:
+        if arg:
+            text = "Usage: `/findings` — show this operation's current evidence-backed findings."
+        else:
+            text = await chat.handle_finding_command(request, model)
+    elif name == "watcher":
+        text = await chat.handle_watcher_command(request, arg)
     elif name == "state":
         text = await _handle_state(model, request, arg)
     elif name == "list":
@@ -817,6 +845,9 @@ async def handle_slash(chat: Any, request: ChatRequest, model: Any, response_key
     elif name == "sandbox":
         text = await _handle_sandbox(model, request, arg)
     else:
-        return False
+        text = (
+            "Unknown Sage slash command. Available commands: `/findings`, `/watcher`, `/state`, "
+            "`/list`, `/mode`, `/stop`, `/mcp`, `/bloodhound`, and `/sandbox`."
+        )
     await chat.send_complete(request, response_key, content=text, complete_request=True)
     return True

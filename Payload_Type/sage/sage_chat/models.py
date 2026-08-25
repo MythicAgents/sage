@@ -16,7 +16,12 @@ from mythic_container.ChatBase import (
     ChatModelMetadata,
 )
 
-from .slash import SLASH_COMMANDS
+from .config import WATCHER_OPTIONAL_USER_SECRETS
+from .slash import SAGE_SLASH_COMMANDS, WATCHER_SLASH_COMMANDS
+
+# Backward-compatible ordinary-Sage export used by assembled command tests and external callers.
+# The Watcher role has its own explicit inventory below; this alias must never become a union.
+SLASH_COMMANDS = SAGE_SLASH_COMMANDS
 
 # Declarative: the channel bot-token scopes Sage's action tools need (PRD Section 8A P1 / 14k).
 # In Phase 1 tools are unauthenticated (fork [F1]) so nothing enforces these yet; Phase 2 adds the
@@ -29,6 +34,7 @@ _CHANNEL_TOKEN_SCOPES = [
     "file.write",
     "tag.write",
 ]
+_WATCHER_CHANNEL_TOKEN_SCOPES = ["chat-ai.write", "apitoken.write"]
 
 # Near-parity with the legacy PayloadType `ChatArguments` (container/agent_functions/chat.py): the
 # operator-facing options from "creating Sage" as an agent are restored here as chat config fields.
@@ -221,6 +227,78 @@ _CONFIG_OPTIONS = [
     ),
 ]
 
+_WATCHER_CONFIG_OPTIONS = [
+    ChatModelConfigurationOption(
+        Name="SAGE_WATCHER_PROVIDER",
+        DisplayName="Provider",
+        DisplayAsChip=True,
+        Type=OptType.Choice,
+        Description="The provider used only by the operation-wide Sage Watcher.",
+        Required=False,
+        DefaultValue="openai",
+        Choices=[
+            ChatModelConfigurationOptionChoice(Label="OpenAI", Value="openai"),
+            ChatModelConfigurationOptionChoice(Label="AWS Bedrock", Value="bedrock"),
+            ChatModelConfigurationOptionChoice(Label="Anthropic", Value="anthropic"),
+            ChatModelConfigurationOptionChoice(Label="Ollama", Value="ollama"),
+        ],
+    ),
+    ChatModelConfigurationOption(
+        Name="SAGE_WATCHER_MODEL",
+        DisplayName="Model",
+        DisplayAsChip=True,
+        Type=OptType.String,
+        Description="The model used only by the Sage Watcher inference route.",
+        Required=False,
+    ),
+    ChatModelConfigurationOption(
+        Name="SAGE_WATCHER_API_ENDPOINT",
+        DisplayName="API Endpoint",
+        Type=OptType.String,
+        Description="[OPTIONAL] The endpoint used only by Sage Watcher.",
+        Required=False,
+        HelpText=(
+            "Resolution order: this field → SAGE_WATCHER_API_ENDPOINT user secret → "
+            "the container's SAGE_WATCHER_API_ENDPOINT environment value."
+        ),
+    ),
+    ChatModelConfigurationOption(
+        Name="SAGE_WATCHER_API_KEY",
+        DisplayName="API Key",
+        Type=OptType.String,
+        Description="[OPTIONAL] The API key used only by Sage Watcher.",
+        Required=False,
+        HelpText=(
+            "Stored in plaintext channel config when entered here. To keep it hidden, leave this "
+            "blank and set the SAGE_WATCHER_API_KEY user secret. Watcher never falls back to API_KEY."
+        ),
+    ),
+    *[
+        ChatModelConfigurationOption(
+            Name=name,
+            DisplayName=name,
+            Type=OptType.String,
+            Description=f"[OPTIONAL] Watcher-only Bedrock value {name}.",
+            Required=False,
+        )
+        for name in (
+            "SAGE_WATCHER_AWS_ACCESS_KEY_ID",
+            "SAGE_WATCHER_AWS_SECRET_ACCESS_KEY",
+            "SAGE_WATCHER_AWS_SESSION_TOKEN",
+            "SAGE_WATCHER_AWS_DEFAULT_REGION",
+        )
+    ],
+    ChatModelConfigurationOption(
+        Name="SAGE_WATCHER_INTERVAL_SECONDS",
+        DisplayName="Scan Interval Seconds",
+        DisplayAsChip=True,
+        Type=OptType.Number,
+        Description="Background scan cadence. Accepted range: 5 through 86400 seconds.",
+        Required=False,
+        DefaultValue=300,
+    ),
+]
+
 SAGE_MODELS = [
     ChatModelDefinition(
         Name="Sage",
@@ -248,7 +326,22 @@ SAGE_MODELS = [
                 "BLOODHOUND_TOKEN_KEY",
             ],
             RequiredChannelAPITokenScopes=_CHANNEL_TOKEN_SCOPES,
-            SlashCommands=SLASH_COMMANDS,
+            SlashCommands=SAGE_SLASH_COMMANDS,
+        ),
+    ),
+    ChatModelDefinition(
+        Name="Sage Watcher",
+        Description=(
+            "Sage Watcher — locked operation-wide findings profile and explanation-only console. "
+            "It cannot issue callback tasks or enter supervised/auto execution."
+        ),
+        Metadata=ChatModelMetadata(
+            Provider="litellm",
+            ConfigurationOptions=_WATCHER_CONFIG_OPTIONS,
+            RequiredUserSecrets=[],
+            OptionalUserSecrets=list(WATCHER_OPTIONAL_USER_SECRETS),
+            RequiredChannelAPITokenScopes=_WATCHER_CHANNEL_TOKEN_SCOPES,
+            SlashCommands=WATCHER_SLASH_COMMANDS,
         ),
     ),
 ]

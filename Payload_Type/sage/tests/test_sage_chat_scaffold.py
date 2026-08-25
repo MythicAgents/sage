@@ -1095,6 +1095,161 @@ def test_no_assistant_output_preserves_nonempty_native_return_text():
     }]
 
 
+def test_native_terminal_appends_deterministic_historical_task_provenance():
+    class _ProvenanceModel(_FakeModel):
+        def current_request_task_provenance_notice(self):
+            return (
+                "**Task provenance:** Mythic task 24 was not issued by this request; "
+                "its output came from prior or external Mythic task history."
+            )
+
+    chat = _DriverChat(
+        _ProvenanceModel(stream=(), return_value="The ticket cache contains one entry.")
+    )
+    _run(chat.chat(build_chat_request("inspect tickets", channel_id=58, request_id=2)))
+
+    assert chat.terminal_emissions[0]["content"] == (
+        "The ticket cache contains one entry.\n\n"
+        "**Task provenance:** Mythic task 24 was not issued by this request; "
+        "its output came from prior or external Mythic task history."
+    )
+
+
+def test_native_error_terminal_appends_deterministic_historical_task_provenance():
+    notice = (
+        "**Task provenance:** Mythic task 24 was not issued by this request; "
+        "its output came from prior or external Mythic task history."
+    )
+
+    class _ErrorProvenanceModel(_FakeModel):
+        def __init__(self):
+            super().__init__(behavior="error", stream=())
+            self.recorded_final = ""
+
+        def current_request_task_provenance_notice(self):
+            return notice
+
+        async def finalize_visibility_turn(self, *, require_final):
+            return {"ok": True}
+
+        def record_request_terminal(self, _status):
+            return None
+
+        def record_final_response(self, content, *, response_key):
+            self.recorded_final = content
+            return "event:error-final"
+
+        def record_final_response_projection(self, _event_id, *, response_key):
+            return None
+
+    model = _ErrorProvenanceModel()
+    chat = _DriverChat(model)
+    _run(chat.chat(build_chat_request("inspect then fail", channel_id=58, request_id=3)))
+
+    assert chat.terminal_emissions == [{
+        "kind": "error",
+        "response_key": "assistant:3:turn",
+        "error": f"boom\n\n{notice}",
+        "metadata": {"channel_id": 58, "event_id": "event:error-final"},
+        "complete_request": True,
+    }]
+    assert model.recorded_final == f"boom\n\n{notice}"
+
+
+@pytest.mark.parametrize("status", ["cancelled", "stopped"])
+def test_native_lifecycle_terminal_appends_deterministic_historical_task_provenance(status):
+    notice = (
+        "**Task provenance:** Mythic task 24 was not issued by this request; "
+        "its output came from prior or external Mythic task history."
+    )
+
+    class _LifecycleProvenanceModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=())
+            self.operator_stops = []
+
+        def current_request_task_provenance_notice(self):
+            return notice
+
+        async def _emit_operator_stop(self, content, *, status):
+            self.operator_stops.append((content, status))
+
+    model = _LifecycleProvenanceModel()
+    _run(
+        HeadlessSageChat._stop_and_close_request_lifecycles(
+            model,
+            status=status,
+            reason="operator" if status == "cancelled" else "session_rotated",
+        )
+    )
+
+    assert len(model.operator_stops) == 1
+    content, observed_status = model.operator_stops[0]
+    assert content.endswith(f"\n\n{notice}")
+    assert observed_status == status
+
+
+@pytest.mark.parametrize("status", ["cancelled", "stopped"])
+def test_native_lifecycle_terminal_without_historical_read_is_byte_exact(status):
+    class _LifecycleCurrentOnlyModel(_FakeModel):
+        def __init__(self):
+            super().__init__(stream=())
+            self.operator_stops = []
+
+        def current_request_task_provenance_notice(self):
+            return ""
+
+        async def _emit_operator_stop(self, content, *, status):
+            self.operator_stops.append((content, status))
+
+    from ai.langgraph.model import stop_notice_for
+
+    reason = "operator" if status == "cancelled" else "session_rotated"
+    model = _LifecycleCurrentOnlyModel()
+    _run(
+        HeadlessSageChat._stop_and_close_request_lifecycles(
+            model,
+            status=status,
+            reason=reason,
+        )
+    )
+
+    assert model.operator_stops == [(stop_notice_for(reason), status)]
+
+
+def test_native_cancel_path_emits_provenance_narrative_before_sdk_cancel_terminal():
+    notice = (
+        "**Task provenance:** Mythic task 24 was not issued by this request; "
+        "its output came from prior or external Mythic task history."
+    )
+
+    class _CancelledProvenanceModel(_FakeModel):
+        def __init__(self):
+            super().__init__(behavior="cancel", stream=())
+            self.operator_stops = []
+
+        def current_request_task_provenance_notice(self):
+            return notice
+
+        async def _emit_operator_stop(self, content, *, status):
+            self.operator_stops.append((content, status))
+
+    model = _CancelledProvenanceModel()
+    chat = _DriverChat(model)
+    request = build_chat_request("inspect then cancel", channel_id=58, request_id=4)
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(chat.chat(request))
+
+    # The SDK owns the content-free cancelled status. Sage must first emit one provenance-bearing
+    # final narrative through its request lifecycle so historical output is never misattributed.
+    assert chat.terminal_emissions == []
+    assert len(model.operator_stops) == 1
+    content, status = model.operator_stops[0]
+    assert content.endswith(f"\n\n{notice}")
+    assert status == "cancelled"
+
+
 def test_native_return_replaces_last_stream_block_as_the_single_terminal():
     chat = _DriverChat(
         _FakeModel(
@@ -1748,7 +1903,36 @@ def _slash_req(name, argument="", channel_id=5, request_id=1):
 
 
 def test_slash_commands_declared():
-    assert {c.Name for c in SLASH_COMMANDS} == {"state", "list", "mode", "stop", "mcp", "bloodhound", "sandbox"}
+    assert {c.Name for c in SLASH_COMMANDS} == {"findings", "watcher", "state", "list", "mode", "stop", "mcp", "bloodhound", "sandbox"}
+
+
+def test_slash_findings_is_canonical_with_hidden_singular_alias():
+    class _FindingChat(HeadlessSageChat):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        async def handle_finding_command(self, request, model):
+            self.calls.append((request.OperationID, model))
+            return "canonical findings"
+
+    chat = _FindingChat()
+    handled = _run(handle_slash(chat, _slash_req("findings"), None, "slash:1"))
+    assert handled is True
+    assert chat.calls == [(1, None)]
+    assert chat.terminal_emissions[-1]["content"] == "canonical findings"
+
+    handled = _run(handle_slash(chat, _slash_req("finding"), None, "slash:2"))
+    assert handled is True
+    assert chat.calls == [(1, None), (1, None)]
+    assert chat.terminal_emissions[-1]["content"] == "canonical findings"
+
+    handled = _run(
+        handle_slash(chat, _slash_req("findings", "extra"), None, "slash:3")
+    )
+    assert handled is True
+    assert chat.calls == [(1, None), (1, None)]
+    assert chat.terminal_emissions[-1]["content"].startswith("Usage: `/findings`")
 
 
 def test_slash_state_no_session_is_handled_with_one_terminal(monkeypatch):
@@ -1785,11 +1969,17 @@ def test_slash_mode_show_then_set():
     assert m._chat_mode_override_base_autonomous_solve is False
 
 
-def test_slash_unknown_falls_through_without_emitting():
-    chat = HeadlessSageChat()
-    handled = _run(handle_slash(chat, _slash_req("frobnicate"), None, "slash:1"))
-    assert handled is False
-    assert chat.emissions == []
+def test_structured_unknown_slash_names_fail_closed_without_model_fallthrough():
+    for index, name in enumerate(("findingss", "findingx", "frobnicate", ""), start=1):
+        chat = HeadlessSageChat()
+        handled = _run(
+            handle_slash(chat, _slash_req(name), None, f"slash:{index}")
+        )
+        assert handled is True
+        assert len(chat.terminal_emissions) == 1
+        assert chat.terminal_emissions[0]["content"].startswith(
+            "Unknown Sage slash command"
+        )
 
 
 def test_slash_mcp_and_bloodhound_declared():

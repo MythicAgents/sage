@@ -25,21 +25,22 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir uv
 # Clone the BloodHound MCP and pre-sync its deps so first connect needs no network.
-# Override at build time: --build-arg BLOODHOUND_MCP_REF=<branch|tag> --build-arg BLOODHOUND_MCP_REPO=<url>
-#
-# `master`, not `main` — that repository has no `main` branch. The previous `main` default made every
-# build fail at this step.
+# Override only with another prospectively verified immutable commit:
+# --build-arg BLOODHOUND_MCP_REF=<full-commit> --build-arg BLOODHOUND_MCP_REPO=<url>
 #
 # Sage requires the byte-upload path: mythic_tools.py calls `file_upload` with
 # `info_type="upload_bytes"`, and bloodhound_config.py lists `file_upload` in
-# REQUIRED_BLOODHOUND_TOOLS. That lived only on `feature/byte-code-upload` until upstream merged it
-# (PR #23, 2026-07-30), so `master` now carries it alongside the CE 9.1 edge-schema alignment, the
-# opt-in TLS verification override, and the unused-FastMCP removal. If a future `master` ever drops
-# `upload_bytes`, BloodHound ingest breaks at runtime while the build still goes green.
+# REQUIRED_BLOODHOUND_TOOLS. The exact commit below carries that path. Pinning the commit prevents
+# a future branch update from silently dropping `upload_bytes` while leaving the image build green.
 ARG BLOODHOUND_MCP_REPO=https://github.com/mwnickerson/bloodhound_mcp.git
-ARG BLOODHOUND_MCP_REF=master
-RUN git clone --depth 1 --branch ${BLOODHOUND_MCP_REF} ${BLOODHOUND_MCP_REPO} /opt/bloodhound_mcp && \
-    cd /opt/bloodhound_mcp && uv sync --no-dev
+ARG BLOODHOUND_MCP_REF=92a37dd481ce675fe552f14c9957a31dbbcd212e
+RUN git init /opt/bloodhound_mcp && \
+    cd /opt/bloodhound_mcp && \
+    git remote add origin ${BLOODHOUND_MCP_REPO} && \
+    git fetch --depth 1 origin ${BLOODHOUND_MCP_REF} && \
+    git checkout --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${BLOODHOUND_MCP_REF}" && \
+    uv sync --no-dev
 # Tell Sage where the baked-in BloodHound MCP lives. Native chat connects it in the serving event loop before
 # model initialization; autonomous sessions additionally require exact tool admission. Local development can
 # override SAGE_BLOODHOUND_MCP_DIR with another checkout.

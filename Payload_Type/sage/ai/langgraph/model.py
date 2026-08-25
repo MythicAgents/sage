@@ -2811,6 +2811,7 @@ class SageState(MessagesState):
     mode: NotRequired[Literal["conversation", "auto", "supervised"]]
     next_owner: NotRequired[str]
     _request_id: NotRequired[str]
+    _request_lane: NotRequired[str]
     _request_stop_condition: NotRequired[str]
     _subgoal_state: NotRequired[dict[str, Any]]
     _pending_objective_refinement: NotRequired[dict[str, Any] | None]
@@ -4285,6 +4286,9 @@ class Model:
             return authority.stored_objective
         return _coerce_prompt_text(prompt)
 
+    def _assisted_operator_input_for_handoff(self) -> str | None:
+        return _current_assisted_operator_input(self.state)
+
     def _install_turn_authority(self, authority: TurnAuthority) -> None:
         self._turn_authority = authority
         mythic_client = getattr(self, "mythic_client", None)
@@ -4354,6 +4358,7 @@ class Model:
             state = getattr(self, "state", None)
             if isinstance(state, dict):
                 state["_request_id"] = contract.request_id
+                state["_request_lane"] = contract.lane.value
                 state["_request_stop_condition"] = contract.stop_condition.kind.value
                 state["_subgoal_state"] = subgoal.to_dict()
         if getattr(self, "_request_execution_digest", "") != contract.digest:
@@ -4382,6 +4387,14 @@ class Model:
         setter = getattr(mythic_client, "set_request_contract", None)
         if callable(setter):
             setter(contract)
+
+    def current_request_task_provenance_notice(self) -> str:
+        """Return the deterministic Mythic-task lineage note for the active request."""
+        mythic_client = getattr(self, "mythic_client", None)
+        getter = getattr(mythic_client, "_current_request_task_provenance_notice", None)
+        if not callable(getter):
+            return ""
+        return str(getter() or "").strip()
 
     def bind_supervised_request_proposal(self, tool_calls: Any) -> None:
         """Fold the exact model-generated guarded proposal into the immutable request."""
@@ -10797,6 +10810,7 @@ class Model:
             autonomous_redirect=self._autonomous_handoff_step_redirect,
             worker_outcome_lookup=self._latest_admitted_worker_handoff,
             subgoal_scheduler=self._schedule_subgoal_transition,
+            assisted_operator_lookup=self._assisted_operator_input_for_handoff,
         )
 
         assign_to_mythic_operator_agent = _create_handoff_tool(
@@ -10805,6 +10819,7 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
+                assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
         assign_to_mythic_payload_agent = _create_handoff_tool(
@@ -10813,6 +10828,7 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
+                assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
         assign_to_bloodhound_agent = _create_handoff_tool(
@@ -10821,6 +10837,7 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
+                assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
         assign_to_mcp_manager_agent = _create_handoff_tool(
@@ -10829,6 +10846,7 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
+                assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
         assign_to_sandbox_agent = _create_handoff_tool(
@@ -10837,6 +10855,7 @@ class Model:
                 autonomous_redirect=self._autonomous_handoff_step_redirect,
                 worker_outcome_lookup=self._latest_admitted_worker_handoff,
                 subgoal_scheduler=self._schedule_subgoal_transition,
+                assisted_operator_lookup=self._assisted_operator_input_for_handoff,
             )
 
         # Completion tool - use when task is done
@@ -11751,7 +11770,13 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
         # the full conversation history from the graph's checkpointing mechanism
         #self._cleanup_dangling_tool_calls()
 
-        user_msg = HumanMessage(content=prompt)
+        user_msg = HumanMessage(
+            content=prompt,
+            additional_kwargs={
+                "_request_id": request_contract.request_id,
+                "_operator_input": True,
+            },
+        )
         user_msg_seq = self._next_seq()
         _tag_msg(user_msg, user_msg_seq)
         self.state["supervisor_messages"].append(user_msg)
@@ -12870,6 +12895,39 @@ def _create_recursion_summary_tool():
 
     return request_continuation
 
+def _current_assisted_operator_input(state: Mapping[str, Any]) -> str | None:
+    """Return the exact transport-bound operator input for an assisted handoff.
+
+    Supervisor prose selects a worker but never becomes authority. Conversation and
+    supervised workers receive only the operator input tagged with the current typed
+    request identity. Autonomous and legacy callers retain their existing instruction
+    ownership.
+    """
+    lane = str(state.get("_request_lane") or "")
+    if lane not in {"conversational", "supervised_workflow"}:
+        return None
+    request_id = str(state.get("_request_id") or "").strip()
+    if not request_id:
+        raise RuntimeError("assisted handoff lacks current operator input request identity")
+    matches: list[str] = []
+    for message in state.get("supervisor_messages", ()):
+        if not isinstance(message, HumanMessage):
+            continue
+        metadata = message.additional_kwargs
+        if (
+            metadata.get("_operator_input") is not True
+            or str(metadata.get("_request_id") or "") != request_id
+            or metadata.get("_synthetic_nudge")
+            or metadata.get("_hide_from_stream")
+        ):
+            continue
+        matches.append(_message_content_as_text(message.content))
+    unique = tuple(dict.fromkeys(matches))
+    if len(unique) != 1:
+        raise RuntimeError("assisted handoff lacks one exact current operator input")
+    return unique[0]
+
+
 def _create_handoff_tool(
     *,
     agent_name: str,
@@ -12877,6 +12935,7 @@ def _create_handoff_tool(
     autonomous_redirect: Callable[[str, str, dict], _HandoffDirective | tuple[str, str] | dict[str, str] | None] | None = None,
     worker_outcome_lookup: Callable[[dict[str, Any]], tuple[dict[str, Any], str] | None] | None = None,
     subgoal_scheduler: Callable[..., dict[str, Any]] | None = None,
+    assisted_operator_lookup: Callable[[], str | None] | None = None,
 ):
     """
     Create a handoff tool to transfer control to another agent.
@@ -12913,10 +12972,14 @@ def _create_handoff_tool(
         input_payload: str = "",
         input_type: str = "",
     ) -> Command:
-        # ISC-70 / ISC-70a: the Supervisor's handoff_instruction is whatever the LLM put in its
-        # tool-call args. It can fabricate operator attributions ("the operator asked X") from
-        # specialist context. In supervised mode, prepend the actual operator message as ground
-        # truth so the receiving specialist sees what was really asked.
+        # ISC-70 / ISC-70a: the Supervisor chooses the worker, but its generated prose is not
+        # operator authority. The exact current assisted input is rebound after every redirect
+        # below, at the final worker-channel boundary.
+        assisted_operator_input = (
+            assisted_operator_lookup()
+            if assisted_operator_lookup is not None
+            else _current_assisted_operator_input(runtime.state)
+        )
         try:
             logger.info(
                 f"🧭 [handoff] → {agent_name} | title={str(handoff_title or '')[:120]!r} | "
@@ -12924,36 +12987,6 @@ def _create_handoff_tool(
             )
         except Exception:  # pragma: no cover
             pass
-        try:
-            from .request_contract import RequestContract, RequestLane
-            _rc_ref = runtime.state.get("_model_ref")
-            if _rc_ref is None:
-                _rc_ref = runtime.state
-            _rc_obj = None
-            for _src in [_rc_ref, runtime.state]:
-                if isinstance(_src, dict):
-                    _rc_obj = _src.get("_request_contract_ref")
-                if _rc_obj is None and hasattr(_src, "_request_contract"):
-                    _rc_obj = getattr(_src, "_request_contract", None)
-            if _rc_obj is None:
-                _supervisor_msgs = runtime.state.get("supervisor_messages", [])
-                for _msg in _supervisor_msgs:
-                    if isinstance(_msg, HumanMessage) and not _msg.additional_kwargs.get("_synthetic_nudge"):
-                        _operator_text = str(_msg.content or "").strip()
-                        if _operator_text and len(_operator_text) < 500:
-                            _rc_lane = str(runtime.state.get("_request_stop_condition") or "")
-                            if _rc_lane == "actions_complete":
-                                handoff_instruction = (
-                                    f"[OPERATOR REQUEST (verbatim)]: {_operator_text}\n\n"
-                                    f"[SUPERVISOR ROUTING NOTE]: {handoff_instruction}"
-                                )
-                                logger.info(
-                                    f"🔒 [handoff] ISC-70a: prepended operator verbatim to supervised "
-                                    f"handoff instruction ({len(_operator_text)} chars)"
-                                )
-                        break
-        except Exception:
-            pass  # fail-open
         requested = _handoff_directive(agent_name, handoff_instruction, handoff_title)
         redirect = None
         raw_subgoal = runtime.state.get("_subgoal_state")
@@ -13153,11 +13186,20 @@ def _create_handoff_tool(
                 },
                 graph=Command.PARENT,
             )
-        delegated_instruction = (
-            _render_sandbox_handoff_instruction(actual_instruction, input_payload, input_type)
-            if actual_agent_name == "Sandbox"
-            else actual_instruction
-        )
+        # Final authority boundary: every redirect, worker outcome, and typed-subgoal decision above
+        # may choose the worker, but assisted lanes serialize only the exact transport-bound operator
+        # input. Keep this selection immediately before the target-channel HumanMessage so neither a
+        # later scheduler summary nor Sandbox payload rendering can replace those bytes.
+        if assisted_operator_input is not None and not terminal_redirect:
+            delegated_instruction = assisted_operator_input
+        elif actual_agent_name == "Sandbox":
+            delegated_instruction = _render_sandbox_handoff_instruction(
+                actual_instruction,
+                input_payload,
+                input_type,
+            )
+        else:
+            delegated_instruction = actual_instruction
         actual_target_channel_key = channel_map.get(actual_agent_name)
 
         # Compute sequence from max of existing messages in all channels

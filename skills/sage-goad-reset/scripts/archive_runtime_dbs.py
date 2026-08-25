@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive active Sage and Phoenix SQLite databases without deleting history."""
+"""Archive active Sage runtime and Phoenix SQLite databases without deleting history."""
 
 from __future__ import annotations
 
@@ -11,6 +11,10 @@ import re
 
 DB_SPECS = (
     ("Payload_Type/sage/sage.db", "sage"),
+    (
+        "Payload_Type/sage/sage_operation_memory.db",
+        "sage_operation_memory",
+    ),
     ("Payload_Type/sage/.phoenix/phoenix.db", "phoenix"),
 )
 STAMP_RE = re.compile(r"^\d{8}-\d{4}$")
@@ -31,7 +35,13 @@ def archive_runtime_dbs(
         if source.exists():
             moves.append((source, source.with_name(f"{prefix}_{stamp}.db")))
 
-    collisions = [destination for _, destination in moves if destination.exists()]
+    collisions: list[Path] = []
+    for source, destination in moves:
+        for suffix in ("", "-wal", "-shm"):
+            source_member = source.with_name(source.name + suffix)
+            destination_member = destination.with_name(destination.name + suffix)
+            if source_member.exists() and destination_member.exists():
+                collisions.append(destination_member)
     if collisions:
         rendered = ", ".join(str(path) for path in collisions)
         raise FileExistsError(f"archive destination already exists: {rendered}")

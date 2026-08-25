@@ -32,14 +32,14 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 > understood: an autonomous agent driving a C2 carries real risk of unintended impact on a live network. Weigh
 > production use very carefully, and prefer labs and authorized engagements until Sage has matured.
 
-> **Requires Mythic v4.0.0 or later.** Native chat containers do not exist before v4.0.0. As of this writing
-> that release lives on Mythic's [`Mythic-v4.0.0`](https://github.com/its-a-feature/Mythic/tree/Mythic-v4.0.0)
-> branch and has not been merged to the default branch, so you must install Mythic from that branch. Once it
-> merges, a normal Mythic installation will satisfy this requirement and this note becomes obsolete.
+> **Beta-qualified Mythic target: `v4.0.0rc5`.** Native chat containers do not exist before Mythic v4. The beta
+> evidence binds tag `v4.0.0rc5` at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`; newer Mythic v4 builds may
+> work, but are not part of this beta's validated support matrix.
 
 ## Contents
 
 - [How Sage works](#how-sage-works)
+- [Product contracts and authority modes](#product-contracts-and-authority-modes)
 - [The engagement ledger](#the-engagement-ledger)
 - [Repository layout](#repository-layout)
 - [Requirements](#requirements)
@@ -56,14 +56,32 @@ services, and Sage-local attack artifacts are not admissible proof of an objecti
 - [Verification](#verification)
 - [Operator workflows](#operator-workflows)
 - [Security and evidence rules](#security-and-evidence-rules)
+- [Limitations](#limitations)
 - [Development guidance](#development-guidance)
 
 ## How Sage works
 
-Sage runs one control loop. It **observes** state from Mythic and BloodHound, **models** the actions available
-to it as typed capabilities, **selects** one, **executes** it as a Mythic task, **verifies** the effect from
-real proof, then **repairs or re-plans** — appending every proven effect to
-[the engagement ledger](#the-engagement-ledger).
+### Product contracts and authority modes
+
+Sage has two distinct product contracts:
+
+- **Assisted mode** is the consultant-facing product umbrella over the existing `conversation` and `supervised`
+  runtime modes. It observes the current Mythic operation and answers through normal Mythic Chat.
+  `conversation` is read-only; `supervised` may propose a concrete guarded action, but that exact action runs only
+  after the consultant approves it.
+- **Auto mode** is the experimental autonomous CTF contract. It attempts an explicitly configured objective end
+  to end without an operator approving each action. Its current validation is GOAD-only; that does not establish
+  reliability or generalization elsewhere.
+
+`conversation`, `supervised`, and `auto` are the only runtime authority modes. Assisted mode is not a fourth
+selectable mode: it names the product experience provided by `conversation` and `supervised` together. The
+assisted and auto contracts therefore share control-plane evidence and Mythic execution plumbing without sharing
+the same authority or acceptance standard.
+
+When authority permits action, Sage runs an observe/model/select/execute/verify loop. It **observes** state from
+Mythic and BloodHound, **models** the actions available to it as typed capabilities, **selects** one, **executes**
+it as a Mythic task, **verifies** the effect from real proof, then **repairs or re-plans** — appending every proven
+effect to [the engagement ledger](#the-engagement-ledger).
 
 ```mermaid
 flowchart LR
@@ -204,12 +222,15 @@ strategy.
 
 ## Requirements
 
-- **Mythic v4.0.0 or later**, currently the [`Mythic-v4.0.0`](https://github.com/its-a-feature/Mythic/tree/Mythic-v4.0.0)
-  branch. Earlier Mythic versions have no native chat-container support and cannot run Sage at all.
+- **Mythic `v4.0.0rc5`** at commit `a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916` for the beta-qualified path.
+  Earlier Mythic versions have no native chat-container support; other Mythic v4 revisions are unvalidated for
+  this beta.
 - Python 3.14 and a repository virtual environment.
 - Model-provider credentials or an OpenAI-compatible endpoint.
-- For BloodHound-backed graph analysis, BloodHound CE plus a compatible [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp) checkout.
-- For target activity, a live supported Mythic payload callback.
+- For the beta-qualified graph path, BloodHound CE 9.5.1 plus [BloodHound MCP](https://github.com/mwnickerson/bloodhound_mcp)
+  commit `92a37dd481ce675fe552f14c9957a31dbbcd212e`.
+- For beta-qualified target activity, an Apollo `v0.1.0-rc1` callback. Other payload types may work through the
+  generic adapter but are unvalidated for this beta.
 
 Create the development environment from the repository root:
 
@@ -785,7 +806,63 @@ are:
 Range-specific operators, prompts, credentials, and generated evidence remain development inputs. They are not
 part of the shipped Sage capability.
 
+### Background findings watcher
+
+Sage exposes two native Mythic AI models: ordinary `Sage` and a separate `Sage Watcher`. Creating a Watcher chat
+is inert. Lock the intended `Sage Watcher` channel and run `/watcher apply` there to claim the operation's sole
+Watcher owner generation. The applied profile starts one serial, incremental background watcher; ordinary Sage
+chat creation or use never selects or reconfigures it.
+
+A **scan** is one read-only, operation-scoped poll of Mythic's callback, task, response/task-output, credential,
+and file streams. It never issues a payload task or contacts a target. Every poll attempt increments `scans`, but
+it does not automatically mean an LLM call: unchanged durable evidence is reconciled deterministically without
+model inference. When evidence changes, the watcher may make one bounded, tool-free model call; `last model
+reasoning` reports the most recent scan that did so.
+
+The profile exposes only `SAGE_WATCHER_PROVIDER`, `SAGE_WATCHER_MODEL`, endpoint/API-key, four AWS credential
+counterparts, and cadence. These values use the same first-non-empty resolution and provider construction as Sage
+Chat—channel config, identically named optional user secret where declared, environment, then default—but never
+fall back to ordinary Sage's unprefixed keys. Scheduled analysis stays on the direct tool-free reasoner. Watcher
+conversation uses a separate one-node, stateless, tool-free, no-checkpointer graph that can only explain and cite
+the admitted canonical view; it has no mode, policy, BloodHound, MCP, sandbox, approval, callback, or task surface.
+
+Background polling separately requires `SAGE_WATCHER_APITOKEN` for an active bot in the watched operation. Its
+effective scopes must exactly match the documented read/delivery set; wildcard, missing, and excess scopes fail
+closed. Mythic's short-lived onStart token may read the active channel profile and create or reuse
+`#sage-findings`, then is discarded. It never becomes scheduler, model, or delivery authority.
+
+After Sage starts:
+
+- Run `/watcher status` from either model to inspect the redacted owner, generation, route sources, cadence, and
+  health. Only the exact active locked owner may run `/watcher apply|scan|pause|resume|interval`. Cadence defaults
+  to 300 seconds, accepts 5–86,400, and pause/cadence persist with the applied profile across restart.
+- UI- and environment-backed profiles auto-resume after exact startup binding checks. A generation that used a
+  requesting-user Mythic secret becomes visibly `credentials-required` after restart; run `/watcher apply` from
+  the locked owner to rehydrate it. Sage never copies the secret into operation memory or channel metadata.
+- Open the normal Mythic channel `#sage-findings` to see bot-authored full finding updates without initiating an
+  AI-chat turn. Mythic's event feed also receives a generic warning notification.
+- Run `/findings` for the same canonical view plus watcher health in either AI model. The legacy
+  `/finding` spelling remains a compatibility alias. The bare word
+  `findings` is an ordinary conversational prompt and has no special command behavior.
+- Optionally configure `SAGE_FINDINGS_SLACK_WEBHOOK_URL`. Slack receives only the fixed generic change notice;
+  the full client-data-bearing finding remains inside Mythic. [Modern Slack app incoming webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
+  are bound to the channel selected at installation, so use one webhook URL per destination. A
+  [legacy custom-integration webhook](https://docs.slack.dev/legacy/legacy-custom-integrations/legacy-custom-integrations-incoming-webhooks/)
+  may use the optional `SAGE_FINDINGS_SLACK_CHANNEL_ID` C/G channel ID; modern app webhooks cannot honor that
+  override.
+- To send the exact production notice manually, use
+  `.venv/bin/python skills/sage-focused-capability-tests/scripts/probe_slack_findings_webhook.py --send`.
+  Select another modern channel's webhook without exposing the URL on the command line with
+  `--webhook-env SAGE_FINDINGS_SLACK_WEBHOOK_URL_SECURITY`; use `--channel-id C0123456789` only for a legacy hook.
+
 ## Security and evidence rules
+
+The complete client-data flow, persistence, erasure, and Slack-egress contract is in
+[Security and Data Handling](docs/SECURITY_AND_DATA_HANDLING.md). In short, Mythic-derived content is client
+data throughout the trusted Mythic/Sage deployment. It may reach the configured model route, checkpoints,
+Phoenix traces, operation memory, findings, and native Mythic notifications. A configured Slack hook is a
+separate boundary and receives only the fixed notice `Sage findings changed. Open Mythic to review.` plus, for
+a legacy override, an operator-configured channel ID that is never derived from Mythic data.
 
 - Target-facing actions execute through Mythic payload tasks only.
 - Objective proof comes from Mythic task output or artifacts, Mythic credential-store state, or BloodHound facts
@@ -800,6 +877,40 @@ part of the shipped Sage capability.
   attempted but no Mythic task was issued. A neutral-delegation soft cap warns the operator after 6 consecutive
   non-tasking delegations. A pair-bounce detector warns when the same agent is delegated 3 times in a row
   without progress.
+
+## Limitations
+
+`v0.1.0-beta` is deliberately narrow:
+
+- Auto mode is experimental and has been exercised against GOAD. That does not establish reliability or
+  generalization on another range or a production network.
+- The assisted operation-memory acceptance case joins one completed native Apollo `download` task to its exact
+  current downloaded `.ps1` file record containing direct literal username/password assignments. One tool-free
+  model call may propose `credential-material`; deterministic admission binds the operation, task, callback, and
+  file identity before background delivery. It does not show that a consultant would have missed the finding,
+  acted on it, or received independent value.
+- The beta support target is Linux arm64 Sage Docker on Mythic `v4.0.0rc5` (`a9add7f1f62f5b2098d1f0eb0306c4b15b8cd916`),
+  Apollo `v0.1.0-rc1` (`d44676d9eda540377ce91a6e636dd8788bc86def`), BloodHound CE 9.5.1 image
+  `specterops/bloodhound@sha256:5f6ae41631b82b2516dd5ffa050105ddb2e4dbf04e3e2f6d00fbc302932cf4ed`,
+  BloodHound MCP `92a37dd481ce675fe552f14c9957a31dbbcd212e`, and `sonnet-4-6` through Sage's
+  `openai` protocol via an OpenAI-compatible LiteLLM route. The accepted release evidence records a successful
+  clean-clone Docker/backfill/restart run for exact candidate tree
+  `b25c00ec22c030566ff7636015ca4a39c1910e35`; this is the beta's validated matrix, not a general production
+  readiness claim.
+- Other operating systems and architectures; Mythic, Apollo, BloodHound CE, or BloodHound MCP revisions; model
+  providers and direct-provider routes; models other than the effective `sonnet-4-6` LiteLLM route; and payload
+  types other than Apollo are not validated for this beta. Code paths that support them are not evidence that
+  the release configuration works.
+- The frozen defect cut covered ESSOS certificate-identity proof, reject binding, approval/resolver parity,
+  worker-handoff authority, fabricated operator attribution, and prior-task provenance. The first, handoff,
+  attribution, and provenance defects were repaired and passed their frozen offline gates; reject binding and
+  approval/resolver parity did not reproduce in their assembled offline paths. No new live-range reproduction is
+  claimed.
+- Operation-memory erasure removes Sage-derived state for one operation but deliberately leaves authoritative
+  Mythic records unchanged. It does not erase separate LangGraph checkpoints, Phoenix traces, LiteLLM/provider
+  retention, native Mythic messages, or Slack workspace records; each owner must apply its own retention policy.
+- Slack findings delivery, when configured, contains only a generic change notice. It does not provide finding
+  previews or operation identifiers; review the full finding inside access-controlled Mythic Chat.
 
 ## Development guidance
 
