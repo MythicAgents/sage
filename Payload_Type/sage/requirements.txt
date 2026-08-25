@@ -4,7 +4,7 @@ langchain-mcp-adapters==0.3.2
 # langchain-mcp-adapters 0.3.2 still imports `mcp.server.fastmcp` and declares `mcp<2.0.0,>=1.24.0`.
 # mcp 2.0.0 removed that module, so mcp must stay below 2.0 until adapters drops the fastmcp import.
 # Track: https://github.com/langchain-ai/langchain-mcp-adapters/issues/578
-mcp==1.25.0
+mcp==1.28.1
 langchain-anthropic==1.5.4
 langchain-aws==1.7.0
 langchain-openai==1.4.2

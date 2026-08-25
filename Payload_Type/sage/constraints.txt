@@ -141,7 +141,7 @@ logfire-api==4.40.0
 Mako==1.4.1
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
-mcp==1.25.0
+mcp==1.28.1
 mdurl==0.1.2
 more-itertools==11.1.0
 multidict==6.7.1
