@@ -894,9 +894,11 @@ a legacy override, an operator-configured channel ID that is never derived from 
   `specterops/bloodhound@sha256:5f6ae41631b82b2516dd5ffa050105ddb2e4dbf04e3e2f6d00fbc302932cf4ed`,
   BloodHound MCP `92a37dd481ce675fe552f14c9957a31dbbcd212e`, and `sonnet-4-6` through Sage's
   `openai` protocol via an OpenAI-compatible LiteLLM route. The accepted release evidence records a successful
-  clean-clone Docker/backfill/restart run for exact candidate tree
-  `b25c00ec22c030566ff7636015ca4a39c1910e35`; this is the beta's validated matrix, not a general production
-  readiness claim.
+  clean-clone Docker/backfill/restart run for exact tree `b25c00ec22c030566ff7636015ca4a39c1910e35`, which is the
+  tagged tree's parent. The tagged tree adds optional Slack channel-ID routing, `mcp` `1.28.1`, and these
+  documentation bytes; its offline suite, repository-boundary guards, and the seeded capability case all pass, but
+  the Docker qualification above was not re-run against it. This is the beta's validated matrix, not a general
+  production readiness claim.
 - Other operating systems and architectures; Mythic, Apollo, BloodHound CE, or BloodHound MCP revisions; model
   providers and direct-provider routes; models other than the effective `sonnet-4-6` LiteLLM route; and payload
   types other than Apollo are not validated for this beta. Code paths that support them are not evidence that
