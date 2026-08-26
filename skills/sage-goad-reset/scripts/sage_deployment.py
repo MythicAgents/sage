@@ -108,6 +108,15 @@ _SYNC_EXCLUDES = (
     # up, chat still answers, and BloodHound is simply gone. Seeded on first deploy below, so a
     # fresh install still receives the documented template.
     ".env", ".env.local",
+    # Engagement evidence, same reason as the live database above: the container writes it, and
+    # `decision_record.py` seals each record `0o444`. Because the container runs as root over the
+    # bind mount, those files are root-owned and read-only on the host, so mirroring a developer's
+    # own `.sage_engagement/` over them fails the whole sync with rsync code 23 and no deploy
+    # happens at all. Evidence belongs to the deployment that produced it, never to the code sync.
+    # The glob is load-bearing: archived engagements sit beside the live one as
+    # `.sage_engagement_<stamp>`, and `--delete` would try to unlink those sealed files too, which
+    # fails the sync just as hard as overwriting them.
+    ".sage_engagement*",
 )
 
 # One program, run on both sides, so the two digests cannot disagree through implementation drift.
