@@ -12,32 +12,23 @@ stateless mode — each tool call opens its OWN stdio session (its docstring: "A
 created for each tool call"), which is loop-safe with the bare runner's asyncio.run-per-call dispatcher
 (a persistent session would be bound to one event loop and break across calls).
 
-The MCP directory defaults to the known lab path (`_DEFAULT_BLOODHOUND_MCP_DIR`) so a bare run gets
-BloodHound with no env setup; `SAGE_BLOODHOUND_MCP_DIR` overrides it. Graceful: if the resolved dir
-doesn't exist or the connect/list fails, returns NO tools and the bare model simply runs without
-BloodHound (it still has the Mythic toolset to collect/enumerate by hand).
+The MCP directory is supplied explicitly through `SAGE_BLOODHOUND_MCP_DIR`. Discovery returns an empty
+toolset when unavailable so offline callers can inspect the seam; the Gate 1P live runner rejects that
+empty result rather than silently relabeling a Mythic-only baseline as Mythic/BloodHound.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from pathlib import Path
 from typing import Any, Callable
 
 BLOODHOUND_SERVER = "BloodHound"
 
 
-# Sibling-of-Sage default so a bare run lights up BloodHound with NO env setup; the env var is
-# just an override. Encodes "bloodhound_mcp sits next to Sage", not one machine's home layout.
-_DEFAULT_BLOODHOUND_MCP_DIR = str(Path(__file__).resolve().parents[5] / "bloodhound_mcp")
-
-
 def _connections() -> dict | None:
-    """Stdio connection dict for MultiServerMCPClient. Resolves the MCP dir as SAGE_BLOODHOUND_MCP_DIR
-    (override) else the hardcoded default; returns None only if the resolved dir doesn't exist on this
-    host (graceful no-op for non-lab machines)."""
-    d = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or _DEFAULT_BLOODHOUND_MCP_DIR
+    """Build the stdio connection from the explicit external-dependency contract."""
+    d = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
     if not d or not os.path.isdir(d):
         return None
     command = os.environ.get("SAGE_BLOODHOUND_MCP_COMMAND", "uv")
@@ -77,7 +68,7 @@ def tool_spec(tool: Any) -> dict:
 
 def load_bloodhound_mcp_tools() -> tuple[list[dict], dict]:
     """Discover EVERY BloodHound MCP tool. Returns (specs, {name: langchain_tool}).
-    Empty (and a loud note) if not configured / connect fails — bare then runs without BloodHound."""
+    Empty if not configured or connection fails; the live Gate 1P builder rejects that state."""
     conns = _connections()
     if conns is None:
         return [], {}

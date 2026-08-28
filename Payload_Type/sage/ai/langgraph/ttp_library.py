@@ -37,6 +37,41 @@ TOOLS_DIR = _SAGE_ROOT / "tools"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 _FULL_REFERENCE_HEADING = "## Full Reference"
+_PRODUCTION_VISIBLE_KEY = "production_visible"
+_RELATION_KEYS = ("related_ttps", "alternatives")
+
+
+def _is_production_visible(frontmatter: dict[str, Any]) -> bool:
+    """Return whether a stored reference is part of the production TTP catalog."""
+    return frontmatter.get(_PRODUCTION_VISIBLE_KEY, True) is not False
+
+
+def _explicitly_hidden_slugs() -> set[str]:
+    hidden: set[str] = set()
+    if not TTP_DIR.is_dir():
+        return hidden
+    for path in TTP_DIR.glob("*.md"):
+        try:
+            frontmatter, _ = parse_markdown(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _is_production_visible(frontmatter):
+            hidden.add(path.stem)
+    return hidden
+
+
+def _without_hidden_relations(
+    frontmatter: dict[str, Any],
+    hidden_slugs: set[str] | None = None,
+) -> dict[str, Any]:
+    """Do not disclose hidden benchmark-reference slugs through visible metadata."""
+    sanitized = dict(frontmatter)
+    hidden = _explicitly_hidden_slugs() if hidden_slugs is None else hidden_slugs
+    for key in _RELATION_KEYS:
+        values = sanitized.get(key)
+        if isinstance(values, list):
+            sanitized[key] = [value for value in values if str(value) not in hidden]
+    return sanitized
 
 
 def _json_safe(obj: Any) -> Any:
@@ -71,12 +106,15 @@ def parse_markdown(text: str) -> tuple[dict[str, Any], str]:
 
 
 def load_ttp(slug: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Load one TTP file by slug. Returns (frontmatter, body) or (None, None) if missing/malformed."""
+    """Load one production-visible TTP by slug, or ``(None, None)`` when unavailable."""
     path = TTP_DIR / f"{slug}.md"
     if not path.is_file():
         return None, None
     try:
-        return parse_markdown(path.read_text(encoding="utf-8"))
+        frontmatter, body = parse_markdown(path.read_text(encoding="utf-8"))
+        if not _is_production_visible(frontmatter):
+            return None, None
+        return _without_hidden_relations(frontmatter), body
     except Exception as exc:  # malformed YAML frontmatter, etc.
         logger.warning("Failed to parse TTP file %s: %s", path.name, exc)
         return None, None
@@ -100,9 +138,10 @@ def full_reference(body: str) -> str:
 
 
 def iter_ttps():
-    """Yield (slug, frontmatter, body) for every TTP file (skips _-prefixed files)."""
+    """Yield (slug, frontmatter, body) for production-visible TTP files."""
     if not TTP_DIR.is_dir():
         return
+    hidden_slugs = _explicitly_hidden_slugs()
     for path in sorted(TTP_DIR.glob("*.md")):
         if path.name.startswith("_"):
             continue
@@ -111,7 +150,9 @@ def iter_ttps():
         except Exception as exc:  # one malformed file must not break the whole catalog
             logger.warning("Skipping malformed TTP file %s: %s", path.name, exc)
             continue
-        yield path.stem, frontmatter, body
+        if not _is_production_visible(frontmatter):
+            continue
+        yield path.stem, _without_hidden_relations(frontmatter, hidden_slugs), body
 
 
 def list_categories() -> dict[str, list[dict[str, str]]]:

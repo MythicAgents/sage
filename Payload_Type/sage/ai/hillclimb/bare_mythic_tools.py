@@ -1,11 +1,9 @@
 """Stripped Mythic toolset for the BARE model — the fair baseline for "is Sage's harness better?".
 
-These are clean, Sage-FREE wrappers over the raw Mythic SDK, mirroring exactly the tools Sage's
-Mythic_Operator/Mythic_Payload agents get via `MythicTools.get_tools([...])` — but with NONE of the
-secret sauce (the audit's EXCLUDE/STRIP findings). So the bare model interacts with Mythic the SAME WAY
-Sage does (enumerate payloads -> enumerate a payload's commands+args -> issue a task -> read output),
-discovering commands at runtime instead of being handed a hardcoded command list. The only difference
-left between bare and harness is then Sage's scaffolding/intelligence itself.
+These are Sage-free wrappers over the raw Mythic SDK. The naive model can enumerate callbacks,
+payloads, commands, schemas, tasks, operation files, credentials, and payloads, then issue Mythic
+commands itself. It receives no Sage-local tool inventory, registration helper, upload shortcut,
+sandbox, TTP knowledge, planner, or agent topology.
 
 STRIPPED (per audit): no engagement-state hook, no dcsync/param normalization, no circuit-breaker,
 no schema-repair, no recon-reread guards, no liveness `_compute_liveness` engine, no footprint/OPSEC
@@ -14,20 +12,16 @@ ingest reconciliation. EXCLUDED entirely (they ARE the harness): liveness verdic
 execute_capability/build_capability_commands, ingest_collection, TTP-pinned download_tool.
 
 LIVE factories — NOT unit-tested against a real Mythic; validated on the lab on first bare run. The
-pure parts (tool schemas, dispatch routing, tools-folder discovery) ARE unit-tested.
+pure parts (tool schemas and dispatch routing) ARE unit-tested.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
-import os
-import subprocess
-from pathlib import Path
 from typing import Any, Callable
 
-# Sage's operator drop zone — the same folder ensure_tool_uploaded scans (ttp_library.TOOLS_DIR).
-TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
+BARE_TOOL_PROFILE = "naive-raw-mythic-bloodhound-v1"
 
 # GraphQL attribute fragment for command enumeration (commands + full parameter schema) — raw Mythic data.
 _COMMANDS_ATTR = """
@@ -151,36 +145,6 @@ async def _get_operations(client) -> str:
     return json.dumps(await mythic.get_operations(mythic=client), default=str)
 
 
-def list_tools_folder_local() -> list[str]:
-    """Pure: the binaries available in Sage's tools/ drop zone (no recursion). Unit-testable."""
-    if not TOOLS_DIR.is_dir():
-        return []
-    return sorted(p.name for p in TOOLS_DIR.iterdir() if p.is_file() and not p.name.startswith("."))
-
-
-async def _list_tools_folder(client) -> str:
-    """List local tool binaries in the tools/ drop zone that can be registered + uploaded."""
-    return json.dumps(list_tools_folder_local())
-
-
-async def _register_tool(client, filename: str) -> str:
-    """Register a local tools/ binary into Mythic's file store (raw register_file; no dedup/by-name sauce).
-    Returns the Mythic file UUID, which `upload_file_to_target` then pushes to a callback."""
-    from mythic import mythic
-    p = TOOLS_DIR / filename
-    if not p.is_file():
-        return f"error: {filename!r} not found in {TOOLS_DIR}. Available: {list_tools_folder_local()}"
-    return json.dumps(await mythic.register_file(client, filename=p.name, contents=p.read_bytes()), default=str)
-
-
-async def _upload_file_to_target(client, callback_display_id: int, file_uuid: str, remote_path: str = "") -> str:
-    """Push a Mythic-stored file (by UUID) to a target via the callback's upload command (raw task)."""
-    args = {"file": file_uuid}
-    if remote_path:
-        args["remote_path"] = remote_path
-    return await _issue_command(client, callback_display_id, "upload", json.dumps(args))
-
-
 async def _create_payload(client, payload_type: str, os_name: str, c2_profile: str,
                           c2_parameters: dict | None = None, build_parameters: dict | None = None,
                           filename: str = "") -> str:
@@ -209,20 +173,6 @@ async def _delete_payload(client, payload_uuid: str, confirm: bool = False) -> s
         return f"payload {payload_uuid} has no callbacks; re-call with confirm=true to delete"
     m = ('mutation Del($id:Int!){updatePayload(payload_id:$id,_set:{deleted:true}){id deleted}}')
     return json.dumps(await mythic.execute_custom_query(client, m, variables={"id": rows[0]["id"]}), default=str)
-
-
-def _sandbox_exec(client, language: str = "sh", code: str = "", timeout: int = 60) -> str:
-    """Run untrusted code in an isolated, network-disabled Docker container (Sage's sage-sandbox image)."""
-    image = "sage-sandbox:latest"
-    inner = ["python3", "-c", code] if language == "python" else ["sh", "-c", code]
-    docker = ["docker", "run", "--rm", "--network=none", "--memory=512m", "--pids-limit=128",
-              "--read-only", "--tmpfs", "/tmp:size=64m", "-u", "10001", "--cap-drop=ALL",
-              "--security-opt=no-new-privileges", image] + inner
-    try:
-        p = subprocess.run(docker, capture_output=True, text=True, timeout=min(max(int(timeout), 1), 120))
-        return f"exit={p.returncode}\nSTDOUT:\n{p.stdout[:20000]}\nSTDERR:\n{p.stderr[:8000]}"
-    except Exception as e:
-        return f"[sandbox error] {type(e).__name__}: {e}"
 
 
 # --- tool registry: name -> (impl, is_async, JSON-schema params, description) ------------------------
@@ -268,15 +218,6 @@ TOOLS: dict[str, dict] = {
                               "desc": "Add a credential to the Mythic store."},
     "get_operations":        {"fn": _get_operations, "async": True, "params": _p({}, []),
                               "desc": "List Mythic operations."},
-    "list_tools_folder":     {"fn": _list_tools_folder, "async": True, "params": _p({}, []),
-                              "desc": "List local tool binaries in the tools/ drop zone."},
-    "register_tool":         {"fn": _register_tool, "async": True,
-                              "params": _p({"filename": _STR}, ["filename"]),
-                              "desc": "Register a tools/ binary into Mythic's store; returns its file UUID."},
-    "upload_file_to_target": {"fn": _upload_file_to_target, "async": True,
-                              "params": _p({"callback_display_id": _INT, "file_uuid": _STR,
-                                            "remote_path": _STR}, ["callback_display_id", "file_uuid"]),
-                              "desc": "Upload a Mythic-stored file (by UUID) to a target via the callback."},
     "create_payload":        {"fn": _create_payload, "async": True,
                               "params": _p({"payload_type": _STR, "os_name": _STR, "c2_profile": _STR,
                                             "c2_parameters": {"type": "object"},
@@ -290,9 +231,6 @@ TOOLS: dict[str, dict] = {
                               "params": _p({"payload_uuid": _STR, "confirm": {"type": "boolean"}},
                                            ["payload_uuid"]),
                               "desc": "Soft-delete a payload (refused if it has callbacks)."},
-    "sandbox_exec":          {"fn": _sandbox_exec, "async": False,
-                              "params": _p({"language": _STR, "code": _STR, "timeout": _INT}, ["code"]),
-                              "desc": "Run untrusted code in an isolated, network-disabled container."},
 }
 
 

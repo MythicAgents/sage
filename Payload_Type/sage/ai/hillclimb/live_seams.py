@@ -26,11 +26,15 @@ from typing import Any, Callable
 
 DirectProbe = Callable[[], bool]
 
-# Sibling-of-Sage anchor: Mythic is checked out next to this repo. Encodes the relationship,
-# not a home-directory layout, so it survives cloning either repo anywhere.
-_WORKSPACE = Path(__file__).resolve().parents[5]
 _REPO = Path(__file__).resolve().parents[4]
-_BLOODHOUND_DIR = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or str(_WORKSPACE / "bloodhound_mcp")
+
+
+def _bloodhound_dir() -> str:
+    """Resolve the external BloodHound MCP checkout from its explicit contract."""
+    directory = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
+    if not directory or not os.path.isdir(directory):
+        raise RuntimeError("SAGE_BLOODHOUND_MCP_DIR must name the BloodHound MCP checkout")
+    return directory
 
 
 def _resolve_mythic_password() -> str:
@@ -77,6 +81,44 @@ def parse_model_decision(message: Any) -> dict:
     return {"final": content if isinstance(content, str) else str(content)}
 
 
+def _response_backend_record(message: Any) -> dict[str, str]:
+    """Extract the effective backend only from provider-owned response metadata."""
+    metadata = getattr(message, "response_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    model_key = next(
+        (
+            key
+            for key in ("model_name", "model_id", "model", "model_version")
+            if str(metadata.get(key) or "").strip()
+        ),
+        None,
+    )
+    model_name = str(metadata.get(model_key) or "").strip() if model_key else ""
+    provider_key = next(
+        (
+            key
+            for key in ("model_provider", "provider")
+            if str(metadata.get(key) or "").strip()
+        ),
+        None,
+    )
+    provider = str(metadata.get(provider_key) or "").strip() if provider_key else ""
+    record = {
+        "backend_provenance_source": "unavailable",
+        "observed_model": model_name,
+        "observed_provider": provider,
+    }
+    if provider and model_name:
+        record["effective_backend"] = f"{provider}:{model_name}"
+        record["backend_provenance_source"] = (
+            f"response_metadata.{provider_key}+response_metadata.{model_key}"
+        )
+    fingerprint = str(metadata.get("system_fingerprint") or "").strip()
+    if fingerprint:
+        record["system_fingerprint"] = fingerprint
+    return record
+
+
 def _render_history(objective: str, history: list) -> str:
     """Render the running transcript as text the bare model reads as its own memory."""
     lines = [f"Objective: {objective}"] if objective else []
@@ -113,7 +155,16 @@ def make_model_fn(
     def model_fn(system: str, tools_spec: list, history: list) -> dict:
         bound = llm.bind_tools(tools_spec) if tools_spec else llm
         messages = [("system", system), ("human", _render_history(objective, history))]
-        return parse_model_decision(bound.invoke(messages))
+        message = bound.invoke(messages)
+        decision = parse_model_decision(message)
+        usage = getattr(message, "usage_metadata", None)
+        if not isinstance(usage, dict):
+            metadata = getattr(message, "response_metadata", None)
+            usage = metadata.get("token_usage") if isinstance(metadata, dict) else None
+        if isinstance(usage, dict):
+            decision["_usage"] = dict(usage)
+        decision["_backend"] = _response_backend_record(message)
+        return decision
 
     return model_fn
 
@@ -196,11 +247,33 @@ def bloodhound_domain_count(*, timeout: int = 60) -> int:
     """Read-only count of BloodHound domains via the MCP's signed client (reuses bh_reset.py status).
     VALIDATED 2026-06-18: returns 0 on a freshly-wiped graph (`available-domains: 200 count=0`)."""
     cmd = [
-        "uv", "--directory", _BLOODHOUND_DIR, "run", "python",
+        "uv", "--directory", _bloodhound_dir(), "run", "python",
         str(_REPO / "skills" / "sage-goad-reset" / "scripts" / "bh_reset.py"), "status",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return parse_domain_count(proc.stdout)
+
+
+def bloodhound_empty_state_evidence(*, timeout: int = 60) -> dict:
+    """Strict read-only BloodHound clean-state evidence for countable eval rows."""
+    directory = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
+    if not directory or not os.path.isdir(directory):
+        return {"returncode": -1, "domain_count": None, "error": "SAGE_BLOODHOUND_MCP_DIR unavailable"}
+    proc = subprocess.run(
+        [
+            "uv", "--directory", directory, "run", "python",
+            str(_REPO / "skills" / "sage-goad-reset" / "scripts" / "bh_reset.py"), "status",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    match = re.search(r"\bcount=(\d+)\b", proc.stdout or "")
+    return {
+        "returncode": int(proc.returncode),
+        "domain_count": int(match.group(1)) if match else None,
+        "status_output": str(proc.stdout or ""),
+    }
 
 
 def graph_collected_probe(*, timeout: int = 60) -> Callable[[], bool]:
@@ -299,7 +372,7 @@ _BH_CYPHER = str(_REPO / "skills" / "sage-eval-gauge" / "scripts" / "bh_cypher.p
 def bloodhound_cypher_count(query: str, *, timeout: int = 60) -> int:
     """Run a read-only Cypher and return the node count, via the BloodHound MCP's signed client.
     Grounded in CypherClient.run_query (POST /api/v2/graphs/cypher)."""
-    cmd = ["uv", "--directory", _BLOODHOUND_DIR, "run", "python", _BH_CYPHER, query]
+    cmd = ["uv", "--directory", _bloodhound_dir(), "run", "python", _BH_CYPHER, query]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     try:
         return int(json.loads(proc.stdout.strip().splitlines()[-1]).get("node_count", 0))
@@ -490,9 +563,15 @@ def _realms_match(a: str | None, b: str | None) -> bool:
         return False
     if left == right:
         return True
+    left_is_fqdn = "." in left
+    right_is_fqdn = "." in right
+    if left_is_fqdn == right_is_fqdn:
+        # Two distinct FQDNs are distinct realms even when their first labels match.
+        # Two distinct single-label NetBIOS names are likewise not equivalent.
+        return False
     left_first = left.split(".", 1)[0]
     right_first = right.split(".", 1)[0]
-    return left_first == right or right_first == left or left_first == right_first
+    return left_first == right if left_is_fqdn else right_first == left
 
 
 def _realm_matches_or_missing(candidate: str | None, requested: str | None) -> bool:
@@ -501,6 +580,24 @@ def _realm_matches_or_missing(candidate: str | None, requested: str | None) -> b
     if not requested or not str(candidate or "").strip():
         return True
     return _realms_match(candidate, requested)
+
+
+_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.IGNORECASE)
+
+
+def _dcsync_realm_matches(candidate: str | None, requested: str | None) -> bool:
+    """Fail-closed FQDN/NetBIOS binding for protected-account DCSync proof."""
+    raw_candidate = str(candidate or "").strip()
+    raw_requested = str(requested or "").strip()
+    if not raw_candidate or not raw_requested:
+        return False
+    for raw in (raw_candidate, raw_requested):
+        labels = raw.split(".")
+        if any(not _DNS_LABEL_RE.fullmatch(label) for label in labels):
+            return False
+        if len(labels) == 1 and len(raw) > 15:
+            return False
+    return _realms_match(raw_candidate, raw_requested)
 
 
 # Probe query strings as module constants so the preflight smoke validates the EXACT query each probe runs.
@@ -527,11 +624,51 @@ _CERTIFICATE_AUTH_TASK_QUERY = """
             command_name
             display_params
             original_params
-            callback { display_id }
+            callback { display_id host domain }
             responses { response_text }
           }
         }
         """
+_CALLBACK_PROOF_QUERY = """
+        query EvalCallbacks {
+          callback(order_by: {display_id: asc}) {
+            display_id
+            host
+            domain
+            user
+            integrity_level
+            active
+          }
+        }
+        """
+_CLEAN_MYTHIC_STATE_QUERY = """
+        query Gate1PCleanState {
+          task(order_by: {display_id: asc}, limit: 1) { display_id }
+          credential(limit: 1) { account realm }
+        }
+        """
+
+
+def mythic_clean_state_evidence(*, timeout: int = 60) -> dict:
+    """Strict read-only Mythic task/credential emptiness evidence after reset and before solve."""
+    from mythic import mythic  # type: ignore
+
+    async def _q():
+        client = await _mythic_login_async_safe()
+        return await asyncio.wait_for(
+            mythic.execute_custom_query(client, _CLEAN_MYTHIC_STATE_QUERY, variables={}),
+            timeout=timeout,
+        )
+
+    try:
+        result = asyncio.run(_q())
+    except Exception as exc:
+        return {"query_ok": False, "tasks": None, "credentials": None, "error": str(exc)}
+    return {
+        "query_ok": True,
+        "tasks": list(result.get("task") or []),
+        "credentials": list(result.get("credential") or []),
+    }
 
 
 def _fetch_credentials_for_probe(*, timeout: int = 60) -> list[dict]:
@@ -566,10 +703,12 @@ def mythic_queries_valid(*, timeout: int = 30) -> tuple[bool, str]:
             mythic.execute_custom_query(client, _KRBTGT_DCSYNC_TASK_QUERY, variables={"limit": 1}), timeout=timeout)
         await asyncio.wait_for(
             mythic.execute_custom_query(client, _CERTIFICATE_AUTH_TASK_QUERY, variables={"limit": 1}), timeout=timeout)
+        await asyncio.wait_for(
+            mythic.execute_custom_query(client, _CALLBACK_PROOF_QUERY, variables={}), timeout=timeout)
 
     try:
         asyncio.run(_run())
-        return True, "mythic credential + task-proof queries validate against the live schema"
+        return True, "mythic credential + task/callback proof queries validate against the live schema"
     except Exception as e:
         return False, f"mythic query failed against the live schema (fix before a live run): {e}"
 
@@ -585,7 +724,13 @@ def bloodhound_reachable(*, timeout: int = 30) -> tuple[bool, str]:
         return False, f"bloodhound REST unreachable (fix before a live run): {e}"
 
 
-def mythic_credential_probe(account: str, *, realm: str | None = None, timeout: int = 60) -> DirectProbe:
+def mythic_credential_probe(
+    account: str,
+    *,
+    realm: str | None = None,
+    timeout: int = 60,
+    require_bound_realm: bool = False,
+) -> DirectProbe:
     """A DirectProbe: True iff Mythic's credential store holds a credential for `account` (optionally
     `realm`). COLLECTION-INDEPENDENT ground truth — it reflects what the agent actually dumped via Mythic,
     not what was ingested into BloodHound — so it is FAIR for bare-vs-harness. Read-only GraphQL."""
@@ -596,7 +741,8 @@ def mythic_credential_probe(account: str, *, realm: str | None = None, timeout: 
             creds = _fetch_credentials_for_probe(timeout=timeout)
             hits = [c for c in creds if _canonical_credential_account(str(c.get("account", ""))) == wanted]
             if realm:
-                hits = [c for c in hits if _realm_matches_or_missing(c.get("realm"), realm)]
+                realm_match = _dcsync_realm_matches if require_bound_realm else _realm_matches_or_missing
+                hits = [c for c in hits if realm_match(c.get("realm"), realm)]
             return bool(hits)
         except Exception:
             # Fail-open like the original async wrapper: probe errors score unmet rather than aborting runs.
@@ -629,6 +775,19 @@ def _certificate_auth_anchor_matches(output: str, account: str, realm: str) -> b
     )
 
 
+def _certificate_auth_anchor_account(output: str, realm: str) -> str:
+    """Return the principal bound into a certificate-auth proof marker, if present."""
+    account_match = re.search(r"(?im)^\s*CERT_AUTH_ACCOUNT\s*[:=]\s*(\S+)\s*$", output or "")
+    if account_match:
+        return _canonical_credential_account(account_match.group(1))
+    realm_slug = _probe_slug(realm)
+    marker_match = re.search(
+        rf"sage_cert_auth_proof_(?P<account>.+?)_{re.escape(realm_slug)}_\d+",
+        str(output or "").casefold(),
+    )
+    return _canonical_credential_account(marker_match.group("account")) if marker_match else ""
+
+
 def _fetch_completed_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
     """Read completed Mythic task outputs used by independent task-derived referees."""
     from mythic import mythic  # type: ignore
@@ -654,9 +813,70 @@ def _fetch_completed_task_outputs(*, timeout: int = 60, limit: int = 300) -> lis
             **row,
             "output": _decode_mythic_response_rows(row.get("responses")),
             "callback_display_id": (row.get("callback") or {}).get("display_id"),
+            "callback_host": (row.get("callback") or {}).get("host"),
+            "callback_domain": (row.get("callback") or {}).get("domain"),
         }
         for row in rows
     ]
+
+
+def _fetch_callbacks_for_probe(*, timeout: int = 60) -> list[dict]:
+    """Read Mythic callback identity for evaluator-side new-callback proof."""
+    from mythic import mythic  # type: ignore
+
+    async def _q():
+        client = await _mythic_login_async_safe()
+        result = await asyncio.wait_for(
+            mythic.execute_custom_query(client, _CALLBACK_PROOF_QUERY, variables={}),
+            timeout=timeout,
+        )
+        return result.get("callback", []) or []
+
+    try:
+        rows = asyncio.run(_q())
+    except Exception:
+        return []
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _hosts_match(candidate: str | None, requested: str | None) -> bool:
+    left = str(candidate or "").strip().casefold().rstrip(".")
+    right = str(requested or "").strip().casefold().rstrip(".")
+    if not left or not right:
+        return False
+    return left == right or left.split(".", 1)[0] == right.split(".", 1)[0]
+
+
+def _callback_is_privileged(row: dict) -> bool:
+    user = str(row.get("user") or "").strip().casefold()
+    if user in {"system", r"nt authority\system"}:
+        return True
+    try:
+        return int(row.get("integrity_level") or 0) >= 3
+    except (TypeError, ValueError):
+        return False
+
+
+def _task_is_identity_query(row: dict) -> bool:
+    """Bind SYSTEM output to a task whose request actually asks for process identity."""
+    command = str(row.get("command_name") or "").strip().casefold()
+    params = str(row.get("original_params") or row.get("display_params") or "").strip().casefold()
+    if command in {"whoami", "getuid"} and not params:
+        return True
+    normalized = re.sub(r"\s+", " ", params).strip()
+    return command in {"shell", "run", "execute"} and normalized in {
+        "whoami",
+        "whoami.exe",
+        "cmd /c whoami",
+        "cmd.exe /c whoami",
+    }
+
+
+def _output_is_system_identity(output: str) -> bool:
+    return any(
+        line.strip().casefold() == r"nt authority\system"
+        for line in str(output or "").splitlines()
+    )
 
 
 def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300) -> list[dict]:
@@ -665,7 +885,7 @@ def _fetch_certificate_auth_task_outputs(*, timeout: int = 60, limit: int = 300)
 
 
 def certificate_admin_control_probe(
-    account: str,
+    account: str | None,
     *,
     realm: str,
     timeout: int = 60,
@@ -674,10 +894,12 @@ def certificate_admin_control_probe(
     """True iff completed Mythic tasks independently prove certificate-authenticated admin access.
 
     Certificate authentication can establish Administrator control without changing Domain Admins group
-    membership. The capability is multi-command, so locate its principal-specific proof marker and replay
-    the verifier over that task plus the immediately preceding tasks on the same callback.
+    membership. When ``account`` is ``None``, bind the verifier to the account named by each proof marker
+    rather than assuming the built-in Administrator account. The capability is multi-command, so locate its
+    principal-specific proof marker and replay the verifier over that task plus the immediately preceding tasks
+    on the same callback.
     """
-    wanted_account = _canonical_credential_account(account)
+    wanted_account = _canonical_credential_account(account or "")
 
     def probe() -> bool:
         try:
@@ -690,7 +912,10 @@ def certificate_admin_control_probe(
             rows = _fetch_certificate_auth_task_outputs(timeout=timeout)
             for anchor in rows:
                 output = str(anchor.get("output") or "")
-                if not _certificate_auth_anchor_matches(output, wanted_account, realm):
+                candidate_account = wanted_account
+                if not candidate_account:
+                    candidate_account = _certificate_auth_anchor_account(output, realm)
+                if not candidate_account or not _certificate_auth_anchor_matches(output, candidate_account, realm):
                     continue
                 anchor_id = int(anchor.get("display_id") or 0)
                 callback_id = anchor.get("callback_display_id")
@@ -703,7 +928,7 @@ def certificate_admin_control_probe(
                 combined = "\n".join(reversed(related))
                 structured = capabilities.extract_adcs_certificate_auth_probe(
                     combined,
-                    wanted_account,
+                    candidate_account,
                     realm,
                 )
                 structured["callback_id"] = str(callback_id or "")
@@ -719,48 +944,64 @@ def certificate_admin_control_probe(
     return probe
 
 
+def system_execution_probe(
+    *,
+    realm: str,
+    host: str | None = None,
+    timeout: int = 60,
+) -> DirectProbe:
+    """True iff completed Mythic output independently proves an NT AUTHORITY\\SYSTEM context.
+
+    This is result proof, not route proof: it reuses the runtime verifier over every completed task and does
+    not require GPO, a particular tool, or a particular privilege-escalation technique.
+    """
+    def probe() -> bool:
+        try:
+            for row in _fetch_completed_task_outputs(timeout=timeout):
+                if not _realms_match(str(row.get("callback_domain") or ""), realm):
+                    continue
+                if host and not _hosts_match(row.get("callback_host"), host):
+                    continue
+                if _task_is_identity_query(row) and _output_is_system_identity(row.get("output") or ""):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    return probe
+
+
 def remote_execution_probe(
     target_host: str,
     *,
     realm: str,
     timeout: int = 60,
 ) -> DirectProbe:
-    """True iff completed Mythic task output proves bounded execution on one target host.
+    """True iff a new Mythic callback appears on the requested host and realm.
 
-    The probe reuses the runtime's existing `execute-as-local-admin` verifier, but adds
-    one evaluator-side target-binding guard: the proof output must name the requested
-    host. This prevents a valid proof for another host in the same reset from satisfying
-    a host-specific holdout objective.
+    Callback identity is control-plane state, not model-authored task text. Capturing the callback IDs that
+    exist when the probe is built supplies the negative control and prevents an old foothold from counting.
     """
     wanted_host = str(target_host or "").strip()
     wanted_realm = str(realm or "").strip()
+    baseline_ids = {
+        str(row.get("display_id") or "").strip()
+        for row in _fetch_callbacks_for_probe(timeout=timeout)
+        if str(row.get("display_id") or "").strip()
+    }
 
     def probe() -> bool:
         try:
-            try:
-                from ..langgraph import capabilities
-            except Exception:
-                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
-                import capabilities  # type: ignore
-
-            for row in _fetch_completed_task_outputs(timeout=timeout):
-                callback_id = str(row.get("callback_display_id") or "").strip()
-                if not callback_id:
+            for row in _fetch_callbacks_for_probe(timeout=timeout):
+                callback_id = str(row.get("display_id") or "").strip()
+                if not callback_id or callback_id in baseline_ids:
                     continue
-                structured = dict(
-                    capabilities.extract_remote_execution_probe(
-                        str(row.get("output") or ""),
-                        wanted_host,
-                        wanted_realm,
-                    )
-                )
-                structured["callback_id"] = callback_id
-                if structured.get("target_host_seen") is not True:
+                if not _hosts_match(row.get("host"), wanted_host):
                     continue
-                if capabilities.verify_capability(
-                    "execute-as-local-admin",
-                    structured,
-                ).verdict == "achieved":
+                if (
+                    _realms_match(str(row.get("domain") or ""), wanted_realm)
+                    and _callback_is_privileged(row)
+                ):
                     return True
         except Exception:
             return False
@@ -1035,7 +1276,7 @@ def _krbtgt_task_output_has_material(*, realm: str | None, timeout: int = 60) ->
     try:
         for entry in _fetch_krbtgt_dcsync_task_outputs(timeout=timeout):
             entry_realm = str(entry.get("realm") or "")
-            if realm and entry_realm and not _realms_match(entry_realm, realm):
+            if realm and not _dcsync_realm_matches(entry_realm, realm):
                 continue
             material = _extract_credential_material(
                 str(entry.get("output") or ""),
@@ -1054,11 +1295,15 @@ def krbtgt_dumped_probe(*, realm: str | None = None, timeout: int = 60) -> Direc
     """Hybrid DirectProbe for KRBTGT_DUMPED.
 
     Credits either Mythic credential-store evidence or completed DCSync task-output evidence containing
-    usable krbtgt material. Realm scoping prefers the requested child realm when present, but absent or
-    unparseable realm is credited because the failure mode we are fixing is under-counting; a missing
-    realm must never turn a real krbtgt dump into a miss.
+    usable krbtgt material. When a child realm is requested, both evidence paths require an exact
+    FQDN or equivalent NetBIOS binding; absent, malformed, and wrong-realm evidence fails closed.
     """
-    store_probe = mythic_credential_probe("krbtgt", realm=realm, timeout=timeout)
+    store_probe = mythic_credential_probe(
+        "krbtgt",
+        realm=realm,
+        timeout=timeout,
+        require_bound_realm=bool(realm),
+    )
 
     def probe() -> bool:
         try:
@@ -1130,13 +1375,11 @@ def ad_domain_admins_probe(
     return probe
 
 
-# --- AD-direct ground truth via OUT-OF-BAND LDAP (the "referee") -------------------------------------
-# The agent (Sage/bare) operates THROUGH the Apollo callback, and Sage reconciles that callback's task
-# history at solve start. Reading DA membership through that SAME callback therefore (a) pollutes the
-# harness with free recon + the answer, asymmetrically vs the bare model, and (b) can only ever
-# enumerate the host's OWN domain (`net group "Domain Admins" /domain` ignores the domain argument). So
-# the gauge reads ground truth OUT-OF-BAND over LDAP, straight from each domain's DC — invisible to both
-# sides and correctly domain-targeted. Bind creds live in a gitignored referee config, never in source.
+# --- One protocol adapter for the independent evaluation plane: LDAP directory observation -----------
+# The scorer-facing contract below is the injected ``reader(domain) -> set`` callable; it is deliberately
+# protocol-neutral. LDAP is one logically observation-only adapter for directory membership. A different
+# evaluation-range protocol may supply the same reader contract without changing Sage or the scorer. Evaluator
+# credentials and raw observations stay outside Sage/model/operation state and ordinary episode logs.
 
 _REFEREE_LDAP_CONFIG_ENV = "SAGE_REFEREE_LDAP_CONFIG"
 _DEFAULT_REFEREE_LDAP_CONFIG = Path(__file__).resolve().parents[2] / ".hillclimb" / "referee_ldap.json"
@@ -1161,8 +1404,8 @@ def load_referee_ldap_config(path=None) -> dict:
     p = Path(path or os.environ.get(_REFEREE_LDAP_CONFIG_ENV) or _DEFAULT_REFEREE_LDAP_CONFIG)
     if not p.exists():
         raise FileNotFoundError(
-            f"referee LDAP config not found at {p}. Ground truth is read out-of-band over LDAP so it never "
-            f"pollutes the agent callback; create it with per-domain {{dc_ip, user, password}} entries.")
+            f"referee LDAP config not found at {p}. This optional evaluation-plane adapter needs per-domain "
+            f"{{dc_ip, user, password}} entries.")
     return json.loads(p.read_text(encoding="utf-8"))
 
 
@@ -1221,7 +1464,7 @@ def ldap_da_equivalent_members(domain: str, *, config: dict | None = None) -> se
 
 
 def make_referee_reader(config: dict | None = None) -> Callable[[str], set]:
-    """A `domain -> members(set)` reader backed by out-of-band LDAP, for the ground-truth probes/baseline.
+    """Build the LDAP adapter for the protocol-neutral ``domain -> members`` evaluator contract.
     Returns DA-EQUIVALENT membership (Domain Admins ∪ Builtin\\Administrators) so local-admin-on-a-DC counts
     as DA control (§8). Loads/validates the referee config eagerly so a missing config aborts up front."""
     cfg = config if config is not None else load_referee_ldap_config()
@@ -1231,9 +1474,10 @@ def make_referee_reader(config: dict | None = None) -> Callable[[str], set]:
 def ad_domain_admins_probe_via_reader(reader: Callable[[str], set], domain: str, *,
                                       baseline: set | None = None, win_principals=None,
                                       settle_timeout: float = 0, settle_interval: float = 20):
-    """Same escalation logic as `ad_domain_admins_probe`, but reads membership via an out-of-band
-    `reader(domain) -> set` (LDAP) instead of the agent's implant — decoupling ground truth from the
-    agent callback (no pollution) and targeting the right domain. The probe PROPAGATES reader errors so
+    """Read membership through an injected, separately controlled evaluation-plane reader.
+
+    The reader may use any contract-declared protocol; it is not an agent callback and is logically
+    observation-only. The probe PROPAGATES reader errors so
     a referee failure is recorded as "could not run", never silently scored as unmet.
 
     SETTLING WINDOW: NORTH/objective DA escalation runs via the SYSTEM-on-DC / GPO route, whose group

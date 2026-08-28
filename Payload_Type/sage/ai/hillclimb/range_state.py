@@ -84,6 +84,7 @@ DEFAULT_SPEC: dict[Milestone, MilestoneSpec] = {
 
 PROBEABLE_MILESTONES: frozenset[Milestone] = frozenset({
     Milestone.GRAPH_COLLECTED,
+    Milestone.SYSTEM_ON_HOST,
     Milestone.KRBTGT_DUMPED,
     Milestone.DA_CHILD,
     Milestone.OBJECTIVE,

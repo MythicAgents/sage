@@ -1,6 +1,7 @@
 ---
 name: GOAD Environment Quick Reference
 category: recon
+production_visible: false
 subcategories: [goad, lab-environment, target-reference, demo]
 tradecraft_tags: [goad, game-of-active-directory, lab, demo, target-reference, mayfly277]
 mitre_attack: []

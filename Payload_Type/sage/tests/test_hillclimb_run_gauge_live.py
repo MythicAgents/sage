@@ -131,6 +131,31 @@ def test_runtime_telemetry_validation_rejects_missing_effective_backend_provenan
         )
 
 
+def test_diagnostic_runtime_telemetry_allows_incomplete_response_provenance_but_not_wrong_model():
+    incomplete = _telemetry(
+        model_provider="openai",
+        model_id="bedrock-claude-4-6-sonnet",
+        effective_backend_requests=[],
+        backend_provenance_complete=False,
+    )
+    rgl.validate_harness_runtime_telemetry(
+        "llm",
+        incomplete,
+        configured_provider="openai",
+        configured_model="bedrock-claude-4-6-sonnet",
+        require_all_response_provenance=False,
+    )
+
+    with pytest.raises(RuntimeError, match="did not match observed model"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            {**incomplete, "model_id": "wrong-model"},
+            configured_provider="openai",
+            configured_model="bedrock-claude-4-6-sonnet",
+            require_all_response_provenance=False,
+        )
+
+
 class _Scn:
     def __init__(self, subset):
         self.milestone_subset = subset
@@ -300,6 +325,64 @@ def test_build_probes_scopes_to_subset_child_da():
     assert Milestone.DA_CHILD in probes
     assert Milestone.KRBTGT_DUMPED in probes
     assert Milestone.OBJECTIVE not in probes
+
+
+def test_build_probes_single_hop_uses_result_based_system_oracle(monkeypatch):
+    seen = {}
+
+    def system_probe(*, realm, host=None, **_kwargs):
+        seen.update({"realm": realm, "host": host})
+        return lambda: True
+
+    monkeypatch.setattr(rgl.live_seams, "system_execution_probe", system_probe)
+    scn = _Scn((Milestone.SYSTEM_ON_HOST,))
+    probes = rgl.build_probes(lambda _domain: set(), {}, scn)
+    assert probes[Milestone.SYSTEM_ON_HOST]() is True
+    assert Milestone.KRBTGT_DUMPED not in probes
+    assert seen == {"realm": rgl.CHILD, "host": None}
+
+
+def test_diagnostic_dimensions_are_non_countable_and_preserve_missing_cost():
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(
+        probe_disagreements=[],
+        objective_proven=True,
+        clean_stop=False,
+        tool_calls=3,
+        model_calls=4,
+        total_tokens=0,
+        wall_seconds=12.0,
+    )
+    dimensions = rgl.measurement_dimensions(
+        card,
+        measurement_kind="diagnostic",
+        cost_countable={
+            "tool_calls": True,
+            "model_calls": True,
+            "total_tokens": False,
+            "wall_seconds": True,
+        },
+    )
+    assert dimensions["outcome"]["countable"] is False
+    assert dimensions["outcome"]["objective_success"] is True
+    assert dimensions["outcome"]["clean_stop"] is None
+    assert dimensions["comparison"]["countable"] is False
+    assert dimensions["cost"]["total_tokens"] == {"countable": False, "value": None}
+
+
+def test_gate1p_row_mode_stops_before_any_live_client(monkeypatch):
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+    with pytest.raises(RuntimeError, match="countable rows remain blocked"):
+        rgl.run_side(
+            rgl.Config(measurement_kind="row"),
+            "harness",
+            "single-hop-system",
+        )
 
 
 def test_build_probes_includes_objective_only_when_scored():

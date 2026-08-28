@@ -24,6 +24,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 try:
     from . import live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod
@@ -55,6 +56,9 @@ class Config:
     model_api_endpoint: str | None = None
     model_api_key: str | None = None
     null_model: bool = False
+    measurement_kind: str = "legacy"  # legacy | diagnostic | row
+    protocol_id: str | None = None
+    source_version: str | None = None
 
     @property
     def results_path(self) -> Path:
@@ -84,16 +88,19 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                  settle_interval: float = 20) -> dict:
     """Build ledger-independent range probes shared by harness and bare-model runs.
 
-    KRBTGT is proven from Mythic loot/task output. DA is proven from out-of-band LDAP membership delta.
-    OBJECTIVE accepts either LDAP admin membership or completed Mythic task output that independently
-    replays the certificate-auth / forged-ticket verifiers; those access paths do not mutate group
-    membership.
+    The scorer consumes typed probe callables, not a protocol. SYSTEM/KRBTGT and task-backed objective
+    proofs come from Mythic control-plane records. Directory-membership proof uses the injected,
+    logically observation-only evaluation-plane reader, which may use any contract-declared protocol.
     """
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
     domains = dict(getattr(scenario, "domains", {}) or {})
     child_domain = str(domains.get("child") or CHILD)
     objective_domain = str(domains.get("objective") or OBJECTIVE)
-    probes = {Milestone.KRBTGT_DUMPED: live_seams.krbtgt_dumped_probe(realm=child_domain)}
+    probes = {}
+    if Milestone.SYSTEM_ON_HOST in sub:
+        probes[Milestone.SYSTEM_ON_HOST] = live_seams.system_execution_probe(realm=child_domain)
+    if Milestone.KRBTGT_DUMPED in sub:
+        probes[Milestone.KRBTGT_DUMPED] = live_seams.krbtgt_dumped_probe(realm=child_domain)
     if Milestone.DA_CHILD in sub:
         probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
             reader, child_domain, baseline=baseline.get(child_domain, set()),
@@ -257,6 +264,7 @@ def validate_harness_runtime_telemetry(
     *,
     configured_provider: str | None = None,
     configured_model: str | None = None,
+    require_all_response_provenance: bool = True,
 ) -> None:
     """Reject mislabeled or incompletely attributed harness runs."""
     if not isinstance(telemetry, dict) or not telemetry:
@@ -303,7 +311,7 @@ def validate_harness_runtime_telemetry(
             f"semantic policy provenance incomplete: {authorized}/{total} transactions authorized"
         )
     model_calls = int(telemetry.get("model_calls", 0) or 0)
-    if configured in {"llm", "hybrid"} and model_calls:
+    if require_all_response_provenance and configured in {"llm", "hybrid"} and model_calls:
         backend_requests = telemetry.get("effective_backend_requests")
         if not isinstance(backend_requests, list):
             raise RuntimeError("runtime telemetry omitted effective backend request records")
@@ -341,20 +349,94 @@ def runtime_evidence_fields(telemetry: dict | None) -> dict:
     return {key: telemetry[key] for key in keys if key in telemetry}
 
 
-def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
+_GATE1P_PRIMARY_SCENARIOS = frozenset({"single-hop-system", "child-control"})
+
+
+def measurement_dimensions(card: ScoreCard, *, measurement_kind: str, cost_countable: dict) -> dict:
+    """Report independent countability dimensions without converting missing evidence to failure or zero."""
+    kind = str(measurement_kind or "legacy")
+    probe_available = not bool(getattr(card, "probe_disagreements", []))
+    clean_stop_available = bool(getattr(card, "clean_stop", False))
+    if kind == "diagnostic":
+        outcome_reason = "prospectively non-countable production-shape diagnostic"
+    elif kind == "row" and not probe_available:
+        outcome_reason = "outcome oracle unavailable or errored"
+    elif kind == "row" and not clean_stop_available:
+        outcome_reason = "evaluator-owned clean-stop observation unavailable"
+    elif kind == "row":
+        outcome_reason = "outcome evidence available"
+    else:
+        outcome_reason = "legacy record outside Gate 1P admission"
+    outcome_countable = bool(kind == "row" and probe_available and clean_stop_available)
+    return {
+        "outcome": {
+            "countable": outcome_countable,
+            "reason": outcome_reason,
+            "objective_success": bool(card.objective_proven),
+            "clean_stop": bool(card.clean_stop) if clean_stop_available else None,
+        },
+        "comparison": {
+            "countable": False,
+            "reason": (
+                "requires a prospectively paired row with matching model, authority, start state, and budgets"
+                if outcome_countable
+                else "outcome dimension is not countable"
+            ),
+        },
+        "cost": {
+            key: {"countable": bool(value), "value": getattr(card, key, None) if value else None}
+            for key, value in cost_countable.items()
+        },
+    }
+
+
+def episode_protocol_snapshot(cfg: Config, *, side: str, scenario_name: str, model_route: dict) -> dict:
+    """The concise per-attempt development-measurement protocol; no sealing or forensic receipt layer."""
+    return {
+        "protocol_id": cfg.protocol_id,
+        "measurement_kind": cfg.measurement_kind,
+        "scenario": scenario_name,
+        "side": side,
+        "model_provider": model_route.get("provider"),
+        "model_id": model_route.get("model"),
+        "solve_timeout_seconds": cfg.solve_timeout,
+        "max_steps": cfg.max_steps,
+        "source_version": cfg.source_version or os.environ.get("SAGE_EVAL_SOURCE_VERSION") or "unrecorded",
+        "invalidation_rules": [
+            "outcome oracle unavailable or errored",
+            "evaluator-owned clean-stop observation unavailable",
+            "arm model/authority/start-state/budget mismatch",
+            "evaluation-plane data leaked into Sage or model context",
+        ],
+    }
+
+
+def run_side(
+    cfg: Config,
+    side: str,
+    scenario_name: str,
+    *,
+    evaluation_reader_factory: Callable[[], Callable[[str], set]] | None = None,
+) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
+    if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        raise RuntimeError(
+            "Gate 1P countable rows remain blocked until the approved Stage A diagnostic supplies "
+            "the production shape for an evaluator-owned clean-stop observer"
+        )
     scn = _scenario(cfg, scenario_name)
     client = live_seams.default_mythic_client()
     runtime_telemetry: dict = {}
 
-    # GROUND TRUTH is read OUT-OF-BAND over LDAP (the referee), NOT through the agent's Apollo callback.
+    # GROUND TRUTH is read through a separately controlled evaluation plane, NOT the agent callback.
     # Routing it through that callback would (a) pollute the HARNESS — Sage reconciles the callback's task
     # history at solve start, so it would see the recon AND the answer, asymmetrically vs the bare model —
     # and (b) misread the domain (`net group /domain` only enumerates the host's own domain). Scope the
     # baseline to the AD-direct milestones THIS scenario scores, so e.g. child-da neither queries nor needs
     # referee creds for essos. The baseline is captured pre-solve but off-callback, so it cannot pollute.
     needed = _scored_referee_domains(scn)   # same scope the preflight validates creds for (single source)
-    reader = live_seams.make_referee_reader() if needed else (lambda _d: set())
+    reader_factory = evaluation_reader_factory or live_seams.make_referee_reader
+    reader = reader_factory() if needed else (lambda _d: set())
     baseline = {d: reader(d) for d in needed}
     probes = build_probes(reader, baseline, scn,
                           settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
@@ -414,12 +496,19 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
             if isinstance(native_result, dict)
             else {}
         )
-        validate_harness_runtime_telemetry(
-            cfg.policy_mode,
-            runtime_telemetry,
-            configured_provider=harness_route["provider"],
-            configured_model=harness_route["model"],
-        )
+        telemetry_validation_error = None
+        try:
+            validate_harness_runtime_telemetry(
+                cfg.policy_mode,
+                runtime_telemetry,
+                configured_provider=harness_route["provider"],
+                configured_model=harness_route["model"],
+                require_all_response_provenance=cfg.measurement_kind != "diagnostic",
+            )
+        except RuntimeError as exc:
+            if cfg.measurement_kind != "diagnostic":
+                raise
+            telemetry_validation_error = str(exc)
         # Record the REAL terminal status (incl. "timeout") AND the wall-clock cost in the card -> jsonl.
         # wall_seconds is the discriminating signal once capability saturates: a completion-recognized clean
         # stop (status="stopped" well under the budget) vs a churn-to-timeout shows up here, not in capability.
@@ -432,9 +521,13 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
             configured_policy_mode=cfg.policy_mode,
         )
     elif side == "bare":
-        bare = build_bare_runner(cfg)            # builds its own stripped-Mythic dispatcher (all callbacks)
+        telemetry_validation_error = None
+        bare = build_bare_runner(
+            cfg,
+            require_bloodhound=scenario_name in _GATE1P_PRIMARY_SCENARIOS,
+        )
         result = bare.run(scn.objective)
-        card = bare_runner.score_bare_run(result, scn, probes)
+        card = bare_runner.score_bare_run(result, scn, probes, evaluator_clean_stop=None)
     else:
         raise SystemExit("--side must be harness|bare")
 
@@ -453,6 +546,20 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
         card.model_provider = str(_defs.get("provider") or "")
         card.model_id = str(_defs.get("model") or "")
     _now = time.time()
+    cost_countable = {
+        "tool_calls": side == "bare" or "transactions" in runtime_telemetry,
+        "model_calls": side == "bare" or "model_calls" in runtime_telemetry,
+        "total_tokens": (
+            bool(getattr(locals().get("result"), "total_tokens", 0))
+            if side == "bare"
+            else "total_tokens" in runtime_telemetry
+        ),
+        "wall_seconds": True,
+    }
+    model_route = {
+        "provider": _defs.get("provider"),
+        "model": _defs.get("model"),
+    }
     rec = {"side": side, "scenario": scenario_name,
            "model": _defs.get("model"), "provider": _defs.get("provider"),
            "policy_mode": card.policy_mode,
@@ -468,6 +575,20 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
            "semantic_policy_coverage": card.semantic_policy_coverage,
            "effective_backends": list(card.effective_backends),
            "effective_backend_requests": list(card.effective_backend_requests),
+           "measurement_kind": cfg.measurement_kind,
+           "protocol": episode_protocol_snapshot(
+               cfg,
+               side=side,
+               scenario_name=scenario_name,
+               model_route=model_route,
+           ),
+           "countability": measurement_dimensions(
+               card,
+               measurement_kind=cfg.measurement_kind,
+               cost_countable=cost_countable,
+           ),
+           "cost_countable": cost_countable,
+           "telemetry_validation_error": telemetry_validation_error,
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
@@ -519,9 +640,16 @@ def run_side(cfg: Config, side: str, scenario_name: str) -> ScoreCard:
     return card
 
 
-def build_bare_runner(cfg: Config) -> bare_runner.BareModelRunner:
-    d = live_seams.load_sage_defaults()
-    model_fn = live_seams.make_model_fn(d["provider"], d["model"], api_key=d["api_key"], base_url=d["base_url"])
+def build_bare_runner(cfg: Config, *, require_bloodhound: bool = False) -> bare_runner.BareModelRunner:
+    route = _resolved_harness_model_route(cfg)
+    if not route.get("provider") or not route.get("model"):
+        raise RuntimeError("the shared Gate 1P provider/model route is unavailable")
+    model_fn = live_seams.make_model_fn(
+        route["provider"],
+        route["model"],
+        api_key=route["api_key"],
+        base_url=route["api_endpoint"],
+    )
     # Bare uses the SAME Mythic interface as Sage (enumerate payloads -> commands -> args -> task), via the
     # STRIPPED (Sage-free) toolset — NOT a hardcoded Apollo command list. The dispatcher routes the model's
     # tool calls straight to the raw Mythic SDK. No step cap (cfg.max_steps=0); solve_timeout is a
@@ -532,6 +660,11 @@ def build_bare_runner(cfg: Config) -> bare_runner.BareModelRunner:
     # BloodHound: discover EVERY MCP tool dynamically (not hardcoded). Raw external tool — Sage's
     # BloodHound *agent* (ingest reconciliation, collect-once gate, graph-fact injection) stays excluded.
     bh_specs, bh_registry = bare_bloodhound.load_bloodhound_mcp_tools()
+    if require_bloodhound and not bh_specs:
+        raise RuntimeError(
+            "the true-naive Gate 1P arm requires raw BloodHound MCP tools; "
+            "set SAGE_BLOODHOUND_MCP_DIR and verify discovery"
+        )
     bh_exec = bare_bloodhound.make_bloodhound_dispatcher(bh_registry)
     print(f"[bare] toolset: {len(bare_mythic_tools.TOOLS)} Mythic + {len(bh_specs)} BloodHound MCP tools", flush=True)
 
@@ -564,14 +697,18 @@ def compare(cfg: Config, scenario_name: str) -> None:
         rec = json.loads(line)
         if rec.get("scenario") != scenario_name:
             continue
+        if scenario_name in _GATE1P_PRIMARY_SCENARIOS and rec.get("measurement_kind") != "row":
+            continue
         card = ScoreCard(**rec["card"])
+        card.cost_countable = dict(rec.get("cost_countable") or {})
         (harness if rec["side"] == "harness" else bare).append(card)
     if not bare or not harness:
         raise SystemExit(f"need >=1 bare and >=1 harness record for {scenario_name} "
                          f"(have bare={len(bare)} harness={len(harness)})")
     cmp = bare_runner.compare_bare_vs_harness(scenario_name, bare, harness)
     print(f"[{scenario_name}] verdict={cmp.verdict} delta={cmp.delta:+.3f} "
-          f"(harness={cmp.harness_capability:.3f} bare={cmp.bare_capability:.3f} mde={cmp.min_detectable_effect:.3f})")
+          f"(harness={cmp.harness_objective_success_rate:.3f} "
+          f"bare={cmp.bare_objective_success_rate:.3f} mde={cmp.min_detectable_effect:.3f})")
 
 
 def main(argv=None) -> int:
@@ -593,6 +730,12 @@ def main(argv=None) -> int:
                    help="explicit harness model ID; required for controlled multi-model runs")
     r.add_argument("--null-model", action="store_true",
                    help="headless ablation: disable the policy model after Model initialization")
+    r.add_argument("--measurement-kind", choices=["legacy", "diagnostic", "row"], default="legacy",
+                   help="Gate 1P admission class; the approved next action is diagnostic")
+    r.add_argument("--protocol-id", default=None,
+                   help="concise prospective protocol identity for diagnostic/row attempts")
+    r.add_argument("--source-version", default=None,
+                   help="exact tested source version; may also come from SAGE_EVAL_SOURCE_VERSION")
     r.add_argument("--da-settle-timeout", type=int, default=None,
                    help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
@@ -644,6 +787,20 @@ def main(argv=None) -> int:
         cfg.model_id = args.model
     if getattr(args, "null_model", False):
         cfg.null_model = True
+    if getattr(args, "measurement_kind", None):
+        cfg.measurement_kind = args.measurement_kind
+    if getattr(args, "protocol_id", None):
+        cfg.protocol_id = args.protocol_id
+    if getattr(args, "source_version", None):
+        cfg.source_version = args.source_version
+
+    if cfg.measurement_kind == "diagnostic":
+        if args.scenario != "single-hop-system" or args.side != "harness":
+            ap.error("the approved Gate 1P diagnostic is exactly harness/single-hop-system")
+        if not cfg.protocol_id:
+            ap.error("--protocol-id is required for the Gate 1P diagnostic")
+    if cfg.measurement_kind == "row" and args.scenario in _GATE1P_PRIMARY_SCENARIOS:
+        ap.error("Gate 1P row mode is blocked pending the approved diagnostic-derived observer repair")
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
@@ -657,6 +814,7 @@ def main(argv=None) -> int:
         print(f"  probes (all collection-independent): KRBTGT_DUMPED (Mythic loot), "
               f"DA_CHILD/OBJECTIVE (AD-direct: live DC Domain Admins vs post-reset baseline)")
         print(f"  objective: {_scenario(cfg, args.scenario).objective}")
+        print(f"  measurement: {cfg.measurement_kind} protocol={cfg.protocol_id or 'none'}")
         if cfg.null_model:
             print("  treatment: null policy model (headless; no policy inference calls)")
         return 0

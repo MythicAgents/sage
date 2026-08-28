@@ -1,8 +1,8 @@
-"""Offline tests for the stripped bare Mythic toolset + the upgraded bare runner loop.
+"""Offline tests for the true-naive raw Mythic toolset + the upgraded bare runner loop.
 
 The live Mythic SDK calls are validated on the lab; these pin the pure parts: the tool schema set
-(discovery/tasking/tools-folder present, NO hardcoded commands, NO excluded secret sauce), dispatch
-routing, tools-folder discovery, and the runner's unlimited-steps / wall-clock / live-watch behavior.
+(discovery/tasking present, NO hardcoded commands, NO Sage-local assets or secret sauce), dispatch
+routing, and the runner's unlimited-steps / wall-clock / live-watch behavior.
 """
 import sys
 from pathlib import Path
@@ -15,9 +15,9 @@ import bare_runner  # noqa: E402
 
 def test_bare_tool_specs_are_mythic_not_commands():
     names = {s["function"]["name"] for s in bmt.bare_tool_specs()}
-    # Sage-style discovery + tasking + bring-your-own-tooling are present...
+    # Raw Mythic discovery + tasking are present...
     assert {"list_callbacks", "get_payload_types", "get_commands", "issue_command", "get_task_history",
-            "get_task_output", "list_tools_folder", "register_tool", "upload_file_to_target",
+            "get_task_output", "get_uploaded_files",
             "read_credentials", "add_credential"} <= names
     # ...and Apollo commands are NOT tools anymore (the model discovers them via get_commands).
     assert "mimikatz" not in names and "shell" not in names and "powerpick" not in names
@@ -32,6 +32,8 @@ def test_excluded_secret_sauce_not_exposed():
                   "execute_capability", "build_capability_commands", "ingest_collection",
                   "check_callback_alive", "assess_callback_liveness", "download_tool"):
         assert sauce not in names, f"{sauce} is harness secret sauce and must not reach the bare model"
+    for local_surface in ("list_tools_folder", "register_tool", "upload_file_to_target", "sandbox_exec"):
+        assert local_surface not in names, f"{local_surface} exposes Sage-local assets or helpers"
     assert "list_callbacks" in names   # raw callback listing IS provided (fixes the cb-pivot gap)
 
 
@@ -40,12 +42,14 @@ def test_dispatcher_unknown_tool_is_graceful():
     assert "[unknown tool]" in ex({"tool": "does_not_exist", "args": {}})
 
 
-def test_list_tools_folder_local(tmp_path, monkeypatch):
-    (tmp_path / "Rubeus.exe").write_bytes(b"MZ")
-    (tmp_path / "SharpHound.exe").write_bytes(b"MZ")
-    (tmp_path / ".keep").write_bytes(b"")
-    monkeypatch.setattr(bmt, "TOOLS_DIR", tmp_path)
-    assert bmt.list_tools_folder_local() == ["Rubeus.exe", "SharpHound.exe"]   # sorted, hidden excluded
+def test_naive_profile_has_no_local_asset_path_symbol():
+    assert bmt.BARE_TOOL_PROFILE == "naive-raw-mythic-bloodhound-v1"
+    assert not hasattr(bmt, "TOOLS_DIR")
+    prompt = bare_runner.DEFAULT_SYSTEM.casefold()
+    assert "list_tools_folder" not in prompt
+    assert "register_tool" not in prompt
+    assert "upload_file_to_target" not in prompt
+    assert "ttp" not in prompt
 
 
 def test_runner_unlimited_runs_past_old_cap():

@@ -37,20 +37,17 @@ def test_load_is_graceful_noop_when_dir_missing(monkeypatch):
     assert specs == [] and registry == {}
 
 
-def test_env_var_overrides_hardcoded_default(monkeypatch):
+def test_explicit_env_var_builds_connection(monkeypatch):
     monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", "/override/dir")
-    monkeypatch.setattr(bb, "_DEFAULT_BLOODHOUND_MCP_DIR", "/default/dir")
     monkeypatch.setattr(bb.os.path, "isdir", lambda p: True)
     conns = bb._connections()
     assert conns[bb.BLOODHOUND_SERVER]["args"] == ["--directory", "/override/dir", "run", "main.py"]
 
 
-def test_hardcoded_default_used_when_env_absent(monkeypatch):
+def test_missing_env_fails_closed_without_checkout_guess(monkeypatch):
     monkeypatch.delenv("SAGE_BLOODHOUND_MCP_DIR", raising=False)
-    monkeypatch.setattr(bb, "_DEFAULT_BLOODHOUND_MCP_DIR", "/default/dir")
     monkeypatch.setattr(bb.os.path, "isdir", lambda p: True)
-    conns = bb._connections()
-    assert conns[bb.BLOODHOUND_SERVER]["cwd"] == "/default/dir"
+    assert bb._connections() is None
 
 
 def test_dispatcher_falls_through_for_non_bloodhound_tool():

@@ -1,6 +1,7 @@
 ---
 name: Sage Output and Reporting Reference
 category: discovery
+production_visible: false
 subcategories: [sage-output, reporting, operator-interface, structured-output]
 tradecraft_tags: [sage, output, reporting, operator, structured, mythic, reference]
 mitre_attack: []

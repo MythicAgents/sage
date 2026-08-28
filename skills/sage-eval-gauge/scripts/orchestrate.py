@@ -27,10 +27,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[3]            # repository root
-WORKSPACE = ROOT.parent                               # sibling checkouts beside Sage
 PAYLOAD = ROOT / "Payload_Type" / "sage"
 PY = str(ROOT / ".venv" / "bin" / "python")
-BH = os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or str(WORKSPACE / "bloodhound_mcp")
+BH = str(os.environ.get("SAGE_BLOODHOUND_MCP_DIR") or "").strip()
 DEFAULT_SNAPSHOT = "sage-seed-apollo-staged-20260710"
 DEFAULT_RETAINED_CALLBACK_CONFIG = (
     ROOT / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
@@ -900,7 +899,8 @@ def full_reset_and_ready(
         timeout=1200,
         env=range_env,
     )
-    return None, discover_callbacks(foothold)
+    callback_id = discover_callbacks(foothold)
+    return None, callback_id
 
 
 # Seconds the per-run gauge SUBPROCESS may take ON TOP OF the solve itself — covers reset-independent
@@ -926,7 +926,10 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              phase7_attempt_index: int | None = None,
              phase8_policy_arm: str | None = None,
              phase8_planned_row_id: str | None = None,
-             phase8_attempt_index: int | None = None) -> None:
+             phase8_attempt_index: int | None = None,
+             measurement_kind: str = "legacy",
+             protocol_id: str | None = None,
+             source_version: str | None = None) -> None:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
@@ -966,6 +969,12 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         argv.extend(["--model", model])
     if null_model:
         argv.append("--null-model")
+    if measurement_kind != "legacy":
+        argv.extend(["--measurement-kind", measurement_kind])
+    if protocol_id:
+        argv.extend(["--protocol-id", protocol_id])
+    if source_version:
+        argv.extend(["--source-version", source_version])
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -1021,6 +1030,9 @@ def compare(scenario: str) -> None:
 
 def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=None, model=None,
                   null_model=False,
+                  measurement_kind="legacy",
+                  protocol_id=None,
+                  source_version=None,
                   snapshot=DEFAULT_SNAPSHOT,
                   retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG,
                   foothold: FootholdSpec | None = None,
@@ -1095,8 +1107,12 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   f"--policy-mode {policy_mode}"
                   f"{f' --provider {provider}' if provider else ''}"
                   f"{f' --model {model}' if model else ''}"
-                  f"{' --null-model' if null_model else ''}")
-    print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
+                  f"{' --null-model' if null_model else ''}"
+                  f"{f' --measurement-kind {measurement_kind}' if measurement_kind != 'legacy' else ''}"
+                  f"{f' --protocol-id {protocol_id}' if protocol_id else ''}"
+                  f"{f' --source-version {source_version}' if source_version else ''}")
+    if measurement_kind != "diagnostic":
+        print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
     print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
 
@@ -1106,6 +1122,13 @@ def main(argv=None) -> int:
     ap.add_argument("--side", choices=["harness", "bare"], default=None,
                     help="run only this side; omit to sweep harness+bare then compare")
     ap.add_argument("--seeds", type=int, default=1)
+    ap.add_argument(
+        "--gate1p-stage-a-diagnostic",
+        action="store_true",
+        help="run exactly one non-countable shipping-Sage single-hop-system production-shape diagnostic",
+    )
+    ap.add_argument("--source-version", default=None,
+                    help="exact source version recorded in the diagnostic protocol snapshot")
     ap.add_argument("--solve-timeout", type=int, default=1800,
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
                          "to cover this + post-solve scoring overhead, so long solves are not killed early.")
@@ -1250,6 +1273,23 @@ def main(argv=None) -> int:
         ap.error("--null-model-factorial cannot be combined with a named model treatment")
     policy_modes = ["symbolic", "llm", "hybrid"] if args.null_model_factorial else [policy_mode]
     null_model = bool(args.null_model or args.null_model_factorial)
+    if args.gate1p_stage_a_diagnostic:
+        if args.scenario != "single-hop-system" or args.side != "harness" or args.seeds != 1:
+            ap.error(
+                "--gate1p-stage-a-diagnostic requires --scenario single-hop-system "
+                "--side harness --seeds 1"
+            )
+        if policy_mode != "llm" or null_model:
+            ap.error("the Stage A diagnostic uses the shipping llm policy, not an ablation")
+        if not BH:
+            ap.error(
+                "SAGE_BLOODHOUND_MCP_DIR is required for the Gate 1P diagnostic; "
+                "set it to the explicit BloodHound MCP checkout"
+            )
+        if not Path(BH).is_dir():
+            ap.error(
+                "SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the Gate 1P diagnostic"
+            )
     route_env = None
     if args.treatment:
         route = load_treatment_route(args.route_env, args.treatment)
@@ -1265,6 +1305,9 @@ def main(argv=None) -> int:
             _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
                           args.seeds, args.solve_timeout, selected_mode,
                           args.provider, args.model, null_model,
+                          "diagnostic" if args.gate1p_stage_a_diagnostic else "legacy",
+                          "gate1p-stage-a-diagnostic-v1" if args.gate1p_stage_a_diagnostic else None,
+                          args.source_version,
                           args.snapshot, args.retained_callback_config, foothold,
                           args.ludus_range_id, args.ludus_mcp_server)
             print(f"\n  NOTE: Sage policy mode -> {selected_mode}; null_model={null_model}.")
@@ -1278,7 +1321,7 @@ def main(argv=None) -> int:
         args.ludus_mcp_server,
     )
     for selected_mode in policy_modes:
-        for _ in range(args.seeds):
+        for _seed_index in range(args.seeds):
             sides = ["harness"] if args.null_model_factorial else (
                 [args.side] if args.side else ["harness", "bare"]
             )
@@ -1299,8 +1342,17 @@ def main(argv=None) -> int:
                          phase7_attempt_index=args.phase7_attempt_index,
                          phase8_policy_arm=args.phase8_policy_arm,
                          phase8_planned_row_id=args.phase8_planned_row_id,
-                         phase8_attempt_index=args.phase8_attempt_index)
-    if not args.side and not args.null_model_factorial:
+                         phase8_attempt_index=args.phase8_attempt_index,
+                         measurement_kind=(
+                             "diagnostic" if args.gate1p_stage_a_diagnostic else "legacy"
+                         ),
+                         protocol_id=(
+                             "gate1p-stage-a-diagnostic-v1"
+                             if args.gate1p_stage_a_diagnostic
+                             else None
+                         ),
+                         source_version=args.source_version)
+    if not args.side and not args.null_model_factorial and not args.gate1p_stage_a_diagnostic:
         compare(args.scenario)
     return 0
 

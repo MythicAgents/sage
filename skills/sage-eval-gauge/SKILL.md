@@ -17,6 +17,26 @@ A measurement instrument: VERIFIED milestones (ground truth) → a vector `Score
 `range_state` (C1 ledger ground truth) · `process_state` (C1b tradecraft + unclassified_rate) · `fitness` (C2 vector; carries `objective_clean_stop` + `wall_seconds`) · `reliability` (C3 noise floor) · `scenarios` · `gate_experiment` · `gate_live` · `hermetic` · `policy_replay_calibration` · `policy_replay_corpus` · `policy_replay_selector_experiment` · `target_disambiguation_contract` · `target_value_census` · `target_value_proofability` · `gpo_dc_scope_late_blocker_contract` · `gpo_dc_scope_late_blocker_authorization` · `gpo_dc_scope_live_surface` · `gpo_dc_scope_canary` · `gpo_dc_scope_matrix` · `probes` · `bare_runner` · `live_runner` · `live_seams` · `run_gauge_live`. The harness side creates a fresh locked Mythic v4 Sage chat channel per run; no Sage callback is required.
 
 ## Run
+
+### Gate 1P Stage A
+
+Gate 1P separates the **Sage execution plane** from the **evaluation plane**. Sage and Sage execution workers
+must send every target-facing action through Mythic payload callbacks. A separately controlled evaluator may
+communicate directly with the range over any protocol required by its frozen evaluation contract; protocol is
+not the authority boundary. Keep the outcome oracle observation-only, keep any authorized reset/readiness
+controller separate, use evaluator-only credentials, and admit only objective range-state evidence that was not
+produced by Sage-local target I/O.
+
+The currently supported Gate 1P action is one prospectively non-countable shipping-Sage diagnostic. It captures
+the production response shape and tests a result-based `SYSTEM` outcome oracle; it is not a bare-vs-harness row,
+cannot support promotion, and does not authorize a live run by itself. Preview it without touching the range:
+
+`.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario single-hop-system --side harness --seeds 1 --gate1p-stage-a-diagnostic --source-version <version>`
+
+Add `--go` only under explicit live authority for this diagnostic. Countable Gate 1P `row` mode remains blocked
+until the diagnostic establishes the real terminal-response shape and a derived clean-stop observer is implemented
+and independently verified. Do not run the bare arm or expand the matrix during Stage A.
+
 - Offline tests: `../../.venv/bin/python -m pytest tests/ -q`
 - Gate-experiment dry-run (synthetic, safe): `../../.venv/bin/python -m ai.hillclimb gate-experiment --dry-run`
 - Operator replay fixture validation (safe): `../../.venv/bin/python -m ai.hillclimb operator-replay validate`
@@ -126,7 +146,9 @@ operation, retry count, current blocker if any, and separate engineering/debug E
 Power down retired or burned purpose ranges once their artifacts are preserved.
 
 ## Gotchas
-- **No `--model`:** the bare model reads Sage's own model from `skills/sage-callback-bootstrap/.env` (provider=OpenAI, gpt-5.5-cyber-preview) for a fair same-model comparison.
+- **Route symmetry:** a later bare-vs-harness comparison must resolve the same provider, model, API route, and
+  behavior-affecting configuration for both sides and record that identity in the per-run protocol snapshot.
+  Gate 1P Stage A is shipping-Sage diagnostic only, so it does not invoke a bare model.
 - **Operator replay is offline only:** `operator-replay run` calls models only when `--dry-run` is omitted; it never touches GOAD, Mythic, BloodHound, or Sage callbacks. The live canary remains `run_gauge_live.py` / `orchestrate.py`.
 - **Token/config seam (live gate):** the harness is only a Mythic CLIENT — env it sets never reaches the running Sage. So the gate's reset restarts Sage with `SAGE_ENGAGEMENT_ID=<run token>` (+ config env) via `full_reset_and_ready(restart_env=...)` → `sage_restart.sh KEY=VAL` overrides. Without that, ground truth reads an empty ledger and `gate_experiment` returns **INVALID** (fail-loud, by design). Which config keys change behavior depends on what Sage reads at startup; `SAGE_ENGAGEMENT_ID` always takes effect.
 - **Structured target matching must be exact:** parse semicolon-delimited key/value fields for capability targets,

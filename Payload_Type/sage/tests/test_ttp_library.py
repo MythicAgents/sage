@@ -62,6 +62,78 @@ def test_match_goal():
     assert ttp_library.match_goal("enumerate the active directory domain"), "expected matches"
 
 
+def test_production_visibility_closes_every_catalog_retrieval_path(tmp_path, monkeypatch):
+    hidden = tmp_path / "benchmark-answer-key.md"
+    hidden.write_text(
+        "---\nname: Benchmark Answer Key\ncategory: route\nproduction_visible: false\n"
+        "tradecraft_tags: [named-needle]\n---\nbody\n## Full Reference\nsecret route\n",
+        encoding="utf-8",
+    )
+    ordinary = tmp_path / "ordinary-tool.md"
+    ordinary.write_text(
+        "---\nname: Ordinary Tool\ncategory: generic\ntradecraft_tags: [named-needle]\n"
+        "related_ttps: [benchmark-answer-key, missing-reference]\n"
+        "alternatives: [benchmark-answer-key]\n"
+        "---\nbody\n## Full Reference\nordinary reference\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ttp_library, "TTP_DIR", tmp_path)
+
+    assert ttp_library.load_ttp("benchmark-answer-key") == (None, None)
+    assert "benchmark-answer-key" not in {slug for slug, _, _ in ttp_library.iter_ttps()}
+    assert all(
+        entry["slug"] != "benchmark-answer-key"
+        for entries in ttp_library.list_categories().values()
+        for entry in entries
+    )
+    assert [
+        slug
+        for slug, _ in ttp_library.match_goal("benchmark answer key named needle", limit=10)
+    ] == ["ordinary-tool"]
+
+    frontmatter, body = ttp_library.load_ttp("ordinary-tool")
+    assert frontmatter["related_ttps"] == ["missing-reference"]
+    assert frontmatter["alternatives"] == []
+    assert ttp_library.full_reference(body).endswith("ordinary reference")
+
+
+def test_benchmark_reference_files_remain_stored_but_not_production_visible():
+    benchmark_slugs = {
+        "sharp-trust-walker",
+        "goadabuse-reference",
+        "post-exploitation-playbook",
+        "bloodhound-attack-path-loop",
+        "sharp-output-format",
+    }
+    assert benchmark_slugs.isdisjoint(slug for slug, _, _ in ttp_library.iter_ttps())
+    for slug in benchmark_slugs:
+        stored = ttp_library.TTP_DIR / f"{slug}.md"
+        frontmatter, body = ttp_library.parse_markdown(stored.read_text(encoding="utf-8"))
+        assert frontmatter["production_visible"] is False
+        assert body
+        assert ttp_library.load_ttp(slug) == (None, None)
+
+
+def test_mythic_operator_prompt_is_route_neutral_but_keeps_safety_invariants():
+    prompt_path = Path(__file__).resolve().parents[1] / "prompts" / "mythic_operator.md"
+    prompt = prompt_path.read_text(encoding="utf-8").lower()
+    assert "environment.exit()" in prompt
+    assert "child-process isolation" in prompt
+    assert "report it as unavailable/blocking" in prompt
+    assert "not authorization to move laterally" in prompt
+    for route_priming in (
+        "sharp-trust-walker",
+        "sharphound",
+        "azurehound",
+        "sharpgpoabuse",
+        "rubeus",
+        "certify",
+        "ghostpack",
+        "gpo/acl/delegation/adcs/laps",
+    ):
+        assert route_priming not in prompt
+
+
 def test_per_agent_files_retired():
     # The per-agent mythic_agents/*.md files were RETIRED 2026-06-05 (sage-tradecraft-doctrine ISC-13):
     # Sage operates ANY agent by SELF-DESCRIBING enumeration (get_all_commands_for_payloadtype now

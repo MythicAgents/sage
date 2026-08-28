@@ -1,6 +1,7 @@
 ---
 name: Trust Walker — Full Chain Reference
 category: delegation-abuse
+production_visible: false
 subcategories: [trust-walker, demo-chain, full-chain, rbcd-adcs-gpo]
 tradecraft_tags: [trust-walker, full-chain, demo, rbcd, adcs, gpo, delegation, reference]
 mitre_attack: []

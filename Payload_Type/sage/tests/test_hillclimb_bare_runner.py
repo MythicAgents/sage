@@ -5,6 +5,7 @@ comparator's noise-floor judgement. The LLM and Mythic are injected fakes — no
 """
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
@@ -22,8 +23,18 @@ def _gt(furthest):
     return GroundTruth("scn", ms, furthest)
 
 
-def _card(furthest):
-    return fitness.score(_RUN, _gt(furthest))
+def _comparison_card(success, *, clean_stop=True, capability=0.0, tool_calls=1, model_calls=1,
+                     total_tokens=10, wall_seconds=1.0, cost_countable=None):
+    return SimpleNamespace(
+        objective_proven=success,
+        clean_stop=clean_stop,
+        capability=capability,
+        tool_calls=tool_calls,
+        model_calls=model_calls,
+        total_tokens=total_tokens,
+        wall_seconds=wall_seconds,
+        cost_countable=cost_countable or {},
+    )
 
 
 def test_loop_runs_until_final():
@@ -64,21 +75,81 @@ def test_tool_error_is_captured_not_fatal():
 
 
 def test_score_bare_run_uses_probes():
-    scn = goad_scenarios()[1]
+    scn = goad_scenarios()[0]
     res = br.BareModelResult(objective="obj", steps=4, stopped="done")
     probes = {Milestone.GRAPH_COLLECTED: lambda: True, Milestone.SYSTEM_ON_HOST: lambda: True}
     card = br.score_bare_run(res, scn, probes)
     assert card.furthest_milestone == "SYSTEM_ON_HOST"
     assert card.substring_score == 0.0          # substring eval doesn't apply to a bare model
+    assert card.request_completed is True
+    assert card.clean_stop is False             # FINAL is not evaluator-owned clean-stop evidence
 
 
-def test_compare_harness_better_when_gap_exceeds_noise():
-    cmp = br.compare_bare_vs_harness("child-da", [_card(Milestone.GRAPH_COLLECTED)] * 3,
-                                     [_card(Milestone.KRBTGT_DUMPED)] * 3)
-    assert cmp.delta > 0 and cmp.real is True and cmp.verdict == "harness-better"
+def test_compare_harness_better_uses_binary_objective_not_route_ladder():
+    bare = [_comparison_card(False, capability=1.0)] * 10
+    harness = [_comparison_card(True, capability=0.0)] * 10
+    cmp = br.compare_bare_vs_harness("child-control", bare, harness)
+    assert cmp.delta == 1.0 and cmp.resolved is True and cmp.verdict == "harness-better"
+    assert cmp.bare_objective_success_rate == 0.0
+    assert cmp.harness_objective_success_rate == 1.0
 
 
-def test_compare_indistinguishable_when_equal():
-    cmp = br.compare_bare_vs_harness("child-da", [_card(Milestone.DA_CHILD)] * 3,
-                                     [_card(Milestone.DA_CHILD)] * 3)
-    assert cmp.delta == 0 and cmp.verdict == "indistinguishable"
+def test_compare_equal_n5_retains_uncertainty_instead_of_claiming_resolution():
+    cards = [_comparison_card(True)] * 5
+    cmp = br.compare_bare_vs_harness("child-control", cards, cards)
+    assert cmp.delta == 0
+    assert cmp.min_detectable_effect > 0
+    assert cmp.resolved is False
+    assert cmp.verdict == "indistinguishable-at-current-sample"
+
+
+def test_compare_reports_clean_stop_separately_from_binary_success():
+    unclean = [_comparison_card(True, clean_stop=False)] * 5
+    clean = [_comparison_card(True, clean_stop=True)] * 5
+    cmp = br.compare_bare_vs_harness("child-control", unclean, clean)
+    assert cmp.bare_objective_success_rate == 1.0
+    assert cmp.harness_objective_success_rate == 1.0
+    assert cmp.bare_clean_stop_rate == 0.0
+
+
+def test_cost_mean_is_unavailable_instead_of_silently_zero_when_not_countable():
+    cards = [_comparison_card(True, total_tokens=0)] * 2
+    cmp = br.compare_bare_vs_harness("child-control", cards, cards)
+    assert cmp.bare_cost_mean["total_tokens"] is None
+    explicit = [_comparison_card(True, total_tokens=0, cost_countable={
+        "tool_calls": True,
+        "model_calls": True,
+        "total_tokens": True,
+        "wall_seconds": True,
+    })] * 2
+    cmp = br.compare_bare_vs_harness("child-control", explicit, explicit)
+    assert cmp.bare_cost_mean["total_tokens"] == 0.0
+
+
+def test_bare_runner_records_model_calls_tokens_and_wall_time():
+    decisions = iter([
+        {
+            "tool": "x",
+            "args": {},
+            "_usage": {"input_tokens": 7, "output_tokens": 3},
+            "_backend": {
+                "effective_backend": "provider:model-v1",
+                "backend_provenance_source": "response_metadata.model_name",
+            },
+        },
+        {
+            "final": "done",
+            "_usage": {"total_tokens": 4},
+            "_backend": {
+                "effective_backend": "provider:model-v1",
+                "backend_provenance_source": "response_metadata.model_name",
+            },
+        },
+    ])
+    result = br.BareModelRunner(lambda *_args: next(decisions), lambda _call: "ok").run("obj")
+    assert result.steps == 1
+    assert result.model_calls == 2
+    assert result.total_tokens == 14
+    assert result.wall_seconds >= 0
+    assert len(result.effective_backend_requests) == 2
+    assert result.effective_backend_requests[1]["decision_id"] == "bare-model-call-2"

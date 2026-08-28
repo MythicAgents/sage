@@ -1,6 +1,7 @@
 import subprocess
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -348,6 +349,96 @@ def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
     foothold = orchestrate.FootholdSpec(password_env="SAGE_MEEREEN_JORAH_PASSWORD")
 
     assert foothold.launch_env()["SAGE_RUN_AS_PASSWORD"] == "jorah-password"
+
+
+def test_gate1p_diagnostic_run_side_threads_non_countable_protocol(monkeypatch):
+    seen = {}
+
+    def fake_run(name, argv, _cwd, _timeout, env=None):
+        del env
+        if name.startswith("gauge "):
+            seen["argv"] = list(argv)
+
+    def fake_full_reset_and_ready(**_kwargs):
+        return None, 7
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
+
+    orchestrate.run_side(
+        "single-hop-system",
+        "harness",
+        go=False,
+        solve_timeout=3600,
+        measurement_kind="diagnostic",
+        protocol_id="gate1p-stage-a-diagnostic-v1",
+        source_version="source-v1",
+    )
+
+    argv = seen["argv"]
+    assert argv[argv.index("--measurement-kind") + 1] == "diagnostic"
+    assert argv[argv.index("--protocol-id") + 1] == "gate1p-stage-a-diagnostic-v1"
+    assert argv[argv.index("--source-version") + 1] == "source-v1"
+    assert "--countable" not in argv
+
+
+def test_gate1p_diagnostic_cli_requires_explicit_bloodhound_dir():
+    env = dict(os.environ)
+    env.pop("SAGE_BLOODHOUND_MCP_DIR", None)
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "single-hop-system",
+            "--side",
+            "harness",
+            "--seeds",
+            "1",
+            "--gate1p-stage-a-diagnostic",
+            "--source-version",
+            "test-source",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "SAGE_BLOODHOUND_MCP_DIR is required" in result.stderr
+
+
+def test_gate1p_diagnostic_cli_dry_run_uses_explicit_bloodhound_dir(tmp_path):
+    bloodhound_dir = tmp_path / "bloodhound-mcp"
+    bloodhound_dir.mkdir()
+    env = {**os.environ, "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir)}
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "single-hop-system",
+            "--side",
+            "harness",
+            "--seeds",
+            "1",
+            "--gate1p-stage-a-diagnostic",
+            "--source-version",
+            "test-source",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert f"SAGE_BLOODHOUND_MCP_DIR={bloodhound_dir}" in result.stdout
+    assert f"uv --directory {bloodhound_dir}" in result.stdout
+    assert "--measurement-kind diagnostic" in result.stdout
+    assert "--protocol-id gate1p-stage-a-diagnostic-v1" in result.stdout
+    assert "--source-version test-source" in result.stdout
 
 
 def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):

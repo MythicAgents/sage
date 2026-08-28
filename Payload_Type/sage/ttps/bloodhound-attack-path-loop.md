@@ -1,6 +1,7 @@
 ---
 name: BloodHound Attack-Path Loop
 category: recon
+production_visible: false
 subcategories: [attack-path-analysis, workflow, playbook, bloodhound, graph-reasoning]
 tradecraft_tags: [bloodhound, attack-path, workflow, playbook, sharphound, graph-reasoning, loop, autonomous, mcp]
 mitre_attack: []
