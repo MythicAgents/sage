@@ -53,6 +53,18 @@ may resume once only when its cleanup disposition is exact and complete. A naive
 retained shipping lifecycle; malformed cleanup, result-ledger contamination, already-started current arm, or a
 second recovery for the same arm fails closed before another reset.
 
+The true-naive runtime tool surface is a strict subset of shipping Sage: 13 mapped raw Mythic tools and the exact
+nine-name shipping BloodHound allowlist, with no exceptions. The preflight validates that parity, all installed SDK
+call signatures/async kinds, and the exact four raw GraphQL documents against the live schema before reset. Raw
+Cypher, MCP file upload, composite BloodHound management, direct Mythic file download, and the currently broken
+shared payload-download path are not exposed to the naive model.
+
+**Prospective stop rule:** retain an isolated `[tool error]`, `[bloodhound tool error]`, or `[unknown tool]` as a
+recoverable model-visible observation and continue within the frozen wall/token/action budget. Immediate stop is
+reserved for safety/authority violation, wrong target/route/model, corrupt start, a declared budget or stop-loss,
+uncontrolled target activity, or loss of interpretable evidence. Post-run admission may still invalidate an unfair
+row. Pair 016 remains burned under its historical protocol; this rule does not retry or reinterpret it.
+
 - Offline tests: `../../.venv/bin/python -m pytest tests/ -q`
 - Gate-experiment dry-run (synthetic, safe): `../../.venv/bin/python -m ai.hillclimb gate-experiment --dry-run`
 - Operator replay fixture validation (safe): `../../.venv/bin/python -m ai.hillclimb operator-replay validate`

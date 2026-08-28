@@ -1,8 +1,8 @@
-"""Dynamic BloodHound MCP tools for the BARE model — ALL tools the MCP server exposes, discovered at
-runtime (not hardcoded).
+"""Dynamic BloodHound MCP tools for the BARE model, discovered at runtime.
 
-This gives the bare model the SAME external attack-graph tool Sage uses (BloodHound is a standard
-offensive tool, not Sage's invention). What stays EXCLUDED is Sage's BloodHound *agent* — the
+This gives the bare model the SAME LLM-visible external attack-graph surface shipping Sage uses.
+Server tools outside that shared allowlist are withheld from both arms. What stays EXCLUDED is
+Sage's BloodHound *agent* — the
 `ingest_collection` reconciliation, collect-once gate, graph-fact injection, dedicated-agent
 orchestration — i.e. the harness value, not the tool.
 
@@ -22,6 +22,11 @@ import asyncio
 import json
 import os
 from typing import Any, Callable
+
+try:
+    from ..comparison_tool_surface import SHIPPING_BLOODHOUND_TOOL_NAMES
+except ImportError:  # direct module import in focused tests
+    from ai.comparison_tool_surface import SHIPPING_BLOODHOUND_TOOL_NAMES  # type: ignore
 
 BLOODHOUND_SERVER = "BloodHound"
 
@@ -66,9 +71,30 @@ def tool_spec(tool: Any) -> dict:
                          "parameters": _params_from_tool(tool)}}
 
 
+def admitted_bloodhound_tools(tools: list[Any]) -> list[Any]:
+    """Apply the same exact-name, unique-name allowlist as shipping Sage."""
+    name_counts: dict[str, int] = {}
+    for tool in tools:
+        name = getattr(tool, "name", None)
+        if isinstance(name, str) and name and name == name.strip():
+            name_counts[name] = name_counts.get(name, 0) + 1
+    return [
+        tool
+        for tool in tools
+        if (
+            isinstance(getattr(tool, "name", None), str)
+            and name_counts.get(tool.name) == 1
+            and tool.name in SHIPPING_BLOODHOUND_TOOL_NAMES
+        )
+    ]
+
+
 def load_bloodhound_mcp_tools() -> tuple[list[dict], dict]:
-    """Discover EVERY BloodHound MCP tool. Returns (specs, {name: langchain_tool}).
-    Empty if not configured or connection fails; the live Gate 1P builder rejects that state."""
+    """Discover and admit the exact shipping-Sage BloodHound surface.
+
+    Duplicate, malformed, and non-shipping names fail closed by being withheld. Empty discovery is
+    returned when unavailable; the live Gate 1P builder rejects that state.
+    """
     conns = _connections()
     if conns is None:
         return [], {}
@@ -79,7 +105,8 @@ def load_bloodhound_mcp_tools() -> tuple[list[dict], dict]:
     except Exception as e:
         print(f"[bare] BloodHound MCP unavailable ({type(e).__name__}: {e}) — running without it", flush=True)
         return [], {}
-    return [tool_spec(t) for t in tools], {t.name: t for t in tools}
+    admitted = admitted_bloodhound_tools(list(tools))
+    return [tool_spec(t) for t in admitted], {t.name: t for t in admitted}
 
 
 def make_bloodhound_dispatcher(registry: dict) -> Callable[[dict], str | None]:

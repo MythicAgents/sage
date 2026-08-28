@@ -126,6 +126,12 @@ Classify work by the decision it supports, not by whether a path or task contain
   mechanism rejection or two consecutive authorized spends with zero usable exploratory/countable rows, stop and
   audit the measurement objective, production boundary, and governing instructions before adding evidence
   machinery or commissioning another candidate review.
+- During a live `development_measurement`, distinguish **stopping execution** from **invalidating evidence**. An
+  isolated recoverable tool/adapter error should be retained as an observation and the bounded arm should continue;
+  decide fairness and countability after the run. Stop immediately only for a safety or authority violation, wrong
+  target/route/model, corrupt start, declared wall/token/stop-loss boundary, uncontrolled target activity, or loss
+  of interpretable evidence. A recoverable error that makes the comparison unfair may still invalidate the row,
+  but invalidation is not a reason to interrupt before the model can recover.
 
 ## Repo Map
 

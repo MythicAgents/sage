@@ -63,6 +63,34 @@ DEFAULT_SYSTEM = (
     "assistance — plan and act yourself."
 )
 
+# Per-tool adapter failures are model-visible observations, not experimenter stop signals.  The
+# runner still stops immediately for the existing wall/token/measurement/model/operator boundaries;
+# safety, authority, route, and uncontrolled-target stop-losses remain the outer coordinator's job.
+RECOVERABLE_TOOL_ERROR_PREFIXES = {
+    "mythic": "[tool error]",
+    "bloodhound": "[bloodhound tool error]",
+    "unknown_tool": "[unknown tool]",
+}
+IMMEDIATE_RUNNER_STOP_STATES = frozenset({
+    "error",
+    "interrupted",
+    "measurement_error",
+    "timeout",
+    "token_budget_exhausted",
+    "token_budget_overshoot",
+})
+
+
+def recoverable_tool_error_category(observation: object) -> str | None:
+    """Classify the bounded adapter-error markers emitted by the raw dispatchers."""
+    if not isinstance(observation, str):
+        return None
+    return next(
+        (category for category, prefix in RECOVERABLE_TOOL_ERROR_PREFIXES.items()
+         if observation.startswith(prefix)),
+        None,
+    )
+
 
 @dataclass
 class BareModelResult:
@@ -80,6 +108,7 @@ class BareModelResult:
     token_usage_complete: bool = False
     token_budget_exhausted: bool = False
     token_budget_overshoot: bool = False
+    recoverable_tool_errors: list = field(default_factory=list)
 
 
 class BareModelRunner:
@@ -128,6 +157,7 @@ class BareModelRunner:
         response_records: list[dict] = []
         final_txt = ""
         objective_recognized = False
+        recoverable_tool_errors: list[dict[str, object]] = []
         token_budget = TokenBudget(ceiling=self.token_ceiling or (2**63 - 1))
         log(f"▶ BARE START — objective: {objective}")
         while True:
@@ -199,6 +229,16 @@ class BareModelRunner:
                 break
             except Exception as exc:
                 obs = f"[tool error] {type(exc).__name__}: {exc}"
+            error_category = recoverable_tool_error_category(obs)
+            if error_category is not None:
+                recoverable_tool_errors.append({
+                    "step": len(history) + 1,
+                    "tool": str(decision.get("tool") or ""),
+                    "category": error_category,
+                })
+                log(
+                    f"⚠ recoverable {error_category} tool error; continuing within the frozen budget"
+                )
             log(f"🔧 step {step} OBSERVATION: {str(obs)[:500]}")
             history.append({"call": decision, "obs": obs})
         log(f"● BARE END — stopped={stopped} steps={len(history)}")
@@ -217,6 +257,7 @@ class BareModelRunner:
             token_usage_complete=token_budget.usage_complete,
             token_budget_exhausted=bool(self.token_ceiling is not None and token_budget.exhausted),
             token_budget_overshoot=bool(self.token_ceiling is not None and token_budget.overshoot),
+            recoverable_tool_errors=recoverable_tool_errors,
         )
 
 

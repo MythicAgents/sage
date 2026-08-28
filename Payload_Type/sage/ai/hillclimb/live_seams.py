@@ -834,6 +834,10 @@ def mythic_queries_valid(*, timeout: int = 30) -> tuple[bool, str]:
     from mythic import mythic  # type: ignore
 
     async def _run():
+        try:
+            from . import bare_mythic_tools
+        except ImportError:
+            import bare_mythic_tools  # type: ignore
         client = await _mythic_login_async_safe()
         await asyncio.wait_for(
             mythic.execute_custom_query(client, _CREDENTIAL_QUERY, variables={}), timeout=timeout)
@@ -843,10 +847,20 @@ def mythic_queries_valid(*, timeout: int = 30) -> tuple[bool, str]:
             mythic.execute_custom_query(client, _CERTIFICATE_AUTH_TASK_QUERY, variables={"limit": 1}), timeout=timeout)
         await asyncio.wait_for(
             mythic.execute_custom_query(client, _CALLBACK_PROOF_QUERY, variables={}), timeout=timeout)
+        raw_ok, raw_detail = await bare_mythic_tools.raw_mythic_surface_preflight(
+            client,
+            timeout=timeout,
+        )
+        if not raw_ok:
+            raise RuntimeError(raw_detail)
+        return raw_detail
 
     try:
-        asyncio.run(_run())
-        return True, "mythic credential + task/callback proof queries validate against the live schema"
+        raw_detail = asyncio.run(_run())
+        return True, (
+            "mythic credential + task/callback proof queries validate against the live schema; "
+            f"{raw_detail}"
+        )
     except Exception as e:
         return False, f"mythic query failed against the live schema (fix before a live run): {e}"
 

@@ -1053,6 +1053,12 @@ def run_side(
                 "event": dict(observer.coordinator.events[0]),
             })
         result = bare.run(scn.objective)
+        if result.recoverable_tool_errors:
+            print(
+                f"[bare/{scenario_name}] retained {len(result.recoverable_tool_errors)} "
+                "recoverable tool error(s); post-run admission will decide countability",
+                flush=True,
+            )
         observer_result = (
             observer.finish(
                 wrapper_status=result.stopped,
@@ -1169,7 +1175,11 @@ def run_side(
     if row_arm:
         native_artifact = getattr(locals().get("solve"), "last_result", None)
         transcript = (
-            {"events": list(result.transcript), "final": result.final_text}
+            {
+                "events": list(result.transcript),
+                "final": result.final_text,
+                "recoverable_tool_errors": list(result.recoverable_tool_errors),
+            }
             if side == "bare"
             else list((native_artifact or {}).get("messages") or [])
             if isinstance(native_artifact, dict)

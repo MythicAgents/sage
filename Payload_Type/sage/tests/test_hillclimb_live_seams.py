@@ -15,6 +15,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import live_seams as ls  # noqa: E402
+
+
+def test_mythic_preflight_consumes_exact_runtime_raw_surface(monkeypatch):
+    import bare_mythic_tools as bmt
+    from mythic import mythic
+
+    client = object()
+    seen = {"raw": 0}
+
+    async def login():
+        return client
+
+    async def query(actual_client, _query, variables=None):
+        assert actual_client is client
+        return {}
+
+    async def raw_preflight(actual_client, *, timeout):
+        assert actual_client is client
+        assert timeout == 7
+        seen["raw"] += 1
+        return False, "planted raw runtime schema drift"
+
+    monkeypatch.setattr(ls, "_mythic_login_async_safe", login)
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    monkeypatch.setattr(bmt, "raw_mythic_surface_preflight", raw_preflight)
+
+    ok, detail = ls.mythic_queries_valid(timeout=7)
+
+    assert ok is False
+    assert "planted raw runtime schema drift" in detail
+    assert seen == {"raw": 1}
 import credential_artifacts as ca  # noqa: E402
 
 

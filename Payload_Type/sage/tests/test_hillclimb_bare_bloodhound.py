@@ -1,5 +1,5 @@
-"""Offline tests for the dynamic BloodHound MCP loader (the live MCP connection is validated on the lab).
-Pins: schema conversion from a discovered tool, graceful no-op when unconfigured, dispatch fall-through.
+"""Offline tests for the parity-filtered BloodHound MCP loader.
+Pins schema conversion, exact shipping allowlist parity, graceful no-op, and dispatch fall-through.
 """
 import sys
 from pathlib import Path
@@ -28,6 +28,20 @@ def test_tool_spec_from_discovered_tool():
     assert spec["function"]["name"] == "cypher_query"
     assert spec["function"]["description"].startswith("Run a raw Cypher")
     assert "query" in spec["function"]["parameters"]["properties"]
+
+
+def test_bare_bloodhound_admits_only_unique_exact_shipping_names():
+    allowed = _StubTool("domain_info", "allowed", {})
+    duplicate_one = _StubTool("user_info", "duplicate", {})
+    duplicate_two = _StubTool("user_info", "duplicate", {})
+    raw_cypher = _StubTool("cypher_query", "shipping withholds this", {})
+    whitespace = _StubTool("group_info ", "malformed", {})
+
+    admitted = bb.admitted_bloodhound_tools(
+        [allowed, duplicate_one, duplicate_two, raw_cypher, whitespace]
+    )
+    assert [tool.name for tool in admitted] == ["domain_info"]
+    assert {tool.name for tool in admitted} <= bb.SHIPPING_BLOODHOUND_TOOL_NAMES
 
 
 def test_load_is_graceful_noop_when_dir_missing(monkeypatch):

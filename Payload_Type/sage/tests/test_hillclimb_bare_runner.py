@@ -133,6 +133,31 @@ def test_tool_error_is_captured_not_fatal():
 
     res = br.BareModelRunner(model_fn, bad_tool).run("obj")
     assert res.stopped == "done" and "[tool error]" in res.transcript[0]["obs"]
+    assert res.recoverable_tool_errors == [
+        {"step": 1, "tool": "x", "category": "mythic"}
+    ]
+
+
+def test_each_dispatcher_error_class_is_recoverable_and_retained():
+    observations = iter([
+        "[tool error] read_credentials: schema drift",
+        "[bloodhound tool error] domain_info: unavailable",
+        "[unknown tool] 'typo'",
+    ])
+    decisions = iter([
+        {"tool": "read_credentials", "args": {}},
+        {"tool": "domain_info", "args": {}},
+        {"tool": "typo", "args": {}},
+        {"final": "STUCK"},
+    ])
+
+    result = br.BareModelRunner(lambda *_args: next(decisions), lambda _call: next(observations)).run("obj")
+
+    assert result.stopped == "done"
+    assert [item["category"] for item in result.recoverable_tool_errors] == [
+        "mythic", "bloodhound", "unknown_tool",
+    ]
+    assert result.steps == 3
 
 
 def test_score_bare_run_uses_probes():

@@ -1,9 +1,10 @@
 """Offline tests for the true-naive raw Mythic toolset + the upgraded bare runner loop.
 
-The live Mythic SDK calls are validated on the lab; these pin the pure parts: the tool schema set
-(discovery/tasking present, NO hardcoded commands, NO Sage-local assets or secret sauce), dispatch
-routing, and the runner's unlimited-steps / wall-clock / live-watch behavior.
+The preflight validates exact live GraphQL documents and installed SDK signatures. These tests pin
+the tool schema set, shipping parity, dispatch routing, and runner behavior.
 """
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -24,6 +25,140 @@ def test_bare_tool_specs_are_mythic_not_commands():
     for s in bmt.bare_tool_specs():
         assert s["type"] == "function"
         assert s["function"]["name"] and "parameters" in s["function"]
+
+
+def test_raw_mythic_surface_is_a_strict_shipping_subset_with_no_exceptions():
+    disposition = bmt.raw_mythic_parity_disposition()
+    assert disposition["valid"] is True
+    assert disposition["raw_count"] == len(bmt.TOOLS) == 13
+    assert disposition["raw_count"] <= disposition["shipping_count"]
+    assert disposition["exceptions"] == {}
+    assert {"download_file", "download_payload"}.isdisjoint(bmt.TOOLS)
+    assert bmt.shipping_visible_mythic_tool_names() == bmt.SHIPPING_MYTHIC_TOOL_NAMES
+
+
+def test_raw_mythic_parity_guard_rejects_an_added_tool(monkeypatch):
+    monkeypatch.setitem(bmt.TOOLS, "raw_only_extra", {"fn": None})
+    disposition = bmt.raw_mythic_parity_disposition()
+    assert disposition["valid"] is False
+    assert disposition["undeclared"] == ["raw_only_extra"]
+
+
+def test_raw_mythic_parity_guard_rejects_missing_shipping_capability():
+    shipping = set(bmt.SHIPPING_MYTHIC_TOOL_NAMES) - {"read_credentials"}
+    disposition = bmt.raw_mythic_parity_disposition(shipping)
+    assert disposition["valid"] is False
+    assert disposition["missing_shipping"] == {"read_credentials": "read_credentials"}
+
+
+def test_installed_mythic_sdk_matches_every_runtime_wrapper_contract():
+    disposition = bmt.raw_mythic_sdk_disposition()
+    assert disposition == {
+        "valid": True,
+        "checked": len(bmt.RAW_MYTHIC_SDK_CONTRACT),
+        "failures": {},
+    }
+
+
+def test_sdk_guard_catches_async_generator_treated_as_coroutine():
+    class FakeMythic:
+        pass
+
+    for name in bmt.RAW_MYTHIC_SDK_CONTRACT:
+        async def ordinary(**_kwargs):
+            return None
+        setattr(FakeMythic, name, ordinary)
+
+    # This is the exact class of the live get_all_uploaded_files defect.
+    async def wrong_coroutine(mythic):
+        return []
+    FakeMythic.get_all_uploaded_files = wrong_coroutine
+
+    disposition = bmt.raw_mythic_sdk_disposition(FakeMythic)
+    assert disposition["valid"] is False
+    assert disposition["failures"]["get_all_uploaded_files"] == (
+        "expected async_generator, observed coroutine"
+    )
+
+
+def test_uploaded_files_consumes_installed_sdk_async_generator(monkeypatch):
+    from mythic import mythic
+
+    async def rows(*, mythic):
+        yield {"agent_file_id": "one"}
+        yield {"agent_file_id": "two"}
+
+    monkeypatch.setattr(mythic, "get_all_uploaded_files", rows)
+    assert json.loads(asyncio.run(bmt._get_uploaded_files(object()))) == [
+        {"agent_file_id": "one"},
+        {"agent_file_id": "two"},
+    ]
+
+
+def _raw_graphql_introspection():
+    from graphql import build_schema, introspection_from_schema
+
+    schema = build_schema("""
+        scalar jsonb
+        type payloadtype { name: String }
+        type credential {
+          account: String
+          realm: String
+          type: String
+          credential_text: String
+          metadata: jsonb
+        }
+        input String_comparison_exp { _eq: String }
+        input payload_bool_exp { uuid: String_comparison_exp }
+        input callback_payload_bool_exp { uuid: String_comparison_exp }
+        input callback_bool_exp { payload: callback_payload_bool_exp }
+        type payload { uuid: String, deleted: Boolean }
+        type aggregate_fields { count: Int }
+        type callback_aggregate_fields { aggregate: aggregate_fields }
+        type update_payload_result { status: String, error: String }
+        type Query {
+          payloadtype: [payloadtype!]!
+          credential: [credential!]!
+          payload(where: payload_bool_exp): [payload!]!
+          callback_aggregate(where: callback_bool_exp): callback_aggregate_fields
+        }
+        type Mutation {
+          updatePayload(payload_uuid: String!, deleted: Boolean!): update_payload_result
+        }
+    """)
+    return introspection_from_schema(schema, descriptions=False)
+
+
+def test_exact_runtime_graphql_documents_validate_as_one_closed_set(monkeypatch):
+    from mythic import mythic
+
+    async def introspect(_client, _query, variables=None):
+        return _raw_graphql_introspection()
+
+    monkeypatch.setattr(mythic, "execute_custom_query", introspect)
+    disposition = asyncio.run(bmt.raw_mythic_graphql_disposition(object()))
+    assert disposition == {
+        "valid": True,
+        "checked": len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS),
+        "failures": {},
+    }
+
+
+def test_graphql_guard_rejects_a_planted_missing_field(monkeypatch):
+    from mythic import mythic
+
+    async def introspect(_client, _query, variables=None):
+        return _raw_graphql_introspection()
+
+    monkeypatch.setattr(mythic, "execute_custom_query", introspect)
+    monkeypatch.setitem(
+        bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS,
+        "planted_drift",
+        "query Planted { credential { credential_type } }",
+    )
+    disposition = asyncio.run(bmt.raw_mythic_graphql_disposition(object()))
+    assert disposition["valid"] is False
+    assert "credential_type" in disposition["failures"]["planted_drift"][0]
 
 
 def test_excluded_secret_sauce_not_exposed():

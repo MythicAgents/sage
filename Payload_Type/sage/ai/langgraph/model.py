@@ -40,6 +40,11 @@ from .mythic_tools import (
     _env_positive_int,
 )
 from .tool_cache import ToolCache
+from ..comparison_tool_surface import (
+    SHIPPING_BLOODHOUND_TOOL_NAMES,
+    SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES,
+    SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES,
+)
 from .prompt_loader import load_prompt, load_prompt_meta, filter_tools_by_frontmatter
 from .turn_authority import (
     TurnAuthority,
@@ -101,17 +106,7 @@ _RECON_REREAD_STOP_LIMIT = 6
 # One hand-back gives the Supervisor a chance to use the prior result; a second means it is not
 # listening, and trading refusals until the step budget dies helps nobody.
 _SUPERVISED_REPEAT_REFUSAL_CAP = 2
-_BLOODHOUND_AGENT_TOOL_ALLOWLIST = frozenset({
-    "domain_info",
-    "user_info",
-    "group_info",
-    "computer_info",
-    "ou_info",
-    "gpo_info",
-    "graph_analysis",
-    "adcs_info",
-    "data_quality",
-})
+_BLOODHOUND_AGENT_TOOL_ALLOWLIST = SHIPPING_BLOODHOUND_TOOL_NAMES
 _DEFAULT_GRAPH_RECURSION_LIMIT = 250
 _TOON_SENTINEL = "⟦TOON "
 _TRUNCATION_MARKER = "[truncated"
@@ -10587,40 +10582,7 @@ class Model:
             self.state["mythic_operator_messages"].append(SystemMessage(content=prompt))
         # Tools
         if self.mythic_client is not None:
-            mythic_tools = self.mythic_client.get_tools([
-                "list_callbacks",
-                # ISC-72: the per-command schema tools existed in mythic_tools.py but were registered
-                # nowhere, so the only schema source the model could see was the all-commands dump —
-                # 75,650 chars for Apollo, head-truncated to 16,000 by _compact_tool_result_str. That
-                # is how `ticket_cache_list` was issued with empty params on 2026-07-28. These return
-                # one command's parameters (including default_value) and a names-only index, both far
-                # under the 4,000-char compaction trigger.
-                "get_all_command_args_for_payloadtype",
-                "get_all_command_names_for_payloadtype",
-                "get_all_commands_for_payloadtype",
-                "wait_for_seconds",
-                "issue_task_and_waitfor_task_output",
-                "get_task_history_for_callback",
-                "get_all_task_output_by_task_id",
-                "upload_file_by_file_uuid",
-                "get_all_uploaded_files",
-                "get_operations",
-                "read_credentials",
-                "add_credential",
-                "execute_capability",
-                "build_capability_commands",
-                "get_ttp_guidance",
-                "get_ttp_full_reference",
-                "list_ttp_categories",
-                "ensure_tool_uploaded",
-                "download_tool",
-                "ingest_collection",
-                # ISC-73: prompts/mythic_operator.md names this twice — the tool list at :18 and the
-                # OPSEC cleanup instruction at :52 ("Clean up dropped files and scratch beacons
-                # (`list_open_artifacts`)") — but it was in no allowlist, so the agent was told to use
-                # a tool it could not call.
-                "list_open_artifacts",
-            ])
+            mythic_tools = self.mythic_client.get_tools(list(SHIPPING_MYTHIC_OPERATOR_TOOL_NAMES))
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
             # Explicit autonomous handback to the Supervisor (routes to Supervisor, does NOT end the run) —
@@ -10668,23 +10630,7 @@ class Model:
             self.state["mythic_payload_messages"].append(SystemMessage(content=prompt))
         # Tools
         if self.mythic_client:
-            mythic_tools = self.mythic_client.get_tools([
-                "get_payload_names",
-                "create_payload",
-                "get_all_payload_info",
-                "get_all_payloads",
-                # ISC-73: prompts/mythic_payload.md:46 instructs this agent to "discover it via
-                # get_all_commands_for_payloadtype('merlin')" — a tool it was never given. Register the
-                # narrow pair alongside it so the prompt's instruction is actually executable.
-                "get_all_command_args_for_payloadtype",
-                "get_all_command_names_for_payloadtype",
-                "get_all_commands_for_payloadtype",
-                "get_c2_profiles_for_payload",
-                "get_callback_c2_config",
-                "get_payload_c2_config",
-                "download_payload",
-                "delete_payload",
-            ])
+            mythic_tools = self.mythic_client.get_tools(list(SHIPPING_MYTHIC_PAYLOAD_TOOL_NAMES))
             # Add the handback tool for recursion limit management
             handback_tool = _create_summarize_handback_tool()
             tools = mythic_tools + [handback_tool]
