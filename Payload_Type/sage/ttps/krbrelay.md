@@ -91,8 +91,8 @@ user can gain SYSTEM via the RBCD path without any external infrastructure.
 - Grant group membership via relayed LDAP auth
 
 ## How Sage uses this
-KrbRelay is the Windows-native local privesc path in the Trust Walker chain when the
-attacker has a domain user shell on a machine but needs SYSTEM. The chain:
+KrbRelay is a Windows-native local privilege-escalation option when the attacker has a
+domain user shell on a machine but needs SYSTEM. The generic chain is:
 1. KrbRelay triggers a DCOM-based loopback coercion, capturing the machine account's
    Kerberos service ticket for LDAP/DC
 2. KrbRelay relays that ticket to the DC's LDAP to write RBCD (a second attacker-controlled

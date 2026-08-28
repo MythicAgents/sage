@@ -87,30 +87,26 @@ Run the read AS a principal that holds the right:
    for a password/hash; or forge → `ticket_cache_add`/PTT for a ticket), THEN run the LDAP read in that
    context (e.g. `execute_assembly`/`powerpick` once the ticket is in the calling thread's cache).
 
-## Cross-forest LAPS via a foreign-group membership (GOAD: BRAAVOS)
+## Cross-forest LAPS via a foreign-group membership
 
-`SPYS@ESSOS` holds `ReadLAPSPassword` on `BRAAVOS.ESSOS.LOCAL`, and `SMALL COUNCIL@SEVENKINGDOMS` is
-`MemberOf SPYS@ESSOS` (a legit foreign-group membership — survives SID filtering). So to read BRAAVOS LAPS you
-must authenticate to ESSOS AS a `SMALL COUNCIL` member, carrying that member's REAL group memberships.
+When a principal in one forest is an authentic member of a foreign group that holds
+`ReadLAPSPassword` in the trusting forest, authenticate as that principal while preserving its real PAC group
+memberships. Do not infer the edge from a benchmark recipe; require current directory or graph evidence.
 
 > **CRITICAL — use the member's REAL ticket, NOT a forged golden ticket.** A golden ticket forged for
-> `cersei.lannister` carries only the SIDs you put in it; it does NOT carry her authentic
-> `SMALL COUNCIL@SEVENKINGDOMS` membership, and you CANNOT inject `SPYS@ESSOS` as an ExtraSID / SID-history —
+> a chosen account carries only the SIDs you put in it; it does NOT carry the account's authentic
+> source-forest group membership, and you CANNOT inject the foreign group as an ExtraSID / SID-history —
 > SID filtering on the FOREST trust strips foreign ExtraSIDs (that filtering is exactly why the legit
-> foreign-group membership is the only path). The cross-forest referral grants `SPYS@ESSOS` (→ ReadLAPSPassword)
-> ONLY when the PAC carries the genuine `SMALL COUNCIL` membership — i.e. when you authenticate as the REAL
-> cersei. Forging a golden ticket here is the #1 way this hop silently fails.
+> foreign-group membership is the only path). The cross-forest referral grants the foreign-group rights
+> ONLY when the PAC carries the genuine source-forest membership. Forging a golden ticket here is a common
+> way this class of hop silently fails.
 
-1. You hold `da:sevenkingdoms.local` → **DCSync the member's REAL key** (you are DA there):
-   `mimikatz lsadump::dcsync /domain:sevenkingdoms.local /user:cersei.lannister` → take her AES256/NTLM.
-2. Request her **REAL TGT** (carries her authentic SMALL COUNCIL membership from the DC):
-   `Rubeus asktgt /user:cersei.lannister /domain:sevenkingdoms.local /aes256:<her-key> /nowrap`.
-3. Request the **cross-forest referral** / service ticket to the ESSOS DC LDAP with that TGT:
-   `Rubeus asktgs /service:ldap/meereen.essos.local /dc:meereen.essos.local /ticket:<cersei-TGT> /ptt` — the
-   trust maps her `SMALL COUNCIL@SEVENKINGDOMS` membership to `SPYS@ESSOS` → ReadLAPSPassword.
-4. Read `ms-mcs-admpwd` of `CN=BRAAVOS,OU=Laps,DC=essos,DC=local` IN that ticket context (run the LDAP/ADSI
+1. Obtain the real key for the source-forest member through an authorized, independently verified capability.
+2. Request the member's **real TGT**, which carries authentic group memberships from the source DC.
+3. Request the **cross-forest referral** / LDAP service ticket to the trusting forest with that TGT.
+4. Read the target computer's LAPS attribute in that ticket context (run the LDAP/ADSI
    query under the applied ticket — a sacrificial process / `make_token`-equivalent, not the default token).
-   The plaintext now returns → local admin on BRAAVOS → continue to ADCS / GoldenCert.
+   A successful read proves the LAPS edge without prescribing the next attack family.
 
 ## LAPS Variants
 

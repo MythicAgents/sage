@@ -79,10 +79,9 @@ piped to mimikatz) to recover Kerberos tickets and credential material.
 - Bypassing PPL via seclogon-duplicate on hardened hosts
 
 ## How Sage uses this
-After Sage gains local-admin or SYSTEM (e.g. after the Trust Walker's
-GPO → SYSTEM-on-WINTERFELL hop), nanodump produces an LSASS dump that
-contains the credential material Sage needs for the next hop (e.g.
-jon.snow's NT hash for the constrained-delegation S4U chain). The dump
+After Sage gains local-admin or SYSTEM through any independently verified route,
+nanodump can produce an LSASS dump containing credential material relevant to a
+subsequent authorized action. The dump
 is parsed in the operator's workflow; Sage may report the recovered
 material back as plain text in the agent's response.
 

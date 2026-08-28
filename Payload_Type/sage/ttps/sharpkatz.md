@@ -82,8 +82,8 @@ Mimikatz signature load.
 SharpKatz is the fallback LSASS credential harvester when Apollo's embedded Mimikatz
 is insufficient or unavailable. Sage prefers Apollo's native `mimikatz` command first;
 SharpKatz is the secondary option when specifically requesting .NET-assembly delivery.
-For the Trust Walker chain, SharpKatz's `dcsync` is an alternative to Apollo's `dcsync`
-native command when the native is unavailable or the operator wants assembly-based delivery.
+SharpKatz's `dcsync` is an alternative to Apollo's native `dcsync` command when the native
+capability is unavailable or the operator explicitly wants assembly-based delivery.
 
 ## Output
 Text output formatted similarly to Mimikatz — per-session blocks with authentication

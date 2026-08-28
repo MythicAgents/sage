@@ -105,8 +105,8 @@ Windows host without dropping mimikatz.
 - UnPAC the hash: extract NT hash from a PKINIT TGT's PAC (`/getcredentials /show`)
 
 ## How Sage uses this
-Rubeus is the kerberos workhorse for the Trust Walker. After SharpHound
-identifies delegation primitives (constrained-delegation-with-protocol-transition,
+Rubeus is a Kerberos operations workhorse. After directory or graph evidence identifies
+delegation primitives (constrained-delegation-with-protocol-transition,
 unconstrained delegation candidates), Rubeus is what actually fires the S4U
 chains and ticket captures. After ADCS ESC1/4/6/8 produces a certificate,
 Rubeus PKINIT-authenticates with it to land a usable TGT.

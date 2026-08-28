@@ -25,11 +25,11 @@ usage_examples:
   - description: Ingest a SharpHound collection ZIP into BloodHound
     args: "(MCP tool) file_upload  — point at the SharpHound output ZIP"
   - description: Find the shortest attack path from a foothold principal to Domain Admins
-    args: "(MCP tool) graph_analysis  — start node = SAMWELL.TARLY@NORTH..., target = Domain Admins"
+    args: "(MCP tool) graph_analysis — start node = CURRENT.USER@DOMAIN, target = Domain Admins"
   - description: Detect ADCS ESC paths in the environment
     args: "(MCP tool) adcs_info  — surfaces vulnerable certificate templates (ESC1/ESC4/ESC6/ESC8...)"
   - description: Run a custom Cypher query for foreign-group / cross-forest membership
-    args: "(MCP tool) cypher_query  — e.g. MATCH paths across the Spys group LAPS readers"
+    args: "(MCP tool) cypher_query — e.g. MATCH paths across foreign-group LAPS readers"
 opsec_notes: |
   No target-side footprint — this is analysis of data already collected. The OPSEC cost
   lives in the SharpHound collection that feeds it (loud LDAP/SAMR). Once data is in
@@ -74,7 +74,7 @@ This is the core of the Phase-1 T1.5 attack-path loop. The pattern:
 
 1. **Collect** — Mythic_Operator runs SharpHound on the foothold (see the `sharphound` TTP) and downloads the output ZIP.
 2. **Ingest** — MCP_Manager calls `file_upload` to push that ZIP into BloodHound.
-3. **Reason** — MCP_Manager calls `graph_analysis` / `adcs_info` / `cypher_query` to identify the path (e.g. samwell.tarly → GPO `STARKWALLPAPER` → SYSTEM on WINTERFELL → jon.snow delegation → Spys/LAPS → ESSOS-CA ESC1).
+3. **Reason** — MCP_Manager calls `graph_analysis` / `adcs_info` / `cypher_query` to identify candidate paths, including ACL, delegation, foreign-group, LAPS, and ADCS edges.
 4. **Act** — Supervisor routes the chosen next hop back to Mythic_Operator, which executes it through the relevant TTP (SharpGPOAbuse, Rubeus, Certify, ...).
 5. **Repeat** until Domain Admin / cross-forest.
 
