@@ -286,6 +286,1019 @@ def test_range_clock_probe_gate_ignores_expected_skew_but_requires_no_errors():
     assert orchestrate._range_clock_probes_reachable("not-json") is False
 
 
+def test_poll_fails_closed_on_nonzero_status_before_accepting_stdout(monkeypatch):
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="available-domains: 200 count=0", stderr="API error"
+        ),
+    )
+    with pytest.raises(SystemExit, match="command failed"):
+        orchestrate._poll(
+            "BloodHound authoritative domain count is zero",
+            ["status"],
+            ROOT,
+            orchestrate._bloodhound_is_empty,
+            timeout=1,
+            interval=0,
+        )
+
+
+def test_poll_can_evaluate_declared_status_one_for_reachable_skew(monkeypatch):
+    payload = (
+        '{"ready":false,"hosts":[{"inventory_hostname":"range-dc01"}],'
+        '"errors":[],"over_limit":["range-dc01"]}'
+    )
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=payload, stderr=""
+        ),
+    )
+
+    observed = orchestrate._poll(
+        "range WinRM clock probes respond",
+        ["check"],
+        ROOT,
+        orchestrate._range_clock_probes_reachable,
+        timeout=1,
+        interval=0,
+        predicate_returncodes=(0, 1),
+    )
+
+    assert observed == payload
+
+
+def test_poll_rejects_probe_errors_even_when_status_one_is_declared(monkeypatch):
+    payload = (
+        '{"ready":false,"hosts":[],"errors":['
+        '{"inventory_hostname":"range-dc01","error":"401"}]}'
+    )
+    monotonic = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(orchestrate.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=payload, stderr=""
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="not ready"):
+        orchestrate._poll(
+            "range WinRM clock probes respond",
+            ["check"],
+            ROOT,
+            orchestrate._range_clock_probes_reachable,
+            timeout=1,
+            interval=0,
+            predicate_returncodes=(0, 1),
+        )
+
+
+def test_poll_can_wait_on_status_one_until_typed_readiness_is_true(monkeypatch):
+    results = iter(
+        (
+            subprocess.CompletedProcess(
+                args=[], returncode=1, stdout='{"ready":false}', stderr=""
+            ),
+            subprocess.CompletedProcess(
+                args=[], returncode=1, stdout='{"ready":true}', stderr=""
+            ),
+        )
+    )
+    monkeypatch.setattr(orchestrate.subprocess, "run", lambda *_args, **_kwargs: next(results))
+    monkeypatch.setattr(orchestrate.time, "sleep", lambda _seconds: None)
+
+    observed = orchestrate._poll(
+        "sage chat + apollo ready",
+        ["readiness"],
+        ROOT,
+        orchestrate._readiness_ok,
+        timeout=1,
+        interval=0,
+        predicate_returncodes=(0, 1),
+    )
+
+    assert observed == '{"ready":true}'
+
+
+def test_poll_still_aborts_on_undeclared_status_with_clock_exception(monkeypatch):
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="not-json", stderr="usage error"
+        ),
+    )
+
+    with pytest.raises(SystemExit, match=r"failed \(exit 2\)"):
+        orchestrate._poll(
+            "range WinRM clock probes respond",
+            ["check"],
+            ROOT,
+            orchestrate._range_clock_probes_reachable,
+            timeout=1,
+            interval=0,
+            predicate_returncodes=(0, 1),
+        )
+
+
+def test_callback_discovery_requires_exact_identity_and_no_other_apollo(monkeypatch):
+    def result(stdout):
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: result(
+            "id=7 payloadtype=apollo host=CASTELBLACK user=evil.samwell.tarly active=True\n"
+        ),
+    )
+    with pytest.raises(SystemExit, match="sole active Apollo callback"):
+        orchestrate.discover_callbacks()
+
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: result(
+            "id=7 payloadtype=apollo host=CASTELBLACK user=NORTH\\samwell.tarly active=True\n"
+        ),
+    )
+    assert orchestrate.discover_callbacks() == 7
+
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: result(
+            "id=7 payloadtype=apollo host=CASTELBLACK user=NORTH\\samwell.tarly active=True\n"
+            "id=8 payloadtype=apollo host=BRAAVOS user=ESSOS\\jorah.mormont active=True\n"
+        ),
+    )
+    with pytest.raises(SystemExit, match="apollo=2 exact=1"):
+        orchestrate.discover_callbacks()
+
+
+def test_gate1p_cleanup_runs_every_step_and_retains_failure_report(monkeypatch, tmp_path):
+    events = []
+
+    def fake_run(name, *_args, **_kwargs):
+        events.append(name)
+        if name.endswith("verify no running tasks"):
+            raise SystemExit("running task 9")
+
+    results = tmp_path / "pair.jsonl"
+    results.write_text(
+        json.dumps({
+            "record_type": "result",
+            "protocol": {
+                "pair_id": orchestrate._gate1p_stagea_protocol().PAIR_ID,
+                "arm": "shipping_sage",
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "shipping_sage-episode.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+
+    with pytest.raises(SystemExit, match="cleanup incomplete"):
+        orchestrate.cleanup_gate1p_arm(
+            arm="shipping_sage",
+            pair_id=orchestrate._gate1p_stagea_protocol().PAIR_ID,
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env={
+                "SAGE_EVAL_RESULTS_PATH": str(results),
+                "SAGE_EVAL_ARTIFACT_DIR": str(tmp_path),
+            },
+        )
+
+    assert events == [
+        "Gate 1P cleanup: stop sage",
+        "Gate 1P cleanup: archive dbs",
+        "Gate 1P cleanup: verify no running tasks",
+        "Gate 1P cleanup: ludus poweroff",
+    ]
+    report = json.loads(results.read_text(encoding="utf-8").splitlines()[-1])
+    assert report["record_type"] == "cleanup"
+    assert report["complete"] is False
+    assert report["result_retained"] is True
+
+
+def test_gate1p_wrapper_cleans_up_when_arm_raises(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        orchestrate,
+        "_validate_gate1p_wrapper_entry",
+        lambda **_kwargs: "tree:test",
+    )
+    monkeypatch.setattr(orchestrate, "_run_side_preflight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrate, "mark_gate1p_prearm_reset_started", lambda **_kwargs: None)
+
+    def fail_after_reset(*_args, **kwargs):
+        kwargs["before_reset"]()
+        raise RuntimeError("arm failed")
+
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side",
+        fail_after_reset,
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "cleanup_gate1p_arm",
+        lambda **kwargs: seen.append(kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="arm failed"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=orchestrate._gate1p_stagea_protocol().PAIR_ID,
+            arm_index=0,
+            source_version="tree:test",
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env={"SAGE_EVAL_RESULTS_PATH": "/tmp/not-used-by-mock"},
+        )
+
+    assert seen[0]["arm"] == "shipping_sage"
+
+
+def test_gate1p_pair_control_is_one_shot_and_advances_only_in_order(tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    path = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["next_arm"] == "shipping_sage"
+    assert state["completed_arms"] == []
+
+    assert orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    ) == path
+
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    orchestrate.advance_gate1p_pair_control(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["next_arm"] == "true_naive"
+    assert state["completed_arms"] == ["shipping_sage"]
+    with pytest.raises(SystemExit, match="out of order"):
+        orchestrate.advance_gate1p_pair_control(
+            arm="shipping_sage", source_version="tree:test", route_env=route_env
+        )
+
+
+def _canonical_gate1p_pair_control():
+    protocol = orchestrate._gate1p_stagea_protocol()
+    return {
+        "schema": "gate1p-stagea-pair-control-v2",
+        "protocol_id": protocol.PROTOCOL_ID,
+        "pair_id": protocol.PAIR_ID,
+        "source_version": "tree:test",
+        "next_arm": "shipping_sage",
+        "completed_arms": [],
+        "prearm_state": {
+            "arm": "shipping_sage",
+            "status": "idle",
+            "updated_at": 1.0,
+        },
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+
+
+@pytest.mark.parametrize("source_version", [None, "", " unrecorded", "unrecorded", 16])
+def test_gate1p_wrapper_rejects_absent_or_malformed_source_before_any_activity(
+    monkeypatch,
+    tmp_path,
+    source_version,
+):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:expected",
+        route_env=route_env,
+    )
+    original = control.read_bytes()
+    events = []
+    monkeypatch.setattr(
+        orchestrate,
+        "_run_side_preflight",
+        lambda *_args, **_kwargs: events.append("provider_preflight"),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side",
+        lambda *_args, **_kwargs: events.append("full_reset_and_ready"),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "cleanup_gate1p_arm",
+        lambda **_kwargs: events.append("cleanup"),
+    )
+
+    with pytest.raises(SystemExit, match="independently expected"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=protocol.PAIR_ID,
+            arm_index=0,
+            source_version=source_version,
+            route_env=route_env,
+        )
+
+    assert events == []
+    assert control.read_bytes() == original
+    assert not orchestrate._gate1p_results_path(route_env).exists()
+    assert not orchestrate._gate1p_prestart_cleanup_path(route_env).exists()
+
+
+def test_gate1p_wrapper_rejects_whole_source_drift_before_provider_or_reset(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:expected",
+        route_env=route_env,
+    )
+    state = json.loads(control.read_text(encoding="utf-8"))
+    state["source_version"] = "tree:drifted"
+    control.write_text(json.dumps(state), encoding="utf-8")
+    drifted = control.read_bytes()
+    events = []
+    monkeypatch.setattr(
+        orchestrate,
+        "_run_side_preflight",
+        lambda *_args, **_kwargs: events.append("provider_preflight"),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side",
+        lambda *_args, **_kwargs: events.extend(
+            ["full_reset_and_ready", "arm_started", "target_activity"]
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="identity or metadata is malformed"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=protocol.PAIR_ID,
+            arm_index=0,
+            source_version="tree:expected",
+            route_env=route_env,
+        )
+
+    assert events == []
+    assert control.read_bytes() == drifted
+    assert json.loads(drifted)["prearm_state"]["status"] == "idle"
+
+
+def test_gate1p_source_drift_after_preflight_cannot_start_reset_or_activity(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:expected",
+        route_env=route_env,
+    )
+    events = []
+    monkeypatch.setattr(
+        orchestrate,
+        "_run_side_preflight",
+        lambda *_args, **_kwargs: events.append("provider_preflight"),
+    )
+
+    def drift_before_reset(*_args, **kwargs):
+        events.append("run_side_entered")
+        state = json.loads(control.read_text(encoding="utf-8"))
+        state["source_version"] = "tree:drifted"
+        control.write_text(json.dumps(state), encoding="utf-8")
+        kwargs["before_reset"]()
+        events.extend(["full_reset_and_ready", "arm_started", "target_activity"])
+
+    monkeypatch.setattr(orchestrate, "run_side", drift_before_reset)
+    with pytest.raises(SystemExit, match="identity or metadata is malformed"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=protocol.PAIR_ID,
+            arm_index=0,
+            source_version="tree:expected",
+            route_env=route_env,
+        )
+
+    assert events == ["provider_preflight", "run_side_entered"]
+    assert json.loads(control.read_text(encoding="utf-8"))["prearm_state"]["status"] == "idle"
+    assert not orchestrate._gate1p_results_path(route_env).exists()
+
+
+@pytest.mark.parametrize("transition", ["reset_started", "cleanup_complete", "advance"])
+def test_gate1p_every_parent_transition_rejects_independent_source_drift(tmp_path, transition):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:expected",
+        route_env=route_env,
+    )
+    if transition in {"cleanup_complete", "advance"}:
+        orchestrate.mark_gate1p_prearm_reset_started(
+            arm="shipping_sage",
+            source_version="tree:expected",
+            route_env=route_env,
+        )
+    state = json.loads(control.read_text(encoding="utf-8"))
+    state["source_version"] = "tree:drifted"
+    control.write_text(json.dumps(state), encoding="utf-8")
+    drifted = control.read_bytes()
+
+    with pytest.raises(SystemExit, match="identity or metadata is malformed"):
+        if transition == "reset_started":
+            orchestrate.mark_gate1p_prearm_reset_started(
+                arm="shipping_sage",
+                source_version="tree:expected",
+                route_env=route_env,
+            )
+        elif transition == "cleanup_complete":
+            orchestrate.mark_gate1p_prestart_cleanup_complete(
+                arm="shipping_sage",
+                source_version="tree:expected",
+                route_env=route_env,
+            )
+        else:
+            orchestrate.advance_gate1p_pair_control(
+                arm="shipping_sage",
+                source_version="tree:expected",
+                route_env=route_env,
+            )
+
+    assert control.read_bytes() == drifted
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra_top_level",
+        "missing_top_level",
+        "created_at_object",
+        "created_at_bool",
+        "created_at_nan",
+        "created_at_pos_inf",
+        "created_at_neg_inf",
+        "extra_prearm_field",
+        "missing_prearm_field",
+        "illegal_arm_combination",
+    ],
+)
+def test_gate1p_pair_control_rejects_noncanonical_json_and_illegal_states(mutation):
+    state = _canonical_gate1p_pair_control()
+    if mutation == "extra_top_level":
+        state["undeclared"] = None
+    elif mutation == "missing_top_level":
+        del state["updated_at"]
+    elif mutation == "created_at_object":
+        state["created_at"] = {}
+    elif mutation == "created_at_bool":
+        state["created_at"] = True
+    elif mutation == "created_at_nan":
+        state["created_at"] = float("nan")
+    elif mutation == "created_at_pos_inf":
+        state["created_at"] = float("inf")
+    elif mutation == "created_at_neg_inf":
+        state["created_at"] = float("-inf")
+    elif mutation == "extra_prearm_field":
+        state["prearm_state"]["undeclared"] = None
+    elif mutation == "missing_prearm_field":
+        del state["prearm_state"]["updated_at"]
+    elif mutation == "illegal_arm_combination":
+        state["next_arm"] = "true_naive"
+        state["prearm_state"]["arm"] = "true_naive"
+
+    with pytest.raises(SystemExit):
+        orchestrate._validate_gate1p_pair_control_state(
+            state,
+            expected_source_version="tree:test",
+        )
+
+
+def test_gate1p_pair_control_update_is_failure_atomic(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    path = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    original = path.read_bytes()
+    real_replace = orchestrate.os.replace
+    monkeypatch.setattr(
+        orchestrate.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("planted torn write")),
+    )
+
+    with pytest.raises(OSError, match="planted torn write"):
+        orchestrate.mark_gate1p_prearm_reset_started(
+            arm="shipping_sage",
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(f".{path.name}.*.tmp"))
+
+    monkeypatch.setattr(orchestrate.os, "replace", real_replace)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    assert json.loads(path.read_text(encoding="utf-8"))["prearm_state"]["status"] == "reset_started"
+
+
+def test_gate1p_pair_control_create_only_never_overwrites_or_exposes_partial_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    path = tmp_path / "pair-control.json"
+    path.write_text("existing\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        orchestrate._atomic_write_gate1p_json(path, {"replacement": True}, create_only=True)
+    assert path.read_text(encoding="utf-8") == "existing\n"
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+    path.unlink()
+    monkeypatch.setattr(
+        orchestrate.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("planted link failure")),
+    )
+    with pytest.raises(OSError, match="planted link failure"):
+        orchestrate._atomic_write_gate1p_json(path, {"new": True}, create_only=True)
+    assert not path.exists()
+    assert not list(tmp_path.glob(f".{path.name}.*.tmp"))
+
+
+def test_gate1p_prestart_failure_cleans_without_consuming_retry_zero(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    def fail_after_reset(*_args, **kwargs):
+        kwargs["before_reset"]()
+        raise RuntimeError("prestart failure")
+
+    monkeypatch.setattr(orchestrate, "run_side", fail_after_reset)
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="prestart failure"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=protocol.PAIR_ID,
+            arm_index=0,
+            source_version="tree:test",
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+        )
+
+    assert not orchestrate._gate1p_results_path(route_env).exists()
+    records = [
+        json.loads(line)
+        for line in orchestrate._gate1p_prestart_cleanup_path(route_env).read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [record["record_type"] for record in records] == ["prestart_cleanup"]
+    assert records[0]["measurement_kind"] == "prestart_readiness"
+    assert records[0]["complete"] is True
+    assert orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    ) == control
+
+
+def test_gate1p_incomplete_prestart_cleanup_blocks_resume_and_does_not_pollute_results(
+    monkeypatch,
+    tmp_path,
+):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+
+    def fail_verify(name, *_args, **_kwargs):
+        if name.endswith("verify no running tasks"):
+            raise SystemExit("not ready")
+
+    monkeypatch.setattr(orchestrate, "_run", fail_verify)
+    with pytest.raises(SystemExit, match="cleanup incomplete"):
+        orchestrate.cleanup_gate1p_arm(
+            arm="shipping_sage",
+            pair_id=protocol.PAIR_ID,
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+            row_started=False,
+            source_version="tree:test",
+        )
+
+    assert not orchestrate._gate1p_results_path(route_env).exists()
+    with pytest.raises(SystemExit, match="incomplete or mismatched"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+def test_gate1p_prestart_record_planted_in_countable_ledger_blocks_resume(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: None)
+    orchestrate.cleanup_gate1p_arm(
+        arm="shipping_sage",
+        pair_id=protocol.PAIR_ID,
+        ludus_range_id="RANGE-1",
+        ludus_mcp_server="ludus_test",
+        route_env=route_env,
+        row_started=False,
+        source_version="tree:test",
+    )
+    planted = orchestrate._gate1p_prestart_cleanup_path(route_env).read_text(encoding="utf-8")
+    orchestrate._gate1p_results_path(route_env).write_text(planted, encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="empty countable result ledger"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+def test_gate1p_naive_prestart_resume_requires_countable_shipping(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    orchestrate._gate1p_results_path(route_env).write_text("{}\n", encoding="utf-8")
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    orchestrate.advance_gate1p_pair_control(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="true_naive", source_version="tree:test", route_env=route_env
+    )
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: None)
+    orchestrate.cleanup_gate1p_arm(
+        arm="true_naive",
+        pair_id=protocol.PAIR_ID,
+        ludus_range_id="RANGE-1",
+        ludus_mcp_server="ludus_test",
+        route_env=route_env,
+        row_started=False,
+        source_version="tree:test",
+    )
+
+    with pytest.raises(SystemExit, match="naive resume blocked by shipping admission"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+    monkeypatch.setattr(
+        protocol,
+        "completed_arm_lifecycle_disposition",
+        lambda *_args, **_kwargs: {"countable": True},
+    )
+    assert orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    ) == control
+
+
+def test_gate1p_duplicate_prestart_recovery_for_one_arm_fails_closed(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: None)
+    for _ in range(2):
+        orchestrate.mark_gate1p_prearm_reset_started(
+            arm="shipping_sage", source_version="tree:test", route_env=route_env
+        )
+        orchestrate.cleanup_gate1p_arm(
+            arm="shipping_sage",
+            pair_id=protocol.PAIR_ID,
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+            row_started=False,
+            source_version="tree:test",
+        )
+
+    with pytest.raises(SystemExit, match="already consumed an arm recovery"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+@pytest.mark.parametrize("timestamp", [True, float("nan"), float("inf"), float("-inf")])
+def test_gate1p_prestart_cleanup_rejects_nonfinite_or_boolean_timestamp(
+    monkeypatch,
+    tmp_path,
+    timestamp,
+):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    monkeypatch.setattr(orchestrate, "_run", lambda *_args, **_kwargs: None)
+    orchestrate.cleanup_gate1p_arm(
+        arm="shipping_sage",
+        pair_id=protocol.PAIR_ID,
+        ludus_range_id="RANGE-1",
+        ludus_mcp_server="ludus_test",
+        route_env=route_env,
+        row_started=False,
+        source_version="tree:test",
+    )
+    cleanup_path = orchestrate._gate1p_prestart_cleanup_path(route_env)
+    record = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    record["ts"] = timestamp
+    cleanup_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="incomplete or mismatched"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+def test_gate1p_preflight_failure_is_unspent_and_does_not_enter_cleanup(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "_run_side_preflight",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("auth failed")),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side",
+        lambda *_args, **_kwargs: pytest.fail("run/reset path must not start"),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "cleanup_gate1p_arm",
+        lambda **_kwargs: pytest.fail("cleanup must not run before reset start"),
+    )
+
+    with pytest.raises(SystemExit, match="auth failed"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=orchestrate._gate1p_stagea_protocol().PAIR_ID,
+            arm_index=0,
+            source_version="tree:test",
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+        )
+
+    state = json.loads(control.read_text(encoding="utf-8"))
+    assert state["prearm_state"]["status"] == "idle"
+    assert not orchestrate._gate1p_results_path(route_env).exists()
+    assert not orchestrate._gate1p_prestart_cleanup_path(route_env).exists()
+
+
+def test_gate1p_valid_idle_naive_resume_needs_no_fictional_cleanup(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    orchestrate._gate1p_results_path(route_env).write_text("{}\n", encoding="utf-8")
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    orchestrate.advance_gate1p_pair_control(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    monkeypatch.setattr(
+        protocol,
+        "completed_arm_lifecycle_disposition",
+        lambda *_args, **_kwargs: {"countable": True},
+    )
+
+    assert orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    ) == control
+    state = json.loads(control.read_text(encoding="utf-8"))
+    assert state["next_arm"] == "true_naive"
+    assert state["prearm_state"]["status"] == "idle"
+    assert not orchestrate._gate1p_prestart_cleanup_path(route_env).exists()
+
+
+def test_gate1p_reset_started_without_cleanup_evidence_blocks_resume(tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+
+    with pytest.raises(SystemExit, match="does not match the current pre-arm state"):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+def test_gate1p_cleanup_command_oserror_runs_remaining_steps_and_blocks_resume(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage", source_version="tree:test", route_env=route_env
+    )
+    events = []
+
+    def fake_run(name, *_args, **_kwargs):
+        events.append(name)
+        if name.endswith("stop sage"):
+            raise FileNotFoundError("missing launcher")
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    with pytest.raises(SystemExit, match="cleanup incomplete"):
+        orchestrate.cleanup_gate1p_arm(
+            arm="shipping_sage",
+            pair_id=protocol.PAIR_ID,
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+            row_started=False,
+            source_version="tree:test",
+        )
+
+    assert events == [
+        "Gate 1P cleanup: stop sage",
+        "Gate 1P cleanup: archive dbs",
+        "Gate 1P cleanup: verify no running tasks",
+        "Gate 1P cleanup: ludus poweroff",
+    ]
+    report = json.loads(
+        orchestrate._gate1p_prestart_cleanup_path(route_env).read_text(encoding="utf-8")
+    )
+    assert report["complete"] is False
+    with pytest.raises(SystemExit):
+        orchestrate.initialize_gate1p_pair_control(
+            source_version="tree:test",
+            route_env=route_env,
+        )
+
+
+def test_gate1p_malformed_arm_ledger_still_runs_all_cleanup_steps(monkeypatch, tmp_path):
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path / ".sage_history" / "pair")}
+    protocol = orchestrate._gate1p_stagea_protocol()
+    orchestrate.initialize_gate1p_pair_control(source_version="tree:test", route_env=route_env)
+    results = orchestrate._gate1p_results_path(route_env)
+    events = []
+    monkeypatch.setattr(orchestrate, "_run_side_preflight", lambda *_args, **_kwargs: None)
+
+    def fail_with_malformed_ledger(*_args, **kwargs):
+        kwargs["before_reset"]()
+        results.write_text("{malformed\n", encoding="utf-8")
+        raise RuntimeError("arm failed")
+
+    def fake_run(name, *_args, **_kwargs):
+        events.append(name)
+
+    monkeypatch.setattr(orchestrate, "run_side", fail_with_malformed_ledger)
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    with pytest.raises(SystemExit, match="cleanup incomplete"):
+        orchestrate.run_side_with_gate1p_cleanup(
+            "child-domain-control",
+            "harness",
+            measurement_kind="row",
+            pair_id=protocol.PAIR_ID,
+            arm_index=0,
+            source_version="tree:test",
+            ludus_range_id="RANGE-1",
+            ludus_mcp_server="ludus_test",
+            route_env=route_env,
+        )
+
+    assert events == [
+        "Gate 1P cleanup: stop sage",
+        "Gate 1P cleanup: archive dbs",
+        "Gate 1P cleanup: verify no running tasks",
+        "Gate 1P cleanup: ludus poweroff",
+    ]
+
+
+def test_gate1p_main_resumes_only_the_unstarted_naive_arm(monkeypatch, tmp_path):
+    control = tmp_path / "pair-control.json"
+    control.write_text(json.dumps({"next_arm": "true_naive"}), encoding="utf-8")
+    bloodhound = tmp_path / "bloodhound"
+    bloodhound.mkdir()
+    events = []
+
+    monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrate,
+        "initialize_gate1p_pair_control",
+        lambda **_kwargs: events.append("initialize") or control,
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side_with_gate1p_cleanup",
+        lambda _scenario, side, **kwargs: events.append((side, kwargs["arm_index"])),
+    )
+    monkeypatch.setattr(orchestrate, "compare", lambda *_args, **_kwargs: events.append("compare"))
+
+    assert orchestrate.main([
+        "--scenario", "child-domain-control",
+        "--gate1p-stage-a-pair",
+        "--source-version", "tree:test",
+        "--model-context-limit", "200000",
+        "--max-output-tokens", "8192",
+        "--go",
+        "--live-authority-id", orchestrate._gate1p_stagea_protocol().PAIR_ID,
+    ]) == 0
+
+    assert events == ["initialize", ("bare", 1), "compare"]
+
+
+def test_gate1p_wrapper_advances_after_successful_arm_and_cleanup(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        orchestrate,
+        "_validate_gate1p_wrapper_entry",
+        lambda **_kwargs: "tree:test",
+    )
+    monkeypatch.setattr(orchestrate, "_run_side_preflight", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrate, "mark_gate1p_prearm_reset_started", lambda **_kwargs: None)
+
+    def succeed_after_reset(*_args, **kwargs):
+        kwargs["before_reset"]()
+        seen.append("run")
+
+    monkeypatch.setattr(orchestrate, "run_side", succeed_after_reset)
+    monkeypatch.setattr(orchestrate, "_gate1p_arm_started", lambda **_kwargs: True)
+    monkeypatch.setattr(orchestrate, "cleanup_gate1p_arm", lambda **_kwargs: seen.append("cleanup"))
+    monkeypatch.setattr(
+        orchestrate,
+        "advance_gate1p_pair_control",
+        lambda **kwargs: seen.append(("advance", kwargs["arm"])),
+    )
+
+    orchestrate.run_side_with_gate1p_cleanup(
+        "child-domain-control",
+        "harness",
+        measurement_kind="row",
+        pair_id=orchestrate._gate1p_stagea_protocol().PAIR_ID,
+        arm_index=0,
+        source_version="tree:test",
+        ludus_range_id="RANGE-1",
+        ludus_mcp_server="ludus_test",
+        route_env={},
+    )
+
+    assert seen == ["run", "cleanup", ("advance", "shipping_sage")]
+
+
 def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
     events = []
 
@@ -293,9 +1306,19 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
         del env
         events.append(("run", name, list(argv)))
 
-    def fake_poll(name, argv, _cwd, _predicate, *, timeout, interval=20, env=None):
+    def fake_poll(
+        name,
+        argv,
+        _cwd,
+        _predicate,
+        *,
+        timeout,
+        interval=20,
+        env=None,
+        predicate_returncodes=(0,),
+    ):
         del timeout, interval, env
-        events.append(("poll", name, list(argv)))
+        events.append(("poll", name, list(argv), predicate_returncodes))
         return ""
 
     monkeypatch.setattr(orchestrate, "_run", fake_run)
@@ -330,6 +1353,15 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
         "SAGELAPSR520260715",
         "check",
     ]
+    assert events[winrm_poll_index][3] == (0, 1)
+    poll_returncodes = {event[1]: event[3] for event in events if event[0] == "poll"}
+    assert poll_returncodes == {
+        "range guests report IPs": (0,),
+        "range WinRM clock probes respond": (0, 1),
+        "BloodHound authoritative domain count is zero": (0,),
+        "CINDER-WS01 powered on": (0,),
+        "sage chat + apollo ready": (0, 1),
+    }
     assert events[sync_index][2] == [
         str(orchestrate.PY),
         "skills/sage-goad-reset/scripts/sync_range_time.py",
@@ -366,7 +1398,7 @@ def test_gate1p_diagnostic_run_side_threads_non_countable_protocol(monkeypatch):
     monkeypatch.setattr(orchestrate, "full_reset_and_ready", fake_full_reset_and_ready)
 
     orchestrate.run_side(
-        "single-hop-system",
+        "child-domain-control",
         "harness",
         go=False,
         solve_timeout=3600,
@@ -382,6 +1414,39 @@ def test_gate1p_diagnostic_run_side_threads_non_countable_protocol(monkeypatch):
     assert "--countable" not in argv
 
 
+def test_run_side_preflight_authenticates_exact_model_route_before_reset(monkeypatch):
+    calls = []
+
+    def fake_run(name, argv, _cwd, _timeout, env=None, **_kwargs):
+        calls.append((name, list(argv), dict(env or {})))
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: (None, 7))
+    route_env = {
+        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+        "SAGE_EVAL_API_KEY": "secret",
+    }
+
+    orchestrate.run_side(
+        "child-domain-control",
+        "harness",
+        go=False,
+        solve_timeout=3600,
+        provider="openai",
+        model="exact-model",
+        max_output_tokens=8192,
+        route_env=route_env,
+    )
+
+    name, argv, env = calls[0]
+    assert name == "preflight child-domain-control"
+    assert argv[argv.index("--provider") + 1] == "openai"
+    assert argv[argv.index("--model") + 1] == "exact-model"
+    assert argv[argv.index("--max-output-tokens") + 1] == "8192"
+    assert env["SAGE_EVAL_API_ENDPOINT"] == route_env["SAGE_EVAL_API_ENDPOINT"]
+    assert env["SAGE_EVAL_API_KEY"] == route_env["SAGE_EVAL_API_KEY"]
+
+
 def test_gate1p_diagnostic_cli_requires_explicit_bloodhound_dir():
     env = dict(os.environ)
     env.pop("SAGE_BLOODHOUND_MCP_DIR", None)
@@ -390,7 +1455,7 @@ def test_gate1p_diagnostic_cli_requires_explicit_bloodhound_dir():
             str(PY),
             str(SCRIPT),
             "--scenario",
-            "single-hop-system",
+            "child-domain-control",
             "--side",
             "harness",
             "--seeds",
@@ -418,7 +1483,7 @@ def test_gate1p_diagnostic_cli_dry_run_uses_explicit_bloodhound_dir(tmp_path):
             str(PY),
             str(SCRIPT),
             "--scenario",
-            "single-hop-system",
+            "child-domain-control",
             "--side",
             "harness",
             "--seeds",
@@ -439,6 +1504,123 @@ def test_gate1p_diagnostic_cli_dry_run_uses_explicit_bloodhound_dir(tmp_path):
     assert "--measurement-kind diagnostic" in result.stdout
     assert "--protocol-id gate1p-stage-a-diagnostic-v1" in result.stdout
     assert "--source-version test-source" in result.stdout
+
+
+def test_gate1p_pair_dry_run_prints_exact_two_arm_plan_without_live_authority(tmp_path):
+    bloodhound_dir = tmp_path / "bloodhound-mcp"
+    bloodhound_dir.mkdir()
+    env = {
+        **os.environ,
+        "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
+        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+    }
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "child-domain-control",
+            "--gate1p-stage-a-pair",
+            "--source-version",
+            "tree:test",
+            "--model-context-limit",
+            "200000",
+            "--max-output-tokens",
+            "8192",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert output.count("--- iteration seed=0 side=") == 2
+    assert "side=harness" in output and "side=bare" in output
+    assert "--arm-index 0" in output and "--arm-index 1" in output
+    assert f"--pair-id {orchestrate._gate1p_stagea_protocol().PAIR_ID}" in output
+    assert output.count("wipe --yes") == 2
+    assert output.count("authoritative count=0") == 2
+    assert output.count("run_gauge_live.py preflight --scenario child-domain-control") == 2
+    assert output.count("<=8 output tokens, 10s, zero retries") == 2
+    assert output.index("run_gauge_live.py preflight") < output.index("mythic_reset.sh --yes")
+    assert "--live-authority-id" not in output
+
+
+def test_gate1p_pair_live_cli_refuses_without_separate_authority(tmp_path):
+    bloodhound_dir = tmp_path / "bloodhound-mcp"
+    bloodhound_dir.mkdir()
+    env = {
+        **os.environ,
+        "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
+        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+    }
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario",
+            "child-domain-control",
+            "--gate1p-stage-a-pair",
+            "--source-version",
+            "tree:test",
+            "--model-context-limit",
+            "200000",
+            "--max-output-tokens",
+            "8192",
+            "--go",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "live paired-row execution requires separate --live-authority-id" in result.stderr
+
+
+def test_gate1p_pair_rejects_snapshot_or_foothold_drift_before_live_contact(tmp_path):
+    bloodhound_dir = tmp_path / "bloodhound-mcp"
+    bloodhound_dir.mkdir()
+    env = {
+        **os.environ,
+        "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
+        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+    }
+    common = [
+        str(PY),
+        str(SCRIPT),
+        "--scenario",
+        "child-domain-control",
+        "--gate1p-stage-a-pair",
+        "--source-version",
+        "tree:test",
+        "--model-context-limit",
+        "200000",
+        "--max-output-tokens",
+        "8192",
+    ]
+    wrong_snapshot = subprocess.run(
+        [*common, "--snapshot", "other-snapshot"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    wrong_foothold = subprocess.run(
+        [*common, "--foothold-host", "WINTERFELL"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert wrong_snapshot.returncode == 2
+    assert "requires --snapshot" in wrong_snapshot.stderr
+    assert wrong_foothold.returncode == 2
+    assert "fixed CASTELBLACK/Samwell Apollo foothold role" in wrong_foothold.stderr
 
 
 def test_run_side_pins_same_netbios_map_for_all_policy_arms(monkeypatch):

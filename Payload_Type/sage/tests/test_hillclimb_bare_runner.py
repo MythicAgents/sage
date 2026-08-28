@@ -4,8 +4,11 @@ Pins the agent loop (done/budget/error/tool-error), probe-based scoring, and the
 comparator's noise-floor judgement. The LLM and Mythic are injected fakes — no lab, no API key.
 """
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
@@ -46,12 +49,70 @@ def test_loop_runs_until_final():
 
     res = br.BareModelRunner(model_fn, lambda c: "ok", tools_spec=[{"name": "mythic"}]).run("get DA")
     assert res.steps == 3 and res.stopped == "done"
+    assert res.objective_recognized is False
     assert len(res.transcript) == 3 and res.transcript[0]["obs"] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("terminal_text", "recognized"),
+    [
+        ("OBJECTIVE_MET", True),
+        ("  objective_met  ", True),
+        ("STUCK", False),
+        ("done", False),
+        ("OBJECTIVE_MET because the range changed", False),
+    ],
+)
+def test_bare_runner_records_only_exact_objective_terminal_as_recognition(
+    terminal_text, recognized,
+):
+    result = br.BareModelRunner(
+        lambda *_args: {"final": terminal_text},
+        lambda _call: "unused",
+    ).run("obj")
+
+    assert result.stopped == "done"
+    assert result.objective_recognized is recognized
 
 
 def test_loop_hits_budget():
     res = br.BareModelRunner(lambda s, t, h: {"tool": "x", "args": {}}, lambda c: "ok", max_steps=5).run("obj")
     assert res.stopped == "budget" and res.steps == 5
+
+
+def test_model_response_after_wall_deadline_cannot_dispatch_target_tool():
+    tool_calls = []
+
+    def late_model(*_args):
+        time.sleep(0.03)
+        return {"tool": "issue_command", "args": {"command": "whoami"}}
+
+    result = br.BareModelRunner(
+        late_model,
+        lambda call: tool_calls.append(call),
+        timeout=0.01,
+    ).run("obj")
+
+    assert result.stopped == "timeout"
+    assert result.model_calls == 1
+    assert result.steps == 0
+    assert tool_calls == []
+
+
+def test_wall_deadline_is_rechecked_at_actual_tool_dispatch_boundary(monkeypatch):
+    clock = iter([0.0, 0.5, 0.999, 1.001, 1.001])
+    monkeypatch.setattr(br.time, "monotonic", lambda: next(clock))
+    tool_calls = []
+
+    result = br.BareModelRunner(
+        lambda *_args: {"tool": "issue_command", "args": {"command": "whoami"}},
+        lambda call: tool_calls.append(call),
+        timeout=1.0,
+    ).run("obj")
+
+    assert result.stopped == "timeout"
+    assert result.steps == 0
+    assert tool_calls == []
 
 
 def test_model_error_stops():

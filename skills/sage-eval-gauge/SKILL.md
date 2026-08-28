@@ -27,15 +27,31 @@ not the authority boundary. Keep the outcome oracle observation-only, keep any a
 controller separate, use evaluator-only credentials, and admit only objective range-state evidence that was not
 produced by Sage-local target I/O.
 
-The currently supported Gate 1P action is one prospectively non-countable shipping-Sage diagnostic. It captures
-the production response shape and tests a result-based `SYSTEM` outcome oracle; it is not a bare-vs-harness row,
-cannot support promotion, and does not authorize a live run by itself. Preview it without touching the range:
+The completed non-countable shipping-Sage diagnostic established the production response shape. The accepted
+next instrument is exactly one `child-domain-control` episode in each primary arm: shipping Sage first, then the
+same-model true-naive runner. Its execution envelope is the exact GOAD range declared by the protocol, while every
+target-facing action from either runner must still be issued through Mythic payload callbacks. Opaque Mythic task
+parameters are not treated as a typed network-intent protocol. It remains a `development_measurement`; it cannot
+support promotion or release and does not authorize live activity by itself. Preview the exact two-reset/two-arm
+plan without touching the range:
 
-`.venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario single-hop-system --side harness --seeds 1 --gate1p-stage-a-diagnostic --source-version <version>`
+`SAGE_BLOODHOUND_MCP_DIR=<explicit-checkout> SAGE_EVAL_API_ENDPOINT=<non-secret-endpoint> .venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario child-domain-control --gate1p-stage-a-pair --source-version <version> --model-context-limit <verified-limit> --max-output-tokens <shared-limit>`
 
-Add `--go` only under explicit live authority for this diagnostic. Countable Gate 1P `row` mode remains blocked
-until the diagnostic establishes the real terminal-response shape and a derived clean-stop observer is implemented
-and independently verified. Do not run the bare arm or expand the matrix during Stage A.
+Live execution requires a separate authority decision and the exact additional arguments
+`--go --live-authority-id gate1p-stagea-child-domain-control-pair-016`; the offline implementation tranche does
+not supply that authority. Row mode fails closed on any protocol/model/budget mismatch, uses a route-neutral
+objective/terminal observer for both arms, and stops before the naive arm when the retained shipping row is not
+outcome-countable. Result consumers must keep `objective_success`, `clean_stop`, `objective_recognized`, and
+`objective_clean_stop` separate. Do not expand the matrix beyond this pair.
+
+Pair control records whether the current arm is `idle`, `reset_started`, or `cleanup_complete`. The exact endpoint/
+key/model smoke runs while the arm is still idle and clamps to at most 8 output tokens, a 10-second request timeout,
+and zero client retries; a failed smoke performs no reset or generic range cleanup. A reset/readiness failure before
+`arm_started` retains its cleanup disposition in the pair directory's separate `prestart-cleanup.jsonl`, never in
+countable `results.jsonl`. An idle current arm may resume without a fictional cleanup record. A reset-started arm
+may resume once only when its cleanup disposition is exact and complete. A naive-arm resume also recomputes the
+retained shipping lifecycle; malformed cleanup, result-ledger contamination, already-started current arm, or a
+second recovery for the same arm fails closed before another reset.
 
 - Offline tests: `../../.venv/bin/python -m pytest tests/ -q`
 - Gate-experiment dry-run (synthetic, safe): `../../.venv/bin/python -m ai.hillclimb gate-experiment --dry-run`
@@ -146,9 +162,9 @@ operation, retry count, current blocker if any, and separate engineering/debug E
 Power down retired or burned purpose ranges once their artifacts are preserved.
 
 ## Gotchas
-- **Route symmetry:** a later bare-vs-harness comparison must resolve the same provider, model, API route, and
-  behavior-affecting configuration for both sides and record that identity in the per-run protocol snapshot.
-  Gate 1P Stage A is shipping-Sage diagnostic only, so it does not invoke a bare model.
+- **Route symmetry:** the Gate 1P pair must resolve the same provider, model, API route, context/output limits, and
+  behavior-affecting configuration for both sides, then verify one nonempty response-derived backend/provenance
+  identity across every model response. The wrapper/tool abstraction is the treatment.
 - **Operator replay is offline only:** `operator-replay run` calls models only when `--dry-run` is omitted; it never touches GOAD, Mythic, BloodHound, or Sage callbacks. The live canary remains `run_gauge_live.py` / `orchestrate.py`.
 - **Token/config seam (live gate):** the harness is only a Mythic CLIENT — env it sets never reaches the running Sage. So the gate's reset restarts Sage with `SAGE_ENGAGEMENT_ID=<run token>` (+ config env) via `full_reset_and_ready(restart_env=...)` → `sage_restart.sh KEY=VAL` overrides. Without that, ground truth reads an empty ledger and `gate_experiment` returns **INVALID** (fail-loud, by design). Which config keys change behavior depends on what Sage reads at startup; `SAGE_ENGAGEMENT_ID` always takes effect.
 - **Structured target matching must be exact:** parse semicolon-delimited key/value fields for capability targets,

@@ -18,12 +18,15 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[3]            # repository root
@@ -63,6 +66,13 @@ def _active_phase8_goad_regression_contract():
     from ai.hillclimb import phase8_goad_regression as phase8_contract  # type: ignore
 
     return phase8_contract
+
+
+def _gate1p_stagea_protocol():
+    sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import gate1p_stagea  # type: ignore
+
+    return gate1p_stagea
 
 
 def _laps_family_transfer_netbios_map() -> str:
@@ -360,10 +370,10 @@ RESET_STEPS = [
     ("ludus rollback",   [PY, "skills/sage-goad-reset/scripts/ludus.py", "rollback", "--yes"], ROOT, 2400),
     ("ludus poweron",    [PY, "skills/sage-goad-reset/scripts/ludus.py", "poweron", "all"], ROOT, 900),
     ("sync range time",  [PY, "skills/sage-goad-reset/scripts/sync_range_time.py", "sync", "--yes"], ROOT, 900),
-    ("restart sage",     ["/bin/bash", "skills/sage-goad-reset/scripts/sage_restart.sh",
-                          "SAGE_ENGAGEMENT_GATE=1", f"SAGE_BLOODHOUND_MCP_DIR={BH}"], ROOT, 240),
     ("wipe bloodhound",  ["uv", "--directory", BH, "run", "python",
                           str(ROOT / "skills/sage-goad-reset/scripts/bh_reset.py"), "wipe", "--yes"], ROOT, 180),
+    ("restart sage",     ["/bin/bash", "skills/sage-goad-reset/scripts/sage_restart.sh",
+                          "SAGE_ENGAGEMENT_GATE=1", f"SAGE_BLOODHOUND_MCP_DIR={BH}"], ROOT, 240),
     (
         "bootstrap foothold",
         [
@@ -626,13 +636,28 @@ def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
         raise SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
 
 
-def _poll(name, argv, cwd, predicate, *, timeout, interval=20, env: dict[str, str] | None = None):
+def _poll(
+    name,
+    argv,
+    cwd,
+    predicate,
+    *,
+    timeout,
+    interval=20,
+    env: dict[str, str] | None = None,
+    predicate_returncodes: tuple[int, ...] = (0,),
+):
     print(f"\n=== poll: {name} (<= {timeout}s) ===", flush=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        out = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, env=env).stdout
-        if predicate(out):
-            return out
+        proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, env=env)
+        if proc.returncode not in predicate_returncodes:
+            detail = (proc.stderr or proc.stdout or "no diagnostic output").strip()
+            raise SystemExit(
+                f"ABORT: poll '{name}' command failed (exit {proc.returncode}): {detail}"
+            )
+        if predicate(proc.stdout):
+            return proc.stdout
         time.sleep(interval)
     raise SystemExit(f"ABORT: '{name}' not ready within {timeout}s — fix the lab before running the gauge.")
 
@@ -671,21 +696,38 @@ def _range_clock_probes_reachable(out: str) -> bool:
     return bool(payload.get("hosts")) and not payload.get("errors")
 
 
+def _bloodhound_is_empty(out: str) -> bool:
+    match = re.search(r"\bcount=(\d+)\b", str(out or ""))
+    return bool(match and int(match.group(1)) == 0)
+
+
 def discover_callbacks(foothold: FootholdSpec | None = None) -> int:
     foothold = foothold or FootholdSpec()
-    out = subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True).stdout
-    apollo = [
-        int(match.group("id"))
-        for match in re.finditer(
-            r"id=(?P<id>\d+)\s+payloadtype=apollo\s+host=(?P<host>\S+)\s+user=(?P<user>\S+)",
-            out,
+    proc = subprocess.run(CALLBACKS, cwd=str(ROOT), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"ABORT: callback inventory failed (exit {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip()}"
         )
+    matches = list(re.finditer(
+        r"id=(?P<id>\d+)\s+payloadtype=apollo\s+host=(?P<host>\S+)\s+user=(?P<user>\S+)",
+        proc.stdout,
+    ))
+    exact = [
+        match
+        for match in matches
         if match.group("host").casefold() == foothold.callback_host.casefold()
-        and foothold.callback_user.casefold() in match.group("user").casefold()
+        and match.group("user").casefold() in {
+            foothold.callback_user.casefold(),
+            foothold.user.casefold(),
+        }
     ]
-    if not apollo:
-        raise SystemExit(f"ABORT: missing Apollo foothold callback for {foothold.label()}.\n{out}")
-    return apollo[-1]
+    if len(matches) != 1 or len(exact) != 1:
+        raise SystemExit(
+            f"ABORT: expected the sole active Apollo callback to exactly match {foothold.label()}, "
+            f"found apollo={len(matches)} exact={len(exact)}.\n{proc.stdout}"
+        )
+    return int(exact[0].group("id"))
 
 
 def _available_snapshots(
@@ -863,6 +905,7 @@ def full_reset_and_ready(
                 _range_clock_probes_reachable,
                 timeout=600,
                 env=range_env,
+                predicate_returncodes=(0, 1),
             )
             step_argv = _sync_range_time_argv(
                 "sync",
@@ -882,6 +925,19 @@ def full_reset_and_ready(
         if name == "restart sage" and restart_env:
             step_argv = list(argv) + [f"{k}={v}" for k, v in restart_env.items()]
         _run(name, step_argv, cwd, timeout, env=range_env)
+        if name == "wipe bloodhound":
+            _poll(
+                "BloodHound authoritative domain count is zero",
+                [
+                    "uv", "--directory", BH, "run", "python",
+                    str(ROOT / "skills/sage-goad-reset/scripts/bh_reset.py"), "status",
+                ],
+                ROOT,
+                _bloodhound_is_empty,
+                timeout=120,
+                interval=5,
+                env=range_env,
+            )
     _poll(
         f"{foothold.host} powered on",
         _ludus_argv("status", range_id=ludus_range_id, mcp_server=ludus_mcp_server),
@@ -898,6 +954,7 @@ def full_reset_and_ready(
         _readiness_ok,
         timeout=1200,
         env=range_env,
+        predicate_returncodes=(0, 1),
     )
     callback_id = discover_callbacks(foothold)
     return None, callback_id
@@ -907,6 +964,45 @@ def full_reset_and_ready(
 # post-solve work (DA settle polling up to ~300s, milestone probes, ScoreCard recording). The step cap is
 # solve_timeout + this, floored at the historical 3600 so the default behaviour is unchanged.
 _GAUGE_STEP_OVERHEAD_S = 900
+
+
+def _side_preflight_argv(
+    scenario: str,
+    *,
+    provider: str | None,
+    model: str | None,
+    max_output_tokens: int | None,
+) -> list[str]:
+    argv = [PY, "ai/hillclimb/run_gauge_live.py", "preflight", "--scenario", scenario]
+    if provider:
+        argv.extend(["--provider", provider])
+    if model:
+        argv.extend(["--model", model])
+    if max_output_tokens is not None:
+        argv.extend(["--max-output-tokens", str(max_output_tokens)])
+    return argv
+
+
+def _run_side_preflight(
+    scenario: str,
+    *,
+    provider: str | None,
+    model: str | None,
+    max_output_tokens: int | None,
+    route_env: dict[str, str] | None,
+) -> None:
+    _run(
+        f"preflight {scenario}",
+        _side_preflight_argv(
+            scenario,
+            provider=provider,
+            model=model,
+            max_output_tokens=max_output_tokens,
+        ),
+        PAYLOAD,
+        120,
+        env={**os.environ, **(route_env or {})},
+    )
 
 
 def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_mode: str = "llm",
@@ -929,13 +1025,28 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              phase8_attempt_index: int | None = None,
              measurement_kind: str = "legacy",
              protocol_id: str | None = None,
-             source_version: str | None = None) -> None:
+             pair_id: str | None = None,
+             arm_index: int | None = None,
+             model_token_budget: int | None = None,
+             model_context_limit: int | None = None,
+             max_output_tokens: int | None = None,
+             source_version: str | None = None,
+             live_authority_id: str | None = None,
+             skip_preflight: bool = False,
+             before_reset: Callable[[], None] | None = None) -> None:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
     # (via _run's non-zero SystemExit) on a dropped/opaque/unparseable objective.
-    _run(f"preflight {scenario}", [PY, "ai/hillclimb/run_gauge_live.py", "preflight", "--scenario", scenario], PAYLOAD, 120)
+    if not skip_preflight:
+        _run_side_preflight(
+            scenario,
+            provider=provider,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            route_env=route_env,
+        )
     # Sage always uses the bounded execution kernel for autonomous solves. Policy mode identifies who selects
     # each semantic capability: the product LLM policy or the preserved symbolic regression baseline.
     # SAGE_ENGAGEMENT_NETBIOS_MAP is the per-engagement NetBIOS->FQDN map (range-agnostic mechanism; the GOAD
@@ -950,6 +1061,12 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         "SAGE_ENGAGEMENT_NETBIOS_MAP": _engagement_netbios_map(scenario, engagement_netbios_map),
     }
     restart_env.update(_scenario_restart_env(scenario))
+    if measurement_kind == "row":
+        restart_env.update({
+            "SAGE_EVAL_MODEL_TOKEN_BUDGET": str(model_token_budget or ""),
+            "SAGE_EVAL_MODEL_CONTEXT_LIMIT": str(model_context_limit or ""),
+            "SAGE_EVAL_MAX_OUTPUT_TOKENS": str(max_output_tokens or ""),
+        })
     reset_kwargs = {
         "restart_env": restart_env,
         "snapshot": snapshot,
@@ -959,6 +1076,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     }
     if ludus_mcp_server is not None:
         reset_kwargs["ludus_mcp_server"] = ludus_mcp_server
+    if before_reset is not None:
+        before_reset()
     _sage_cb, apollo_cb = full_reset_and_ready(**reset_kwargs)
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "run", "--side", side, "--scenario", scenario,
             "--apollo-cb", str(apollo_cb), "--solve-timeout", str(solve_timeout),
@@ -973,8 +1092,20 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         argv.extend(["--measurement-kind", measurement_kind])
     if protocol_id:
         argv.extend(["--protocol-id", protocol_id])
+    if pair_id:
+        argv.extend(["--pair-id", pair_id])
+    if arm_index is not None:
+        argv.extend(["--arm-index", str(arm_index)])
+    if model_token_budget is not None:
+        argv.extend(["--model-token-budget", str(model_token_budget)])
+    if model_context_limit is not None:
+        argv.extend(["--model-context-limit", str(model_context_limit)])
+    if max_output_tokens is not None:
+        argv.extend(["--max-output-tokens", str(max_output_tokens)])
     if source_version:
         argv.extend(["--source-version", source_version])
+    if live_authority_id:
+        argv.extend(["--live-authority-id", live_authority_id])
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -991,6 +1122,19 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         "SAGE_BLOODHOUND_MCP_DIR": BH,
         **restart_env,
     }
+    if measurement_kind == "row" and pair_id:
+        child_env["SAGE_EVAL_RESET_READINESS_JSON"] = json.dumps({
+            "ready": True,
+            "snapshot": snapshot,
+            "range_id": ludus_range_id,
+            "bloodhound_domain_count": 0,
+            "clock_gate": "passed",
+            "runtime_databases_archived": True,
+            "mythic_reset": "passed",
+            "initial_callback_display_id": int(apollo_cb),
+            "unique_initial_callback": True,
+            "pre_arm_task_count": 0,
+        }, sort_keys=True)
     if scenario.startswith("laps-family-transfer-"):
         child_env.pop("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON", None)
         child_env.pop("SAGE_EVAL_PHASE6_FORCED_PATH", None)
@@ -1021,17 +1165,661 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     )
     if route_env:
         child_env.update(route_env)
+    if measurement_kind == "row" and pair_id:
+        artifact_dir = _gate1p_artifact_dir(route_env)
+        child_env["SAGE_EVAL_ARTIFACT_DIR"] = str(artifact_dir)
+        child_env["SAGE_EVAL_RESULTS_PATH"] = str(_gate1p_results_path(route_env))
+        child_env["SAGE_EVAL_PAIR_CONTROL_PATH"] = str(_gate1p_pair_control_path(route_env))
     _run(f"gauge {side}/{scenario}", argv, PAYLOAD, step_timeout, env=child_env)
 
 
-def compare(scenario: str) -> None:
-    _run(f"compare {scenario}", [PY, "ai/hillclimb/run_gauge_live.py", "compare", "--scenario", scenario], PAYLOAD, 120)
+def compare(scenario: str, *, pair_id: str | None = None) -> None:
+    argv = [PY, "ai/hillclimb/run_gauge_live.py", "compare", "--scenario", scenario]
+    if pair_id:
+        argv.extend(["--pair-id", pair_id])
+    _run(f"compare {scenario}", argv, PAYLOAD, 120)
+
+
+def _gate1p_artifact_dir(route_env: dict[str, str] | None = None) -> Path:
+    effective_env = {**os.environ, **(route_env or {})}
+    override = str(effective_env.get("SAGE_EVAL_ARTIFACT_DIR") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return (
+        ROOT / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / "gate1p-stagea" / _gate1p_stagea_protocol().PAIR_ID
+    )
+
+
+def _gate1p_results_path(route_env: dict[str, str] | None = None) -> Path:
+    effective_env = {**os.environ, **(route_env or {})}
+    override = str(effective_env.get("SAGE_EVAL_RESULTS_PATH") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _gate1p_artifact_dir(route_env) / "results.jsonl"
+
+
+def _gate1p_pair_control_path(route_env: dict[str, str] | None = None) -> Path:
+    return _gate1p_artifact_dir(route_env) / "pair-control.json"
+
+
+def _gate1p_prestart_cleanup_path(route_env: dict[str, str] | None = None) -> Path:
+    return _gate1p_artifact_dir(route_env) / "prestart-cleanup.jsonl"
+
+
+def validate_gate1p_storage(route_env: dict[str, str] | None = None) -> None:
+    history_root = (ROOT / ".sage_history").resolve()
+    artifact_dir = _gate1p_artifact_dir(route_env).resolve()
+    results_path = _gate1p_results_path(route_env).resolve()
+    prestart_cleanup_path = _gate1p_prestart_cleanup_path(route_env).resolve()
+    try:
+        artifact_dir.relative_to(history_root)
+        results_path.relative_to(history_root)
+        prestart_cleanup_path.relative_to(history_root)
+    except ValueError as exc:
+        raise SystemExit("ABORT: Gate 1P artifacts and results must stay under private .sage_history") from exc
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    probe = artifact_dir / f".write-probe-{os.getpid()}"
+    try:
+        probe.write_text("write-probe\n", encoding="utf-8")
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _read_gate1p_jsonl(path: Path, *, label: str) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except Exception as exc:
+        raise SystemExit(f"ABORT: {label} is unreadable: {exc}") from exc
+    if any(not isinstance(record, dict) for record in records):
+        raise SystemExit(f"ABORT: {label} contains a malformed record")
+    return records
+
+
+_GATE1P_PAIR_CONTROL_FIELDS = {
+    "schema", "protocol_id", "pair_id", "source_version", "next_arm",
+    "completed_arms", "prearm_state", "created_at", "updated_at",
+}
+_GATE1P_PREARM_FIELDS = {"arm", "status", "updated_at"}
+
+
+def _finite_json_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(float(value))
+
+
+def _require_gate1p_expected_source(source_version: object) -> str:
+    """Return the independently contracted source identity; never consult mutable control state."""
+    if (
+        type(source_version) is not str
+        or not source_version
+        or source_version != source_version.strip()
+        or source_version == "unrecorded"
+    ):
+        raise SystemExit("ABORT: an exact independently expected Gate 1P source_version is required")
+    return source_version
+
+
+def _validate_gate1p_pair_control_state(
+    state: object,
+    *,
+    expected_source_version: object,
+    allow_complete: bool = False,
+) -> dict:
+    protocol = _gate1p_stagea_protocol()
+    expected_source = _require_gate1p_expected_source(expected_source_version)
+    if not isinstance(state, dict) or set(state) != _GATE1P_PAIR_CONTROL_FIELDS:
+        raise SystemExit("ABORT: Gate 1P pair control has a non-canonical top-level schema")
+    if (
+        state.get("schema") != "gate1p-stagea-pair-control-v2"
+        or state.get("protocol_id") != protocol.PROTOCOL_ID
+        or state.get("pair_id") != protocol.PAIR_ID
+        or type(expected_source) is not str
+        or not expected_source
+        or state.get("source_version") != expected_source
+        or not _finite_json_number(state.get("created_at"))
+        or not _finite_json_number(state.get("updated_at"))
+        or float(state["updated_at"]) < float(state["created_at"])
+        or type(state.get("completed_arms")) is not list
+    ):
+        raise SystemExit("ABORT: Gate 1P pair control identity or metadata is malformed")
+    next_arm = state.get("next_arm")
+    completed = state.get("completed_arms")
+    prearm = state.get("prearm_state")
+    legal_active = {
+        "shipping_sage": [],
+        "true_naive": ["shipping_sage"],
+    }
+    if next_arm in legal_active:
+        if (
+            completed != legal_active[next_arm]
+            or not isinstance(prearm, dict)
+            or set(prearm) != _GATE1P_PREARM_FIELDS
+            or prearm.get("arm") != next_arm
+            or prearm.get("status") not in {"idle", "reset_started", "cleanup_complete"}
+            or not _finite_json_number(prearm.get("updated_at"))
+            or float(prearm["updated_at"]) < float(state["created_at"])
+            or float(prearm["updated_at"]) > float(state["updated_at"])
+        ):
+            raise SystemExit("ABORT: Gate 1P active pair-control state is malformed or illegal")
+    elif next_arm == "complete" and allow_complete:
+        if completed != list(protocol.ARMS) or prearm is not None:
+            raise SystemExit("ABORT: Gate 1P complete pair-control state is malformed")
+    else:
+        raise SystemExit("ABORT: Gate 1P pair control is consumed or out of order")
+    return state
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_gate1p_json(path: Path, payload: dict, *, create_only: bool = False) -> None:
+    """Publish one complete canonical JSON object without truncating the prior control state."""
+    data = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if create_only:
+            os.link(tmp, path)
+            tmp.unlink()
+        else:
+            os.replace(tmp, path)
+        _fsync_directory(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _validate_gate1p_prestart_cleanup(
+    records: list[dict],
+    *,
+    expected_arm: str,
+    require_current_arm: bool,
+) -> None:
+    """Admit one exact completed pre-arm cleanup per reached arm, outside the row ledger."""
+    protocol = _gate1p_stagea_protocol()
+    expected_steps = ["stop sage", "archive dbs", "verify no running tasks", "ludus poweroff"]
+    expected_fields = {
+        "schema", "record_type", "measurement_kind", "protocol", "result_retained",
+        "episode_artifact_retained", "temporary_evaluator_material", "complete", "errors",
+        "steps", "ts",
+    }
+    seen_arms: list[str] = []
+    timestamps: list[float] = []
+    for record in records:
+        identity = record.get("protocol")
+        steps = record.get("steps")
+        timestamp = record.get("ts")
+        if set(record) != expected_fields:
+            raise SystemExit("ABORT: prestart cleanup record has an undeclared shape")
+        if (
+            record.get("schema") != "gate1p-stagea-prestart-cleanup-v1"
+            or record.get("record_type") != "prestart_cleanup"
+            or record.get("measurement_kind") != "prestart_readiness"
+            or not isinstance(identity, dict)
+            or set(identity) != {"protocol_id", "pair_id", "arm"}
+            or identity.get("protocol_id") != protocol.PROTOCOL_ID
+            or identity.get("pair_id") != protocol.PAIR_ID
+            or identity.get("arm") not in protocol.ARMS
+            or record.get("result_retained") is not False
+            or record.get("episode_artifact_retained") is not False
+            or record.get("temporary_evaluator_material") != {
+                "created": False,
+                "removal_required": False,
+                "disposition": "not_applicable",
+            }
+            or record.get("complete") is not True
+            or record.get("errors") != []
+            or not isinstance(steps, list)
+            or [step.get("name") for step in steps if isinstance(step, dict)] != expected_steps
+            or any(
+                not isinstance(step, dict)
+                or set(step) != {"name", "ok"}
+                or step.get("ok") is not True
+                for step in steps
+            )
+            or not _finite_json_number(timestamp)
+        ):
+            raise SystemExit("ABORT: prestart cleanup record is incomplete or mismatched")
+        seen_arms.append(str(identity["arm"]))
+        timestamps.append(float(timestamp))
+    if len(seen_arms) != len(set(seen_arms)):
+        raise SystemExit("ABORT: retry-zero prestart cleanup already consumed an arm recovery")
+    arm_indices = [protocol.ARMS.index(arm) for arm in seen_arms]
+    if arm_indices != sorted(arm_indices):
+        raise SystemExit("ABORT: prestart cleanup arm order is invalid")
+    if any(index > protocol.ARMS.index(expected_arm) for index in arm_indices):
+        raise SystemExit("ABORT: prestart cleanup is ahead of pair control")
+    current_present = expected_arm in seen_arms
+    if current_present is not require_current_arm:
+        raise SystemExit("ABORT: prestart cleanup does not match the current pre-arm state")
+    if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
+        raise SystemExit("ABORT: prestart cleanup chronology is invalid")
+
+
+def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, str] | None = None) -> Path:
+    """Create or exactly resume the one-shot lifecycle state before any reset begins."""
+    expected_source = _require_gate1p_expected_source(source_version)
+    protocol = _gate1p_stagea_protocol()
+    path = _gate1p_pair_control_path(route_env)
+    results = _gate1p_results_path(route_env)
+    prior = _read_gate1p_jsonl(results, label="existing Gate 1P result ledger")
+    prestart = _read_gate1p_jsonl(
+        _gate1p_prestart_cleanup_path(route_env),
+        label="Gate 1P prestart cleanup ledger",
+    )
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise SystemExit(f"ABORT: existing Gate 1P pair control is unreadable: {exc}") from exc
+        _validate_gate1p_pair_control_state(existing, expected_source_version=expected_source)
+        next_arm = existing["next_arm"]
+        completed_arms = existing["completed_arms"]
+        prearm_state = existing["prearm_state"]
+        if next_arm == "shipping_sage" and completed_arms == []:
+            if prior:
+                raise SystemExit("ABORT: shipping resume requires an empty countable result ledger")
+        elif next_arm == "true_naive" and completed_arms == ["shipping_sage"]:
+            if any(
+                (record.get("protocol") or {}).get("arm") == "true_naive"
+                for record in prior
+            ):
+                raise SystemExit("ABORT: retry-zero lifecycle already consumed the naive arm")
+            shipping = protocol.completed_arm_lifecycle_disposition(
+                prior,
+                arm="shipping_sage",
+                history_root=(ROOT / ".sage_history").resolve(),
+            )
+            if shipping.get("countable") is not True:
+                raise SystemExit(
+                    f"ABORT: naive resume blocked by shipping admission: {shipping.get('reason')}"
+                )
+        else:
+            raise SystemExit("ABORT: Gate 1P pair control is consumed or out of order")
+        _validate_gate1p_prestart_cleanup(
+            prestart,
+            expected_arm=str(next_arm),
+            require_current_arm=prearm_state["status"] != "idle",
+        )
+        if prearm_state["status"] == "reset_started":
+            existing["prearm_state"] = {
+                "arm": next_arm,
+                "status": "cleanup_complete",
+                "updated_at": time.time(),
+            }
+            existing["updated_at"] = time.time()
+            _validate_gate1p_pair_control_state(existing, expected_source_version=expected_source)
+            _atomic_write_gate1p_json(path, existing)
+        return path
+    if prior or prestart:
+        raise SystemExit("ABORT: Gate 1P lifecycle evidence exists without pair control")
+    created_at = time.time()
+    state = {
+        "schema": "gate1p-stagea-pair-control-v2",
+        "protocol_id": protocol.PROTOCOL_ID,
+        "pair_id": protocol.PAIR_ID,
+        "source_version": expected_source,
+        "next_arm": "shipping_sage",
+        "completed_arms": [],
+        "prearm_state": {
+            "arm": "shipping_sage",
+            "status": "idle",
+            "updated_at": created_at,
+        },
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    try:
+        _atomic_write_gate1p_json(path, state, create_only=True)
+    except FileExistsError as exc:
+        raise SystemExit("ABORT: Gate 1P pair control was concurrently created") from exc
+    return path
+
+
+def mark_gate1p_prearm_reset_started(
+    *,
+    arm: str,
+    source_version: str,
+    route_env: dict[str, str] | None = None,
+) -> None:
+    """Persist reset mutation intent immediately before the reset/readiness controller runs."""
+    path = _gate1p_pair_control_path(route_env)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
+    expected_source = _require_gate1p_expected_source(source_version)
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    prearm_state = state["prearm_state"]
+    if (
+        state.get("next_arm") != arm
+        or prearm_state.get("arm") != arm
+        or prearm_state.get("status") not in {"idle", "cleanup_complete"}
+    ):
+        raise SystemExit("ABORT: Gate 1P reset start is out of order")
+    state["prearm_state"] = {"arm": arm, "status": "reset_started", "updated_at": time.time()}
+    state["updated_at"] = time.time()
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    _atomic_write_gate1p_json(path, state)
+
+
+def mark_gate1p_prestart_cleanup_complete(
+    *,
+    arm: str,
+    source_version: str,
+    route_env: dict[str, str] | None = None,
+) -> None:
+    """Bind a complete pre-arm cleanup to the exact reset-started arm."""
+    path = _gate1p_pair_control_path(route_env)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
+    expected_source = _require_gate1p_expected_source(source_version)
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    prearm_state = state["prearm_state"]
+    if (
+        state.get("next_arm") != arm
+        or prearm_state.get("arm") != arm
+        or prearm_state.get("status") != "reset_started"
+    ):
+        raise SystemExit("ABORT: Gate 1P prestart cleanup completion is out of order")
+    state["prearm_state"] = {"arm": arm, "status": "cleanup_complete", "updated_at": time.time()}
+    state["updated_at"] = time.time()
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    _atomic_write_gate1p_json(path, state)
+
+
+def advance_gate1p_pair_control(
+    *,
+    arm: str,
+    source_version: str,
+    route_env: dict[str, str] | None = None,
+) -> None:
+    """Advance only after the arm returned and its guaranteed cleanup completed."""
+    path = _gate1p_pair_control_path(route_env)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
+    expected_source = _require_gate1p_expected_source(source_version)
+    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    expected_completed = [] if arm == "shipping_sage" else ["shipping_sage"]
+    prearm_state = state["prearm_state"]
+    if (
+        state.get("next_arm") != arm
+        or state.get("completed_arms") != expected_completed
+        or prearm_state.get("arm") != arm
+        or prearm_state.get("status") != "reset_started"
+    ):
+        raise SystemExit("ABORT: Gate 1P pair control transition is out of order")
+    state["completed_arms"] = [*expected_completed, arm]
+    state["next_arm"] = "true_naive" if arm == "shipping_sage" else "complete"
+    state["prearm_state"] = (
+        {"arm": "true_naive", "status": "idle", "updated_at": time.time()}
+        if arm == "shipping_sage"
+        else None
+    )
+    state["updated_at"] = time.time()
+    _validate_gate1p_pair_control_state(
+        state,
+        expected_source_version=expected_source,
+        allow_complete=True,
+    )
+    _atomic_write_gate1p_json(path, state)
+
+
+def _gate1p_result_retained(*, arm: str, pair_id: str, route_env: dict[str, str] | None = None) -> bool:
+    path = _gate1p_results_path(route_env)
+    if not path.is_file():
+        return False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        protocol = record.get("protocol") if isinstance(record.get("protocol"), dict) else {}
+        if (
+            record.get("record_type") == "result"
+            and protocol.get("pair_id") == pair_id
+            and protocol.get("arm") == arm
+        ):
+            return True
+    return False
+
+
+def _gate1p_arm_started(*, arm: str, pair_id: str, route_env: dict[str, str] | None = None) -> bool:
+    path = _gate1p_results_path(route_env)
+    if not path.is_file():
+        return False
+    try:
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except Exception as exc:
+        raise SystemExit(f"ABORT: Gate 1P row ledger is unreadable during cleanup: {exc}") from exc
+    return any(
+        isinstance(record, dict)
+        and record.get("record_type") == "arm_started"
+        and (record.get("protocol") or {}).get("pair_id") == pair_id
+        and (record.get("protocol") or {}).get("arm") == arm
+        for record in records
+    )
+
+
+def cleanup_gate1p_arm(
+    *,
+    arm: str,
+    pair_id: str,
+    ludus_range_id: str | None,
+    ludus_mcp_server: str | None,
+    route_env: dict[str, str] | None = None,
+    row_started: bool = True,
+    source_version: str | None = None,
+) -> dict:
+    """Always execute the declared post-arm cleanup and retain a typed disposition."""
+    range_env = _range_env(ludus_range_id, ludus_mcp_server)
+    steps: list[dict[str, object]] = []
+    errors: list[str] = []
+    cleanup_steps = [
+        ("stop sage", ["/bin/bash", "skills/sage-goad-reset/scripts/sage_stop.sh"], ROOT, 120),
+        ("archive dbs", [PY, "skills/sage-goad-reset/scripts/archive_runtime_dbs.py"], ROOT, 180),
+        (
+            "verify no running tasks",
+            [PY, "ai/hillclimb/run_gauge_live.py", "verify-no-running-tasks"],
+            PAYLOAD,
+            120,
+        ),
+        (
+            "ludus poweroff",
+            _ludus_argv(
+                "poweroff",
+                "all",
+                range_id=ludus_range_id,
+                mcp_server=ludus_mcp_server,
+            ),
+            ROOT,
+            900,
+        ),
+    ]
+    for name, argv, cwd, timeout in cleanup_steps:
+        try:
+            _run(f"Gate 1P cleanup: {name}", argv, cwd, timeout, env=range_env)
+        except (OSError, SystemExit, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{name}: {exc}")
+            steps.append({"name": name, "ok": False, "error": str(exc)})
+        else:
+            steps.append({"name": name, "ok": True})
+    result_retained = _gate1p_result_retained(arm=arm, pair_id=pair_id, route_env=route_env)
+    episode_artifact = _gate1p_artifact_dir(route_env) / f"{arm}-episode.json"
+    episode_artifact_retained = episode_artifact.is_file()
+    if row_started and not result_retained:
+        errors.append("required arm result record is absent")
+    if row_started and not episode_artifact_retained:
+        errors.append("required episode artifact is absent")
+    if not row_started and not errors:
+        try:
+            mark_gate1p_prestart_cleanup_complete(
+                arm=arm,
+                source_version=_require_gate1p_expected_source(source_version),
+                route_env=route_env,
+            )
+        except SystemExit as exc:
+            errors.append(f"pair control: {exc}")
+    report = {
+        "record_type": "cleanup",
+        "measurement_kind": "row",
+        "protocol": {"protocol_id": _gate1p_stagea_protocol().PROTOCOL_ID, "pair_id": pair_id, "arm": arm},
+        "result_retained": result_retained,
+        "episode_artifact": str(episode_artifact),
+        "episode_artifact_retained": episode_artifact_retained,
+        "temporary_evaluator_material": {
+            "created": False,
+            "removal_required": False,
+            "disposition": "not_applicable",
+        },
+        "complete": not errors,
+        "errors": errors,
+        "steps": steps,
+        "ts": time.time(),
+    }
+    if row_started:
+        path = _gate1p_results_path(route_env)
+    else:
+        report = {
+            "schema": "gate1p-stagea-prestart-cleanup-v1",
+            "record_type": "prestart_cleanup",
+            "measurement_kind": "prestart_readiness",
+            "protocol": report["protocol"],
+            "result_retained": result_retained,
+            "episode_artifact_retained": episode_artifact_retained,
+            "temporary_evaluator_material": report["temporary_evaluator_material"],
+            "complete": report["complete"],
+            "errors": errors,
+            "steps": steps,
+            "ts": report["ts"],
+        }
+        path = _gate1p_prestart_cleanup_path(route_env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(report, sort_keys=True) + "\n")
+    if errors:
+        raise SystemExit(f"ABORT: Gate 1P cleanup incomplete for {arm}: {'; '.join(errors)}")
+    return report
+
+
+def _validate_gate1p_wrapper_entry(
+    *,
+    arm: str,
+    source_version: object,
+    route_env: dict[str, str] | None,
+) -> str:
+    """Bind the CLI/contract source to mutable control before provider or reset spend."""
+    expected_source = _require_gate1p_expected_source(source_version)
+    try:
+        entry_state = json.loads(
+            _gate1p_pair_control_path(route_env).read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        raise SystemExit(f"ABORT: Gate 1P pair control is unreadable at wrapper entry: {exc}") from exc
+    _validate_gate1p_pair_control_state(
+        entry_state,
+        expected_source_version=expected_source,
+    )
+    if entry_state.get("next_arm") != arm:
+        raise SystemExit("ABORT: Gate 1P wrapper arm is out of order")
+    return expected_source
+
+
+def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
+    """Run one arm and guarantee cleanup after every started Gate 1P row, including failures."""
+    is_pair = kwargs.get("measurement_kind") == "row" and kwargs.get("pair_id")
+    protocol = _gate1p_stagea_protocol()
+    arm_index = kwargs.get("arm_index")
+    arm = protocol.ARMS[int(arm_index)] if arm_index in (0, 1) else f"invalid:{arm_index}"
+    run_kwargs = dict(kwargs)
+    reset_started = False
+    if is_pair:
+        expected_source = _validate_gate1p_wrapper_entry(
+            arm=arm,
+            source_version=kwargs.get("source_version"),
+            route_env=kwargs.get("route_env"),
+        )
+        _run_side_preflight(
+            scenario,
+            provider=kwargs.get("provider"),
+            model=kwargs.get("model"),
+            max_output_tokens=kwargs.get("max_output_tokens"),
+            route_env=kwargs.get("route_env"),
+        )
+
+        def before_reset() -> None:
+            nonlocal reset_started
+            mark_gate1p_prearm_reset_started(
+                arm=arm,
+                source_version=expected_source,
+                route_env=kwargs.get("route_env"),
+            )
+            reset_started = True
+
+        run_kwargs["skip_preflight"] = True
+        run_kwargs["before_reset"] = before_reset
+    arm_returned = False
+    try:
+        run_side(scenario, side, **run_kwargs)
+        arm_returned = True
+    finally:
+        if is_pair and reset_started:
+            try:
+                row_started = _gate1p_arm_started(
+                    arm=arm,
+                    pair_id=str(kwargs["pair_id"]),
+                    route_env=kwargs.get("route_env"),
+                )
+            except SystemExit:
+                row_started = True
+            cleanup_gate1p_arm(
+                arm=arm,
+                pair_id=str(kwargs["pair_id"]),
+                ludus_range_id=kwargs.get("ludus_range_id"),
+                ludus_mcp_server=kwargs.get("ludus_mcp_server"),
+                route_env=kwargs.get("route_env"),
+                row_started=row_started,
+                source_version=expected_source,
+            )
+            if arm_returned:
+                if not row_started:
+                    raise SystemExit("ABORT: Gate 1P arm returned without an arm_started record")
+                advance_gate1p_pair_control(
+                    arm=arm,
+                    source_version=expected_source,
+                    route_env=kwargs.get("route_env"),
+                )
 
 
 def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=None, model=None,
                   null_model=False,
                   measurement_kind="legacy",
                   protocol_id=None,
+                  pair_id=None,
+                  model_token_budget=None,
+                  model_context_limit=None,
+                  max_output_tokens=None,
                   source_version=None,
                   snapshot=DEFAULT_SNAPSHOT,
                   retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG,
@@ -1044,9 +1832,23 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
+    if measurement_kind == "row":
+        print(f"  durable-artifact-dir={_gate1p_artifact_dir()}\n")
     for s in range(seeds):
-        for sd in ([side] if side else ["harness", "bare"]):
+        for arm_index, sd in enumerate([side] if side else ["harness", "bare"]):
             print(f"--- iteration seed={s} side={sd} ---")
+            preflight_argv = _side_preflight_argv(
+                scenario,
+                provider=provider,
+                model=model,
+                max_output_tokens=max_output_tokens,
+            )
+            preflight_note = (
+                "     # exact model-route smoke clamps to <=8 output tokens, 10s, zero retries"
+                if measurement_kind == "row"
+                else ""
+            )
+            print(f"  (cd {PAYLOAD}) {' '.join(preflight_argv)}{preflight_note}")
             for name, argv, cwd, _ in RESET_STEPS:
                 if name == "ludus rollback" and snapshot:
                     argv = _ludus_argv(
@@ -1088,6 +1890,12 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                         str(retained_callback_config),
                     ]
                 print(f"  (cd {cwd}) {' '.join(argv)}")
+                if name == "wipe bloodhound":
+                    print(
+                        f"  (cd {ROOT}) uv --directory {BH} run python "
+                        f"{ROOT / 'skills/sage-goad-reset/scripts/bh_reset.py'} status     "
+                        "# poll every 5s for <=120s until authoritative count=0"
+                    )
             print(
                 f"  (cd {ROOT}) {' '.join(_ludus_argv('status', range_id=ludus_range_id, mcp_server=ludus_mcp_server))}     "
                 f"# poll until {foothold.host} is up"
@@ -1110,9 +1918,25 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   f"{' --null-model' if null_model else ''}"
                   f"{f' --measurement-kind {measurement_kind}' if measurement_kind != 'legacy' else ''}"
                   f"{f' --protocol-id {protocol_id}' if protocol_id else ''}"
+                  f"{f' --pair-id {pair_id}' if pair_id else ''}"
+                  f"{f' --arm-index {arm_index}' if pair_id else ''}"
+                  f"{f' --model-token-budget {model_token_budget}' if model_token_budget else ''}"
+                  f"{f' --model-context-limit {model_context_limit}' if model_context_limit else ''}"
+                  f"{f' --max-output-tokens {max_output_tokens}' if max_output_tokens else ''}"
                   f"{f' --source-version {source_version}' if source_version else ''}")
+            if measurement_kind == "row":
+                print(f"  (cd {ROOT}) /bin/bash skills/sage-goad-reset/scripts/sage_stop.sh     # cleanup")
+                print(f"  (cd {ROOT}) {PY} skills/sage-goad-reset/scripts/archive_runtime_dbs.py     # cleanup")
+                print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py verify-no-running-tasks     # cleanup")
+                print(
+                    f"  (cd {ROOT}) {' '.join(_ludus_argv('poweroff', 'all', range_id=ludus_range_id, mcp_server=ludus_mcp_server))}"
+                    "     # cleanup; retained disposition required"
+                )
     if measurement_kind != "diagnostic":
-        print(f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}")
+        print(
+            f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}"
+            f"{f' --pair-id {pair_id}' if pair_id else ''}"
+        )
     print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
 
@@ -1125,10 +1949,24 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--gate1p-stage-a-diagnostic",
         action="store_true",
-        help="run exactly one non-countable shipping-Sage single-hop-system production-shape diagnostic",
+        help="run exactly one non-countable shipping-Sage child-domain-control production-shape diagnostic",
     )
+    ap.add_argument(
+        "--gate1p-stage-a-pair",
+        action="store_true",
+        help="run the exact accepted one-row shipping-Sage/true-naive Stage A pair",
+    )
+    ap.add_argument("--model-context-limit", type=int, default=None,
+                    help="verified provider per-request context limit for the paired row")
+    ap.add_argument("--max-output-tokens", type=int, default=None,
+                    help="shared configured maximum output tokens for the paired row")
     ap.add_argument("--source-version", default=None,
                     help="exact source version recorded in the diagnostic protocol snapshot")
+    ap.add_argument(
+        "--live-authority-id",
+        default=None,
+        help="separate explicit live authority identifier; required with --go for the Stage A pair",
+    )
     ap.add_argument("--solve-timeout", type=int, default=1800,
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
                          "to cover this + post-solve scoring overhead, so long solves are not killed early.")
@@ -1273,10 +2111,12 @@ def main(argv=None) -> int:
         ap.error("--null-model-factorial cannot be combined with a named model treatment")
     policy_modes = ["symbolic", "llm", "hybrid"] if args.null_model_factorial else [policy_mode]
     null_model = bool(args.null_model or args.null_model_factorial)
+    if args.gate1p_stage_a_diagnostic and args.gate1p_stage_a_pair:
+        ap.error("the non-countable diagnostic and countable paired-row modes are mutually exclusive")
     if args.gate1p_stage_a_diagnostic:
-        if args.scenario != "single-hop-system" or args.side != "harness" or args.seeds != 1:
+        if args.scenario != "child-domain-control" or args.side != "harness" or args.seeds != 1:
             ap.error(
-                "--gate1p-stage-a-diagnostic requires --scenario single-hop-system "
+                "--gate1p-stage-a-diagnostic requires --scenario child-domain-control "
                 "--side harness --seeds 1"
             )
         if policy_mode != "llm" or null_model:
@@ -1299,14 +2139,75 @@ def main(argv=None) -> int:
             "SAGE_EVAL_API_ENDPOINT": route["api_endpoint"],
             "SAGE_EVAL_API_KEY": route["api_key"],
         }
+    gate1p = _gate1p_stagea_protocol()
+    if args.gate1p_stage_a_pair:
+        if args.scenario != gate1p.SCENARIO or args.side is not None or args.seeds != 1:
+            ap.error(
+                f"--gate1p-stage-a-pair requires --scenario {gate1p.SCENARIO} "
+                "with no --side and --seeds 1"
+            )
+        if policy_mode != gate1p.POLICY_MODE or null_model or args.null_model_factorial:
+            ap.error("the Stage A pair uses only the shipping llm policy and true-naive arm")
+        if args.solve_timeout != gate1p.WALL_SECONDS:
+            ap.error(f"the Stage A pair requires --solve-timeout {gate1p.WALL_SECONDS}")
+        if args.snapshot != gate1p.RESET_SNAPSHOT:
+            ap.error(f"the Stage A pair requires --snapshot {gate1p.RESET_SNAPSHOT}")
+        actual_foothold = {
+            "host": foothold.host,
+            "ip": foothold.ip,
+            "identity": foothold.user,
+            "callback_user": foothold.callback_user,
+            "payload_type": "apollo",
+        }
+        if actual_foothold != gate1p.INITIAL_FOOTHOLD_ROLE:
+            ap.error("the Stage A pair requires the fixed CASTELBLACK/Samwell Apollo foothold role")
+        args.provider = args.provider or gate1p.MODEL_PROVIDER
+        args.model = args.model or gate1p.MODEL_ID
+        if args.provider.casefold() != gate1p.MODEL_PROVIDER or args.model != gate1p.MODEL_ID:
+            ap.error(
+                f"the Stage A pair requires provider/model "
+                f"{gate1p.MODEL_PROVIDER}/{gate1p.MODEL_ID}"
+            )
+        if not args.source_version:
+            ap.error("--source-version is required for the Stage A pair")
+        if not args.model_context_limit or not args.max_output_tokens:
+            ap.error("--model-context-limit and --max-output-tokens are required for the Stage A pair")
+        if args.max_output_tokens > args.model_context_limit:
+            ap.error("--max-output-tokens cannot exceed --model-context-limit")
+        if not BH or not Path(BH).is_dir():
+            ap.error(
+                "SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the Stage A pair"
+            )
+        effective_route_env = route_env or os.environ
+        if not str(effective_route_env.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
+            ap.error("SAGE_EVAL_API_ENDPOINT is required for exact Stage A route parity")
+        if args.go and args.live_authority_id != gate1p.PAIR_ID:
+            ap.error(
+                f"live paired-row execution requires separate --live-authority-id {gate1p.PAIR_ID}"
+            )
+        if args.go:
+            validate_gate1p_storage(route_env)
 
     if not args.go:
         for selected_mode in policy_modes:
             _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
                           args.seeds, args.solve_timeout, selected_mode,
                           args.provider, args.model, null_model,
-                          "diagnostic" if args.gate1p_stage_a_diagnostic else "legacy",
-                          "gate1p-stage-a-diagnostic-v1" if args.gate1p_stage_a_diagnostic else None,
+                          (
+                              "row" if args.gate1p_stage_a_pair
+                              else "diagnostic" if args.gate1p_stage_a_diagnostic
+                              else "legacy"
+                          ),
+                          (
+                              gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
+                              else "gate1p-stage-a-diagnostic-v1"
+                              if args.gate1p_stage_a_diagnostic
+                              else None
+                          ),
+                          gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
+                          gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair else None,
+                          args.model_context_limit,
+                          args.max_output_tokens,
                           args.source_version,
                           args.snapshot, args.retained_callback_config, foothold,
                           args.ludus_range_id, args.ludus_mcp_server)
@@ -1320,13 +2221,26 @@ def main(argv=None) -> int:
         args.ludus_range_id,
         args.ludus_mcp_server,
     )
+    gate1p_start_arm_index = 0
+    if args.gate1p_stage_a_pair:
+        control_path = initialize_gate1p_pair_control(
+            source_version=str(args.source_version),
+            route_env=route_env,
+        )
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        gate1p_start_arm_index = gate1p.ARMS.index(str(control["next_arm"]))
     for selected_mode in policy_modes:
         for _seed_index in range(args.seeds):
-            sides = ["harness"] if args.null_model_factorial else (
-                [args.side] if args.side else ["harness", "bare"]
-            )
-            for side in sides:
-                run_side(args.scenario, side, go=True, solve_timeout=args.solve_timeout,
+            if args.gate1p_stage_a_pair:
+                indexed_sides = list(enumerate(["harness", "bare"]))[gate1p_start_arm_index:]
+            else:
+                sides = ["harness"] if args.null_model_factorial else (
+                    [args.side] if args.side else ["harness", "bare"]
+                )
+                indexed_sides = list(enumerate(sides))
+            for arm_index, side in indexed_sides:
+                run_side_with_gate1p_cleanup(
+                         args.scenario, side, go=True, solve_timeout=args.solve_timeout,
                          policy_mode=selected_mode, provider=args.provider, model=args.model,
                          null_model=null_model, route_env=route_env,
                          snapshot=args.snapshot,
@@ -1344,16 +2258,28 @@ def main(argv=None) -> int:
                          phase8_planned_row_id=args.phase8_planned_row_id,
                          phase8_attempt_index=args.phase8_attempt_index,
                          measurement_kind=(
-                             "diagnostic" if args.gate1p_stage_a_diagnostic else "legacy"
+                             "row" if args.gate1p_stage_a_pair
+                             else "diagnostic" if args.gate1p_stage_a_diagnostic
+                             else "legacy"
                          ),
                          protocol_id=(
-                             "gate1p-stage-a-diagnostic-v1"
-                             if args.gate1p_stage_a_diagnostic
-                             else None
+                             gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
+                             else "gate1p-stage-a-diagnostic-v1"
+                             if args.gate1p_stage_a_diagnostic else None
                          ),
-                         source_version=args.source_version)
+                         pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
+                         arm_index=arm_index if args.gate1p_stage_a_pair else None,
+                         model_token_budget=(
+                             gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair else None
+                         ),
+                         model_context_limit=args.model_context_limit,
+                         max_output_tokens=args.max_output_tokens,
+                         source_version=args.source_version,
+                         live_authority_id=(
+                             args.live_authority_id if args.gate1p_stage_a_pair else None
+                         ))
     if not args.side and not args.null_model_factorial and not args.gate1p_stage_a_diagnostic:
-        compare(args.scenario)
+        compare(args.scenario, pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None)
     return 0
 
 

@@ -382,17 +382,64 @@ def _response_backend_provenance(value: Any) -> dict[str, Any]:
         "",
     )
     backend = f"{provider}:{model_id}" if provider and model_id else (model_id or provider)
-    source_key = next(
-        (key for key in ("model_name", "model_id", "model", "model_provider", "provider_name", "provider")
-         if key in value_sources),
+    provider_source_key = next(
+        (key for key in ("model_provider", "provider_name", "provider") if key in value_sources),
         "",
     )
+    model_source_key = next(
+        (key for key in ("model_name", "model_id", "model") if key in value_sources),
+        "",
+    )
+    provenance_parts = [
+        value_sources[key]
+        for key in (provider_source_key, model_source_key)
+        if key
+    ]
+    usage: dict[str, int] = {}
+    usage_source = "unavailable"
+    usage_candidates = (
+        ("usage_metadata", getattr(value, "usage_metadata", None)),
+        (
+            "response_metadata.token_usage",
+            getattr(value, "response_metadata", {}).get("token_usage")
+            if isinstance(getattr(value, "response_metadata", None), dict)
+            else None,
+        ),
+    )
+    aliases = {
+        "input_tokens": ("input_tokens", "prompt_tokens", "input_token_count"),
+        "output_tokens": ("output_tokens", "completion_tokens", "output_token_count"),
+        "total_tokens": ("total_tokens", "total_token_count"),
+    }
+    for candidate_source, candidate in usage_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        parsed: dict[str, int] = {}
+        for canonical, names in aliases.items():
+            for name in names:
+                if candidate.get(name) is None:
+                    continue
+                try:
+                    number = int(candidate[name])
+                except (TypeError, ValueError):
+                    break
+                if number >= 0:
+                    parsed[canonical] = number
+                break
+        if "total_tokens" not in parsed and {"input_tokens", "output_tokens"} <= set(parsed):
+            parsed["total_tokens"] = parsed["input_tokens"] + parsed["output_tokens"]
+        if parsed:
+            usage = parsed
+            usage_source = candidate_source
+            break
     return {
         "effective_backend": backend,
         "effective_model_provider": provider,
         "effective_model_id": model_id,
-        "backend_provenance_source": value_sources.get(source_key, "unavailable"),
+        "backend_provenance_source": "+".join(provenance_parts) or "unavailable",
         "response_metadata": safe_metadata,
+        "token_usage": usage,
+        "token_usage_source": usage_source,
     }
 
 
@@ -496,6 +543,8 @@ class PolicyDecision:
     effective_model_id: str = ""
     backend_provenance_source: str = ""
     response_metadata: dict[str, str] = field(default_factory=dict)
+    token_usage: dict[str, int] = field(default_factory=dict)
+    token_usage_source: str = ""
     decision_packet: dict[str, Any] = field(default_factory=dict)
     decision_packet_hash: str = ""
     policy_version: str = ""

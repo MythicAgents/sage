@@ -168,6 +168,166 @@ def test_config_results_path_honors_eval_override(tmp_path, monkeypatch):
     assert rgl.Config().results_path == path
 
 
+def test_compare_passes_entire_gate1p_ledger_to_closed_envelope(tmp_path, monkeypatch):
+    path = tmp_path / "pair.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+    path.write_text(json.dumps({
+        "record_type": "arm_started",
+        "measurement_kind": "row",
+        "protocol": {
+            "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
+            "pair_id": "other-pair",
+            "arm": "shipping_sage",
+        },
+    }) + "\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="closed envelope"):
+        rgl.compare(
+            rgl.Config(pair_id=rgl.gate1p_stagea.PAIR_ID),
+            rgl.gate1p_stagea.SCENARIO,
+        )
+
+
+def test_compare_rejects_malformed_top_level_json_before_record_derivation(tmp_path, monkeypatch):
+    path = tmp_path / "pair.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+    path.write_text("[]\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="malformed record"):
+        rgl.compare(
+            rgl.Config(pair_id=rgl.gate1p_stagea.PAIR_ID),
+            rgl.gate1p_stagea.SCENARIO,
+        )
+
+
+def test_compare_admits_complete_gate1p_ledger_before_constructing_cards(tmp_path, monkeypatch):
+    path = tmp_path / "pair.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+    records = [
+        {
+            "record_type": "result",
+            "measurement_kind": "row",
+            "scenario": rgl.gate1p_stagea.SCENARIO,
+            "protocol": {
+                "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
+                "pair_id": rgl.gate1p_stagea.PAIR_ID,
+                "arm": arm,
+            },
+            "side": side,
+            "card": {},
+            "cost_countable": {},
+        }
+        for arm, side in (("shipping_sage", "harness"), ("true_naive", "bare"))
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    calls = []
+
+    projected = [
+        {
+            "arm": arm,
+            "side": side,
+            "card": {"projection": arm},
+            "cost_countable": {"model_calls": True},
+        }
+        for arm, side in (("shipping_sage", "harness"), ("true_naive", "bare"))
+    ]
+
+    def _admit(ledger):
+        calls.append(("admit", ledger))
+        return {"countable": True, "comparison_inputs": projected}
+
+    class _Card:
+        def __init__(self, **kwargs):
+            assert calls and calls[0][0] == "admit"
+            calls.append(("card", kwargs))
+
+    class _Comparison:
+        verdict = "test"
+        delta = 0.0
+        harness_objective_success_rate = 0.0
+        bare_objective_success_rate = 0.0
+        min_detectable_effect = 1.0
+
+    monkeypatch.setattr(rgl.gate1p_stagea, "pair_disposition", _admit)
+    monkeypatch.setattr(rgl, "ScoreCard", _Card)
+    monkeypatch.setattr(
+        rgl.bare_runner,
+        "compare_bare_vs_harness",
+        lambda *_args, **_kwargs: _Comparison(),
+    )
+
+    rgl.compare(
+        rgl.Config(pair_id=rgl.gate1p_stagea.PAIR_ID),
+        rgl.gate1p_stagea.SCENARIO,
+    )
+
+    assert [name for name, _value in calls] == ["admit", "card", "card"]
+    assert [value for name, value in calls if name == "card"] == [
+        {"projection": "shipping_sage"},
+        {"projection": "true_naive"},
+    ]
+
+
+def test_compare_preserves_ordinary_non_gate_record_behavior(tmp_path, monkeypatch):
+    path = tmp_path / "ordinary.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+    records = [
+        {
+            "record_type": "result",
+            "scenario": "ordinary-scenario",
+            "side": side,
+            "card": {"raw": side},
+            "cost_countable": {"wall_seconds": True},
+        }
+        for side in ("harness", "bare")
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    constructed = []
+
+    class _Card:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    class _Comparison:
+        verdict = "test"
+        delta = 0.0
+        harness_objective_success_rate = 0.0
+        bare_objective_success_rate = 0.0
+        min_detectable_effect = 1.0
+
+    monkeypatch.setattr(rgl, "ScoreCard", _Card)
+    monkeypatch.setattr(
+        rgl.bare_runner,
+        "compare_bare_vs_harness",
+        lambda *_args, **_kwargs: _Comparison(),
+    )
+
+    rgl.compare(rgl.Config(), "ordinary-scenario")
+
+    assert constructed == [{"raw": "harness"}, {"raw": "bare"}]
+
+
+def test_pair_arm_retry_ledger_ignores_prestart_snapshot_but_blocks_started_arm(tmp_path):
+    path = tmp_path / "pair.jsonl"
+    protocol = {"pair_id": rgl.gate1p_stagea.PAIR_ID, "arm": "shipping_sage"}
+    rgl._append_jsonl(path, {
+        "record_type": "pre_run_protocol_snapshot",
+        "protocol": protocol,
+    })
+    assert rgl._pair_arm_has_started(
+        path,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm="shipping_sage",
+    ) is False
+
+    rgl._append_jsonl(path, {"record_type": "arm_started", "protocol": protocol})
+    assert rgl._pair_arm_has_started(
+        path,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm="shipping_sage",
+    ) is True
+
+
 def test_headless_harness_route_uses_sage_defaults_when_no_treatment_override(monkeypatch):
     monkeypatch.setattr(
         rgl.live_seams,
@@ -348,6 +508,8 @@ def test_diagnostic_dimensions_are_non_countable_and_preserve_missing_cost():
     card = SimpleNamespace(
         probe_disagreements=[],
         objective_proven=True,
+        objective_recognized=False,
+        objective_clean_stop=False,
         clean_stop=False,
         tool_calls=3,
         model_calls=4,
@@ -363,26 +525,491 @@ def test_diagnostic_dimensions_are_non_countable_and_preserve_missing_cost():
             "total_tokens": False,
             "wall_seconds": True,
         },
+        stop_observation_available=True,
     )
     assert dimensions["outcome"]["countable"] is False
     assert dimensions["outcome"]["objective_success"] is True
-    assert dimensions["outcome"]["clean_stop"] is None
+    assert dimensions["outcome"]["clean_stop"] is False
+    assert dimensions["outcome"]["objective_recognized"] is False
+    assert dimensions["outcome"]["objective_clean_stop"] is False
     assert dimensions["comparison"]["countable"] is False
     assert dimensions["cost"]["total_tokens"] == {"countable": False, "value": None}
 
 
-def test_gate1p_row_mode_stops_before_any_live_client(monkeypatch):
+def test_gate1p_row_mode_requires_exact_protocol_before_any_live_client(monkeypatch):
     monkeypatch.setattr(
         rgl.live_seams,
         "default_mythic_client",
         lambda: pytest.fail("live client must not be touched"),
     )
-    with pytest.raises(RuntimeError, match="countable rows remain blocked"):
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="protocol_id must be"):
         rgl.run_side(
             rgl.Config(measurement_kind="row"),
             "harness",
-            "single-hop-system",
+            "child-domain-control",
         )
+
+
+def test_gate1p_row_mode_requires_separate_live_authority_before_any_live_client(monkeypatch):
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="separate authority ID"):
+        rgl.run_side(
+            rgl.Config(
+                measurement_kind="row",
+                protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+                pair_id=rgl.gate1p_stagea.PAIR_ID,
+                arm_index=0,
+                model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+                model_id=rgl.gate1p_stagea.MODEL_ID,
+                model_api_endpoint="https://provider.invalid/v1",
+                model_context_limit=200_000,
+                max_output_tokens=8_192,
+                source_version="tree:test",
+            ),
+            "harness",
+            rgl.gate1p_stagea.SCENARIO,
+        )
+
+
+@pytest.mark.parametrize(("side", "arm_index"), [("harness", 0), ("bare", 1)])
+def test_gate1p_direct_row_entrypoint_refuses_without_pair_orchestrator_before_live_client(
+    monkeypatch, tmp_path, side, arm_index,
+):
+    monkeypatch.delenv("SAGE_EVAL_PAIR_CONTROL_PATH", raising=False)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(tmp_path))
+    monkeypatch.setattr(rgl, "_validate_gate1p_artifact_destinations", lambda *_args: tmp_path / "episode.json")
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=arm_index,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="pair orchestrator"):
+        rgl.run_side(cfg, side, rgl.gate1p_stagea.SCENARIO)
+
+
+def test_gate1p_naive_child_recomputes_shipping_lifecycle_before_live_client(monkeypatch, tmp_path):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "pair"
+    artifact_dir.mkdir(parents=True)
+    results = artifact_dir / "results.jsonl"
+    control = artifact_dir / "pair-control.json"
+    control.write_text(json.dumps({
+        "schema": "gate1p-stagea-pair-control-v2",
+        "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
+        "pair_id": rgl.gate1p_stagea.PAIR_ID,
+        "source_version": "tree:test",
+        "next_arm": "true_naive",
+        "completed_arms": ["shipping_sage"],
+        "prearm_state": {"arm": "true_naive", "status": "reset_started", "updated_at": 1.0},
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }), encoding="utf-8")
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(results))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=1,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="shipping admission"):
+        rgl.run_side(cfg, "bare", rgl.gate1p_stagea.SCENARIO)
+
+
+def test_gate1p_child_rejects_idle_prearm_state_before_live_client(monkeypatch, tmp_path):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "pair"
+    artifact_dir.mkdir(parents=True)
+    control = artifact_dir / "pair-control.json"
+    control.write_text(json.dumps({
+        "schema": "gate1p-stagea-pair-control-v2",
+        "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
+        "pair_id": rgl.gate1p_stagea.PAIR_ID,
+        "source_version": "tree:test",
+        "next_arm": "shipping_sage",
+        "completed_arms": [],
+        "prearm_state": {"arm": "shipping_sage", "status": "idle", "updated_at": 1.0},
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }), encoding="utf-8")
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=0,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="does not prove reset start"):
+        rgl.run_side(cfg, "harness", rgl.gate1p_stagea.SCENARIO)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra_top_level",
+        "missing_top_level",
+        "created_at_object",
+        "created_at_bool",
+        "created_at_nan",
+        "created_at_pos_inf",
+        "created_at_neg_inf",
+        "extra_prearm_field",
+        "missing_prearm_field",
+        "illegal_arm_combination",
+        "source_version_drift",
+    ],
+)
+def test_gate1p_child_rejects_same_noncanonical_pair_control_class(
+    monkeypatch,
+    tmp_path,
+    mutation,
+):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "pair"
+    artifact_dir.mkdir(parents=True)
+    control = artifact_dir / "pair-control.json"
+    state = {
+        "schema": "gate1p-stagea-pair-control-v2",
+        "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
+        "pair_id": rgl.gate1p_stagea.PAIR_ID,
+        "source_version": "tree:test",
+        "next_arm": "shipping_sage",
+        "completed_arms": [],
+        "prearm_state": {
+            "arm": "shipping_sage",
+            "status": "reset_started",
+            "updated_at": 1.0,
+        },
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }
+    if mutation == "extra_top_level":
+        state["undeclared"] = None
+    elif mutation == "missing_top_level":
+        del state["updated_at"]
+    elif mutation == "created_at_object":
+        state["created_at"] = {}
+    elif mutation == "created_at_bool":
+        state["created_at"] = True
+    elif mutation == "created_at_nan":
+        state["created_at"] = float("nan")
+    elif mutation == "created_at_pos_inf":
+        state["created_at"] = float("inf")
+    elif mutation == "created_at_neg_inf":
+        state["created_at"] = float("-inf")
+    elif mutation == "extra_prearm_field":
+        state["prearm_state"]["undeclared"] = None
+    elif mutation == "missing_prearm_field":
+        del state["prearm_state"]["updated_at"]
+    elif mutation == "illegal_arm_combination":
+        state["next_arm"] = "true_naive"
+        state["prearm_state"]["arm"] = "true_naive"
+    elif mutation == "source_version_drift":
+        state["source_version"] = "tree:drifted"
+    control.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=0,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError):
+        rgl._validate_gate1p_pair_control(cfg, "shipping_sage")
+
+
+def test_missing_harness_cost_telemetry_is_unavailable_not_zero():
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(
+        probe_disagreements=[],
+        objective_proven=True,
+        objective_recognized=True,
+        objective_clean_stop=True,
+        clean_stop=True,
+        tool_calls=0,
+        model_calls=7,
+        total_tokens=0,
+        wall_seconds=12.0,
+    )
+    dimensions = rgl.measurement_dimensions(
+        card,
+        measurement_kind="diagnostic",
+        cost_countable={
+            "tool_calls": False,
+            "model_calls": True,
+            "total_tokens": False,
+            "wall_seconds": True,
+        },
+        stop_observation_available=True,
+    )
+
+    assert dimensions["cost"]["tool_calls"] == {"countable": False, "value": None}
+    assert dimensions["cost"]["total_tokens"] == {"countable": False, "value": None}
+
+
+def _valid_row_observer(*, objective_success=False, task_quiescent=True, status="done"):
+    events = [{
+        "event_id": f"{rgl.gate1p_stagea.PAIR_ID}:shipping_sage:coordinator:1",
+        "source": "coordinator",
+        "kind": "arm_started",
+        "sequence": 1,
+        "monotonic_ns": 1,
+    }]
+    if objective_success:
+        events.append({
+            "event_id": f"{rgl.gate1p_stagea.PAIR_ID}:shipping_sage:oracle:2",
+            "source": "oracle",
+            "kind": "objective_positive",
+            "sequence": 2,
+            "monotonic_ns": 2,
+        })
+    sequence = len(events) + 1
+    events.append({
+        "event_id": f"{rgl.gate1p_stagea.PAIR_ID}:shipping_sage:wrapper:{sequence}",
+        "source": "wrapper",
+        "kind": "terminal",
+        "sequence": sequence,
+        "monotonic_ns": sequence,
+        "status": status,
+    })
+    recognized = bool(objective_success)
+    tasks = [] if task_quiescent else [{
+        "operation_id": None,
+        "display_id": 1,
+        "completed": False,
+        "callback": {"display_id": None, "host": None, "domain": None, "user": None},
+    }]
+    return {
+            "observer_version": "gate1p-stagea-observer-facts-v16",
+        "oracle": {
+            "success": objective_success,
+            "proof_class": "directory_delta" if objective_success else None,
+            "summary": {
+                "domain": "north.sevenkingdoms.local",
+                "baseline_member_count": 1,
+                "final_member_count": 2 if objective_success else 1,
+                "proof_states": {
+                    "directory_delta": objective_success,
+                    "certificate_control": False,
+                    "ticket_control": False,
+                },
+            },
+            "artifact_pointer": ".sage_history/example.json",
+        },
+        "task_window_observed": True,
+        "wrapper_objective_recognized": recognized,
+        "tasks": tasks,
+        "events": events,
+    }
+
+
+def _row_response_records(*, model_calls, total_tokens):
+    base, remainder = divmod(total_tokens, model_calls)
+    records = []
+    for index in range(model_calls):
+        total = base + (1 if index < remainder else 0)
+        records.append({
+            "response_id": f"response-{index + 1}",
+            "effective_backend": "openai:effective",
+            "backend_provenance_source": "response_metadata.model_name",
+            "input_tokens": total - 1,
+            "output_tokens": 1,
+            "total_tokens": total,
+        })
+    return records
+
+
+def test_gate1p_row_cost_vector_keeps_coordinates_independent():
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(
+        probe_disagreements=[],
+        objective_proven=False,
+        objective_recognized=False,
+        objective_clean_stop=False,
+        clean_stop=True,
+        model_calls=3,
+        total_tokens=120,
+        wall_seconds=9.5,
+    )
+    dimensions = rgl.measurement_dimensions(
+        card,
+        measurement_kind="row",
+        cost_countable={
+            "model_calls": True,
+            "total_tokens": True,
+            "environment_actions": True,
+            "wrapper_tool_invocations": True,
+            "control_plane_reads": False,
+            "wall_seconds": True,
+        },
+        cost_values={
+            "model_calls": 3,
+            "total_tokens": 120,
+            "environment_actions": 2,
+            "wrapper_tool_invocations": 4,
+            "control_plane_reads": None,
+            "wall_seconds": 9.5,
+        },
+        stop_observation_available=True,
+        observer_result=_valid_row_observer(objective_success=False, task_quiescent=True),
+        arm="shipping_sage",
+        model_response_records=_row_response_records(model_calls=3, total_tokens=120),
+        model_calls=3,
+        token_ceiling=rgl.gate1p_stagea.TOKEN_ADMISSION_CEILING,
+    )
+
+    assert dimensions["outcome"]["countable"] is True
+    assert dimensions["cost"]["environment_actions"] == {"countable": True, "value": 2}
+    assert dimensions["cost"]["control_plane_reads"] == {"countable": False, "value": None}
+
+
+def test_gate1p_row_dimensions_use_shared_observer_semantics_and_fail_closed():
+    from types import SimpleNamespace
+
+    observer = _valid_row_observer(objective_success=True, task_quiescent=True)
+    observer["task_window_observed"] = False
+    card = SimpleNamespace(
+        probe_disagreements=[],
+        objective_proven=True,
+        objective_recognized=True,
+        objective_clean_stop=True,
+        clean_stop=True,
+        model_calls=1,
+        total_tokens=10,
+        wall_seconds=1.0,
+    )
+
+    dimensions = rgl.measurement_dimensions(
+        card,
+        measurement_kind="row",
+        cost_countable={"model_calls": True},
+        stop_observation_available=True,
+        observer_result=observer,
+        arm="shipping_sage",
+        model_response_records=_row_response_records(model_calls=1, total_tokens=10),
+        model_calls=1,
+        token_ceiling=rgl.gate1p_stagea.TOKEN_ADMISSION_CEILING,
+    )
+
+    assert dimensions["outcome"]["countable"] is False
+    assert "task window was not observed" in dimensions["outcome"]["reason"]
+    assert dimensions["outcome"]["clean_stop"] is None
+
+
+def test_gate1p_stage_a_objective_is_child_control_not_system():
+    from scenarios import goad_scenarios  # noqa: E402
+
+    scn = next(s for s in goad_scenarios("Operation_GOAD") if s.name == "child-domain-control")
+    objective = scn.objective.casefold()
+
+    assert "administrative control of north.sevenkingdoms.local" in objective
+    assert "system" not in objective
+    assert scn.milestone_subset == (Milestone.OBJECTIVE,)
+    assert "system:" not in rgl._objective_effect_prefixes(scn)
+
+
+def test_gate1p_stage_a_objective_completes_at_child_control_with_further_hops_available():
+    from scenarios import goad_scenarios  # noqa: E402
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
+    import engagement_state as es  # noqa: E402
+
+    scn = next(s for s in goad_scenarios("Operation_GOAD") if s.name == "child-domain-control")
+    state = es.EngagementState(objective=scn.objective)
+
+    assert es._objective_target_domains(scn.objective) == {rgl.CHILD}
+    assert es._objective_is_complete(state, has_next=True) is False
+
+    state.footholds = [
+        es.Foothold(
+            callback_id="2",
+            agent="apollo",
+            host="CASTELBLACK",
+            forest=rgl.CHILD,
+            identity="NORTH\\samwell.tarly",
+            integrity="medium",
+            alive=True,
+            source="mythic",
+            timestamp="2026-08-27T00:00:00Z",
+        )
+    ]
+    state.hops = [
+        es.Hop(
+            id="gpo:child-control",
+            technique="gpo-controlled-system-exec",
+            target="starkwallpaper",
+            effect=f"da:{rgl.CHILD}",
+            status="achieved",
+            evidence={"task_id": "8"},
+            preconditions=[],
+            satisfied_effects=[f"da:{rgl.CHILD}"],
+            source="mythic",
+            timestamp="2026-08-27T00:00:01Z",
+        )
+    ]
+
+    assert es._objective_is_complete(state, has_next=True) is True
 
 
 def test_build_probes_includes_objective_only_when_scored():
@@ -628,3 +1255,43 @@ def test_preflight_smoke_checks_declared_and_fail_closed(monkeypatch):
     ok_b, detail_b = ls.bloodhound_reachable(timeout=1)
     assert ok_m is False and isinstance(detail_m, str)
     assert ok_b is False and isinstance(detail_b, str)
+
+
+def test_preflight_declares_exact_model_route_authentication_smoke(monkeypatch):
+    seen = {}
+
+    def auth_smoke(provider, model, **kwargs):
+        seen.update({"provider": provider, "model": model, **kwargs})
+        return True, "authenticated"
+
+    monkeypatch.setattr(rgl.live_seams, "model_route_auth_smoke", auth_smoke)
+    cfg = rgl.Config(
+        model_provider="openai",
+        model_id="exact-model",
+        model_api_endpoint="https://provider.invalid/v1",
+        model_api_key="secret",
+        max_output_tokens=8192,
+    )
+    checks = {name: check for name, cost, check in rgl.scenario_preconditions(cfg, "child-domain-control")
+              if cost == "smoke"}
+
+    assert "llm-endpoint-authenticated" in checks
+    assert checks["llm-endpoint-authenticated"]() == (True, "authenticated")
+    assert seen == {
+        "provider": "openai",
+        "model": "exact-model",
+        "api_key": "secret",
+        "base_url": "https://provider.invalid/v1",
+        "max_output_tokens": 8192,
+    }
+
+
+def test_preflight_model_route_authentication_fails_closed_when_route_incomplete(monkeypatch):
+    monkeypatch.setattr(rgl.live_seams, "load_sage_defaults", lambda: {})
+    cfg = rgl.Config(model_provider="openai", model_id="exact-model")
+    checks = {name: check for name, cost, check in rgl.scenario_preconditions(cfg, "child-domain-control")
+              if cost == "smoke"}
+
+    ok, detail = checks["llm-endpoint-authenticated"]()
+    assert ok is False
+    assert "incomplete" in detail

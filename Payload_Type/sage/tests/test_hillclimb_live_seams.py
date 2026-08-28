@@ -6,7 +6,10 @@ here. These pin the parsing: LLM decision, BloodHound literals, and the domain-c
 import sys
 import base64
 import time
+import types
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
@@ -31,8 +34,161 @@ def test_parse_model_decision_tool_call():
     assert d == {"tool": "shell", "args": {"command": "whoami"}}
 
 
+def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
+    import langchain.chat_models
+
+    calls = []
+    monkeypatch.setattr(
+        langchain.chat_models,
+        "init_chat_model",
+        lambda **kwargs: calls.append(kwargs) or object(),
+    )
+
+    model_fn = ls.make_model_fn(
+        "openai",
+        "bedrock-claude-4-6-sonnet",
+        api_key="test-key",
+        base_url="https://provider.invalid/v1",
+        max_output_tokens=8192,
+    )
+
+    assert callable(model_fn)
+    assert calls == [{
+        "model_provider": "openai",
+        "model": "bedrock-claude-4-6-sonnet",
+        "api_key": "test-key",
+        "base_url": "https://provider.invalid/v1",
+        "max_tokens": 8192,
+    }]
+
+
+def test_model_route_auth_smoke_uses_exact_route_and_returns_only_allowlisted_metadata(monkeypatch):
+    seen = {}
+
+    def fake_factory(provider, model, **kwargs):
+        seen.update({"provider": provider, "model": model, **kwargs})
+
+        def invoke(system, tools, history):
+            seen.update({"system": system, "tools": tools, "history": history})
+            return {
+                "final": "SECRET RESPONSE CONTENT",
+                "_usage": {"input_tokens": 11, "output_tokens": 1, "ignored": "not-an-int"},
+                "_backend": {
+                    "effective_backend": "openai:observed-revision",
+                    "observed_provider": "openai",
+                    "observed_model": "observed-revision",
+                    "untrusted": "must-not-leak",
+                },
+            }
+
+        return invoke
+
+    monkeypatch.setattr(ls, "make_model_fn", fake_factory)
+    ok, detail = ls.model_route_auth_smoke(
+        "openai",
+        "configured-model",
+        api_key="super-secret-key",
+        base_url="https://secret-endpoint.invalid/v1",
+        max_output_tokens=8192,
+    )
+
+    assert ok is True
+    assert seen["provider"] == "openai" and seen["model"] == "configured-model"
+    assert seen["api_key"] == "super-secret-key"
+    assert seen["base_url"] == "https://secret-endpoint.invalid/v1"
+    assert seen["max_output_tokens"] == 8
+    assert seen["request_timeout"] == 10
+    assert seen["max_retries"] == 0
+    assert seen["tools"] == [] and seen["history"] == []
+    assert "super-secret-key" not in detail
+    assert "secret-endpoint" not in detail
+    assert "SECRET RESPONSE CONTENT" not in detail
+    assert "must-not-leak" not in detail
+    assert '"accounting": "pre_arm_smoke"' in detail
+    assert '"input_tokens": 11' in detail and '"output_tokens": 1' in detail
+
+
+def test_model_route_auth_smoke_fails_closed_without_leaking_provider_exception(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("credential=super-secret endpoint=https://secret.invalid")
+
+    monkeypatch.setattr(ls, "make_model_fn", fail)
+    ok, detail = ls.model_route_auth_smoke(
+        "openai",
+        "configured-model",
+        api_key="super-secret",
+        base_url="https://secret.invalid",
+    )
+
+    assert ok is False
+    assert detail == "model route request failed (RuntimeError)"
+    assert "super-secret" not in detail and "secret.invalid" not in detail
+
+
+def test_gate1p_task_states_binds_query_to_authenticated_operation(monkeypatch):
+    seen = {}
+
+    async def fake_login():
+        return types.SimpleNamespace(current_operation_id=41)
+
+    class FakeMythic:
+        @staticmethod
+        async def execute_custom_query(client, query, variables):
+            seen.update({"client": client, "query": query, "variables": variables})
+            return {"task": [{"operation_id": 41, "display_id": 3}]}
+
+    monkeypatch.setattr(ls, "_mythic_login_async_safe", fake_login)
+    monkeypatch.setitem(sys.modules, "mythic", types.SimpleNamespace(mythic=FakeMythic))
+
+    rows = ls.mythic_operation_task_states(expected_operation_id=41)
+
+    assert rows == [{"operation_id": 41, "display_id": 3}]
+    assert seen["variables"] == {"operationId": 41}
+    assert "operation_id: {_eq: $operationId}" in seen["query"]
+
+
+def test_gate1p_task_states_rejects_authenticated_operation_drift(monkeypatch):
+    async def fake_login():
+        return types.SimpleNamespace(current_operation_id=42)
+
+    monkeypatch.setattr(ls, "_mythic_login_async_safe", fake_login)
+    monkeypatch.setitem(sys.modules, "mythic", types.SimpleNamespace(mythic=object()))
+
+    with pytest.raises(RuntimeError, match="operation identity drifted"):
+        ls.mythic_operation_task_states(expected_operation_id=41)
+
+
+def test_gate1p_task_states_rejects_boolean_expected_operation_identity():
+    with pytest.raises(RuntimeError, match="expected Mythic operation identity"):
+        ls.mythic_operation_task_states(expected_operation_id=True)
+
+
+def test_gate1p_task_states_rejects_non_mapping_task_rows(monkeypatch):
+    async def fake_login():
+        return types.SimpleNamespace(current_operation_id=41)
+
+    class FakeMythic:
+        @staticmethod
+        async def execute_custom_query(_client, _query, variables):
+            del variables
+            return {"task": [None]}
+
+    monkeypatch.setattr(ls, "_mythic_login_async_safe", fake_login)
+    monkeypatch.setitem(sys.modules, "mythic", types.SimpleNamespace(mythic=FakeMythic))
+
+    with pytest.raises(RuntimeError, match="non-mapping task row"):
+        ls.mythic_operation_task_states(expected_operation_id=41)
+
+
 def test_parse_model_decision_final():
     assert ls.parse_model_decision(_Msg(content="objective complete")) == {"final": "objective complete"}
+
+
+def test_bare_history_requests_typed_objective_or_stuck_terminal():
+    rendered = ls._render_history("objective", [])
+    assert "OBJECTIVE_MET" in rendered
+    assert "STUCK" in rendered
+    assert "FINAL if done/stuck" not in rendered
 
 
 def test_response_backend_record_uses_observed_model_revision_not_configured_alias():
@@ -313,6 +469,16 @@ def test_certificate_admin_control_probe_rejects_other_realm(monkeypatch):
     )() is False
 
 
+def test_certificate_admin_control_probe_preserves_observer_unavailable(monkeypatch):
+    def unavailable(**_kwargs):
+        raise ls.ProbeReadError("task query unavailable")
+
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", unavailable)
+
+    with pytest.raises(ls.ProbeReadError, match="task query unavailable"):
+        ls.certificate_admin_control_probe(None, realm=CHILD)()
+
+
 def test_remote_execution_probe_accepts_new_privileged_target_callback(monkeypatch):
     rows = iter([
         [{"display_id": 1, "host": "CASTELBLACK", "domain": "north.sevenkingdoms.local"}],
@@ -501,6 +667,140 @@ def test_ticket_admin_control_probe_rejects_listing_without_forge(monkeypatch):
     assert ls.ticket_admin_control_probe(realm="range.local")() is False
 
 
+def test_ticket_admin_control_probe_preserves_observer_unavailable(monkeypatch):
+    def unavailable(**_kwargs):
+        raise ls.ProbeReadError("task query unavailable")
+
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", unavailable)
+
+    with pytest.raises(ls.ProbeReadError, match="task query unavailable"):
+        ls.ticket_admin_control_probe(realm=CHILD)()
+
+
+def test_strict_da_equivalent_reader_does_not_hide_builtin_failure(monkeypatch):
+    def reader(_domain, *, config=None, group="Domain Admins"):
+        del config
+        if group == "Administrators":
+            raise RuntimeError("Builtin read unavailable")
+        return {"north\\domain admins"}
+
+    monkeypatch.setattr(ls, "ldap_domain_admins", reader)
+
+    assert ls.ldap_da_equivalent_members(CHILD, config={}, strict=False) == {
+        "north\\domain admins"
+    }
+    with pytest.raises(RuntimeError, match="Builtin read unavailable"):
+        ls.ldap_da_equivalent_members(CHILD, config={}, strict=True)
+
+
+def test_dsa_info_single_value_accepts_case_insensitive_rootdse_attribute():
+    info = types.SimpleNamespace(other={"DEFAULTNAMINGCONTEXT": ["DC=north,DC=sevenkingdoms,DC=local"]})
+    assert ls._dsa_info_single_value(info, "defaultNamingContext") == "DC=north,DC=sevenkingdoms,DC=local"
+
+
+def test_dsa_info_single_value_accepts_ldap3_production_mapping_type():
+    from ldap3.utils.ciDict import CaseInsensitiveWithAliasDict
+
+    other = CaseInsensitiveWithAliasDict()
+    other["defaultNamingContext"] = ["DC=north,DC=sevenkingdoms,DC=local"]
+    info = types.SimpleNamespace(other=other)
+
+    assert ls._dsa_info_single_value(info, "DEFAULTNAMINGCONTEXT") == "DC=north,DC=sevenkingdoms,DC=local"
+
+
+@pytest.mark.parametrize("other", [
+    {},
+    {"defaultNamingContext": []},
+    {"defaultNamingContext": ["DC=one", "DC=two"]},
+    {"defaultNamingContext": ["DC=one"], "DEFAULTNAMINGCONTEXT": ["DC=two"]},
+])
+def test_dsa_info_single_value_rejects_missing_duplicate_or_ambiguous_values(other):
+    with pytest.raises(RuntimeError, match="RootDSE defaultNamingContext"):
+        ls._dsa_info_single_value(types.SimpleNamespace(other=other), "defaultNamingContext")
+
+
+def test_ldap_domain_admins_uses_dsa_info_then_schema_checked_group_search(monkeypatch):
+    all_marker = object()
+    seen = {"searches": []}
+
+    class FakeServer:
+        def __init__(self, host, **kwargs):
+            seen["server"] = (host, kwargs)
+            self.info = types.SimpleNamespace(
+                other={"defaultNamingContext": ["DC=NORTH,DC=SEVENKINGDOMS,DC=LOCAL"]},
+            )
+
+    class FakeEntry:
+        member = types.SimpleNamespace(values=[
+            "CN=Administrator,CN=Users,DC=north,DC=sevenkingdoms,DC=local",
+            "CN=evil.admin,CN=Users,DC=north,DC=sevenkingdoms,DC=local",
+        ])
+
+        def __contains__(self, key):
+            return key == "member"
+
+    class FakeConnection:
+        def __init__(self, server, **kwargs):
+            seen["connection"] = (server, kwargs)
+            self.entries = []
+
+        def search(self, base, query, **kwargs):
+            seen["searches"].append((base, query, kwargs))
+            self.entries = [FakeEntry()]
+            return True
+
+        def unbind(self):
+            seen["unbound"] = True
+
+    monkeypatch.setitem(sys.modules, "ldap3", types.SimpleNamespace(
+        ALL=all_marker,
+        Connection=FakeConnection,
+        NTLM="NTLM",
+        Server=FakeServer,
+    ))
+    config = {CHILD: {"dc_ip": "10.0.0.1", "user": "ref", "password": "secret"}}
+
+    members = ls.ldap_domain_admins(CHILD, config=config)
+
+    assert members == {"administrator", "evil.admin"}
+    assert seen["server"] == ("10.0.0.1", {
+        "use_ssl": False,
+        "connect_timeout": 15,
+        "get_info": all_marker,
+    })
+    assert len(seen["searches"]) == 1
+    assert seen["searches"][0][0] == "DC=north,DC=sevenkingdoms,DC=local"
+    assert "sAMAccountName=Domain Admins" in seen["searches"][0][1]
+    assert seen["unbound"] is True
+
+
+def test_ldap_domain_admins_rejects_wrong_rootdse_domain_before_group_search(monkeypatch):
+    seen = {"searches": 0}
+
+    class FakeServer:
+        def __init__(self, *_args, **_kwargs):
+            self.info = types.SimpleNamespace(other={"defaultNamingContext": ["DC=essos,DC=local"]})
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def search(self, *_args, **_kwargs):
+            seen["searches"] += 1
+
+        def unbind(self):
+            seen["unbound"] = True
+
+    monkeypatch.setitem(sys.modules, "ldap3", types.SimpleNamespace(
+        ALL="ALL", Connection=FakeConnection, NTLM="NTLM", Server=FakeServer,
+    ))
+    config = {CHILD: {"dc_ip": "10.0.0.1", "user": "ref", "password": "secret"}}
+
+    with pytest.raises(RuntimeError, match="does not match declared domain"):
+        ls.ldap_domain_admins(CHILD, config=config)
+    assert seen["searches"] == 0 and seen["unbound"] is True
+
+
 def test_any_probe_retries_all_paths_within_one_shared_settle_window(monkeypatch):
     calls = {"certificate": 0, "ldap": 0}
 
@@ -521,6 +821,21 @@ def test_any_probe_retries_all_paths_within_one_shared_settle_window(monkeypatch
         settle_interval=1,
     )() is True
     assert calls == {"certificate": 2, "ldap": 1}
+
+
+def test_any_probe_accepts_available_positive_despite_an_unavailable_optional_path():
+    def unavailable():
+        raise ls.ProbeReadError("certificate task query unavailable")
+
+    assert ls.any_probe(unavailable, lambda: True)() is True
+
+
+def test_any_probe_reports_unavailable_when_no_proof_path_can_decide():
+    def unavailable():
+        raise ls.ProbeReadError("certificate task query unavailable")
+
+    with pytest.raises(ls.ProbeReadError, match="certificate task query unavailable"):
+        ls.any_probe(unavailable, lambda: False)()
 
 
 def test_decode_mythic_response_rows_base64_with_raw_fallback():

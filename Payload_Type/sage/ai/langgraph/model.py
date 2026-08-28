@@ -5267,6 +5267,11 @@ class Model:
             return None
 
         llm = None
+        eval_max_output_tokens = 0
+        try:
+            eval_max_output_tokens = int(os.environ.get("SAGE_EVAL_MAX_OUTPUT_TOKENS") or 0)
+        except (TypeError, ValueError):
+            eval_max_output_tokens = 0
         if self.provider.lower() == "bedrock" and cfg is not None:
             # Set region to cfg.get("region") if it exists, else default to "us-east-1"
             region = cfg.get("region")
@@ -5285,13 +5290,18 @@ class Model:
                 logger.error("Bedrock model configuration is missing 'aws_session_token'.")
                 return None
             logger.debug(f"Initializing Bedrock model with provider={self.provider}, model={self.model}, aws_region={region}")
-            llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token)
+            bedrock_kwargs: dict[str, Any] = {}
+            if eval_max_output_tokens > 0:
+                bedrock_kwargs["max_tokens"] = eval_max_output_tokens
+            llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token, **bedrock_kwargs)
         else:
             model_kwargs: dict[str, Any] = {}
             if cfg.get("api_key"):
                 model_kwargs["api_key"] = cfg["api_key"]
             if cfg.get("base_url"):
                 model_kwargs["base_url"] = cfg["base_url"]
+            if eval_max_output_tokens > 0:
+                model_kwargs["max_tokens"] = eval_max_output_tokens
             logger.debug(
                 f"Initializing model with provider={self.provider}, model={self.model}, "
                 f"api_key={'configured' if 'api_key' in model_kwargs else 'provider default'}, "
@@ -8613,6 +8623,17 @@ class Model:
         """Ask the configured model for exactly one semantic capability decision."""
         if self.llm is None:
             raise RuntimeError("configured LLM is unavailable")
+        telemetry = self._controller_refresh_runtime_policy_telemetry()
+        try:
+            token_ceiling = int(os.environ.get("SAGE_EVAL_MODEL_TOKEN_BUDGET") or 0)
+        except (TypeError, ValueError):
+            token_ceiling = 0
+        if token_ceiling > 0 and int(telemetry.get("total_tokens", 0) or 0) >= token_ceiling:
+            return {
+                "disposition": "stop",
+                "rationale": "the declared evaluation model-token budget is exhausted",
+                "_policy_model_response_observed": False,
+            }
         self._policy_model_calls = int(getattr(self, "_policy_model_calls", 0) or 0) + 1
         if str(request.get("selection_contract") or "") == "hybrid-full-frontier-v2":
             instruction = (
@@ -8641,7 +8662,7 @@ class Model:
         for decision in decisions:
             if not isinstance(decision, dict) or decision.get("model_response_observed") is not True:
                 continue
-            requests.append({
+            record = {
                 "decision_id": str(decision.get("decision_id") or ""),
                 "policy_mode": str(decision.get("policy_mode") or ""),
                 "effective_backend": str(decision.get("effective_backend") or ""),
@@ -8649,7 +8670,11 @@ class Model:
                 "effective_model_id": str(decision.get("effective_model_id") or ""),
                 "backend_provenance_source": str(decision.get("backend_provenance_source") or ""),
                 "response_metadata": dict(decision.get("response_metadata") or {}),
-            })
+            }
+            if isinstance(decision.get("token_usage"), dict) and decision.get("token_usage"):
+                record["token_usage"] = dict(decision["token_usage"])
+                record["token_usage_source"] = str(decision.get("token_usage_source") or "")
+            requests.append(record)
         return requests
 
     @staticmethod
@@ -8939,6 +8964,35 @@ class Model:
             if str(item.get("effective_backend") or "")
         })
         model_calls = int(getattr(self, "_policy_model_calls", 0) or 0)
+        response_usage_complete = bool(model_calls) and len(effective_backend_requests) == model_calls
+        total_tokens = 0
+        for item in effective_backend_requests:
+            usage = item.get("token_usage") if isinstance(item.get("token_usage"), dict) else {}
+            try:
+                input_tokens = int(usage.get("input_tokens"))
+                output_tokens = int(usage.get("output_tokens"))
+                response_total = int(usage.get("total_tokens"))
+            except (TypeError, ValueError):
+                response_usage_complete = False
+                continue
+            if min(input_tokens, output_tokens, response_total) < 0 or response_total != input_tokens + output_tokens:
+                response_usage_complete = False
+                continue
+            total_tokens += response_total
+            if str(item.get("token_usage_source") or "") in {"", "unavailable"}:
+                response_usage_complete = False
+        try:
+            token_ceiling = int(os.environ.get("SAGE_EVAL_MODEL_TOKEN_BUDGET") or 0)
+        except (TypeError, ValueError):
+            token_ceiling = 0
+        try:
+            model_context_limit = int(os.environ.get("SAGE_EVAL_MODEL_CONTEXT_LIMIT") or 0)
+        except (TypeError, ValueError):
+            model_context_limit = 0
+        try:
+            max_output_tokens = int(os.environ.get("SAGE_EVAL_MAX_OUTPUT_TOKENS") or 0)
+        except (TypeError, ValueError):
+            max_output_tokens = 0
         policy_switches = self._controller_policy_switches(policy_mode, decisions, transactions)
         branch_opportunity_count = sum(int(item.get("branch_opportunity_count") or 0) for item in decisions)
         model_owned_decision_count = sum(int(item.get("model_owned_decision_count") or 0) for item in decisions)
@@ -8975,6 +9029,14 @@ class Model:
                     for item in effective_backend_requests
                 )
             ),
+            "model_response_records": effective_backend_requests,
+            "token_usage_complete": response_usage_complete,
+            "total_tokens": total_tokens if response_usage_complete else 0,
+            "token_budget": token_ceiling,
+            "token_budget_exhausted": bool(token_ceiling > 0 and response_usage_complete and total_tokens >= token_ceiling),
+            "token_budget_overshoot": bool(token_ceiling > 0 and response_usage_complete and total_tokens > token_ceiling),
+            "model_context_limit": model_context_limit,
+            "max_output_tokens": max_output_tokens,
             "policy_identity_valid": not policy_switches,
             "policy_switches": policy_switches,
             "semantic_transaction_count": len(transactions),

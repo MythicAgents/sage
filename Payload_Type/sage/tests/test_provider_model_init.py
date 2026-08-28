@@ -77,6 +77,24 @@ def test_bedrock_constructor_contract_is_unchanged(monkeypatch):
     }]
 
 
+def test_eval_max_output_tokens_is_applied_to_shipping_model(monkeypatch):
+    calls = []
+    monkeypatch.setenv("SAGE_EVAL_MAX_OUTPUT_TOKENS", "8192")
+    monkeypatch.setattr(
+        model_module,
+        "init_chat_model",
+        lambda **kwargs: calls.append(kwargs) or _FakeLLM(),
+    )
+    monkeypatch.setattr(model_module, "_patch_model_for_bedrock", lambda llm: llm)
+
+    assert isinstance(_model("openai", {})._get_base_chat_model(), _FakeLLM)
+    assert calls == [{
+        "model_provider": "openai",
+        "model": "test-model",
+        "max_tokens": 8192,
+    }]
+
+
 def test_missing_configurable_section_still_fails_closed(monkeypatch):
     instance = _model("ollama", {})
     instance.config = {}

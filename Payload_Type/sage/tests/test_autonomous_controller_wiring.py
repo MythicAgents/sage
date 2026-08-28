@@ -368,6 +368,11 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
                     "model_provider": "runtime-provider",
                     "model_name": "runtime-model",
                 },
+                "usage_metadata": {
+                    "input_tokens": 17,
+                    "output_tokens": 5,
+                    "total_tokens": 22,
+                },
             })()
 
     m.llm = FakeLLM()
@@ -384,12 +389,23 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
         "effective_backend": "runtime-provider:runtime-model",
         "effective_model_provider": "runtime-provider",
         "effective_model_id": "runtime-model",
-        "backend_provenance_source": "response_metadata.model_name",
+        "backend_provenance_source": (
+            "response_metadata.model_provider+response_metadata.model_name"
+        ),
         "response_metadata": {
             "model_name": "runtime-model",
             "model_provider": "runtime-provider",
         },
+        "token_usage": {
+            "input_tokens": 17,
+            "output_tokens": 5,
+            "total_tokens": 22,
+        },
+        "token_usage_source": "usage_metadata",
     }]
+    assert telemetry["model_response_records"] == telemetry["effective_backend_requests"]
+    assert telemetry["token_usage_complete"] is True
+    assert telemetry["total_tokens"] == 22
 
     assert asyncio.run(m.handle_controller_hitl_resume("deny")) == ""
     telemetry = m.controller_runtime_telemetry()
@@ -398,6 +414,23 @@ def test_supervised_denied_pending_selection_keeps_backend_provenance_telemetry(
     assert telemetry["model_calls"] == 1
     assert telemetry["effective_backends"] == ["runtime-provider:runtime-model"]
     assert telemetry["backend_provenance_complete"] is True
+
+
+def test_controller_token_ceiling_prevents_another_model_request(monkeypatch):
+    m = object.__new__(model.Model)
+    m.llm = object()
+    m._policy_model_calls = 3
+    m._controller_refresh_runtime_policy_telemetry = lambda: {"total_tokens": 250_000}
+    monkeypatch.setenv("SAGE_EVAL_MODEL_TOKEN_BUDGET", "250000")
+
+    decision = asyncio.run(m._controller_llm_policy_decide({}))
+
+    assert decision == {
+        "disposition": "stop",
+        "rationale": "the declared evaluation model-token budget is exhausted",
+        "_policy_model_response_observed": False,
+    }
+    assert m._policy_model_calls == 3
 
 
 def test_verbose_controller_streams_progress_before_terminal_report():

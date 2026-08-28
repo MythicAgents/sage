@@ -261,7 +261,9 @@ def test_llm_policy_persists_raw_decline_and_response_backend_provenance():
     assert decision.effective_backend == "runtime-provider:provider-model-v1"
     assert decision.effective_model_provider == "runtime-provider"
     assert decision.effective_model_id == "provider-model-v1"
-    assert decision.backend_provenance_source == "response_metadata.model_name"
+    assert decision.backend_provenance_source == (
+        "response_metadata.model_provider+response_metadata.model_name"
+    )
 
 
 def test_llm_policy_replay_reuses_original_decision_provenance():
