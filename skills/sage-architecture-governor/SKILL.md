@@ -19,7 +19,7 @@ Before editing high-risk files, produce this gate brief for the user:
 Architecture Gate
 
 Hypothesis:
-Review lane: runtime_bugfix | sealed_evaluation
+Review lane: runtime_bugfix | development_measurement | sealed_evaluation
 Mechanism ID:
 Ideal State Criteria:
 Production call path:
@@ -55,17 +55,29 @@ Use `open_gate.py status` to inspect the current token and `open_gate.py close` 
 Choose the lane before the first edit:
 
 - `runtime_bugfix`: a bounded product defect with a concrete production call path. Use atomic criteria, exact
-  adversarial/near-match probes, focused tests, the maintained product suite when required, one candidate freeze,
-  and one fresh adversarial review. Do not add sealed manifests, promotion gates, or evaluation lifecycle artifacts
-  unless the approved contract explicitly requires them.
-- `sealed_evaluation`: evaluation, evidence admission, phase exit, countability, or promotion work. Use the full
-  candidate, provenance, lifecycle, and independent-review discipline in `AGENTS.md`.
+  adversarial/near-match probes, focused tests, and the maintained product suite when required. Do not add sealed
+  manifests, promotion gates, or evaluation lifecycle artifacts unless the approved contract names a separate
+  high-impact integrity threat.
+- `development_measurement`: an internal baseline, exploratory eval, evaluator-debugging run, or hill-climb signal
+  that cannot authorize promotion, release, or an external claim. Record exact model/system/configuration and code
+  version, structured logs, budgets, and independent result proof. Snapshot each row's protocol before execution,
+  but do not require signed approvals, immutable source candidates, per-artifact hash chains, or review leases.
+- `sealed_evaluation`: a final holdout, promotion, release, externally relied-on claim, or a prospectively named
+  adversarial-integrity decision where exact candidate identity and independent provenance are material. Use the
+  full candidate, provenance, lifecycle, and independent-review discipline in `AGENTS.md`.
 
-The prospective acceptance contract is frozen by the approved gate. A post-implementation reviewer may reject only
-for a reproducible production-reachable counterexample to an atomic criterion or a concrete safety/authority-boundary
-violation. Classify all other findings as hardening, unreachable, pre-existing, or out-of-scope. The implementation
-owner runs the same declared probes before review; the reviewer independently repeats them and completes all
-predeclared probes in one round.
+Evaluation, countability, and evidence admission do not by themselves select `sealed_evaluation`. The gate brief
+must give a one-sentence lane rationale. Any proposal to add signing, per-artifact hashes, immutable bundles, or a
+review lease must name the protected decision, the actor or failure that could alter it, and why version control plus
+structured logs is insufficient.
+
+The approved gate records a prospective working contract. For `runtime_bugfix` and `development_measurement`, update
+it transparently when direct production inspection falsifies an assumption; the changed evaluator or protocol gets a
+new version and does not rewrite prior results. For `sealed_evaluation`, freeze the decision protocol and exact
+candidate before consequential review. A reviewer may reject only for a reproducible production-reachable
+counterexample to an atomic criterion or a concrete safety/authority-boundary violation. Classify all other findings
+as hardening, unreachable, pre-existing, or out-of-scope. The implementation owner runs the declared probes before
+review; the reviewer completes all of its predeclared probes in one round.
 
 For deadline-bound `runtime_bugfix` work, include a review wall-clock and command budget in the contract. Default to
 15 minutes and the focused production-path suite. The reviewer completes those probes and returns; it does not
@@ -73,26 +85,44 @@ expand into unrelated history or sealed-lifecycle archaeology. Prefer typed fiel
 control authority. After a language-classification rejection, replace prose inference with structured authority
 when practical instead of growing a blacklist or regex grammar.
 
-An optional pre-implementation design review uses the prospective contract directly and has no candidate, lease, or
-source/test disposition. Candidate freezing and lease verification begin only after implementation and author
-verification.
+A pre-implementation `DESIGN_ACCEPT` review is mandatory only for `sealed_evaluation`. Root freezes the prospective
+gate contract and owns its operator-approval binding; a fresh `sage_eval_reviewer` returns the read-only design
+result. There is no source candidate, lease, or source/test disposition during this preflight.
 
-After the first rejection of a mechanism, close the rejected lease, reproduce the complete blocking set, perform
-RCA, and property-test the full failure class before opening another candidate. Do not serialize discovery of one
-frozen candidate's defects across repeated review rounds.
+The source-candidate breaker uses this fixed transition:
+
+`DESIGN_ACCEPT` → candidate 1 → rejection → RCA/simplification/full-class probes → fresh `RECOVERY_ACCEPT` →
+candidate 2 → rejection → exhausted epoch.
+
+Root owns the gate, recovery inputs, candidate bytes, and final evidence admission. The reviewer owns the design
+or recovery disposition and attests the route and probes it actually reproduced. There is at most one initial
+candidate and one rejected-candidate successor per design epoch. A higher epoch requires a fresh design result
+that binds the exhausted predecessor and the same operator-approved superseding scope.
+
+The sealed guard assumes a trusted repository operator. Manifest and hash checks detect accidental drift and bind
+exact bytes to a review; they do not cryptographically authenticate reviewer identity or defend against a malicious
+repository administrator. If authentication or hostile substitution is actually in scope, use a separately designed
+signing and key-trust mechanism rather than describing local hashes as signatures. Freeze validates recorded probe
+evidence and never executes probe commands.
 
 ## Candidate Freeze And Review
 
-After implementation and focused verification, stop all writers and stage only the candidate paths. A candidate
-path may not have unstaged bytes layered over its staged form. Freeze the exact candidate before starting a
-review:
+Use the ordinary git diff, focused probes, and one-writer discipline for `runtime_bugfix` and
+`development_measurement`. Do not invoke `review_lease.py` merely because a change touches an eval path.
+
+For `sealed_evaluation`, after implementation and focused verification, stop all writers and stage only the exact
+candidate paths. A candidate path may not have unstaged bytes layered over its staged form. The manifest-bound gate
+contract's `governed_paths` must exactly match `--paths`, and the freeze requires the fresh design-review result plus
+the recovery result after one rejection:
 
 ```bash
-python3 skills/sage-architecture-governor/scripts/review_lease.py freeze --paths Payload_Type/sage/ai/langgraph/model.py --protected Payload_Type/sage/ai/langgraph/turn_authority.py --review-stage source_candidate --review-domain conversation_behavior --independence-class internal_subagent --mechanism-id supervised-turn-authority --review-round 1 --governing-gate "approved architecture gate"
+python3 skills/sage-architecture-governor/scripts/review_lease.py freeze --paths Payload_Type/sage/ai/langgraph/model.py --protected Payload_Type/sage/ai/langgraph/turn_authority.py --review-stage source_candidate --review-domain conversation_behavior --independence-class internal_subagent --mechanism-id supervised-turn-authority --review-round 1 --governing-gate "approved architecture gate" --gate-contract "$SAGE_GATE_CONTRACT" --design-receipt "$SAGE_DESIGN_RECEIPT"
 ```
 
-The command records HEAD, a complete git-index fingerprint, scoped git status, staged candidate blob hashes,
-protected-path hashes, a candidate ID, and a lease ID. It does not modify the git index. The PreToolUse hook
+For sealed round 2, append `--recovery-receipt "$SAGE_RECOVERY_RECEIPT"`. Caller-supplied domain,
+mechanism, gate label, and round do not override the gate-derived values. The command records the gate and receipt
+hashes, stable process key, epoch, HEAD, complete git-index fingerprint, scoped status, staged candidate blob
+hashes, protected-path hashes, candidate ID, and lease ID. It does not modify the git index. The PreToolUse hook
 blocks writes to candidate and protected paths while the lease is active.
 
 The reviewer must verify the lease at review start, after its declared commands, and immediately before its

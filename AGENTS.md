@@ -61,58 +61,71 @@ provider, model, payload, range, or platform configuration not backed by the rel
 - Use the retention manifest to relate durable artifacts to source paths, hashes, sessions, runs, commits, and
   decisions. Later blog/publication work must curate and redact a separate published subset.
 
-## Sealed Evaluation Review Discipline
+## Evaluation Evidence Proportionality
 
-- Generated `passes` fields, readiness flags, self-attestations, and tests that only reread generated claims are
-  not independent evidence. Inject adversarial inputs at the production boundary.
-- Cover semantic failure classes with recursive/property matrices, protocol boundaries, and valid near-match
-  controls before generating the first candidate. Named regression examples are necessary but insufficient.
-- Bind every allowed semantic delta to an artifact, exact pointer, delta kind, and exact expected old/new value or
-  a named independent validator. Do not allow generic whole-subtree, generic-hash, or candidate-self rules.
-- Validate the exact bytes selected for writing. Eliminate shadow/prepared/payload/serialized duals or prove full
-  equality before comparison and write.
-- Bind each approval record atomically to one gate's exact path, hash, phrase, operator, and scope. Never compose a
-  provenance tuple from multiple gates or rely on an implicit detached contextual join to cure a false assertion.
-- Define test suites by lifecycle stage. A pre-generation absence assertion must not be required during
-  post-generation candidate review; every sealed candidate needs a hermetic post-generation suite.
-- Treat source/test acceptance, artifact acceptance, phase exit, development/live authority, countability, and
-  promotion as separate state transitions. Changed hashes never inherit authority.
-- Treat a governor result with no classified paths as no enforcement evidence. Fix coverage or disclose the limit;
-  do not count an exit-zero result as approval proof.
-- Preserve rejected bundles append-only, but centralize integrity in one canonical machine-readable ledger rather
-  than copying large hash tables into every prose result.
-- After the first rejection of the same mechanism, stop resealing. Perform RCA, simplify the mechanism, and
-  property-test the complete failure class before another candidate or external review.
+- Match evidence controls to the decision and threat model. Before requiring signatures, per-artifact hashes,
+  immutable candidate bundles, approval binding, or a review lease, name the protected decision, the actor or
+  failure that could alter it, and why ordinary version control plus structured logs is insufficient.
+- An internal development measurement normally needs the exact tested model/system/configuration, a version or
+  commit identifier, structured run logs, resource budgets, and result-based proof from an authority independent of
+  the system under test. It does **not** need digital signatures, a cryptographic trust chain, immutable source
+  candidates, or approval records bound to every changed hash.
+- A separately controlled evaluation plane may communicate directly with exact endpoints in the evaluation range
+  over whatever protocol its declared function requires. Outcome-oracle operations are logically read-only;
+  separately authorized reset/readiness controllers may mutate evaluation state. These helpers are not Sage
+  execution: their credentials and raw observations must not enter Sage, the policy-model context, the
+  operation/effect ledger, or the product's runtime proof chain. Sage itself remains limited to
+  Mythic/BloodHound control-plane data and Mythic payload tasks for target interaction.
+- A hash or commit ID identifies bytes and detects drift; it does not authenticate who produced them. Require a
+  digital signature only when a real relying party must authenticate the producer across a trust boundary or the
+  threat model includes adversarial substitution. Do not create signing or key-management ceremony for a trusted
+  single-operator development loop.
+- Capture a countable row's objective, scorer, budget, tested configuration, and invalidation rules before running
+  it. This is a per-run protocol snapshot, not a freeze on exploratory evaluator development. If the protocol
+  changes after results are observed, label the old row under its old version and treat the changed run as a new
+  comparison rather than repeatedly resealing source.
+- Protect unseen holdouts and preregister promotion analyses when adaptive development could overfit to them.
+  Reserve immutable candidate review, access isolation, review leases, and stronger provenance for final holdouts,
+  promotion/release decisions, externally relied-on claims, or another prospectively named high-impact boundary.
+- Generated `passes` fields, readiness flags, self-attestations, and tests that only reread generated claims are not
+  independent evidence. Validate important outcomes at the production boundary and include valid near matches and
+  adversarial cases proportional to the claim.
+- When fixing a semantic class, exercise the class rather than accumulating named examples. If the same mechanism
+  is rejected once, pause candidate production, inspect the real producer/consumer boundary, simplify, and test the
+  complete known class before another implementation review.
+- Preserve useful rejected evidence and decision history without turning the activity log into another hash
+  registry or promotion gate.
 
-## Review Lane And Acceptance-Contract Discipline
+## Review Lanes And Acceptance Discipline
 
-- Classify work before implementation as either `runtime_bugfix` or `sealed_evaluation`. Runtime bugfixes use the
-  lightest review process that can prove the production behavior; do not introduce sealed manifests, promotion
-  gates, or evaluation lifecycle machinery merely to repair a bounded runtime defect. Sealed evaluation work keeps
-  the full provenance and lifecycle discipline above.
-- Freeze a prospective acceptance contract before the first edit. It must name the mechanism, lane, atomic Ideal
-  State Criteria, exact production call path, adversarial and valid-near-match probes, non-goals, permitted files,
-  and the rule that distinguishes a blocker from non-blocking hardening.
-- The implementation owner must run the acceptance contract's declared probes before candidate review and map each
-  changed behavior to one criterion. Passing author-written examples alone is not sufficient when the contract
-  declares a broader semantic class.
-- A post-implementation rejection must identify a reproducible, production-reachable counterexample to a frozen
-  criterion or a concrete safety/authority-boundary violation. New preferences or requirements discovered after
-  implementation are non-blocking unless they meet that standard.
-- Every review finding must be classified as `blocking`, `hardening`, `unreachable`, `pre_existing`, or
-  `out_of_scope`. Only `blocking` findings affect the candidate disposition.
-- One review round must return the complete observed blocking set from all predeclared probes. Do not stop at the
-  first defect and reveal the rest across serial review rounds.
-- A fresh reviewer provides adversarial diversity, not evidence by agreement. Prefer executable invariants,
-  production-boundary probes, and frozen criteria over changing models or accumulating reviewer opinions.
+Classify work by the decision it supports, not by whether a path or task contains the word `eval`:
+
+- `runtime_bugfix`: a bounded product defect with a concrete production call path.
+- `development_measurement`: an internal baseline, exploratory run, evaluator debugging, or hill-climb signal that
+  cannot authorize promotion, release, or an external claim.
+- `sealed_evaluation`: final-holdout, promotion, release, externally relied-on evidence, or a prospectively named
+  adversarial-integrity decision for which exact candidate identity and independent provenance are material.
+- Evaluation and row countability alone do not select `sealed_evaluation`. Record the lane and one-sentence reason
+  in the task contract or activity log; that classification is not itself a signed or sealed artifact.
+- Before implementation, define atomic criteria, the production path, falsifying and valid-near-match probes,
+  non-goals, permitted scope, and blocker rule. For `runtime_bugfix` and `development_measurement`, keep this as a
+  concise working contract and update it transparently when production facts invalidate an assumption. Only
+  `sealed_evaluation` freezes the decision protocol and exact candidate before consequential review.
+- The implementation owner must run the declared probes and map each changed behavior to a criterion. Passing
+  author-written examples alone is insufficient when a broader semantic class is claimed.
+- A post-implementation rejection must identify a reproducible, production-reachable counterexample to an agreed
+  criterion or a concrete safety/authority-boundary violation. Classify every finding as `blocking`, `hardening`,
+  `unreachable`, `pre_existing`, or `out_of_scope`; only `blocking` affects disposition.
+- One review round returns the complete observed blocking set from its declared probes. A fresh reviewer provides
+  adversarial diversity, not evidence by agreement; prefer executable invariants, production-boundary probes, and
+  direct outcome inspection over accumulating reviewer opinions.
 - Do not encode control authority by classifying open-ended natural-language prose when a typed field, enum, or
-  protocol state can carry the same decision. If a rejection exposes a new paraphrase in the same language class,
-  simplify to structured authority instead of extending keyword, negation, or regex lists.
-- Give deadline-bound `runtime_bugfix` reviews an explicit wall-clock and command budget in the task contract
-  (15 minutes and the focused production-path suite by default). Complete the declared probes, then return a
-  disposition. Do not expand into unrelated history, whole-repository archaeology, or lifecycle review; the
-  maintained offline suite remains the implementation owner's regression evidence unless the frozen contract
-  identifies a concrete reason the reviewer must rerun it.
+  protocol state can carry the same decision.
+- Give deadline-bound `runtime_bugfix` reviews an explicit wall-clock and command budget (15 minutes and the
+  focused production-path suite by default). Give `development_measurement` a row-yield stop-loss: after one
+  mechanism rejection or two consecutive authorized spends with zero usable exploratory/countable rows, stop and
+  audit the measurement objective, production boundary, and governing instructions before adding evidence
+  machinery or commissioning another candidate review.
 
 ## Repo Map
 
@@ -280,7 +293,10 @@ For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do
 - Objective/proof boundary: no capability effect or objective completion may be recorded from Sage-host target
   I/O or Sage-local attack-artifact generation/use. Valid proof comes from Mythic task output/artifacts,
   Mythic credential-store state, or BloodHound facts derived from payload-collected artifacts. Operator
-  reset/readiness/eval helpers may inspect the lab out of band, but they are not Sage execution or proof.
+  reset/readiness/evaluation helpers may communicate with the evaluation range out of band over the protocol their
+  declared function requires. That access is never Sage execution or product/runtime proof. Outcome oracles remain
+  logically observation-only; separately authorized reset/readiness controllers may mutate evaluation state.
+  Their credentials and raw observations remain isolated from Sage and the policy model.
 - Never delete runtime databases. Before a clean reset, stop local Sage and use
   `skills/sage-goad-reset/scripts/archive_runtime_dbs.py` to move active databases to timestamped
   `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db` archives.
