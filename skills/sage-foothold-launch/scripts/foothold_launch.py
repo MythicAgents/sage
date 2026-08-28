@@ -35,6 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 PY = str(REPO / ".venv" / "bin" / "python")
 CERT = str(REPO / "Payload_Type" / "sage" / "certs" / "combined-bundle.pem")
+SKILL_ENV = Path(__file__).resolve().parents[1] / ".env"
 SAGE_ENV = REPO / "Payload_Type" / "sage" / ".env"
 
 LUDUS = "skills/sage-goad-reset/scripts/ludus.py"
@@ -49,15 +50,29 @@ DEFAULT_RUN_AS = "NORTH\\samwell.tarly"
 DEFAULT_SERVE_HOST = os.environ.get("SAGE_SERVE_HOST", "100.108.59.85")  # operator Tailscale IP
 
 
+def _read_nonempty_env_value(path: Path, key: str) -> str | None:
+    if not path.is_file():
+        return None
+    prefix = f"{key}="
+    for line in path.read_text(encoding="utf-8").splitlines():
+        candidate = line.strip()
+        if not candidate.startswith(prefix):
+            continue
+        value = candidate.split("=", 1)[1].strip().strip("'\"")
+        return value or None
+    return None
+
+
 def _env() -> dict:
     env = dict(os.environ)
     env["SSL_CERT_FILE"] = CERT
-    # Source SAGE_RUN_AS_PASSWORD from Sage .env if not already exported (single source of truth).
-    if not env.get("SAGE_RUN_AS_PASSWORD") and SAGE_ENV.exists():
-        for line in SAGE_ENV.read_text(encoding="utf-8").splitlines():
-            s = line.strip()
-            if s.startswith("SAGE_RUN_AS_PASSWORD="):
-                env["SAGE_RUN_AS_PASSWORD"] = s.split("=", 1)[1].strip().strip("'\"")
+    # Keep the run-as credential beside the skill that owns the launch. The process environment wins;
+    # Sage's runtime env remains a compatibility fallback for existing private installations.
+    if not env.get("SAGE_RUN_AS_PASSWORD"):
+        for path in (SKILL_ENV, SAGE_ENV):
+            value = _read_nonempty_env_value(path, "SAGE_RUN_AS_PASSWORD")
+            if value:
+                env["SAGE_RUN_AS_PASSWORD"] = value
                 break
     return env
 

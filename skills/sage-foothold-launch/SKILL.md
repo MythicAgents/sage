@@ -43,9 +43,10 @@ Pass `--no-grant-batch-right` to skip the privilege grant (e.g. if the right is 
   bundled `skills/sage-goad-reset/scripts/ludus.py` and `sync_range_time.py`. The bare `ludus` CLI has no
   credential on this host.
 - Mythic auth (payload download): `MYTHIC_ADMIN_PASSWORD` (resolved by `deploy_payload_via_ludus.py`).
-- samwell run-as password: `SAGE_RUN_AS_PASSWORD`, sourced automatically from `Payload_Type/sage/.env`
-  when not already exported. (Mythic's credential store is empty on this range, so `--run-as-credential-account`
-  does not resolve — the env value is the source of truth.)
+- samwell run-as password: `SAGE_RUN_AS_PASSWORD`. The launcher checks the process environment first, then the
+  gitignored `skills/sage-foothold-launch/.env`; `Payload_Type/sage/.env` remains a compatibility fallback.
+  Keep the credential in exactly one file and set the file mode to `0600`. (Mythic's credential store is empty
+  on this range, so `--run-as-credential-account` does not resolve — the env value is the source of truth.)
 - `--serve-host` must be reachable from the Windows target. Default is the operator Tailscale IP
   `100.108.59.85`; override with `--serve-host` or `SAGE_SERVE_HOST`.
 - Every Python invocation needs `SSL_CERT_FILE=Payload_Type/sage/certs/combined-bundle.pem`; the script
