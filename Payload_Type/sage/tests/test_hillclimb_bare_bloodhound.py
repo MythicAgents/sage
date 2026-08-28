@@ -2,6 +2,9 @@
 Pins schema conversion, exact shipping allowlist parity, graceful no-op, and dispatch fall-through.
 """
 import sys
+import asyncio
+import base64
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
@@ -20,6 +23,17 @@ class _StubTool:
     @property
     def args(self):
         return self._args
+
+
+class _AsyncStubTool(_StubTool):
+    def __init__(self, name, desc, args, responses):
+        super().__init__(name, desc, args)
+        self.responses = list(responses)
+        self.calls = []
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        return self.responses.pop(0)
 
 
 def test_tool_spec_from_discovered_tool():
@@ -42,6 +56,47 @@ def test_bare_bloodhound_admits_only_unique_exact_shipping_names():
     )
     assert [tool.name for tool in admitted] == ["domain_info"]
     assert {tool.name for tool in admitted} <= bb.SHIPPING_BLOODHOUND_TOOL_NAMES
+
+
+def test_hidden_collection_adapter_requires_one_exact_compatible_tool():
+    args = {
+        "info_type": {"type": "string"},
+        "job_id": {"type": "integer"},
+        "file_name": {"type": "string"},
+        "file_bytes_base64": {"type": "string"},
+    }
+    compatible = _StubTool("file_upload", "hidden", args)
+    assert bb.admitted_collection_upload_tool([compatible]) is compatible
+    assert bb.admitted_collection_upload_tool([compatible, compatible]) is None
+    assert bb.admitted_collection_upload_tool([
+        _StubTool("file_upload", "drifted", {"file_path": {"type": "string"}})
+    ]) is None
+
+
+def test_collection_ingestor_uploads_bytes_then_returns_raw_job_status():
+    tool = _AsyncStubTool(
+        "file_upload",
+        "hidden",
+        {},
+        [json.dumps({"job_id": 17, "status": "upload_complete"}),
+         {"job_id": 17, "status_message": "Ingesting"}],
+    )
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip-bytes"))
+    assert result == {
+        "upload": {"job_id": 17, "status": "upload_complete"},
+        "job_status": {"job_id": 17, "status_message": "Ingesting"},
+    }
+    assert tool.calls[0]["info_type"] == "upload_bytes"
+    assert tool.calls[0]["file_name"] == "forest.zip"
+    assert base64.b64decode(tool.calls[0]["file_bytes_base64"]) == b"zip-bytes"
+    assert tool.calls[1] == {"info_type": "status", "job_id": 17}
+
+
+def test_collection_ingestor_preserves_upload_without_inventing_job_status():
+    tool = _AsyncStubTool("file_upload", "hidden", {}, ["accepted-without-job-id"])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": "accepted-without-job-id", "job_status": None}
+    assert len(tool.calls) == 1
 
 
 def test_load_is_graceful_noop_when_dir_missing(monkeypatch):

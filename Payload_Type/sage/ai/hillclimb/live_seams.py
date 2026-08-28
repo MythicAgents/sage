@@ -876,6 +876,25 @@ def bloodhound_reachable(*, timeout: int = 30) -> tuple[bool, str]:
         return False, f"bloodhound REST unreachable (fix before a live run): {e}"
 
 
+def bloodhound_raw_surface_valid() -> tuple[bool, str]:
+    """Fail closed unless the exact nine query tools and hidden ingest adapter are discoverable."""
+    try:
+        from . import bare_bloodhound
+    except ImportError:
+        import bare_bloodhound  # type: ignore
+    try:
+        specs, registry, upload_tool = bare_bloodhound.load_bloodhound_mcp_surface()
+    except Exception as exc:
+        return False, f"raw BloodHound surface discovery failed ({type(exc).__name__})"
+    names = {str(spec.get("function", {}).get("name") or "") for spec in specs}
+    expected = set(bare_bloodhound.SHIPPING_BLOODHOUND_TOOL_NAMES)
+    if names != expected or set(registry) != expected:
+        return False, "raw BloodHound query surface does not match shipping's exact nine-name allowlist"
+    if upload_tool is None:
+        return False, "raw BloodHound collection adapter file_upload is absent or schema-incompatible"
+    return True, "raw BloodHound surface validated: 9 query tools plus hidden file_upload adapter"
+
+
 def mythic_credential_probe(
     account: str,
     *,

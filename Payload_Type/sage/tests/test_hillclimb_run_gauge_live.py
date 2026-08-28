@@ -4,6 +4,7 @@ validated on the range; this pins the wiring that prevents the pollution + wrong
 """
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,49 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb")
 
 import run_gauge_live as rgl  # noqa: E402
 from range_state import Milestone, PROBEABLE_MILESTONES  # noqa: E402
+
+
+def test_build_bare_runner_injects_hidden_collection_adapter_without_exposing_file_upload(monkeypatch):
+    captured = {}
+    upload_tool = object()
+    query_spec = {"type": "function", "function": {
+        "name": "domain_info", "description": "query", "parameters": {"type": "object", "properties": {}}
+    }}
+
+    monkeypatch.setattr(rgl, "_resolved_harness_model_route", lambda _cfg: {
+        "provider": "openai", "model": "same-model", "api_key": "key", "api_endpoint": "https://invalid"
+    })
+    monkeypatch.setattr(rgl.live_seams, "make_model_fn", lambda *_args, **_kwargs: (lambda *_a: {"final": "done"}))
+    monkeypatch.setattr(rgl.live_seams, "default_mythic_client", lambda: "mythic-client")
+    monkeypatch.setattr(
+        rgl.bare_bloodhound,
+        "load_bloodhound_mcp_surface",
+        lambda: ([query_spec], {"domain_info": object()}, upload_tool),
+    )
+
+    async def ingestor(_name, _blob):
+        return {"job_id": 1}
+
+    monkeypatch.setattr(rgl.bare_bloodhound, "make_collection_ingestor", lambda tool: ingestor if tool is upload_tool else None)
+    monkeypatch.setattr(rgl.bare_bloodhound, "make_bloodhound_dispatcher", lambda _registry: (lambda _call: "bh"))
+
+    def make_dispatcher(client, *, collection_ingestor=None):
+        captured.update(client=client, collection_ingestor=collection_ingestor)
+        return lambda _call: "mythic"
+
+    monkeypatch.setattr(rgl.bare_mythic_tools, "make_mythic_dispatcher", make_dispatcher)
+    cfg = SimpleNamespace(
+        max_output_tokens=100,
+        max_steps=0,
+        solve_timeout=10,
+        model_token_budget=1000,
+        measurement_kind="diagnostic",
+    )
+    runner = rgl.build_bare_runner(cfg, require_bloodhound=True)
+    names = {spec["function"]["name"] for spec in runner.tools_spec}
+    assert captured == {"client": "mythic-client", "collection_ingestor": ingestor}
+    assert "ingest_collection" in names
+    assert "file_upload" not in names
 
 
 def _telemetry(**overrides):

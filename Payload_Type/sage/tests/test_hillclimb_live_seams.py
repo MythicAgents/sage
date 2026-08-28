@@ -46,6 +46,31 @@ def test_mythic_preflight_consumes_exact_runtime_raw_surface(monkeypatch):
     assert ok is False
     assert "planted raw runtime schema drift" in detail
     assert seen == {"raw": 1}
+
+
+def test_bloodhound_raw_surface_preflight_requires_query_parity_and_hidden_ingest(monkeypatch):
+    import bare_bloodhound as bb
+
+    specs = [
+        {"function": {"name": name}}
+        for name in sorted(bb.SHIPPING_BLOODHOUND_TOOL_NAMES)
+    ]
+    registry = {name: object() for name in bb.SHIPPING_BLOODHOUND_TOOL_NAMES}
+    monkeypatch.setattr(bb, "load_bloodhound_mcp_surface", lambda: (specs, registry, object()))
+    assert ls.bloodhound_raw_surface_valid() == (
+        True,
+        "raw BloodHound surface validated: 9 query tools plus hidden file_upload adapter",
+    )
+
+    monkeypatch.setattr(bb, "load_bloodhound_mcp_surface", lambda: (specs, registry, None))
+    ok, detail = ls.bloodhound_raw_surface_valid()
+    assert ok is False
+    assert "file_upload" in detail
+
+    monkeypatch.setattr(bb, "load_bloodhound_mcp_surface", lambda: (specs[:-1], registry, object()))
+    ok, detail = ls.bloodhound_raw_surface_valid()
+    assert ok is False
+    assert "nine-name allowlist" in detail
 import credential_artifacts as ca  # noqa: E402
 
 

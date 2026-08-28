@@ -4,8 +4,10 @@ The preflight validates exact live GraphQL documents and installed SDK signature
 the tool schema set, shipping parity, dispatch routing, and runner behavior.
 """
 import asyncio
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
@@ -19,7 +21,9 @@ def test_bare_tool_specs_are_mythic_not_commands():
     # Raw Mythic discovery + tasking are present...
     assert {"list_callbacks", "get_payload_types", "get_commands", "issue_command", "get_task_history",
             "get_task_output", "get_uploaded_files",
-            "read_credentials", "add_credential"} <= names
+            "read_credentials", "add_credential", "get_all_payload_info",
+            "get_c2_profiles_for_payload", "get_callback_c2_config",
+            "get_payload_c2_config", "ingest_collection"} <= names
     # ...and Apollo commands are NOT tools anymore (the model discovers them via get_commands).
     assert "mimikatz" not in names and "shell" not in names and "powerpick" not in names
     for s in bmt.bare_tool_specs():
@@ -30,7 +34,7 @@ def test_bare_tool_specs_are_mythic_not_commands():
 def test_raw_mythic_surface_is_a_strict_shipping_subset_with_no_exceptions():
     disposition = bmt.raw_mythic_parity_disposition()
     assert disposition["valid"] is True
-    assert disposition["raw_count"] == len(bmt.TOOLS) == 13
+    assert disposition["raw_count"] == len(bmt.TOOLS) == 18
     assert disposition["raw_count"] <= disposition["shipping_count"]
     assert disposition["exceptions"] == {}
     assert {"download_file", "download_payload"}.isdisjoint(bmt.TOOLS)
@@ -49,6 +53,34 @@ def test_raw_mythic_parity_guard_rejects_missing_shipping_capability():
     disposition = bmt.raw_mythic_parity_disposition(shipping)
     assert disposition["valid"] is False
     assert disposition["missing_shipping"] == {"read_credentials": "read_credentials"}
+
+
+def test_bidirectional_reverse_audit_is_exhaustive_and_implemented():
+    disposition = bmt.raw_mythic_bidirectional_disposition()
+    assert disposition == {
+        "valid": True,
+        "shipping_count": 31,
+        "classified_count": 31,
+        "counts": {
+            "ADD_RAW": 5,
+            "ALREADY_COMPOSABLE": 4,
+            "ALREADY_DIRECT": 13,
+            "DO_NOT_ADD_TREATMENT": 9,
+        },
+        "failures": {},
+    }
+
+
+def test_bidirectional_guard_rejects_missing_required_raw_coverage(monkeypatch):
+    removed = bmt.TOOLS.pop("get_payload_c2_config")
+    try:
+        disposition = bmt.raw_mythic_bidirectional_disposition()
+    finally:
+        bmt.TOOLS["get_payload_c2_config"] = removed
+    assert disposition["valid"] is False
+    assert disposition["failures"]["get_payload_c2_config"] == (
+        "missing raw coverage ['get_payload_c2_config']"
+    )
 
 
 def test_installed_mythic_sdk_matches_every_runtime_wrapper_contract():
@@ -100,7 +132,58 @@ def _raw_graphql_introspection():
 
     schema = build_schema("""
         scalar jsonb
-        type payloadtype { name: String }
+        enum order_by { asc desc }
+        type buildparameter {
+          id: Int
+          name: String
+          parameter_type: String
+          choices: String
+          default_value: String
+          description: String
+        }
+        type payloadtype {
+          name: String
+          agent_type: String
+          supported_os: [String!]
+          buildparameters: [buildparameter!]
+        }
+        type c2profileparameter {
+          name: String
+          description: String
+          parameter_type: String
+          required: Boolean
+          default_value: String
+          choices: String
+        }
+        type c2profile {
+          name: String
+          description: String
+          is_p2p: Boolean
+          c2profileparameters: [c2profileparameter!]
+        }
+        type payloadtypec2profile { payloadtype: payloadtype, c2profile: c2profile }
+        type c2profileparametersinstance {
+          value: String
+          instance_name: String
+          c2profileparameter: c2profileparameter
+          c2profile: c2profile
+        }
+        type callback {
+          display_id: Int
+          host: String
+          user: String
+          c2profileparametersinstances: [c2profileparametersinstance!]
+        }
+        type task { display_id: Int, command_name: String, callback: callback }
+        type filemeta {
+          agent_file_id: String
+          filename_utf8: String
+          timestamp: String
+          complete: Boolean
+          deleted: Boolean
+          is_download_from_agent: Boolean
+          task: task
+        }
         type credential {
           account: String
           realm: String
@@ -109,6 +192,20 @@ def _raw_graphql_introspection():
           metadata: jsonb
         }
         input String_comparison_exp { _eq: String }
+        input Int_comparison_exp { _eq: Int }
+        input Boolean_comparison_exp { _eq: Boolean }
+        input payloadtype_bool_exp { name: String_comparison_exp }
+        input payloadtypec2profile_bool_exp { payloadtype: payloadtype_bool_exp }
+        input callback_display_bool_exp { display_id: Int_comparison_exp }
+        input task_callback_bool_exp { callback: callback_display_bool_exp }
+        input filemeta_bool_exp {
+          complete: Boolean_comparison_exp
+          deleted: Boolean_comparison_exp
+          is_payload: Boolean_comparison_exp
+          is_download_from_agent: Boolean_comparison_exp
+          task: task_callback_bool_exp
+        }
+        input filemeta_order_by { id: order_by }
         input payload_bool_exp { uuid: String_comparison_exp }
         input callback_payload_bool_exp { uuid: String_comparison_exp }
         input callback_bool_exp { payload: callback_payload_bool_exp }
@@ -118,6 +215,9 @@ def _raw_graphql_introspection():
         type update_payload_result { status: String, error: String }
         type Query {
           payloadtype: [payloadtype!]!
+          payloadtypec2profile(where: payloadtypec2profile_bool_exp): [payloadtypec2profile!]!
+          callback(where: callback_display_bool_exp): [callback!]!
+          filemeta(where: filemeta_bool_exp, order_by: filemeta_order_by, limit: Int): [filemeta!]!
           credential: [credential!]!
           payload(where: payload_bool_exp): [payload!]!
           callback_aggregate(where: callback_bool_exp): callback_aggregate_fields
@@ -164,12 +264,138 @@ def test_graphql_guard_rejects_a_planted_missing_field(monkeypatch):
 def test_excluded_secret_sauce_not_exposed():
     names = set(bmt.TOOLS)
     for sauce in ("get_ttp_guidance", "get_ttp_full_reference", "list_ttp_categories",
-                  "execute_capability", "build_capability_commands", "ingest_collection",
+                  "execute_capability", "build_capability_commands",
                   "check_callback_alive", "assess_callback_liveness", "download_tool"):
         assert sauce not in names, f"{sauce} is harness secret sauce and must not reach the bare model"
     for local_surface in ("list_tools_folder", "register_tool", "upload_file_to_target", "sandbox_exec"):
         assert local_surface not in names, f"{local_surface} exposes Sage-local assets or helpers"
     assert "list_callbacks" in names   # raw callback listing IS provided (fixes the cb-pivot gap)
+
+
+def _collection_zip() -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("users.json", '{"data": [{"name": "EXAMPLE"}]}')
+    return out.getvalue()
+
+
+def test_new_metadata_wrappers_execute_exact_runtime_calls(monkeypatch):
+    from mythic import mythic
+    calls = []
+
+    async def query(_client, document, variables=None):
+        calls.append((document, variables))
+        return {"ok": True}
+
+    async def payload_by_uuid(*, mythic, payload_uuid, custom_return_attributes):
+        calls.append((payload_uuid, custom_return_attributes))
+        return {"uuid": payload_uuid, "c2profileparametersinstances": []}
+
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    monkeypatch.setattr(mythic, "get_payload_by_uuid", payload_by_uuid)
+    assert json.loads(asyncio.run(bmt._get_all_payload_info(object()))) == {"ok": True}
+    assert json.loads(asyncio.run(bmt._get_c2_profiles_for_payload(object(), "apollo"))) == {"ok": True}
+    assert json.loads(asyncio.run(bmt._get_callback_c2_config(object(), 7))) == {"ok": True}
+    payload = json.loads(asyncio.run(bmt._get_payload_c2_config(object(), "payload-1")))
+    assert payload["uuid"] == "payload-1"
+    assert any(variables == {"payload_type_name": "apollo"} for _, variables in calls if isinstance(variables, dict))
+    assert any(variables == {"id": 7} for _, variables in calls if isinstance(variables, dict))
+
+
+def test_ingest_collection_dispatches_real_zip_bytes_without_exposing_them(monkeypatch):
+    from mythic import mythic
+    blob = _collection_zip()
+    received = {}
+
+    async def download(*, mythic, file_uuid):
+        assert file_uuid == "file-1"
+        return blob
+
+    async def ingest(name, data):
+        received.update(name=name, data=data)
+        return {"job_id": 41, "status_message": "Running"}
+
+    monkeypatch.setattr(mythic, "download_file", download)
+    dispatcher = bmt.make_mythic_dispatcher(object(), collection_ingestor=ingest)
+    result = json.loads(dispatcher({"tool": "ingest_collection", "args": {"file_uuid": "file-1"}}))
+    assert received == {"name": "file-1.zip", "data": blob}
+    assert result["source"]["bytes"] == len(blob)
+    assert result["bloodhound"]["job_id"] == 41
+    assert "UEsDB" not in json.dumps(result)
+
+
+def test_ingest_collection_resolves_latest_matching_callback_file(monkeypatch):
+    from mythic import mythic
+    blob = _collection_zip()
+
+    async def query(_client, document, variables=None):
+        assert document == bmt._LATEST_COLLECTION_QUERY
+        assert variables == {"cbid": 9}
+        return {"filemeta": [
+            {"agent_file_id": "newest", "filename_utf8": "notes.txt"},
+            {"agent_file_id": "collection", "filename_utf8": "forest.zip"},
+        ]}
+
+    async def download(*, mythic, file_uuid):
+        assert file_uuid == "collection"
+        return blob
+
+    async def ingest(name, data):
+        return {"job_id": 8}
+
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    monkeypatch.setattr(mythic, "download_file", download)
+    result = json.loads(asyncio.run(bmt._ingest_collection(
+        object(), callback_display_id=9, collection_ingestor=ingest
+    )))
+    assert result["source"]["resolved_by"] == "callback:9"
+    assert result["source"]["file_uuid"] == "collection"
+
+
+def test_ingest_collection_rejects_ambiguous_missing_and_malformed_sources(monkeypatch):
+    from mythic import mythic
+
+    async def bad_download(*, mythic, file_uuid):
+        return b"not-a-zip"
+
+    async def ingest(_name, _data):
+        raise AssertionError("invalid source must not reach BloodHound")
+
+    monkeypatch.setattr(mythic, "download_file", bad_download)
+    for kwargs in ({}, {"file_uuid": "x", "callback_display_id": 2}):
+        try:
+            asyncio.run(bmt._ingest_collection(object(), collection_ingestor=ingest, **kwargs))
+        except ValueError as exc:
+            assert "exactly one" in str(exc)
+        else:
+            raise AssertionError("ambiguous source was accepted")
+    try:
+        asyncio.run(bmt._ingest_collection(object(), file_uuid="x", collection_ingestor=ingest))
+    except ValueError as exc:
+        assert "collection ZIP" in str(exc)
+    else:
+        raise AssertionError("malformed collection was accepted")
+
+
+def test_download_preflight_exercises_sdk_and_fails_closed(monkeypatch):
+    from mythic import mythic
+
+    async def query(_client, _document, variables=None):
+        return {"filemeta": [{"agent_file_id": "payload-file"}]}
+
+    async def ok_download(*, mythic, file_uuid):
+        return b"payload"
+
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    monkeypatch.setattr(mythic, "download_file", ok_download)
+    assert asyncio.run(bmt.raw_mythic_download_disposition(object()))["valid"] is True
+
+    async def broken(*, mythic, file_uuid):
+        raise RuntimeError("redirect")
+
+    monkeypatch.setattr(mythic, "download_file", broken)
+    failed = asyncio.run(bmt.raw_mythic_download_disposition(object()))
+    assert failed == {"valid": False, "reason": "download preflight failed (RuntimeError)"}
 
 
 def test_dispatcher_unknown_tool_is_graceful():
@@ -178,7 +404,7 @@ def test_dispatcher_unknown_tool_is_graceful():
 
 
 def test_naive_profile_has_no_local_asset_path_symbol():
-    assert bmt.BARE_TOOL_PROFILE == "naive-raw-mythic-bloodhound-v1"
+    assert bmt.BARE_TOOL_PROFILE == "naive-raw-mythic-bloodhound-v2"
     assert not hasattr(bmt, "TOOLS_DIR")
     prompt = bare_runner.DEFAULT_SYSTEM.casefold()
     assert "list_tools_folder" not in prompt

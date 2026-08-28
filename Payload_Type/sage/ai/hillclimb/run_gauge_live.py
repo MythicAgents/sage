@@ -417,6 +417,12 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
     sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
     if Milestone.GRAPH_COLLECTED in sub:
         checks.append(("bloodhound-reachable", "smoke", lambda: live_seams.bloodhound_reachable()))
+    if scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        checks.append((
+            "bloodhound-raw-surface-valid",
+            "smoke",
+            lambda: live_seams.bloodhound_raw_surface_valid(),
+        ))
     for d in sorted(_scored_referee_domains(scn)):
         checks.append((f"referee-creds:{d}", "offline", (lambda d=d: _referee_creds_present(d))))
     return checks
@@ -1362,16 +1368,24 @@ def build_bare_runner(cfg: Config, *, require_bloodhound: bool = False) -> bare_
     # tool calls straight to the raw Mythic SDK. No step cap (cfg.max_steps=0); solve_timeout is a
     # wall-clock ceiling; a live stdout logger lets the operator watch the model between Mythic tasks.
     client = live_seams.default_mythic_client()
-    mythic_exec = bare_mythic_tools.make_mythic_dispatcher(client)
 
     # BloodHound: discover EVERY MCP tool dynamically (not hardcoded). Raw external tool — Sage's
     # BloodHound *agent* (ingest reconciliation, collect-once gate, graph-fact injection) stays excluded.
-    bh_specs, bh_registry = bare_bloodhound.load_bloodhound_mcp_tools()
-    if require_bloodhound and not bh_specs:
+    bh_specs, bh_registry, bh_upload_tool = bare_bloodhound.load_bloodhound_mcp_surface()
+    if require_bloodhound and (not bh_specs or bh_upload_tool is None):
         raise RuntimeError(
-            "the true-naive Gate 1P arm requires raw BloodHound MCP tools; "
+            "the true-naive Gate 1P arm requires the exact raw BloodHound query and ingest surface; "
             "set SAGE_BLOODHOUND_MCP_DIR and verify discovery"
         )
+    collection_ingestor = (
+        bare_bloodhound.make_collection_ingestor(bh_upload_tool)
+        if bh_upload_tool is not None
+        else None
+    )
+    mythic_exec = bare_mythic_tools.make_mythic_dispatcher(
+        client,
+        collection_ingestor=collection_ingestor,
+    )
     bh_exec = bare_bloodhound.make_bloodhound_dispatcher(bh_registry)
     print(f"[bare] toolset: {len(bare_mythic_tools.TOOLS)} Mythic + {len(bh_specs)} BloodHound MCP tools", flush=True)
 

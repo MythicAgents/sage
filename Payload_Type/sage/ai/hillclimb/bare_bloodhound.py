@@ -19,6 +19,7 @@ empty result rather than silently relabeling a Mythic-only baseline as Mythic/Bl
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from typing import Any, Callable
@@ -89,24 +90,95 @@ def admitted_bloodhound_tools(tools: list[Any]) -> list[Any]:
     ]
 
 
+def admitted_collection_upload_tool(tools: list[Any]) -> Any | None:
+    """Select one exact `file_upload` adapter without exposing it as a model-visible MCP tool."""
+    matches = [tool for tool in tools if getattr(tool, "name", None) == "file_upload"]
+    if len(matches) != 1:
+        return None
+    params = _params_from_tool(matches[0]).get("properties", {})
+    required = {"info_type", "job_id", "file_name", "file_bytes_base64"}
+    return matches[0] if required <= set(params) else None
+
+
+def _discover_bloodhound_tools() -> list[Any]:
+    conns = _connections()
+    if conns is None:
+        return []
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    client = MultiServerMCPClient(conns)
+    return list(asyncio.run(client.get_tools(server_name=BLOODHOUND_SERVER)))
+
+
+def load_bloodhound_mcp_surface() -> tuple[list[dict], dict, Any | None]:
+    """Discover model-visible query tools plus the hidden collection-upload dependency once."""
+    try:
+        tools = _discover_bloodhound_tools()
+    except Exception as e:
+        print(f"[bare] BloodHound MCP unavailable ({type(e).__name__}: {e}) — running without it", flush=True)
+        return [], {}, None
+    admitted = admitted_bloodhound_tools(tools)
+    return (
+        [tool_spec(tool) for tool in admitted],
+        {tool.name: tool for tool in admitted},
+        admitted_collection_upload_tool(tools),
+    )
+
+
 def load_bloodhound_mcp_tools() -> tuple[list[dict], dict]:
     """Discover and admit the exact shipping-Sage BloodHound surface.
 
     Duplicate, malformed, and non-shipping names fail closed by being withheld. Empty discovery is
     returned when unavailable; the live Gate 1P builder rejects that state.
     """
-    conns = _connections()
-    if conns is None:
-        return [], {}
-    try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-        client = MultiServerMCPClient(conns)
-        tools = asyncio.run(client.get_tools(server_name=BLOODHOUND_SERVER))
-    except Exception as e:
-        print(f"[bare] BloodHound MCP unavailable ({type(e).__name__}: {e}) — running without it", flush=True)
-        return [], {}
-    admitted = admitted_bloodhound_tools(list(tools))
-    return [tool_spec(t) for t in admitted], {t.name: t for t in admitted}
+    specs, registry, _ = load_bloodhound_mcp_surface()
+    return specs, registry
+
+
+def make_collection_ingestor(file_upload_tool: Any) -> Callable[[str, bytes], Any]:
+    """Build the hidden raw bytes-upload adapter used only by raw `ingest_collection`."""
+    async def ingest(file_name: str, file_bytes: bytes) -> dict[str, Any]:
+        if file_upload_tool is None:
+            raise RuntimeError("BloodHound file_upload tool is unavailable or schema-incompatible")
+        upload_raw = await file_upload_tool.ainvoke({
+            "info_type": "upload_bytes",
+            "file_name": file_name,
+            "file_bytes_base64": base64.b64encode(file_bytes).decode("ascii"),
+        })
+        upload = _json_value(upload_raw)
+        job_id = _find_job_id(upload)
+        status = None
+        if job_id is not None:
+            status = _json_value(await file_upload_tool.ainvoke({
+                "info_type": "status",
+                "job_id": job_id,
+            }))
+        return {"upload": upload, "job_status": status}
+    return ingest
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _find_job_id(value: Any) -> int | str | None:
+    if isinstance(value, dict):
+        if value.get("job_id") is not None:
+            return value["job_id"]
+        for nested in value.values():
+            found = _find_job_id(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_job_id(nested)
+            if found is not None:
+                return found
+    return None
 
 
 def make_bloodhound_dispatcher(registry: dict) -> Callable[[dict], str | None]:

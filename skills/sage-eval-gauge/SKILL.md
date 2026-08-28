@@ -53,11 +53,22 @@ may resume once only when its cleanup disposition is exact and complete. A naive
 retained shipping lifecycle; malformed cleanup, result-ledger contamination, already-started current arm, or a
 second recovery for the same arm fails closed before another reset.
 
-The true-naive runtime tool surface is a strict subset of shipping Sage: 13 mapped raw Mythic tools and the exact
-nine-name shipping BloodHound allowlist, with no exceptions. The preflight validates that parity, all installed SDK
-call signatures/async kinds, and the exact four raw GraphQL documents against the live schema before reset. Raw
-Cypher, MCP file upload, composite BloodHound management, direct Mythic file download, and the currently broken
-shared payload-download path are not exposed to the naive model.
+The true-naive runtime tool surface is a strict subset of shipping Sage: 18 mapped raw Mythic tools and the exact
+nine-name shipping BloodHound query allowlist, with no exceptions. The accepted reverse audit classifies every one
+of shipping Sage's 31 prompt-visible Mythic tools exactly once: 13 originally direct, 4 compositionally covered, 5
+now implemented as neutral raw additions, and 9 intentionally retained as harness treatment. The five additions are
+payload/build metadata, payload-compatible C2 schemas, callback C2 configuration, payload C2 configuration, and a
+stripped collection-ingest bridge. That bridge exposes only explicit Mythic file/callback selection; its required
+BloodHound `file_upload` adapter remains hidden from the model and returns raw upload/job status without Sage
+transaction, freshness, idempotency, graph-projection, planner, or reconciliation behavior.
+
+Before reset, preflight validates the 18-to-31 one-way subset, the complete 31-row reverse disposition, all 14
+installed-SDK call signatures/async kinds, all 9 exact raw GraphQL documents against the live schema, the exact nine
+BloodHound query names, the hidden upload adapter's schema, and one real SDK download. The current Mythic direct-
+download redirect loop makes that final check fail closed, so Pair 017 cannot start until the separately scoped
+redirect repair passes. Raw Cypher, a standalone model-visible MCP file-upload tool, composite BloodHound management,
+general direct-file download, TTP guidance, host-side waiting, capability/planner abstractions, and Sage-local
+inventory/artifact state remain excluded.
 
 **Prospective stop rule:** retain an isolated `[tool error]`, `[bloodhound tool error]`, or `[unknown tool]` as a
 recoverable model-visible observation and continue within the frozen wall/token/action budget. Immediate stop is
