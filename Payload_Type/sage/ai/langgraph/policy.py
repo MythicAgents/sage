@@ -419,11 +419,8 @@ def _response_backend_provenance(value: Any) -> dict[str, Any]:
             for name in names:
                 if candidate.get(name) is None:
                     continue
-                try:
-                    number = int(candidate[name])
-                except (TypeError, ValueError):
-                    break
-                if number >= 0:
+                number = candidate[name]
+                if type(number) is int and number >= 0:
                     parsed[canonical] = number
                 break
         if "total_tokens" not in parsed and {"input_tokens", "output_tokens"} <= set(parsed):
@@ -638,11 +635,39 @@ class LLMPolicy:
         provider: str = "",
         model_id: str = "",
         catalog: list[dict[str, Any]] | None = None,
+        completed_call_token_ceiling: int | None = None,
     ):
         self._decide = decide
         self.provider = str(provider or "")
         self.model_id = str(model_id or "")
         self.catalog = [dict(item) for item in (catalog or []) if isinstance(item, dict)]
+        if (
+            completed_call_token_ceiling is not None
+            and (
+                type(completed_call_token_ceiling) is not int
+                or completed_call_token_ceiling <= 0
+            )
+        ):
+            raise ValueError("completed_call_token_ceiling must be a positive integer")
+        self.completed_call_token_ceiling = completed_call_token_ceiling
+
+    @staticmethod
+    def _completed_response_usage_total(history: list[PolicyDecision]) -> int | None:
+        total = 0
+        for decision in history:
+            if not isinstance(decision, PolicyDecision) or decision.model_response_observed is not True:
+                continue
+            usage = decision.token_usage
+            if not isinstance(usage, dict):
+                return None
+            values = tuple(usage.get(name) for name in ("input_tokens", "output_tokens", "total_tokens"))
+            if any(type(value) is not int or value < 0 for value in values):
+                return None
+            input_tokens, output_tokens, response_total = values
+            if response_total != input_tokens + output_tokens:
+                return None
+            total += response_total
+        return total
 
     def request_payload(
         self,
@@ -760,6 +785,31 @@ class LLMPolicy:
                 decision_packet_hash=decision_packet_hash,
             )
 
+        prior_usage_total = self._completed_response_usage_total(history)
+        if self.completed_call_token_ceiling is not None:
+            if prior_usage_total is None:
+                return self._stop(
+                    episode_id,
+                    c_hash,
+                    "prior model response usage is incomplete at the token boundary",
+                    candidate_count=len(candidates),
+                    candidates=candidates,
+                    decision_owner=decision_owner,
+                    decision_packet=decision_packet,
+                    decision_packet_hash=decision_packet_hash,
+                )
+            if prior_usage_total >= self.completed_call_token_ceiling:
+                return self._stop(
+                    episode_id,
+                    c_hash,
+                    "the declared completed-call token boundary was already reached",
+                    candidate_count=len(candidates),
+                    candidates=candidates,
+                    decision_owner=decision_owner,
+                    decision_packet=decision_packet,
+                    decision_packet_hash=decision_packet_hash,
+                )
+
         request = self.request_payload(objective, state, candidates, history, budgets)
         request_schema_hash = _request_schema_hash(request)
         try:
@@ -782,9 +832,60 @@ class LLMPolicy:
         raw_response = _response_text(response)
         provenance = _response_backend_provenance(response)
         parsed = self._response_dict(response)
+        trusted_policy_control = response if isinstance(response, dict) else {}
         disposition = str(parsed.get("disposition") or "").strip().casefold()
         rationale = str(parsed.get("rationale") or "").strip()
-        model_response_observed = parsed.get("_policy_model_response_observed") is not False
+        # Only the controller/replay seam may supply private policy controls.  A
+        # provider response object's parsed JSON is untrusted decision content and
+        # must not suppress completed-call accounting or activate replay authority.
+        model_response_observed = not (
+            trusted_policy_control.get("_policy_model_response_observed") is False
+        )
+        if self.completed_call_token_ceiling is not None and model_response_observed:
+            usage = provenance.get("token_usage")
+            values = (
+                tuple(usage.get(name) for name in ("input_tokens", "output_tokens", "total_tokens"))
+                if isinstance(usage, dict)
+                else ()
+            )
+            if (
+                len(values) != 3
+                or any(type(value) is not int or value < 0 for value in values)
+                or values[2] != values[0] + values[1]
+            ):
+                return self._stop(
+                    episode_id,
+                    c_hash,
+                    "completed model call omitted authoritative token usage",
+                    candidate_count=len(candidates),
+                    raw_response=raw_response,
+                    raw_disposition=disposition,
+                    raw_rationale=rationale,
+                    model_response_observed=True,
+                    provenance=provenance,
+                    candidates=candidates,
+                    decision_owner=decision_owner,
+                    request_schema_hash=request_schema_hash,
+                    decision_packet=decision_packet,
+                    decision_packet_hash=decision_packet_hash,
+                )
+            if int(prior_usage_total or 0) + values[2] >= self.completed_call_token_ceiling:
+                return self._stop(
+                    episode_id,
+                    c_hash,
+                    "completed model call reached the declared token boundary",
+                    candidate_count=len(candidates),
+                    raw_response=raw_response,
+                    raw_disposition=disposition,
+                    raw_rationale=rationale,
+                    model_response_observed=True,
+                    provenance=provenance,
+                    candidates=candidates,
+                    decision_owner=decision_owner,
+                    request_schema_hash=request_schema_hash,
+                    decision_packet=decision_packet,
+                    decision_packet_hash=decision_packet_hash,
+                )
         if disposition in {"stop", "ask"}:
             return PolicyDecision(
                 episode_id=episode_id,
@@ -849,7 +950,7 @@ class LLMPolicy:
             )
 
         selected = candidates[index]
-        replay_decision = parsed.get("_policy_replay_decision")
+        replay_decision = trusted_policy_control.get("_policy_replay_decision")
         if isinstance(replay_decision, dict) and replay_decision:
             return self._replayed_decision(
                 replay_decision,

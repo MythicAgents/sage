@@ -9400,10 +9400,19 @@ class Model:
         def clock():
             return asyncio.get_event_loop().time() - start
 
+        try:
+            evaluation_token_ceiling = int(os.environ.get("SAGE_EVAL_MODEL_TOKEN_BUDGET") or 0)
+        except (TypeError, ValueError):
+            evaluation_token_ceiling = 0
+        if evaluation_token_ceiling < 0:
+            evaluation_token_ceiling = 0
         cfg = _ctrl.ControllerConfig(
             seam_timeout_s=float(_env_positive_int("SAGE_CONTROLLER_SEAM_TIMEOUT_S", 900)),
             wall_clock_budget_s=float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700)),
-            token_budget=_env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000),
+            token_budget=(
+                evaluation_token_ceiling
+                or _env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000)
+            ),
             max_cycles=_env_positive_int("SAGE_CONTROLLER_MAX_CYCLES", 60),
             max_collection_attempts_per_request=1 if supervised_collection_lane else 2,
         )
@@ -9534,6 +9543,7 @@ class Model:
                 provider=getattr(self, "provider", ""),
                 model_id=getattr(self, "model", ""),
                 catalog=_cap.capability_catalog() if policy_mode == _policy.POLICY_LLM else None,
+                completed_call_token_ceiling=(evaluation_token_ceiling or None),
             )
         policy_backend = _EvalForcedInterventionPolicy(policy_backend)
         self._controller_runtime_telemetry = {
@@ -13845,7 +13855,11 @@ def _eval_apply_forced_intervention_decision(decision: Any, candidates: list[Any
     as non-creditable forced execution.
     """
     forced_index = _eval_forced_intervention_index(candidates)
-    if decision is None or forced_index is None:
+    if (
+        decision is None
+        or str(getattr(decision, "disposition", "") or "").strip().casefold() != "select"
+        or forced_index is None
+    ):
         return decision
     try:
         from . import policy as _policy

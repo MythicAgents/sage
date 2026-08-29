@@ -3,6 +3,9 @@ milestones and read via the OUT-OF-BAND reader (never the agent callback). The l
 validated on the range; this pins the wiring that prevents the pollution + wrong-domain bugs.
 """
 import json
+import importlib.util
+import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,6 +16,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb")
 
 import run_gauge_live as rgl  # noqa: E402
 from range_state import Milestone, PROBEABLE_MILESTONES  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[3]
+ORCHESTRATE_SCRIPT = ROOT / "skills" / "sage-eval-gauge" / "scripts" / "orchestrate.py"
+ORCHESTRATE_SPEC = importlib.util.spec_from_file_location(
+    "sage_eval_orchestrate_for_live_child",
+    ORCHESTRATE_SCRIPT,
+)
+orchestrate = importlib.util.module_from_spec(ORCHESTRATE_SPEC)
+assert ORCHESTRATE_SPEC and ORCHESTRATE_SPEC.loader
+ORCHESTRATE_SPEC.loader.exec_module(orchestrate)
+
+
+def test_gate1p_exact_child_command_parses_help_without_pythonpath():
+    payload_root = ROOT / "Payload_Type" / "sage"
+    result = subprocess.run(
+        [sys.executable, "ai/hillclimb/run_gauge_live.py", "--help"],
+        cwd=payload_root,
+        env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage: run_gauge_live.py" in result.stdout
 
 
 def test_build_bare_runner_injects_hidden_collection_adapter_without_exposing_file_upload(monkeypatch):
@@ -105,6 +134,37 @@ def test_runtime_telemetry_validation_rejects_mislabeled_model():
             _telemetry(model_provider="openai", model_id="gpt-5.4-mini"),
             configured_provider="openai",
             configured_model="bedrock-claude-4-6-sonnet",
+        )
+
+
+def test_runtime_telemetry_validation_rejects_response_backend_route_drift():
+    telemetry = _telemetry(
+        model_provider="openai",
+        model_id="bedrock-claude-4-6-sonnet",
+    )
+    for request in telemetry["effective_backend_requests"]:
+        request["effective_backend"] = "unexpected-provider:unexpected-model"
+
+    with pytest.raises(RuntimeError, match="response-derived effective backend differs"):
+        rgl.validate_harness_runtime_telemetry(
+            "llm",
+            telemetry,
+            configured_provider="openai",
+            configured_model="bedrock-claude-4-6-sonnet",
+        )
+
+
+def test_gate1p_run_side_rejects_inherited_intervention_before_live_seams(monkeypatch):
+    monkeypatch.setenv(
+        "SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
+        json.dumps([{"capability": "adcs-ca-private-key-export"}]),
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="incompatible evaluation override"):
+        rgl.run_side(
+            rgl.Config(measurement_kind="row"),
+            "harness",
+            rgl.gate1p_stagea.SCENARIO,
         )
 
 
@@ -656,13 +716,18 @@ def test_gate1p_naive_child_recomputes_shipping_lifecycle_before_live_client(mon
     results = artifact_dir / "results.jsonl"
     control = artifact_dir / "pair-control.json"
     control.write_text(json.dumps({
-        "schema": "gate1p-stagea-pair-control-v2",
+        "schema": "gate1p-stagea-pair-control-v3",
         "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
         "pair_id": rgl.gate1p_stagea.PAIR_ID,
         "source_version": "tree:test",
         "next_arm": "true_naive",
         "completed_arms": ["shipping_sage"],
-        "prearm_state": {"arm": "true_naive", "status": "reset_started", "updated_at": 1.0},
+        "prearm_state": {
+            "arm": "true_naive",
+            "status": "reset_started",
+            "reset_generation": 1,
+            "updated_at": 1.0,
+        },
         "created_at": 1.0,
         "updated_at": 1.0,
     }), encoding="utf-8")
@@ -699,13 +764,18 @@ def test_gate1p_child_rejects_idle_prearm_state_before_live_client(monkeypatch, 
     artifact_dir.mkdir(parents=True)
     control = artifact_dir / "pair-control.json"
     control.write_text(json.dumps({
-        "schema": "gate1p-stagea-pair-control-v2",
+        "schema": "gate1p-stagea-pair-control-v3",
         "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
         "pair_id": rgl.gate1p_stagea.PAIR_ID,
         "source_version": "tree:test",
         "next_arm": "shipping_sage",
         "completed_arms": [],
-        "prearm_state": {"arm": "shipping_sage", "status": "idle", "updated_at": 1.0},
+        "prearm_state": {
+            "arm": "shipping_sage",
+            "status": "idle",
+            "reset_generation": 0,
+            "updated_at": 1.0,
+        },
         "created_at": 1.0,
         "updated_at": 1.0,
     }), encoding="utf-8")
@@ -736,6 +806,113 @@ def test_gate1p_child_rejects_idle_prearm_state_before_live_client(monkeypatch, 
         rgl.run_side(cfg, "harness", rgl.gate1p_stagea.SCENARIO)
 
 
+def test_gate1p_real_orchestrator_control_reaches_live_child_client_seam(monkeypatch, tmp_path):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "pair"
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(artifact_dir)}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: (_ for _ in ()).throw(RuntimeError("assembled client seam reached")),
+    )
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=0,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_api_key="dummy",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(RuntimeError, match="assembled client seam reached"):
+        rgl.run_side(cfg, "harness", rgl.gate1p_stagea.SCENARIO)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("schema", "gate1p-stagea-pair-control-v2"),
+        ("missing_generation", None),
+        ("generation", True),
+        ("generation", 1.0),
+        ("generation", 0),
+        ("generation", -1),
+    ],
+)
+def test_gate1p_real_orchestrator_control_mutations_stop_before_live_client(
+    monkeypatch,
+    tmp_path,
+    mutation,
+    value,
+):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "pair"
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(artifact_dir)}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+    )
+    state = json.loads(control.read_text(encoding="utf-8"))
+    if mutation == "schema":
+        state["schema"] = value
+    elif mutation == "missing_generation":
+        del state["prearm_state"]["reset_generation"]
+    else:
+        state["prearm_state"]["reset_generation"] = value
+    control.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("invalid producer control must stop before live client"),
+    )
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stagea.PROTOCOL_ID,
+        pair_id=rgl.gate1p_stagea.PAIR_ID,
+        arm_index=0,
+        model_provider=rgl.gate1p_stagea.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stagea.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_api_key="dummy",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stagea.PAIR_ID,
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError):
+        rgl.run_side(cfg, "harness", rgl.gate1p_stagea.SCENARIO)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -746,8 +923,13 @@ def test_gate1p_child_rejects_idle_prearm_state_before_live_client(monkeypatch, 
         "created_at_nan",
         "created_at_pos_inf",
         "created_at_neg_inf",
+        "stale_schema",
         "extra_prearm_field",
         "missing_prearm_field",
+        "reset_generation_bool",
+        "reset_generation_float",
+        "reset_generation_zero",
+        "reset_generation_negative",
         "illegal_arm_combination",
         "source_version_drift",
     ],
@@ -762,7 +944,7 @@ def test_gate1p_child_rejects_same_noncanonical_pair_control_class(
     artifact_dir.mkdir(parents=True)
     control = artifact_dir / "pair-control.json"
     state = {
-        "schema": "gate1p-stagea-pair-control-v2",
+        "schema": "gate1p-stagea-pair-control-v3",
         "protocol_id": rgl.gate1p_stagea.PROTOCOL_ID,
         "pair_id": rgl.gate1p_stagea.PAIR_ID,
         "source_version": "tree:test",
@@ -771,6 +953,7 @@ def test_gate1p_child_rejects_same_noncanonical_pair_control_class(
         "prearm_state": {
             "arm": "shipping_sage",
             "status": "reset_started",
+            "reset_generation": 1,
             "updated_at": 1.0,
         },
         "created_at": 1.0,
@@ -790,10 +973,20 @@ def test_gate1p_child_rejects_same_noncanonical_pair_control_class(
         state["created_at"] = float("inf")
     elif mutation == "created_at_neg_inf":
         state["created_at"] = float("-inf")
+    elif mutation == "stale_schema":
+        state["schema"] = "gate1p-stagea-pair-control-v2"
     elif mutation == "extra_prearm_field":
         state["prearm_state"]["undeclared"] = None
     elif mutation == "missing_prearm_field":
         del state["prearm_state"]["updated_at"]
+    elif mutation == "reset_generation_bool":
+        state["prearm_state"]["reset_generation"] = True
+    elif mutation == "reset_generation_float":
+        state["prearm_state"]["reset_generation"] = 1.0
+    elif mutation == "reset_generation_zero":
+        state["prearm_state"]["reset_generation"] = 0
+    elif mutation == "reset_generation_negative":
+        state["prearm_state"]["reset_generation"] = -1
     elif mutation == "illegal_arm_combination":
         state["next_arm"] = "true_naive"
         state["prearm_state"]["arm"] = "true_naive"
@@ -885,7 +1078,7 @@ def _valid_row_observer(*, objective_success=False, task_quiescent=True, status=
         "callback": {"display_id": None, "host": None, "domain": None, "user": None},
     }]
     return {
-            "observer_version": "gate1p-stagea-observer-facts-v16",
+            "observer_version": "gate1p-stagea-observer-facts-v22",
         "oracle": {
             "success": objective_success,
             "proof_class": "directory_delta" if objective_success else None,
@@ -974,6 +1167,18 @@ def test_gate1p_row_dimensions_use_shared_observer_semantics_and_fail_closed():
 
     observer = _valid_row_observer(objective_success=True, task_quiescent=True)
     observer["task_window_observed"] = False
+    sequence = len(observer["events"]) + 1
+    observer["events"].append({
+        "event_id": (
+            f"{rgl.gate1p_stagea.PAIR_ID}:shipping_sage:observer:{sequence}"
+        ),
+        "source": "observer",
+        "kind": "lane_unavailable",
+        "sequence": sequence,
+        "monotonic_ns": sequence,
+        "lane": "task",
+        "reason": "producer_deadline",
+    })
     card = SimpleNamespace(
         probe_disagreements=[],
         objective_proven=True,
@@ -997,9 +1202,12 @@ def test_gate1p_row_dimensions_use_shared_observer_semantics_and_fail_closed():
         token_ceiling=rgl.gate1p_stagea.TOKEN_ADMISSION_CEILING,
     )
 
-    assert dimensions["outcome"]["countable"] is False
-    assert "task window was not observed" in dimensions["outcome"]["reason"]
+    assert dimensions["outcome"]["countable"] is True
+    assert dimensions["outcome"]["stop_countable"] is False
+    assert "task-stop evidence unavailable" in dimensions["outcome"]["reason"]
+    assert dimensions["outcome"]["objective_success"] is True
     assert dimensions["outcome"]["clean_stop"] is None
+    assert dimensions["comparison"]["countable"] is False
 
 
 def test_gate1p_stage_a_objective_is_child_control_not_system():

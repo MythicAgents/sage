@@ -178,9 +178,11 @@ def _raw_graphql_introspection():
         type filemeta {
           agent_file_id: String
           filename_utf8: String
+          path: String
           timestamp: String
           complete: Boolean
           deleted: Boolean
+          is_payload: Boolean
           is_download_from_agent: Boolean
           task: task
         }
@@ -332,8 +334,20 @@ def test_ingest_collection_resolves_latest_matching_callback_file(monkeypatch):
         assert document == bmt._LATEST_COLLECTION_QUERY
         assert variables == {"cbid": 9}
         return {"filemeta": [
-            {"agent_file_id": "newest", "filename_utf8": "notes.txt"},
-            {"agent_file_id": "collection", "filename_utf8": "forest.zip"},
+            {
+                "agent_file_id": "newest", "filename_utf8": "notes.txt", "path": "/files/notes",
+                "complete": True, "deleted": False, "is_payload": False,
+                "is_download_from_agent": True,
+                "task": {"display_id": 12, "command_name": "download",
+                         "callback": {"display_id": 9}},
+            },
+            {
+                "agent_file_id": "collection", "filename_utf8": "forest.zip", "path": "/files/zip",
+                "complete": True, "deleted": False, "is_payload": False,
+                "is_download_from_agent": True,
+                "task": {"display_id": 11, "command_name": "download",
+                         "callback": {"display_id": 9}},
+            },
         ]}
 
     async def download(*, mythic, file_uuid):
@@ -377,25 +391,138 @@ def test_ingest_collection_rejects_ambiguous_missing_and_malformed_sources(monke
         raise AssertionError("malformed collection was accepted")
 
 
-def test_download_preflight_exercises_sdk_and_fails_closed(monkeypatch):
-    from mythic import mythic
+def _collection_source_row(**updates):
+    row = {
+        "agent_file_id": "collection-file",
+        "filename_utf8": "forest_collection.zip",
+        "path": "/mythic/files/collection-file",
+        "complete": True,
+        "deleted": False,
+        "is_payload": False,
+        "is_download_from_agent": True,
+        "task": {
+            "display_id": 41,
+            "command_name": "download",
+            "callback": {"display_id": 7},
+        },
+    }
+    row.update(updates)
+    return row
 
-    async def query(_client, _document, variables=None):
-        return {"filemeta": [{"agent_file_id": "payload-file"}]}
+
+def test_download_preflight_exercises_task_collection_sdk_path(monkeypatch):
+    from mythic import mythic
+    blob = _collection_zip()
+    calls = []
+
+    async def query(_client, document, variables=None):
+        calls.append((document, variables))
+        return {"filemeta": [_collection_source_row()]}
 
     async def ok_download(*, mythic, file_uuid):
-        return b"payload"
+        calls.append(("download", file_uuid))
+        return blob
 
     monkeypatch.setattr(mythic, "execute_custom_query", query)
     monkeypatch.setattr(mythic, "download_file", ok_download)
-    assert asyncio.run(bmt.raw_mythic_download_disposition(object()))["valid"] is True
+    result = asyncio.run(bmt.raw_mythic_download_disposition(object()))
+    assert result == {"valid": True, "checked": 1, "bytes_received": len(blob)}
+    assert calls == [(bmt._DOWNLOAD_PROBE_QUERY, {}), ("download", "collection-file")]
+
+
+def test_download_preflight_rejects_noncollection_source_class(monkeypatch):
+    from mythic import mythic
+
+    invalid_rows = [
+        None,
+        _collection_source_row(agent_file_id=""),
+        _collection_source_row(filename_utf8="payload.exe"),
+        _collection_source_row(path=""),
+        _collection_source_row(complete=False),
+        _collection_source_row(deleted=True),
+        _collection_source_row(is_payload=True),
+        _collection_source_row(is_download_from_agent=False),
+        _collection_source_row(task=None),
+        _collection_source_row(task={"display_id": 41, "command_name": "download", "callback": None}),
+    ]
+
+    async def download_must_not_run(**_kwargs):
+        raise AssertionError("invalid source reached the official SDK download")
+
+    monkeypatch.setattr(mythic, "download_file", download_must_not_run)
+    for row in invalid_rows:
+        async def query(_client, _document, variables=None, *, selected=row):
+            return {"filemeta": [selected]}
+        monkeypatch.setattr(mythic, "execute_custom_query", query)
+        assert asyncio.run(bmt.raw_mythic_download_disposition(object())) == {
+            "valid": False,
+            "reason": "no valid task-produced collection file is available for download preflight",
+        }
+
+    async def omitted(_client, _document, variables=None):
+        return {"filemeta": None}
+    monkeypatch.setattr(mythic, "execute_custom_query", omitted)
+    assert asyncio.run(bmt.raw_mythic_download_disposition(object())) == {
+        "valid": False,
+        "reason": "collection download preflight omitted the file list",
+    }
+
+
+def test_callback_collection_resolution_rejects_mismatched_provenance(monkeypatch):
+    from mythic import mythic
+
+    rows = [
+        _collection_source_row(task={
+            "display_id": 41, "command_name": "download", "callback": {"display_id": 8}
+        }),
+        _collection_source_row(path=""),
+    ]
+
+    async def query(_client, _document, variables=None):
+        return {"filemeta": rows}
+
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    try:
+        asyncio.run(bmt._resolve_collection_source(
+            object(), file_uuid="", callback_display_id=7, name_contains="zip"
+        ))
+    except LookupError as exc:
+        assert "no completed non-deleted callback download" in str(exc)
+    else:
+        raise AssertionError("callback-mismatched collection source was accepted")
+
+
+def test_download_preflight_rejects_empty_malformed_and_undownloadable_bytes(monkeypatch):
+    from mythic import mythic
+
+    async def query(_client, _document, variables=None):
+        return {"filemeta": [_collection_source_row()]}
+
+    monkeypatch.setattr(mythic, "execute_custom_query", query)
+    invalid_blobs = [b"", b"not-a-zip"]
+    empty_json_zip = io.BytesIO()
+    with zipfile.ZipFile(empty_json_zip, "w") as archive:
+        archive.writestr("users.json", "")
+    invalid_blobs.append(empty_json_zip.getvalue())
+
+    for blob in invalid_blobs:
+        async def invalid_download(*, mythic, file_uuid, selected=blob):
+            return selected
+        monkeypatch.setattr(mythic, "download_file", invalid_download)
+        assert asyncio.run(bmt.raw_mythic_download_disposition(object())) == {
+            "valid": False,
+            "reason": "download preflight did not return a valid collection ZIP",
+        }
 
     async def broken(*, mythic, file_uuid):
         raise RuntimeError("redirect")
 
     monkeypatch.setattr(mythic, "download_file", broken)
     failed = asyncio.run(bmt.raw_mythic_download_disposition(object()))
-    assert failed == {"valid": False, "reason": "download preflight failed (RuntimeError)"}
+    assert failed == {
+        "valid": False,
+        "reason": "task-produced collection download preflight failed (RuntimeError)",
+    }
 
 
 def test_dispatcher_unknown_tool_is_graceful():

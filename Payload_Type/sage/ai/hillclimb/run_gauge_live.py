@@ -33,11 +33,18 @@ try:
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import gate1p_stagea, live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod  # type: ignore
-    from scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
-    from range_state import Milestone  # type: ignore
-    from fitness import ScoreCard  # type: ignore
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from ai.hillclimb import (  # type: ignore
+        gate1p_stagea,
+        live_seams,
+        bare_runner,
+        bare_mythic_tools,
+        bare_bloodhound,
+        probes as probes_mod,
+    )
+    from ai.hillclimb.scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
+    from ai.hillclimb.range_state import Milestone  # type: ignore
+    from ai.hillclimb.fitness import ScoreCard  # type: ignore
 
 
 @dataclass
@@ -159,7 +166,7 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
     if (
         not isinstance(state, dict)
         or set(state) != control_fields
-        or state.get("schema") != "gate1p-stagea-pair-control-v2"
+        or state.get("schema") != "gate1p-stagea-pair-control-v3"
         or state.get("protocol_id") != gate1p_stagea.PROTOCOL_ID
         or state.get("pair_id") != gate1p_stagea.PAIR_ID
         or type(state.get("source_version")) is not str
@@ -176,9 +183,11 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
     prearm_state = state.get("prearm_state")
     if (
         not isinstance(prearm_state, dict)
-        or set(prearm_state) != {"arm", "status", "updated_at"}
+        or set(prearm_state) != {"arm", "status", "reset_generation", "updated_at"}
         or prearm_state.get("arm") != arm
         or prearm_state.get("status") != "reset_started"
+        or type(prearm_state.get("reset_generation")) is not int
+        or prearm_state.get("reset_generation") <= 0
         or not finite_number(prearm_state.get("updated_at"))
         or float(prearm_state["updated_at"]) < float(state["created_at"])
         or float(prearm_state["updated_at"]) > float(state["updated_at"])
@@ -496,8 +505,15 @@ def validate_harness_runtime_telemetry(
         for request in backend_requests:
             if not isinstance(request, dict):
                 raise RuntimeError("runtime telemetry contains a malformed effective backend record")
-            if not str(request.get("effective_backend") or "").strip():
+            effective_backend = str(request.get("effective_backend") or "").strip()
+            if not effective_backend:
                 raise RuntimeError("runtime telemetry omitted the response-derived effective backend")
+            if configured_provider and configured_model:
+                expected_backend = f"{configured_provider}:{configured_model}"
+                if effective_backend.casefold() != expected_backend.casefold():
+                    raise RuntimeError(
+                        "response-derived effective backend differs from the declared route"
+                    )
             if str(request.get("backend_provenance_source") or "").strip() in {"", "unavailable"}:
                 raise RuntimeError("runtime telemetry omitted the effective backend provenance source")
         if telemetry.get("backend_provenance_complete") is not True:
@@ -590,18 +606,22 @@ def measurement_dimensions(
         if kind == "row" and usage.get("countable") is True
         else {"countable": False, "reason": usage.get("reason")}
     )
+    if kind == "row" and observer_semantics.get("countable") is True:
+        clean_stop_available = bool(
+            stop_observation_available and observer_semantics.get("stop_countable") is True
+        )
     if kind == "diagnostic":
         outcome_reason = "prospectively non-countable production-shape diagnostic"
     elif kind == "row" and outcome_measurement_error:
         outcome_reason = f"measurement defect: {outcome_measurement_error}"
     elif kind == "row" and not probe_available:
         outcome_reason = "outcome oracle unavailable or errored"
-    elif kind == "row" and not clean_stop_available:
-        outcome_reason = "evaluator-owned clean-stop observation unavailable"
     elif kind == "row" and usage.get("countable") is not True:
         outcome_reason = f"measurement defect: {usage.get('reason')}"
     elif kind == "row" and observer_semantics.get("countable") is not True:
         outcome_reason = f"measurement defect: {observer_semantics.get('reason')}"
+    elif kind == "row" and not clean_stop_available:
+        outcome_reason = "objective evidence available; evaluator-owned task-stop evidence unavailable"
     elif kind == "row":
         outcome_reason = "outcome evidence available"
     else:
@@ -610,7 +630,6 @@ def measurement_dimensions(
         kind == "row"
         and not outcome_measurement_error
         and probe_available
-        and clean_stop_available
         and observer_semantics.get("countable") is True
     )
     semantic_projection = (
@@ -625,6 +644,9 @@ def measurement_dimensions(
         "outcome": {
             "countable": outcome_countable,
             "reason": outcome_reason,
+            "stop_countable": (
+                clean_stop_available if kind == "row" else bool(clean_stop_available)
+            ),
             "objective_success": (
                 semantic_projection["objective_success"]
                 if semantic_projection is not None
@@ -749,6 +771,12 @@ def run_side(
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     row_arm = ""
     if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        incompatible = gate1p_stagea.active_incompatible_evaluation_overrides(os.environ)
+        if incompatible:
+            raise gate1p_stagea.ProtocolError(
+                "Gate 1P row inherited incompatible evaluation override(s): "
+                + ", ".join(incompatible)
+            )
         row_arm = gate1p_stagea.validate_request(
             protocol_id=cfg.protocol_id,
             pair_id=cfg.pair_id,
@@ -1009,7 +1037,11 @@ def run_side(
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
             )
-        if observer_result and canonical_outcome.get("countable") is True:
+        if (
+            observer_result
+            and canonical_outcome.get("countable") is True
+            and canonical_outcome.get("stop_countable") is True
+        ):
             runtime_telemetry.update({
                 "clean_stop": canonical_outcome["clean_stop"],
                 "objective_recognized": canonical_outcome["objective_recognized"],
@@ -1059,6 +1091,11 @@ def run_side(
                 "event": dict(observer.coordinator.events[0]),
             })
         result = bare.run(scn.objective)
+        runtime_telemetry = {
+            "controller_cycle_count": 0,
+            "achieved_effects": [],
+            "action_response_ids": list(result.action_response_ids),
+        }
         if result.recoverable_tool_errors:
             print(
                 f"[bare/{scenario_name}] retained {len(result.recoverable_tool_errors)} "
@@ -1145,7 +1182,10 @@ def run_side(
         cost_countable = {
             "model_calls": side == "bare" or "model_calls" in runtime_telemetry,
             "total_tokens": token_cost_countable,
-            "environment_actions": observer_evidence.get("countable") is True,
+            "environment_actions": bool(
+                observer_evidence.get("countable") is True
+                and observer_evidence.get("task_window_observed") is True
+            ),
             "wrapper_tool_invocations": wrapper_tool_countable,
             "control_plane_reads": False,
             "wall_seconds": True,
@@ -1167,7 +1207,7 @@ def run_side(
         }
         cost_values = None
     stop_observation_available = bool(
-        canonical_outcome.get("countable") is True
+        canonical_outcome.get("stop_countable") is True
         if observer_result
         else side == "harness" and any(
             key in runtime_telemetry
@@ -1192,7 +1232,7 @@ def run_side(
             else []
         )
         artifact_payload = {
-            "schema": "gate1p-stagea-episode-artifact-v11",
+            "schema": "gate1p-stagea-episode-artifact-v17",
             "protocol": protocol_snapshot,
             "side": side,
             "arm": row_arm,
@@ -1239,7 +1279,7 @@ def run_side(
         outcome_measurement_error = (
             f"runtime diagnostic summary failed: {runtime_summary_evidence.get('reason')}"
         )
-    if row_arm:
+    if row_arm and observer_result.get("task_window_observed") is True:
         try:
             authority_evidence = gate1p_stagea.stagea_authority_evidence(
                 observer_result.get("tasks") or [],
@@ -1614,6 +1654,8 @@ def main(argv=None) -> int:
             )
         except gate1p_stagea.ProtocolError as exc:
             ap.error(str(exc))
+        if args.cmd == "run" and args.go and not gate1p_stagea.PAIR_ALLOCATED:
+            ap.error("the Gate 1P successor pair is not allocated for live execution")
         if args.cmd == "run" and args.go and cfg.live_authority_id != gate1p_stagea.PAIR_ID:
             ap.error(
                 f"live paired-row execution requires separate --live-authority-id "

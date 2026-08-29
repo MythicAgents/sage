@@ -162,23 +162,83 @@ def _json_value(value: Any) -> Any:
             return json.loads(value)
         except json.JSONDecodeError:
             return value
+    if isinstance(value, list):
+        if len(value) != 1:
+            return {"error": "ambiguous_mcp_content"}
+        block = value[0]
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "text"
+            or not isinstance(block.get("text"), str)
+        ):
+            return {"error": "unsupported_mcp_content"}
+        try:
+            decoded = json.loads(block["text"])
+        except json.JSONDecodeError:
+            return {"error": "malformed_mcp_text"}
+        if not isinstance(decoded, (dict, list)):
+            return {"error": "non_structured_mcp_text"}
+        return decoded
     return value
 
 
-def _find_job_id(value: Any) -> int | str | None:
+def _is_nonempty_error_value(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (str, bytes, list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _has_explicit_error(value: Any) -> bool:
+    """Recognize typed failure signals without classifying unstructured prose."""
     if isinstance(value, dict):
-        if value.get("job_id") is not None:
-            return value["job_id"]
-        for nested in value.values():
-            found = _find_job_id(nested)
-            if found is not None:
-                return found
-    elif isinstance(value, list):
-        for nested in value:
-            found = _find_job_id(nested)
-            if found is not None:
-                return found
-    return None
+        for key, nested in value.items():
+            if key in {"error", "errors"} and _is_nonempty_error_value(nested):
+                return True
+            if key in {"isError", "is_error"} and nested is True:
+                return True
+            if key == "success" and nested is False:
+                return True
+            if (
+                key == "status"
+                and isinstance(nested, str)
+                and nested.strip().casefold() in {"error", "failed", "failure", "rejected"}
+            ):
+                return True
+        return any(_has_explicit_error(nested) for nested in value.values())
+    if isinstance(value, list):
+        return any(_has_explicit_error(nested) for nested in value)
+    return False
+
+
+def _find_job_id(value: Any) -> int | None:
+    """Admit one unambiguous positive JSON integer from an error-free response."""
+    if _has_explicit_error(value):
+        return None
+
+    job_ids: list[int] = []
+    invalid_job_id = False
+
+    def collect(candidate: Any) -> None:
+        nonlocal invalid_job_id
+        if isinstance(candidate, dict):
+            for key, nested in candidate.items():
+                if key == "job_id":
+                    if type(nested) is int and nested > 0:
+                        job_ids.append(nested)
+                    else:
+                        invalid_job_id = True
+                else:
+                    collect(nested)
+        elif isinstance(candidate, list):
+            for nested in candidate:
+                collect(nested)
+
+    collect(value)
+    if invalid_job_id or len(job_ids) != 1:
+        return None
+    return job_ids[0]
 
 
 def make_bloodhound_dispatcher(registry: dict) -> Callable[[dict], str | None]:

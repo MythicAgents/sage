@@ -6,6 +6,7 @@ import threading
 import time
 import json
 import itertools
+from pathlib import Path
 
 import pytest
 
@@ -100,6 +101,20 @@ def test_token_usage_is_complete_only_for_reconciling_input_output_total():
     assert wrong["usage_complete"] is False
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"input_tokens": "9", "output_tokens": "2", "total_tokens": "11"},
+        {"input_tokens": 9.9, "output_tokens": 2.9, "total_tokens": 11.9},
+        {"input_tokens": True, "output_tokens": 2, "total_tokens": 3},
+    ],
+)
+def test_normalize_usage_rejects_coercible_non_integer_values(raw):
+    usage = g1p.normalize_usage(raw, response_id="malformed")
+
+    assert usage["usage_complete"] is False
+
+
 def test_token_budget_distinguishes_exact_exhaustion_from_overshoot():
     budget = g1p.TokenBudget(ceiling=10)
     budget.add({"input_tokens": 4, "output_tokens": 6}, response_id="r1")
@@ -108,6 +123,113 @@ def test_token_budget_distinguishes_exact_exhaustion_from_overshoot():
     assert budget.overshoot is False
     budget.add({"input_tokens": 1, "output_tokens": 0}, response_id="r2")
     assert budget.overshoot is True
+
+
+def _budget_response(response_id, input_tokens, output_tokens):
+    return {
+        "response_id": response_id,
+        "effective_backend": "openai:model",
+        "backend_provenance_source": "response_metadata.model_name",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "usage_complete": True,
+    }
+
+
+def test_completed_call_budget_accepts_one_bounded_crossing_without_action():
+    records = [_budget_response("r1", 4, 2), _budget_response("r2", 4, 1)]
+
+    disposition = g1p.completed_call_budget_disposition(
+        records,
+        model_calls=2,
+        action_response_ids=["r1"],
+        token_ceiling=10,
+        model_context_limit=100,
+        max_output_tokens=10,
+    )
+
+    assert disposition == {
+        "countable": True,
+        "reason": "one bounded completed call reached the token boundary without a downstream action",
+        "boundary_reached": True,
+        "overshoot": True,
+        "prior_total_tokens": 6,
+        "total_tokens": 11,
+        "terminal_response_id": "r2",
+    }
+
+
+@pytest.mark.parametrize(
+    ("records", "action_ids", "reason"),
+    [
+        (
+            [_budget_response("r1", 4, 2), _budget_response("r2", 4, 1)],
+            ["r1", "r2"],
+            "the boundary-crossing response caused a downstream action",
+        ),
+        (
+            [_budget_response("r1", 9, 1), _budget_response("r2", 1, 0)],
+            [],
+            "a model call occurred after the token boundary",
+        ),
+    ],
+)
+def test_completed_call_budget_rejects_post_boundary_activity(records, action_ids, reason):
+    disposition = g1p.completed_call_budget_disposition(
+        records,
+        model_calls=len(records),
+        action_response_ids=action_ids,
+        token_ceiling=10,
+        model_context_limit=100,
+        max_output_tokens=10,
+    )
+
+    assert disposition == {"countable": False, "reason": reason}
+
+
+def test_completed_call_budget_accepts_exact_boundary_and_normal_below_boundary():
+    exact = g1p.completed_call_budget_disposition(
+        [_budget_response("r1", 6, 4)],
+        model_calls=1,
+        action_response_ids=[],
+        token_ceiling=10,
+        model_context_limit=100,
+        max_output_tokens=10,
+    )
+    below = g1p.completed_call_budget_disposition(
+        [_budget_response("r1", 4, 2)],
+        model_calls=1,
+        action_response_ids=[],
+        token_ceiling=10,
+        model_context_limit=100,
+        max_output_tokens=10,
+    )
+
+    assert exact["countable"] is True
+    assert exact["boundary_reached"] is True
+    assert exact["overshoot"] is False
+    assert below["countable"] is True
+    assert below["boundary_reached"] is False
+
+
+def test_runtime_summary_projects_shipping_transaction_decision_ids_as_action_lineage():
+    disposition = g1p.runtime_summary_disposition({
+        "controller_cycle_count": 2,
+        "achieved_effects": ["effect:b", "effect:a"],
+        "transactions": [
+            {"decision_id": "response-1", "capability": "first"},
+            {"decision_id": "response-2", "capability": "second"},
+        ],
+    })
+
+    assert disposition["countable"] is True
+    assert disposition["canonical_summary"] == {
+        "schema": "gate1p-stagea-runtime-summary-v2",
+        "controller_cycle_count": 2,
+        "achieved_effects": ["effect:a", "effect:b"],
+        "action_response_ids": ["response-1", "response-2"],
+    }
 
 
 def _facts_only_observer(*, arm="shipping_sage", objective=True, status="done", tasks=None,
@@ -151,7 +273,7 @@ def _facts_only_observer(*, arm="shipping_sage", objective=True, status="done", 
             },
         })
     return {
-        "observer_version": "gate1p-stagea-observer-facts-v16",
+        "observer_version": "gate1p-stagea-observer-facts-v22",
         "oracle": {
             "success": objective,
             "proof_class": "directory_delta" if objective else None,
@@ -178,6 +300,21 @@ def _typed_oracle_observation(success):
     return _facts_only_observer(objective=success)["oracle"]
 
 
+def _mark_task_window_unavailable(observer, *, reason="producer_deadline"):
+    observer["task_window_observed"] = False
+    sequence = len(observer["events"]) + 1
+    arm = "shipping_sage"
+    observer["events"].append({
+        "event_id": f"{g1p.PAIR_ID}:{arm}:observer:{sequence}",
+        "source": "observer",
+        "kind": "lane_unavailable",
+        "sequence": sequence,
+        "monotonic_ns": sequence,
+        "lane": "task",
+        "reason": reason,
+    })
+
+
 def _usage_records(total=15):
     return [{
         "response_id": "response-1",
@@ -201,8 +338,9 @@ def test_facts_only_outcome_derives_budget_and_terminal_without_duplicate_claims
     )
     assert outcome == {
         "countable": True,
-        "reason": "raw observer facts derive one complete outcome",
+        "reason": "raw observer facts derive objective and stop outcomes",
         "objective_success": True,
+        "stop_countable": True,
         "task_quiescent": True,
         "token_budget_exhausted": False,
         "token_budget_overshoot": False,
@@ -498,7 +636,7 @@ def test_observer_discards_task_poll_that_returns_after_exact_deadline():
         arm="shipping_sage",
         objective_probe=lambda: _typed_oracle_observation(False),
         task_fetcher=delayed_fetcher,
-        objective_settle_seconds=0.025,
+        objective_settle_seconds=0.2,
         objective_poll_seconds=0.002,
         task_quiescence_seconds=0.01,
         task_poll_seconds=0.02,
@@ -510,7 +648,10 @@ def test_observer_discards_task_poll_that_returns_after_exact_deadline():
     )
 
     assert result["task_window_observed"] is False
-    assert _derived_observer_outcome(result)["countable"] is False
+    outcome = _derived_observer_outcome(result)
+    assert outcome["countable"] is True, outcome
+    assert outcome["stop_countable"] is False
+    assert outcome["clean_stop"] is None
 
 
 def test_observer_post_objective_tasks_defeat_checkpoint_recognition():
@@ -587,21 +728,23 @@ def test_observer_fails_closed_when_wrapper_recognition_is_unavailable():
         wrapper_status="completed",
         wrapper_objective_recognized=None,
     )
-    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is False
-    assert _derived_observer_outcome(result)["countable"] is False
+    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is True
+    outcome = _derived_observer_outcome(result)
+    assert outcome["countable"] is True
+    assert outcome["stop_countable"] is True
+    assert outcome["objective_success"] is True
+    assert outcome["clean_stop"] is True
+    assert outcome["objective_recognized"] is None
+    assert outcome["objective_clean_stop"] is None
     assert "objective_success" not in result
     assert "objective_recognized" not in result
     assert "objective_clean_stop" not in result
-    assert any(
-        event.get("source") == "observer"
-        and "omitted Boolean objective-recognition" in event.get("error", "")
-        for event in result["events"]
-    )
+    assert not any(event.get("source") == "observer" for event in result["events"])
 
 
 def test_observer_error_is_unavailable_not_objective_false():
     def broken_tasks():
-        raise RuntimeError("query failed")
+        raise RuntimeError("query failed with credential=must-not-leak")
 
     observer = g1p.LiveEpisodeObserver(
         pair_id=g1p.PAIR_ID,
@@ -618,10 +761,247 @@ def test_observer_error_is_unavailable_not_objective_false():
         wrapper_status="completed",
         wrapper_objective_recognized=False,
     )
-    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is False
-    assert _derived_observer_outcome(result)["countable"] is False
+    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is True
+    outcome = _derived_observer_outcome(result)
+    assert outcome["countable"] is True
+    assert outcome["objective_success"] is False
+    assert outcome["stop_countable"] is False
+    assert outcome["clean_stop"] is None
     assert "objective_success" not in result
     assert "clean_stop" not in result
+    unavailable = [
+        event for event in result["events"]
+        if event.get("source") == "observer" and event.get("kind") == "lane_unavailable"
+    ]
+    assert len(unavailable) == 1
+    assert set(unavailable[0]) == {
+        "event_id", "source", "kind", "sequence", "monotonic_ns", "lane", "reason",
+    }
+    assert unavailable[0]["lane"] == "task"
+    assert unavailable[0]["reason"] == "producer_error"
+    assert "must-not-leak" not in json.dumps(result)
+
+
+def test_observer_rejects_unavailable_task_window_without_one_typed_reason():
+    observer = _facts_only_observer()
+    observer["task_window_observed"] = False
+
+    disposition = g1p.observer_facts_disposition(observer, arm="shipping_sage")
+
+    assert disposition == {
+        "countable": False,
+        "reason": "unavailable task window lacks one typed reason",
+    }
+
+
+def test_blocked_task_producer_fails_locally_without_owning_observer_deadline():
+    release = threading.Event()
+
+    def blocked_tasks():
+        release.wait()
+        return []
+
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=lambda: _typed_oracle_observation(False),
+        task_fetcher=blocked_tasks,
+        objective_settle_seconds=0.02,
+        objective_poll_seconds=0.005,
+        task_quiescence_seconds=0.02,
+        task_poll_seconds=0.005,
+    )
+    observer.start()
+    started = time.monotonic()
+    try:
+        result = observer.finish(
+            wrapper_status="completed",
+            wrapper_objective_recognized=False,
+        )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.25
+    disposition = g1p.episode_outcome_disposition(
+        result,
+        arm="shipping_sage",
+        total_tokens=15,
+        token_ceiling=g1p.TOKEN_ADMISSION_CEILING,
+    )
+    assert disposition["countable"] is True
+    assert disposition["objective_success"] is False
+    assert disposition["stop_countable"] is False
+    assert disposition["clean_stop"] is None
+    assert result["task_window_observed"] is False
+    assert result["tasks"] == []
+    frozen_events = list(result["events"])
+    time.sleep(0.02)
+    assert result["tasks"] == []
+    assert result["events"] == frozen_events
+
+
+def test_sleeping_task_poller_is_not_misclassified_as_a_blocked_producer():
+    observed = threading.Event()
+
+    def healthy_tasks():
+        observed.set()
+        return []
+
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=lambda: _typed_oracle_observation(True),
+        task_fetcher=healthy_tasks,
+        objective_settle_seconds=0.05,
+        objective_poll_seconds=0.01,
+        task_quiescence_seconds=0.05,
+        task_poll_seconds=0.20,
+    )
+    observer.start()
+    assert observed.wait(timeout=0.1)
+    time.sleep(0.01)
+    started = time.monotonic()
+    result = observer.finish(
+        wrapper_status="completed",
+        wrapper_objective_recognized=True,
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert result["task_window_observed"] is True
+    assert result["tasks"] == []
+
+
+def test_blocked_objective_producer_is_unavailable_not_objective_false():
+    release = threading.Event()
+
+    def blocked_objective():
+        release.wait()
+        return _typed_oracle_observation(False)
+
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=blocked_objective,
+        task_fetcher=lambda: [],
+        objective_settle_seconds=0.02,
+        objective_poll_seconds=0.005,
+        task_quiescence_seconds=0.02,
+        task_poll_seconds=0.005,
+    )
+    observer.start()
+    started = time.monotonic()
+    try:
+        result = observer.finish(
+            wrapper_status="completed",
+            wrapper_objective_recognized=False,
+        )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started < 0.25
+    disposition = _derived_observer_outcome(result)
+    assert disposition["countable"] is False
+    assert "objective" in disposition["reason"]
+    assert "objective_success" not in disposition
+    assert result["task_window_observed"] is True
+
+
+def test_sleeping_negative_objective_poller_retains_its_on_time_observation():
+    observed = threading.Event()
+
+    def healthy_negative_objective():
+        observed.set()
+        return _typed_oracle_observation(False)
+
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=healthy_negative_objective,
+        task_fetcher=lambda: [],
+        objective_settle_seconds=0.05,
+        objective_poll_seconds=0.20,
+        task_quiescence_seconds=0.01,
+        task_poll_seconds=0.002,
+    )
+    observer.start()
+    assert observed.wait(timeout=0.1)
+    time.sleep(0.01)
+    started = time.monotonic()
+    result = observer.finish(
+        wrapper_status="completed",
+        wrapper_objective_recognized=False,
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert result["oracle"]["success"] is False
+    assert not any(event.get("source") == "observer" for event in result["events"])
+    assert _derived_observer_outcome(result)["objective_success"] is False
+
+
+def test_preterminal_objective_probe_returning_just_after_deadline_is_unavailable():
+    entered = threading.Event()
+    release = threading.Event()
+
+    def just_late_objective():
+        entered.set()
+        release.wait()
+        return _typed_oracle_observation(False)
+
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=just_late_objective,
+        task_fetcher=lambda: [],
+        objective_settle_seconds=0.05,
+        objective_poll_seconds=0.005,
+        task_quiescence_seconds=0.01,
+        task_poll_seconds=0.002,
+    )
+    observer.start()
+    assert entered.wait(timeout=0.1)
+    timer = threading.Timer(0.065, release.set)
+    timer.start()
+    try:
+        result = observer.finish(
+            wrapper_status="completed",
+            wrapper_objective_recognized=False,
+        )
+    finally:
+        release.set()
+        timer.join(timeout=0.2)
+
+    disposition = _derived_observer_outcome(result)
+    assert disposition["countable"] is False
+    assert "objective" in disposition["reason"]
+    assert "objective_success" not in disposition
+    assert any(event.get("source") == "observer" for event in result["events"])
+
+
+def test_known_authority_violation_remains_a_global_outcome_blocker():
+    observer = g1p.LiveEpisodeObserver(
+        pair_id=g1p.PAIR_ID,
+        arm="shipping_sage",
+        objective_probe=lambda: _typed_oracle_observation(False),
+        task_fetcher=lambda: [{"display_id": 7, "completed": True}],
+        authority_checker=lambda _rows: {"available": True, "valid": False},
+        objective_settle_seconds=0.02,
+        objective_poll_seconds=0.005,
+        task_quiescence_seconds=0.02,
+        task_poll_seconds=0.005,
+    )
+    observer.start()
+    result = observer.finish(
+        wrapper_status="completed",
+        wrapper_objective_recognized=False,
+    )
+
+    disposition = _derived_observer_outcome(result)
+    assert disposition["countable"] is False
+    assert any(
+        event.get("source") == "observer"
+        and "authority observer reported a violation" in event.get("error", "")
+        for event in result["events"]
+    )
 
 
 def test_observer_rejects_boolean_task_identity_without_an_authority_checker():
@@ -641,11 +1021,11 @@ def test_observer_rejects_boolean_task_identity_without_an_authority_checker():
         wrapper_objective_recognized=False,
     )
 
-    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is False
-    assert any(
-        event.get("source") == "observer" and "integer display_id" in event.get("error", "")
-        for event in result["events"]
-    )
+    assert g1p.observer_facts_disposition(result, arm="shipping_sage")["countable"] is True
+    outcome = _derived_observer_outcome(result)
+    assert outcome["countable"] is True
+    assert outcome["stop_countable"] is False
+    assert outcome["clean_stop"] is None
 
 
 def _scorecard(*, total_tokens):
@@ -675,7 +1055,14 @@ def _scorecard(*, total_tokens):
     ))
 
 
-def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:effective"):
+def _row(
+    arm,
+    history_root,
+    *,
+    outcome=True,
+    overshoot=False,
+    backend="openai:bedrock-claude-4-6-sonnet",
+):
     side = "harness" if arm == "shipping_sage" else "bare"
     arm_index = g1p.ARMS.index(arm)
     protocol = {
@@ -735,6 +1122,38 @@ def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:ef
         },
     ]
     total_tokens = g1p.TOKEN_ADMISSION_CEILING + 1 if overshoot else 15
+    model_calls = 2 if overshoot else 1
+    response_records = ([
+        {
+            "response_id": "response-1",
+            "effective_backend": backend,
+            "backend_provenance_source": "response_metadata.model_name",
+            "input_tokens": 189_995,
+            "output_tokens": 5,
+            "total_tokens": 190_000,
+            "usage_complete": True,
+        },
+        {
+            "response_id": "response-2",
+            "effective_backend": backend,
+            "backend_provenance_source": "response_metadata.model_name",
+            "input_tokens": 59_996,
+            "output_tokens": 5,
+            "total_tokens": 60_001,
+            "usage_complete": True,
+        },
+    ] if overshoot else [{
+        "response_id": "response-1",
+        "effective_backend": backend,
+        "backend_provenance_source": "response_metadata.model_name",
+        "input_tokens": total_tokens - 5,
+        "output_tokens": 5,
+        "total_tokens": total_tokens,
+        "usage_complete": True,
+    }])
+    action_response_ids = ["response-1"] if overshoot else []
+    wrapper_status = "token_budget_overshoot" if overshoot else "done"
+    events[-1]["status"] = wrapper_status
     row = {
         "record_type": "result",
         "scenario": g1p.SCENARIO,
@@ -745,12 +1164,13 @@ def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:ef
             "outcome": {
                 "countable": outcome,
                 "objective_success": True,
-                "clean_stop": True,
-                "objective_recognized": True,
-                "objective_clean_stop": True,
+                "stop_countable": True,
+                "clean_stop": not overshoot,
+                "objective_recognized": not overshoot,
+                "objective_clean_stop": not overshoot,
             },
             "cost": {
-                "model_calls": {"countable": True, "value": 1},
+                "model_calls": {"countable": True, "value": model_calls},
                 "total_tokens": {"countable": True, "value": total_tokens},
             },
         },
@@ -763,24 +1183,16 @@ def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:ef
             "wall_seconds": True,
         },
         "effective_backends": [backend],
-        "model_calls": 1,
-        "model_response_records": [{
-            "response_id": "response-1",
-            "effective_backend": backend,
-            "backend_provenance_source": "response_metadata.model_name",
-            "input_tokens": total_tokens - 5,
-            "output_tokens": 5,
-            "total_tokens": total_tokens,
-            "usage_complete": True,
-        }],
+        "model_calls": model_calls,
+        "model_response_records": response_records,
         "token_usage_complete": True,
-        "request_completed": True,
-        "objective_recognized": True,
+        "request_completed": not overshoot,
+        "objective_recognized": not overshoot,
         "objective_proven": True,
-        "clean_stop": True,
-        "objective_clean_stop": True,
+        "clean_stop": not overshoot,
+        "objective_clean_stop": not overshoot,
         "observer": {
-            "observer_version": "gate1p-stagea-observer-facts-v16",
+            "observer_version": "gate1p-stagea-observer-facts-v22",
             "task_window_observed": True,
             "wrapper_objective_recognized": True,
             "tasks": [],
@@ -802,9 +1214,10 @@ def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:ef
             },
         },
         "runtime_summary": {
-            "schema": "gate1p-stagea-runtime-summary-v1",
+            "schema": "gate1p-stagea-runtime-summary-v2",
             "controller_cycle_count": 0,
             "achieved_effects": [],
+            "action_response_ids": action_response_ids,
         },
         "artifact_capture": {
             "complete": True,
@@ -815,19 +1228,31 @@ def _row(arm, history_root, *, outcome=True, overshoot=False, backend="openai:ef
         "ts": 2.0 if arm == "shipping_sage" else 5.0,
         "card": _scorecard(total_tokens=total_tokens),
     }
+    row["card"].update({
+        "model_calls": model_calls,
+        "status": wrapper_status,
+        "request_completed": not overshoot,
+        "objective_recognized": not overshoot,
+        "clean_stop": not overshoot,
+        "objective_clean_stop": not overshoot,
+    })
+    transcript_events = ([{"response_id": "response-1", "kind": "tool_dispatch"}]
+                         if side == "bare" and overshoot else [])
+    row["artifact_capture"]["transcript_entries"] = len(transcript_events) + 1
     episode.write_text(json.dumps({
-        "schema": "gate1p-stagea-episode-artifact-v11",
+        "schema": "gate1p-stagea-episode-artifact-v17",
         "protocol": protocol,
         "side": side,
         "arm": arm,
         "evaluator_private": {},
         "oracle": row["observer"]["oracle"],
         "observer": row["observer"],
-        "transcript": {"events": [], "final": "done"},
+        "transcript": {"events": transcript_events, "final": "done"},
         "runtime_summary": {
-            "schema": "gate1p-stagea-runtime-summary-v1",
+            "schema": "gate1p-stagea-runtime-summary-v2",
             "controller_cycle_count": 0,
             "achieved_effects": [],
+            "action_response_ids": action_response_ids,
         },
         "response_evidence": row["model_response_records"],
         "scorecard": row["card"],
@@ -1155,18 +1580,49 @@ def test_pair014_closes_pair011_post_admission_crash_repros(tmp_path, mutation):
     assert disposition["countable"] is False
 
 
-def test_pair_disposition_rejects_backend_drift_and_token_overshoot(tmp_path):
+def test_pair_disposition_rejects_backend_drift_and_accepts_bounded_completed_call_overshoot(tmp_path):
     history = tmp_path / ".sage_history"
     assert g1p.pair_disposition(_pair(
         _row("shipping_sage", history),
         _row("true_naive", history, backend="openai:other"),
     ), history_root=history)["countable"] is False
+    both_wrong = g1p.pair_disposition(_pair(
+        _row("shipping_sage", history, backend="unexpected-provider:unexpected-model"),
+        _row("true_naive", history, backend="unexpected-provider:unexpected-model"),
+    ), history_root=history)
+    assert both_wrong == {
+        "countable": False,
+        "reason": "observed effective backend differs from the declared route",
+    }
     missing_cleanup = _pair(_row("shipping_sage", history), _row("true_naive", history))[:-1]
     assert g1p.pair_disposition(missing_cleanup, history_root=history)["countable"] is False
+    bounded = _row("true_naive", history, overshoot=True)
     assert g1p.pair_disposition(_pair(
         _row("shipping_sage", history),
-        _row("true_naive", history, overshoot=True),
+        bounded,
+    ), history_root=history)["countable"] is True
+    bounded["runtime_summary"]["action_response_ids"].append("response-2")
+    _rewrite_retained_row(bounded)
+    assert g1p.pair_disposition(_pair(
+        _row("shipping_sage", history),
+        bounded,
     ), history_root=history)["countable"] is False
+
+
+def test_bare_artifact_rejects_transcript_action_lineage_drift(tmp_path):
+    history = tmp_path / ".sage_history"
+    row = _row("true_naive", history, overshoot=True)
+    artifact_path = Path(row["artifact_capture"]["episode_artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["transcript"]["events"][0]["response_id"] = "response-2"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    disposition = g1p.arm_comparison_disposition(row, history_root=history)
+
+    assert disposition == {
+        "countable": False,
+        "reason": "bare transcript does not prove model-response action lineage",
+    }
 
 
 def test_pair_disposition_rejects_invariant_and_per_response_evidence_drift(tmp_path):
@@ -1309,6 +1765,7 @@ def test_arm_disposition_rejects_fully_retained_observer_projection_split_brains
 
 
 def _set_row_outcome_projection(row, outcome):
+    row["countability"]["outcome"]["stop_countable"] = outcome["stop_countable"]
     for semantic, row_field, card_field in (
         ("objective_success", "objective_proven", "objective_proven"),
         ("clean_stop", "clean_stop", "clean_stop"),
@@ -1321,17 +1778,64 @@ def _set_row_outcome_projection(row, outcome):
     row["request_completed"] = outcome["clean_stop"]
 
 
+def test_arm_comparison_rejects_objective_countable_row_with_unavailable_task_stop_lane(tmp_path):
+    history = tmp_path / ".sage_history"
+    row = _row("shipping_sage", history)
+    _mark_task_window_unavailable(row["observer"])
+    outcome = g1p.episode_outcome_disposition(
+        row["observer"],
+        arm="shipping_sage",
+        total_tokens=15,
+        token_ceiling=g1p.TOKEN_ADMISSION_CEILING,
+    )
+    row["countability"]["outcome"].update({
+        "countable": outcome["countable"],
+        "objective_success": outcome["objective_success"],
+        "stop_countable": outcome["stop_countable"],
+        "clean_stop": outcome["clean_stop"],
+        "objective_recognized": outcome["objective_recognized"],
+        "objective_clean_stop": outcome["objective_clean_stop"],
+    })
+    _rewrite_retained_row(row)
+
+    disposition = g1p.arm_comparison_disposition(row, history_root=history)
+
+    assert outcome["countable"] is True
+    assert disposition == {
+        "countable": False,
+        "reason": "task-stop evidence is unavailable for paired comparison",
+    }
+
+
 def test_arm_disposition_accepts_exact_ceiling_as_observed_non_clean_outcome(tmp_path):
     history = tmp_path / ".sage_history"
     row = _row("shipping_sage", history)
     total = g1p.TOKEN_ADMISSION_CEILING
-    row["model_response_records"][0].update({
-        "input_tokens": total - 5,
-        "output_tokens": 5,
-        "total_tokens": total,
-    })
-    row["card"]["total_tokens"] = total
+    row["model_response_records"] = [
+        {
+            "response_id": "response-1",
+            "effective_backend": "openai:bedrock-claude-4-6-sonnet",
+            "backend_provenance_source": "response_metadata.model_name",
+            "input_tokens": 189_995,
+            "output_tokens": 5,
+            "total_tokens": 190_000,
+            "usage_complete": True,
+        },
+        {
+            "response_id": "response-2",
+            "effective_backend": "openai:bedrock-claude-4-6-sonnet",
+            "backend_provenance_source": "response_metadata.model_name",
+            "input_tokens": 59_995,
+            "output_tokens": 5,
+            "total_tokens": 60_000,
+            "usage_complete": True,
+        },
+    ]
+    row["model_calls"] = 2
+    row["card"].update(total_tokens=total, model_calls=2)
+    row["countability"]["cost"]["model_calls"]["value"] = 2
     row["countability"]["cost"]["total_tokens"]["value"] = total
+    row["runtime_summary"]["action_response_ids"] = ["response-1"]
     outcome = g1p.episode_outcome_disposition(
         row["observer"],
         arm="shipping_sage",
@@ -2106,8 +2610,10 @@ def test_stagea_authority_evidence_accepts_any_nonempty_principal_on_authorized_
 
 
 def test_full_goad_authority_contract_is_exact_and_does_not_parse_task_parameters():
-    assert g1p.PROTOCOL_ID == "gate1p-stage-a-child-domain-control-paired-v16"
-    assert g1p.PAIR_ID == "gate1p-stagea-child-domain-control-pair-016"
+    assert g1p.PROTOCOL_ID == "gate1p-stage-a-child-domain-control-completed-call-budget-v1"
+    assert g1p.PAIR_ID == "gate1p-stagea-child-domain-control-pair-024"
+    assert g1p.PAIR_ALLOCATED is True
+    assert g1p.RESET_SNAPSHOT == "sage-seed-apollo-v252-mythic4-20260829"
     assert set(g1p.AUTHORIZED_GOAD_TARGET_IPS) == {
         "10.4.10.10", "10.4.10.11", "10.4.10.12",
         "10.4.10.22", "10.4.10.23", "10.4.10.254",
@@ -2123,7 +2629,11 @@ def test_full_goad_authority_contract_is_exact_and_does_not_parse_task_parameter
     assert protocol["authorized_target_ips"] == list(g1p.AUTHORIZED_GOAD_TARGET_IPS)
     assert protocol["target_interaction_boundary"] == "mythic_payload_tasks_only"
     assert protocol["authority_observer_version"] == "gate1p-stagea-authority-observer-v4"
-    assert protocol["terminal_observer_version"] == "gate1p-stagea-observer-facts-v16"
+    assert protocol["terminal_observer_version"] == "gate1p-stagea-observer-facts-v22"
+    assert protocol["reset_snapshot"] == g1p.RESET_SNAPSHOT
+    assert protocol["readiness_protocol"] == (
+        "gate1p-stagea-last-material-mutation-qualified-reset-v2"
+    )
     row = {
         "operation_id": 41,
         "display_id": 18,

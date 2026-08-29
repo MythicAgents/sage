@@ -1035,6 +1035,15 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              skip_preflight: bool = False,
              before_reset: Callable[[], None] | None = None) -> None:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
+    if measurement_kind == "row" and pair_id:
+        gate1p = _gate1p_stagea_protocol()
+        inherited = {**os.environ, **(route_env or {})}
+        incompatible = gate1p.active_incompatible_evaluation_overrides(inherited)
+        if incompatible:
+            raise SystemExit(
+                "ABORT: Gate 1P row inherited incompatible evaluation override(s): "
+                + ", ".join(incompatible)
+            )
     # Fail in seconds, not after a ~60-min range run: assert the scenario objective is completion-recognizable
     # BEFORE spending a reset + live solve. Guards the harness->Sage objective seam that shipped opaque once
     # (the gauge's read-only/seam-injected design makes that seam invisible to offline unit tests). Aborts
@@ -1246,7 +1255,7 @@ _GATE1P_PAIR_CONTROL_FIELDS = {
     "schema", "protocol_id", "pair_id", "source_version", "next_arm",
     "completed_arms", "prearm_state", "created_at", "updated_at",
 }
-_GATE1P_PREARM_FIELDS = {"arm", "status", "updated_at"}
+_GATE1P_PREARM_FIELDS = {"arm", "status", "reset_generation", "updated_at"}
 
 
 def _finite_json_number(value: object) -> bool:
@@ -1276,7 +1285,7 @@ def _validate_gate1p_pair_control_state(
     if not isinstance(state, dict) or set(state) != _GATE1P_PAIR_CONTROL_FIELDS:
         raise SystemExit("ABORT: Gate 1P pair control has a non-canonical top-level schema")
     if (
-        state.get("schema") != "gate1p-stagea-pair-control-v2"
+        state.get("schema") != "gate1p-stagea-pair-control-v3"
         or state.get("protocol_id") != protocol.PROTOCOL_ID
         or state.get("pair_id") != protocol.PAIR_ID
         or type(expected_source) is not str
@@ -1296,12 +1305,16 @@ def _validate_gate1p_pair_control_state(
         "true_naive": ["shipping_sage"],
     }
     if next_arm in legal_active:
+        reset_generation = prearm.get("reset_generation") if isinstance(prearm, dict) else None
         if (
             completed != legal_active[next_arm]
             or not isinstance(prearm, dict)
             or set(prearm) != _GATE1P_PREARM_FIELDS
             or prearm.get("arm") != next_arm
             or prearm.get("status") not in {"idle", "reset_started", "cleanup_complete"}
+            or type(reset_generation) is not int
+            or reset_generation < 0
+            or (prearm.get("status") == "idle") != (reset_generation == 0)
             or not _finite_json_number(prearm.get("updated_at"))
             or float(prearm["updated_at"]) < float(state["created_at"])
             or float(prearm["updated_at"]) > float(state["updated_at"])
@@ -1350,6 +1363,7 @@ def _validate_gate1p_prestart_cleanup(
     *,
     expected_arm: str,
     require_current_arm: bool,
+    expected_reset_generation: int | None,
 ) -> None:
     """Admit one exact completed pre-arm cleanup per reached arm, outside the row ledger."""
     protocol = _gate1p_stagea_protocol()
@@ -1357,7 +1371,7 @@ def _validate_gate1p_prestart_cleanup(
     expected_fields = {
         "schema", "record_type", "measurement_kind", "protocol", "result_retained",
         "episode_artifact_retained", "temporary_evaluator_material", "complete", "errors",
-        "steps", "ts",
+        "reset_generation", "steps", "ts",
     }
     seen_arms: list[str] = []
     timestamps: list[float] = []
@@ -1365,10 +1379,11 @@ def _validate_gate1p_prestart_cleanup(
         identity = record.get("protocol")
         steps = record.get("steps")
         timestamp = record.get("ts")
+        reset_generation = record.get("reset_generation")
         if set(record) != expected_fields:
             raise SystemExit("ABORT: prestart cleanup record has an undeclared shape")
         if (
-            record.get("schema") != "gate1p-stagea-prestart-cleanup-v1"
+            record.get("schema") != "gate1p-stagea-prestart-cleanup-v2"
             or record.get("record_type") != "prestart_cleanup"
             or record.get("measurement_kind") != "prestart_readiness"
             or not isinstance(identity, dict)
@@ -1385,6 +1400,8 @@ def _validate_gate1p_prestart_cleanup(
             }
             or record.get("complete") is not True
             or record.get("errors") != []
+            or type(reset_generation) is not int
+            or reset_generation <= 0
             or not isinstance(steps, list)
             or [step.get("name") for step in steps if isinstance(step, dict)] != expected_steps
             or any(
@@ -1408,6 +1425,10 @@ def _validate_gate1p_prestart_cleanup(
     current_present = expected_arm in seen_arms
     if current_present is not require_current_arm:
         raise SystemExit("ABORT: prestart cleanup does not match the current pre-arm state")
+    if require_current_arm:
+        current = next(record for record in records if record["protocol"]["arm"] == expected_arm)
+        if current["reset_generation"] != expected_reset_generation:
+            raise SystemExit("ABORT: prestart cleanup reset generation is stale or mismatched")
     if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
         raise SystemExit("ABORT: prestart cleanup chronology is invalid")
 
@@ -1456,11 +1477,13 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
             prestart,
             expected_arm=str(next_arm),
             require_current_arm=prearm_state["status"] != "idle",
+            expected_reset_generation=prearm_state["reset_generation"],
         )
         if prearm_state["status"] == "reset_started":
             existing["prearm_state"] = {
                 "arm": next_arm,
                 "status": "cleanup_complete",
+                "reset_generation": prearm_state["reset_generation"],
                 "updated_at": time.time(),
             }
             existing["updated_at"] = time.time()
@@ -1471,7 +1494,7 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
         raise SystemExit("ABORT: Gate 1P lifecycle evidence exists without pair control")
     created_at = time.time()
     state = {
-        "schema": "gate1p-stagea-pair-control-v2",
+        "schema": "gate1p-stagea-pair-control-v3",
         "protocol_id": protocol.PROTOCOL_ID,
         "pair_id": protocol.PAIR_ID,
         "source_version": expected_source,
@@ -1480,6 +1503,7 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
         "prearm_state": {
             "arm": "shipping_sage",
             "status": "idle",
+            "reset_generation": 0,
             "updated_at": created_at,
         },
         "created_at": created_at,
@@ -1514,7 +1538,12 @@ def mark_gate1p_prearm_reset_started(
         or prearm_state.get("status") not in {"idle", "cleanup_complete"}
     ):
         raise SystemExit("ABORT: Gate 1P reset start is out of order")
-    state["prearm_state"] = {"arm": arm, "status": "reset_started", "updated_at": time.time()}
+    state["prearm_state"] = {
+        "arm": arm,
+        "status": "reset_started",
+        "reset_generation": prearm_state["reset_generation"] + 1,
+        "updated_at": time.time(),
+    }
     state["updated_at"] = time.time()
     _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
     _atomic_write_gate1p_json(path, state)
@@ -1525,7 +1554,7 @@ def mark_gate1p_prestart_cleanup_complete(
     arm: str,
     source_version: str,
     route_env: dict[str, str] | None = None,
-) -> None:
+) -> int:
     """Bind a complete pre-arm cleanup to the exact reset-started arm."""
     path = _gate1p_pair_control_path(route_env)
     try:
@@ -1541,10 +1570,17 @@ def mark_gate1p_prestart_cleanup_complete(
         or prearm_state.get("status") != "reset_started"
     ):
         raise SystemExit("ABORT: Gate 1P prestart cleanup completion is out of order")
-    state["prearm_state"] = {"arm": arm, "status": "cleanup_complete", "updated_at": time.time()}
+    reset_generation = prearm_state["reset_generation"]
+    state["prearm_state"] = {
+        "arm": arm,
+        "status": "cleanup_complete",
+        "reset_generation": reset_generation,
+        "updated_at": time.time(),
+    }
     state["updated_at"] = time.time()
     _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
     _atomic_write_gate1p_json(path, state)
+    return reset_generation
 
 
 def advance_gate1p_pair_control(
@@ -1573,7 +1609,12 @@ def advance_gate1p_pair_control(
     state["completed_arms"] = [*expected_completed, arm]
     state["next_arm"] = "true_naive" if arm == "shipping_sage" else "complete"
     state["prearm_state"] = (
-        {"arm": "true_naive", "status": "idle", "updated_at": time.time()}
+        {
+            "arm": "true_naive",
+            "status": "idle",
+            "reset_generation": 0,
+            "updated_at": time.time(),
+        }
         if arm == "shipping_sage"
         else None
     )
@@ -1672,15 +1713,28 @@ def cleanup_gate1p_arm(
         errors.append("required arm result record is absent")
     if row_started and not episode_artifact_retained:
         errors.append("required episode artifact is absent")
+    prestart_reset_generation: int | None = None
     if not row_started and not errors:
         try:
-            mark_gate1p_prestart_cleanup_complete(
+            prestart_reset_generation = mark_gate1p_prestart_cleanup_complete(
                 arm=arm,
                 source_version=_require_gate1p_expected_source(source_version),
                 route_env=route_env,
             )
         except SystemExit as exc:
             errors.append(f"pair control: {exc}")
+    elif not row_started:
+        try:
+            control = json.loads(_gate1p_pair_control_path(route_env).read_text(encoding="utf-8"))
+            _validate_gate1p_pair_control_state(
+                control,
+                expected_source_version=_require_gate1p_expected_source(source_version),
+            )
+            prearm = control["prearm_state"]
+            if control["next_arm"] == arm and prearm["status"] == "reset_started":
+                prestart_reset_generation = prearm["reset_generation"]
+        except (OSError, TypeError, ValueError, SystemExit):
+            prestart_reset_generation = None
     report = {
         "record_type": "cleanup",
         "measurement_kind": "row",
@@ -1702,12 +1756,13 @@ def cleanup_gate1p_arm(
         path = _gate1p_results_path(route_env)
     else:
         report = {
-            "schema": "gate1p-stagea-prestart-cleanup-v1",
+            "schema": "gate1p-stagea-prestart-cleanup-v2",
             "record_type": "prestart_cleanup",
             "measurement_kind": "prestart_readiness",
             "protocol": report["protocol"],
             "result_retained": result_retained,
             "episode_artifact_retained": episode_artifact_retained,
+            "reset_generation": prestart_reset_generation,
             "temporary_evaluator_material": report["temporary_evaluator_material"],
             "complete": report["complete"],
             "errors": errors,
@@ -1806,6 +1861,12 @@ def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
                 if not row_started:
                     raise SystemExit("ABORT: Gate 1P arm returned without an arm_started record")
                 advance_gate1p_pair_control(
+                    arm=arm,
+                    source_version=expected_source,
+                    route_env=kwargs.get("route_env"),
+                )
+            elif row_started:
+                mark_gate1p_prestart_cleanup_complete(
                     arm=arm,
                     source_version=expected_source,
                     route_env=kwargs.get("route_env"),
@@ -1937,7 +1998,11 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
             f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}"
             f"{f' --pair-id {pair_id}' if pair_id else ''}"
         )
-    print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
+    gate1p = _gate1p_stagea_protocol()
+    if pair_id == gate1p.PAIR_ID and not gate1p.PAIR_ALLOCATED:
+        print("\nPAIR UNALLOCATED: this prospective plan cannot execute live until a fresh pair identity is allocated.")
+    else:
+        print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
 
 def main(argv=None) -> int:
@@ -2181,6 +2246,8 @@ def main(argv=None) -> int:
         effective_route_env = route_env or os.environ
         if not str(effective_route_env.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
             ap.error("SAGE_EVAL_API_ENDPOINT is required for exact Stage A route parity")
+        if args.go and not gate1p.PAIR_ALLOCATED:
+            ap.error("the Gate 1P successor pair is not allocated for live execution")
         if args.go and args.live_authority_id != gate1p.PAIR_ID:
             ap.error(
                 f"live paired-row execution requires separate --live-authority-id {gate1p.PAIR_ID}"

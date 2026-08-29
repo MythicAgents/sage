@@ -7,6 +7,8 @@ import base64
 import json
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
 import bare_bloodhound as bb  # noqa: E402
@@ -90,6 +92,155 @@ def test_collection_ingestor_uploads_bytes_then_returns_raw_job_status():
     assert tool.calls[0]["file_name"] == "forest.zip"
     assert base64.b64decode(tool.calls[0]["file_bytes_base64"]) == b"zip-bytes"
     assert tool.calls[1] == {"info_type": "status", "job_id": 17}
+
+
+def test_collection_ingestor_decodes_standard_mcp_text_content_blocks():
+    tool = _AsyncStubTool(
+        "file_upload",
+        "hidden",
+        {},
+        [
+            [{
+                "type": "text",
+                "id": "opaque-upload-content-id",
+                "text": json.dumps({
+                    "info_type": "upload_bytes",
+                    "data": {"job_id": 23, "status": "upload_complete"},
+                }),
+            }],
+            [{
+                "type": "text",
+                "id": "opaque-status-content-id",
+                "text": json.dumps({
+                    "info_type": "status",
+                    "data": {"job_id": 23, "status_message": "Complete"},
+                }),
+            }],
+        ],
+    )
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip-bytes"))
+    assert result == {
+        "upload": {
+            "info_type": "upload_bytes",
+            "data": {"job_id": 23, "status": "upload_complete"},
+        },
+        "job_status": {
+            "info_type": "status",
+            "data": {"job_id": 23, "status_message": "Complete"},
+        },
+    }
+    assert tool.calls[1] == {"info_type": "status", "job_id": 23}
+
+
+def test_collection_ingestor_accepts_native_success_mapping():
+    upload = {
+        "info_type": "upload_bytes",
+        "data": {"job_id": 29, "status": "upload_complete"},
+    }
+    tool = _AsyncStubTool(
+        "file_upload",
+        "hidden",
+        {},
+        [upload, {"info_type": "status", "data": {"job_id": 29}}],
+    )
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result["upload"] == upload
+    assert tool.calls[1] == {"info_type": "status", "job_id": 29}
+
+
+@pytest.mark.parametrize(
+    "upload",
+    [
+        {"error": "upload rejected", "data": {"job_id": 99}},
+        {"data": {"error": "upload rejected", "job_id": 99}},
+        {"errors": ["upload rejected"], "data": {"job_id": 99}},
+        {"isError": True, "data": {"job_id": 99}},
+        {"is_error": True, "data": {"job_id": 99}},
+        {"success": False, "data": {"job_id": 99}},
+        {"status": "Failed", "data": {"job_id": 99}},
+        {"status": "rejected", "data": {"job_id": 99}},
+    ],
+)
+def test_collection_ingestor_rejects_explicit_error_even_with_nested_job_id(upload):
+    response = [{"type": "text", "text": json.dumps(upload)}]
+    tool = _AsyncStubTool("file_upload", "hidden", {}, [response])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": upload, "job_status": None}
+    assert len(tool.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    [False, True, None, "", "17", 0, -1, 1.5, {}, []],
+)
+def test_collection_ingestor_rejects_schema_invalid_job_ids(job_id):
+    upload = {"info_type": "upload_bytes", "data": {"job_id": job_id}}
+    tool = _AsyncStubTool("file_upload", "hidden", {}, [upload])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": upload, "job_status": None}
+    assert len(tool.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "upload",
+    [
+        {"info_type": "upload_bytes", "data": {}},
+        {"job_id": 17, "data": {"job_id": 17}},
+        {"job_id": 17, "data": {"job_id": 23}},
+    ],
+)
+def test_collection_ingestor_rejects_missing_or_ambiguous_job_ids(upload):
+    tool = _AsyncStubTool("file_upload", "hidden", {}, [upload])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": upload, "job_status": None}
+    assert len(tool.calls) == 1
+
+
+def test_collection_ingestor_does_not_classify_untyped_error_word_as_failure():
+    upload = {
+        "info_type": "upload_bytes",
+        "data": {"job_id": 31, "message": "prior error recovered"},
+    }
+    tool = _AsyncStubTool(
+        "file_upload",
+        "hidden",
+        {},
+        [upload, {"info_type": "status", "data": {"job_id": 31}}],
+    )
+    asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert tool.calls[1] == {"info_type": "status", "job_id": 31}
+
+
+def test_mcp_content_normalization_fails_closed_for_ambiguous_or_malformed_blocks():
+    valid = {"type": "text", "text": json.dumps({"data": {"job_id": 17}})}
+    assert bb._json_value([valid, valid]) == {"error": "ambiguous_mcp_content"}
+    assert bb._json_value([{"type": "image", "data": "opaque"}]) == {
+        "error": "unsupported_mcp_content"
+    }
+    assert bb._json_value([{"type": "text", "text": "not-json"}]) == {
+        "error": "malformed_mcp_text"
+    }
+    assert bb._json_value([{"type": "text", "text": "17"}]) == {
+        "error": "non_structured_mcp_text"
+    }
+
+
+def test_collection_ingestor_does_not_echo_sensitive_malformed_mcp_content():
+    marker = "sensitive-malformed-content-must-not-reach-model"
+    response = [{"type": "text", "text": '{"secret":' + json.dumps(marker)}]
+    tool = _AsyncStubTool("file_upload", "hidden", {}, [response])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": {"error": "malformed_mcp_text"}, "job_status": None}
+    assert marker not in json.dumps(result)
+    assert len(tool.calls) == 1
+
+
+def test_collection_ingestor_does_not_invent_job_from_ambiguous_mcp_content():
+    block = {"type": "text", "text": json.dumps({"data": {"job_id": 17}})}
+    tool = _AsyncStubTool("file_upload", "hidden", {}, [[block, block]])
+    result = asyncio.run(bb.make_collection_ingestor(tool)("forest.zip", b"zip"))
+    assert result == {"upload": {"error": "ambiguous_mcp_content"}, "job_status": None}
+    assert len(tool.calls) == 1
 
 
 def test_collection_ingestor_preserves_upload_without_inventing_job_status():

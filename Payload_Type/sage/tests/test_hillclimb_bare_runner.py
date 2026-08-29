@@ -99,6 +99,67 @@ def test_model_response_after_wall_deadline_cannot_dispatch_target_tool():
     assert tool_calls == []
 
 
+def test_completed_call_token_boundary_retains_crossing_response_without_dispatch():
+    tool_calls = []
+    decisions = iter([
+        {
+            "tool": "issue_command",
+            "args": {"command": "whoami"},
+            "_usage": {"input_tokens": 4, "output_tokens": 2},
+        },
+        {
+            "tool": "issue_command",
+            "args": {"command": "hostname"},
+            "_usage": {"input_tokens": 4, "output_tokens": 1},
+        },
+    ])
+
+    result = br.BareModelRunner(
+        lambda *_args: next(decisions),
+        lambda call: tool_calls.append(call) or "ok",
+        token_ceiling=10,
+        require_complete_usage=True,
+    ).run("obj")
+
+    assert result.stopped == "token_budget_overshoot"
+    assert result.total_tokens == 11
+    assert result.model_calls == 2
+    assert result.steps == 1
+    assert [call["args"]["command"] for call in tool_calls] == ["whoami"]
+    assert [item["response_id"] for item in result.model_response_records] == [
+        "bare-model-call-1",
+        "bare-model-call-2",
+    ]
+    assert result.action_response_ids == ["bare-model-call-1"]
+    assert [item["response_id"] for item in result.transcript] == ["bare-model-call-1"]
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": "9", "output_tokens": "2", "total_tokens": "11"},
+        {"input_tokens": 9.9, "output_tokens": 2.9, "total_tokens": 11.9},
+    ],
+)
+def test_bare_runner_does_not_coerce_malformed_usage_values(usage):
+    tool_calls = []
+    result = br.BareModelRunner(
+        lambda *_args: {
+            "tool": "issue_command",
+            "args": {"command": "whoami"},
+            "_usage": usage,
+        },
+        lambda call: tool_calls.append(call),
+        token_ceiling=10,
+        require_complete_usage=True,
+    ).run("obj")
+
+    assert result.stopped == "measurement_error"
+    assert result.token_usage_complete is False
+    assert result.steps == 0
+    assert tool_calls == []
+
+
 def test_wall_deadline_is_rechecked_at_actual_tool_dispatch_boundary(monkeypatch):
     clock = iter([0.0, 0.5, 0.999, 1.001, 1.001])
     monkeypatch.setattr(br.time, "monotonic", lambda: next(clock))

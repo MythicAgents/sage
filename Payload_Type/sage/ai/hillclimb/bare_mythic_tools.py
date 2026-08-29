@@ -123,9 +123,11 @@ query RawLatestCollection($cbid: Int!) {
   ) {
     agent_file_id
     filename_utf8
+    path
     timestamp
     complete
     deleted
+    is_payload
     is_download_from_agent
     task {
       display_id
@@ -136,12 +138,31 @@ query RawLatestCollection($cbid: Int!) {
 }
 """
 _DOWNLOAD_PROBE_QUERY = """
-query RawDownloadProbe {
+query RawTaskCollectionDownloadProbe {
   filemeta(
-    where: {complete: {_eq: true}, deleted: {_eq: false}, is_payload: {_eq: true}}
+    where: {
+      complete: {_eq: true}
+      deleted: {_eq: false}
+      is_payload: {_eq: false}
+      is_download_from_agent: {_eq: true}
+      task: {}
+    }
     order_by: {id: desc}
-    limit: 1
-  ) { agent_file_id }
+    limit: 25
+  ) {
+    agent_file_id
+    filename_utf8
+    path
+    complete
+    deleted
+    is_payload
+    is_download_from_agent
+    task {
+      display_id
+      command_name
+      callback { display_id }
+    }
+  }
 }
 """
 
@@ -489,6 +510,52 @@ def _collection_zip_valid(data: bytes) -> bool:
         return False
 
 
+def _task_collection_source(
+    row: Any,
+    *,
+    callback_display_id: int | None = None,
+    name_contains: str = "zip",
+) -> tuple[str, str] | None:
+    """Return one exact task-produced collection source, or fail closed with ``None``."""
+    if not isinstance(row, dict):
+        return None
+    if (
+        row.get("complete") is not True
+        or row.get("deleted") is not False
+        or row.get("is_payload") is not False
+        or row.get("is_download_from_agent") is not True
+    ):
+        return None
+    agent_file_id = str(row.get("agent_file_id") or "").strip()
+    filename = str(row.get("filename_utf8") or "").strip()
+    storage_path = str(row.get("path") or "").strip()
+    if not agent_file_id or not filename or not storage_path or not filename.casefold().endswith(".zip"):
+        return None
+    needle = str(name_contains or "").strip().casefold()
+    if needle and needle not in filename.casefold():
+        return None
+    task = row.get("task")
+    if not isinstance(task, dict):
+        return None
+    task_id = task.get("display_id")
+    command_name = str(task.get("command_name") or "").strip()
+    callback = task.get("callback")
+    callback_id = callback.get("display_id") if isinstance(callback, dict) else None
+    if (
+        not isinstance(task_id, int)
+        or isinstance(task_id, bool)
+        or task_id <= 0
+        or not command_name
+        or not isinstance(callback_id, int)
+        or isinstance(callback_id, bool)
+        or callback_id <= 0
+    ):
+        return None
+    if callback_display_id is not None and callback_id != callback_display_id:
+        return None
+    return agent_file_id, filename
+
+
 async def _resolve_collection_source(
     client: Any,
     *,
@@ -514,14 +581,15 @@ async def _resolve_collection_source(
         variables={"cbid": callback_id},
     )
     rows = result.get("filemeta") if isinstance(result, dict) else None
-    needle = str(name_contains or "").strip().casefold()
     for row in rows or []:
-        if not isinstance(row, dict):
-            continue
-        filename = str(row.get("filename_utf8") or "")
-        agent_file_id = str(row.get("agent_file_id") or "").strip()
-        if agent_file_id and (not needle or needle in filename.casefold()):
-            return agent_file_id, filename or f"{agent_file_id}.zip", f"callback:{callback_id}"
+        source = _task_collection_source(
+            row,
+            callback_display_id=callback_id,
+            name_contains=name_contains,
+        )
+        if source is not None:
+            agent_file_id, filename = source
+            return agent_file_id, filename, f"callback:{callback_id}"
     raise LookupError(
         f"no completed non-deleted callback download matched name_contains={name_contains!r}"
     )
@@ -777,7 +845,7 @@ async def raw_mythic_graphql_disposition(client: Any, *, timeout: int = 30) -> d
 
 
 async def raw_mythic_download_disposition(client: Any, *, timeout: int = 30) -> dict[str, object]:
-    """Exercise the exact SDK download path on one complete payload before a reset can start."""
+    """Exercise the official SDK on one task-produced collection before reset can start."""
     from mythic import mythic
 
     try:
@@ -786,18 +854,37 @@ async def raw_mythic_download_disposition(client: Any, *, timeout: int = 30) -> 
             timeout=timeout,
         )
         rows = result.get("filemeta") if isinstance(result, dict) else None
-        file_uuid = str((rows or [{}])[0].get("agent_file_id") or "").strip()
-        if not file_uuid:
-            return {"valid": False, "reason": "no complete payload file is available for download preflight"}
+        if not isinstance(rows, list):
+            return {"valid": False, "reason": "collection download preflight omitted the file list"}
+        source = next(
+            (
+                candidate
+                for row in rows
+                if (candidate := _task_collection_source(row)) is not None
+            ),
+            None,
+        )
+        if source is None:
+            return {
+                "valid": False,
+                "reason": "no valid task-produced collection file is available for download preflight",
+            }
+        file_uuid, _ = source
         blob = await asyncio.wait_for(
             mythic.download_file(mythic=client, file_uuid=file_uuid),
             timeout=timeout,
         )
-        if not isinstance(blob, (bytes, bytearray)) or not blob:
-            return {"valid": False, "reason": "download preflight returned no bytes"}
+        if not _collection_zip_valid(blob):
+            return {
+                "valid": False,
+                "reason": "download preflight did not return a valid collection ZIP",
+            }
         return {"valid": True, "checked": 1, "bytes_received": len(blob)}
     except Exception as exc:
-        return {"valid": False, "reason": f"download preflight failed ({type(exc).__name__})"}
+        return {
+            "valid": False,
+            "reason": f"task-produced collection download preflight failed ({type(exc).__name__})",
+        }
 
 
 async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tuple[bool, str]:
@@ -819,7 +906,7 @@ async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tup
     return True, (
         f"raw Mythic surface validated: {parity['raw_count']} raw <= "
         f"{parity['shipping_count']} shipping tools; {sdk['checked']} SDK calls; "
-        f"{graphql['checked']} exact GraphQL documents; download path exercised"
+        f"{graphql['checked']} exact GraphQL documents; task-produced collection download exercised"
     )
 
 

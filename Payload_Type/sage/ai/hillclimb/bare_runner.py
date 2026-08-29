@@ -105,6 +105,7 @@ class BareModelResult:
     wall_seconds: float = 0.0
     effective_backend_requests: list = field(default_factory=list)
     model_response_records: list = field(default_factory=list)
+    action_response_ids: list = field(default_factory=list)
     token_usage_complete: bool = False
     token_budget_exhausted: bool = False
     token_budget_overshoot: bool = False
@@ -155,6 +156,7 @@ class BareModelRunner:
         total_tokens = 0
         backend_requests: list[dict] = []
         response_records: list[dict] = []
+        action_response_ids: list[str] = []
         final_txt = ""
         objective_recognized = False
         recoverable_tool_errors: list[dict[str, object]] = []
@@ -202,6 +204,18 @@ class BareModelRunner:
                     stopped = "measurement_error"
                     log(f"✗ step {step} response omitted complete token usage")
                     break
+                # Provider calls are indivisible at this layer: authoritative usage exists only after
+                # the response.  Retain the crossing response and its actual cost, but do not interpret
+                # it into a final claim or dispatch its tool.  The same completed-call boundary is used
+                # by Sage's model-mediated policy seam during Gate 1P rows.
+                if self.token_ceiling is not None and token_budget.exhausted:
+                    stopped = (
+                        "token_budget_overshoot"
+                        if token_budget.overshoot
+                        else "token_budget_exhausted"
+                    )
+                    log(f"■ completed model call reached token boundary at step {step}")
+                    break
             # A provider request may itself cross the wall deadline. Preserve its cost evidence,
             # but never interpret or dispatch a tool call that arrived after the fixed ceiling.
             if self.timeout is not None and (time.monotonic() - start) >= self.timeout:
@@ -222,6 +236,7 @@ class BareModelRunner:
                 log(f"⏱ wall-clock timeout before tool dispatch at step {step}")
                 break
             try:
+                action_response_ids.append(str(response_records[-1]["response_id"]))
                 obs = self.tool_executor(decision)
             except KeyboardInterrupt:
                 stopped = "interrupted"
@@ -240,7 +255,11 @@ class BareModelRunner:
                     f"⚠ recoverable {error_category} tool error; continuing within the frozen budget"
                 )
             log(f"🔧 step {step} OBSERVATION: {str(obs)[:500]}")
-            history.append({"call": decision, "obs": obs})
+            history.append({
+                "response_id": action_response_ids[-1],
+                "call": decision,
+                "obs": obs,
+            })
         log(f"● BARE END — stopped={stopped} steps={len(history)}")
         return BareModelResult(
             objective=objective,
@@ -254,6 +273,7 @@ class BareModelRunner:
             wall_seconds=max(0.0, time.monotonic() - start),
             effective_backend_requests=backend_requests,
             model_response_records=response_records,
+            action_response_ids=action_response_ids,
             token_usage_complete=token_budget.usage_complete,
             token_budget_exhausted=bool(self.token_ceiling is not None and token_budget.exhausted),
             token_budget_overshoot=bool(self.token_ceiling is not None and token_budget.overshoot),
@@ -347,6 +367,7 @@ def score_bare_run(
             "effective_backends": effective_backends,
             "effective_backend_requests": list(result.effective_backend_requests),
             "model_response_records": list(result.model_response_records),
+            "action_response_ids": list(result.action_response_ids),
             "token_usage_complete": bool(result.token_usage_complete),
             "token_budget_exhausted": bool(result.token_budget_exhausted),
             "token_budget_overshoot": bool(result.token_budget_overshoot),
