@@ -85,67 +85,31 @@ expand into unrelated history or sealed-lifecycle archaeology. Prefer typed fiel
 control authority. After a language-classification rejection, replace prose inference with structured authority
 when practical instead of growing a blacklist or regex grammar.
 
-A pre-implementation `DESIGN_ACCEPT` review is mandatory only for `sealed_evaluation`. Root freezes the prospective
-gate contract and owns its operator-approval binding; a fresh `sage_eval_reviewer` returns the read-only design
-result. There is no source candidate, lease, or source/test disposition during this preflight.
-
-The source-candidate breaker uses this fixed transition:
-
-`DESIGN_ACCEPT` → candidate 1 → rejection → RCA/simplification/full-class probes → fresh `RECOVERY_ACCEPT` →
-candidate 2 → rejection → exhausted epoch.
-
-Root owns the gate, recovery inputs, candidate bytes, and final evidence admission. The reviewer owns the design
-or recovery disposition and attests the route and probes it actually reproduced. There is at most one initial
-candidate and one rejected-candidate successor per design epoch. A higher epoch requires a fresh design result
-that binds the exhausted predecessor and the same operator-approved superseding scope.
-
-The sealed guard assumes a trusted repository operator. Manifest and hash checks detect accidental drift and bind
-exact bytes to a review; they do not cryptographically authenticate reviewer identity or defend against a malicious
-repository administrator. If authentication or hostile substitution is actually in scope, use a separately designed
-signing and key-trust mechanism rather than describing local hashes as signatures. Freeze validates recorded probe
-evidence and never executes probe commands.
-
 ## Candidate Freeze And Review
 
-Use the ordinary git diff, focused probes, and one-writer discipline for `runtime_bugfix` and
-`development_measurement`. Do not invoke `review_lease.py` merely because a change touches an eval path.
-
-For `sealed_evaluation`, after implementation and focused verification, stop all writers and stage only the exact
-candidate paths. A candidate path may not have unstaged bytes layered over its staged form. The manifest-bound gate
-contract's `governed_paths` must exactly match `--paths`, and the freeze requires the fresh design-review result plus
-the recovery result after one rejection:
+**Use the ordinary git diff, focused probes, and one-writer discipline for `runtime_bugfix` and
+`development_measurement`.** That is nearly all work. Run these:
 
 ```bash
-python3 skills/sage-architecture-governor/scripts/review_lease.py freeze --paths Payload_Type/sage/ai/langgraph/model.py --protected Payload_Type/sage/ai/langgraph/turn_authority.py --review-stage source_candidate --review-domain conversation_behavior --independence-class internal_subagent --mechanism-id supervised-turn-authority --review-round 1 --governing-gate "approved architecture gate" --gate-contract "$SAGE_GATE_CONTRACT" --design-receipt "$SAGE_DESIGN_RECEIPT"
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
+python3 skills/sage-architecture-governor/scripts/check_arch_budget.py
 ```
 
-For sealed round 2, append `--recovery-receipt "$SAGE_RECOVERY_RECEIPT"`. Caller-supplied domain,
-mechanism, gate label, and round do not override the gate-derived values. The command records the gate and receipt
-hashes, stable process key, epoch, HEAD, complete git-index fingerprint, scoped status, staged candidate blob
-hashes, protected-path hashes, candidate ID, and lease ID. It does not modify the git index. The PreToolUse hook
-blocks writes to candidate and protected paths while the lease is active.
+### `sealed_evaluation` — archived, not available by default
 
-The reviewer must verify the lease at review start, after its declared commands, and immediately before its
-disposition:
+The sealed-evaluation lifecycle (design-accept preflight, source-candidate breaker, epochs, freeze manifests,
+protected-path hashes, review leases) was **archived out of this file on 2026-08-29** to
+`.sage_history/2026/08/governance/ARCHIVED_sealed_evaluation_section.md`. `scripts/review_lease.py` is unchanged
+and still runnable; only the procedure text left this file.
 
-```bash
-python3 skills/sage-architecture-governor/scripts/review_lease.py verify
-```
+**It applies only when a named external party actually relies on a Sage claim. If you think you need it, you are
+in `development_measurement`.**
 
-Any HEAD or index drift invalidates the candidate. Worktree and scoped-status drift is checked for candidate and
-protected paths; unrelated unstaged worktree changes do not invalidate it. Drift produces
-`INVALIDATED_CANDIDATE_DRIFT`. Close the exact lease after review and preserve its archived receipt:
-
-```bash
-python3 skills/sage-architecture-governor/scripts/review_lease.py close --lease-id <lease-id> --disposition accepted
-```
-
-Active review leases remain under `/tmp/sage_arch_review`; successful close writes the immutable closed receipt
-under `.sage_history/<year>/<month>/governance/architecture-reviews/` before removing the active lease. If the
-durable write fails, close fails and leaves the active lease in place.
-
-Do not edit a rejected candidate while its review lease is active. Close it as `rejected`, open the next
-prospectively approved edit tranche, and freeze a new candidate.
+*Why it was archived, measured: this file is what an agent reads at the moment it selects a review lane. It
+carried three runnable command blocks for the sealed lane and zero for the cheap lanes, so the sealed lane won on
+salience — even after `AGENTS.md:108` was added specifically because the model kept selecting it, and kept
+selecting it anyway. A prose prohibition does not outcompete a copy-pasteable command. Restoring the text here
+re-creates the asymmetry; restore it in a reference the agent opens after the lane is already chosen.*
 
 ## Complexity Budget
 

@@ -4,6 +4,13 @@ This repo is the Sage Mythic v4 chat container: an AI/LangGraph interface that o
 
 ## Start Here
 
+> **CANARY — do not remove.** On your first tool-using turn of a session, print exactly one line:
+> `CANARY: AGENTS.md resident`. This is a measurement, not decoration: if you stop doing it after a
+> `"type":"compacted"` event, this file is too long to survive compaction and must be cut further.
+> Added 2026-08-29 on an external reviewer's recommendation — "until that test exists, any target is
+> decoration."
+
+
 1. Read `## Repo Map` below to find the subsystem you are changing.
 2. Read `skills/README.md` — it indexes every operator skill by name, purpose, and entry script.
 3. Read the `SKILL.md` of each skill your task touches. `--help` shows flags, not semantics.
@@ -226,64 +233,27 @@ hardcoding them into product capability logic (see § Highest-Value Demo Work).
 
 ## Current Validation Baseline
 
-Run this from repo root before and after code changes:
+Run from repo root before and after code changes. One tier, no exclusions: green means the tree is green.
 
 ```bash
-.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py supported
+.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
 ```
 
-There is one tier and no exclusions: a green run means the tree is green. The trailing `supported` argument is
-accepted and ignored so older handoffs keep working.
+**A green suite proves the tree is green. It does not prove Sage runs.** On 2026-08-10 two
+individually-correct features were fatally incompatible in combination: every request failed at
+graph-build time in ~5 seconds while the suite sat at 3955 green. A human typing into the chat
+window found it.
 
-### Test the assembled artifact, not only its parts
+Two rules with teeth:
+- Touch anything the graph is built from — node, edge, middleware, node default, error handler,
+  checkpointer — and `tests/test_graph_builds.py` must pass, with a new case for a new branch.
+- **Never assert on source text when you can assert on the built object.** A test that greps a
+  function with `ast` can only fail if someone deletes the line.
 
-A green suite proves the tree is green. It does not prove Sage runs. On 2026-08-10 two features that were each
-correct and each covered by passing tests were fatally incompatible in combination: every request — including a
-bare "Hello" — failed at graph-build time in about five seconds, before reaching a model, while the suite sat at
-3955 green. It was found by a human typing into the chat window.
-
-Four layers, defined in full at `docs/development/TEST_TIERS.md` § Test layers:
-
-| Layer | May touch | Answers |
-|---|---|---|
-| **build** | nothing external — dummy key, mocked Mythic | does the real thing assemble? |
-| **scripted** | a fake chat model + `InMemorySaver` | given this model output, does Sage behave? |
-| **recorded** | replayed HTTP cassettes | does it handle real provider responses? |
-| **live** | real provider, Mythic, range | does it work for real? |
-
-**Build and scripted require no API key, no VPN and no AWS session**, so an unreachable provider is never a
-reason to skip them. `GenericFakeChatModel`, `FakeListChatModel` and `InMemorySaver` are already installed; a
-fake model scripts exact responses including tool calls, so agent routing, middleware, handoffs, HITL and
-streaming are all testable offline and deterministically.
-
-Worked examples: `tests/test_graph_builds.py` (build) and `tests/test_scripted_handoff.py` (scripted — the
-Supervisor→Mythic_Operator handoff driven end to end in under a second). Copy the second one's harness rather
-than reinventing it; `docs/development/TEST_TIERS.md` § Writing a scripted (layer 1) test records the four traps
-that cost hours to find, two of which make a test **hang** rather than fail.
-
-Two rules with teeth, both learned from that outage:
-
-- **If you touch anything the graph is built from** — a node, edge, middleware, node default, error handler or
-  checkpointer — `tests/test_graph_builds.py` must pass, and a new configuration branch needs a new case there.
-- **Never assert on source text when you can assert on the built object.** A test that parses a function with
-  `ast` and checks a string appears in it can only fail if someone deletes the line; it cannot fail for a reason
-  that lives in behaviour. Likewise, a hand-built stand-in for a real structure only tests the parts you
-  remembered to copy, and stops matching silently when the real one changes.
-
-The four rejected successor-portfolio suites this command used to exclude are rejected *evaluation evidence*, and
-per § Durable Artifact Retention that belongs in `.sage_history/`, not the product tree. They are preserved
-append-only at `.sage_history/evaluation/architecture-policy/rejected-successor-portfolios/`. Do not rewrite or
-reseal them, and do not move them back. Record the observed suite count in the current handoff rather than
-preserving a fast-staling count here.
-
-Sealed evaluation evidence belongs under `.sage_history/`, never `Plans/`, which is the maintainer's own
-documents and is gitignored for an unrelated reason. The Phase 16R/17 campaign's evidence and source now live at
-`.sage_history/evaluation/architecture-policy/`. **Known gap:** `phase10_evidence_bundle`, `phase12`, `phase13`,
-`phase14` (both), and `phase15` still write outputs under `Plans/` — ten path anchors across six modules. Route
-new evidence writes to `.sage_history/`, and prefer a shared resolver over another per-module `/ "Plans" /`
-constant when those six are migrated.
-
-For live evals, use the Phoenix-backed harness in `Payload_Type/sage/evals/`. Do not trust the Mythic task poller for long Sage runs; it can hang. Read results from `Payload_Type/sage/.phoenix/phoenix.db` or decoded Mythic task output.
+The four test layers (**build** / **scripted** / **recorded** / **live**), what each may touch, the
+worked examples, and the four traps that make a scripted test *hang* rather than fail:
+**`docs/development/TEST_TIERS.md`**. Build and scripted need no API key, no VPN and no AWS session,
+so an unreachable provider is never a reason to skip them.
 
 ## Operating Rules
 
@@ -384,118 +354,20 @@ chat UI renders operator-facing output richly. Leverage this; don't fight it.
 
 ## Lab Reset Tools
 
-Official repo-local Sage skills now carry reusable reset/run/analyze tooling:
+The full GOAD/Ludus/BloodHound/Mythic reset and readiness lifecycle — clean rehearsal order,
+snapshot names, clock sync, callback bootstrap, payload deploy — lives in
+**`skills/sage-goad-reset/SKILL.md`** and the sibling `sage-callback-bootstrap`,
+`sage-mythic-payload-deploy`, `sage-live-runner` skills. `skills/README.md` indexes them all.
 
-- Use `skills/sage-goad-reset` for the clean GOAD/Ludus/BloodHound/Sage rehearsal reset and readiness preflight.
-- `$sage-goad-reset full reset` means the complete workflow: archive Sage/Phoenix, reset Mythic, roll back GOAD,
-  wipe BloodHound, restart local Sage chat, and generate a fresh Apollo payload. Do not interpret it as Ludus-only.
-- Use `skills/sage-callback-bootstrap` after Mythic reset to verify the Sage chat container and establish the
-  Apollo or retained foothold callback.
-- Use `skills/sage-live-runner` for native chat solves, request monitoring, and inspection.
-- Use `skills/sage-focused-capability-tests` for narrow capability/adaptor validation.
-- Use `skills/sage-trace-analysis` for Phoenix/Mythic/log analysis.
-- Use `skills/sage-trajectory-learning` for corpus manifests, transition export, and repair-policy replay.
-  Runtime capability failures append redacted records to `Payload_Type/sage/.trajectory/transitions.jsonl` by
-  default and return `trajectory_repair` in failed `execute_capability` responses.
+**Read the SKILL.md before running anything in it. `--help` shows flags, not semantics** — a script
+run as a "read-only probe" once did something categorically different, and its SKILL.md said so.
 
-Do not store lab passwords in skills or copied helper scripts. Prefer session environment variables, local gitignored
-`.env` files owned by each tool, or an OS keychain/secret manager. Current Mythic-facing reset helpers should resolve
-`MYTHIC_ADMIN_PASSWORD` first, then `MYTHIC_ENV_PATH`. There is no checkout-name default — see `.env.example`.
-
-### Range Source, Runtime, and Evidence States
-
-- For reusable AD ranges intended for publication or transfer, prefer a DreadGOAD-format source definition and use
-  Ludus as the Sage execution/reset substrate. A Sage-only benchmark fixture may remain Ludus-first in
-  `ludus/sage-purpose-ranges/` when portability is not a goal. A source definition is not evidence that a Ludus
-  range exists, is provisioned, or is ready.
-- Use precise range state words in updates and handoffs instead of the ambiguous word `deployed`:
-  - `defined`: the source/profile exists, but no runtime claim is made.
-  - `provisioned`: the Ludus VMs exist.
-  - `snapshotted`: the intended clean baseline snapshot exists.
-  - `callback-ready`: the expected foothold is live and readiness/preflight passed.
-  - `countable`: all gates for a live row passed and the attempt may be used as evidence.
-  - `burned`: the attempt cannot be used as evidence because setup, measurement, or isolation failed.
-  - `complete`: the required evidence was accepted and artifacts were captured.
-- A holdout attempt is `countable` only after the relevant clean-reset, clock-sync, BloodHound, callback uniqueness,
-  backend/route, and validator gates pass. If a duplicate callback lane, clock skew, route mismatch, setup defect, or
-  measurement defect is discovered after an attempt starts, mark that attempt `burned`, preserve its artifacts, fix
-  the gate, and use a fresh attempt for evidence. Do not retroactively promote a burned attempt.
-- For sealed evaluators and live-row validators, do not use substring membership for structured capability targets,
-  domains, or callback-scoped effect keys. Parse exact fields and keep a regression for suffix-collision cases such
-  as `zeta.branch.local` versus `branch.local`.
-- Before any countable live spend, sealed evaluators and live-row validators must have fixture coverage for every
-  plan-permitted evidence mode and terminal interpretation, including valid no-branch/kernel-only evidence and
-  fail-closed negative cases when the plan allows them. Do not derive the validator contract from only the typical
-  success row.
-- Power down ranges that are not needed for the next active operation after a stop-loss, burned attempt, or completed
-  tranche. The Ludus host is resource constrained; leaving old purpose ranges running is not a neutral default.
-- For each live eval row, record the effective model provider/route, Sage startup env overrides that change behavior,
-  range/snapshot identity, foothold callback identity, chat channel/request IDs, and validator artifact path. State
-  explicitly whether a run used Bedrock, a local `127.0.0.1` API route, or another backend; do not infer it from the
-  model name alone.
-
-Use this order for clean GOAD/BloodHound/Mythic rehearsal setup. Mythic is Docker-backed, but Sage runs locally
-in tmux throughout current development.
-
-### Clean Rehearsal Order
-
-1. **Stop local Sage and archive its active databases.** Run
-   `/bin/bash skills/sage-goad-reset/scripts/sage_stop.sh`, then
-   `.venv/bin/python skills/sage-goad-reset/scripts/archive_runtime_dbs.py`. Never overwrite or delete retained
-   archives.
-2. **Reset Mythic through its CLI.** Run
-   `/bin/bash skills/sage-goad-reset/scripts/mythic_reset.sh --yes`, which executes `mythic-cli stop`,
-   `mythic-cli database reset -f`, and `mythic-cli start`.
-3. **Reset GOAD and BloodHound.** Roll back/power on GOAD, wipe BloodHound, and require
-   `available-domains: count=0` before ingest. Then run
-   `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes` and require `"ready": true`;
-   RAM-backed snapshots can restore guests with clocks days apart.
-4. **Start/restart local Sage in the `sage` tmux session after DB archival and Mythic reset**, with the engagement gate and BloodHound MCP directory:
-   `/bin/bash skills/sage-goad-reset/scripts/sage_restart.sh SAGE_ENGAGEMENT_GATE=1 SAGE_BLOODHOUND_MCP_DIR="$SAGE_BLOODHOUND_MCP_DIR"`.
-5. **Verify Sage chat and create Apollo.** Run
-   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset`. It requires
-   a running Sage chat container and builds/downloads a fresh Apollo payload. It does not create Sage payloads.
-6. **Establish the foothold callback.** Open an active RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then stage/launch the fresh Apollo payload with
-   `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
-   `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged
-   bootstrap payload file, which defaults to `C:\Users\Public\apollo.exe`; clean-baseline Defender otherwise
-   quarantines stock Apollo. After a new callback is observed, the helper disconnects the RDP session with
-   `tsdiscon` by default so the local client exits without logging off the Windows session.
-7. **Run the callback preflight.** Run
-   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py post-callback-preflight`; it
-   waits for the live Samwell Apollo callback through Mythic control-plane observation, synchronizes clocks out of
-   band, and returns explicit zero-task metadata. It issues no Mythic payload tasks and does not claim Kerberos
-   purge or target-probed UTC/domain/identity output.
-8. **Only then rediscover Apollo and run Sage.** After DB archival and Sage restart, run
-   `.venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py readiness --runtime-dbs-archived` as a non-destructive
-   preflight; it must show `ready: true`. Then run
-   `.venv/bin/python skills/sage-live-runner/scripts/native_chat.py run --autonomous --prompt 'From the current foothold, achieve administrative control of essos.local.' --timeout 5400`.
-
-The GOAD and BloodHound reset helpers below are still used for lab state, but they do not replace the Mythic
-payload/callback lifecycle above.
-
-- **GOAD Ludus range:** `skills/sage-goad-reset/scripts/ludus.py` reads Ludus credentials from `.mcp.json`.
-  - Check state: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py status`
-  - List snapshots: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py snapshots`
-  - Treat `clean-baseline` as a logical state name, not a guaranteed Ludus snapshot ID. List the live restore
-    targets first, then pass the intended name explicitly. For range #4 the clean restore target verified on
-    July 20, 2026 is `sage-seed-baseline-20260710`:
-    `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py rollback sage-seed-baseline-20260710 --yes`
-    Stop and reconcile the handoff if that exact target is absent; never guess among multiple snapshots.
-  - Power on all range VMs: `.venv/bin/python skills/sage-goad-reset/scripts/ludus.py poweron all`
-  - Verify all six VMs are ON and reporting IPs: router `10.4.10.254`, DC01 `.10`, DC02 `.11`, DC03 `.12`,
-    SRV02/CASTELBLACK `.22`, SRV03/BRAAVOS `.23`. DC01/DC02 can briefly show `ip=null` after rollback; wait and
-    poll `status` until the guest agent reports IPs.
-  - Synchronize Windows clocks after every rollback:
-    `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py sync --yes`
-  - Read-only clock gate:
-    `.venv/bin/python skills/sage-goad-reset/scripts/sync_range_time.py check`
-- **BloodHound CE reset:** `skills/sage-goad-reset/scripts/bh_reset.py` uses the BloodHound MCP environment at
-  `"$SAGE_BLOODHOUND_MCP_DIR"`.
-  - Status: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py status`
-  - Wipe collected graph data: `uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes`
-  - `clear-database: 204 (empty body)` is expected. The wipe is asynchronous; verify `available-domains:
-    count=0` before any ingest. Do not start SharpHound ingest while the wipe is still settling.
+Three invariants that are not negotiable and do not live only in a skill:
+- **Never delete runtime databases.** Archive them with
+  `skills/sage-goad-reset/scripts/archive_runtime_dbs.py` before a clean reset.
+- **Synchronize range clocks after every rollback.** RAM-backed snapshots restore guests days apart.
+- **Do not store lab passwords in skills or helper scripts.** Resolve `MYTHIC_ADMIN_PASSWORD`, then
+  `MYTHIC_ENV_PATH`. There is no checkout-name default — see `.env.example`.
 
 ## Safety/Control Reality
 

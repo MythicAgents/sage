@@ -80,7 +80,7 @@ def run_hook(event: dict) -> tuple[int, dict]:
     paths = _event_paths(event)
     conflicts, lease = frozen_path_conflicts(root, paths)
     if conflicts:
-        return 0, _deny(
+        return 2, _deny(
             "active Sage review lease "
             f"{lease.get('lease_id')} freezes candidate "
             f"{lease.get('candidate_id')}; write conflicts: {', '.join(conflicts)}. "
@@ -95,7 +95,7 @@ def run_hook(event: dict) -> tuple[int, dict]:
 
     deny_paths = gate_deny_paths(high, root)
     if deny_paths:
-        return 0, _deny(
+        return 2, _deny(
             f"architecture gate: no approval token covers {', '.join(deny_paths)}"
             ". Prepare the Sage Architecture Gate brief, get explicit user approval, then run "
             "`python3 skills/sage-architecture-governor/scripts/open_gate.py open --files <scope> ...`."
@@ -175,18 +175,29 @@ def self_test() -> int:
             ("Edit", _edit_event, ADVISE_TARGET, "advise"),
             ("Edit", _edit_event, SAFE_TARGET, "silent"),
         ]
+        # Assert BOTH dialects on every case: the stdout payload Claude Code reads, and the exit
+        # code Codex reads. Asserting only the payload is how this gate shipped unable to block
+        # under Codex while reporting "self-test passed" for months.
+        expected_code = {"deny": 2, "advise": 0, "silent": 0}
         for dialect, build, target, expected in cases:
-            _code, payload = run_hook(build(target))
+            code, payload = run_hook(build(target))
             got = _verdict(payload)
             if got != expected:
                 failures.append(f"{dialect} on {target}: expected {expected}, got {got}")
+            if code != expected_code[expected]:
+                failures.append(
+                    f"{dialect} on {target}: expected exit {expected_code[expected]} "
+                    f"for a {expected} verdict, got {code} (Codex reads the exit code, not the JSON)"
+                )
 
         # The shell lane must still see a redirect into a deny-listed path.
-        _code, payload = run_hook(
+        code, payload = run_hook(
             {"tool_name": "Bash", "tool_input": {"command": f"echo x > {DENY_TARGET}"}}
         )
         if _verdict(payload) != "deny":
             failures.append("Bash redirect into a deny-listed path was not denied")
+        if code != 2:
+            failures.append(f"Bash redirect into a deny-listed path exited {code}, not 2")
 
     if failures:
         for line in failures:
@@ -206,10 +217,23 @@ def main() -> int:
         event = json.load(sys.stdin)
     except Exception:
         event = {}
-    _code, payload = run_hook(event if isinstance(event, dict) else {})
+    code, payload = run_hook(event if isinstance(event, dict) else {})
     if payload:
         print(json.dumps(payload, sort_keys=True))
-    return 0
+    # Two harnesses, two block dialects, and the hook must speak both.
+    #
+    # Claude Code reads `hookSpecificOutput.permissionDecision == "deny"` from stdout JSON.
+    # Codex reads the EXIT CODE: 2 blocks, and stderr is shown to the model as the reason.
+    #
+    # Until 2026-08-29 this function discarded run_hook's code and returned 0 unconditionally, so
+    # every deny was emitted in Claude Code's dialect and then handed to Codex as a clean exit.
+    # Codex is ~99% of Sage development. The gate could not have blocked anything there, and its
+    # own self-test could not see the defect because `_verdict()` inspects the payload and never
+    # asserts the exit code. That is the class this gate exists to prevent, shipped inside the gate.
+    if code == 2:
+        specific = payload.get("hookSpecificOutput") or {}
+        print(specific.get("permissionDecisionReason") or "architecture gate: denied", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":
