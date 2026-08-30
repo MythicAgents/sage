@@ -1436,6 +1436,95 @@ def test_gate1p_main_resumes_only_the_unstarted_naive_arm(monkeypatch, tmp_path)
     assert events == ["initialize", ("bare", 1), "compare"]
 
 
+def test_gate1p_main_passes_the_same_budget_to_both_arms(monkeypatch, tmp_path):
+    protocol = orchestrate._gate1p_stagea_protocol()
+    control = tmp_path / "pair-control.json"
+    results = tmp_path / "results.jsonl"
+    control.write_text(json.dumps({"next_arm": "shipping_sage"}), encoding="utf-8")
+    bloodhound = tmp_path / "bloodhound"
+    bloodhound.mkdir()
+    events = []
+
+    monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrate, "_gate1p_results_path", lambda _route_env=None: results)
+    monkeypatch.setattr(
+        orchestrate,
+        "initialize_gate1p_pair_control",
+        lambda **_kwargs: control,
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "run_side_with_gate1p_cleanup",
+        lambda _scenario, side, **kwargs: events.append(
+            (side, kwargs["arm_index"], kwargs["model_token_budget"])
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrate,
+        "compare",
+        lambda *_args, **kwargs: events.append(("compare", kwargs["results_path"])),
+    )
+
+    assert orchestrate.main([
+        "--scenario", "child-domain-control",
+        "--gate1p-stage-a-pair",
+        "--snapshot", protocol.RESET_SNAPSHOT,
+        "--source-version", "tree:test",
+        "--model-context-limit", "200000",
+        "--max-output-tokens", "8192",
+        "--go",
+        "--live-authority-id", protocol.PAIR_ID,
+    ]) == 0
+
+    assert events == [
+        ("harness", 0, protocol.TOKEN_ADMISSION_CEILING),
+        ("bare", 1, protocol.TOKEN_ADMISSION_CEILING),
+        ("compare", results),
+    ]
+
+
+def test_gate1p_compare_receives_the_exact_private_results_path(monkeypatch, tmp_path):
+    protocol = orchestrate._gate1p_stagea_protocol()
+    selected = tmp_path / "private-pair" / "results.jsonl"
+    unrelated_default = tmp_path / "default" / "bare_vs_harness.jsonl"
+    unrelated_default.parent.mkdir()
+    unrelated_default.write_text('{"wrong": "ledger"}\n', encoding="utf-8")
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(unrelated_default))
+    monkeypatch.delenv("SAGE_EVAL_API_KEY", raising=False)
+    observed = {}
+
+    def fake_run(name, argv, cwd, timeout, env=None):
+        observed.update(name=name, argv=argv, cwd=cwd, timeout=timeout, env=env)
+
+    monkeypatch.setattr(orchestrate, "_run", fake_run)
+    orchestrate.compare(
+        "child-domain-control",
+        pair_id=protocol.PAIR_ID,
+        results_path=selected,
+    )
+
+    assert observed["argv"][-2:] == ["--pair-id", protocol.PAIR_ID]
+    assert observed["env"]["SAGE_EVAL_RESULTS_PATH"] == str(selected)
+    assert observed["env"].get("SAGE_EVAL_API_KEY") is None
+    assert observed["env"]["SAGE_EVAL_RESULTS_PATH"] != str(unrelated_default)
+
+
+def test_legacy_compare_does_not_override_the_results_path(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        orchestrate,
+        "_run",
+        lambda _name, _argv, _cwd, _timeout, env=None: observed.update(env=env),
+    )
+
+    orchestrate.compare("child-da")
+
+    assert observed["env"] is None
+
+
 def test_gate1p_row_rejects_inherited_intervention_before_preflight(monkeypatch):
     protocol = orchestrate._gate1p_stagea_protocol()
     monkeypatch.setenv(

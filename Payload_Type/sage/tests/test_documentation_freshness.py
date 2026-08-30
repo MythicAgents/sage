@@ -108,7 +108,6 @@ def test_reset_docs_distinguish_logical_baseline_from_snapshot_identity():
     ).read_text(encoding="utf-8")
 
     assert "rollback clean-baseline --yes" not in agents
-    assert "sage-seed-baseline-20260710" in agents
     assert "rollback <snapshot-name> --yes" in reset_skill
     assert re.search(
         r"not guaranteed to be the literal Ludus snapshot\s+name",

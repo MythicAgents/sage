@@ -4,9 +4,9 @@
 WHY THIS METRIC
 ---------------
 The binary objective bit compressed an 81x cost difference into `1` vs `0` and produced a headline
-with two-tailed Fisher p = 1.0 at n=1. `bias_bounds.py` then showed the claim does not survive
-imputation: all four observed wins came from pairs whose naive arm was killed by a budget cap only
-that arm runs under.
+with two-tailed Fisher p = 1.0 at n=1. The fixed-budget result is valid but extremely low-density;
+`bias_bounds.py` separately shows that eventual success after the shared budget boundary is
+unidentified.
 
 Per-capability verifier outcomes cannot fix this. They are Sage-internal (`ISA.md:126` names the
 planner, capability catalog and private ledgers as treatment-side), so the control arm scores
@@ -14,8 +14,8 @@ structurally UNDEFINED rather than zero -- measuring the harness with the harnes
 
 Tool calls are the right unit. Both arms reach the range only through Mythic and BloodHound; the
 product contract forbids anything else. So both emit tool calls by construction, and a run that
-died on the budget wall STILL EMITTED EVERY CALL IT MADE BEFORE DYING. That converts most censoring
-into measurement: pairs unusable for the binary metric are partially informative here.
+reached the budget wall still emitted every call it made first. That adds dense process evidence to
+the valid but sparse fixed-budget binary outcome.
 
 The campaign's own lessons already said this. `REFERENCES_AND_LESSONS.md:147` (L5): "Density of the
 metric, not seed count, is the dominant term." `:158` (L7): "Fixing reward density shrinks the
@@ -36,11 +36,11 @@ TWO ANALYSES, BOTH REPORTED
   primary     equal-work truncation at K = min(exposure) within each pair, differenced per pair.
               Standard for unequal exposure, and paired, which is L7's prescription.
   sensitivity full exposure.
-If the two disagree, that disagreement IS the budget confound, quantified.
+If the two disagree, the result is exposure-sensitive and both views remain labeled.
 
 NEVER report a rate without its denominator. A clean arm that finishes early has thin exposure and
-can reach 1.0 cheaply; under the binary metric censoring flattered Sage, and under a naive rate thin
-exposure could flatter it too. Equal-work truncation is what neutralizes both directions.
+can reach 1.0 cheaply, while full exposure weights a longer run more heavily. Equal-work truncation
+is the paired process comparison; full exposure is retained as its sensitivity analysis.
 
 USAGE
     python3 Payload_Type/sage/ai/hillclimb/toolcall_validity.py [--json] [--self-test]
@@ -323,7 +323,7 @@ def main() -> int:
         print(f"{eq['pair']:>5}  {eq['k']:>4} {str(eq['shipping']):>8} {str(eq['naive']):>8} "
               f"{str(eq['delta']):>8}   |  {str(fu['shipping']):>6} {str(fu['naive']):>6} "
               f"{str(fu['delta']):>7}  {fu['n_shipping']:>6} {fu['n_naive']:>7}")
-    print("\nIf equal-work and full-exposure disagree, that disagreement is the budget confound.")
+    print("\nIf equal-work and full-exposure disagree, report the result as exposure-sensitive.")
     return 0
 
 

@@ -1182,11 +1182,20 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
     _run(f"gauge {side}/{scenario}", argv, PAYLOAD, step_timeout, env=child_env)
 
 
-def compare(scenario: str, *, pair_id: str | None = None) -> None:
+def compare(
+    scenario: str,
+    *,
+    pair_id: str | None = None,
+    results_path: Path | None = None,
+) -> None:
     argv = [PY, "ai/hillclimb/run_gauge_live.py", "compare", "--scenario", scenario]
     if pair_id:
         argv.extend(["--pair-id", pair_id])
-    _run(f"compare {scenario}", argv, PAYLOAD, 120)
+    child_env = None
+    if results_path is not None:
+        child_env = os.environ.copy()
+        child_env["SAGE_EVAL_RESULTS_PATH"] = str(results_path)
+    _run(f"compare {scenario}", argv, PAYLOAD, 120, env=child_env)
 
 
 def _gate1p_artifact_dir(route_env: dict[str, str] | None = None) -> Path:
@@ -2346,7 +2355,11 @@ def main(argv=None) -> int:
                              args.live_authority_id if args.gate1p_stage_a_pair else None
                          ))
     if not args.side and not args.null_model_factorial and not args.gate1p_stage_a_diagnostic:
-        compare(args.scenario, pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None)
+        compare(
+            args.scenario,
+            pair_id=gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
+            results_path=_gate1p_results_path(route_env) if args.gate1p_stage_a_pair else None,
+        )
     return 0
 
 

@@ -3,11 +3,10 @@
 
 WHY
 ---
-Pair 024 is the campaign's only comparison-countable pair, and its two arms are not comparable:
-shipping_sage scored 1.000 on 3,203 tokens while true_naive was terminated at 260,079 by
-`token_budget_overshoot`. `test_gate1p_budget_symmetry.py` proves in source that only the naive arm
-runs under a token budget at all -- `ai/hillclimb/` contains exactly one `TokenBudget(`
-construction, inside `bare_runner.py`.
+Pair 024 is the campaign's only comparison-countable pair. Shipping Sage scored 1.000 on 3,203
+tokens while true-naive reached the shared completed-call boundary at 260,079 tokens. Both arms
+receive the same ceiling and suppress a boundary-crossing action at their production seams; the
+focused symmetry test executes both mechanisms.
 
 A 96% discard rate is harmless to the estimate IF AND ONLY IF discards are independent of which arm
 was running. This tool answers that question from artifacts already on disk. No range time, no live
@@ -15,10 +14,10 @@ runs, no model calls.
 
 THE METHOD, AND WHY IT IS NOT A SIGNIFICANCE TEST
 -------------------------------------------------
-With counts this small a Fisher test on the burn table is theatre. The real question is
-**enumerative**: for each discard, is the cause *reachable* by the opposite arm? Budget truncation
-at 13 raw completions is not reachable by an arm that does not make 13 raw completions. If any
-cause class is arm-unreachable, the confound is established without a p-value.
+With counts this small a Fisher test on the burn table is theatre. The useful enumerative question
+is whether each discard cause is structurally reachable by the opposite arm. Observed budget
+attrition is arm-correlated, but the completed-call boundary itself is reachable by both arms; the
+census must not turn an observed imbalance into a false mechanism claim.
 
 So each row gets a `reachable_by_other_arm` verdict, and the summary reports the contingency table
 of cause class against arm plus the retention counts that motivated the census.
@@ -41,10 +40,10 @@ from typing import Any, Iterable
 ARMS = ("shipping_sage", "true_naive")
 
 # Cause classes, and whether the opposite arm could structurally have hit the same cause.
-# `False` here is the whole finding: a cause only one arm can experience is a design confound.
+# `False` means the mechanism itself is arm-specific, not merely observed in one arm.
 CAUSE_REACHABILITY = {
-    "token_budget_overshoot": False,   # aggregate cap over raw completions = the bare arm's shape
-    "token_budget_exhausted": False,   # same mechanism, non-overshoot spelling
+    "token_budget_overshoot": True,
+    "token_budget_exhausted": True,
     "arm_missing": None,               # needs the ledger to say why; resolved per-row below
     "completed": True,
     "objective_reached": True,
@@ -189,8 +188,8 @@ def self_test() -> int:
                 f"positive control failed: pair 024 true_naive classified as "
                 f"{naive_024[0]['cause_class']!r}, expected token_budget_overshoot"
             )
-    if CAUSE_REACHABILITY["token_budget_overshoot"] is not False:
-        failures.append("budget truncation must be marked arm-unreachable")
+    if CAUSE_REACHABILITY["token_budget_overshoot"] is not True:
+        failures.append("the shared completed-call boundary must be marked reachable by both arms")
     clean = {"clean_stop": True, "card": {"capability": 1.0}}
     if classify(clean, True) != ("completed", "objective_reached"):
         failures.append("clean objective run misclassified")
@@ -241,10 +240,7 @@ def main() -> int:
     for row in losses:
         print(f"  pair {row['pair']} {row['arm']}: {row['cause_class']}")
     if losses:
-        print(
-            "\nA cause class only one arm can experience is a design confound, not sampling noise.\n"
-            "No sample size corrects it. Establish it enumeratively; a p-value is not required."
-        )
+        print("\nAt least one observed loss mechanism is structurally arm-specific.")
     return 0
 
 

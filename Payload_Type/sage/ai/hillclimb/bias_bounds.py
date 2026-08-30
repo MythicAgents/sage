@@ -3,13 +3,15 @@
 
 WHY
 ---
-`disposition_census.py` established that attrition is arm-correlated with no overlap: shipping_sage
-reached live 8/8 and scored capability 1.0 on all eight; true_naive reached live 4/8 and every one
-of those four died on `token_budget_overshoot`. `test_gate1p_budget_symmetry.py` proves in source
-that only the naive arm runs under a token budget at all.
+`disposition_census.py` established that observed attrition is arm-correlated with no overlap:
+shipping_sage reached live 8/8 and scored capability 1.0 on all eight; true_naive reached live 4/8
+and every one of those four reached the shared completed-call token boundary. The boundary is
+structurally reachable by both arms, so this is a sensitivity analysis of observed censoring, not
+proof that only one arm had a budget.
 
-That establishes the confound exists. It does not say how big it is, or whether the campaign's
-headline ("the harness beats the bare model") survives it. This tool answers that.
+This does not invalidate the fixed-budget comparison: failure to achieve the objective within the
+shared budget is a valid zero for that estimand. This tool asks a different question—how the
+conclusion changes under an eventual-success estimand that imputes outcomes after the boundary.
 
 THE TWO MEASURES, AND WHY THE BINARY ONE THREW AWAY THE SIGNAL
 --------------------------------------------------------------
@@ -18,10 +20,10 @@ Pair 024 scored `1` against `0`. Underneath that single bit:
     shipping_sage   8 Mythic tasks issued, 8 completed, objective reached,   3,203 tokens
     true_naive      7 Mythic tasks issued, 7 completed, objective NOT reached, 260,079 tokens
 
-The naive arm did not flail. It issued seven Mythic tasks and completed all seven, then hit a cap
-its opponent does not run under. Scoring that as `0` records a right-censored observation as a
-failure event. Those are different objects, and conflating them biases toward the arm that is never
-censored.
+The naive arm did not flail. It issued seven Mythic tasks and completed all seven, then reached the
+shared cap. Scoring that as `0` is correct for success-within-budget. Treating it as right-censored
+asks an alternate question. The bounds keep those estimands explicit rather than using one to
+retroactively invalidate the other.
 
 Mythic task records are the right dense unit because BOTH arms emit them by construction -- the
 product contract forbids either from touching a target any other way. Sage-internal constructs
@@ -32,11 +34,11 @@ WHAT IT REPORTS
 ---------------
 1. Per-pair dense progress and exposure for every arm with a retained episode.
 2. `verified tasks per 1k tokens` -- exposure-normalized, symmetric, ground-truthed from Mythic.
-3. Tipping-point bounds on the binary claim:
-     best case for the null  -- every censored naive arm WOULD have reached the objective
+3. Tipping-point sensitivity under an alternate eventual-success estimand:
+     best case for the null  -- every budget-limited naive arm WOULD have reached the objective
      worst case for the null -- none of them would
-   If "harness > bare" survives the best case for the null, the censoring is immaterial and the
-   result stands as a low-power observation. If it flips, the headline is unsupported.
+   A flip means eventual success is unidentified after the boundary; it does not erase the
+   observed success-within-budget result.
 
 Reads only `.sage_history`. No range time, no model calls, no live runs.
 
@@ -143,7 +145,7 @@ def collect(root: Path | None = None) -> dict[str, Any]:
 
 def bounds(pairs: list[dict[str, Any]]) -> dict[str, Any]:
     complete = [p for p in pairs if p["both_arms_present"]]
-    censored = [
+    budget_limited = [
         p for p in complete
         if p["arms"]["true_naive"]["census"].get("cause_class", "").startswith("token_budget")
     ]
@@ -153,13 +155,14 @@ def bounds(pairs: list[dict[str, Any]]) -> dict[str, Any]:
         if p["arms"]["shipping_sage"]["dense"]["objective_reached"]
         and not p["arms"]["true_naive"]["dense"]["objective_reached"]
     )
-    # Best case for the null: every censored naive arm would have reached the objective, so those
+    # Best case for the null: every budget-limited naive arm would have reached the objective, so those
     # pairs stop being wins for the harness.
-    wins_best_for_null = wins - len(censored)
+    wins_best_for_null = wins - len(budget_limited)
     return {
+        "primary_estimand": "objective_success_within_shared_completed_call_budget",
         "complete_pairs": n,
         "observed_harness_wins": wins,
-        "censored_naive_arms": len(censored),
+        "budget_limited_naive_arms": len(budget_limited),
         "worst_case_for_null": {
             "wins": wins,
             "separation": "perfect" if wins == n else "partial",
@@ -170,8 +173,8 @@ def bounds(pairs: list[dict[str, Any]]) -> dict[str, Any]:
             "separation": "none" if wins_best_for_null <= 0 else "partial",
             "two_tailed_p": None,
             "note": (
-                "Every censored naive arm is imputed to have reached the objective. All observed "
-                "wins came from censored pairs, so the claim does not survive."
+                "Every budget-limited naive arm is imputed to have reached the objective. Eventual "
+                "success is unidentified; the fixed-budget result is unchanged."
                 if wins_best_for_null <= 0 else
                 "Some wins survive the imputation."
             ),
@@ -236,10 +239,11 @@ def main() -> int:
                 f"{str(dense['tasks_per_1k_tokens']):>12}"
             )
 
-    print(f"\nTipping-point bounds on 'harness > bare'")
+    print("\nFixed-budget result and eventual-success sensitivity")
+    print(f"  primary estimand:                     {result['primary_estimand']}")
     print(f"  complete pairs (both arms retained): {result['complete_pairs']}")
     print(f"  observed harness wins:               {result['observed_harness_wins']}")
-    print(f"  naive arms lost to the budget cap:   {result['censored_naive_arms']}")
+    print(f"  naive arms reaching the budget cap:  {result['budget_limited_naive_arms']}")
     worst, best = result["worst_case_for_null"], result["best_case_for_null"]
     print(f"\n  worst case for the null: {worst['wins']} wins, separation {worst['separation']}, "
           f"two-tailed p = {worst['two_tailed_p']}")

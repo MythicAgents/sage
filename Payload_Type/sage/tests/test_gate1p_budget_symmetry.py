@@ -1,128 +1,193 @@
-"""Gate 1P budget symmetry: a comparison is only valid if both arms run under the same constraint.
+"""Gate 1P completed-call budget symmetry at the real arm boundaries.
 
-WHY THIS FILE EXISTS
---------------------
-Pair 024, the campaign's only comparison-countable pair, recorded:
-
-    shipping_sage   capability 1.000   2 calls,      3,203 tokens, 8 tasks
-    true_naive      capability 0.000   token_budget_overshoot at 260,079 tokens
-
-The winning arm used 1/81st of what the losing arm was allowed to burn before being killed. The
-naive arm did not attempt the objective and fail; it was terminated by a resource cap. A
-right-censored observation was then scored as a failure event, which are different objects.
-
-An external review found the same pattern across the campaign: every documented arm-specific loss
-removed a BARE-MODEL trial (Pair 022 budget termination at 13 calls / 254,163 tokens; Pair 023 the
-same class; Pair 018 never produced a mate). Under arm-correlated censoring the estimate is biased
-toward the hypothesis being promoted.
-
-The mechanism is structural, not chance. `TOKEN_ADMISSION_CEILING` is an aggregate cap over a
-sequence of model completions. That is the bare runner's execution shape by construction: its whole
-disadvantage is that it has no planner, no capability catalog and no deterministic builders, so it
-must explore in raw completions. The harness arm executes capability plans against Mythic instead.
-A cap written in one arm's shape does not censor at random; it censors that arm. No sample size
-fixes it.
-
-WHAT THIS TEST ASSERTS, AND WHY IT FAILS TODAY
----------------------------------------------
-`test_scoring_function_is_arm_agnostic` passes: the disposition function itself is symmetric.
-
-`test_both_arms_run_under_the_same_ceiling` FAILS, deliberately, and documents the defect. As of
-2026-08-29 there is exactly one `TokenBudget` construction in `ai/hillclimb/` and it is inside
-`BareModelRunner`. No shipping-arm runner accepts a `token_ceiling` at all, and no shipping-arm
-runner module exists. Only one of the two arms can be stopped by the budget.
-
-This is a failing test on purpose. It is the falsifier for "is Gate 1P salvageable as specified,"
-and it is written as a test rather than a document so it cannot quietly stop being true. Delete it
-only when the budget is genuinely symmetric, never to make the suite green.
-
-HOW TO MAKE IT PASS (three options, in preference order)
---------------------------------------------------------
-1. Remove the cap as a TERMINATION trigger for both arms. Let each arm reach a self-determined
-   terminal state (success or give-up) and record token spend as a separate cost coordinate. This
-   is the option the review preferred: the 81x spread is the largest real effect in the dataset and
-   the binary metric threw it away.
-2. Cap on a resource both arms consume comparably -- objective-directed action count, or wall
-   clock -- and record a cap hit as `burned` (a censored observation), never as capability 0.0.
-   The ISA's own vocabulary already has the right word.
-3. Keep the token cap but enforce it identically on both arms, including Sage's own LLM calls.
-
-Until one of those lands, no pair is countable under this budget spec and Pair 024's +1.000 delta
-may not be promoted to a comparison result.
+The shipping arm enforces the boundary in ``ai.langgraph.policy.LLMPolicy``; the true-naive arm
+enforces it in ``ai.hillclimb.bare_runner.BareModelRunner``. These tests execute both mechanisms.
+Comments, docstrings, helper names, and unrelated constructors cannot satisfy the guard.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
-from pathlib import Path
+import json
 
 import pytest
 
-from ai.hillclimb import bare_runner, gate1p_stagea
+from ai.hillclimb import bare_runner, gate1p_stagea, run_gauge_live
+from ai.langgraph import policy
 
-CEILING = gate1p_stagea.TOKEN_ADMISSION_CEILING
+
+class _Action:
+    def __init__(self):
+        self.name = "candidate"
+        self.target = "target"
+        self.preconditions = []
+        self.effects = ["effect:candidate"]
+        self.reason = ""
 
 
-def _usage(*totals: int) -> list[dict]:
-    """A response stream with the given per-call total_tokens."""
-    return [
+class _State:
+    def achieved_effects(self):
+        return set()
+
+
+class _CrossingResponse:
+    content = json.dumps({
+        "disposition": "select",
+        "capability": "candidate",
+        "target": "target",
+        "rationale": "cross the boundary",
+    })
+    response_metadata = {"model_provider": "openai", "model_name": "test-model"}
+    usage_metadata = {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
+
+
+def _valid_request(*, side: str, arm_index: int, token_ceiling=10) -> dict:
+    return {
+        "protocol_id": gate1p_stagea.PROTOCOL_ID,
+        "pair_id": gate1p_stagea.PAIR_ID,
+        "scenario": gate1p_stagea.SCENARIO,
+        "side": side,
+        "arm_index": arm_index,
+        "provider": gate1p_stagea.MODEL_PROVIDER,
+        "model": gate1p_stagea.MODEL_ID,
+        "policy_mode": gate1p_stagea.POLICY_MODE,
+        "solve_timeout": gate1p_stagea.WALL_SECONDS,
+        "token_ceiling": token_ceiling,
+        "model_context_limit": 200_000,
+        "max_output_tokens": 8_192,
+        "source_version": "tree:test",
+        "api_endpoint": "https://provider.invalid/v1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("side", "arm_index", "expected_arm"),
+    (("harness", 0, "shipping_sage"), ("bare", 1, "true_naive")),
+)
+def test_both_arms_require_the_same_protocol_ceiling(side, arm_index, expected_arm):
+    request = _valid_request(
+        side=side,
+        arm_index=arm_index,
+        token_ceiling=gate1p_stagea.TOKEN_ADMISSION_CEILING,
+    )
+    assert gate1p_stagea.validate_request(**request) == expected_arm
+
+    with pytest.raises(gate1p_stagea.ProtocolError, match="token_ceiling"):
+        gate1p_stagea.validate_request(**{**request, "token_ceiling": 250_001})
+
+
+def test_assembled_driver_defaults_to_the_frozen_shared_ceiling():
+    cfg = run_gauge_live.Config(measurement_kind="row")
+    invariants = gate1p_stagea.pair_invariants(
+        provider=gate1p_stagea.MODEL_PROVIDER,
+        model=gate1p_stagea.MODEL_ID,
+        api_endpoint="https://provider.invalid/v1",
+        source_version="tree:test",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+    )
+
+    assert cfg.model_token_budget == gate1p_stagea.TOKEN_ADMISSION_CEILING
+    assert invariants["token_admission_ceiling"] == gate1p_stagea.TOKEN_ADMISSION_CEILING
+    assert invariants["token_budget_boundary"] == "completed_model_call_v1"
+
+
+def _run_naive_crossing(*, ceiling):
+    decisions = iter([
         {
-            "response_id": f"resp-{index}",
-            "total_tokens": total,
-            "input_tokens": total // 2,
-            "output_tokens": total - total // 2,
-        }
-        for index, total in enumerate(totals)
+            "tool": "noop",
+            "args": {},
+            "_usage": {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11},
+        },
+        {
+            "final": "done",
+            "_usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        },
+    ])
+    dispatched: list[dict] = []
+    runner = bare_runner.BareModelRunner(
+        lambda _system, _tools, _history: next(decisions),
+        lambda call: dispatched.append(call) or {"ok": True},
+        tools_spec=[],
+        token_ceiling=ceiling,
+        require_complete_usage=True,
+    )
+    return runner.run("cross the boundary"), dispatched
+
+
+def _run_shipping_crossing(*, ceiling):
+    async def decide(_request):
+        return _CrossingResponse()
+
+    return asyncio.run(policy.LLMPolicy(
+        decide,
+        provider="openai",
+        model_id="test-model",
+        catalog=[{"name": "candidate", "description": "candidate"}],
+        completed_call_token_ceiling=ceiling,
+    ).select(
+        episode_id="episode-budget-symmetry",
+        objective="cross the boundary",
+        state=_State(),
+        candidates=[_Action()],
+        history=[],
+    ))
+
+
+def test_both_arms_suppress_the_boundary_crossing_action():
+    naive, dispatched = _run_naive_crossing(ceiling=10)
+    shipping = _run_shipping_crossing(ceiling=10)
+
+    assert naive.stopped == "token_budget_overshoot"
+    assert naive.model_calls == 1
+    assert dispatched == []
+    assert shipping.disposition == "stop"
+    assert shipping.raw_disposition == "select"
+    assert shipping.model_response_observed is True
+    assert shipping.selected_capability == ""
+    assert shipping.token_usage == {"input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
+
+
+def test_negative_control_proves_removing_the_ceiling_releases_both_actions():
+    naive, dispatched = _run_naive_crossing(ceiling=None)
+    shipping = _run_shipping_crossing(ceiling=None)
+
+    assert naive.stopped == "done"
+    assert len(dispatched) == 1
+    assert shipping.disposition == "select"
+    assert shipping.selected_capability == "candidate"
+
+
+def test_crossing_evidence_is_admitted_identically_after_both_runners_stop():
+    record = {
+        "response_id": "r1",
+        "effective_backend": "openai:test-model",
+        "backend_provenance_source": "response_metadata.model_name",
+        "input_tokens": 9,
+        "output_tokens": 2,
+        "total_tokens": 11,
+        "usage_complete": True,
+    }
+    dispositions = [
+        gate1p_stagea.completed_call_budget_disposition(
+            [record],
+            model_calls=1,
+            action_response_ids=[],
+            token_ceiling=10,
+            model_context_limit=100,
+            max_output_tokens=10,
+        )
+        for _arm in gate1p_stagea.ARMS
     ]
 
+    assert dispositions[0] == dispositions[1]
+    assert dispositions[0]["countable"] is True
+    assert dispositions[0]["boundary_reached"] is True
+    assert dispositions[0]["overshoot"] is True
+    assert dispositions[0]["terminal_response_id"] == "r1"
 
-def test_ceiling_is_the_single_declared_constant() -> None:
-    """Floor assertion: if this drifts, every other assertion here is measuring the wrong thing."""
-    assert CEILING == 250_000
-    assert gate1p_stagea.ARMS == ("shipping_sage", "true_naive")
 
-
-def test_scoring_function_is_arm_agnostic() -> None:
-    """The disposition function is symmetric. The defect is in enforcement, not in scoring."""
+def test_scoring_function_has_no_arm_branch():
     signature = inspect.signature(gate1p_stagea.completed_call_budget_disposition)
-    assert "arm" not in signature.parameters, (
-        "completed_call_budget_disposition must not branch on arm; if it grows an arm parameter, "
-        "the asymmetry has moved into the scorer as well."
-    )
-
-
-@pytest.mark.parametrize("arm", gate1p_stagea.ARMS)
-def test_both_arms_run_under_the_same_ceiling(arm: str) -> None:
-    """FAILS for shipping_sage by design. See the module docstring.
-
-    A comparison in which only one arm can be terminated by the budget is not a measurement of the
-    treatment; it is a measurement of which arm the budget was shaped around.
-    """
-    hillclimb_dir = Path(bare_runner.__file__).parent
-    constructions = {
-        path.name
-        for path in hillclimb_dir.glob("*.py")
-        if "TokenBudget(" in path.read_text(errors="replace")
-    }
-
-    runners_with_a_ceiling = {
-        name: obj
-        for name, obj in vars(bare_runner).items()
-        if inspect.isclass(obj)
-        and "token_ceiling" in inspect.signature(obj.__init__).parameters
-    }
-
-    if arm == "true_naive":
-        assert "bare_runner.py" in constructions
-        assert runners_with_a_ceiling, "the naive arm lost its budget enforcement"
-        return
-
-    assert constructions - {"bare_runner.py"}, (
-        f"arm {arm!r} runs under no token budget. Exactly one module constructs a TokenBudget "
-        f"({sorted(constructions)}), and it enforces the ceiling only on the bare model. "
-        f"Pair 024: shipping_sage completed on 3,203 tokens while true_naive was terminated at "
-        f"260,079 -- an 81x spread in what each arm was permitted to spend. Every documented "
-        f"arm-specific loss in the campaign removed a bare-model trial, so the censoring is "
-        f"arm-correlated and biased toward the hypothesis under test. Fix the budget, not this "
-        f"test; see this module's docstring for the three accepted options."
-    )
+    assert "arm" not in signature.parameters
