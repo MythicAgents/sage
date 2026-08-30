@@ -68,6 +68,7 @@ _AUTHORIZED_CALLBACK_REALMS = {
     "braavos": {"essos", "essos.local"},
 }
 OBJECTIVE_PROOF_CLASSES = ("directory_delta", "certificate_control", "ticket_control")
+OBSERVER_VERSION = "gate1p-stagea-observer-facts-v22"
 
 
 class ProtocolError(ValueError):
@@ -692,13 +693,17 @@ def observer_facts_disposition(
     observer: Mapping[str, Any] | object,
     *,
     arm: str,
+    pair_id: str = PAIR_ID,
+    arms: tuple[str, ...] = ARMS,
+    observer_version: str = OBSERVER_VERSION,
+    oracle_canonicalizer: Callable[[object], dict[str, Any]] = _canonical_oracle_fact,
 ) -> dict[str, Any]:
     """Validate the complete finite observer evidence tree without semantic aliases."""
-    if arm not in ARMS:
+    if arm not in arms:
         return {"countable": False, "reason": "observer arm is not declared"}
     if not _exact_mapping_keys(observer, _OBSERVER_FACT_FIELDS):
         return {"countable": False, "reason": "raw observer top-level schema is not exact"}
-    if observer.get("observer_version") != "gate1p-stagea-observer-facts-v22":
+    if observer.get("observer_version") != observer_version:
         return {"countable": False, "reason": "raw observer-facts version is mismatched"}
     if type(observer.get("task_window_observed")) is not bool:
         return {"countable": False, "reason": "task-window observation state is not Boolean"}
@@ -707,7 +712,7 @@ def observer_facts_disposition(
     ) is not bool:
         return {"countable": False, "reason": "wrapper recognition fact is not Boolean or unavailable"}
     try:
-        oracle = _canonical_oracle_fact(observer.get("oracle"))
+        oracle = oracle_canonicalizer(observer.get("oracle"))
     except ObserverUnavailable as exc:
         return {"countable": False, "reason": str(exc)}
     if dict(observer["oracle"]) != oracle:
@@ -754,7 +759,7 @@ def observer_facts_disposition(
             return {"countable": False, "reason": "observer event sequence is malformed"}
         if type(event.get("monotonic_ns")) is not int or event["monotonic_ns"] < 0:
             return {"countable": False, "reason": "observer event timestamp is malformed"}
-        expected_id = f"{PAIR_ID}:{arm}:{event['source']}:{expected_sequence}"
+        expected_id = f"{pair_id}:{arm}:{event['source']}:{expected_sequence}"
         if event.get("event_id") != expected_id or expected_id in event_ids:
             return {"countable": False, "reason": "observer event identity is malformed or duplicated"}
         event_ids.add(expected_id)
@@ -802,9 +807,10 @@ def episode_outcome_disposition(
     arm: str,
     total_tokens: object,
     token_ceiling: object,
+    facts_disposition: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Derive all outcome semantics from closed-world observer facts and token evidence."""
-    facts = observer_facts_disposition(observer, arm=arm)
+    facts = (facts_disposition or observer_facts_disposition)(observer, arm=arm)
     if facts.get("countable") is not True:
         return facts
     if type(total_tokens) is not int or total_tokens < 0:
@@ -1152,6 +1158,9 @@ class LiveEpisodeObserver:
         task_poll_seconds: float = TASK_POLL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         event_clock_ns: Callable[[], int] = time.monotonic_ns,
+        oracle_canonicalizer: Callable[[object], dict[str, Any]] = _canonical_oracle_fact,
+        observer_version: str = OBSERVER_VERSION,
+        thread_name_prefix: str = "gate1p-stagea",
     ):
         self.objective_probe = objective_probe
         self.task_fetcher = task_fetcher
@@ -1161,6 +1170,9 @@ class LiveEpisodeObserver:
         self.task_quiescence_seconds = float(task_quiescence_seconds)
         self.task_poll_seconds = float(task_poll_seconds)
         self.clock = clock
+        self.oracle_canonicalizer = oracle_canonicalizer
+        self.observer_version = str(observer_version)
+        self.thread_name_prefix = str(thread_name_prefix)
         self.coordinator = EventCoordinator(pair_id, arm, clock_ns=event_clock_ns)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -1283,7 +1295,7 @@ class LiveEpisodeObserver:
         finally:
             with self._lock:
                 self._objective_producer_active = False
-        observation = _canonical_oracle_fact(raw)
+        observation = self.oracle_canonicalizer(raw)
         if deadline is None and self._terminal_at is not None:
             deadline = self._terminal_at + self.objective_settle_seconds
         if deadline is not None and self.clock() > deadline:
@@ -1364,12 +1376,12 @@ class LiveEpisodeObserver:
         self.coordinator.emit("coordinator", "arm_started")
         self._task_thread = threading.Thread(
             target=self._task_loop,
-            name="gate1p-stagea-task-observer",
+            name=f"{self.thread_name_prefix}-task-observer",
             daemon=True,
         )
         self._objective_thread = threading.Thread(
             target=self._objective_loop,
-            name="gate1p-stagea-objective-observer",
+            name=f"{self.thread_name_prefix}-objective-observer",
             daemon=True,
         )
         self._task_thread.start()
@@ -1426,7 +1438,7 @@ class LiveEpisodeObserver:
 
         with self._lock:
             return {
-                "observer_version": "gate1p-stagea-observer-facts-v22",
+                "observer_version": self.observer_version,
                 "oracle": dict(self._objective_observation or {}),
                 "task_window_observed": bool(self._task_window_observed),
                 "wrapper_objective_recognized": (

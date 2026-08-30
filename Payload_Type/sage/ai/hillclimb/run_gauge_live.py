@@ -28,21 +28,24 @@ from pathlib import Path
 from typing import Callable
 
 try:
-    from . import gate1p_stagea, live_seams, bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod
-    from .scenarios import all_scenarios, CHILD, OBJECTIVE
+    from . import (gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams, bare_runner,
+                   bare_mythic_tools, bare_bloodhound, probes as probes_mod)
+    from .scenarios import all_scenarios, CHILD, CHILD_DC, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from ai.hillclimb import (  # type: ignore
         gate1p_stagea,
+        gate1p_stageb,
+        gate1p_protocol,
         live_seams,
         bare_runner,
         bare_mythic_tools,
         bare_bloodhound,
         probes as probes_mod,
     )
-    from ai.hillclimb.scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
+    from ai.hillclimb.scenarios import all_scenarios, CHILD, CHILD_DC, OBJECTIVE  # type: ignore
     from ai.hillclimb.range_state import Milestone  # type: ignore
     from ai.hillclimb.fitness import ScoreCard  # type: ignore
 
@@ -241,6 +244,67 @@ def _resolved_harness_model_route(cfg: Config) -> dict[str, str | None]:
     }
 
 
+def _stageb_proof_adapters(
+    reader,
+    baseline: dict,
+    *,
+    objective_domain: str,
+    directory_probe: Callable[[], bool] | None = None,
+):
+    baseline_members = set(baseline.get(objective_domain, set()))
+
+    def directory_delta() -> bool:
+        return bool(set(reader(objective_domain)) - baseline_members)
+
+    def typed(name: str, probe: Callable[[], bool], *, require_fresh: bool = True):
+        def read() -> bool:
+            try:
+                value = probe()
+            except live_seams.ProbeReadError as exc:
+                raise gate1p_stageb.ProofUnavailable(str(exc)) from exc
+            if type(value) is not bool:
+                raise gate1p_stagea.ObserverUnavailable(
+                    f"malformed {name} proof baseline: Boolean state required"
+                )
+            return value
+
+        baseline_available = True
+        baseline_value = False
+        if require_fresh:
+            try:
+                baseline_value = read()
+            except gate1p_stageb.ProofUnavailable:
+                baseline_available = False
+
+        def observe() -> bool:
+            if not baseline_available:
+                raise gate1p_stageb.ProofUnavailable(
+                    f"{name} proof baseline was unavailable"
+                )
+            current = read()
+            return current and not baseline_value if require_fresh else current
+
+        return gate1p_stageb.make_proof_adapter(name, observe)
+
+    return (
+        typed("directory_delta", directory_probe or directory_delta, require_fresh=False),
+        typed(
+            "certificate_control",
+            live_seams.certificate_admin_control_probe(None, realm=objective_domain),
+        ),
+        typed("ticket_control", live_seams.ticket_admin_control_probe(realm=objective_domain)),
+        typed("krbtgt_control", live_seams.krbtgt_dumped_probe(realm=objective_domain)),
+        typed(
+            "system_on_child_dc",
+            live_seams.system_execution_probe(realm=objective_domain, host=CHILD_DC),
+        ),
+        typed(
+            "remote_exec_child_dc",
+            live_seams.remote_execution_probe(CHILD_DC, realm=objective_domain),
+        ),
+    )
+
+
 def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                  settle_interval: float = 20) -> dict:
     """Build ledger-independent range probes shared by harness and bare-model runs.
@@ -263,7 +327,18 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
             reader, child_domain, baseline=baseline.get(child_domain, set()),
             settle_timeout=settle_timeout, settle_interval=settle_interval)
     if Milestone.OBJECTIVE in sub:
-        if _objective_uses_remote_exec_probe(scenario):
+        if getattr(scenario, "name", "") == gate1p_stageb.SCENARIO:
+            objective_oracle = gate1p_stageb.build_objective_oracle(
+                _stageb_proof_adapters(reader, baseline, objective_domain=objective_domain),
+                artifact_pointer="unretained:stageb-probe-assembly",
+                domain=objective_domain,
+            )
+            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
+                lambda: bool(objective_oracle()["success"]),
+                settle_timeout=settle_timeout,
+                settle_interval=settle_interval,
+            )
+        elif _objective_uses_remote_exec_probe(scenario):
             remote_targets = _objective_remote_exec_targets(scenario)
             if len(remote_targets) != 1:
                 raise ValueError(
@@ -349,7 +424,10 @@ def _scored_referee_domains(scn) -> set:
         child = str(domains.get("child") or "").strip()
         if child:
             scored.add(child)
-    if Milestone.OBJECTIVE in sub and not _objective_uses_remote_exec_probe(scn):
+    if Milestone.OBJECTIVE in sub and (
+        getattr(scn, "name", "") == gate1p_stageb.SCENARIO
+        or not _objective_uses_remote_exec_probe(scn)
+    ):
         objective = str(domains.get("objective") or "").strip()
         if objective:
             scored.add(objective)
@@ -567,7 +645,7 @@ def runtime_evidence_fields(telemetry: dict | None) -> dict:
     return {key: telemetry[key] for key in keys if key in telemetry}
 
 
-_GATE1P_PRIMARY_SCENARIOS = frozenset({"child-domain-control", "child-control"})
+_GATE1P_PRIMARY_SCENARIOS = gate1p_protocol.primary_scenarios()
 
 
 def measurement_dimensions(
@@ -770,14 +848,20 @@ def run_side(
 ) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     row_arm = ""
+    row_protocol = None
     if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        row_protocol = gate1p_protocol.protocol_for_request(
+            protocol_id=cfg.protocol_id,
+            scenario=scenario_name,
+        )
         incompatible = gate1p_stagea.active_incompatible_evaluation_overrides(os.environ)
         if incompatible:
             raise gate1p_stagea.ProtocolError(
                 "Gate 1P row inherited incompatible evaluation override(s): "
                 + ", ".join(incompatible)
             )
-        row_arm = gate1p_stagea.validate_request(
+        row_arm = row_protocol.validate_request(
+            require_allocation=True,
             protocol_id=cfg.protocol_id,
             pair_id=cfg.pair_id,
             scenario=scenario_name,
@@ -793,12 +877,12 @@ def run_side(
             source_version=cfg.source_version,
             api_endpoint=cfg.model_api_endpoint,
         )
-        if cfg.live_authority_id != gate1p_stagea.PAIR_ID:
+        if cfg.live_authority_id != row_protocol.pair_id:
             raise gate1p_stagea.ProtocolError(
-                f"live paired-row execution requires separate authority ID {gate1p_stagea.PAIR_ID!r}"
+                f"live paired-row execution requires separate authority ID {row_protocol.pair_id!r}"
             )
     scn = _scenario(cfg, scenario_name)
-    if row_arm and scn.objective != gate1p_stagea.OBJECTIVE:
+    if row_arm and scn.objective != row_protocol.objective:
         raise gate1p_stagea.ProtocolError("assembled scenario objective bytes differ from the accepted protocol")
     if row_arm and _pair_arm_has_started(
         cfg.results_path,
@@ -1028,7 +1112,7 @@ def run_side(
             )
             canonical_response_records = list(usage_evidence.get("canonical_records") or [])
             canonical_outcome = (
-                gate1p_stagea.episode_outcome_disposition(
+                row_protocol.episode_outcome_disposition(
                     observer_result,
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
@@ -1117,7 +1201,7 @@ def run_side(
             )
             canonical_response_records = list(usage_evidence.get("canonical_records") or [])
             canonical_outcome = (
-                gate1p_stagea.episode_outcome_disposition(
+                row_protocol.episode_outcome_disposition(
                     observer_result,
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
@@ -1174,7 +1258,7 @@ def run_side(
         else runtime_telemetry.get("token_usage_complete") is True
     )
     observer_evidence = (
-        gate1p_stagea.observer_facts_disposition(observer_result, arm=row_arm)
+        row_protocol.observer_facts_disposition(observer_result, arm=row_arm)
         if row_arm and observer_result
         else {"countable": False}
     )
@@ -1383,7 +1467,7 @@ def run_side(
     print(f"[{side}/{scenario_name}] capability={card.capability:.3f} furthest={card.furthest_milestone} "
           f"-> recorded to {p}", flush=True)
     if row_arm:
-        arm_admission = gate1p_stagea.arm_comparison_disposition(rec)
+        arm_admission = row_protocol.module.arm_comparison_disposition(rec)
         if arm_admission.get("countable") is not True:
             raise RuntimeError(
                 "the arm was retained but cannot admit its mate; stop the pair: "
@@ -1458,10 +1542,11 @@ def compare(cfg: Config, scenario_name: str) -> None:
         if not line.strip():
             continue
         parsed_records.append(json.loads(line))
-    if scenario_name == gate1p_stagea.SCENARIO:
-        if cfg.pair_id != gate1p_stagea.PAIR_ID:
+    if scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        protocol = gate1p_protocol.protocol_for_scenario(scenario_name)
+        if cfg.pair_id != protocol.pair_id:
             raise SystemExit("Gate 1P comparison pair identity is mismatched")
-        disposition = gate1p_stagea.pair_disposition(parsed_records)
+        disposition = protocol.comparison_disposition(parsed_records)
         print(json.dumps({"pair_disposition": disposition}, sort_keys=True))
         if disposition.get("countable") is not True:
             raise SystemExit(f"Gate 1P pair is not comparison-countable: {disposition.get('reason')}")
@@ -1634,9 +1719,15 @@ def main(argv=None) -> int:
             ap.error("the approved Gate 1P diagnostic is exactly harness/child-domain-control")
         if not cfg.protocol_id:
             ap.error("--protocol-id is required for the Gate 1P diagnostic")
+    selected_protocol = None
     if cfg.measurement_kind == "row" and args.scenario in _GATE1P_PRIMARY_SCENARIOS:
         try:
-            gate1p_stagea.validate_request(
+            selected_protocol = gate1p_protocol.protocol_for_request(
+                protocol_id=cfg.protocol_id,
+                scenario=args.scenario,
+            )
+            selected_protocol.validate_request(
+                require_allocation=False,
                 protocol_id=cfg.protocol_id,
                 pair_id=cfg.pair_id,
                 scenario=args.scenario,
@@ -1654,12 +1745,14 @@ def main(argv=None) -> int:
             )
         except gate1p_stagea.ProtocolError as exc:
             ap.error(str(exc))
-        if args.cmd == "run" and args.go and not gate1p_stagea.PAIR_ALLOCATED:
-            ap.error("the Gate 1P successor pair is not allocated for live execution")
-        if args.cmd == "run" and args.go and cfg.live_authority_id != gate1p_stagea.PAIR_ID:
+        if args.cmd == "run" and args.go and not selected_protocol.pair_allocated:
+            ap.error(
+                f"{selected_protocol.protocol_id} is unallocated; live execution is not authorized"
+            )
+        if args.cmd == "run" and args.go and cfg.live_authority_id != selected_protocol.pair_id:
             ap.error(
                 f"live paired-row execution requires separate --live-authority-id "
-                f"{gate1p_stagea.PAIR_ID}"
+                f"{selected_protocol.pair_id}"
             )
 
     if args.cmd == "compare":
@@ -1667,6 +1760,13 @@ def main(argv=None) -> int:
         return 0
 
     if not args.go:
+        if selected_protocol is not None and not selected_protocol.pair_allocated:
+            print(json.dumps({"prospective_protocol": selected_protocol.assembled_contract()}, sort_keys=True))
+            print(
+                "UNALLOCATED: protocol assembly only. No reset, arm, model, Mythic, "
+                "BloodHound, range, target, or comparison call is authorized."
+            )
+            return 0
         d = live_seams.load_sage_defaults()
         print(f"DRY RUN (no --go). Would run side={args.side} scenario={args.scenario}")
         print(f"  RESET the range first ({{sage-goad-reset}}) — each run needs a clean lab.")

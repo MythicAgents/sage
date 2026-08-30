@@ -75,6 +75,13 @@ def _gate1p_stagea_protocol():
     return gate1p_stagea
 
 
+def _gate1p_protocol_selector():
+    sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import gate1p_protocol  # type: ignore
+
+    return gate1p_protocol
+
+
 def _laps_family_transfer_netbios_map() -> str:
     laps_contract = _active_laps_contract()
     mapping = {laps_contract.ROOT_NETBIOS: laps_contract.ROOT_DOMAIN}
@@ -1902,6 +1909,18 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
+    if protocol_id and measurement_kind == "row":
+        selected = _gate1p_protocol_selector().protocol_for_request(
+            protocol_id=protocol_id,
+            scenario=scenario,
+        )
+        if not selected.pair_allocated:
+            print(json.dumps({"prospective_protocol": selected.assembled_contract()}, sort_keys=True))
+            print(
+                "\nUNALLOCATED: protocol assembly only. No reset, arm, model, Mythic, "
+                "BloodHound, range, target, or comparison command is emitted."
+            )
+            return
     if measurement_kind == "row":
         print(f"  durable-artifact-dir={_gate1p_artifact_dir()}\n")
     for s in range(seeds):
@@ -2029,6 +2048,11 @@ def main(argv=None) -> int:
         "--gate1p-stage-a-pair",
         action="store_true",
         help="run the exact accepted one-row shipping-Sage/true-naive Stage A pair",
+    )
+    ap.add_argument(
+        "--gate1p-stage-b-protocol",
+        action="store_true",
+        help="assemble the prospective unallocated Stage B child-control protocol offline",
     )
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
@@ -2185,8 +2209,12 @@ def main(argv=None) -> int:
         ap.error("--null-model-factorial cannot be combined with a named model treatment")
     policy_modes = ["symbolic", "llm", "hybrid"] if args.null_model_factorial else [policy_mode]
     null_model = bool(args.null_model or args.null_model_factorial)
-    if args.gate1p_stage_a_diagnostic and args.gate1p_stage_a_pair:
-        ap.error("the non-countable diagnostic and countable paired-row modes are mutually exclusive")
+    if sum(map(bool, (
+        args.gate1p_stage_a_diagnostic,
+        args.gate1p_stage_a_pair,
+        args.gate1p_stage_b_protocol,
+    ))) > 1:
+        ap.error("Gate 1P diagnostic, Stage A pair, and Stage B protocol modes are mutually exclusive")
     if args.gate1p_stage_a_diagnostic:
         if args.scenario != "child-domain-control" or args.side != "harness" or args.seeds != 1:
             ap.error(
@@ -2204,6 +2232,17 @@ def main(argv=None) -> int:
             ap.error(
                 "SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the Gate 1P diagnostic"
             )
+    stageb = _gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    if args.gate1p_stage_b_protocol:
+        if args.scenario != stageb.SCENARIO or args.side is not None or args.seeds != 1:
+            ap.error(
+                f"--gate1p-stage-b-protocol requires --scenario {stageb.SCENARIO} "
+                "with no --side and --seeds 1"
+            )
+        if policy_mode != stageb.POLICY_MODE or null_model or args.treatment:
+            ap.error("the Stage B protocol declares only the shipping llm policy and true-naive arm")
+        if args.go:
+            ap.error(f"{stageb.PROTOCOL_ID} is unallocated; --go cannot reset or execute anything")
     route_env = None
     if args.treatment:
         route = load_treatment_route(args.route_env, args.treatment)
@@ -2270,18 +2309,23 @@ def main(argv=None) -> int:
                           args.seeds, args.solve_timeout, selected_mode,
                           args.provider, args.model, null_model,
                           (
-                              "row" if args.gate1p_stage_a_pair
+                              "row" if args.gate1p_stage_a_pair or args.gate1p_stage_b_protocol
                               else "diagnostic" if args.gate1p_stage_a_diagnostic
                               else "legacy"
                           ),
                           (
                               gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
+                              else stageb.PROTOCOL_ID if args.gate1p_stage_b_protocol
                               else "gate1p-stage-a-diagnostic-v1"
                               if args.gate1p_stage_a_diagnostic
                               else None
                           ),
                           gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
-                          gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair else None,
+                          (
+                              gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair
+                              else stageb.TOKEN_ADMISSION_CEILING
+                              if args.gate1p_stage_b_protocol else None
+                          ),
                           args.model_context_limit,
                           args.max_output_tokens,
                           args.source_version,

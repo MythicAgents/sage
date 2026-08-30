@@ -16,6 +16,68 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(orchestrate)
 
 
+def _stageb_protocol_argv(*extra):
+    return [
+        str(PY),
+        str(SCRIPT),
+        "--scenario",
+        "child-control",
+        "--gate1p-stage-b-protocol",
+        "--snapshot",
+        "sage-seed-apollo-v252-mythic4-20260829",
+        *extra,
+    ]
+
+
+def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_contract():
+    result = subprocess.run(
+        _stageb_protocol_argv(),
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = result.stdout
+    assert '"protocol_id": "gate1p-stage-b-child-control-completed-call-budget-v1"' in output
+    assert '"matrix_id": "gate1p-stageb-child-control-matrix-v1"' in output
+    assert '"pair_allocated": false' in output
+    assert '"pair_id": null' in output
+    assert "UNALLOCATED: protocol assembly only" in output
+    assert "rollback " not in output
+    assert "bootstrap_payloads.py" not in output
+    assert "run --go" not in output
+    assert "compare --scenario" not in output
+
+
+def test_gate1p_stageb_go_fails_before_reset_or_execution_plan():
+    result = subprocess.run(
+        _stageb_protocol_argv("--go"),
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "is unallocated; --go cannot reset or execute anything" in result.stderr
+    assert "rollback " not in result.stdout
+    assert "bootstrap_payloads.py" not in result.stdout
+
+
+def test_gate1p_stageb_protocol_mode_is_mutually_exclusive_with_stagea_pair():
+    result = subprocess.run(
+        _stageb_protocol_argv("--gate1p-stage-a-pair"),
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "modes are mutually exclusive" in result.stderr
+
+
 def test_dry_run_uses_staged_snapshot_retained_config_and_existing_apollo():
     result = subprocess.run(
         [
