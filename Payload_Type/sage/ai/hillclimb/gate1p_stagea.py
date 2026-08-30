@@ -71,6 +71,22 @@ OBJECTIVE_PROOF_CLASSES = ("directory_delta", "certificate_control", "ticket_con
 OBSERVER_VERSION = "gate1p-stagea-observer-facts-v22"
 
 
+@dataclass(frozen=True)
+class PairAdmissionSpec:
+    protocol_id: str = PROTOCOL_ID
+    pair_id: str = PAIR_ID
+    scenario: str = SCENARIO
+    objective: str = OBJECTIVE
+    observer_version: str = OBSERVER_VERSION
+    reset_snapshot: str = RESET_SNAPSHOT
+    oracle_version: str = "gate1p-child-control-route-neutral-v2"
+    readiness_protocol: str = "gate1p-stagea-last-material-mutation-qualified-reset-v2"
+    logical_seed: int = 0
+
+
+STAGEA_ADMISSION = PairAdmissionSpec()
+
+
 class ProtocolError(ValueError):
     """The prospective row contract is incomplete or mismatched."""
 
@@ -423,17 +439,18 @@ def _comparison_input_disposition(
     row: Mapping[str, Any],
     *,
     arm: str,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> dict[str, Any]:
     """Project the exact finite result surface consumed after pair admission."""
     expected_side = SIDE_BY_ARM.get(arm)
-    if row.get("scenario") != SCENARIO:
+    if row.get("scenario") != admission.scenario:
         return {"countable": False, "reason": "result scenario is missing or mismatched"}
     if row.get("side") != expected_side:
         return {"countable": False, "reason": "result side does not match its protocol arm"}
     card = row.get("card")
     if not isinstance(card, Mapping) or set(card) != _SCORECARD_FIELDS:
         return {"countable": False, "reason": "scorecard constructor schema is not exact"}
-    if card.get("scenario") != SCENARIO:
+    if card.get("scenario") != admission.scenario:
         return {"countable": False, "reason": "scorecard scenario is missing or mismatched"}
     if type(card.get("objective_proven")) is not bool or type(card.get("clean_stop")) is not bool:
         return {"countable": False, "reason": "scorecard comparison outcomes are not Boolean"}
@@ -468,6 +485,8 @@ def _comparison_input_disposition(
 
 def _lifecycle_envelope_disposition(
     records: Iterable[Mapping[str, Any]],
+    *,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> dict[str, Any]:
     """Validate every record in the dedicated pair ledger before selecting an arm."""
     positioned: list[tuple[int, str, Mapping[str, Any]]] = []
@@ -497,8 +516,8 @@ def _lifecycle_envelope_disposition(
         }
         arm = str(identity["arm"] or "")
         if (
-            identity["protocol_id"] != PROTOCOL_ID
-            or identity["pair_id"] != PAIR_ID
+            identity["protocol_id"] != admission.protocol_id
+            or identity["pair_id"] != admission.pair_id
             or arm not in ARMS
             or record_type not in allowed_by_arm[arm]
         ):
@@ -516,11 +535,12 @@ def _arm_record_order_disposition(
     *,
     arm: str,
     include_cleanup: bool,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> dict[str, Any]:
     """Preserve physical JSONL/list positions for one arm's typed lifecycle records."""
     if arm not in ARMS:
         return {"countable": False, "reason": "arm is not declared"}
-    envelope = _lifecycle_envelope_disposition(records)
+    envelope = _lifecycle_envelope_disposition(records, admission=admission)
     if envelope.get("countable") is not True:
         return envelope
     expected = (
@@ -1009,14 +1029,15 @@ def validate_request(
     max_output_tokens: int | None,
     source_version: str | None,
     api_endpoint: str | None,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> str:
     """Validate one exact arm before any live client or evaluator is constructed."""
-    if protocol_id != PROTOCOL_ID:
-        raise ProtocolError(f"protocol_id must be {PROTOCOL_ID!r}")
-    if pair_id != PAIR_ID:
-        raise ProtocolError(f"pair_id must be {PAIR_ID!r}")
-    if scenario != SCENARIO:
-        raise ProtocolError(f"scenario must be {SCENARIO!r}")
+    if protocol_id != admission.protocol_id:
+        raise ProtocolError(f"protocol_id must be {admission.protocol_id!r}")
+    if pair_id != admission.pair_id:
+        raise ProtocolError(f"pair_id must be {admission.pair_id!r}")
+    if scenario != admission.scenario:
+        raise ProtocolError(f"scenario must be {admission.scenario!r}")
     if type(arm_index) is not int or arm_index not in (0, 1):
         raise ProtocolError("arm_index must be 0 for shipping Sage or 1 for true naive")
     arm = ARMS[arm_index]
@@ -1065,13 +1086,17 @@ def pair_invariants(
     source_version: str,
     model_context_limit: int,
     max_output_tokens: int,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
+    pair_id: str | None = None,
 ) -> dict[str, Any]:
+    if pair_id is not None and pair_id != admission.pair_id:
+        raise ProtocolError("pair invariant identity is mismatched")
     return {
-        "protocol_id": PROTOCOL_ID,
-        "pair_id": PAIR_ID,
-        "scenario": SCENARIO,
-        "objective_utf8": OBJECTIVE,
-        "logical_seed": 0,
+        "protocol_id": admission.protocol_id,
+        "pair_id": admission.pair_id,
+        "scenario": admission.scenario,
+        "objective_utf8": admission.objective,
+        "logical_seed": admission.logical_seed,
         "model_provider": provider,
         "model_id": model,
         "api_endpoint": api_endpoint,
@@ -1089,9 +1114,9 @@ def pair_invariants(
         "target_interaction_boundary": "mythic_payload_tasks_only",
         "authority_observer_version": "gate1p-stagea-authority-observer-v4",
         "policy_mode": POLICY_MODE,
-        "reset_snapshot": RESET_SNAPSHOT,
+        "reset_snapshot": admission.reset_snapshot,
         "initial_foothold_role": dict(INITIAL_FOOTHOLD_ROLE),
-        "readiness_protocol": "gate1p-stagea-last-material-mutation-qualified-reset-v2",
+        "readiness_protocol": admission.readiness_protocol,
         "wall_seconds": WALL_SECONDS,
         "token_admission_ceiling": TOKEN_ADMISSION_CEILING,
         "token_budget_boundary": TOKEN_BUDGET_BOUNDARY,
@@ -1099,8 +1124,8 @@ def pair_invariants(
         "objective_poll_seconds": OBJECTIVE_POLL_SECONDS,
         "task_quiescence_seconds": TASK_QUIESCENCE_SECONDS,
         "task_poll_seconds": TASK_POLL_SECONDS,
-        "oracle_version": "gate1p-child-control-route-neutral-v2",
-        "terminal_observer_version": "gate1p-stagea-observer-facts-v22",
+        "oracle_version": admission.oracle_version,
+        "terminal_observer_version": admission.observer_version,
         "source_version": source_version,
     }
 
@@ -1474,7 +1499,11 @@ def _retained_file(
     return path, None
 
 
-def _protocol_disposition(row: Mapping[str, Any]) -> dict[str, Any]:
+def _protocol_disposition(
+    row: Mapping[str, Any],
+    *,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
+) -> dict[str, Any]:
     protocol = row.get("protocol")
     if not isinstance(protocol, Mapping):
         return {"countable": False, "reason": "protocol snapshot is missing"}
@@ -1508,6 +1537,7 @@ def _protocol_disposition(row: Mapping[str, Any]) -> dict[str, Any]:
             max_output_tokens=generation.get("max_output_tokens"),
             source_version=str(invariants.get("source_version") or ""),
             api_endpoint=str(invariants.get("api_endpoint") or ""),
+            admission=admission,
         )
     except (ProtocolError, TypeError, ValueError) as exc:
         return {"countable": False, "reason": f"fixed protocol snapshot is invalid: {exc}"}
@@ -1520,6 +1550,7 @@ def _protocol_disposition(row: Mapping[str, Any]) -> dict[str, Any]:
         source_version=str(invariants["source_version"]),
         model_context_limit=int(invariants["model_context_limit"]),
         max_output_tokens=int(generation["max_output_tokens"]),
+        admission=admission,
     )
     if dict(invariants) != expected:
         return {"countable": False, "reason": "pair invariant snapshot differs from the fixed protocol"}
@@ -1527,7 +1558,7 @@ def _protocol_disposition(row: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(readiness, Mapping) or any(
         (
             readiness.get("ready") is not True,
-            readiness.get("snapshot") != RESET_SNAPSHOT,
+            readiness.get("snapshot") != admission.reset_snapshot,
             readiness.get("bloodhound_domain_count") != 0,
             readiness.get("clock_gate") != "passed",
             readiness.get("runtime_databases_archived") is not True,
@@ -1551,6 +1582,7 @@ def _artifact_disposition(
     row: Mapping[str, Any],
     *,
     history_root: Path,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> dict[str, Any]:
     capture = row.get("artifact_capture")
     if not isinstance(capture, Mapping) or capture.get("complete") is not True:
@@ -1642,6 +1674,7 @@ def _artifact_disposition(
         ledger_records,
         arm=str(protocol.get("arm") or ""),
         include_cleanup=False,
+        admission=admission,
     )
     if order.get("countable") is not True:
         return order
@@ -1684,14 +1717,18 @@ def arm_comparison_disposition(
     row: Mapping[str, Any],
     *,
     history_root: Path | None = None,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
+    outcome_disposition: Callable[..., dict[str, Any]] = episode_outcome_disposition,
+    oracle_canonicalizer: Callable[[object], dict[str, Any]] = _canonical_oracle_fact,
 ) -> dict[str, Any]:
     """Recompute whether one retained outcome is eligible to spend/compare its mate."""
-    protocol_disposition = _protocol_disposition(row)
+    protocol_disposition = _protocol_disposition(row, admission=admission)
     if protocol_disposition.get("countable") is not True:
         return protocol_disposition
     comparison_input = _comparison_input_disposition(
         row,
         arm=protocol_disposition["arm"],
+        admission=admission,
     )
     if comparison_input.get("countable") is not True:
         return comparison_input
@@ -1745,7 +1782,7 @@ def arm_comparison_disposition(
     observer = row.get("observer")
     if not isinstance(observer, Mapping):
         return {"countable": False, "reason": "typed observer evidence is missing"}
-    semantics = episode_outcome_disposition(
+    semantics = outcome_disposition(
         observer,
         arm=protocol_disposition["arm"],
         total_tokens=aggregate_tokens,
@@ -1828,20 +1865,17 @@ def arm_comparison_disposition(
         return {"countable": False, "reason": "authority-envelope evidence is missing or violated"}
     if recomputed_authority.get("valid") is not True:
         return {"countable": False, "reason": "authority-envelope evidence is missing or violated"}
-    oracle = observer.get("oracle") or {}
-    if (
-        not isinstance(oracle.get("success"), bool)
-        or not isinstance(oracle.get("summary"), Mapping)
-        or not str(oracle.get("artifact_pointer") or "").strip()
-        or (oracle.get("success") is True and oracle.get("proof_class") not in OBJECTIVE_PROOF_CLASSES)
-    ):
+    try:
+        oracle_canonicalizer(observer.get("oracle"))
+    except (ObserverUnavailable, TypeError, ValueError):
         return {"countable": False, "reason": "typed objective-oracle evidence is incomplete"}
-    coordinator = coordinator_lifecycle_disposition(result=row)
+    coordinator = coordinator_lifecycle_disposition(result=row, admission=admission)
     if coordinator.get("countable") is not True:
         return coordinator
     artifact_disposition = _artifact_disposition(
         row,
         history_root=(history_root or _default_history_root()),
+        admission=admission,
     )
     if artifact_disposition.get("countable") is not True:
         return artifact_disposition
@@ -1933,6 +1967,7 @@ def coordinator_lifecycle_disposition(
     *,
     result: Mapping[str, Any],
     started: Mapping[str, Any] | None = None,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
 ) -> dict[str, Any]:
     """Validate the complete, ordered, duplicate-free coordinator receipt stream."""
     protocol = result.get("protocol") or {}
@@ -1949,7 +1984,7 @@ def coordinator_lifecycle_disposition(
         kind = str(event.get("kind") or "")
         sequence = event.get("sequence")
         monotonic_ns = event.get("monotonic_ns")
-        expected_id = f"{PAIR_ID}:{arm}:{source}:{expected_sequence}"
+        expected_id = f"{admission.pair_id}:{arm}:{source}:{expected_sequence}"
         if (
             not source
             or not kind
@@ -2035,10 +2070,15 @@ def completed_arm_lifecycle_disposition(
     *,
     arm: str,
     history_root: Path | None = None,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
+    outcome_disposition: Callable[..., dict[str, Any]] = episode_outcome_disposition,
+    oracle_canonicalizer: Callable[[object], dict[str, Any]] = _canonical_oracle_fact,
 ) -> dict[str, Any]:
     """Recompute one arm's retry-zero result and cleanup before admitting the next arm."""
     rows = list(records)
-    order = _arm_record_order_disposition(rows, arm=arm, include_cleanup=True)
+    order = _arm_record_order_disposition(
+        rows, arm=arm, include_cleanup=True, admission=admission,
+    )
     if order.get("countable") is not True:
         return order
     selected = order["selected"]
@@ -2055,10 +2095,18 @@ def completed_arm_lifecycle_disposition(
         or start_event.get("kind") != "arm_started"
     ):
         return {"countable": False, "reason": "arm_started evidence does not match the exact result protocol"}
-    coordinator = coordinator_lifecycle_disposition(result=result, started=started)
+    coordinator = coordinator_lifecycle_disposition(
+        result=result, started=started, admission=admission,
+    )
     if coordinator.get("countable") is not True:
         return coordinator
-    arm_disposition = arm_comparison_disposition(result, history_root=history_root)
+    arm_disposition = arm_comparison_disposition(
+        result,
+        history_root=history_root,
+        admission=admission,
+        outcome_disposition=outcome_disposition,
+        oracle_canonicalizer=oracle_canonicalizer,
+    )
     if arm_disposition.get("countable") is not True:
         return arm_disposition
     cleaned = cleanup_disposition(cleanup, result=result, history_root=history_root)
@@ -2082,10 +2130,16 @@ def pair_disposition(
     records: Iterable[Mapping[str, Any]],
     *,
     history_root: Path | None = None,
+    admission: PairAdmissionSpec = STAGEA_ADMISSION,
+    outcome_disposition: Callable[..., dict[str, Any]] = episode_outcome_disposition,
+    oracle_canonicalizer: Callable[[object], dict[str, Any]] = _canonical_oracle_fact,
+    pair_id: str | None = None,
 ) -> dict[str, Any]:
     """Decide comparison countability for exactly one retained row per primary arm."""
     rows = list(records)
-    envelope = _lifecycle_envelope_disposition(rows)
+    if pair_id is not None and pair_id != admission.pair_id:
+        return {"countable": False, "reason": "comparison pair identity is mismatched"}
+    envelope = _lifecycle_envelope_disposition(rows, admission=admission)
     if envelope.get("countable") is not True:
         return envelope
     rows = [dict(item) for item in rows]
@@ -2094,8 +2148,8 @@ def pair_disposition(
         for row in rows
         if row.get("record_type") == "result"
         if row.get("measurement_kind") == "row"
-        and (row.get("protocol") or {}).get("protocol_id") == PROTOCOL_ID
-        and (row.get("protocol") or {}).get("pair_id") == PAIR_ID
+        and (row.get("protocol") or {}).get("protocol_id") == admission.protocol_id
+        and (row.get("protocol") or {}).get("pair_id") == admission.pair_id
     ]
     by_arm: dict[str, list[dict[str, Any]]] = {arm: [] for arm in ARMS}
     for row in matching:
@@ -2112,7 +2166,14 @@ def pair_disposition(
     ordered = [by_arm[arm][0] for arm in ARMS]
     try:
         arm_dispositions = [
-            arm_comparison_disposition(row, history_root=history_root) for row in ordered
+            arm_comparison_disposition(
+                row,
+                history_root=history_root,
+                admission=admission,
+                outcome_disposition=outcome_disposition,
+                oracle_canonicalizer=oracle_canonicalizer,
+            )
+            for row in ordered
         ]
     except (KeyError, TypeError, ValueError) as exc:
         return {"countable": False, "reason": f"result schema is invalid: {type(exc).__name__}"}
@@ -2131,7 +2192,9 @@ def pair_disposition(
     if observed_routes[0] != observed_routes[1]:
         return {"countable": False, "reason": "observed effective backend parity failed"}
     arm_orders = {
-        arm: _arm_record_order_disposition(rows, arm=arm, include_cleanup=True)
+        arm: _arm_record_order_disposition(
+            rows, arm=arm, include_cleanup=True, admission=admission,
+        )
         for arm in ARMS
     }
     if any(order.get("countable") is not True for order in arm_orders.values()):
@@ -2162,7 +2225,9 @@ def pair_disposition(
             or event.get("kind") != "arm_started"
         ):
             return {"countable": False, "reason": "arm_started evidence differs from the exact result protocol"}
-        coordinator = coordinator_lifecycle_disposition(result=ordered[index], started=started)
+        coordinator = coordinator_lifecycle_disposition(
+            result=ordered[index], started=started, admission=admission,
+        )
         if coordinator.get("countable") is not True:
             return coordinator
     cleanup_dispositions = [

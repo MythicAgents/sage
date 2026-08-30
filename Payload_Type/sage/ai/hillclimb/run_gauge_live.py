@@ -791,20 +791,24 @@ def episode_protocol_snapshot(cfg: Config, *, side: str, scenario_name: str, mod
             "evaluation-plane data leaked into Sage or model context",
         ],
     }
-    if cfg.measurement_kind == "row" and scenario_name == gate1p_stagea.SCENARIO:
-        arm = gate1p_stagea.ARMS[int(cfg.arm_index)] if cfg.arm_index in (0, 1) else ""
+    if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
+        protocol = gate1p_protocol.protocol_for_request(
+            protocol_id=cfg.protocol_id, scenario=scenario_name,
+        )
+        arm = protocol.arms[int(cfg.arm_index)] if cfg.arm_index in (0, 1) else ""
         snapshot.update({
             "pair_id": cfg.pair_id,
             "arm": arm,
             "arm_index": cfg.arm_index,
             "wrapper": "shipping_native_sage" if side == "harness" else "true_naive_raw_tools",
-            "pair_invariants": gate1p_stagea.pair_invariants(
+            "pair_invariants": protocol.module.pair_invariants(
                 provider=str(model_route.get("provider") or ""),
                 model=str(model_route.get("model") or ""),
                 api_endpoint=str(model_route.get("api_endpoint") or ""),
                 source_version=str(cfg.source_version or ""),
                 model_context_limit=int(cfg.model_context_limit or 0),
                 max_output_tokens=int(cfg.max_output_tokens or 0),
+                pair_id=str(cfg.pair_id or ""),
             ),
         })
     return snapshot
@@ -877,9 +881,9 @@ def run_side(
             source_version=cfg.source_version,
             api_endpoint=cfg.model_api_endpoint,
         )
-        if cfg.live_authority_id != row_protocol.pair_id:
+        if cfg.live_authority_id != row_protocol.allocation_id:
             raise gate1p_stagea.ProtocolError(
-                f"live paired-row execution requires separate authority ID {row_protocol.pair_id!r}"
+                f"live paired-row execution requires separate authority ID {row_protocol.allocation_id!r}"
             )
     scn = _scenario(cfg, scenario_name)
     if row_arm and scn.objective != row_protocol.objective:
@@ -971,23 +975,32 @@ def run_side(
             gate1p_evaluator_state["final_members"] = sorted(final_members)
             return bool(final_members - baseline_members)
 
-        gate1p_oracle = gate1p_stagea.StageAObjectiveOracle(
-            {
-                "directory_delta": _directory_delta_probe,
-                "certificate_control": live_seams.certificate_admin_control_probe(
-                    None,
-                    realm=objective_domain,
+        if row_protocol.module is gate1p_stageb:
+            gate1p_oracle = row_protocol.build_objective_oracle(
+                _stageb_proof_adapters(
+                    reader, baseline, objective_domain=objective_domain,
+                    directory_probe=_directory_delta_probe,
                 ),
-                "ticket_control": live_seams.ticket_admin_control_probe(realm=objective_domain),
-            },
-            artifact_pointer=str(gate1p_artifact_path),
-            summary_factory=lambda: {
-                "domain": objective_domain,
-                "baseline_member_count": len(baseline_members),
-                "final_member_count": len(gate1p_evaluator_state.get("final_members") or []),
-            },
-        )
-        observer = gate1p_stagea.LiveEpisodeObserver(
+                artifact_pointer=str(gate1p_artifact_path),
+                domain=objective_domain,
+            )
+        else:
+            gate1p_oracle = row_protocol.build_objective_oracle(
+                {
+                    "directory_delta": _directory_delta_probe,
+                    "certificate_control": live_seams.certificate_admin_control_probe(
+                        None, realm=objective_domain,
+                    ),
+                    "ticket_control": live_seams.ticket_admin_control_probe(realm=objective_domain),
+                },
+                artifact_pointer=str(gate1p_artifact_path),
+                summary_factory=lambda: {
+                    "domain": objective_domain,
+                    "baseline_member_count": len(baseline_members),
+                    "final_member_count": len(gate1p_evaluator_state.get("final_members") or []),
+                },
+            )
+        observer = row_protocol.build_episode_observer(
             pair_id=str(cfg.pair_id),
             arm=row_arm,
             objective_probe=gate1p_oracle,
@@ -1117,6 +1130,7 @@ def run_side(
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
                     token_ceiling=cfg.model_token_budget,
+                    pair_id=cfg.pair_id,
                 )
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
@@ -1206,6 +1220,7 @@ def run_side(
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
                     token_ceiling=cfg.model_token_budget,
+                    pair_id=cfg.pair_id,
                 )
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
@@ -1258,7 +1273,9 @@ def run_side(
         else runtime_telemetry.get("token_usage_complete") is True
     )
     observer_evidence = (
-        row_protocol.observer_facts_disposition(observer_result, arm=row_arm)
+        row_protocol.observer_facts_disposition(
+            observer_result, arm=row_arm, pair_id=cfg.pair_id,
+        )
         if row_arm and observer_result
         else {"countable": False}
     )
@@ -1544,9 +1561,11 @@ def compare(cfg: Config, scenario_name: str) -> None:
         parsed_records.append(json.loads(line))
     if scenario_name in _GATE1P_PRIMARY_SCENARIOS:
         protocol = gate1p_protocol.protocol_for_scenario(scenario_name)
-        if cfg.pair_id != protocol.pair_id:
+        if protocol.pair_id is not None and cfg.pair_id != protocol.pair_id:
             raise SystemExit("Gate 1P comparison pair identity is mismatched")
-        disposition = protocol.comparison_disposition(parsed_records)
+        if protocol.pair_id is None and cfg.pair_id is not None and cfg.pair_id not in protocol.pair_ids:
+            raise SystemExit("Gate 1P comparison pair identity is mismatched")
+        disposition = protocol.comparison_disposition(parsed_records, pair_id=cfg.pair_id)
         print(json.dumps({"pair_disposition": disposition}, sort_keys=True))
         if disposition.get("countable") is not True:
             raise SystemExit(f"Gate 1P pair is not comparison-countable: {disposition.get('reason')}")
@@ -1726,33 +1745,34 @@ def main(argv=None) -> int:
                 protocol_id=cfg.protocol_id,
                 scenario=args.scenario,
             )
-            selected_protocol.validate_request(
-                require_allocation=False,
-                protocol_id=cfg.protocol_id,
-                pair_id=cfg.pair_id,
-                scenario=args.scenario,
-                side=args.side,
-                arm_index=cfg.arm_index,
-                provider=cfg.model_provider,
-                model=cfg.model_id,
-                policy_mode=cfg.policy_mode,
-                solve_timeout=cfg.solve_timeout,
-                token_ceiling=cfg.model_token_budget,
-                model_context_limit=cfg.model_context_limit,
-                max_output_tokens=cfg.max_output_tokens,
-                source_version=cfg.source_version,
-                api_endpoint=cfg.model_api_endpoint,
-            )
+            if cfg.pair_id is not None or selected_protocol.pair_allocated:
+                selected_protocol.validate_request(
+                    require_allocation=False,
+                    protocol_id=cfg.protocol_id,
+                    pair_id=cfg.pair_id,
+                    scenario=args.scenario,
+                    side=args.side,
+                    arm_index=cfg.arm_index,
+                    provider=cfg.model_provider,
+                    model=cfg.model_id,
+                    policy_mode=cfg.policy_mode,
+                    solve_timeout=cfg.solve_timeout,
+                    token_ceiling=cfg.model_token_budget,
+                    model_context_limit=cfg.model_context_limit,
+                    max_output_tokens=cfg.max_output_tokens,
+                    source_version=cfg.source_version,
+                    api_endpoint=cfg.model_api_endpoint,
+                )
         except gate1p_stagea.ProtocolError as exc:
             ap.error(str(exc))
         if args.cmd == "run" and args.go and not selected_protocol.pair_allocated:
             ap.error(
                 f"{selected_protocol.protocol_id} is unallocated; live execution is not authorized"
             )
-        if args.cmd == "run" and args.go and cfg.live_authority_id != selected_protocol.pair_id:
+        if args.cmd == "run" and args.go and cfg.live_authority_id != selected_protocol.allocation_id:
             ap.error(
                 f"live paired-row execution requires separate --live-authority-id "
-                f"{selected_protocol.pair_id}"
+                f"{selected_protocol.allocation_id}"
             )
 
     if args.cmd == "compare":

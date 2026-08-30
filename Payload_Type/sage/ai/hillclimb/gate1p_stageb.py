@@ -1,7 +1,9 @@
 """Prospective, unallocated Gate 1P Stage B protocol."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 try:
@@ -14,6 +16,13 @@ PROTOCOL_ID = "gate1p-stage-b-child-control-completed-call-budget-v1"
 MATRIX_ID = "gate1p-stageb-child-control-matrix-v1"
 PAIR_ID = None
 PAIR_ALLOCATED = False
+ALLOCATION_ID = "gate1p-stageb-child-control-allocation-001"
+PRIMARY_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 6))
+RESERVE_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(6, 8))
+PAIR_IDS = PRIMARY_PAIR_IDS + RESERVE_PAIR_IDS
+REQUIRED_COMPARISON_PAIRS = 5
+MAX_PAIR_ATTEMPTS = 7
+PAIR_CONTROL_SCHEMA = "gate1p-stageb-pair-control-v1"
 STORAGE_NAMESPACE = f"gate1p-stageb/{MATRIX_ID}"
 SCENARIO = "child-control"
 OBJECTIVE_DOMAIN = "north.sevenkingdoms.local"
@@ -186,36 +195,221 @@ def build_episode_observer(**kwargs):
     )
 
 
-def observer_facts_disposition(observer, *, arm: str):
+def observer_facts_disposition(observer, *, arm: str, pair_id: str | None = None):
+    identity = pair_id or MATRIX_ID
+    if identity != MATRIX_ID and identity not in PAIR_IDS:
+        return {"countable": False, "reason": "Stage B observer pair identity is unknown"}
     return gate1p_stagea.observer_facts_disposition(
-        observer, arm=arm, pair_id=MATRIX_ID, arms=ARMS,
+        observer, arm=arm, pair_id=identity, arms=ARMS,
         observer_version=OBSERVER_VERSION, oracle_canonicalizer=canonical_oracle_fact,
     )
 
 
-def episode_outcome_disposition(observer, *, arm: str, total_tokens: object, token_ceiling: object):
+def episode_outcome_disposition(
+    observer, *, arm: str, total_tokens: object, token_ceiling: object, pair_id: str | None = None,
+):
     return gate1p_stagea.episode_outcome_disposition(
         observer, arm=arm, total_tokens=total_tokens, token_ceiling=token_ceiling,
-        facts_disposition=observer_facts_disposition,
+        facts_disposition=lambda value, *, arm: observer_facts_disposition(
+            value, arm=arm, pair_id=pair_id,
+        ),
+    )
+
+
+def admission_for_pair(pair_id: str) -> gate1p_stagea.PairAdmissionSpec:
+    if pair_id not in PAIR_IDS:
+        raise ProtocolError(f"pair_id must be one of {PAIR_IDS!r}")
+    return gate1p_stagea.PairAdmissionSpec(
+        protocol_id=PROTOCOL_ID,
+        pair_id=pair_id,
+        scenario=SCENARIO,
+        objective=OBJECTIVE,
+        observer_version=OBSERVER_VERSION,
+        reset_snapshot=RESET_SNAPSHOT,
+        oracle_version="gate1p-stageb-child-control-route-neutral-v1",
+        readiness_protocol="gate1p-stageb-qualified-reset-v1",
+        logical_seed=PAIR_IDS.index(pair_id),
+    )
+
+
+def pair_invariants(*, pair_id: str, **kwargs):
+    return gate1p_stagea.pair_invariants(
+        **kwargs, admission=admission_for_pair(pair_id),
     )
 
 
 def validate_request(**request) -> str:
     if request.pop("protocol_id", None) != PROTOCOL_ID:
         raise ProtocolError(f"protocol_id must be {PROTOCOL_ID!r}")
-    if request.pop("pair_id", None) is not None:
-        raise ProtocolError("Stage B has no allocated pair_id")
+    pair_id = request.pop("pair_id", None)
+    admission = admission_for_pair(str(pair_id or ""))
     if request.pop("scenario", None) != SCENARIO:
         raise ProtocolError(f"scenario must be {SCENARIO!r}")
     return gate1p_stagea.validate_request(
-        protocol_id=gate1p_stagea.PROTOCOL_ID, pair_id=gate1p_stagea.PAIR_ID,
-        scenario=gate1p_stagea.SCENARIO, **request,
+        protocol_id=PROTOCOL_ID, pair_id=pair_id, scenario=SCENARIO,
+        admission=admission, **request,
     )
 
 
-def pair_disposition(_records) -> dict[str, Any]:
-    return {"countable": False, "reason": "Stage B is prospective and has no allocated execution identity", "matrix_id": MATRIX_ID}
+def arm_comparison_disposition(row, *, history_root: Path | None = None):
+    pair_id = str(((row or {}).get("protocol") or {}).get("pair_id") or "")
+    if pair_id not in PAIR_IDS:
+        return {"countable": False, "reason": "Stage B row pair identity is missing or mismatched"}
+    return gate1p_stagea.arm_comparison_disposition(
+        row,
+        history_root=history_root,
+        admission=admission_for_pair(pair_id),
+        outcome_disposition=lambda observer, **kwargs: episode_outcome_disposition(
+            observer, pair_id=pair_id, **kwargs,
+        ),
+        oracle_canonicalizer=canonical_oracle_fact,
+    )
 
 
-def arm_comparison_disposition(_row):
-    return pair_disposition(())
+def completed_arm_lifecycle_disposition(records, *, arm: str, pair_id: str, history_root=None):
+    return gate1p_stagea.completed_arm_lifecycle_disposition(
+        records,
+        arm=arm,
+        history_root=history_root,
+        admission=admission_for_pair(pair_id),
+        outcome_disposition=lambda observer, **kwargs: episode_outcome_disposition(
+            observer, pair_id=pair_id, **kwargs,
+        ),
+        oracle_canonicalizer=canonical_oracle_fact,
+    )
+
+
+def _exact_pair_disposition(records, *, pair_id: str, history_root: Path | None = None):
+    return gate1p_stagea.pair_disposition(
+        records,
+        history_root=history_root,
+        admission=admission_for_pair(pair_id),
+        outcome_disposition=lambda observer, **kwargs: episode_outcome_disposition(
+            observer, pair_id=pair_id, **kwargs,
+        ),
+        oracle_canonicalizer=canonical_oracle_fact,
+        pair_id=pair_id,
+    )
+
+
+def _binomial_cdf(k: int, n: int, probability: float) -> float:
+    return sum(
+        math.comb(n, value) * probability ** value * (1.0 - probability) ** (n - value)
+        for value in range(k + 1)
+    )
+
+
+def _clopper_pearson(successes: int, n: int, alpha: float = 0.05) -> list[float]:
+    def solve(predicate: Callable[[float], bool]) -> float:
+        low, high = 0.0, 1.0
+        for _ in range(80):
+            middle = (low + high) / 2.0
+            if predicate(middle):
+                high = middle
+            else:
+                low = middle
+        return (low + high) / 2.0
+
+    lower = 0.0 if successes == 0 else solve(
+        lambda probability: 1.0 - _binomial_cdf(successes - 1, n, probability) >= alpha / 2.0
+    )
+    upper = 1.0 if successes == n else solve(
+        lambda probability: _binomial_cdf(successes, n, probability) <= alpha / 2.0
+    )
+    return [lower, upper]
+
+
+def _matrix_report(accepted: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+    outcomes = {arm: [] for arm in ARMS}
+    paired = []
+    for pair_id, disposition in accepted:
+        pair_outcome = {"pair_id": pair_id}
+        for item in disposition["comparison_inputs"]:
+            success = bool(item["card"]["objective_proven"])
+            outcomes[item["arm"]].append(success)
+            pair_outcome[item["arm"]] = success
+        paired.append(pair_outcome)
+    per_arm = {}
+    for arm, values in outcomes.items():
+        n, successes = len(values), sum(values)
+        proportion = successes / n
+        per_arm[arm] = {
+            "n": n,
+            "successes": successes,
+            "success_proportion": proportion,
+            "sample_variance": n * proportion * (1.0 - proportion) / (n - 1),
+            "clopper_pearson_95": _clopper_pearson(successes, n),
+        }
+    shipping_only = sum(item[ARMS[0]] and not item[ARMS[1]] for item in paired)
+    naive_only = sum(item[ARMS[1]] and not item[ARMS[0]] for item in paired)
+    return {
+        "per_arm": per_arm,
+        "paired_outcomes": paired,
+        "success_proportion_delta": (
+            per_arm[ARMS[0]]["success_proportion"] - per_arm[ARMS[1]]["success_proportion"]
+        ),
+        "discordant_pairs": {"shipping_only": shipping_only, "true_naive_only": naive_only},
+    }
+
+
+def pair_disposition(records, *, history_root: Path | None = None, pair_id: str | None = None) -> dict[str, Any]:
+    rows = list(records)
+    if pair_id is not None:
+        return _exact_pair_disposition(rows, pair_id=pair_id, history_root=history_root)
+    grouped = {identity: [] for identity in PAIR_IDS}
+    for row in rows:
+        protocol = row.get("protocol") if isinstance(row, Mapping) else None
+        identity = protocol.get("pair_id") if isinstance(protocol, Mapping) else None
+        if identity not in grouped or protocol.get("protocol_id") != PROTOCOL_ID:
+            return {"countable": False, "reason": "matrix contains an unknown or malformed lifecycle identity"}
+        grouped[identity].append(row)
+    attempted = [identity for identity in PAIR_IDS if grouped[identity]]
+    if attempted != list(PAIR_IDS[:len(attempted)]):
+        return {"countable": False, "reason": "pair attempts are missing or physically out of allocation order"}
+    accepted: list[tuple[str, dict[str, Any]]] = []
+    consecutive_failures = 0
+    dispositions = {}
+    for identity in attempted:
+        disposition = _exact_pair_disposition(
+            grouped[identity], pair_id=identity, history_root=history_root,
+        )
+        dispositions[identity] = {key: value for key, value in disposition.items() if key != "comparison_inputs"}
+        if disposition.get("countable") is True:
+            consecutive_failures = 0
+            accepted.append((identity, disposition))
+            if len(accepted) == REQUIRED_COMPARISON_PAIRS:
+                if identity != attempted[-1]:
+                    return {"countable": False, "reason": "matrix continued after five complete pairs"}
+                return {
+                    "countable": True,
+                    "reason": "five comparison-countable Stage B pairs are complete",
+                    "matrix_id": MATRIX_ID,
+                    "allocation_id": ALLOCATION_ID,
+                    "attempted_pair_ids": attempted,
+                    "accepted_pair_ids": [item[0] for item in accepted],
+                    "pair_dispositions": dispositions,
+                    **_matrix_report(accepted),
+                }
+        else:
+            consecutive_failures += 1
+            if identity == PRIMARY_PAIR_IDS[0] and len(attempted) > 1:
+                return {"countable": False, "reason": "first-pair validation failed before matrix continuation"}
+            if consecutive_failures >= 2:
+                return {"countable": False, "reason": "matrix stop-loss reached two consecutive failed pairs"}
+    return {
+        "countable": False,
+        "reason": (
+            "maximum pair-attempt budget exhausted"
+            if len(attempted) == MAX_PAIR_ATTEMPTS
+            else f"matrix has {len(accepted)}/{REQUIRED_COMPARISON_PAIRS} comparison-countable pairs"
+        ),
+        "matrix_id": MATRIX_ID,
+        "allocation_id": ALLOCATION_ID,
+        "attempted_pair_ids": attempted,
+        "accepted_pair_ids": [item[0] for item in accepted],
+        "pair_dispositions": dispositions,
+    }
+
+
+def matrix_disposition(records, *, history_root: Path | None = None):
+    return pair_disposition(records, history_root=history_root)

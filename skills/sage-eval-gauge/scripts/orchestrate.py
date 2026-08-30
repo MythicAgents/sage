@@ -1915,7 +1915,23 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
             scenario=scenario,
         )
         if not selected.pair_allocated:
-            print(json.dumps({"prospective_protocol": selected.assembled_contract()}, sort_keys=True))
+            contract = selected.assembled_contract()
+            print(json.dumps({"prospective_protocol": contract}, sort_keys=True))
+            if contract["required_comparison_pairs"] > 1:
+                print(json.dumps({
+                    "prospective_matrix_schedule": [
+                        {
+                            "pair_id": pair_id,
+                            "role": "primary" if pair_id in contract["primary_pair_ids"] else "reserve",
+                            "arm_order": list(selected.arms),
+                            "fresh_range_per_arm": True,
+                        }
+                        for pair_id in contract["pair_ids"]
+                    ],
+                    "first_pair_gate": contract["primary_pair_ids"][0],
+                    "stop_loss": "two consecutive failed pairs or maximum pair-attempt budget",
+                    "automatic_expansion": False,
+                }, sort_keys=True))
             print(
                 "\nUNALLOCATED: protocol assembly only. No reset, arm, model, Mythic, "
                 "BloodHound, range, target, or comparison command is emitted."

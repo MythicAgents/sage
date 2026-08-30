@@ -29,7 +29,7 @@ def _stageb_protocol_argv(*extra):
     ]
 
 
-def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_contract():
+def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_and_matrix_schedule():
     result = subprocess.run(
         _stageb_protocol_argv(),
         cwd=ROOT,
@@ -43,6 +43,11 @@ def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_contract():
     assert '"matrix_id": "gate1p-stageb-child-control-matrix-v1"' in output
     assert '"pair_allocated": false' in output
     assert '"pair_id": null' in output
+    assert '"allocation_id": "gate1p-stageb-child-control-allocation-001"' in output
+    assert '"first_pair_gate": "gate1p-stageb-child-control-pair-001"' in output
+    assert '"pair_id": "gate1p-stageb-child-control-pair-007"' in output
+    assert output.count('"fresh_range_per_arm": true') == 7
+    assert '"automatic_expansion": false' in output
     assert "UNALLOCATED: protocol assembly only" in output
     assert "rollback " not in output
     assert "bootstrap_payloads.py" not in output

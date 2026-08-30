@@ -24,9 +24,10 @@ RUNNER = PAYLOAD_ROOT / "ai" / "hillclimb" / "run_gauge_live.py"
 
 
 def _request(protocol, *, side="harness", arm_index=0, pair_id=None):
+    selected_pair = protocol.pair_id or protocol.pair_ids[0]
     return {
         "protocol_id": protocol.protocol_id,
-        "pair_id": protocol.pair_id if pair_id is None else pair_id,
+        "pair_id": selected_pair if pair_id is None else pair_id,
         "scenario": protocol.scenario,
         "side": side,
         "arm_index": arm_index,
@@ -107,6 +108,12 @@ def test_stageb_contract_routes_storage_observer_and_comparator_while_unallocate
         "matrix_id": gate1p_stageb.MATRIX_ID,
         "pair_id": None,
         "pair_allocated": False,
+        "allocation_id": gate1p_stageb.ALLOCATION_ID,
+        "pair_ids": list(gate1p_stageb.PAIR_IDS),
+        "primary_pair_ids": list(gate1p_stageb.PRIMARY_PAIR_IDS),
+        "reserve_pair_ids": list(gate1p_stageb.RESERVE_PAIR_IDS),
+        "required_comparison_pairs": gate1p_stageb.REQUIRED_COMPARISON_PAIRS,
+        "max_pair_attempts": gate1p_stageb.MAX_PAIR_ATTEMPTS,
         "scenario": gate1p_stageb.SCENARIO,
         "objective": gate1p_stageb.OBJECTIVE,
         "arms": list(gate1p_stageb.ARMS),
@@ -325,7 +332,7 @@ def test_stageb_live_run_rejects_unallocated_protocol_before_any_live_seam(monke
     cfg = rgl.Config(
         measurement_kind="row",
         protocol_id=protocol.protocol_id,
-        pair_id=None,
+        pair_id=gate1p_stageb.PRIMARY_PAIR_IDS[0],
         arm_index=0,
         model_provider=gate1p_stageb.MODEL_PROVIDER,
         model_id=gate1p_stageb.MODEL_ID,
@@ -346,6 +353,130 @@ def test_stageb_live_run_rejects_unallocated_protocol_before_any_live_seam(monke
 
     with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="no allocated live execution identity"):
         rgl.run_side(cfg, "harness", gate1p_stageb.SCENARIO)
+
+
+def _matrix_records(*pair_ids):
+    return [
+        {"protocol": {"protocol_id": gate1p_stageb.PROTOCOL_ID, "pair_id": pair_id}}
+        for pair_id in pair_ids
+    ]
+
+
+def _stub_pair_disposition(outcomes, failures=()):
+    def admit(_records, *, pair_id, history_root=None):
+        del history_root
+        if pair_id in failures:
+            return {"countable": False, "reason": f"invalid {pair_id}"}
+        shipping, naive = outcomes[pair_id]
+        return {
+            "countable": True,
+            "reason": "stub admitted",
+            "comparison_inputs": [
+                {"arm": "shipping_sage", "side": "harness", "card": {"objective_proven": shipping}},
+                {"arm": "true_naive", "side": "bare", "card": {"objective_proven": naive}},
+            ],
+        }
+    return admit
+
+
+def test_stageb_pair_specs_are_exact_ordered_and_still_unallocated():
+    protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
+
+    assert gate1p_stageb.PAIR_IDS == (*gate1p_stageb.PRIMARY_PAIR_IDS, *gate1p_stageb.RESERVE_PAIR_IDS)
+    assert len(gate1p_stageb.PRIMARY_PAIR_IDS) == 5
+    assert len(gate1p_stageb.RESERVE_PAIR_IDS) == 2
+    assert protocol.pair_allocated is False
+    assert protocol.allocation_id == gate1p_stageb.ALLOCATION_ID
+    assert [gate1p_stageb.admission_for_pair(pair_id).logical_seed for pair_id in gate1p_stageb.PAIR_IDS] == list(range(7))
+    with pytest.raises(gate1p_stagea.ProtocolError, match="pair_id must be one of"):
+        gate1p_stageb.admission_for_pair("gate1p-stageb-child-control-pair-008")
+
+
+def test_stageb_matrix_admits_five_pairs_and_reports_exact_binary_uncertainty(monkeypatch):
+    outcomes = {
+        pair_id: pair_outcome
+        for pair_id, pair_outcome in zip(
+            gate1p_stageb.PRIMARY_PAIR_IDS,
+            ((True, False), (True, True), (False, False), (True, False), (False, False)),
+            strict=True,
+        )
+    }
+    monkeypatch.setattr(gate1p_stageb, "_exact_pair_disposition", _stub_pair_disposition(outcomes))
+
+    result = gate1p_stageb.matrix_disposition(_matrix_records(*gate1p_stageb.PRIMARY_PAIR_IDS))
+
+    assert result["countable"] is True
+    assert result["accepted_pair_ids"] == list(gate1p_stageb.PRIMARY_PAIR_IDS)
+    assert result["per_arm"]["shipping_sage"] == {
+        "n": 5,
+        "successes": 3,
+        "success_proportion": 0.6,
+        "sample_variance": pytest.approx(0.3),
+        "clopper_pearson_95": pytest.approx([0.1466327996, 0.9472550495]),
+    }
+    assert result["per_arm"]["true_naive"]["successes"] == 1
+    assert result["success_proportion_delta"] == pytest.approx(0.4)
+    assert result["discordant_pairs"] == {"shipping_only": 2, "true_naive_only": 0}
+
+
+@pytest.mark.parametrize(
+    ("attempted", "failures", "reason"),
+    [
+        ((0, 2), (), "missing or physically out of allocation order"),
+        ((0, 1), (0,), "first-pair validation failed"),
+        ((0, 1, 2), (1, 2), "two consecutive failed pairs"),
+    ],
+)
+def test_stageb_matrix_fails_closed_on_order_first_pair_and_stop_loss(
+    monkeypatch, attempted, failures, reason,
+):
+    pair_ids = tuple(gate1p_stageb.PAIR_IDS[index] for index in attempted)
+    outcomes = {pair_id: (False, False) for pair_id in gate1p_stageb.PAIR_IDS}
+    failed_ids = tuple(gate1p_stageb.PAIR_IDS[index] for index in failures)
+    monkeypatch.setattr(
+        gate1p_stageb, "_exact_pair_disposition", _stub_pair_disposition(outcomes, failed_ids),
+    )
+
+    result = gate1p_stageb.matrix_disposition(_matrix_records(*pair_ids))
+
+    assert result["countable"] is False
+    assert reason in result["reason"]
+
+
+def test_stageb_matrix_rejects_activity_after_five_complete_pairs(monkeypatch):
+    outcomes = {pair_id: (False, False) for pair_id in gate1p_stageb.PAIR_IDS}
+    monkeypatch.setattr(gate1p_stageb, "_exact_pair_disposition", _stub_pair_disposition(outcomes))
+
+    result = gate1p_stageb.matrix_disposition(_matrix_records(*gate1p_stageb.PAIR_IDS[:6]))
+
+    assert result == {"countable": False, "reason": "matrix continued after five complete pairs"}
+
+
+def test_stageb_episode_snapshot_uses_pair_specific_invariants():
+    pair_id = gate1p_stageb.PRIMARY_PAIR_IDS[3]
+    cfg = rgl.Config(
+        measurement_kind="row",
+        protocol_id=gate1p_stageb.PROTOCOL_ID,
+        pair_id=pair_id,
+        arm_index=1,
+        source_version="tree:test",
+        model_context_limit=200_000,
+        max_output_tokens=8192,
+    )
+
+    snapshot = rgl.episode_protocol_snapshot(
+        cfg,
+        side="bare",
+        scenario_name=gate1p_stageb.SCENARIO,
+        model_route={"provider": gate1p_stageb.MODEL_PROVIDER, "model": gate1p_stageb.MODEL_ID,
+                     "api_endpoint": "https://model.invalid/v1"},
+    )
+
+    assert snapshot["pair_id"] == pair_id
+    assert snapshot["arm"] == "true_naive"
+    assert snapshot["pair_invariants"]["protocol_id"] == gate1p_stageb.PROTOCOL_ID
+    assert snapshot["pair_invariants"]["logical_seed"] == 3
+    assert snapshot["pair_invariants"]["terminal_observer_version"] == gate1p_stageb.OBSERVER_VERSION
 
 
 def test_every_primary_scenario_matches_its_typed_protocol_objective():

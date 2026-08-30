@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from ai.hillclimb import gate1p_stagea as g1p
+from ai.hillclimb import gate1p_stageb as g1pb
 from ai.hillclimb.fitness import ScoreCard
 
 
@@ -223,7 +224,7 @@ def test_runtime_summary_projects_shipping_transaction_decision_ids_as_action_li
         ],
     })
 
-    assert disposition["countable"] is True
+    assert disposition["countable"] is True, disposition
     assert disposition["canonical_summary"] == {
         "schema": "gate1p-stagea-runtime-summary-v2",
         "controller_cycle_count": 2,
@@ -828,7 +829,7 @@ def test_blocked_task_producer_fails_locally_without_owning_observer_deadline():
         total_tokens=15,
         token_ceiling=g1p.TOKEN_ADMISSION_CEILING,
     )
-    assert disposition["countable"] is True
+    assert disposition["countable"] is True, disposition
     assert disposition["objective_success"] is False
     assert disposition["stop_countable"] is False
     assert disposition["clean_stop"] is None
@@ -1427,6 +1428,65 @@ def _write_pair_ledger(records):
     with open(ledger, "w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record) + "\n")
+
+
+def test_stageb_pair_uses_the_real_shared_lifecycle_and_artifact_admission(tmp_path):
+    history = tmp_path / ".sage_history"
+    pair_id = g1pb.PRIMARY_PAIR_IDS[0]
+    records = _pair(_row("shipping_sage", history), _row("true_naive", history))
+    invariants = g1pb.pair_invariants(
+        pair_id=pair_id,
+        provider=g1pb.MODEL_PROVIDER,
+        model=g1pb.MODEL_ID,
+        api_endpoint="https://provider.invalid/v1",
+        source_version="tree:test",
+        model_context_limit=200_000,
+        max_output_tokens=8_192,
+    )
+    for record in records:
+        protocol = record["protocol"]
+        protocol["protocol_id"] = g1pb.PROTOCOL_ID
+        protocol["pair_id"] = pair_id
+        if "pair_invariants" in protocol:
+            protocol["pair_invariants"] = invariants
+        if record["record_type"] != "result":
+            continue
+        record["scenario"] = g1pb.SCENARIO
+        record["card"]["scenario"] = g1pb.SCENARIO
+        observer = record["observer"]
+        observer["observer_version"] = g1pb.OBSERVER_VERSION
+        for event in observer["events"]:
+            event["event_id"] = event["event_id"].replace(g1p.PAIR_ID, pair_id)
+        observer["oracle"] = {
+            "success": True,
+            "control_proof_class": "certificate_control",
+            "exercised_action_proof_class": "certificate_control",
+            "summary": {
+                "domain": g1pb.OBJECTIVE_DOMAIN,
+                "control_satisfied": True,
+                "exercised_action_satisfied": True,
+                "proof_states": {
+                    name: name == "certificate_control" for name in g1pb.OBJECTIVE_PROOF_CLASSES
+                },
+                "observation_sources": dict(g1pb.PROOF_SOURCES),
+            },
+            "artifact_pointer": record["artifact_capture"]["episode_artifact"],
+        }
+        episode_path = Path(record["artifact_capture"]["episode_artifact"])
+        artifact = json.loads(episode_path.read_text(encoding="utf-8"))
+        artifact.update({
+            "protocol": protocol,
+            "oracle": observer["oracle"],
+            "observer": observer,
+            "scorecard": record["card"],
+        })
+        episode_path.write_text(json.dumps(artifact), encoding="utf-8")
+    _write_pair_ledger(records)
+
+    disposition = g1pb.pair_disposition(records, pair_id=pair_id, history_root=history)
+
+    assert disposition["countable"] is True, disposition
+    assert [item["arm"] for item in disposition["comparison_inputs"]] == list(g1pb.ARMS)
 
 
 def test_pair_disposition_requires_exactly_one_outcome_countable_row_per_arm(tmp_path):

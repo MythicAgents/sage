@@ -25,6 +25,16 @@ class Gate1PProtocol:
     def pair_allocated(self) -> bool: return self.module.PAIR_ALLOCATED is True
 
     @property
+    def allocation_id(self) -> str | None:
+        value = getattr(self.module, "ALLOCATION_ID", self.pair_id)
+        return str(value) if value is not None else None
+
+    @property
+    def pair_ids(self) -> tuple[str, ...]:
+        values = getattr(self.module, "PAIR_IDS", None)
+        return tuple(values) if values is not None else ((self.pair_id,) if self.pair_id else ())
+
+    @property
     def scenario(self) -> str: return str(self.module.SCENARIO)
 
     @property
@@ -55,22 +65,41 @@ class Gate1PProtocol:
         factory = getattr(self.module, "build_episode_observer", None) or self.module.LiveEpisodeObserver
         return factory(*args, **kwargs)
 
-    def observer_facts_disposition(self, observer: Mapping[str, Any], *, arm: str) -> dict[str, Any]:
-        return self.module.observer_facts_disposition(observer, arm=arm)
+    def observer_facts_disposition(
+        self, observer: Mapping[str, Any], *, arm: str, pair_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self.pair_id is not None:
+            return self.module.observer_facts_disposition(observer, arm=arm)
+        return self.module.observer_facts_disposition(observer, arm=arm, pair_id=pair_id)
 
     def episode_outcome_disposition(self, observer: Mapping[str, Any], *, arm: str,
-                                    total_tokens: object, token_ceiling: object) -> dict[str, Any]:
+                                    total_tokens: object, token_ceiling: object,
+                                    pair_id: str | None = None) -> dict[str, Any]:
+        if self.pair_id is not None:
+            return self.module.episode_outcome_disposition(
+                observer, arm=arm, total_tokens=total_tokens, token_ceiling=token_ceiling,
+            )
         return self.module.episode_outcome_disposition(
             observer, arm=arm, total_tokens=total_tokens, token_ceiling=token_ceiling,
+            pair_id=pair_id,
         )
 
-    def comparison_disposition(self, records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-        return self.module.pair_disposition(records)
+    def comparison_disposition(
+        self, records: Iterable[Mapping[str, Any]], *, pair_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self.pair_id is not None:
+            return self.module.pair_disposition(records)
+        return self.module.pair_disposition(records, pair_id=pair_id)
 
     def assembled_contract(self) -> dict[str, Any]:
         return {
             "protocol_id": self.protocol_id, "matrix_id": self.matrix_id,
             "pair_id": self.pair_id, "pair_allocated": self.pair_allocated,
+            "allocation_id": self.allocation_id, "pair_ids": list(self.pair_ids),
+            "primary_pair_ids": list(getattr(self.module, "PRIMARY_PAIR_IDS", self.pair_ids)),
+            "reserve_pair_ids": list(getattr(self.module, "RESERVE_PAIR_IDS", ())),
+            "required_comparison_pairs": int(getattr(self.module, "REQUIRED_COMPARISON_PAIRS", 1)),
+            "max_pair_attempts": int(getattr(self.module, "MAX_PAIR_ATTEMPTS", 1)),
             "scenario": self.scenario, "objective": self.objective,
             "arms": list(self.arms),
             "proof_classes": list(self.proof_classes),
