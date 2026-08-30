@@ -888,16 +888,15 @@ async def raw_mythic_download_disposition(client: Any, *, timeout: int = 30) -> 
 
 
 async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tuple[bool, str]:
-    """Fail-cheap parity, SDK, and exact-live-schema preflight for the runtime raw surface."""
+    """Fail-cheap structural preflight for the runtime raw Mythic surface."""
     parity = raw_mythic_parity_disposition()
     bidirectional = raw_mythic_bidirectional_disposition()
     sdk = raw_mythic_sdk_disposition()
     graphql = await raw_mythic_graphql_disposition(client, timeout=timeout)
-    download = await raw_mythic_download_disposition(client, timeout=timeout)
     failures = [
         name for name, disposition in (
             ("parity", parity), ("bidirectional", bidirectional), ("sdk", sdk),
-            ("graphql", graphql), ("download", download)
+            ("graphql", graphql),
         )
         if disposition.get("valid") is not True
     ]
@@ -906,7 +905,7 @@ async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tup
     return True, (
         f"raw Mythic surface validated: {parity['raw_count']} raw <= "
         f"{parity['shipping_count']} shipping tools; {sdk['checked']} SDK calls; "
-        f"{graphql['checked']} exact GraphQL documents; task-produced collection download exercised"
+        f"{graphql['checked']} exact GraphQL documents"
     )
 
 

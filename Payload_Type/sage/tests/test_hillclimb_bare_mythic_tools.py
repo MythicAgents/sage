@@ -10,6 +10,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
 import bare_mythic_tools as bmt  # noqa: E402
@@ -263,6 +265,61 @@ def test_graphql_guard_rejects_a_planted_missing_field(monkeypatch):
     assert "credential_type" in disposition["failures"]["planted_drift"][0]
 
 
+def _patch_valid_structural_preflight(monkeypatch, *, failed_component=""):
+    def disposition(name, **details):
+        return {"valid": name != failed_component, **details}
+
+    monkeypatch.setattr(
+        bmt,
+        "raw_mythic_parity_disposition",
+        lambda: disposition("parity", raw_count=18, shipping_count=31),
+    )
+    monkeypatch.setattr(
+        bmt,
+        "raw_mythic_bidirectional_disposition",
+        lambda: disposition("bidirectional"),
+    )
+    monkeypatch.setattr(
+        bmt,
+        "raw_mythic_sdk_disposition",
+        lambda: disposition("sdk", checked=len(bmt.RAW_MYTHIC_SDK_CONTRACT)),
+    )
+
+    async def graphql(_client, *, timeout):
+        assert timeout == 7
+        return disposition("graphql", checked=len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS))
+
+    monkeypatch.setattr(bmt, "raw_mythic_graphql_disposition", graphql)
+
+
+def test_raw_mythic_surface_preflight_accepts_zero_files_without_download(monkeypatch):
+    _patch_valid_structural_preflight(monkeypatch)
+
+    async def download_must_not_run(*_args, **_kwargs):
+        raise AssertionError("ephemeral collection availability reached structural preflight")
+
+    monkeypatch.setattr(bmt, "raw_mythic_download_disposition", download_must_not_run)
+    ok, detail = asyncio.run(bmt.raw_mythic_surface_preflight(object(), timeout=7))
+
+    assert ok is True
+    assert detail == (
+        "raw Mythic surface validated: 18 raw <= 31 shipping tools; "
+        f"{len(bmt.RAW_MYTHIC_SDK_CONTRACT)} SDK calls; "
+        f"{len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS)} exact GraphQL documents"
+    )
+
+
+@pytest.mark.parametrize("failed_component", ["parity", "bidirectional", "sdk", "graphql"])
+def test_raw_mythic_surface_preflight_rejects_each_structural_failure(
+    monkeypatch, failed_component
+):
+    _patch_valid_structural_preflight(monkeypatch, failed_component=failed_component)
+    ok, detail = asyncio.run(bmt.raw_mythic_surface_preflight(object(), timeout=7))
+
+    assert ok is False
+    assert detail == f"raw Mythic surface failed {failed_component} validation"
+
+
 def test_excluded_secret_sauce_not_exposed():
     names = set(bmt.TOOLS)
     for sauce in ("get_ttp_guidance", "get_ttp_full_reference", "list_ttp_categories",
@@ -389,6 +446,30 @@ def test_ingest_collection_rejects_ambiguous_missing_and_malformed_sources(monke
         assert "collection ZIP" in str(exc)
     else:
         raise AssertionError("malformed collection was accepted")
+
+
+def test_dispatcher_returns_typed_tool_error_when_callback_has_no_collection(monkeypatch):
+    from mythic import mythic
+
+    async def no_files(_client, document, variables=None):
+        assert document == bmt._LATEST_COLLECTION_QUERY
+        assert variables == {"cbid": 7}
+        return {"filemeta": []}
+
+    async def ingest_must_not_run(_name, _data):
+        raise AssertionError("missing collection reached BloodHound")
+
+    monkeypatch.setattr(mythic, "execute_custom_query", no_files)
+    dispatcher = bmt.make_mythic_dispatcher(object(), collection_ingestor=ingest_must_not_run)
+    result = dispatcher({
+        "tool": "ingest_collection",
+        "args": {"callback_display_id": 7, "name_contains": "zip"},
+    })
+
+    assert result == (
+        "[tool error] ingest_collection: LookupError: "
+        "no completed non-deleted callback download matched name_contains='zip'"
+    )
 
 
 def _collection_source_row(**updates):
