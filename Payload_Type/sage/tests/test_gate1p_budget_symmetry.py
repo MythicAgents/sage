@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from ai.hillclimb import bare_runner, gate1p_stagea, run_gauge_live
+from ai.hillclimb import bare_runner, gate1p_control_floor, gate1p_stagea, run_gauge_live
 from ai.langgraph import policy
 
 
@@ -191,3 +191,37 @@ def test_crossing_evidence_is_admitted_identically_after_both_runners_stop():
 def test_scoring_function_has_no_arm_branch():
     signature = inspect.signature(gate1p_stagea.completed_call_budget_disposition)
     assert "arm" not in signature.parameters
+
+
+@pytest.mark.parametrize(
+    ("side", "arm_index", "expected_arm"),
+    (("harness", 0, "shipping_sage"), ("bare", 1, "true_naive")),
+)
+def test_control_floor_successor_requires_one_million_completed_call_tokens_per_arm(
+    side, arm_index, expected_arm,
+):
+    request = {
+        **_valid_request(side=side, arm_index=arm_index, token_ceiling=1_000_000),
+        "protocol_id": gate1p_control_floor.PROTOCOL_ID,
+        "pair_id": gate1p_control_floor.PAIR_ID,
+        "scenario": gate1p_control_floor.SCENARIO,
+    }
+
+    assert gate1p_control_floor.validate_request(**request) == expected_arm
+    with pytest.raises(gate1p_stagea.ProtocolError, match="token_ceiling"):
+        gate1p_control_floor.validate_request(**{**request, "token_ceiling": 999_999})
+
+
+def test_existing_stagea_budget_identity_remains_unchanged():
+    assert gate1p_stagea.TOKEN_ADMISSION_CEILING == 250_000
+    assert gate1p_stagea.PairAdmissionSpec(
+        protocol_id="p",
+        pair_id="x",
+        scenario="s",
+        objective="o",
+        observer_version="v",
+        reset_snapshot="r",
+        oracle_version="q",
+        readiness_protocol="ready",
+        logical_seed=0,
+    ).token_admission_ceiling == 250_000

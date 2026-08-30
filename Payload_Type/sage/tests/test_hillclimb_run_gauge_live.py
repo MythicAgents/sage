@@ -640,6 +640,70 @@ def test_diagnostic_dimensions_are_non_countable_and_preserve_missing_cost():
     assert dimensions["cost"]["total_tokens"] == {"countable": False, "value": None}
 
 
+def test_control_floor_row_dimensions_report_both_endpoints_without_weighting():
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(
+        probe_disagreements=[], objective_proven=True, objective_recognized=False,
+        objective_clean_stop=False, clean_stop=False, tool_calls=0, model_calls=1,
+        total_tokens=10, wall_seconds=1.0,
+    )
+    response = [{
+        "response_id": "r1",
+        "effective_backend": "openai:model",
+        "backend_provenance_source": "response_metadata.model_name",
+        "input_tokens": 8,
+        "output_tokens": 2,
+        "total_tokens": 10,
+        "usage_complete": True,
+    }]
+    dimensions = rgl.measurement_dimensions(
+        card,
+        measurement_kind="row",
+        cost_countable={"total_tokens": True},
+        stop_observation_available=True,
+        observer_result={},
+        arm="shipping_sage",
+        model_response_records=response,
+        model_calls=1,
+        token_ceiling=1_000_000,
+        outcome_disposition=lambda *_args, **_kwargs: {
+            "countable": True,
+            "stop_countable": True,
+            "objective_success": True,
+            "clean_stop": False,
+            "objective_recognized": False,
+            "objective_clean_stop": False,
+            "control_achieved": True,
+            "control_exercised": False,
+            "strict_control_result": False,
+        },
+    )
+
+    assert dimensions["outcome"]["control_achieved"] is True
+    assert dimensions["outcome"]["control_exercised"] is False
+    assert dimensions["outcome"]["strict_control_result"] is False
+    assert "score" not in dimensions["outcome"]
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "telemetry", "expected"),
+    [
+        ("timeout", {}, {"cause": "wall_time", "subtype": "wrapper_timeout"}),
+        ("success", {"controller_status": "complete"},
+         {"cause": "explicit_terminal_decision", "subtype": "objective_met"}),
+        ("success", {"controller_status": "halted_budget", "controller_terminal_reason": "token budget exhausted"},
+         {"cause": "cumulative_token_ceiling", "subtype": "exhausted"}),
+        ("success", {"controller_status": "halted_budget", "controller_terminal_reason": "token budget exhausted", "token_budget_overshoot": True},
+         {"cause": "cumulative_token_ceiling", "subtype": "overshoot"}),
+        ("success", {"controller_status": "halted_blocked"},
+         {"cause": "other_declared_boundary", "subtype": "controller_blocked"}),
+    ],
+)
+def test_harness_terminal_cause_uses_typed_wrapper_and_controller_state(wrapper, telemetry, expected):
+    assert rgl.harness_terminal_cause(wrapper, telemetry) == expected
+
+
 def test_gate1p_row_mode_requires_exact_protocol_before_any_live_client(monkeypatch):
     monkeypatch.setattr(
         rgl.live_seams,

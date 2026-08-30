@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
 import gate1p_protocol  # noqa: E402
+import gate1p_control_floor  # noqa: E402
 import gate1p_stagea  # noqa: E402
 import gate1p_stageb  # noqa: E402
 import run_gauge_live as rgl  # noqa: E402
@@ -73,6 +74,12 @@ def test_protocol_registry_is_exact_and_does_not_infer_from_scenario_prose():
     }
     assert stagea.module is gate1p_stagea
     assert stageb.module is gate1p_stageb
+    successor = gate1p_protocol.protocol_for_request(
+        protocol_id=gate1p_control_floor.PROTOCOL_ID,
+        scenario=gate1p_control_floor.SCENARIO,
+    )
+    assert successor.module is gate1p_control_floor
+    assert gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO).module is gate1p_stageb
     with pytest.raises(gate1p_stagea.ProtocolError, match="requires scenario"):
         gate1p_protocol.protocol_for_request(
             protocol_id=gate1p_stagea.PROTOCOL_ID,
@@ -83,6 +90,62 @@ def test_protocol_registry_is_exact_and_does_not_infer_from_scenario_prose():
             protocol_id=gate1p_stageb.PROTOCOL_ID,
             scenario=gate1p_stagea.SCENARIO,
         )
+
+
+def test_control_floor_contract_is_unallocated_two_arm_dual_endpoint_and_budget_symmetric():
+    protocol = gate1p_protocol.protocol_for_request(
+        protocol_id=gate1p_control_floor.PROTOCOL_ID,
+        scenario=gate1p_control_floor.SCENARIO,
+    )
+    contract = protocol.assembled_contract()
+
+    assert protocol.pair_allocated is False
+    assert contract["arms"] == ["shipping_sage", "true_naive"]
+    assert contract["arm_labels"]["true_naive"] == "same-model raw-tool/raw-history floor"
+    assert "not a proxy for Codex, Claude Code" in contract["raw_arm_interpretation"]
+    assert contract["primary_endpoint"] == "control_achieved"
+    assert contract["secondary_endpoints"] == ["control_exercised", "strict_control_result"]
+    assert contract["completed_call_token_ceiling_per_arm"] == {
+        "shipping_sage": 1_000_000,
+        "true_naive": 1_000_000,
+    }
+    assert contract["per_request_context_limit"] == 200_000
+    assert contract["max_output_tokens"] == 8_192
+    assert "do not add compaction or a third arm" in contract["raw_history_falsifier"]
+    with pytest.raises(gate1p_stagea.ProtocolError, match="prospective"):
+        protocol.validate_request(require_allocation=True, **_request(protocol))
+
+
+@pytest.mark.parametrize(
+    ("states", "control_achieved", "control_exercised"),
+    [
+        (_states(), False, False),
+        (_states(directory_delta=True), True, False),
+        (_states(remote_exec_child_dc=True), False, True),
+        (_states(certificate_control=True), True, True),
+    ],
+)
+def test_control_floor_projects_independent_binary_endpoints(
+    states, control_achieved, control_exercised,
+):
+    raw = gate1p_control_floor.build_objective_oracle(
+        _adapters(states),
+        artifact_pointer="private-history/control-floor-episode.json",
+    )()
+
+    assert raw["success"] is control_achieved
+    assert raw["control_achieved"] is control_achieved
+    assert raw["control_exercised"] is control_exercised
+    assert raw["strict_control_result"] is (control_achieved and control_exercised)
+    assert gate1p_control_floor.canonical_oracle_fact(raw) == raw
+
+
+def test_historical_stageb_semantics_remain_strict_and_are_not_rescored():
+    historical = _oracle(_states(directory_delta=True))()
+
+    assert historical["summary"]["control_satisfied"] is True
+    assert historical["summary"]["exercised_action_satisfied"] is False
+    assert historical["success"] is False
 
 
 def test_stageb_allocated_request_assembles_with_live_allocation_identity():
@@ -585,3 +648,65 @@ def test_stageb_runner_pair_go_requires_allocation_authority_before_external_cal
 
     assert result.returncode == 2
     assert "requires separate --live-authority-id" in result.stderr
+
+
+def _control_floor_runner_argv(*extra):
+    return [
+        sys.executable,
+        str(RUNNER),
+        "run",
+        "--side", "harness",
+        "--scenario", gate1p_control_floor.SCENARIO,
+        "--measurement-kind", "row",
+        "--protocol-id", gate1p_control_floor.PROTOCOL_ID,
+        "--pair-id", gate1p_control_floor.PAIR_ID,
+        "--arm-index", "0",
+        "--provider", gate1p_control_floor.MODEL_PROVIDER,
+        "--model", gate1p_control_floor.MODEL_ID,
+        "--solve-timeout", str(gate1p_control_floor.WALL_SECONDS),
+        "--model-token-budget", str(gate1p_control_floor.TOKEN_ADMISSION_CEILING),
+        "--model-context-limit", str(gate1p_control_floor.MODEL_CONTEXT_LIMIT),
+        "--max-output-tokens", str(gate1p_control_floor.MAX_OUTPUT_TOKENS),
+        "--source-version", "source-tree-v1",
+        *extra,
+    ]
+
+
+def test_control_floor_runner_dry_path_reports_contract_without_external_action():
+    result = subprocess.run(
+        _control_floor_runner_argv(),
+        cwd=PAYLOAD_ROOT,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "LANG": "C.UTF-8",
+            "SAGE_EVAL_API_ENDPOINT": "https://model.invalid/v1",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert '"pair_allocated": false' in result.stdout
+    assert '"shipping_sage": 1000000' in result.stdout
+    assert '"true_naive": 1000000' in result.stdout
+    assert '"per_request_context_limit": 200000' in result.stdout
+    assert "UNALLOCATED: protocol assembly only" in result.stdout
+    assert "RESET the range" not in result.stdout
+
+
+def test_control_floor_runner_go_refuses_before_external_import_or_call():
+    result = subprocess.run(
+        _control_floor_runner_argv("--go"),
+        cwd=PAYLOAD_ROOT,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "LANG": "C.UTF-8",
+            "SAGE_EVAL_API_ENDPOINT": "https://model.invalid/v1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "is unallocated; live execution is not authorized" in result.stderr

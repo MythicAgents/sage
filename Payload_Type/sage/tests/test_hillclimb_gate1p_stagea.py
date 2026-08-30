@@ -12,6 +12,7 @@ import pytest
 
 from ai.hillclimb import gate1p_stagea as g1p
 from ai.hillclimb import gate1p_stageb as g1pb
+from ai.hillclimb import gate1p_control_floor as g1pc
 from ai.hillclimb.fitness import ScoreCard
 
 
@@ -1487,6 +1488,84 @@ def test_stageb_pair_uses_the_real_shared_lifecycle_and_artifact_admission(tmp_p
 
     assert disposition["countable"] is True, disposition
     assert [item["arm"] for item in disposition["comparison_inputs"]] == list(g1pb.ARMS)
+
+
+def test_control_floor_pair_reports_primary_and_strict_results_separately(tmp_path):
+    history = tmp_path / ".sage_history"
+    records = _pair(_row("shipping_sage", history), _row("true_naive", history))
+    invariants = g1pc.pair_invariants(
+        provider=g1pc.MODEL_PROVIDER,
+        model=g1pc.MODEL_ID,
+        api_endpoint="https://provider.invalid/v1",
+        source_version="tree:test",
+        model_context_limit=g1pc.MODEL_CONTEXT_LIMIT,
+        max_output_tokens=g1pc.MAX_OUTPUT_TOKENS,
+    )
+    for record in records:
+        protocol = record.get("protocol") or {}
+        protocol["protocol_id"] = g1pc.PROTOCOL_ID
+        protocol["pair_id"] = g1pc.PAIR_ID
+        if "pair_invariants" in protocol:
+            protocol["pair_invariants"] = invariants
+        if record.get("record_type") != "result":
+            continue
+        arm = protocol["arm"]
+        exercised = arm == "true_naive"
+        record["scenario"] = g1pc.SCENARIO
+        record["card"]["scenario"] = g1pc.SCENARIO
+        record["termination"] = {
+            "cause": "explicit_terminal_decision",
+            "subtype": "objective_met",
+        }
+        record["countability"]["outcome"].update({
+            "control_achieved": True,
+            "control_exercised": exercised,
+            "strict_control_result": exercised,
+        })
+        observer = record["observer"]
+        observer["observer_version"] = g1pc.OBSERVER_VERSION
+        for event in observer["events"]:
+            event["event_id"] = event["event_id"].replace(g1p.PAIR_ID, g1pc.PAIR_ID)
+        proof_states = {
+            name: name == ("certificate_control" if exercised else "directory_delta")
+            for name in g1pc.OBJECTIVE_PROOF_CLASSES
+        }
+        observer["oracle"] = {
+            "success": True,
+            "control_achieved": True,
+            "control_exercised": exercised,
+            "strict_control_result": exercised,
+            "control_proof_class": "certificate_control" if exercised else "directory_delta",
+            "exercised_action_proof_class": "certificate_control" if exercised else None,
+            "summary": {
+                "domain": g1pc.OBJECTIVE_DOMAIN,
+                "control_satisfied": True,
+                "exercised_action_satisfied": exercised,
+                "proof_states": proof_states,
+                "observation_sources": dict(g1pc.PROOF_SOURCES),
+            },
+            "artifact_pointer": record["artifact_capture"]["episode_artifact"],
+        }
+        episode_path = Path(record["artifact_capture"]["episode_artifact"])
+        artifact = json.loads(episode_path.read_text(encoding="utf-8"))
+        artifact.update({
+            "protocol": protocol,
+            "oracle": observer["oracle"],
+            "observer": observer,
+            "scorecard": record["card"],
+        })
+        episode_path.write_text(json.dumps(artifact), encoding="utf-8")
+    _write_pair_ledger(records)
+
+    disposition = g1pc.pair_disposition(records, history_root=history)
+
+    assert disposition["countable"] is True, disposition
+    assert disposition["primary_endpoint"] == "control_achieved"
+    assert disposition["primary_outcomes"] == {"shipping_sage": True, "true_naive": True}
+    assert disposition["strict_outcomes"] == {"shipping_sage": False, "true_naive": True}
+    assert disposition["informative"] is False
+    assert disposition["continuation"] == "stop_gate1p"
+    assert "score" not in disposition
 
 
 def test_pair_disposition_requires_exactly_one_outcome_countable_row_per_arm(tmp_path):

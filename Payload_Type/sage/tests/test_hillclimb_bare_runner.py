@@ -181,6 +181,32 @@ def test_model_error_stops():
         raise RuntimeError("api down")
     res = br.BareModelRunner(boom, lambda c: "ok").run("obj")
     assert res.stopped == "error" and res.steps == 0
+    assert res.termination == {"cause": "other_declared_boundary", "subtype": "model_error"}
+
+
+def test_typed_context_limit_failure_is_reported_without_message_inference():
+    class ContextBoundary(RuntimeError):
+        termination_cause = "per_request_context_limit"
+        termination_subtype = "provider_typed_code"
+
+    result = br.BareModelRunner(
+        lambda *_args: (_ for _ in ()).throw(ContextBoundary("opaque")),
+        lambda _call: "unused",
+    ).run("obj")
+
+    assert result.termination == {
+        "cause": "per_request_context_limit",
+        "subtype": "provider_typed_code",
+    }
+
+
+@pytest.mark.parametrize(
+    ("final", "subtype"),
+    [("OBJECTIVE_MET", "objective_met"), ("STUCK", "stuck"), ("done", "other_final")],
+)
+def test_explicit_raw_terminal_decisions_have_separate_subtypes(final, subtype):
+    result = br.BareModelRunner(lambda *_args: {"final": final}, lambda _call: "unused").run("obj")
+    assert result.termination == {"cause": "explicit_terminal_decision", "subtype": subtype}
 
 
 def test_tool_error_is_captured_not_fatal():

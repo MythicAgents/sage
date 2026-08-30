@@ -744,8 +744,7 @@ def measurement_dimensions(
     canonical_cost_values = dict(cost_values or {})
     if kind == "row" and usage.get("countable") is True:
         canonical_cost_values["total_tokens"] = usage["total_tokens"]
-    return {
-        "outcome": {
+    outcome = {
             "countable": outcome_countable,
             "reason": outcome_reason,
             "stop_countable": (
@@ -775,7 +774,13 @@ def measurement_dimensions(
                 if kind != "row" and probe_available and clean_stop_available
                 else None
             ),
-        },
+    }
+    if semantic_projection is not None:
+        for field in ("control_achieved", "control_exercised", "strict_control_result"):
+            if field in semantic_projection:
+                outcome[field] = semantic_projection[field]
+    return {
+        "outcome": outcome,
         "comparison": {
             "countable": False,
             "reason": (
@@ -796,6 +801,38 @@ def measurement_dimensions(
             for key, value in cost_countable.items()
         },
     }
+
+
+def harness_terminal_cause(wrapper_status: object, runtime_telemetry: dict) -> dict[str, str]:
+    """Classify only typed wrapper/controller state; never infer context failure from prose."""
+    wrapper = str(wrapper_status or "").strip().casefold()
+    if wrapper == "timeout":
+        return {"cause": "wall_time", "subtype": "wrapper_timeout"}
+    if wrapper == "interrupted":
+        return {"cause": "other_declared_boundary", "subtype": "interrupted"}
+    if wrapper.startswith("error:"):
+        return {"cause": "other_declared_boundary", "subtype": "wrapper_error"}
+    status = str(runtime_telemetry.get("controller_status") or "").strip().casefold()
+    reason = str(runtime_telemetry.get("controller_terminal_reason") or "").strip().casefold()
+    if status == "complete":
+        return {"cause": "explicit_terminal_decision", "subtype": "objective_met"}
+    if status == "halted_budget":
+        if reason == "token budget exhausted":
+            subtype = "overshoot" if runtime_telemetry.get("token_budget_overshoot") is True else "exhausted"
+            return {"cause": "cumulative_token_ceiling", "subtype": subtype}
+        if reason == "wall-clock budget exhausted":
+            return {"cause": "wall_time", "subtype": "wrapper_timeout"}
+    controller_subtypes = {
+        "halted_aborted": "controller_aborted",
+        "halted_blocked": "controller_blocked",
+        "halted_denied": "controller_denied",
+        "halted_max_cycles": "controller_max_cycles",
+        "halted_no_action": "controller_no_action",
+        "halted_no_progress": "controller_no_progress",
+    }
+    if status in controller_subtypes:
+        return {"cause": "other_declared_boundary", "subtype": controller_subtypes[status]}
+    return {"cause": "other_declared_boundary", "subtype": "unknown"}
 
 
 def episode_protocol_snapshot(cfg: Config, *, side: str, scenario_name: str, model_route: dict) -> dict:
@@ -1001,7 +1038,10 @@ def run_side(
             gate1p_evaluator_state["final_members"] = sorted(final_members)
             return bool(final_members - baseline_members)
 
-        if row_protocol.module is gate1p_stageb:
+        if (
+            row_protocol.module is gate1p_stageb
+            or getattr(row_protocol.module, "PROOF_ADAPTER_FAMILY", "") == "stageb"
+        ):
             gate1p_oracle = row_protocol.build_objective_oracle(
                 _stageb_proof_adapters(
                     reader, baseline, objective_domain=objective_domain,
@@ -1115,6 +1155,7 @@ def run_side(
             if isinstance(native_result, dict)
             else {}
         )
+        termination = harness_terminal_cause(solve_status, runtime_telemetry)
         observer_result = (
             observer.finish(
                 wrapper_status=solve_status,
@@ -1215,6 +1256,7 @@ def run_side(
                 "event": dict(observer.coordinator.events[0]),
             })
         result = bare.run(scn.objective)
+        termination = dict(result.termination)
         runtime_telemetry = {
             "controller_cycle_count": 0,
             "achieved_effects": [],
@@ -1443,6 +1485,7 @@ def run_side(
                else runtime_telemetry.get("token_usage_complete") is True
            ),
            "measurement_kind": cfg.measurement_kind,
+           "termination": dict(termination),
            "protocol": dict(protocol_snapshot),
            "countability": measurement_dimensions(
                card,

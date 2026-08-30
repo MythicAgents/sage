@@ -82,6 +82,13 @@ def _gate1p_protocol_selector():
     return gate1p_protocol
 
 
+def _gate1p_control_floor_protocol():
+    sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import gate1p_control_floor  # type: ignore
+
+    return gate1p_control_floor
+
+
 def _laps_family_transfer_netbios_map() -> str:
     laps_contract = _active_laps_contract()
     mapping = {laps_contract.ROOT_NETBIOS: laps_contract.ROOT_DOMAIN}
@@ -2257,6 +2264,11 @@ def main(argv=None) -> int:
         action="store_true",
         help="assemble or execute the allocated Stage B child-control matrix",
     )
+    ap.add_argument(
+        "--gate1p-control-floor-canary",
+        action="store_true",
+        help="assemble the unallocated dual-endpoint, 1M-token control-floor canary",
+    )
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
     ap.add_argument("--max-output-tokens", type=int, default=None,
@@ -2416,8 +2428,9 @@ def main(argv=None) -> int:
         args.gate1p_stage_a_diagnostic,
         args.gate1p_stage_a_pair,
         args.gate1p_stage_b_protocol,
+        args.gate1p_control_floor_canary,
     ))) > 1:
-        ap.error("Gate 1P diagnostic, Stage A pair, and Stage B protocol modes are mutually exclusive")
+        ap.error("Gate 1P diagnostic, Stage A pair, Stage B, and control-floor modes are mutually exclusive")
     if args.gate1p_stage_a_diagnostic:
         if args.scenario != "child-domain-control" or args.side != "harness" or args.seeds != 1:
             ap.error(
@@ -2436,6 +2449,25 @@ def main(argv=None) -> int:
                 "SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the Gate 1P diagnostic"
             )
     stageb = _gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    control_floor = _gate1p_control_floor_protocol()
+    if args.gate1p_control_floor_canary:
+        if args.scenario != control_floor.SCENARIO or args.side is not None or args.seeds != 1:
+            ap.error(
+                f"--gate1p-control-floor-canary requires --scenario {control_floor.SCENARIO} "
+                "with no --side and --seeds 1"
+            )
+        if policy_mode != control_floor.POLICY_MODE or null_model or args.treatment:
+            ap.error("the control-floor canary declares only shipping Sage and the same-model raw floor")
+        if args.solve_timeout != control_floor.WALL_SECONDS:
+            ap.error(f"the control-floor canary requires --solve-timeout {control_floor.WALL_SECONDS}")
+        if args.go:
+            ap.error(
+                f"{control_floor.PROTOCOL_ID} is unallocated; --go cannot reset or execute anything"
+            )
+        args.provider = args.provider or control_floor.MODEL_PROVIDER
+        args.model = args.model or control_floor.MODEL_ID
+        args.model_context_limit = args.model_context_limit or control_floor.MODEL_CONTEXT_LIMIT
+        args.max_output_tokens = args.max_output_tokens or control_floor.MAX_OUTPUT_TOKENS
     if args.gate1p_stage_b_protocol:
         if args.scenario != stageb.SCENARIO or args.side is not None or args.seeds != 1:
             ap.error(
@@ -2542,21 +2574,29 @@ def main(argv=None) -> int:
                           args.provider, args.model, null_model,
                           (
                               "row" if args.gate1p_stage_a_pair or args.gate1p_stage_b_protocol
+                              or args.gate1p_control_floor_canary
                               else "diagnostic" if args.gate1p_stage_a_diagnostic
                               else "legacy"
                           ),
                           (
                               gate1p.PROTOCOL_ID if args.gate1p_stage_a_pair
                               else stageb.PROTOCOL_ID if args.gate1p_stage_b_protocol
+                              else control_floor.PROTOCOL_ID if args.gate1p_control_floor_canary
                               else "gate1p-stage-a-diagnostic-v1"
                               if args.gate1p_stage_a_diagnostic
                               else None
                           ),
-                          gate1p.PAIR_ID if args.gate1p_stage_a_pair else None,
+                          (
+                              gate1p.PAIR_ID if args.gate1p_stage_a_pair
+                              else control_floor.PAIR_ID if args.gate1p_control_floor_canary
+                              else None
+                          ),
                           (
                               gate1p.TOKEN_ADMISSION_CEILING if args.gate1p_stage_a_pair
                               else stageb.TOKEN_ADMISSION_CEILING
-                              if args.gate1p_stage_b_protocol else None
+                              if args.gate1p_stage_b_protocol
+                              else control_floor.TOKEN_ADMISSION_CEILING
+                              if args.gate1p_control_floor_canary else None
                           ),
                           args.model_context_limit,
                           args.max_output_tokens,

@@ -125,6 +125,40 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
     }]
 
 
+@pytest.mark.parametrize(
+    ("code", "expected_cause"),
+    [
+        ("context_length_exceeded", "per_request_context_limit"),
+        ("rate_limit_exceeded", "other_declared_boundary"),
+        (None, "other_declared_boundary"),
+    ],
+)
+def test_model_factory_classifies_only_typed_provider_context_codes(monkeypatch, code, expected_cause):
+    import langchain.chat_models
+
+    class ProviderFailure(RuntimeError):
+        pass
+
+    failure = ProviderFailure("context_length_exceeded appears only in untrusted prose")
+    failure.code = code
+
+    class FakeModel:
+        def invoke(self, _messages):
+            raise failure
+
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", lambda **_kwargs: FakeModel())
+    invoke = ls.make_model_fn("openai", "model")
+
+    with pytest.raises(ls.ModelRequestBoundaryError) as raised:
+        invoke("system", [], [])
+
+    assert raised.value.termination_cause == expected_cause
+    assert raised.value.termination_subtype == (
+        "provider_typed_code" if expected_cause == "per_request_context_limit" else "model_error"
+    )
+
+
 def test_model_route_auth_smoke_uses_exact_route_and_returns_only_allowlisted_metadata(monkeypatch):
     seen = {}
 
@@ -252,6 +286,19 @@ def test_bare_history_requests_typed_objective_or_stuck_terminal():
     assert "OBJECTIVE_MET" in rendered
     assert "STUCK" in rendered
     assert "FINAL if done/stuck" not in rendered
+
+
+def test_bare_history_renders_every_action_observation_without_compaction():
+    history = [
+        {"call": {"tool": "task", "args": {"index": index}}, "obs": f"observation-{index}"}
+        for index in range(25)
+    ]
+
+    rendered = ls._render_history("objective", history)
+
+    for index in range(25):
+        assert f'"index": {index}' in rendered
+        assert f"observation-{index}" in rendered
 
 
 def test_response_backend_record_uses_observed_model_revision_not_configured_alias():

@@ -92,7 +92,7 @@ class Gate1PProtocol:
         return self.module.pair_disposition(records, pair_id=pair_id)
 
     def assembled_contract(self) -> dict[str, Any]:
-        return {
+        contract = {
             "protocol_id": self.protocol_id, "matrix_id": self.matrix_id,
             "pair_id": self.pair_id, "pair_allocated": self.pair_allocated,
             "allocation_id": self.allocation_id, "pair_ids": list(self.pair_ids),
@@ -107,16 +107,29 @@ class Gate1PProtocol:
             "observer_version": str(self.module.OBSERVER_VERSION),
             "comparator": "pair_disposition",
         }
+        extensions = getattr(self.module, "CONTRACT_EXTENSIONS", {})
+        for output_name, value in extensions.items():
+            contract[output_name] = (
+                dict(value) if isinstance(value, Mapping)
+                else list(value) if isinstance(value, tuple)
+                else value
+            )
+        return contract
 
 
 def _protocols() -> tuple[Gate1PProtocol, ...]:
     try:
-        from . import gate1p_stagea, gate1p_stageb
+        from . import gate1p_control_floor, gate1p_stagea, gate1p_stageb
     except Exception:
+        import gate1p_control_floor  # type: ignore
         import gate1p_stagea  # type: ignore
         import gate1p_stageb  # type: ignore
 
-    return Gate1PProtocol(gate1p_stagea), Gate1PProtocol(gate1p_stageb)
+    return (
+        Gate1PProtocol(gate1p_stagea),
+        Gate1PProtocol(gate1p_stageb),
+        Gate1PProtocol(gate1p_control_floor),
+    )
 
 
 def primary_scenarios() -> frozenset[str]:
@@ -125,6 +138,9 @@ def primary_scenarios() -> frozenset[str]:
 
 def protocol_for_scenario(scenario: str) -> Gate1PProtocol:
     matches = [protocol for protocol in _protocols() if protocol.scenario == scenario]
+    defaults = [protocol for protocol in matches if getattr(protocol.module, "SCENARIO_DEFAULT", True) is True]
+    if len(defaults) == 1:
+        return defaults[0]
     if len(matches) != 1:
         error_type = _protocols()[0].module.ProtocolError
         raise error_type(f"no unique Gate 1P protocol is declared for scenario {scenario!r}")

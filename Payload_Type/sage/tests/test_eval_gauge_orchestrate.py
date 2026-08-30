@@ -2130,6 +2130,49 @@ def test_gate1p_pair_live_cli_refuses_without_exact_pair024_authority(tmp_path):
     ) in result.stderr
 
 
+def test_control_floor_canary_dry_run_is_unallocated_and_emits_no_live_plan():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario", "child-control",
+            "--gate1p-control-floor-canary",
+        ],
+        cwd=ROOT,
+        env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert '"pair_allocated": false' in result.stdout
+    assert '"shipping_sage": 1000000' in result.stdout
+    assert '"true_naive": 1000000' in result.stdout
+    assert '"per_request_context_limit": 200000' in result.stdout
+    assert "No reset, arm, model, Mythic, BloodHound, range, target, or comparison command" in result.stdout
+    assert "wipe --yes" not in result.stdout
+
+
+def test_control_floor_canary_go_refuses_before_reset_or_route_discovery():
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario", "child-control",
+            "--gate1p-control-floor-canary",
+            "--go",
+        ],
+        cwd=ROOT,
+        env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "is unallocated; --go cannot reset or execute anything" in result.stderr
+
+
 def test_gate1p_pair_rejects_snapshot_or_foothold_drift_before_live_contact(tmp_path):
     bloodhound_dir = tmp_path / "bloodhound-mcp"
     bloodhound_dir.mkdir()

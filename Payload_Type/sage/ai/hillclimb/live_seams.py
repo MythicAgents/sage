@@ -29,6 +29,47 @@ from ssl_bootstrap import configure_sage_ssl_cert_file
 
 DirectProbe = Callable[[], bool]
 
+_CONTEXT_LIMIT_CODES = frozenset({
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "max_context_length_exceeded",
+    "prompt_too_long",
+})
+
+
+class ModelRequestBoundaryError(RuntimeError):
+    """Sanitized typed provider failure used only for terminal-boundary reporting."""
+
+    def __init__(self, *, error_type: str, provider_code: str | None):
+        self.provider_code = provider_code
+        self.termination_cause = (
+            "per_request_context_limit"
+            if provider_code in _CONTEXT_LIMIT_CODES
+            else "other_declared_boundary"
+        )
+        self.termination_subtype = (
+            "provider_typed_code"
+            if self.termination_cause == "per_request_context_limit"
+            else "model_error"
+        )
+        suffix = f", typed_code={provider_code}" if provider_code else ""
+        super().__init__(f"model request failed ({error_type}{suffix})")
+
+
+def _typed_provider_error_code(exc: BaseException) -> str | None:
+    """Extract structured provider codes without classifying exception prose."""
+    direct = getattr(exc, "code", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip().casefold()
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping):
+        nested = body.get("error")
+        candidates = [body.get("code"), nested.get("code") if isinstance(nested, Mapping) else None]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip().casefold()
+    return None
+
 _REPO = Path(__file__).resolve().parents[4]
 
 
@@ -171,7 +212,13 @@ def make_model_fn(
     def model_fn(system: str, tools_spec: list, history: list) -> dict:
         bound = llm.bind_tools(tools_spec) if tools_spec else llm
         messages = [("system", system), ("human", _render_history(objective, history))]
-        message = bound.invoke(messages)
+        try:
+            message = bound.invoke(messages)
+        except Exception as exc:
+            raise ModelRequestBoundaryError(
+                error_type=type(exc).__name__,
+                provider_code=_typed_provider_error_code(exc),
+            ) from exc
         decision = parse_model_decision(message)
         usage = getattr(message, "usage_metadata", None)
         if not isinstance(usage, dict):

@@ -82,6 +82,7 @@ class PairAdmissionSpec:
     oracle_version: str = "gate1p-child-control-route-neutral-v2"
     readiness_protocol: str = "gate1p-stagea-last-material-mutation-qualified-reset-v2"
     logical_seed: int = 0
+    token_admission_ceiling: int = TOKEN_ADMISSION_CEILING
 
 
 STAGEA_ADMISSION = PairAdmissionSpec()
@@ -1051,8 +1052,13 @@ def validate_request(
         raise ProtocolError(f"policy_mode must be {POLICY_MODE!r}")
     if type(solve_timeout) is not int or solve_timeout != WALL_SECONDS:
         raise ProtocolError(f"solve_timeout must be {WALL_SECONDS}")
-    if type(token_ceiling) is not int or token_ceiling != TOKEN_ADMISSION_CEILING:
-        raise ProtocolError(f"token_ceiling must be {TOKEN_ADMISSION_CEILING}")
+    if (
+        type(admission.token_admission_ceiling) is not int
+        or admission.token_admission_ceiling <= 0
+    ):
+        raise ProtocolError("the protocol token_admission_ceiling must be a positive integer")
+    if type(token_ceiling) is not int or token_ceiling != admission.token_admission_ceiling:
+        raise ProtocolError(f"token_ceiling must be {admission.token_admission_ceiling}")
     if not source_version or str(source_version).strip() in {"", "unrecorded"}:
         raise ProtocolError("source_version is required")
     if not api_endpoint or not str(api_endpoint).strip():
@@ -1118,7 +1124,7 @@ def pair_invariants(
         "initial_foothold_role": dict(INITIAL_FOOTHOLD_ROLE),
         "readiness_protocol": admission.readiness_protocol,
         "wall_seconds": WALL_SECONDS,
-        "token_admission_ceiling": TOKEN_ADMISSION_CEILING,
+        "token_admission_ceiling": admission.token_admission_ceiling,
         "token_budget_boundary": TOKEN_BUDGET_BOUNDARY,
         "objective_settle_seconds": OBJECTIVE_SETTLE_SECONDS,
         "objective_poll_seconds": OBJECTIVE_POLL_SECONDS,

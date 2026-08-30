@@ -110,6 +110,39 @@ class BareModelResult:
     token_budget_exhausted: bool = False
     token_budget_overshoot: bool = False
     recoverable_tool_errors: list = field(default_factory=list)
+    termination: dict[str, str] = field(default_factory=lambda: {
+        "cause": "other_declared_boundary",
+        "subtype": "unknown",
+    })
+
+
+def terminal_cause(stopped: object, final_text: object = "", error: BaseException | None = None) -> dict[str, str]:
+    """Project raw-runner state onto the prospectively declared terminal taxonomy."""
+    state = str(stopped or "")
+    if state == "token_budget_exhausted":
+        return {"cause": "cumulative_token_ceiling", "subtype": "exhausted"}
+    if state == "token_budget_overshoot":
+        return {"cause": "cumulative_token_ceiling", "subtype": "overshoot"}
+    if state == "timeout":
+        return {"cause": "wall_time", "subtype": "wrapper_timeout"}
+    if state == "done":
+        final = str(final_text or "").strip().casefold()
+        subtype = "objective_met" if final == "objective_met" else "stuck" if final == "stuck" else "other_final"
+        return {"cause": "explicit_terminal_decision", "subtype": subtype}
+    if state == "budget":
+        return {"cause": "other_declared_boundary", "subtype": "step_budget"}
+    if state in {"interrupted", "measurement_error"}:
+        return {"cause": "other_declared_boundary", "subtype": state}
+    if state == "error" and error is not None:
+        cause = getattr(error, "termination_cause", None)
+        subtype = getattr(error, "termination_subtype", None)
+        if cause == "per_request_context_limit" and subtype in {
+            "provider_typed_code", "local_pre_request_boundary",
+        }:
+            return {"cause": cause, "subtype": subtype}
+    if state == "error":
+        return {"cause": "other_declared_boundary", "subtype": "model_error"}
+    return {"cause": "other_declared_boundary", "subtype": "unknown"}
 
 
 class BareModelRunner:
@@ -160,6 +193,7 @@ class BareModelRunner:
         final_txt = ""
         objective_recognized = False
         recoverable_tool_errors: list[dict[str, object]] = []
+        model_error: BaseException | None = None
         token_budget = TokenBudget(ceiling=self.token_ceiling or (2**63 - 1))
         log(f"▶ BARE START — objective: {objective}")
         while True:
@@ -183,6 +217,7 @@ class BareModelRunner:
                 break
             except Exception as exc:
                 stopped = "error"
+                model_error = exc
                 log(f"✗ step {step} model error: {type(exc).__name__}: {exc}")
                 break
             if isinstance(decision, dict):
@@ -278,6 +313,7 @@ class BareModelRunner:
             token_budget_exhausted=bool(self.token_ceiling is not None and token_budget.exhausted),
             token_budget_overshoot=bool(self.token_ceiling is not None and token_budget.overshoot),
             recoverable_tool_errors=recoverable_tool_errors,
+            termination=terminal_cause(stopped, final_txt, model_error),
         )
 
 
