@@ -29,6 +29,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
+from ssl_bootstrap import (
+    DEFAULT_SAGE_COMBINED_CA_BUNDLE_PATH,
+    DEFAULT_SAGE_CUSTOM_CA_BUNDLE_PATH,
+    configure_sage_ssl_cert_file,
+)
+
 try:  # package import
     from . import policy_replay_calibration as calibration
     from . import policy_replay_corpus as corpus
@@ -53,9 +59,6 @@ except Exception:  # script / flat import
 
 DEFAULT_CORPUS_PATH = corpus.DEFAULT_CORPUS_PATH
 DEFAULT_ROUTE_ENV_PATH = Path(__file__).resolve().parents[4] / "skills" / "sage-eval-gauge" / ".env.local"
-DEFAULT_SAGE_CERTS_DIR = Path(__file__).resolve().parents[2] / "certs"
-DEFAULT_SAGE_COMBINED_CA_BUNDLE_PATH = DEFAULT_SAGE_CERTS_DIR / "combined-bundle.pem"
-DEFAULT_SAGE_CUSTOM_CA_BUNDLE_PATH = DEFAULT_SAGE_CERTS_DIR / "bundle.pem"
 PHASE5_SCHEMA_VERSION = 1
 DEFAULT_SAMPLES_PER_CELL = 5
 PRIMARY_POLICY_MODE = policy.POLICY_HYBRID
@@ -1366,36 +1369,6 @@ def _parse_env_file(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip("'\"")
     return values
-
-
-def configure_sage_ssl_cert_file(
-    *,
-    combined_bundle_path: str | Path | None = None,
-    custom_bundle_path: str | Path | None = None,
-) -> str:
-    """Reuse Sage's existing local trust bundle for eval-provider clients.
-
-    `Payload_Type/sage/main.py` already combines system CAs with the gitignored
-    custom bundle into `certs/combined-bundle.pem` for the running Sage service.
-    The standalone Phase 5 evaluator does not import `main.py`, so it must opt in
-    to the same trust material before LangChain/OpenAI constructs its HTTP client.
-
-    Explicit operator configuration wins. When no combined bundle exists, the
-    custom bundle is still a valid explicit trust input; the helper does not
-    weaken verification or invent a new certificate path.
-    """
-
-    configured = str(os.environ.get("SSL_CERT_FILE") or "").strip()
-    if configured:
-        return configured
-    combined = Path(combined_bundle_path) if combined_bundle_path is not None else DEFAULT_SAGE_COMBINED_CA_BUNDLE_PATH
-    custom = Path(custom_bundle_path) if custom_bundle_path is not None else DEFAULT_SAGE_CUSTOM_CA_BUNDLE_PATH
-    for candidate in (combined, custom):
-        if candidate.is_file():
-            resolved = str(candidate.resolve())
-            os.environ["SSL_CERT_FILE"] = resolved
-            return resolved
-    return ""
 
 
 def load_default_treatments(path: str | Path | None = None) -> list[ModelTreatment]:

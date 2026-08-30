@@ -25,6 +25,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 
+from ssl_bootstrap import configure_sage_ssl_cert_file
+
 DirectProbe = Callable[[], bool]
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -150,6 +152,7 @@ def make_model_fn(
 ) -> Callable[[str, list, list], dict]:
     """The bare LLM (same model Sage uses) with tool-calling, NO scaffolding.
     Grounded: model.py:1331 `init_chat_model(model_provider=..., model=...)`."""
+    configure_sage_ssl_cert_file()
     from langchain.chat_models import init_chat_model  # imported lazily; needs the LLM creds at runtime
 
     kwargs: dict = {"model_provider": provider, "model": model}

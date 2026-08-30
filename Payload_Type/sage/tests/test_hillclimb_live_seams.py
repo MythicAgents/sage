@@ -94,10 +94,16 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
     import langchain.chat_models
 
     calls = []
+    events = []
+    monkeypatch.setattr(
+        ls,
+        "configure_sage_ssl_cert_file",
+        lambda: events.append("ssl-bootstrap") or "",
+    )
     monkeypatch.setattr(
         langchain.chat_models,
         "init_chat_model",
-        lambda **kwargs: calls.append(kwargs) or object(),
+        lambda **kwargs: events.append("model-init") or calls.append(kwargs) or object(),
     )
 
     model_fn = ls.make_model_fn(
@@ -109,6 +115,7 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
     )
 
     assert callable(model_fn)
+    assert events == ["ssl-bootstrap", "model-init"]
     assert calls == [{
         "model_provider": "openai",
         "model": "bedrock-claude-4-6-sonnet",

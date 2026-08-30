@@ -6,6 +6,7 @@ from pathlib import Path
 # directory, so an operator edits it from the web UI container file browser — no shell, no sudo.
 # Precedence and empty-value rules live in the module. See README "Configuration load order".
 from dotenv_bootstrap import load_sage_dotenv
+from ssl_bootstrap import configure_sage_ssl_cert_file
 
 _dotenv_applied = load_sage_dotenv()
 
@@ -22,28 +23,12 @@ from openinference.instrumentation.langchain import LangChainInstrumentor
 if _dotenv_applied:
     logger.info(f"Loaded {len(_dotenv_applied)} setting(s) from .env: {sorted(_dotenv_applied)}")
 
-# Configure SSL certificate bundle if present
-# Combines system CA certs with any custom certs so both public APIs and internal services work
-import ssl
-
-cert_bundle_path = os.path.join(os.path.dirname(__file__), "certs", "bundle.pem")
-if os.path.exists(cert_bundle_path):
-    system_ca_path = ssl.get_default_verify_paths().openssl_cafile
-    combined = ""
-    if system_ca_path and os.path.exists(system_ca_path):
-        with open(system_ca_path, "r") as f:
-            combined = f.read()
-        if not combined.endswith("\n"):
-            combined += "\n"
-    with open(cert_bundle_path, "r") as f:
-        combined += f.read()
-    combined_path = os.path.join(os.path.dirname(__file__), "certs", "combined-bundle.pem")
-    with open(combined_path, "w") as f:
-        f.write(combined)
-    os.environ["SSL_CERT_FILE"] = combined_path
-    logger.info(f"Using combined SSL certificate bundle (system CAs + custom certs): {combined_path}")
+certs_dir = Path(__file__).resolve().parent / "certs"
+ssl_cert_file = configure_sage_ssl_cert_file(certs_dir=certs_dir)
+if ssl_cert_file:
+    logger.info(f"Using configured SSL certificate bundle: {ssl_cert_file}")
 else:
-    logger.info(f"No custom SSL certificate bundle found at {cert_bundle_path}, using system defaults")
+    logger.info(f"No custom SSL certificate bundle found at {certs_dir / 'bundle.pem'}, using system defaults")
 
 _phoenix_working_dir = Path(__file__).resolve().parent / ".phoenix"
 _phoenix_working_dir.mkdir(parents=True, exist_ok=True)
