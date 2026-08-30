@@ -2130,13 +2130,14 @@ def test_gate1p_pair_live_cli_refuses_without_exact_pair024_authority(tmp_path):
     ) in result.stderr
 
 
-def test_control_floor_canary_dry_run_is_unallocated_and_emits_no_live_plan():
+def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan():
     result = subprocess.run(
         [
             str(PY),
             str(SCRIPT),
             "--scenario", "child-control",
             "--gate1p-control-floor-canary",
+            "--live-authority-id", "gate1p-control-floor-canary-allocation-001",
         ],
         cwd=ROOT,
         env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
@@ -2145,15 +2146,24 @@ def test_control_floor_canary_dry_run_is_unallocated_and_emits_no_live_plan():
         check=True,
     )
 
-    assert '"pair_allocated": false' in result.stdout
+    assert '"pair_allocated": true' in result.stdout
+    assert '"allocation_id": "gate1p-control-floor-canary-allocation-001"' in result.stdout
     assert '"shipping_sage": 1000000' in result.stdout
     assert '"true_naive": 1000000' in result.stdout
     assert '"per_request_context_limit": 200000' in result.stdout
-    assert "No reset, arm, model, Mythic, BloodHound, range, target, or comparison command" in result.stdout
-    assert "wipe --yes" not in result.stdout
+    assert result.stdout.count("--- iteration seed=0 side=") == 2
+    assert "side=harness" in result.stdout
+    assert "side=bare" in result.stdout
+    assert result.stdout.count("wipe --yes") == 2
+    assert "gate1p-control-floor/gate1p-control-floor-canary-v1/gate1p-control-floor-canary-pair-001" in result.stdout
+    assert result.stdout.count("--live-authority-id gate1p-control-floor-canary-allocation-001") == 2
+    assert "run_gauge_live.py compare" not in result.stdout
+    assert "control-floor dual-endpoint pair disposition" in result.stdout
 
 
-def test_control_floor_canary_go_refuses_before_reset_or_route_discovery():
+@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-terminal"))
+def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_discovery(authority):
+    authority_args = [] if authority is None else ["--live-authority-id", authority]
     result = subprocess.run(
         [
             str(PY),
@@ -2161,6 +2171,7 @@ def test_control_floor_canary_go_refuses_before_reset_or_route_discovery():
             "--scenario", "child-control",
             "--gate1p-control-floor-canary",
             "--go",
+            *authority_args,
         ],
         cwd=ROOT,
         env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
@@ -2170,7 +2181,236 @@ def test_control_floor_canary_go_refuses_before_reset_or_route_discovery():
     )
 
     assert result.returncode == 2
-    assert "is unallocated; --go cannot reset or execute anything" in result.stderr
+    assert (
+        "live control-floor execution requires separate --live-authority-id "
+        "gate1p-control-floor-canary-allocation-001"
+    ) in result.stderr
+    assert "rollback " not in result.stdout
+    assert "bootstrap_payloads.py" not in result.stdout
+
+
+def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatch, tmp_path):
+    control_floor = orchestrate._gate1p_control_floor_protocol()
+    historical = tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement" / "gate1p-stagea"
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+
+    pair_env = orchestrate._control_floor_pair_env(
+        control_floor,
+        {
+            "SAGE_EVAL_ARTIFACT_DIR": str(historical),
+            "SAGE_EVAL_RESULTS_PATH": str(historical / "results.jsonl"),
+            "SAGE_EVAL_API_ENDPOINT": "https://model.invalid/v1",
+        },
+    )
+    expected = (
+        tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / "gate1p-control-floor" / control_floor.MATRIX_ID / control_floor.PAIR_ID
+    )
+
+    assert Path(pair_env["SAGE_EVAL_ARTIFACT_DIR"]) == expected
+    assert Path(pair_env["SAGE_EVAL_RESULTS_PATH"]) == expected / "results.jsonl"
+    assert pair_env["SAGE_EVAL_API_ENDPOINT"] == "https://model.invalid/v1"
+    assert not historical.exists()
+
+
+def test_control_floor_pair_control_uses_control_floor_schema_and_namespace(monkeypatch, tmp_path):
+    control_floor = orchestrate._gate1p_control_floor_protocol()
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+    pair_env = orchestrate._control_floor_pair_env(control_floor, None)
+
+    path = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=pair_env,
+        protocol=control_floor,
+        pair_id=control_floor.PAIR_ID,
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+
+    assert state["schema"] == "gate1p-control-floor-pair-control-v1"
+    assert control_floor.PRESTART_CLEANUP_SCHEMA == "gate1p-control-floor-prestart-cleanup-v1"
+    assert path == (
+        tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / "gate1p-control-floor" / control_floor.MATRIX_ID / control_floor.PAIR_ID
+        / "pair-control.json"
+    )
+
+
+def _control_floor_fixture(monkeypatch, tmp_path, *, shipping_countable=True):
+    control_floor = orchestrate._gate1p_control_floor_protocol()
+    calls = []
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+    pair_env = orchestrate._control_floor_pair_env(control_floor, None)
+    monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args: None)
+
+    control_path = orchestrate._gate1p_pair_control_path(pair_env)
+    control_path.parent.mkdir(parents=True, exist_ok=True)
+    control_path.write_text(json.dumps({
+        "schema": control_floor.PAIR_CONTROL_SCHEMA,
+        "protocol_id": control_floor.PROTOCOL_ID,
+        "pair_id": control_floor.PAIR_ID,
+        "source_version": "tree:test",
+        "next_arm": "shipping_sage",
+        "completed_arms": [],
+        "prearm_state": {
+            "arm": "shipping_sage", "status": "idle", "reset_generation": 0, "updated_at": 1.0,
+        },
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        orchestrate,
+        "initialize_gate1p_pair_control",
+        lambda **_kwargs: control_path,
+    )
+
+    def run_side(_scenario, side, **kwargs):
+        calls.append((side, kwargs))
+        results = orchestrate._gate1p_results_path(kwargs["route_env"])
+        results.parent.mkdir(parents=True, exist_ok=True)
+        with results.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "record_type": "result",
+                "protocol": {"arm": control_floor.ARMS[kwargs["arm_index"]]},
+            }) + "\n")
+
+    monkeypatch.setattr(orchestrate, "run_side_with_gate1p_cleanup", run_side)
+    monkeypatch.setattr(
+        orchestrate,
+        "_gate1p_completed_arm_disposition",
+        lambda *_args, **_kwargs: {
+            "countable": shipping_countable,
+            "reason": "fixture shipping admission",
+        },
+    )
+    monkeypatch.setattr(
+        control_floor,
+        "pair_disposition",
+        lambda *_args, **_kwargs: {
+            "countable": shipping_countable,
+            "reason": "fixture pair disposition",
+        },
+    )
+    args = SimpleNamespace(
+        source_version="tree:test",
+        solve_timeout=control_floor.WALL_SECONDS,
+        provider=control_floor.MODEL_PROVIDER,
+        model=control_floor.MODEL_ID,
+        snapshot=control_floor.RESET_SNAPSHOT,
+        retained_callback_config=Path("retained.json"),
+        ludus_range_id="range",
+        ludus_mcp_server="server",
+        model_context_limit=control_floor.MODEL_CONTEXT_LIMIT,
+        max_output_tokens=control_floor.MAX_OUTPUT_TOKENS,
+        live_authority_id=control_floor.ALLOCATION_ID,
+    )
+    return control_floor, args, calls
+
+
+def test_control_floor_coordinator_runs_exactly_shipping_then_raw_with_symmetric_contract(
+    monkeypatch, tmp_path,
+):
+    control_floor, args, calls = _control_floor_fixture(monkeypatch, tmp_path)
+
+    disposition = orchestrate._run_gate1p_control_floor_canary(
+        args,
+        control_floor,
+        policy_mode="llm",
+        route_env=None,
+        foothold=orchestrate.FootholdSpec(),
+    )
+
+    assert disposition["countable"] is True
+    assert [side for side, _kwargs in calls] == ["harness", "bare"]
+    for index, (_side, kwargs) in enumerate(calls):
+        assert kwargs["arm_index"] == index
+        assert kwargs["protocol_id"] == control_floor.PROTOCOL_ID
+        assert kwargs["pair_id"] == control_floor.PAIR_ID
+        assert kwargs["model_token_budget"] == 1_000_000
+        assert kwargs["model_context_limit"] == 200_000
+        assert kwargs["max_output_tokens"] == 8_192
+        assert kwargs["live_authority_id"] == control_floor.ALLOCATION_ID
+
+
+def test_control_floor_coordinator_blocks_raw_when_shipping_is_not_countable(monkeypatch, tmp_path):
+    control_floor, args, calls = _control_floor_fixture(
+        monkeypatch, tmp_path, shipping_countable=False,
+    )
+
+    with pytest.raises(SystemExit, match="raw arm blocked by shipping admission"):
+        orchestrate._run_gate1p_control_floor_canary(
+            args,
+            control_floor,
+            policy_mode="llm",
+            route_env=None,
+            foothold=orchestrate.FootholdSpec(),
+        )
+
+    assert [side for side, _kwargs in calls] == ["harness"]
+
+
+def test_control_floor_main_exact_authority_dispatches_once_without_external_action(
+    monkeypatch, tmp_path,
+):
+    control_floor = orchestrate._gate1p_control_floor_protocol()
+    bloodhound = tmp_path / "bloodhound-mcp"
+    bloodhound.mkdir()
+    calls = []
+    monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://model.invalid/v1")
+    monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args: None)
+    monkeypatch.setattr(
+        orchestrate,
+        "_run_gate1p_control_floor_canary",
+        lambda args, protocol, **kwargs: calls.append((args, protocol, kwargs)),
+    )
+
+    assert orchestrate.main([
+        "--scenario", control_floor.SCENARIO,
+        "--gate1p-control-floor-canary",
+        "--snapshot", control_floor.RESET_SNAPSHOT,
+        "--source-version", "tree:test",
+        "--live-authority-id", control_floor.ALLOCATION_ID,
+        "--go",
+    ]) == 0
+    assert len(calls) == 1
+    args, protocol, kwargs = calls[0]
+    assert protocol is control_floor
+    assert args.model_context_limit == 200_000
+    assert args.max_output_tokens == 8_192
+    assert kwargs["policy_mode"] == "llm"
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ([], "requires an exact source identity"),
+        (["--source-version", "tree:test", "--model-context-limit", "1000000"],
+         "fixed context-limit and max-output identities"),
+    ],
+)
+def test_control_floor_main_rejects_source_or_context_drift_before_reset(extra, message):
+    control_floor = orchestrate._gate1p_control_floor_protocol()
+    result = subprocess.run(
+        [
+            str(PY),
+            str(SCRIPT),
+            "--scenario", control_floor.SCENARIO,
+            "--gate1p-control-floor-canary",
+            "--snapshot", control_floor.RESET_SNAPSHOT,
+            "--live-authority-id", control_floor.ALLOCATION_ID,
+            "--go",
+            *extra,
+        ],
+        cwd=ROOT,
+        env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "rollback " not in result.stdout
 
 
 def test_gate1p_pair_rejects_snapshot_or_foothold_drift_before_live_contact(tmp_path):

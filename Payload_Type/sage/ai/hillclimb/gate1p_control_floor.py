@@ -1,4 +1,4 @@
-"""Prospective unallocated Gate 1P dual-endpoint control-floor canary."""
+"""Allocated one-pair Gate 1P dual-endpoint control-floor canary."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,14 +14,16 @@ except Exception:
 PROTOCOL_ID = "gate1p-control-floor-dual-endpoint-completed-call-budget-v1"
 MATRIX_ID = "gate1p-control-floor-canary-v1"
 PAIR_ID = "gate1p-control-floor-canary-pair-001"
-PAIR_ALLOCATED = False
-ALLOCATION_ID = None
+PAIR_ALLOCATED = True
+ALLOCATION_ID = "gate1p-control-floor-canary-allocation-001"
 PAIR_IDS = (PAIR_ID,)
 PRIMARY_PAIR_IDS = PAIR_IDS
 RESERVE_PAIR_IDS: tuple[str, ...] = ()
 REQUIRED_COMPARISON_PAIRS = 1
 MAX_PAIR_ATTEMPTS = 1
 STORAGE_NAMESPACE = f"gate1p-control-floor/{MATRIX_ID}"
+PAIR_CONTROL_SCHEMA = "gate1p-control-floor-pair-control-v1"
+PRESTART_CLEANUP_SCHEMA = "gate1p-control-floor-prestart-cleanup-v1"
 SCENARIO = gate1p_stageb.SCENARIO
 SCENARIO_DEFAULT = False
 OBJECTIVE_DOMAIN = gate1p_stageb.OBJECTIVE_DOMAIN

@@ -92,14 +92,15 @@ def test_protocol_registry_is_exact_and_does_not_infer_from_scenario_prose():
         )
 
 
-def test_control_floor_contract_is_unallocated_two_arm_dual_endpoint_and_budget_symmetric():
+def test_control_floor_contract_is_allocated_two_arm_dual_endpoint_and_budget_symmetric():
     protocol = gate1p_protocol.protocol_for_request(
         protocol_id=gate1p_control_floor.PROTOCOL_ID,
         scenario=gate1p_control_floor.SCENARIO,
     )
     contract = protocol.assembled_contract()
 
-    assert protocol.pair_allocated is False
+    assert protocol.pair_allocated is True
+    assert protocol.allocation_id == "gate1p-control-floor-canary-allocation-001"
     assert contract["arms"] == ["shipping_sage", "true_naive"]
     assert contract["arm_labels"]["true_naive"] == "same-model raw-tool/raw-history floor"
     assert "not a proxy for Codex, Claude Code" in contract["raw_arm_interpretation"]
@@ -112,8 +113,9 @@ def test_control_floor_contract_is_unallocated_two_arm_dual_endpoint_and_budget_
     assert contract["per_request_context_limit"] == 200_000
     assert contract["max_output_tokens"] == 8_192
     assert "do not add compaction or a third arm" in contract["raw_history_falsifier"]
-    with pytest.raises(gate1p_stagea.ProtocolError, match="prospective"):
-        protocol.validate_request(require_allocation=True, **_request(protocol))
+    assert protocol.validate_request(
+        require_allocation=True, **_request(protocol)
+    ) == "shipping_sage"
 
 
 @pytest.mark.parametrize(
@@ -686,17 +688,16 @@ def test_control_floor_runner_dry_path_reports_contract_without_external_action(
         check=True,
     )
 
-    assert '"pair_allocated": false' in result.stdout
-    assert '"shipping_sage": 1000000' in result.stdout
-    assert '"true_naive": 1000000' in result.stdout
-    assert '"per_request_context_limit": 200000' in result.stdout
-    assert "UNALLOCATED: protocol assembly only" in result.stdout
-    assert "RESET the range" not in result.stdout
+    assert "DRY RUN (no --go)" in result.stdout
+    assert "measurement: row protocol=gate1p-control-floor-dual-endpoint-completed-call-budget-v1" in result.stdout
+    assert "live paired-row execution requires" not in result.stderr
 
 
-def test_control_floor_runner_go_refuses_before_external_import_or_call():
+@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-terminal"))
+def test_control_floor_runner_go_refuses_wrong_authority_before_external_import_or_call(authority):
+    authority_args = [] if authority is None else ["--live-authority-id", authority]
     result = subprocess.run(
-        _control_floor_runner_argv("--go"),
+        _control_floor_runner_argv("--go", *authority_args),
         cwd=PAYLOAD_ROOT,
         env={
             "PATH": os.environ.get("PATH", ""),
@@ -709,4 +710,41 @@ def test_control_floor_runner_go_refuses_before_external_import_or_call():
     )
 
     assert result.returncode == 2
-    assert "is unallocated; live execution is not authorized" in result.stderr
+    assert (
+        "live paired-row execution requires separate --live-authority-id "
+        "gate1p-control-floor-canary-allocation-001"
+    ) in result.stderr
+
+
+def test_control_floor_runner_exact_authority_reaches_dispatch_without_external_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        rgl,
+        "run_side",
+        lambda cfg, side, scenario: calls.append((cfg.live_authority_id, side, scenario)),
+    )
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://model.invalid/v1")
+
+    assert rgl.main([
+        "run",
+        "--side", "harness",
+        "--scenario", gate1p_control_floor.SCENARIO,
+        "--measurement-kind", "row",
+        "--protocol-id", gate1p_control_floor.PROTOCOL_ID,
+        "--pair-id", gate1p_control_floor.PAIR_ID,
+        "--arm-index", "0",
+        "--provider", gate1p_control_floor.MODEL_PROVIDER,
+        "--model", gate1p_control_floor.MODEL_ID,
+        "--solve-timeout", str(gate1p_control_floor.WALL_SECONDS),
+        "--model-token-budget", str(gate1p_control_floor.TOKEN_ADMISSION_CEILING),
+        "--model-context-limit", str(gate1p_control_floor.MODEL_CONTEXT_LIMIT),
+        "--max-output-tokens", str(gate1p_control_floor.MAX_OUTPUT_TOKENS),
+        "--source-version", "source-tree-v1",
+        "--live-authority-id", gate1p_control_floor.ALLOCATION_ID,
+        "--go",
+    ]) == 0
+    assert calls == [(
+        gate1p_control_floor.ALLOCATION_ID,
+        "harness",
+        gate1p_control_floor.SCENARIO,
+    )]

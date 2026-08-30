@@ -1991,6 +1991,88 @@ def _stageb_pair_env(stageb, pair_id: str, route_env: dict[str, str] | None) -> 
     return env
 
 
+def _control_floor_pair_env(control_floor, route_env: dict[str, str] | None) -> dict[str, str]:
+    """Bind the one-shot canary to its own private namespace, never a historical override."""
+    env = dict(route_env or {})
+    pair_dir = (
+        ROOT / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / control_floor.STORAGE_NAMESPACE / control_floor.PAIR_ID
+    )
+    env.update({
+        "SAGE_EVAL_ARTIFACT_DIR": str(pair_dir),
+        "SAGE_EVAL_RESULTS_PATH": str(pair_dir / "results.jsonl"),
+    })
+    return env
+
+
+def _run_gate1p_control_floor_canary(
+    args, control_floor, *, policy_mode: str, route_env, foothold,
+) -> dict:
+    pair_env = _control_floor_pair_env(control_floor, route_env)
+    validate_gate1p_storage(pair_env)
+    control = json.loads(initialize_gate1p_pair_control(
+        source_version=args.source_version,
+        route_env=pair_env,
+        protocol=control_floor,
+        pair_id=control_floor.PAIR_ID,
+    ).read_text(encoding="utf-8"))
+    start = control_floor.ARMS.index(str(control["next_arm"]))
+    for arm_index, side in list(enumerate(("harness", "bare")))[start:]:
+        if arm_index == 1:
+            records = _read_gate1p_jsonl(
+                _gate1p_results_path(pair_env),
+                label="control-floor shipping result ledger",
+            )
+            shipping = _gate1p_completed_arm_disposition(
+                control_floor,
+                records,
+                arm=control_floor.ARMS[0],
+                pair_id=control_floor.PAIR_ID,
+            )
+            if shipping.get("countable") is not True:
+                raise SystemExit(
+                    "ABORT: control-floor raw arm blocked by shipping admission: "
+                    f"{shipping.get('reason')}"
+                )
+        run_side_with_gate1p_cleanup(
+            control_floor.SCENARIO,
+            side,
+            go=True,
+            solve_timeout=args.solve_timeout,
+            policy_mode=policy_mode,
+            provider=args.provider,
+            model=args.model,
+            route_env=pair_env,
+            snapshot=args.snapshot,
+            retained_callback_config=args.retained_callback_config,
+            foothold=foothold,
+            ludus_range_id=args.ludus_range_id,
+            ludus_mcp_server=args.ludus_mcp_server,
+            measurement_kind="row",
+            protocol_id=control_floor.PROTOCOL_ID,
+            pair_id=control_floor.PAIR_ID,
+            arm_index=arm_index,
+            model_token_budget=control_floor.TOKEN_ADMISSION_CEILING,
+            model_context_limit=args.model_context_limit,
+            max_output_tokens=args.max_output_tokens,
+            source_version=args.source_version,
+            live_authority_id=args.live_authority_id,
+        )
+    records = _read_gate1p_jsonl(
+        _gate1p_results_path(pair_env), label="control-floor result ledger",
+    )
+    disposition = control_floor.pair_disposition(
+        records, history_root=(ROOT / ".sage_history").resolve(),
+    )
+    print(json.dumps({"pair_disposition": disposition}, sort_keys=True))
+    if disposition.get("countable") is not True:
+        raise SystemExit(
+            "ABORT: control-floor pair is not comparison-countable: "
+            f"{disposition.get('reason')}"
+        )
+    return disposition
+
+
 def _run_gate1p_stageb_matrix(args, stageb, *, policy_mode: str, route_env, foothold) -> dict:
     accepted = consecutive_failures = 0
     matrix_records: list[dict] = []
@@ -2085,6 +2167,7 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   model_context_limit=None,
                   max_output_tokens=None,
                   source_version=None,
+                  live_authority_id=None,
                   snapshot=DEFAULT_SNAPSHOT,
                   retained_callback_config=DEFAULT_RETAINED_CALLBACK_CONFIG,
                   foothold: FootholdSpec | None = None,
@@ -2096,6 +2179,7 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
+    selected = None
     if protocol_id and measurement_kind == "row":
         selected = _gate1p_protocol_selector().protocol_for_request(
             protocol_id=protocol_id,
@@ -2131,8 +2215,15 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                 "BloodHound, range, target, or comparison command is emitted."
             )
             return
+        print(json.dumps({"allocation_protocol": contract}, sort_keys=True))
+    planned_live_authority_id = live_authority_id
     if measurement_kind == "row":
-        print(f"  durable-artifact-dir={_gate1p_artifact_dir()}\n")
+        artifact_dir = _gate1p_artifact_dir()
+        if selected and selected.protocol_id == _gate1p_control_floor_protocol().PROTOCOL_ID:
+            artifact_dir = Path(
+                _control_floor_pair_env(selected.module, None)["SAGE_EVAL_ARTIFACT_DIR"]
+            )
+        print(f"  durable-artifact-dir={artifact_dir}\n")
     for s in range(seeds):
         for arm_index, sd in enumerate([side] if side else ["harness", "bare"]):
             print(f"--- iteration seed={s} side={sd} ---")
@@ -2222,7 +2313,8 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                   f"{f' --model-token-budget {model_token_budget}' if model_token_budget else ''}"
                   f"{f' --model-context-limit {model_context_limit}' if model_context_limit else ''}"
                   f"{f' --max-output-tokens {max_output_tokens}' if max_output_tokens else ''}"
-                  f"{f' --source-version {source_version}' if source_version else ''}")
+                  f"{f' --source-version {source_version}' if source_version else ''}"
+                  f"{f' --live-authority-id {planned_live_authority_id}' if planned_live_authority_id else ''}")
             if measurement_kind == "row":
                 print(f"  (cd {ROOT}) /bin/bash skills/sage-goad-reset/scripts/sage_stop.sh     # cleanup")
                 print(f"  (cd {ROOT}) {PY} skills/sage-goad-reset/scripts/archive_runtime_dbs.py     # cleanup")
@@ -2231,7 +2323,13 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                     f"  (cd {ROOT}) {' '.join(_ludus_argv('poweroff', 'all', range_id=ludus_range_id, mcp_server=ludus_mcp_server))}"
                     "     # cleanup; retained disposition required"
                 )
-    if measurement_kind != "diagnostic":
+    if (
+        measurement_kind == "row"
+        and selected
+        and selected.protocol_id == _gate1p_control_floor_protocol().PROTOCOL_ID
+    ):
+        print("  # orchestrator emits the control-floor dual-endpoint pair disposition from its isolated ledger")
+    elif measurement_kind != "diagnostic":
         print(
             f"  (cd {PAYLOAD}) {PY} ai/hillclimb/run_gauge_live.py compare --scenario {scenario}"
             f"{f' --pair-id {pair_id}' if pair_id else ''}"
@@ -2267,7 +2365,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--gate1p-control-floor-canary",
         action="store_true",
-        help="assemble the unallocated dual-endpoint, 1M-token control-floor canary",
+        help="assemble or execute the allocated dual-endpoint, 1M-token control-floor canary",
     )
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
@@ -2460,14 +2558,50 @@ def main(argv=None) -> int:
             ap.error("the control-floor canary declares only shipping Sage and the same-model raw floor")
         if args.solve_timeout != control_floor.WALL_SECONDS:
             ap.error(f"the control-floor canary requires --solve-timeout {control_floor.WALL_SECONDS}")
-        if args.go:
-            ap.error(
-                f"{control_floor.PROTOCOL_ID} is unallocated; --go cannot reset or execute anything"
-            )
         args.provider = args.provider or control_floor.MODEL_PROVIDER
         args.model = args.model or control_floor.MODEL_ID
         args.model_context_limit = args.model_context_limit or control_floor.MODEL_CONTEXT_LIMIT
         args.max_output_tokens = args.max_output_tokens or control_floor.MAX_OUTPUT_TOKENS
+        if args.go:
+            if not control_floor.PAIR_ALLOCATED:
+                ap.error(f"{control_floor.PROTOCOL_ID} is unallocated; --go cannot execute")
+            if args.live_authority_id != control_floor.ALLOCATION_ID:
+                ap.error(
+                    "live control-floor execution requires separate --live-authority-id "
+                    f"{control_floor.ALLOCATION_ID}"
+                )
+            if (
+                args.solve_timeout != control_floor.WALL_SECONDS
+                or args.snapshot != control_floor.RESET_SNAPSHOT
+            ):
+                ap.error("the control-floor allocation requires its fixed solve timeout and reset snapshot")
+            actual_foothold = {
+                "host": foothold.host,
+                "ip": foothold.ip,
+                "identity": foothold.user,
+                "callback_user": foothold.callback_user,
+                "payload_type": "apollo",
+            }
+            if actual_foothold != control_floor.INITIAL_FOOTHOLD_ROLE:
+                ap.error("the control-floor allocation requires the fixed CASTELBLACK/Samwell Apollo foothold role")
+            if (
+                args.provider.casefold() != control_floor.MODEL_PROVIDER
+                or args.model != control_floor.MODEL_ID
+            ):
+                ap.error("the control-floor allocation requires its fixed provider/model route")
+            if not args.source_version:
+                ap.error("control-floor --go requires an exact source identity")
+            if (
+                args.model_context_limit != control_floor.MODEL_CONTEXT_LIMIT
+                or args.max_output_tokens != control_floor.MAX_OUTPUT_TOKENS
+            ):
+                ap.error("control-floor --go requires its fixed context-limit and max-output identities")
+            if args.max_output_tokens > args.model_context_limit:
+                ap.error("--max-output-tokens cannot exceed --model-context-limit")
+            if not BH or not Path(BH).is_dir():
+                ap.error("SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the control-floor canary")
+            if not str(os.environ.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
+                ap.error("SAGE_EVAL_API_ENDPOINT is required for exact control-floor route parity")
     if args.gate1p_stage_b_protocol:
         if args.scenario != stageb.SCENARIO or args.side is not None or args.seeds != 1:
             ap.error(
@@ -2601,6 +2735,7 @@ def main(argv=None) -> int:
                           args.model_context_limit,
                           args.max_output_tokens,
                           args.source_version,
+                          args.live_authority_id,
                           args.snapshot, args.retained_callback_config, foothold,
                           args.ludus_range_id, args.ludus_mcp_server)
             print(f"\n  NOTE: Sage policy mode -> {selected_mode}; null_model={null_model}.")
@@ -2616,6 +2751,11 @@ def main(argv=None) -> int:
     if args.gate1p_stage_b_protocol:
         _run_gate1p_stageb_matrix(
             args, stageb, policy_mode=policy_mode, route_env=route_env, foothold=foothold,
+        )
+        return 0
+    if args.gate1p_control_floor_canary:
+        _run_gate1p_control_floor_canary(
+            args, control_floor, policy_mode=policy_mode, route_env=route_env, foothold=foothold,
         )
         return 0
     gate1p_start_arm_index = 0
