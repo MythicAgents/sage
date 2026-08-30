@@ -868,6 +868,25 @@ def _stageb_row_cfg(pair_id, *, arm_index=0):
 
 
 @pytest.mark.parametrize(
+    "terminal_pair_id",
+    tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 8)),
+)
+def test_stageb_terminal_pair_rejects_before_live_child_client(monkeypatch, terminal_pair_id):
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("live client must not be touched"),
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="pair_id must be one of"):
+        rgl.run_side(
+            _stageb_row_cfg(terminal_pair_id),
+            "harness",
+            rgl.gate1p_stageb.SCENARIO,
+        )
+
+
+@pytest.mark.parametrize(
     "pair_id",
     (rgl.gate1p_stageb.PRIMARY_PAIR_IDS[0], rgl.gate1p_stageb.RESERVE_PAIR_IDS[-1]),
 )

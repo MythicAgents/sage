@@ -401,7 +401,7 @@ def test_stageb_pair_specs_are_exact_ordered_and_allocated():
     assert protocol.allocation_id == gate1p_stageb.ALLOCATION_ID
     assert [gate1p_stageb.admission_for_pair(pair_id).logical_seed for pair_id in gate1p_stageb.PAIR_IDS] == list(range(7))
     with pytest.raises(gate1p_stagea.ProtocolError, match="pair_id must be one of"):
-        gate1p_stageb.admission_for_pair("gate1p-stageb-child-control-pair-008")
+        gate1p_stageb.admission_for_pair("gate1p-stageb-child-control-pair-015")
 
 
 def test_stageb_matrix_admits_five_pairs_and_reports_exact_binary_uncertainty(monkeypatch):

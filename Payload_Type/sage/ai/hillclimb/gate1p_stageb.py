@@ -13,12 +13,12 @@ except Exception:
 
 
 PROTOCOL_ID = "gate1p-stage-b-child-control-completed-call-budget-v1"
-MATRIX_ID = "gate1p-stageb-child-control-matrix-v1"
+MATRIX_ID = "gate1p-stageb-child-control-matrix-v2"
 PAIR_ID = None
 PAIR_ALLOCATED = True
-ALLOCATION_ID = "gate1p-stageb-child-control-allocation-001"
-PRIMARY_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 6))
-RESERVE_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(6, 8))
+ALLOCATION_ID = "gate1p-stageb-child-control-allocation-002"
+PRIMARY_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(8, 13))
+RESERVE_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(13, 15))
 PAIR_IDS = PRIMARY_PAIR_IDS + RESERVE_PAIR_IDS
 REQUIRED_COMPARISON_PAIRS = 5
 MAX_PAIR_ATTEMPTS = 7
