@@ -847,10 +847,175 @@ def test_gate1p_real_orchestrator_control_reaches_live_child_client_seam(monkeyp
         rgl.run_side(cfg, "harness", rgl.gate1p_stagea.SCENARIO)
 
 
+def _stageb_row_cfg(pair_id, *, arm_index=0):
+    return rgl.Config(
+        measurement_kind="row",
+        protocol_id=rgl.gate1p_stageb.PROTOCOL_ID,
+        pair_id=pair_id,
+        arm_index=arm_index,
+        model_provider=rgl.gate1p_stageb.MODEL_PROVIDER,
+        model_id=rgl.gate1p_stageb.MODEL_ID,
+        model_api_endpoint="https://provider.invalid/v1",
+        model_api_key="dummy",
+        policy_mode=rgl.gate1p_stageb.POLICY_MODE,
+        solve_timeout=rgl.gate1p_stageb.WALL_SECONDS,
+        model_token_budget=rgl.gate1p_stageb.TOKEN_ADMISSION_CEILING,
+        model_context_limit=rgl.gate1p_stageb.MODEL_CONTEXT_LIMIT,
+        max_output_tokens=rgl.gate1p_stageb.MAX_OUTPUT_TOKENS,
+        source_version="tree:test",
+        live_authority_id=rgl.gate1p_stageb.ALLOCATION_ID,
+    )
+
+
+@pytest.mark.parametrize(
+    "pair_id",
+    (rgl.gate1p_stageb.PRIMARY_PAIR_IDS[0], rgl.gate1p_stageb.RESERVE_PAIR_IDS[-1]),
+)
+def test_stageb_real_orchestrator_control_reaches_live_child_client_seam(
+    monkeypatch, tmp_path, pair_id,
+):
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "stageb" / pair_id
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(artifact_dir)}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: (_ for _ in ()).throw(RuntimeError("stageb assembled client seam reached")),
+    )
+
+    with pytest.raises(RuntimeError, match="stageb assembled client seam reached"):
+        rgl.run_side(_stageb_row_cfg(pair_id), "harness", rgl.gate1p_stageb.SCENARIO)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("stagea_schema", "wrong_protocol", "cross_pair", "wrong_source", "nonfinite_time", "cleanup_complete"),
+)
+def test_stageb_orchestrator_control_mutations_stop_before_live_client(
+    monkeypatch, tmp_path, mutation,
+):
+    pair_id = rgl.gate1p_stageb.PRIMARY_PAIR_IDS[0]
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "stageb" / pair_id
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(artifact_dir)}
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    state = json.loads(control.read_text(encoding="utf-8"))
+    if mutation == "stagea_schema":
+        state["schema"] = "gate1p-stagea-pair-control-v3"
+    elif mutation == "wrong_protocol":
+        state["protocol_id"] = rgl.gate1p_stagea.PROTOCOL_ID
+    elif mutation == "cross_pair":
+        state["pair_id"] = rgl.gate1p_stageb.PRIMARY_PAIR_IDS[1]
+    elif mutation == "wrong_source":
+        state["source_version"] = "tree:drifted"
+    elif mutation == "nonfinite_time":
+        state["created_at"] = float("inf")
+    else:
+        state["prearm_state"]["status"] = "cleanup_complete"
+    control.write_text(json.dumps(state) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("invalid Stage B control must stop before live client"),
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError):
+        rgl.run_side(_stageb_row_cfg(pair_id), "harness", rgl.gate1p_stageb.SCENARIO)
+
+
+def test_stageb_naive_child_recomputes_pair_specific_shipping_admission(monkeypatch, tmp_path):
+    pair_id = rgl.gate1p_stageb.PRIMARY_PAIR_IDS[0]
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "stageb" / pair_id
+    artifact_dir.mkdir(parents=True)
+    control = artifact_dir / "pair-control.json"
+    control.write_text(json.dumps({
+        "schema": rgl.gate1p_stageb.PAIR_CONTROL_SCHEMA,
+        "protocol_id": rgl.gate1p_stageb.PROTOCOL_ID,
+        "pair_id": pair_id,
+        "source_version": "tree:test",
+        "next_arm": "true_naive",
+        "completed_arms": ["shipping_sage"],
+        "prearm_state": {
+            "arm": "true_naive",
+            "status": "reset_started",
+            "reset_generation": 1,
+            "updated_at": 1.0,
+        },
+        "created_at": 1.0,
+        "updated_at": 1.0,
+    }) + "\n", encoding="utf-8")
+    observed = {}
+
+    def shipping_disposition(records, *, arm, pair_id, history_root):
+        observed.update(records=records, arm=arm, pair_id=pair_id, history_root=history_root)
+        return {"countable": False, "reason": "test non-countable shipping lifecycle"}
+
+    monkeypatch.setattr(
+        rgl.gate1p_stageb,
+        "completed_arm_lifecycle_disposition",
+        shipping_disposition,
+    )
+    monkeypatch.setattr(rgl, "_private_history_root", lambda: history)
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(artifact_dir))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(artifact_dir / "results.jsonl"))
+    monkeypatch.setenv("SAGE_EVAL_PAIR_CONTROL_PATH", str(control))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "default_mythic_client",
+        lambda: pytest.fail("non-countable shipping must stop before live client"),
+    )
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="shipping admission"):
+        rgl.run_side(
+            _stageb_row_cfg(pair_id, arm_index=1), "bare", rgl.gate1p_stageb.SCENARIO,
+        )
+
+    assert observed["arm"] == "shipping_sage"
+    assert observed["pair_id"] == pair_id
+    assert observed["records"] == []
+    assert observed["history_root"] == history
+
+
 @pytest.mark.parametrize(
     ("mutation", "value"),
     [
         ("schema", "gate1p-stagea-pair-control-v2"),
+        ("schema", rgl.gate1p_stageb.PAIR_CONTROL_SCHEMA),
         ("missing_generation", None),
         ("generation", True),
         ("generation", 1.0),
@@ -1012,7 +1177,14 @@ def test_gate1p_child_rejects_same_noncanonical_pair_control_class(
     )
 
     with pytest.raises(rgl.gate1p_stagea.ProtocolError):
-        rgl._validate_gate1p_pair_control(cfg, "shipping_sage")
+        rgl._validate_gate1p_pair_control(
+            cfg,
+            "shipping_sage",
+            protocol=rgl.gate1p_protocol.protocol_for_request(
+                protocol_id=cfg.protocol_id,
+                scenario=rgl.gate1p_stagea.SCENARIO,
+            ),
+        )
 
 
 def test_missing_harness_cost_telemetry_is_unavailable_not_zero():

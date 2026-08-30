@@ -140,11 +140,22 @@ def _read_jsonl(path: Path) -> list[dict]:
         raise gate1p_stagea.ProtocolError(f"cannot read the paired-row ledger: {exc}") from exc
 
 
-def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
-    """Require the sole pair orchestrator and recompute shipping admission before naive spend."""
+def _validate_gate1p_pair_control(
+    cfg: Config,
+    arm: str,
+    *,
+    protocol: gate1p_protocol.Gate1PProtocol,
+) -> None:
+    """Require the selected protocol's orchestrator control before any row spend."""
+    module = protocol.module
+    error_type = module.ProtocolError
+    expected_pair_id = str(cfg.pair_id or "").strip()
+    arms = tuple(protocol.arms)
+    if len(arms) != 2 or arm not in arms or expected_pair_id not in protocol.pair_ids:
+        raise error_type("pair orchestrator control identity is not allocated by this protocol")
     raw = str(os.environ.get("SAGE_EVAL_PAIR_CONTROL_PATH") or "").strip()
     if not raw or cfg.artifact_dir is None:
-        raise gate1p_stagea.ProtocolError(
+        raise error_type(
             "paired rows may run only as children of the Gate 1P pair orchestrator"
         )
     path = Path(raw).expanduser()
@@ -153,11 +164,11 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
         path.resolve().relative_to(cfg.artifact_dir.resolve())
         path.resolve().relative_to(history_root.resolve())
     except ValueError as exc:
-        raise gate1p_stagea.ProtocolError("pair control state must be retained in the pair artifact directory") from exc
+        raise error_type("pair control state must be retained in the pair artifact directory") from exc
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise gate1p_stagea.ProtocolError(f"pair orchestrator control state is missing or unreadable: {exc}") from exc
+        raise error_type(f"pair orchestrator control state is missing or unreadable: {exc}") from exc
     control_fields = {
         "schema", "protocol_id", "pair_id", "source_version", "next_arm",
         "completed_arms", "prearm_state", "created_at", "updated_at",
@@ -165,13 +176,15 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
     finite_number = lambda value: (  # noqa: E731 - bounded local schema predicate
         type(value) in (int, float) and math.isfinite(float(value))
     )
-    expected_completed = [] if arm == "shipping_sage" else ["shipping_sage"]
+    expected_completed = [] if arm == arms[0] else [arms[0]]
     if (
         not isinstance(state, dict)
         or set(state) != control_fields
-        or state.get("schema") != "gate1p-stagea-pair-control-v3"
-        or state.get("protocol_id") != gate1p_stagea.PROTOCOL_ID
-        or state.get("pair_id") != gate1p_stagea.PAIR_ID
+        or state.get("schema") != getattr(
+            module, "PAIR_CONTROL_SCHEMA", "gate1p-stagea-pair-control-v3"
+        )
+        or state.get("protocol_id") != protocol.protocol_id
+        or state.get("pair_id") != expected_pair_id
         or type(state.get("source_version")) is not str
         or not state.get("source_version")
         or state.get("source_version") != cfg.source_version
@@ -182,7 +195,7 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
         or not finite_number(state.get("updated_at"))
         or float(state["updated_at"]) < float(state["created_at"])
     ):
-        raise gate1p_stagea.ProtocolError("pair orchestrator control state does not admit this exact arm")
+        raise error_type("pair orchestrator control state does not admit this exact arm")
     prearm_state = state.get("prearm_state")
     if (
         not isinstance(prearm_state, dict)
@@ -195,35 +208,34 @@ def _validate_gate1p_pair_control(cfg: Config, arm: str) -> None:
         or float(prearm_state["updated_at"]) < float(state["created_at"])
         or float(prearm_state["updated_at"]) > float(state["updated_at"])
     ):
-        raise gate1p_stagea.ProtocolError("pair control does not prove reset start for this exact arm")
+        raise error_type("pair control does not prove reset start for this exact arm")
     records = _read_jsonl(cfg.results_path)
     lifecycle_types = {"arm_started", "result", "cleanup"}
     existing_current = [
         row for row in records
         if row.get("record_type") in lifecycle_types
-        and (row.get("protocol") or {}).get("pair_id") == gate1p_stagea.PAIR_ID
+        and (row.get("protocol") or {}).get("pair_id") == expected_pair_id
         and (row.get("protocol") or {}).get("arm") == arm
     ]
     if existing_current:
-        raise gate1p_stagea.ProtocolError(f"retry-zero lifecycle already consumed arm {arm!r}")
-    if arm == "shipping_sage":
+        raise error_type(f"retry-zero lifecycle already consumed arm {arm!r}")
+    if arm == arms[0]:
         any_started = [
             row for row in records
             if row.get("record_type") in lifecycle_types
-            and (row.get("protocol") or {}).get("pair_id") == gate1p_stagea.PAIR_ID
+            and (row.get("protocol") or {}).get("pair_id") == expected_pair_id
         ]
         if any_started or state.get("completed_arms") != []:
-            raise gate1p_stagea.ProtocolError("shipping must be the first and only unconsumed pair arm")
+            raise error_type("shipping must be the first and only unconsumed pair arm")
     else:
-        if state.get("completed_arms") != ["shipping_sage"]:
-            raise gate1p_stagea.ProtocolError("naive arm requires the completed shipping lifecycle")
-        shipping = gate1p_stagea.completed_arm_lifecycle_disposition(
-            records,
-            arm="shipping_sage",
-            history_root=history_root,
-        )
+        if state.get("completed_arms") != [arms[0]]:
+            raise error_type("naive arm requires the completed shipping lifecycle")
+        disposition_kwargs = {"arm": arms[0], "history_root": history_root}
+        if protocol.pair_id is None:
+            disposition_kwargs["pair_id"] = expected_pair_id
+        shipping = module.completed_arm_lifecycle_disposition(records, **disposition_kwargs)
         if shipping.get("countable") is not True:
-            raise gate1p_stagea.ProtocolError(
+            raise error_type(
                 f"naive arm blocked by shipping admission: {shipping.get('reason')}"
             )
 
@@ -898,7 +910,7 @@ def run_side(
         )
     gate1p_artifact_path = _validate_gate1p_artifact_destinations(cfg, row_arm) if row_arm else None
     if row_arm:
-        _validate_gate1p_pair_control(cfg, row_arm)
+        _validate_gate1p_pair_control(cfg, row_arm, protocol=row_protocol)
     resolved_model_route = _resolved_harness_model_route(cfg)
     client = live_seams.default_mythic_client()
     mythic_operation_id = getattr(client, "current_operation_id", None)
