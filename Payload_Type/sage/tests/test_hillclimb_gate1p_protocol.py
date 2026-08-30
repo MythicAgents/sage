@@ -36,8 +36,8 @@ def _request(protocol, *, side="harness", arm_index=0, pair_id=None):
         "policy_mode": protocol.module.POLICY_MODE,
         "solve_timeout": protocol.module.WALL_SECONDS,
         "token_ceiling": protocol.module.TOKEN_ADMISSION_CEILING,
-        "model_context_limit": 1_000_000,
-        "max_output_tokens": 32_000,
+        "model_context_limit": getattr(protocol.module, "MODEL_CONTEXT_LIMIT", 1_000_000),
+        "max_output_tokens": getattr(protocol.module, "MAX_OUTPUT_TOKENS", 32_000),
         "source_version": "source-tree-v1",
         "api_endpoint": "https://model.invalid/v1",
     }
@@ -85,15 +85,27 @@ def test_protocol_registry_is_exact_and_does_not_infer_from_scenario_prose():
         )
 
 
-def test_stageb_prospective_request_assembles_but_live_allocation_fails_closed():
+def test_stageb_allocated_request_assembles_with_live_allocation_identity():
     protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
 
     assert protocol.validate_request(require_allocation=False, **_request(protocol)) == "shipping_sage"
-    with pytest.raises(gate1p_stagea.ProtocolError, match="no allocated live execution identity"):
-        protocol.validate_request(require_allocation=True, **_request(protocol))
+    assert protocol.validate_request(require_allocation=True, **_request(protocol)) == "shipping_sage"
 
 
-def test_stageb_contract_routes_storage_observer_and_comparator_while_unallocated():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("model_context_limit", 1_000_000), ("max_output_tokens", 32_000)],
+)
+def test_stageb_allocated_request_rejects_generation_identity_drift(field, value):
+    protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
+    request = _request(protocol)
+    request[field] = value
+
+    with pytest.raises(gate1p_stagea.ProtocolError, match="allocated context"):
+        protocol.validate_request(require_allocation=True, **request)
+
+
+def test_stageb_contract_routes_storage_observer_and_comparator_while_allocated():
     protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
     contract = protocol.assembled_contract()
     observer = protocol.build_episode_observer(
@@ -107,7 +119,7 @@ def test_stageb_contract_routes_storage_observer_and_comparator_while_unallocate
         "protocol_id": gate1p_stageb.PROTOCOL_ID,
         "matrix_id": gate1p_stageb.MATRIX_ID,
         "pair_id": None,
-        "pair_allocated": False,
+        "pair_allocated": True,
         "allocation_id": gate1p_stageb.ALLOCATION_ID,
         "pair_ids": list(gate1p_stageb.PAIR_IDS),
         "primary_pair_ids": list(gate1p_stageb.PRIMARY_PAIR_IDS),
@@ -327,7 +339,7 @@ def test_stageb_task_and_callback_routes_reject_evidence_true_before_the_arm(mon
     assert probes[Milestone.OBJECTIVE]() is False
 
 
-def test_stageb_live_run_rejects_unallocated_protocol_before_any_live_seam(monkeypatch):
+def test_stageb_live_run_rejects_missing_authority_before_any_live_seam(monkeypatch):
     protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
     cfg = rgl.Config(
         measurement_kind="row",
@@ -340,8 +352,8 @@ def test_stageb_live_run_rejects_unallocated_protocol_before_any_live_seam(monke
         policy_mode=gate1p_stageb.POLICY_MODE,
         solve_timeout=gate1p_stageb.WALL_SECONDS,
         model_token_budget=gate1p_stageb.TOKEN_ADMISSION_CEILING,
-        model_context_limit=1_000_000,
-        max_output_tokens=32_000,
+        model_context_limit=gate1p_stageb.MODEL_CONTEXT_LIMIT,
+        max_output_tokens=gate1p_stageb.MAX_OUTPUT_TOKENS,
         source_version="source-tree-v1",
     )
     monkeypatch.setattr(rgl, "_scenario", lambda *_args: pytest.fail("scenario assembly is after allocation"))
@@ -351,7 +363,7 @@ def test_stageb_live_run_rejects_unallocated_protocol_before_any_live_seam(monke
         lambda: pytest.fail("Mythic client must not be constructed"),
     )
 
-    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="no allocated live execution identity"):
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="requires separate authority ID"):
         rgl.run_side(cfg, "harness", gate1p_stageb.SCENARIO)
 
 
@@ -379,13 +391,13 @@ def _stub_pair_disposition(outcomes, failures=()):
     return admit
 
 
-def test_stageb_pair_specs_are_exact_ordered_and_still_unallocated():
+def test_stageb_pair_specs_are_exact_ordered_and_allocated():
     protocol = gate1p_protocol.protocol_for_scenario(gate1p_stageb.SCENARIO)
 
     assert gate1p_stageb.PAIR_IDS == (*gate1p_stageb.PRIMARY_PAIR_IDS, *gate1p_stageb.RESERVE_PAIR_IDS)
     assert len(gate1p_stageb.PRIMARY_PAIR_IDS) == 5
     assert len(gate1p_stageb.RESERVE_PAIR_IDS) == 2
-    assert protocol.pair_allocated is False
+    assert protocol.pair_allocated is True
     assert protocol.allocation_id == gate1p_stageb.ALLOCATION_ID
     assert [gate1p_stageb.admission_for_pair(pair_id).logical_seed for pair_id in gate1p_stageb.PAIR_IDS] == list(range(7))
     with pytest.raises(gate1p_stagea.ProtocolError, match="pair_id must be one of"):
@@ -511,9 +523,9 @@ def _stageb_runner_argv(*extra):
         "--model-token-budget",
         str(gate1p_stageb.TOKEN_ADMISSION_CEILING),
         "--model-context-limit",
-        "1000000",
+        str(gate1p_stageb.MODEL_CONTEXT_LIMIT),
         "--max-output-tokens",
-        "32000",
+        str(gate1p_stageb.MAX_OUTPUT_TOKENS),
         "--source-version",
         "source-tree-v1",
         *extra,
@@ -534,8 +546,8 @@ def test_stageb_runner_dry_path_does_not_load_defaults_or_emit_reset_instruction
         check=True,
     )
 
-    assert '"pair_allocated": false' in result.stdout
-    assert "UNALLOCATED: protocol assembly only" in result.stdout
+    assert '"pair_allocated": true' in result.stdout
+    assert "ALLOCATED: protocol assembly only" in result.stdout
     assert "RESET the range" not in result.stdout
 
 
@@ -554,4 +566,22 @@ def test_stageb_runner_go_fails_before_any_external_import_or_call():
     )
 
     assert result.returncode == 2
-    assert "is unallocated; live execution is not authorized" in result.stderr
+    assert "allocated matrix row execution requires one exact --pair-id" in result.stderr
+
+
+def test_stageb_runner_pair_go_requires_allocation_authority_before_external_call():
+    result = subprocess.run(
+        _stageb_runner_argv("--pair-id", gate1p_stageb.PAIR_IDS[0], "--go"),
+        cwd=PAYLOAD_ROOT,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "LANG": "C.UTF-8",
+            "SAGE_EVAL_API_ENDPOINT": "https://model.invalid/v1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "requires separate --live-authority-id" in result.stderr

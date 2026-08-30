@@ -1745,7 +1745,7 @@ def main(argv=None) -> int:
                 protocol_id=cfg.protocol_id,
                 scenario=args.scenario,
             )
-            if cfg.pair_id is not None or selected_protocol.pair_allocated:
+            if cfg.pair_id is not None or selected_protocol.pair_id is not None:
                 selected_protocol.validate_request(
                     require_allocation=False,
                     protocol_id=cfg.protocol_id,
@@ -1769,6 +1769,11 @@ def main(argv=None) -> int:
             ap.error(
                 f"{selected_protocol.protocol_id} is unallocated; live execution is not authorized"
             )
+        if (
+            args.cmd == "run" and args.go and selected_protocol.pair_id is None
+            and cfg.pair_id not in selected_protocol.pair_ids
+        ):
+            ap.error("allocated matrix row execution requires one exact --pair-id")
         if args.cmd == "run" and args.go and cfg.live_authority_id != selected_protocol.allocation_id:
             ap.error(
                 f"live paired-row execution requires separate --live-authority-id "
@@ -1780,10 +1785,14 @@ def main(argv=None) -> int:
         return 0
 
     if not args.go:
-        if selected_protocol is not None and not selected_protocol.pair_allocated:
+        if (
+            selected_protocol is not None
+            and (not selected_protocol.pair_allocated or cfg.pair_id is None)
+        ):
             print(json.dumps({"prospective_protocol": selected_protocol.assembled_contract()}, sort_keys=True))
             print(
-                "UNALLOCATED: protocol assembly only. No reset, arm, model, Mythic, "
+                f"{'ALLOCATED' if selected_protocol.pair_allocated else 'UNALLOCATED'}: "
+                "protocol assembly only. No reset, arm, model, Mythic, "
                 "BloodHound, range, target, or comparison call is authorized."
             )
             return 0

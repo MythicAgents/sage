@@ -1290,20 +1290,38 @@ def _require_gate1p_expected_source(source_version: object) -> str:
     return source_version
 
 
+def _gate1p_control_identity(protocol=None, pair_id: str | None = None):
+    protocol = protocol or _gate1p_stagea_protocol()
+    identity = pair_id if pair_id is not None else protocol.PAIR_ID
+    allowed = tuple(getattr(protocol, "PAIR_IDS", (protocol.PAIR_ID,)))
+    if identity not in allowed:
+        raise SystemExit("ABORT: Gate 1P pair control identity is not allocated")
+    return protocol, str(identity)
+
+
+def _gate1p_completed_arm_disposition(protocol, records, *, arm: str, pair_id: str):
+    kwargs = {"arm": arm, "history_root": (ROOT / ".sage_history").resolve()}
+    if protocol.PAIR_ID is None:
+        kwargs["pair_id"] = pair_id
+    return protocol.completed_arm_lifecycle_disposition(records, **kwargs)
+
+
 def _validate_gate1p_pair_control_state(
     state: object,
     *,
     expected_source_version: object,
     allow_complete: bool = False,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> dict:
-    protocol = _gate1p_stagea_protocol()
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
     expected_source = _require_gate1p_expected_source(expected_source_version)
     if not isinstance(state, dict) or set(state) != _GATE1P_PAIR_CONTROL_FIELDS:
         raise SystemExit("ABORT: Gate 1P pair control has a non-canonical top-level schema")
     if (
-        state.get("schema") != "gate1p-stagea-pair-control-v3"
+        state.get("schema") != getattr(protocol, "PAIR_CONTROL_SCHEMA", "gate1p-stagea-pair-control-v3")
         or state.get("protocol_id") != protocol.PROTOCOL_ID
-        or state.get("pair_id") != protocol.PAIR_ID
+        or state.get("pair_id") != pair_id
         or type(expected_source) is not str
         or not expected_source
         or state.get("source_version") != expected_source
@@ -1380,9 +1398,11 @@ def _validate_gate1p_prestart_cleanup(
     expected_arm: str,
     require_current_arm: bool,
     expected_reset_generation: int | None,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> None:
     """Admit one exact completed pre-arm cleanup per reached arm, outside the row ledger."""
-    protocol = _gate1p_stagea_protocol()
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
     expected_steps = ["stop sage", "archive dbs", "verify no running tasks", "ludus poweroff"]
     expected_fields = {
         "schema", "record_type", "measurement_kind", "protocol", "result_retained",
@@ -1399,13 +1419,15 @@ def _validate_gate1p_prestart_cleanup(
         if set(record) != expected_fields:
             raise SystemExit("ABORT: prestart cleanup record has an undeclared shape")
         if (
-            record.get("schema") != "gate1p-stagea-prestart-cleanup-v2"
+            record.get("schema") != getattr(
+                protocol, "PRESTART_CLEANUP_SCHEMA", "gate1p-stagea-prestart-cleanup-v2",
+            )
             or record.get("record_type") != "prestart_cleanup"
             or record.get("measurement_kind") != "prestart_readiness"
             or not isinstance(identity, dict)
             or set(identity) != {"protocol_id", "pair_id", "arm"}
             or identity.get("protocol_id") != protocol.PROTOCOL_ID
-            or identity.get("pair_id") != protocol.PAIR_ID
+            or identity.get("pair_id") != pair_id
             or identity.get("arm") not in protocol.ARMS
             or record.get("result_retained") is not False
             or record.get("episode_artifact_retained") is not False
@@ -1449,10 +1471,13 @@ def _validate_gate1p_prestart_cleanup(
         raise SystemExit("ABORT: prestart cleanup chronology is invalid")
 
 
-def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, str] | None = None) -> Path:
+def initialize_gate1p_pair_control(
+    *, source_version: str, route_env: dict[str, str] | None = None,
+    protocol=None, pair_id: str | None = None,
+) -> Path:
     """Create or exactly resume the one-shot lifecycle state before any reset begins."""
     expected_source = _require_gate1p_expected_source(source_version)
-    protocol = _gate1p_stagea_protocol()
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
     path = _gate1p_pair_control_path(route_env)
     results = _gate1p_results_path(route_env)
     prior = _read_gate1p_jsonl(results, label="existing Gate 1P result ledger")
@@ -1465,7 +1490,9 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
             existing = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise SystemExit(f"ABORT: existing Gate 1P pair control is unreadable: {exc}") from exc
-        _validate_gate1p_pair_control_state(existing, expected_source_version=expected_source)
+        _validate_gate1p_pair_control_state(
+            existing, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+        )
         next_arm = existing["next_arm"]
         completed_arms = existing["completed_arms"]
         prearm_state = existing["prearm_state"]
@@ -1478,10 +1505,8 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
                 for record in prior
             ):
                 raise SystemExit("ABORT: retry-zero lifecycle already consumed the naive arm")
-            shipping = protocol.completed_arm_lifecycle_disposition(
-                prior,
-                arm="shipping_sage",
-                history_root=(ROOT / ".sage_history").resolve(),
+            shipping = _gate1p_completed_arm_disposition(
+                protocol, prior, arm="shipping_sage", pair_id=pair_id,
             )
             if shipping.get("countable") is not True:
                 raise SystemExit(
@@ -1494,6 +1519,8 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
             expected_arm=str(next_arm),
             require_current_arm=prearm_state["status"] != "idle",
             expected_reset_generation=prearm_state["reset_generation"],
+            protocol=protocol,
+            pair_id=pair_id,
         )
         if prearm_state["status"] == "reset_started":
             existing["prearm_state"] = {
@@ -1503,16 +1530,19 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
                 "updated_at": time.time(),
             }
             existing["updated_at"] = time.time()
-            _validate_gate1p_pair_control_state(existing, expected_source_version=expected_source)
+            _validate_gate1p_pair_control_state(
+                existing, expected_source_version=expected_source,
+                protocol=protocol, pair_id=pair_id,
+            )
             _atomic_write_gate1p_json(path, existing)
         return path
     if prior or prestart:
         raise SystemExit("ABORT: Gate 1P lifecycle evidence exists without pair control")
     created_at = time.time()
     state = {
-        "schema": "gate1p-stagea-pair-control-v3",
+        "schema": getattr(protocol, "PAIR_CONTROL_SCHEMA", "gate1p-stagea-pair-control-v3"),
         "protocol_id": protocol.PROTOCOL_ID,
-        "pair_id": protocol.PAIR_ID,
+        "pair_id": pair_id,
         "source_version": expected_source,
         "next_arm": "shipping_sage",
         "completed_arms": [],
@@ -1525,7 +1555,9 @@ def initialize_gate1p_pair_control(*, source_version: str, route_env: dict[str, 
         "created_at": created_at,
         "updated_at": created_at,
     }
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     try:
         _atomic_write_gate1p_json(path, state, create_only=True)
     except FileExistsError as exc:
@@ -1538,6 +1570,8 @@ def mark_gate1p_prearm_reset_started(
     arm: str,
     source_version: str,
     route_env: dict[str, str] | None = None,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> None:
     """Persist reset mutation intent immediately before the reset/readiness controller runs."""
     path = _gate1p_pair_control_path(route_env)
@@ -1546,7 +1580,10 @@ def mark_gate1p_prearm_reset_started(
     except Exception as exc:
         raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
     expected_source = _require_gate1p_expected_source(source_version)
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     prearm_state = state["prearm_state"]
     if (
         state.get("next_arm") != arm
@@ -1561,7 +1598,9 @@ def mark_gate1p_prearm_reset_started(
         "updated_at": time.time(),
     }
     state["updated_at"] = time.time()
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     _atomic_write_gate1p_json(path, state)
 
 
@@ -1570,6 +1609,8 @@ def mark_gate1p_prestart_cleanup_complete(
     arm: str,
     source_version: str,
     route_env: dict[str, str] | None = None,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> int:
     """Bind a complete pre-arm cleanup to the exact reset-started arm."""
     path = _gate1p_pair_control_path(route_env)
@@ -1578,7 +1619,10 @@ def mark_gate1p_prestart_cleanup_complete(
     except Exception as exc:
         raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
     expected_source = _require_gate1p_expected_source(source_version)
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     prearm_state = state["prearm_state"]
     if (
         state.get("next_arm") != arm
@@ -1594,7 +1638,9 @@ def mark_gate1p_prestart_cleanup_complete(
         "updated_at": time.time(),
     }
     state["updated_at"] = time.time()
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     _atomic_write_gate1p_json(path, state)
     return reset_generation
 
@@ -1604,6 +1650,8 @@ def advance_gate1p_pair_control(
     arm: str,
     source_version: str,
     route_env: dict[str, str] | None = None,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> None:
     """Advance only after the arm returned and its guaranteed cleanup completed."""
     path = _gate1p_pair_control_path(route_env)
@@ -1612,7 +1660,10 @@ def advance_gate1p_pair_control(
     except Exception as exc:
         raise SystemExit(f"ABORT: Gate 1P pair control is unreadable: {exc}") from exc
     expected_source = _require_gate1p_expected_source(source_version)
-    _validate_gate1p_pair_control_state(state, expected_source_version=expected_source)
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
+    _validate_gate1p_pair_control_state(
+        state, expected_source_version=expected_source, protocol=protocol, pair_id=pair_id,
+    )
     expected_completed = [] if arm == "shipping_sage" else ["shipping_sage"]
     prearm_state = state["prearm_state"]
     if (
@@ -1639,6 +1690,8 @@ def advance_gate1p_pair_control(
         state,
         expected_source_version=expected_source,
         allow_complete=True,
+        protocol=protocol,
+        pair_id=pair_id,
     )
     _atomic_write_gate1p_json(path, state)
 
@@ -1688,8 +1741,10 @@ def cleanup_gate1p_arm(
     route_env: dict[str, str] | None = None,
     row_started: bool = True,
     source_version: str | None = None,
+    protocol=None,
 ) -> dict:
     """Always execute the declared post-arm cleanup and retain a typed disposition."""
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
     range_env = _range_env(ludus_range_id, ludus_mcp_server)
     steps: list[dict[str, object]] = []
     errors: list[str] = []
@@ -1736,6 +1791,8 @@ def cleanup_gate1p_arm(
                 arm=arm,
                 source_version=_require_gate1p_expected_source(source_version),
                 route_env=route_env,
+                protocol=protocol,
+                pair_id=pair_id,
             )
         except SystemExit as exc:
             errors.append(f"pair control: {exc}")
@@ -1745,6 +1802,8 @@ def cleanup_gate1p_arm(
             _validate_gate1p_pair_control_state(
                 control,
                 expected_source_version=_require_gate1p_expected_source(source_version),
+                protocol=protocol,
+                pair_id=pair_id,
             )
             prearm = control["prearm_state"]
             if control["next_arm"] == arm and prearm["status"] == "reset_started":
@@ -1754,7 +1813,7 @@ def cleanup_gate1p_arm(
     report = {
         "record_type": "cleanup",
         "measurement_kind": "row",
-        "protocol": {"protocol_id": _gate1p_stagea_protocol().PROTOCOL_ID, "pair_id": pair_id, "arm": arm},
+        "protocol": {"protocol_id": protocol.PROTOCOL_ID, "pair_id": pair_id, "arm": arm},
         "result_retained": result_retained,
         "episode_artifact": str(episode_artifact),
         "episode_artifact_retained": episode_artifact_retained,
@@ -1772,7 +1831,7 @@ def cleanup_gate1p_arm(
         path = _gate1p_results_path(route_env)
     else:
         report = {
-            "schema": "gate1p-stagea-prestart-cleanup-v2",
+            "schema": getattr(protocol, "PRESTART_CLEANUP_SCHEMA", "gate1p-stagea-prestart-cleanup-v2"),
             "record_type": "prestart_cleanup",
             "measurement_kind": "prestart_readiness",
             "protocol": report["protocol"],
@@ -1799,9 +1858,12 @@ def _validate_gate1p_wrapper_entry(
     arm: str,
     source_version: object,
     route_env: dict[str, str] | None,
+    protocol=None,
+    pair_id: str | None = None,
 ) -> str:
     """Bind the CLI/contract source to mutable control before provider or reset spend."""
     expected_source = _require_gate1p_expected_source(source_version)
+    protocol, pair_id = _gate1p_control_identity(protocol, pair_id)
     try:
         entry_state = json.loads(
             _gate1p_pair_control_path(route_env).read_text(encoding="utf-8")
@@ -1811,6 +1873,8 @@ def _validate_gate1p_wrapper_entry(
     _validate_gate1p_pair_control_state(
         entry_state,
         expected_source_version=expected_source,
+        protocol=protocol,
+        pair_id=pair_id,
     )
     if entry_state.get("next_arm") != arm:
         raise SystemExit("ABORT: Gate 1P wrapper arm is out of order")
@@ -1820,7 +1884,13 @@ def _validate_gate1p_wrapper_entry(
 def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
     """Run one arm and guarantee cleanup after every started Gate 1P row, including failures."""
     is_pair = kwargs.get("measurement_kind") == "row" and kwargs.get("pair_id")
-    protocol = _gate1p_stagea_protocol()
+    protocol = (
+        _gate1p_protocol_selector().protocol_for_request(
+            protocol_id=kwargs.get("protocol_id"), scenario=scenario,
+        ).module
+        if is_pair else _gate1p_stagea_protocol()
+    )
+    pair_id = str(kwargs.get("pair_id") or "")
     arm_index = kwargs.get("arm_index")
     arm = protocol.ARMS[int(arm_index)] if arm_index in (0, 1) else f"invalid:{arm_index}"
     run_kwargs = dict(kwargs)
@@ -1830,6 +1900,8 @@ def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
             arm=arm,
             source_version=kwargs.get("source_version"),
             route_env=kwargs.get("route_env"),
+            protocol=protocol,
+            pair_id=pair_id,
         )
         _run_side_preflight(
             scenario,
@@ -1845,6 +1917,8 @@ def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
                 arm=arm,
                 source_version=expected_source,
                 route_env=kwargs.get("route_env"),
+                protocol=protocol,
+                pair_id=pair_id,
             )
             reset_started = True
 
@@ -1872,6 +1946,7 @@ def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
                 route_env=kwargs.get("route_env"),
                 row_started=row_started,
                 source_version=expected_source,
+                protocol=protocol,
             )
             if arm_returned:
                 if not row_started:
@@ -1880,13 +1955,118 @@ def run_side_with_gate1p_cleanup(scenario: str, side: str, **kwargs) -> None:
                     arm=arm,
                     source_version=expected_source,
                     route_env=kwargs.get("route_env"),
+                    protocol=protocol,
+                    pair_id=pair_id,
                 )
             elif row_started:
                 mark_gate1p_prestart_cleanup_complete(
                     arm=arm,
                     source_version=expected_source,
                     route_env=kwargs.get("route_env"),
+                    protocol=protocol,
+                    pair_id=pair_id,
                 )
+
+
+def _stageb_pair_env(stageb, pair_id: str, route_env: dict[str, str] | None) -> dict[str, str]:
+    env = dict(route_env or {})
+    base = Path(
+        str(env.get("SAGE_EVAL_ARTIFACT_DIR") or (
+            ROOT / ".sage_history" / "evaluation" / "harness-self-improvement"
+            / "gate1p-stageb" / stageb.MATRIX_ID
+        ))
+    ).expanduser()
+    pair_dir = base / pair_id
+    env.update({
+        "SAGE_EVAL_ARTIFACT_DIR": str(pair_dir),
+        "SAGE_EVAL_RESULTS_PATH": str(pair_dir / "results.jsonl"),
+    })
+    return env
+
+
+def _run_gate1p_stageb_matrix(args, stageb, *, policy_mode: str, route_env, foothold) -> dict:
+    accepted = consecutive_failures = 0
+    matrix_records: list[dict] = []
+    for pair_id in stageb.PAIR_IDS:
+        pair_env = _stageb_pair_env(stageb, pair_id, route_env)
+        validate_gate1p_storage(pair_env)
+        control_path = _gate1p_pair_control_path(pair_env)
+        state = None
+        if control_path.exists():
+            try:
+                state = _validate_gate1p_pair_control_state(
+                    json.loads(control_path.read_text(encoding="utf-8")),
+                    expected_source_version=args.source_version, allow_complete=True,
+                    protocol=stageb, pair_id=pair_id,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise SystemExit(f"ABORT: Stage B {pair_id} control is unreadable: {exc}") from exc
+        records = _read_gate1p_jsonl(
+            _gate1p_results_path(pair_env), label=f"Stage B {pair_id} result ledger",
+        )
+        shipping = (
+            _gate1p_completed_arm_disposition(
+                stageb, records, arm=stageb.ARMS[0], pair_id=pair_id,
+            )
+            if state and state["next_arm"] == stageb.ARMS[1] else None
+        )
+        if (
+            not state
+            or state["next_arm"] == stageb.ARMS[0]
+            or state["next_arm"] == stageb.ARMS[1] and shipping.get("countable") is True
+        ):
+            control = json.loads(initialize_gate1p_pair_control(
+                source_version=args.source_version, route_env=pair_env,
+                protocol=stageb, pair_id=pair_id,
+            ).read_text(encoding="utf-8"))
+            start = stageb.ARMS.index(control["next_arm"])
+            for arm_index, side in list(enumerate(("harness", "bare")))[start:]:
+                if arm_index == 1:
+                    records = _read_gate1p_jsonl(
+                        _gate1p_results_path(pair_env), label=f"Stage B {pair_id} result ledger",
+                    )
+                    shipping = _gate1p_completed_arm_disposition(
+                        stageb, records, arm=stageb.ARMS[0], pair_id=pair_id,
+                    )
+                    if shipping.get("countable") is not True:
+                        break
+                run_side_with_gate1p_cleanup(
+                    stageb.SCENARIO, side, go=True, solve_timeout=args.solve_timeout,
+                    policy_mode=policy_mode, provider=args.provider, model=args.model,
+                    route_env=pair_env, snapshot=args.snapshot,
+                    retained_callback_config=args.retained_callback_config, foothold=foothold,
+                    ludus_range_id=args.ludus_range_id, ludus_mcp_server=args.ludus_mcp_server,
+                    measurement_kind="row", protocol_id=stageb.PROTOCOL_ID, pair_id=pair_id,
+                    arm_index=arm_index, model_token_budget=stageb.TOKEN_ADMISSION_CEILING,
+                    model_context_limit=args.model_context_limit,
+                    max_output_tokens=args.max_output_tokens, source_version=args.source_version,
+                    live_authority_id=args.live_authority_id,
+                )
+            records = _read_gate1p_jsonl(
+                _gate1p_results_path(pair_env), label=f"Stage B {pair_id} result ledger",
+            )
+        matrix_records.extend(records)
+        disposition = stageb.pair_disposition(
+            records, pair_id=pair_id, history_root=(ROOT / ".sage_history").resolve(),
+        )
+        if disposition.get("countable") is True:
+            accepted += 1
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if pair_id == stageb.PRIMARY_PAIR_IDS[0]:
+                raise SystemExit(f"ABORT: Stage B first-pair gate failed: {disposition.get('reason')}")
+            if consecutive_failures >= 2:
+                raise SystemExit("ABORT: Stage B stop-loss reached two consecutive failed pairs")
+        if accepted == stageb.REQUIRED_COMPARISON_PAIRS:
+            matrix = stageb.matrix_disposition(
+                matrix_records, history_root=(ROOT / ".sage_history").resolve(),
+            )
+            if matrix.get("countable") is not True:
+                raise SystemExit(f"ABORT: Stage B matrix admission failed: {matrix.get('reason')}")
+            print(json.dumps({"matrix_disposition": matrix}, sort_keys=True))
+            return matrix
+    raise SystemExit("ABORT: Stage B exhausted seven pair identities before five countable pairs")
 
 
 def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=None, model=None,
@@ -1914,11 +2094,10 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
             protocol_id=protocol_id,
             scenario=scenario,
         )
-        if not selected.pair_allocated:
-            contract = selected.assembled_contract()
-            print(json.dumps({"prospective_protocol": contract}, sort_keys=True))
-            if contract["required_comparison_pairs"] > 1:
-                print(json.dumps({
+        contract = selected.assembled_contract()
+        if contract["required_comparison_pairs"] > 1:
+            print(json.dumps({"allocation_protocol": contract}, sort_keys=True))
+            print(json.dumps({
                     "prospective_matrix_schedule": [
                         {
                             "pair_id": pair_id,
@@ -1931,7 +2110,15 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
                     "first_pair_gate": contract["primary_pair_ids"][0],
                     "stop_loss": "two consecutive failed pairs or maximum pair-attempt budget",
                     "automatic_expansion": False,
-                }, sort_keys=True))
+            }, sort_keys=True))
+            state = "ALLOCATED" if selected.pair_allocated else "UNALLOCATED"
+            print(
+                f"\n{state}: protocol assembly only. No reset, arm, model, Mythic, "
+                "BloodHound, range, target, or comparison command is emitted."
+            )
+            return
+        if not selected.pair_allocated:
+            print(json.dumps({"prospective_protocol": contract}, sort_keys=True))
             print(
                 "\nUNALLOCATED: protocol assembly only. No reset, arm, model, Mythic, "
                 "BloodHound, range, target, or comparison command is emitted."
@@ -2068,7 +2255,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--gate1p-stage-b-protocol",
         action="store_true",
-        help="assemble the prospective unallocated Stage B child-control protocol offline",
+        help="assemble or execute the allocated Stage B child-control matrix",
     )
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
@@ -2079,7 +2266,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--live-authority-id",
         default=None,
-        help="separate explicit live authority identifier; required with --go for the Stage A pair",
+        help="separate explicit live authority identifier; required with --go for an allocated Gate 1P run",
     )
     ap.add_argument("--solve-timeout", type=int, default=1800,
                     help="seconds per gauge solve (default 1800=30min). The per-run subprocess cap is raised "
@@ -2258,7 +2445,36 @@ def main(argv=None) -> int:
         if policy_mode != stageb.POLICY_MODE or null_model or args.treatment:
             ap.error("the Stage B protocol declares only the shipping llm policy and true-naive arm")
         if args.go:
-            ap.error(f"{stageb.PROTOCOL_ID} is unallocated; --go cannot reset or execute anything")
+            if not stageb.PAIR_ALLOCATED:
+                ap.error(f"{stageb.PROTOCOL_ID} is unallocated; --go cannot reset or execute anything")
+            if args.live_authority_id != stageb.ALLOCATION_ID:
+                ap.error(
+                    f"live Stage B execution requires separate --live-authority-id {stageb.ALLOCATION_ID}"
+                )
+            if args.solve_timeout != stageb.WALL_SECONDS or args.snapshot != stageb.RESET_SNAPSHOT:
+                ap.error("the Stage B allocation requires its fixed solve timeout and reset snapshot")
+            actual_foothold = {
+                "host": foothold.host, "ip": foothold.ip, "identity": foothold.user,
+                "callback_user": foothold.callback_user, "payload_type": "apollo",
+            }
+            if actual_foothold != stageb.INITIAL_FOOTHOLD_ROLE:
+                ap.error("the Stage B allocation requires the fixed CASTELBLACK/Samwell Apollo foothold role")
+            args.provider, args.model = args.provider or stageb.MODEL_PROVIDER, args.model or stageb.MODEL_ID
+            if args.provider.casefold() != stageb.MODEL_PROVIDER or args.model != stageb.MODEL_ID:
+                ap.error("the Stage B allocation requires its fixed provider/model route")
+            if not args.source_version:
+                ap.error("Stage B --go requires an exact source identity")
+            if (
+                args.model_context_limit != stageb.MODEL_CONTEXT_LIMIT
+                or args.max_output_tokens != stageb.MAX_OUTPUT_TOKENS
+            ):
+                ap.error("Stage B --go requires source, context-limit, and max-output identities")
+            if args.max_output_tokens > args.model_context_limit:
+                ap.error("--max-output-tokens cannot exceed --model-context-limit")
+            if not BH or not Path(BH).is_dir():
+                ap.error("SAGE_BLOODHOUND_MCP_DIR must name an existing directory for Stage B")
+            if not str(os.environ.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
+                ap.error("SAGE_EVAL_API_ENDPOINT is required for exact Stage B route parity")
     route_env = None
     if args.treatment:
         route = load_treatment_route(args.route_env, args.treatment)
@@ -2357,6 +2573,11 @@ def main(argv=None) -> int:
         args.ludus_range_id,
         args.ludus_mcp_server,
     )
+    if args.gate1p_stage_b_protocol:
+        _run_gate1p_stageb_matrix(
+            args, stageb, policy_mode=policy_mode, route_env=route_env, foothold=foothold,
+        )
+        return 0
     gate1p_start_arm_index = 0
     if args.gate1p_stage_a_pair:
         control_path = initialize_gate1p_pair_control(

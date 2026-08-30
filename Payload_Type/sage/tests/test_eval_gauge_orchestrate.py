@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,7 +30,7 @@ def _stageb_protocol_argv(*extra):
     ]
 
 
-def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_and_matrix_schedule():
+def test_gate1p_stageb_dry_run_emits_only_allocated_protocol_and_matrix_schedule():
     result = subprocess.run(
         _stageb_protocol_argv(),
         cwd=ROOT,
@@ -41,21 +42,21 @@ def test_gate1p_stageb_dry_run_emits_only_unallocated_protocol_and_matrix_schedu
     output = result.stdout
     assert '"protocol_id": "gate1p-stage-b-child-control-completed-call-budget-v1"' in output
     assert '"matrix_id": "gate1p-stageb-child-control-matrix-v1"' in output
-    assert '"pair_allocated": false' in output
+    assert '"pair_allocated": true' in output
     assert '"pair_id": null' in output
     assert '"allocation_id": "gate1p-stageb-child-control-allocation-001"' in output
     assert '"first_pair_gate": "gate1p-stageb-child-control-pair-001"' in output
     assert '"pair_id": "gate1p-stageb-child-control-pair-007"' in output
     assert output.count('"fresh_range_per_arm": true') == 7
     assert '"automatic_expansion": false' in output
-    assert "UNALLOCATED: protocol assembly only" in output
+    assert "ALLOCATED: protocol assembly only" in output
     assert "rollback " not in output
     assert "bootstrap_payloads.py" not in output
     assert "run --go" not in output
     assert "compare --scenario" not in output
 
 
-def test_gate1p_stageb_go_fails_before_reset_or_execution_plan():
+def test_gate1p_stageb_go_requires_exact_authority_before_reset_or_execution_plan():
     result = subprocess.run(
         _stageb_protocol_argv("--go"),
         cwd=ROOT,
@@ -65,7 +66,7 @@ def test_gate1p_stageb_go_fails_before_reset_or_execution_plan():
     )
 
     assert result.returncode == 2
-    assert "is unallocated; --go cannot reset or execute anything" in result.stderr
+    assert "requires separate --live-authority-id" in result.stderr
     assert "rollback " not in result.stdout
     assert "bootstrap_payloads.py" not in result.stdout
 
@@ -81,6 +82,157 @@ def test_gate1p_stageb_protocol_mode_is_mutually_exclusive_with_stagea_pair():
 
     assert result.returncode == 2
     assert "modes are mutually exclusive" in result.stderr
+
+
+def _stageb_matrix_fixture(monkeypatch, tmp_path, outcomes):
+    stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    calls = []
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path)}
+    monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args: None)
+
+    def write_control(pair_env, pair_id, *, next_arm="shipping_sage"):
+        now = 1.0
+        completed = [] if next_arm == "shipping_sage" else (
+            ["shipping_sage"] if next_arm == "true_naive" else list(stageb.ARMS)
+        )
+        prearm = None if next_arm == "complete" else {
+            "arm": next_arm, "status": "idle", "reset_generation": 0, "updated_at": now,
+        }
+        path = orchestrate._gate1p_pair_control_path(pair_env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schema": stageb.PAIR_CONTROL_SCHEMA, "protocol_id": stageb.PROTOCOL_ID,
+            "pair_id": pair_id, "source_version": "tree:test", "next_arm": next_arm,
+            "completed_arms": completed, "prearm_state": prearm,
+            "created_at": now, "updated_at": now,
+        }), encoding="utf-8")
+        return path
+
+    def initialize(*, route_env, pair_id, **_kwargs):
+        return write_control(route_env, pair_id)
+
+    def run_side(_scenario, side, **kwargs):
+        pair_id, arm_index = kwargs["pair_id"], kwargs["arm_index"]
+        assert kwargs["live_authority_id"] == stageb.ALLOCATION_ID
+        calls.append((pair_id, side))
+        pair_env = kwargs["route_env"]
+        next_arm = "true_naive" if arm_index == 0 else "complete"
+        write_control(pair_env, pair_id, next_arm=next_arm)
+        results = orchestrate._gate1p_results_path(pair_env)
+        with results.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"protocol": {"pair_id": pair_id}, "arm_index": arm_index}) + "\n")
+
+    monkeypatch.setattr(orchestrate, "initialize_gate1p_pair_control", initialize)
+    monkeypatch.setattr(orchestrate, "run_side_with_gate1p_cleanup", run_side)
+    monkeypatch.setattr(
+        orchestrate, "_gate1p_completed_arm_disposition",
+        lambda _protocol, _records, *, pair_id, **_kwargs: {
+            "countable": bool(outcomes[pair_id]), "reason": "fixture shipping disposition",
+        },
+    )
+    monkeypatch.setattr(
+        stageb, "pair_disposition",
+        lambda _records, *, pair_id, **_kwargs: {
+            "countable": bool(outcomes[pair_id]), "reason": "fixture pair disposition",
+        },
+    )
+    monkeypatch.setattr(
+        stageb, "matrix_disposition",
+        lambda _records, **_kwargs: {"countable": True, "accepted": 5},
+    )
+    args = SimpleNamespace(
+        source_version="tree:test", solve_timeout=stageb.WALL_SECONDS,
+        provider=stageb.MODEL_PROVIDER, model=stageb.MODEL_ID, snapshot=stageb.RESET_SNAPSHOT,
+        retained_callback_config=Path("retained.json"), ludus_range_id="range",
+        ludus_mcp_server="server", model_context_limit=200_000, max_output_tokens=8192,
+        live_authority_id=stageb.ALLOCATION_ID,
+    )
+    return stageb, args, route_env, calls, write_control
+
+
+def test_stageb_matrix_coordinator_runs_five_pairs_in_exact_arm_order(monkeypatch, tmp_path):
+    stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    outcomes = {pair_id: True for pair_id in stageb.PAIR_IDS}
+    stageb, args, route_env, calls, _write = _stageb_matrix_fixture(
+        monkeypatch, tmp_path, outcomes,
+    )
+
+    result = orchestrate._run_gate1p_stageb_matrix(
+        args, stageb, policy_mode="llm", route_env=route_env, foothold=orchestrate.FootholdSpec(),
+    )
+
+    assert result == {"countable": True, "accepted": 5}
+    assert calls == [
+        (pair_id, side)
+        for pair_id in stageb.PRIMARY_PAIR_IDS
+        for side in ("harness", "bare")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "message", "expected_pairs"),
+    [
+        ([False], "first-pair gate failed", 1),
+        ([True, False, False], "two consecutive failed pairs", 3),
+    ],
+)
+def test_stageb_matrix_coordinator_enforces_first_pair_and_stop_loss(
+    monkeypatch, tmp_path, outcomes, message, expected_pairs,
+):
+    stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    disposition = {
+        pair_id: outcomes[index] if index < len(outcomes) else True
+        for index, pair_id in enumerate(stageb.PAIR_IDS)
+    }
+    stageb, args, route_env, calls, _write = _stageb_matrix_fixture(
+        monkeypatch, tmp_path, disposition,
+    )
+
+    with pytest.raises(SystemExit, match=message):
+        orchestrate._run_gate1p_stageb_matrix(
+            args, stageb, policy_mode="llm", route_env=route_env,
+            foothold=orchestrate.FootholdSpec(),
+        )
+
+    assert {pair_id for pair_id, _side in calls} == set(stageb.PAIR_IDS[:expected_pairs])
+    assert all(side == "harness" for pair_id, side in calls if not disposition[pair_id])
+
+
+def test_stageb_matrix_coordinator_resumes_completed_pair_without_rerun(monkeypatch, tmp_path):
+    stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    outcomes = {pair_id: True for pair_id in stageb.PAIR_IDS}
+    stageb, args, route_env, calls, write_control = _stageb_matrix_fixture(
+        monkeypatch, tmp_path, outcomes,
+    )
+    first_env = orchestrate._stageb_pair_env(stageb, stageb.PAIR_IDS[0], route_env)
+    write_control(first_env, stageb.PAIR_IDS[0], next_arm="complete")
+    orchestrate._gate1p_results_path(first_env).write_text(
+        json.dumps({"protocol": {"pair_id": stageb.PAIR_IDS[0]}, "arm_index": 1}) + "\n",
+        encoding="utf-8",
+    )
+
+    orchestrate._run_gate1p_stageb_matrix(
+        args, stageb, policy_mode="llm", route_env=route_env, foothold=orchestrate.FootholdSpec(),
+    )
+
+    assert all(pair_id != stageb.PAIR_IDS[0] for pair_id, _side in calls)
+
+
+def test_stageb_pair_control_rejects_cross_pair_resume(tmp_path):
+    stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(tmp_path)}
+    path = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test", route_env=route_env,
+        protocol=stageb, pair_id=stageb.PAIR_IDS[0],
+    )
+    state = json.loads(path.read_text(encoding="utf-8"))
+
+    assert state["schema"] == stageb.PAIR_CONTROL_SCHEMA
+    with pytest.raises(SystemExit, match="identity or metadata is malformed"):
+        orchestrate._validate_gate1p_pair_control_state(
+            state, expected_source_version="tree:test",
+            protocol=stageb, pair_id=stageb.PAIR_IDS[1],
+        )
 
 
 def test_dry_run_uses_staged_snapshot_retained_config_and_existing_apollo():

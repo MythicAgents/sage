@@ -15,7 +15,7 @@ except Exception:
 PROTOCOL_ID = "gate1p-stage-b-child-control-completed-call-budget-v1"
 MATRIX_ID = "gate1p-stageb-child-control-matrix-v1"
 PAIR_ID = None
-PAIR_ALLOCATED = False
+PAIR_ALLOCATED = True
 ALLOCATION_ID = "gate1p-stageb-child-control-allocation-001"
 PRIMARY_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 6))
 RESERVE_PAIR_IDS = tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(6, 8))
@@ -23,6 +23,7 @@ PAIR_IDS = PRIMARY_PAIR_IDS + RESERVE_PAIR_IDS
 REQUIRED_COMPARISON_PAIRS = 5
 MAX_PAIR_ATTEMPTS = 7
 PAIR_CONTROL_SCHEMA = "gate1p-stageb-pair-control-v1"
+PRESTART_CLEANUP_SCHEMA = "gate1p-stageb-prestart-cleanup-v1"
 STORAGE_NAMESPACE = f"gate1p-stageb/{MATRIX_ID}"
 SCENARIO = "child-control"
 OBJECTIVE_DOMAIN = "north.sevenkingdoms.local"
@@ -40,6 +41,8 @@ MODEL_ID = gate1p_stagea.MODEL_ID
 POLICY_MODE = gate1p_stagea.POLICY_MODE
 WALL_SECONDS = gate1p_stagea.WALL_SECONDS
 TOKEN_ADMISSION_CEILING = gate1p_stagea.TOKEN_ADMISSION_CEILING
+MODEL_CONTEXT_LIMIT = 200_000
+MAX_OUTPUT_TOKENS = 8_192
 RESET_SNAPSHOT = gate1p_stagea.RESET_SNAPSHOT
 INITIAL_FOOTHOLD_ROLE = gate1p_stagea.INITIAL_FOOTHOLD_ROLE
 ProtocolError = gate1p_stagea.ProtocolError
@@ -245,6 +248,11 @@ def validate_request(**request) -> str:
     admission = admission_for_pair(str(pair_id or ""))
     if request.pop("scenario", None) != SCENARIO:
         raise ProtocolError(f"scenario must be {SCENARIO!r}")
+    if (
+        request.get("model_context_limit") != MODEL_CONTEXT_LIMIT
+        or request.get("max_output_tokens") != MAX_OUTPUT_TOKENS
+    ):
+        raise ProtocolError("Stage B requires the allocated context and maximum-output settings")
     return gate1p_stagea.validate_request(
         protocol_id=PROTOCOL_ID, pair_id=pair_id, scenario=SCENARIO,
         admission=admission, **request,
