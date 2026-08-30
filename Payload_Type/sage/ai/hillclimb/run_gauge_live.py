@@ -660,6 +660,19 @@ def runtime_evidence_fields(telemetry: dict | None) -> dict:
 _GATE1P_PRIMARY_SCENARIOS = gate1p_protocol.primary_scenarios()
 
 
+def _row_outcome_disposition(
+    row_protocol: gate1p_protocol.Gate1PProtocol | None,
+    pair_id: str | None,
+) -> Callable[..., dict]:
+    if row_protocol is None:
+        return gate1p_stagea.episode_outcome_disposition
+    return lambda observer, **kwargs: row_protocol.episode_outcome_disposition(
+        observer,
+        pair_id=pair_id,
+        **kwargs,
+    )
+
+
 def measurement_dimensions(
     card: ScoreCard,
     *,
@@ -673,6 +686,7 @@ def measurement_dimensions(
     model_response_records: object = None,
     model_calls: object = None,
     token_ceiling: object = None,
+    outcome_disposition: Callable[..., dict] = gate1p_stagea.episode_outcome_disposition,
 ) -> dict:
     """Report independent countability dimensions without converting missing evidence to failure or zero."""
     kind = str(measurement_kind or "legacy")
@@ -687,7 +701,7 @@ def measurement_dimensions(
         else {"countable": False}
     )
     observer_semantics = (
-        gate1p_stagea.episode_outcome_disposition(
+        outcome_disposition(
             observer_result,
             arm=str(arm or ""),
             total_tokens=usage.get("total_tokens"),
@@ -1442,6 +1456,7 @@ def run_side(
                model_response_records=list(canonical_response_records),
                model_calls=getattr(card, "model_calls", None),
                token_ceiling=cfg.model_token_budget,
+               outcome_disposition=_row_outcome_disposition(row_protocol, cfg.pair_id),
            ),
            "cost_countable": cost_countable,
            "telemetry_validation_error": telemetry_validation_error,

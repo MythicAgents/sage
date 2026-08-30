@@ -41,12 +41,12 @@ def test_gate1p_stageb_dry_run_emits_only_allocated_protocol_and_matrix_schedule
 
     output = result.stdout
     assert '"protocol_id": "gate1p-stage-b-child-control-completed-call-budget-v1"' in output
-    assert '"matrix_id": "gate1p-stageb-child-control-matrix-v2"' in output
+    assert '"matrix_id": "gate1p-stageb-child-control-matrix-v3"' in output
     assert '"pair_allocated": true' in output
     assert '"pair_id": null' in output
-    assert '"allocation_id": "gate1p-stageb-child-control-allocation-002"' in output
-    assert '"first_pair_gate": "gate1p-stageb-child-control-pair-008"' in output
-    assert '"pair_id": "gate1p-stageb-child-control-pair-014"' in output
+    assert '"allocation_id": "gate1p-stageb-child-control-allocation-003"' in output
+    assert '"first_pair_gate": "gate1p-stageb-child-control-pair-015"' in output
+    assert '"pair_id": "gate1p-stageb-child-control-pair-021"' in output
     assert output.count('"fresh_range_per_arm": true') == 7
     assert '"automatic_expansion": false' in output
     assert "ALLOCATED: protocol assembly only" in output
@@ -58,7 +58,7 @@ def test_gate1p_stageb_dry_run_emits_only_allocated_protocol_and_matrix_schedule
 
 @pytest.mark.parametrize(
     "live_authority",
-    (None, "gate1p-stageb-child-control-allocation-001"),
+    (None, "gate1p-stageb-child-control-allocation-001", "gate1p-stageb-child-control-allocation-002"),
 )
 def test_gate1p_stageb_go_requires_exact_authority_before_reset_or_execution_plan(live_authority):
     authority_args = [] if live_authority is None else ["--live-authority-id", live_authority]
@@ -78,27 +78,33 @@ def test_gate1p_stageb_go_requires_exact_authority_before_reset_or_execution_pla
 
 def test_gate1p_stageb_successor_storage_ignores_terminal_matrix_artifacts(monkeypatch, tmp_path):
     stageb = orchestrate._gate1p_protocol_selector().protocol_for_scenario("child-control").module
-    terminal_dir = (
-        tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
-        / "gate1p-stageb" / "gate1p-stageb-child-control-matrix-v1"
-        / "gate1p-stageb-child-control-pair-001"
-    )
-    terminal_dir.mkdir(parents=True)
-    terminal_control = terminal_dir / "pair-control.json"
-    terminal_control.write_text("terminal-v1-control\n", encoding="utf-8")
+    terminal_controls = []
+    for matrix_id, pair_id in (
+        ("gate1p-stageb-child-control-matrix-v1", "gate1p-stageb-child-control-pair-001"),
+        ("gate1p-stageb-child-control-matrix-v2", "gate1p-stageb-child-control-pair-008"),
+    ):
+        terminal_dir = (
+            tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
+            / "gate1p-stageb" / matrix_id / pair_id
+        )
+        terminal_dir.mkdir(parents=True)
+        terminal_control = terminal_dir / "pair-control.json"
+        terminal_control.write_text(f"terminal-{matrix_id}-control\n", encoding="utf-8")
+        terminal_controls.append((terminal_control, matrix_id))
     monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
 
     successor = orchestrate._stageb_pair_env(stageb, stageb.PRIMARY_PAIR_IDS[0], None)
     successor_dir = Path(successor["SAGE_EVAL_ARTIFACT_DIR"])
 
-    assert stageb.STORAGE_NAMESPACE == "gate1p-stageb/gate1p-stageb-child-control-matrix-v2"
+    assert stageb.STORAGE_NAMESPACE == "gate1p-stageb/gate1p-stageb-child-control-matrix-v3"
     assert successor_dir == (
         tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
-        / "gate1p-stageb" / "gate1p-stageb-child-control-matrix-v2"
-        / "gate1p-stageb-child-control-pair-008"
+        / "gate1p-stageb" / "gate1p-stageb-child-control-matrix-v3"
+        / "gate1p-stageb-child-control-pair-015"
     )
     assert not successor_dir.exists()
-    assert terminal_control.read_text(encoding="utf-8") == "terminal-v1-control\n"
+    for terminal_control, matrix_id in terminal_controls:
+        assert terminal_control.read_text(encoding="utf-8") == f"terminal-{matrix_id}-control\n"
 
 
 def test_gate1p_stageb_protocol_mode_is_mutually_exclusive_with_stagea_pair():

@@ -869,7 +869,7 @@ def _stageb_row_cfg(pair_id, *, arm_index=0):
 
 @pytest.mark.parametrize(
     "terminal_pair_id",
-    tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 8)),
+    tuple(f"gate1p-stageb-child-control-pair-{index:03d}" for index in range(1, 15)),
 )
 def test_stageb_terminal_pair_rejects_before_live_child_client(monkeypatch, terminal_pair_id):
     monkeypatch.setattr(
@@ -1028,6 +1028,192 @@ def test_stageb_naive_child_recomputes_pair_specific_shipping_admission(monkeypa
     assert observed["pair_id"] == pair_id
     assert observed["records"] == []
     assert observed["history_root"] == history
+
+
+def test_stageb_selected_protocol_projects_and_admits_synthetic_lifecycle(
+    monkeypatch,
+    tmp_path,
+):
+    fixture_spec = importlib.util.spec_from_file_location(
+        "gate1p_stagea_lifecycle_fixtures",
+        Path(__file__).with_name("test_hillclimb_gate1p_stagea.py"),
+    )
+    fixtures = importlib.util.module_from_spec(fixture_spec)
+    assert fixture_spec and fixture_spec.loader
+    fixture_spec.loader.exec_module(fixtures)
+
+    row_protocol = rgl.gate1p_protocol.protocol_for_request(
+        protocol_id=rgl.gate1p_stageb.PROTOCOL_ID,
+        scenario=rgl.gate1p_stageb.SCENARIO,
+    )
+    pair_id = rgl.gate1p_stageb.PRIMARY_PAIR_IDS[0]
+    history = tmp_path / ".sage_history"
+    artifact_dir = history / "evaluation" / "gate1p"
+    route_env = {"SAGE_EVAL_ARTIFACT_DIR": str(artifact_dir)}
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+    control = orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    orchestrate.mark_gate1p_prearm_reset_started(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+
+    shipping = fixtures._row("shipping_sage", history)
+    naive = fixtures._row("true_naive", history)
+    records = fixtures._pair(shipping, naive)
+    invariants = rgl.gate1p_stageb.pair_invariants(
+        pair_id=pair_id,
+        provider=rgl.gate1p_stageb.MODEL_PROVIDER,
+        model=rgl.gate1p_stageb.MODEL_ID,
+        api_endpoint="https://provider.invalid/v1",
+        source_version="tree:test",
+        model_context_limit=rgl.gate1p_stageb.MODEL_CONTEXT_LIMIT,
+        max_output_tokens=rgl.gate1p_stageb.MAX_OUTPUT_TOKENS,
+    )
+    for record in records:
+        protocol = record["protocol"]
+        protocol["protocol_id"] = rgl.gate1p_stageb.PROTOCOL_ID
+        protocol["pair_id"] = pair_id
+        if "pair_invariants" in protocol:
+            protocol["pair_invariants"] = invariants
+        if record["record_type"] != "result":
+            continue
+        arm = protocol["arm"]
+        episode_path = Path(record["artifact_capture"]["episode_artifact"])
+        oracle = row_protocol.build_objective_oracle(
+            tuple(
+                rgl.gate1p_stageb.make_proof_adapter(name, lambda: False)
+                for name in rgl.gate1p_stageb.OBJECTIVE_PROOF_CLASSES
+            ),
+            artifact_pointer=str(episode_path),
+        )
+        observer = row_protocol.build_episode_observer(
+            pair_id=pair_id,
+            arm=arm,
+            objective_probe=oracle,
+            task_fetcher=lambda: (),
+            objective_settle_seconds=0.01,
+            objective_poll_seconds=0.002,
+            task_quiescence_seconds=0.01,
+            task_poll_seconds=0.002,
+        )
+        observer.start()
+        observer_result = observer.finish(
+            wrapper_status="completed" if arm == "shipping_sage" else "done",
+            wrapper_objective_recognized=False,
+        )
+        next(
+            item
+            for item in records
+            if item["record_type"] == "arm_started" and item["protocol"]["arm"] == arm
+        )["event"] = observer_result["events"][0]
+        semantics = row_protocol.episode_outcome_disposition(
+            observer_result,
+            arm=arm,
+            total_tokens=15,
+            token_ceiling=rgl.gate1p_stageb.TOKEN_ADMISSION_CEILING,
+            pair_id=pair_id,
+        )
+        assert {
+            key: semantics[key]
+            for key in (
+                "countable",
+                "objective_success",
+                "objective_recognized",
+                "stop_countable",
+                "task_quiescent",
+                "clean_stop",
+                "objective_clean_stop",
+            )
+        } == {
+            "countable": True,
+            "objective_success": False,
+            "objective_recognized": False,
+            "stop_countable": True,
+            "task_quiescent": True,
+            "clean_stop": True,
+            "objective_clean_stop": False,
+        }
+        record["scenario"] = rgl.gate1p_stageb.SCENARIO
+        record["observer"] = observer_result
+        record["request_completed"] = True
+        record["objective_recognized"] = False
+        record["objective_proven"] = False
+        record["clean_stop"] = True
+        record["objective_clean_stop"] = False
+        record["card"].update({
+            "scenario": rgl.gate1p_stageb.SCENARIO,
+            "request_completed": True,
+            "objective_recognized": False,
+            "objective_proven": False,
+            "clean_stop": True,
+            "objective_clean_stop": False,
+        })
+        record["countability"] = rgl.measurement_dimensions(
+            rgl.ScoreCard(**record["card"]),
+            measurement_kind="row",
+            cost_countable=record["cost_countable"],
+            stop_observation_available=True,
+            observer_result=observer_result,
+            arm=arm,
+            model_response_records=record["model_response_records"],
+            model_calls=record["model_calls"],
+            token_ceiling=rgl.gate1p_stageb.TOKEN_ADMISSION_CEILING,
+            outcome_disposition=rgl._row_outcome_disposition(row_protocol, pair_id),
+        )
+        artifact = json.loads(episode_path.read_text(encoding="utf-8"))
+        artifact.update({
+            "protocol": protocol,
+            "oracle": observer_result["oracle"],
+            "observer": observer_result,
+            "runtime_summary": record["runtime_summary"],
+            "response_evidence": record["model_response_records"],
+            "scorecard": record["card"],
+            "reset_readiness": protocol["reset_readiness"],
+        })
+        episode_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    shipping_records = records[:4]
+    fixtures._write_pair_ledger(shipping_records)
+    shipping_admission = rgl.gate1p_stageb.completed_arm_lifecycle_disposition(
+        shipping_records,
+        arm="shipping_sage",
+        pair_id=pair_id,
+        history_root=history,
+    )
+    assert shipping_admission["countable"] is True, shipping_admission
+    orchestrate.advance_gate1p_pair_control(
+        arm="shipping_sage",
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    )
+    assert orchestrate.initialize_gate1p_pair_control(
+        source_version="tree:test",
+        route_env=route_env,
+        protocol=rgl.gate1p_stageb,
+        pair_id=pair_id,
+    ) == control
+    assert json.loads(control.read_text(encoding="utf-8"))["next_arm"] == "true_naive"
+
+    fixtures._write_pair_ledger(records)
+    pair_admission = rgl.gate1p_stageb.pair_disposition(
+        records,
+        pair_id=pair_id,
+        history_root=history,
+    )
+    assert pair_admission["countable"] is True, pair_admission
+    assert [item["arm"] for item in pair_admission["comparison_inputs"]] == list(
+        rgl.gate1p_stageb.ARMS
+    )
 
 
 @pytest.mark.parametrize(
