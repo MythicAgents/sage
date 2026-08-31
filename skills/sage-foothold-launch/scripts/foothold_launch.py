@@ -25,6 +25,7 @@ An empty or ambiguous callback set is a FAILURE, not a pass.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -35,8 +36,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 PY = str(REPO / ".venv" / "bin" / "python")
 CERT = str(REPO / "Payload_Type" / "sage" / "certs" / "combined-bundle.pem")
-SKILL_ENV = Path(__file__).resolve().parents[1] / ".env"
-SAGE_ENV = REPO / "Payload_Type" / "sage" / ".env"
+RUN_AS_RESOLVER_PATH = Path(__file__).resolve().with_name("run_as_resolver.py")
 
 LUDUS = "skills/sage-goad-reset/scripts/ludus.py"
 CLOCK = "skills/sage-goad-reset/scripts/sync_range_time.py"
@@ -50,30 +50,24 @@ DEFAULT_RUN_AS = "NORTH\\samwell.tarly"
 DEFAULT_SERVE_HOST = os.environ.get("SAGE_SERVE_HOST", "100.108.59.85")  # operator Tailscale IP
 
 
-def _read_nonempty_env_value(path: Path, key: str) -> str | None:
-    if not path.is_file():
-        return None
-    prefix = f"{key}="
-    for line in path.read_text(encoding="utf-8").splitlines():
-        candidate = line.strip()
-        if not candidate.startswith(prefix):
-            continue
-        value = candidate.split("=", 1)[1].strip().strip("'\"")
-        return value or None
-    return None
+def _load_run_as_resolver():
+    spec = importlib.util.spec_from_file_location("sage_operator_run_as_resolver", RUN_AS_RESOLVER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load run-as resolver: {RUN_AS_RESOLVER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_RUN_AS_RESOLVER = _load_run_as_resolver()
 
 
 def _env() -> dict:
     env = dict(os.environ)
     env["SSL_CERT_FILE"] = CERT
-    # Keep the run-as credential beside the skill that owns the launch. The process environment wins;
-    # Sage's runtime env remains a compatibility fallback for existing private installations.
-    if not env.get("SAGE_RUN_AS_PASSWORD"):
-        for path in (SKILL_ENV, SAGE_ENV):
-            value = _read_nonempty_env_value(path, "SAGE_RUN_AS_PASSWORD")
-            if value:
-                env["SAGE_RUN_AS_PASSWORD"] = value
-                break
+    password = _RUN_AS_RESOLVER.resolve_run_as_password(environ=env)
+    if password:
+        env["SAGE_RUN_AS_PASSWORD"] = password
     return env
 
 

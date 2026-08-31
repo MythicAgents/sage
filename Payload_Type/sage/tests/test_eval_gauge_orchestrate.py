@@ -11,10 +11,19 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 PY = ROOT / ".venv" / "bin" / "python"
 SCRIPT = ROOT / "skills" / "sage-eval-gauge" / "scripts" / "orchestrate.py"
+FOOTHOLD_SCRIPT = ROOT / "skills" / "sage-foothold-launch" / "scripts" / "foothold_launch.py"
 SPEC = importlib.util.spec_from_file_location("sage_eval_orchestrate", SCRIPT)
 orchestrate = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(orchestrate)
+
+
+def _load_foothold_launcher():
+    spec = importlib.util.spec_from_file_location("sage_foothold_launcher_cross_boundary", FOOTHOLD_SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _stageb_protocol_argv(*extra):
@@ -1923,6 +1932,78 @@ def test_foothold_launch_env_maps_alternate_password_source(monkeypatch):
     foothold = orchestrate.FootholdSpec(password_env="SAGE_MEEREEN_JORAH_PASSWORD")
 
     assert foothold.launch_env()["SAGE_RUN_AS_PASSWORD"] == "jorah-password"
+
+
+def test_gate1p_preflight_and_headless_launcher_share_skill_local_resolver(
+    monkeypatch, tmp_path, capsys
+):
+    secret = "skill-local-test-secret"
+    skill_env = tmp_path / "skill.env"
+    skill_env.write_text(f"SAGE_RUN_AS_PASSWORD={secret}\n", encoding="utf-8")
+    resolver = orchestrate._RUN_AS_RESOLVER
+    monkeypatch.setattr(resolver, "SKILL_ENV", skill_env)
+    monkeypatch.setattr(resolver, "USER_RUN_AS_ENV", tmp_path / "missing-user.env")
+    monkeypatch.setattr(resolver, "RUNTIME_ENV", tmp_path / "missing-runtime.env")
+    for key in ("SAGE_RUN_AS_PASSWORD", "SAGE_RUNAS_FILE", "MYTHIC_ENV_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    retained = tmp_path / "apollo.json"
+    retained.write_text('{"config":{"payload_type":{"name":"apollo"}}}', encoding="utf-8")
+    monkeypatch.setattr(orchestrate, "_available_snapshots", lambda *_args: {"snapshot-1"})
+
+    orchestrate.validate_reset_inputs("snapshot-1", retained)
+    foothold_launcher = _load_foothold_launcher()
+    foothold_resolver = foothold_launcher._RUN_AS_RESOLVER
+    monkeypatch.setattr(foothold_resolver, "SKILL_ENV", skill_env)
+    monkeypatch.setattr(foothold_resolver, "USER_RUN_AS_ENV", tmp_path / "missing-user.env")
+    monkeypatch.setattr(foothold_resolver, "RUNTIME_ENV", tmp_path / "missing-runtime.env")
+
+    assert Path(foothold_resolver.__file__).resolve() == Path(resolver.__file__).resolve()
+    assert orchestrate._resolve_password_source() == secret
+    assert foothold_launcher._env()["SAGE_RUN_AS_PASSWORD"] == secret
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
+def test_gate1p_preflight_missing_sources_names_canonical_skill_file(monkeypatch, tmp_path):
+    resolver = orchestrate._RUN_AS_RESOLVER
+    empty_skill = tmp_path / "empty-skill.env"
+    empty_skill.write_text("SAGE_RUN_AS_PASSWORD=\n", encoding="utf-8")
+    empty_runtime = tmp_path / "empty-runtime.env"
+    empty_runtime.write_text("SAGE_RUN_AS_PASSWORD=\n", encoding="utf-8")
+    monkeypatch.setattr(resolver, "SKILL_ENV", empty_skill)
+    monkeypatch.setattr(resolver, "USER_RUN_AS_ENV", tmp_path / "missing-user.env")
+    monkeypatch.setattr(resolver, "RUNTIME_ENV", empty_runtime)
+    for key in ("SAGE_RUN_AS_PASSWORD", "SAGE_RUNAS_FILE", "MYTHIC_ENV_PATH"):
+        monkeypatch.delenv(key, raising=False)
+
+    retained = tmp_path / "apollo.json"
+    retained.write_text('{"config":{"payload_type":{"name":"apollo"}}}', encoding="utf-8")
+    monkeypatch.setattr(orchestrate, "_available_snapshots", lambda *_args: {"snapshot-1"})
+
+    with pytest.raises(SystemExit) as exc_info:
+        orchestrate.validate_reset_inputs("snapshot-1", retained)
+
+    assert "skills/sage-foothold-launch/.env" in str(exc_info.value)
+
+
+def test_gate1p_preflight_preserves_interactive_compatibility_after_empty_skill(
+    monkeypatch, tmp_path
+):
+    resolver = orchestrate._RUN_AS_RESOLVER
+    empty_skill = tmp_path / "empty-skill.env"
+    empty_skill.write_text("SAGE_RUN_AS_PASSWORD=\n", encoding="utf-8")
+    interactive_env = tmp_path / "interactive.env"
+    interactive_env.write_text("SAGE_RUN_AS_PASSWORD=interactive-secret\n", encoding="utf-8")
+    monkeypatch.setattr(resolver, "SKILL_ENV", empty_skill)
+    monkeypatch.setattr(resolver, "USER_RUN_AS_ENV", tmp_path / "missing-user.env")
+    monkeypatch.setattr(resolver, "RUNTIME_ENV", tmp_path / "missing-runtime.env")
+    monkeypatch.delenv("SAGE_RUN_AS_PASSWORD", raising=False)
+    monkeypatch.setenv("SAGE_RUNAS_FILE", str(interactive_env))
+    monkeypatch.delenv("MYTHIC_ENV_PATH", raising=False)
+
+    assert orchestrate._resolve_password_source() == "interactive-secret"
 
 
 def test_gate1p_diagnostic_run_side_threads_non_countable_protocol(monkeypatch):

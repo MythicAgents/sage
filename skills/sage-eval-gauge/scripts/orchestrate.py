@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 import math
 import os
@@ -38,6 +39,9 @@ DEFAULT_RETAINED_CALLBACK_CONFIG = (
     ROOT / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
 )
 DEFAULT_ROUTE_ENV = ROOT / "skills" / "sage-eval-gauge" / ".env.local"
+RUN_AS_RESOLVER_PATH = (
+    ROOT / "skills" / "sage-foothold-launch" / "scripts" / "run_as_resolver.py"
+)
 DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '{"NORTH":"north.sevenkingdoms.local",'
     '"SEVENKINGDOMS":"sevenkingdoms.local",'
@@ -45,6 +49,18 @@ DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
 )
 DEFAULT_PURPOSE_RANGE_NETBIOS_MAP = '{"RANGE":"range.local"}'
 DEFAULT_REPLICATION_PURPOSE_RANGE_NETBIOS_MAP = '{"REPLICATION":"replication.local"}'
+
+
+def _load_run_as_resolver():
+    spec = importlib.util.spec_from_file_location("sage_operator_run_as_resolver", RUN_AS_RESOLVER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load run-as resolver: {RUN_AS_RESOLVER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_RUN_AS_RESOLVER = _load_run_as_resolver()
 
 
 def _active_laps_contract():
@@ -766,26 +782,10 @@ def _available_snapshots(
 
 
 def _resolve_password_source(password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV) -> str | None:
-    if os.environ.get(password_env):
-        return os.environ[password_env]
-    candidates = [
-        os.environ.get("SAGE_RUNAS_FILE"),
-        str(Path.home() / ".config" / "sage" / "runas.env"),
-        str(PAYLOAD / ".env"),
-        os.environ.get("MYTHIC_ENV_PATH") or "",
-    ]
-    for value in candidates:
-        path = Path(value).expanduser() if value else None
-        if not path or not path.is_file():
-            continue
-        for line in path.read_text(errors="replace").splitlines():
-            stripped = line.strip()
-            if not stripped.startswith(f"{password_env}="):
-                continue
-            value = stripped.split("=", 1)[1].strip().strip("'\"")
-            if value:
-                return value
-    return None
+    return _RUN_AS_RESOLVER.resolve_run_as_password(
+        password_env,
+        include_interactive_compatibility=True,
+    )
 
 
 def validate_reset_inputs(
@@ -817,7 +817,7 @@ def validate_reset_inputs(
     if not _resolve_password_source(foothold.password_env):
         raise SystemExit(
             f"ABORT: no durable {foothold.password_env} source for {foothold.label()}; set the "
-            "environment variable or add it to Payload_Type/sage/.env or ~/.config/sage/runas.env "
+            f"environment variable or add it to {_RUN_AS_RESOLVER.CANONICAL_SKILL_ENV_DISPLAY} "
             "before resetting."
         )
 
