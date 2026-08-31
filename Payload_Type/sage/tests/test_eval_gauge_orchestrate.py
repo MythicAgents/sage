@@ -1671,7 +1671,8 @@ def test_gate1p_main_resumes_only_the_unstarted_naive_arm(monkeypatch, tmp_path)
     events = []
 
     monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
-    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setenv("API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setenv("API_KEY", "same-secret")
     monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -1710,7 +1711,8 @@ def test_gate1p_main_passes_the_same_budget_to_both_arms(monkeypatch, tmp_path):
     events = []
 
     monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
-    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setenv("API_ENDPOINT", "https://provider.invalid/v1")
+    monkeypatch.setenv("API_KEY", "same-secret")
     monkeypatch.setattr(orchestrate, "validate_gate1p_storage", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrate, "_gate1p_results_path", lambda _route_env=None: results)
@@ -1723,7 +1725,13 @@ def test_gate1p_main_passes_the_same_budget_to_both_arms(monkeypatch, tmp_path):
         orchestrate,
         "run_side_with_gate1p_cleanup",
         lambda _scenario, side, **kwargs: events.append(
-            (side, kwargs["arm_index"], kwargs["model_token_budget"])
+            (
+                side,
+                kwargs["arm_index"],
+                kwargs["model_token_budget"],
+                kwargs["route_env"]["API_ENDPOINT"],
+                kwargs["route_env"]["API_KEY"],
+            )
         ),
     )
     monkeypatch.setattr(
@@ -1744,8 +1752,14 @@ def test_gate1p_main_passes_the_same_budget_to_both_arms(monkeypatch, tmp_path):
     ]) == 0
 
     assert events == [
-        ("harness", 0, protocol.TOKEN_ADMISSION_CEILING),
-        ("bare", 1, protocol.TOKEN_ADMISSION_CEILING),
+        (
+            "harness", 0, protocol.TOKEN_ADMISSION_CEILING,
+            "https://provider.invalid/v1", "same-secret",
+        ),
+        (
+            "bare", 1, protocol.TOKEN_ADMISSION_CEILING,
+            "https://provider.invalid/v1", "same-secret",
+        ),
         ("compare", results),
     ]
 
@@ -1757,7 +1771,7 @@ def test_gate1p_compare_receives_the_exact_private_results_path(monkeypatch, tmp
     unrelated_default.parent.mkdir()
     unrelated_default.write_text('{"wrong": "ledger"}\n', encoding="utf-8")
     monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(unrelated_default))
-    monkeypatch.delenv("SAGE_EVAL_API_KEY", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
     observed = {}
 
     def fake_run(name, argv, cwd, timeout, env=None):
@@ -1772,7 +1786,7 @@ def test_gate1p_compare_receives_the_exact_private_results_path(monkeypatch, tmp
 
     assert observed["argv"][-2:] == ["--pair-id", protocol.PAIR_ID]
     assert observed["env"]["SAGE_EVAL_RESULTS_PATH"] == str(selected)
-    assert observed["env"].get("SAGE_EVAL_API_KEY") is None
+    assert observed["env"].get("API_KEY") is None
     assert observed["env"]["SAGE_EVAL_RESULTS_PATH"] != str(unrelated_default)
 
 
@@ -2046,8 +2060,8 @@ def test_run_side_preflight_authenticates_exact_model_route_before_reset(monkeyp
     monkeypatch.setattr(orchestrate, "_run", fake_run)
     monkeypatch.setattr(orchestrate, "full_reset_and_ready", lambda **_kwargs: (None, 7))
     route_env = {
-        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
-        "SAGE_EVAL_API_KEY": "secret",
+        "API_ENDPOINT": "https://provider.invalid/v1",
+        "API_KEY": "secret",
     }
 
     orchestrate.run_side(
@@ -2066,8 +2080,8 @@ def test_run_side_preflight_authenticates_exact_model_route_before_reset(monkeyp
     assert argv[argv.index("--provider") + 1] == "openai"
     assert argv[argv.index("--model") + 1] == "exact-model"
     assert argv[argv.index("--max-output-tokens") + 1] == "8192"
-    assert env["SAGE_EVAL_API_ENDPOINT"] == route_env["SAGE_EVAL_API_ENDPOINT"]
-    assert env["SAGE_EVAL_API_KEY"] == route_env["SAGE_EVAL_API_KEY"]
+    assert env["API_ENDPOINT"] == route_env["API_ENDPOINT"]
+    assert env["API_KEY"] == route_env["API_KEY"]
 
 
 def test_gate1p_diagnostic_cli_requires_explicit_bloodhound_dir():
@@ -2135,7 +2149,7 @@ def test_gate1p_pair_dry_run_prints_exact_two_arm_plan_without_live_authority(tm
     env = {
         **os.environ,
         "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
-        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+        "API_ENDPOINT": "https://provider.invalid/v1",
     }
     result = subprocess.run(
         [
@@ -2179,7 +2193,7 @@ def test_gate1p_pair_live_cli_refuses_without_exact_pair024_authority(tmp_path):
     env = {
         **os.environ,
         "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
-        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+        "API_ENDPOINT": "https://provider.invalid/v1",
     }
     result = subprocess.run(
         [
@@ -2218,7 +2232,7 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
             str(SCRIPT),
             "--scenario", "child-control",
             "--gate1p-control-floor-canary",
-            "--live-authority-id", "gate1p-control-floor-canary-allocation-001",
+            "--live-authority-id", "gate1p-control-floor-canary-allocation-002",
         ],
         cwd=ROOT,
         env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
@@ -2228,7 +2242,7 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
     )
 
     assert '"pair_allocated": true' in result.stdout
-    assert '"allocation_id": "gate1p-control-floor-canary-allocation-001"' in result.stdout
+    assert '"allocation_id": "gate1p-control-floor-canary-allocation-002"' in result.stdout
     assert '"shipping_sage": 1000000' in result.stdout
     assert '"true_naive": 1000000' in result.stdout
     assert '"per_request_context_limit": 200000' in result.stdout
@@ -2236,13 +2250,13 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
     assert "side=harness" in result.stdout
     assert "side=bare" in result.stdout
     assert result.stdout.count("wipe --yes") == 2
-    assert "gate1p-control-floor/gate1p-control-floor-canary-v1/gate1p-control-floor-canary-pair-001" in result.stdout
-    assert result.stdout.count("--live-authority-id gate1p-control-floor-canary-allocation-001") == 2
+    assert "gate1p-control-floor/gate1p-control-floor-canary-v2/gate1p-control-floor-canary-pair-002" in result.stdout
+    assert result.stdout.count("--live-authority-id gate1p-control-floor-canary-allocation-002") == 2
     assert "run_gauge_live.py compare" not in result.stdout
     assert "control-floor dual-endpoint pair disposition" in result.stdout
 
 
-@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-terminal"))
+@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-001"))
 def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_discovery(authority):
     authority_args = [] if authority is None else ["--live-authority-id", authority]
     result = subprocess.run(
@@ -2264,7 +2278,7 @@ def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_d
     assert result.returncode == 2
     assert (
         "live control-floor execution requires separate --live-authority-id "
-        "gate1p-control-floor-canary-allocation-001"
+        "gate1p-control-floor-canary-allocation-002"
     ) in result.stderr
     assert "rollback " not in result.stdout
     assert "bootstrap_payloads.py" not in result.stdout
@@ -2273,6 +2287,13 @@ def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_d
 def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatch, tmp_path):
     control_floor = orchestrate._gate1p_control_floor_protocol()
     historical = tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement" / "gate1p-stagea"
+    retained_v1 = (
+        tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / "gate1p-control-floor" / "gate1p-control-floor-canary-v1"
+        / "gate1p-control-floor-canary-pair-001" / "pair-control.json"
+    )
+    retained_v1.parent.mkdir(parents=True)
+    retained_v1.write_text("retained-v1-bytes", encoding="utf-8")
     monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
 
     pair_env = orchestrate._control_floor_pair_env(
@@ -2280,7 +2301,7 @@ def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatc
         {
             "SAGE_EVAL_ARTIFACT_DIR": str(historical),
             "SAGE_EVAL_RESULTS_PATH": str(historical / "results.jsonl"),
-            "SAGE_EVAL_API_ENDPOINT": "https://model.invalid/v1",
+            "API_ENDPOINT": "https://model.invalid/v1",
         },
     )
     expected = (
@@ -2290,8 +2311,9 @@ def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatc
 
     assert Path(pair_env["SAGE_EVAL_ARTIFACT_DIR"]) == expected
     assert Path(pair_env["SAGE_EVAL_RESULTS_PATH"]) == expected / "results.jsonl"
-    assert pair_env["SAGE_EVAL_API_ENDPOINT"] == "https://model.invalid/v1"
+    assert pair_env["API_ENDPOINT"] == "https://model.invalid/v1"
     assert not historical.exists()
+    assert retained_v1.read_text(encoding="utf-8") == "retained-v1-bytes"
 
 
 def test_control_floor_pair_control_uses_control_floor_schema_and_namespace(monkeypatch, tmp_path):
@@ -2437,7 +2459,7 @@ def test_control_floor_main_exact_authority_dispatches_once_without_external_act
     bloodhound.mkdir()
     calls = []
     monkeypatch.setattr(orchestrate, "BH", str(bloodhound))
-    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://model.invalid/v1")
+    monkeypatch.setenv("API_ENDPOINT", "https://model.invalid/v1")
     monkeypatch.setattr(orchestrate, "validate_reset_inputs", lambda *_args: None)
     monkeypatch.setattr(
         orchestrate,
@@ -2500,7 +2522,7 @@ def test_gate1p_pair_rejects_snapshot_or_foothold_drift_before_live_contact(tmp_
     env = {
         **os.environ,
         "SAGE_BLOODHOUND_MCP_DIR": str(bloodhound_dir),
-        "SAGE_EVAL_API_ENDPOINT": "https://provider.invalid/v1",
+        "API_ENDPOINT": "https://provider.invalid/v1",
     }
     common = [
         str(PY),
@@ -2853,12 +2875,12 @@ def test_purpose_range_gpo_dc_scope_late_blocker_forces_terminal_certificate_aut
     assert blocker["probe"]["account"] == "administrator"
 
 
-def test_treatment_route_rejects_loopback_proxy(tmp_path):
+def test_treatment_route_rejects_loopback_proxy(monkeypatch, tmp_path):
+    monkeypatch.setenv("API_ENDPOINT", "http://127.0.0.1:8100/v1")
+    monkeypatch.setenv("API_KEY", "sage-secret")
     route = tmp_path / ".env.local"
     route.write_text(
         "SAGE_EVAL_PROVIDER=openai\n"
-        "SAGE_EVAL_API_ENDPOINT=http://127.0.0.1:8100/v1\n"
-        "SAGE_EVAL_API_KEY=secret\n"
         "SAGE_EVAL_SONNET_MODEL=sonnet\n"
     )
 
@@ -2866,12 +2888,16 @@ def test_treatment_route_rejects_loopback_proxy(tmp_path):
         orchestrate.load_treatment_route(route, "sonnet")
 
 
-def test_treatment_route_loads_selected_model_without_exposing_secret(tmp_path):
+def test_treatment_route_uses_sage_endpoint_and_key_over_stale_eval_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("API_ENDPOINT", "https://sage-route.example/v1")
+    monkeypatch.setenv("API_KEY", "sage-secret")
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
     route = tmp_path / ".env.local"
     route.write_text(
         "SAGE_EVAL_PROVIDER=openai\n"
-        "SAGE_EVAL_API_ENDPOINT=https://bedrock-proxy.example/v1\n"
-        "SAGE_EVAL_API_KEY=secret\n"
+        "SAGE_EVAL_API_ENDPOINT=https://also-stale.invalid/v1\n"
+        "SAGE_EVAL_API_KEY=also-stale-secret\n"
         "SAGE_EVAL_SONNET_MODEL=sonnet\n"
         "SAGE_EVAL_HAIKU_MODEL=haiku\n"
     )
@@ -2881,6 +2907,63 @@ def test_treatment_route_loads_selected_model_without_exposing_secret(tmp_path):
     assert loaded == {
         "provider": "openai",
         "model": "haiku",
-        "api_endpoint": "https://bedrock-proxy.example/v1",
-        "api_key": "secret",
+        "api_endpoint": "https://sage-route.example/v1",
+        "api_key": "sage-secret",
     }
+
+
+def test_treatment_route_rejects_legacy_eval_credentials_without_sage_route(monkeypatch, tmp_path):
+    monkeypatch.delenv("API_ENDPOINT", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
+    route = tmp_path / ".env.local"
+    route.write_text(
+        "SAGE_EVAL_PROVIDER=openai\n"
+        "SAGE_EVAL_SONNET_MODEL=sonnet\n"
+    )
+
+    with pytest.raises(SystemExit, match="API_ENDPOINT, API_KEY"):
+        orchestrate.load_treatment_route(route, "sonnet")
+
+
+def test_orchestrator_loads_sage_dotenv_with_local_precedence(monkeypatch, tmp_path):
+    (tmp_path / ".env.local").write_text(
+        "API_ENDPOINT=https://local.example/v1\nAPI_KEY=local-secret\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "API_ENDPOINT=https://tracked.example/v1\nAPI_KEY=tracked-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrate, "PAYLOAD", tmp_path)
+    monkeypatch.delenv("API_ENDPOINT", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    resolved = orchestrate._load_sage_model_environment()
+
+    assert resolved == {
+        "API_ENDPOINT": "https://local.example/v1",
+        "API_KEY": "local-secret",
+    }
+    assert "API_ENDPOINT" not in orchestrate.os.environ
+    assert "API_KEY" not in orchestrate.os.environ
+
+
+def test_orchestrator_preserves_explicit_sage_route_over_dotenv(monkeypatch, tmp_path):
+    (tmp_path / ".env.local").write_text(
+        "API_ENDPOINT=https://file.example/v1\nAPI_KEY=file-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrate, "PAYLOAD", tmp_path)
+    monkeypatch.setenv("API_ENDPOINT", "https://explicit.example/v1")
+    monkeypatch.setenv("API_KEY", "explicit-secret")
+
+    resolved = orchestrate._load_sage_model_environment()
+
+    assert resolved == {
+        "API_ENDPOINT": "https://explicit.example/v1",
+        "API_KEY": "explicit-secret",
+    }
+    assert orchestrate.os.environ["API_ENDPOINT"] == "https://explicit.example/v1"
+    assert orchestrate.os.environ["API_KEY"] == "explicit-secret"

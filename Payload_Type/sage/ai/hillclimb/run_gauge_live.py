@@ -1665,6 +1665,18 @@ def compare(cfg: Config, scenario_name: str) -> None:
 
 
 def main(argv=None) -> int:
+    from dotenv_bootstrap import load_sage_dotenv
+
+    applied = load_sage_dotenv(str(Path(__file__).resolve().parents[2]))
+    try:
+        sage_model_environment = {
+            key: value
+            for key in ("API_ENDPOINT", "API_KEY")
+            if (value := str(os.environ.get(key) or "").strip())
+        }
+    finally:
+        for key in applied:
+            os.environ.pop(key, None)
     ap = argparse.ArgumentParser(description="Live bare-vs-harness gauge (GOAD). Reset before EVERY --go run.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run ONE side on ONE scenario (range must be freshly reset)")
@@ -1722,8 +1734,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = Config()
-    cfg.model_api_endpoint = os.environ.get("SAGE_EVAL_API_ENDPOINT") or None
-    cfg.model_api_key = os.environ.get("SAGE_EVAL_API_KEY") or None
+    cfg.model_api_endpoint = sage_model_environment.get("API_ENDPOINT") or None
+    cfg.model_api_key = sage_model_environment.get("API_KEY") or None
     if getattr(args, "provider", None):
         cfg.model_provider = args.provider
     if getattr(args, "model", None):

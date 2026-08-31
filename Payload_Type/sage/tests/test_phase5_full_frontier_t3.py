@@ -204,6 +204,50 @@ def test_phase5_t3_invoker_reuses_existing_sage_ca_bundle_without_overriding_exp
     ) == "/operator/explicit.pem"
 
 
+def test_phase5_treatments_use_sage_route_over_stale_eval_credentials(monkeypatch, tmp_path):
+    import dotenv_bootstrap
+
+    monkeypatch.setattr(dotenv_bootstrap, "load_sage_dotenv", lambda _directory: [])
+    monkeypatch.setenv("API_ENDPOINT", "https://sage-route.example/v1")
+    monkeypatch.setenv("API_KEY", "sage-secret")
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
+    route = tmp_path / ".env.local"
+    route.write_text(
+        "SAGE_EVAL_PROVIDER=openai\n"
+        "SAGE_EVAL_API_ENDPOINT=https://also-stale.invalid/v1\n"
+        "SAGE_EVAL_API_KEY=also-stale-secret\n"
+        f"SAGE_EVAL_HAIKU_MODEL={full_frontier_t3.REQUIRED_WEAK_MODEL}\n"
+        f"SAGE_EVAL_SONNET_MODEL={full_frontier_t3.REQUIRED_STRONG_MODEL}\n",
+        encoding="utf-8",
+    )
+
+    treatments = full_frontier_t3.load_default_treatments(route)
+
+    assert {treatment.base_url for treatment in treatments} == {"https://sage-route.example/v1"}
+    assert {treatment.api_key for treatment in treatments} == {"sage-secret"}
+
+
+def test_phase5_treatments_reject_legacy_eval_credentials_without_sage_route(monkeypatch, tmp_path):
+    import dotenv_bootstrap
+
+    monkeypatch.setattr(dotenv_bootstrap, "load_sage_dotenv", lambda _directory: [])
+    monkeypatch.delenv("API_ENDPOINT", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
+    route = tmp_path / ".env.local"
+    route.write_text(
+        "SAGE_EVAL_PROVIDER=openai\n"
+        f"SAGE_EVAL_HAIKU_MODEL={full_frontier_t3.REQUIRED_WEAK_MODEL}\n"
+        f"SAGE_EVAL_SONNET_MODEL={full_frontier_t3.REQUIRED_STRONG_MODEL}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(full_frontier_t3.Phase5EvaluationError, match="API_ENDPOINT, API_KEY"):
+        full_frontier_t3.load_default_treatments(route)
+
+
 @pytest.mark.pinned_policy_rows
 def test_phase5_cli_emits_offline_negative_verdict_without_model_calls():
     result = subprocess.run(

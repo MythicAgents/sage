@@ -1372,19 +1372,36 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def load_default_treatments(path: str | Path | None = None) -> list[ModelTreatment]:
+    from dotenv_bootstrap import load_sage_dotenv
+
+    applied = load_sage_dotenv(str(Path(__file__).resolve().parents[2]))
+    try:
+        sage_model_environment = {
+            key: value
+            for key in ("API_ENDPOINT", "API_KEY")
+            if (value := str(os.environ.get(key) or "").strip())
+        }
+    finally:
+        for key in applied:
+            os.environ.pop(key, None)
     route_path = Path(path) if path is not None else DEFAULT_ROUTE_ENV_PATH
     values = _parse_env_file(route_path)
     required = (
         "SAGE_EVAL_PROVIDER",
-        "SAGE_EVAL_API_ENDPOINT",
-        "SAGE_EVAL_API_KEY",
         "SAGE_EVAL_HAIKU_MODEL",
         "SAGE_EVAL_SONNET_MODEL",
+        "API_ENDPOINT",
+        "API_KEY",
     )
-    missing = [key for key in required if not values.get(key)]
+    route_values = {
+        **values,
+        "API_ENDPOINT": sage_model_environment.get("API_ENDPOINT"),
+        "API_KEY": sage_model_environment.get("API_KEY"),
+    }
+    missing = [key for key in required if not route_values.get(key)]
     if missing:
-        raise Phase5EvaluationError(f"evaluation route file is missing values for: {', '.join(missing)}")
-    endpoint = values["SAGE_EVAL_API_ENDPOINT"]
+        raise Phase5EvaluationError(f"evaluation model route is missing values for: {', '.join(missing)}")
+    endpoint = str(route_values["API_ENDPOINT"])
     host = (urlparse(endpoint).hostname or "").strip().casefold()
     if host in {"127.0.0.1", "localhost", "::1"}:
         raise Phase5EvaluationError(
@@ -1399,7 +1416,7 @@ def load_default_treatments(path: str | Path | None = None) -> list[ModelTreatme
         )
     common = {
         "provider": values["SAGE_EVAL_PROVIDER"].strip().casefold(),
-        "api_key": values["SAGE_EVAL_API_KEY"],
+        "api_key": str(route_values["API_KEY"]),
         "base_url": endpoint,
         "temperature": 0.0,
     }

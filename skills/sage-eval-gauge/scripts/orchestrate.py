@@ -63,6 +63,24 @@ def _load_run_as_resolver():
 _RUN_AS_RESOLVER = _load_run_as_resolver()
 
 
+def _load_sage_model_environment() -> dict[str, str]:
+    """Resolve Sage's endpoint/key precedence without mutating the caller environment."""
+    if str(PAYLOAD) not in sys.path:
+        sys.path.insert(0, str(PAYLOAD))
+    from dotenv_bootstrap import load_sage_dotenv
+
+    applied = load_sage_dotenv(str(PAYLOAD))
+    try:
+        return {
+            key: value
+            for key in ("API_ENDPOINT", "API_KEY")
+            if (value := str(os.environ.get(key) or "").strip())
+        }
+    finally:
+        for key in applied:
+            os.environ.pop(key, None)
+
+
 def _active_laps_contract():
     sys.path.insert(0, str(PAYLOAD))
     from ai.hillclimb import laps_family_transfer_holdout as laps_contract  # type: ignore
@@ -822,7 +840,11 @@ def validate_reset_inputs(
         )
 
 
-def load_treatment_route(path: Path, treatment: str) -> dict[str, str]:
+def load_treatment_route(
+    path: Path,
+    treatment: str,
+    model_environment: dict[str, str] | None = None,
+) -> dict[str, str]:
     if not path.is_file():
         raise SystemExit(f"ABORT: evaluation route file missing: {path}")
     values: dict[str, str] = {}
@@ -838,14 +860,19 @@ def load_treatment_route(path: Path, treatment: str) -> dict[str, str]:
     }[treatment]
     required = (
         "SAGE_EVAL_PROVIDER",
-        "SAGE_EVAL_API_ENDPOINT",
-        "SAGE_EVAL_API_KEY",
         model_key,
+        "API_ENDPOINT",
+        "API_KEY",
     )
-    missing = [key for key in required if not values.get(key)]
+    route_values = {
+        **values,
+        "API_ENDPOINT": (model_environment or os.environ).get("API_ENDPOINT"),
+        "API_KEY": (model_environment or os.environ).get("API_KEY"),
+    }
+    missing = [key for key in required if not route_values.get(key)]
     if missing:
-        raise SystemExit(f"ABORT: evaluation route file is missing values for: {', '.join(missing)}")
-    endpoint = values["SAGE_EVAL_API_ENDPOINT"]
+        raise SystemExit(f"ABORT: evaluation model route is missing values for: {', '.join(missing)}")
+    endpoint = str(route_values["API_ENDPOINT"])
     host = (urlparse(endpoint).hostname or "").strip().casefold()
     if host in {"127.0.0.1", "localhost", "::1"}:
         raise SystemExit(
@@ -856,7 +883,7 @@ def load_treatment_route(path: Path, treatment: str) -> dict[str, str]:
         "provider": values["SAGE_EVAL_PROVIDER"].strip().lower(),
         "model": values[model_key],
         "api_endpoint": endpoint,
-        "api_key": values["SAGE_EVAL_API_KEY"],
+        "api_key": str(route_values["API_KEY"]),
     }
 
 
@@ -2342,6 +2369,7 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
 
 
 def main(argv=None) -> int:
+    sage_model_environment = _load_sage_model_environment()
     ap = argparse.ArgumentParser(description="Bare-vs-harness gauge orchestrator (resets the lab per run).")
     ap.add_argument("--scenario", required=True)
     ap.add_argument("--side", choices=["harness", "bare"], default=None,
@@ -2600,8 +2628,8 @@ def main(argv=None) -> int:
                 ap.error("--max-output-tokens cannot exceed --model-context-limit")
             if not BH or not Path(BH).is_dir():
                 ap.error("SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the control-floor canary")
-            if not str(os.environ.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
-                ap.error("SAGE_EVAL_API_ENDPOINT is required for exact control-floor route parity")
+            if not str(sage_model_environment.get("API_ENDPOINT") or "").strip():
+                ap.error("API_ENDPOINT is required for exact control-floor route parity")
     if args.gate1p_stage_b_protocol:
         if args.scenario != stageb.SCENARIO or args.side is not None or args.seeds != 1:
             ap.error(
@@ -2639,16 +2667,20 @@ def main(argv=None) -> int:
                 ap.error("--max-output-tokens cannot exceed --model-context-limit")
             if not BH or not Path(BH).is_dir():
                 ap.error("SAGE_BLOODHOUND_MCP_DIR must name an existing directory for Stage B")
-            if not str(os.environ.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
-                ap.error("SAGE_EVAL_API_ENDPOINT is required for exact Stage B route parity")
-    route_env = None
+            if not str(sage_model_environment.get("API_ENDPOINT") or "").strip():
+                ap.error("API_ENDPOINT is required for exact Stage B route parity")
+    route_env = sage_model_environment
     if args.treatment:
-        route = load_treatment_route(args.route_env, args.treatment)
+        route = load_treatment_route(
+            args.route_env,
+            args.treatment,
+            model_environment=sage_model_environment,
+        )
         args.provider = route["provider"]
         args.model = route["model"]
         route_env = {
-            "SAGE_EVAL_API_ENDPOINT": route["api_endpoint"],
-            "SAGE_EVAL_API_KEY": route["api_key"],
+            "API_ENDPOINT": route["api_endpoint"],
+            "API_KEY": route["api_key"],
         }
     gate1p = _gate1p_stagea_protocol()
     if args.gate1p_stage_a_pair:
@@ -2690,8 +2722,8 @@ def main(argv=None) -> int:
                 "SAGE_BLOODHOUND_MCP_DIR must name an existing directory for the Stage A pair"
             )
         effective_route_env = route_env or os.environ
-        if not str(effective_route_env.get("SAGE_EVAL_API_ENDPOINT") or "").strip():
-            ap.error("SAGE_EVAL_API_ENDPOINT is required for exact Stage A route parity")
+        if not str(effective_route_env.get("API_ENDPOINT") or "").strip():
+            ap.error("API_ENDPOINT is required for exact Stage A route parity")
         if args.go and not gate1p.PAIR_ALLOCATED:
             ap.error("the Gate 1P successor pair is not allocated for live execution")
         if args.go and args.live_authority_id != gate1p.PAIR_ID:

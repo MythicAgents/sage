@@ -44,6 +44,58 @@ def test_gate1p_exact_child_command_parses_help_without_pythonpath():
     assert "usage: run_gauge_live.py" in result.stdout
 
 
+def test_live_driver_uses_sage_route_over_stale_eval_credentials(monkeypatch):
+    import dotenv_bootstrap
+
+    seen = {}
+    monkeypatch.setattr(dotenv_bootstrap, "load_sage_dotenv", lambda _directory: [])
+    monkeypatch.setenv("API_ENDPOINT", "https://sage-route.example/v1")
+    monkeypatch.setenv("API_KEY", "sage-secret")
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
+    monkeypatch.setattr(
+        rgl,
+        "compare",
+        lambda cfg, scenario: seen.update(cfg=cfg, scenario=scenario),
+    )
+
+    assert rgl.main(["compare", "--scenario", "child-da"]) == 0
+
+    assert seen["cfg"].model_api_endpoint == "https://sage-route.example/v1"
+    assert seen["cfg"].model_api_key == "sage-secret"
+
+
+def test_live_driver_rejects_legacy_eval_credentials_without_sage_route(monkeypatch):
+    import dotenv_bootstrap
+
+    monkeypatch.setattr(dotenv_bootstrap, "load_sage_dotenv", lambda _directory: [])
+    monkeypatch.delenv("API_ENDPOINT", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
+    monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
+    monkeypatch.setattr(
+        rgl,
+        "scenario_preconditions",
+        lambda cfg, _scenario: [
+            (
+                "llm-endpoint-authenticated",
+                "smoke",
+                lambda: (
+                    bool(cfg.model_api_endpoint and cfg.model_api_key),
+                    "route complete" if cfg.model_api_endpoint and cfg.model_api_key else "route incomplete",
+                ),
+            )
+        ],
+    )
+
+    assert rgl.main([
+        "preflight",
+        "--scenario", "child-domain-control",
+        "--provider", "openai",
+        "--model", "exact-model",
+    ]) == 2
+
+
 def test_build_bare_runner_injects_hidden_collection_adapter_without_exposing_file_upload(monkeypatch):
     captured = {}
     upload_tool = object()
