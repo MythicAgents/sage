@@ -777,10 +777,35 @@ def query_user_sessions(session: Any) -> dict[str, Any]:
     return {"output": output, "status_code": result.get("status_code")}
 
 
+def classify_user_session_query(result: dict[str, Any]) -> str:
+    """Classify a quser result without treating enumeration failure as an empty census."""
+    status_code = result.get("status_code")
+    output = str(result.get("output") or "")
+    if status_code == 0:
+        return "ok"
+    if status_code == 1 and "no user exists for" in output.casefold():
+        return "empty"
+    return "error"
+
+
 def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
     """Log off only sessions owned by username and report the before/after rows."""
     before = query_user_sessions(session)
+    before_state = classify_user_session_query(before)
+    if before_state == "empty":
+        raise DeployError(
+            f"No Windows user sessions are available yet; expected a session owned by {username!r}."
+        )
+    if before_state != "ok":
+        raise DeployError(
+            f"Could not enumerate Windows sessions before logoff for {username!r} "
+            f"(status {before.get('status_code')!r})."
+        )
     matches = find_user_sessions(before.get("output", ""), username)
+    if not matches:
+        raise DeployError(
+            f"No session owned by {username!r} was found; refusing to report cleanup success."
+        )
     logged_off: list[dict[str, str]] = []
     for match in matches:
         session_id = match["session_id"]
@@ -790,6 +815,12 @@ def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
         )
         logged_off.append(match)
     after = query_user_sessions(session)
+    after_state = classify_user_session_query(after)
+    if after_state not in {"ok", "empty"}:
+        raise DeployError(
+            f"Could not verify Windows sessions after logoff for {username!r} "
+            f"(status {after.get('status_code')!r})."
+        )
     remaining = find_user_sessions(after.get("output", ""), username)
     if remaining:
         raise DeployError(
@@ -800,6 +831,8 @@ def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
         "username": username,
         "logged_off": logged_off,
         "remaining": remaining,
+        "before_state": before_state,
+        "after_state": after_state,
     }
 
 

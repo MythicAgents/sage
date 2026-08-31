@@ -96,6 +96,182 @@ def test_logoff_user_sessions_only_logs_off_named_user(monkeypatch):
     assert "4" not in scripts[0]
 
 
+def test_logoff_user_sessions_rejects_empty_initial_enumeration(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": "quser : No User exists for *",
+            "status_code": 1,
+        },
+    )
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script),
+    )
+
+    with pytest.raises(deploy.DeployError, match="No Windows user sessions are available yet"):
+        deploy.logoff_user_sessions(object(), "localuser")
+
+    assert scripts == []
+
+
+def test_logoff_user_sessions_rejects_initial_enumeration_error(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": "Access is denied.",
+            "status_code": 1,
+        },
+    )
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script),
+    )
+
+    with pytest.raises(deploy.DeployError, match="Could not enumerate Windows sessions before logoff"):
+        deploy.logoff_user_sessions(object(), "localuser")
+
+    assert scripts == []
+
+
+def test_logoff_user_sessions_rejects_zero_match_without_touching_other_users(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": " robb.stark            rdp-tcp#1           3  Active          .  now\r\n",
+            "status_code": 0,
+        },
+    )
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script),
+    )
+
+    with pytest.raises(deploy.DeployError, match="No session owned by 'localuser' was found"):
+        deploy.logoff_user_sessions(object(), "localuser")
+
+    assert scripts == []
+
+
+def test_logoff_user_sessions_accepts_verified_empty_after_exact_logoff(monkeypatch):
+    outputs = iter([
+        {
+            "output": " localuser             console             1  Active      none   now\r\n",
+            "status_code": 0,
+        },
+        {
+            "output": "quser : No User exists for *",
+            "status_code": 1,
+        },
+    ])
+    scripts = []
+    monkeypatch.setattr(deploy, "query_user_sessions", lambda session: next(outputs))
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script) or {
+            "status_code": 0,
+            "stdout": "",
+            "stderr": "",
+        },
+    )
+
+    result = deploy.logoff_user_sessions(object(), "localuser")
+
+    assert [row["session_id"] for row in result["logged_off"]] == ["1"]
+    assert result["remaining"] == []
+    assert len(scripts) == 1
+
+
+def test_logoff_user_sessions_rejects_named_user_remaining_after_logoff(monkeypatch):
+    row = " localuser             console             1  Active      none   now\r\n"
+    outputs = iter([
+        {"output": row, "status_code": 0},
+        {"output": row, "status_code": 0},
+    ])
+    scripts = []
+    monkeypatch.setattr(deploy, "query_user_sessions", lambda session: next(outputs))
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script) or {
+            "status_code": 0,
+            "stdout": "",
+            "stderr": "",
+        },
+    )
+
+    with pytest.raises(deploy.DeployError, match="Sessions for 'localuser' remain after logoff"):
+        deploy.logoff_user_sessions(object(), "localuser")
+
+    assert len(scripts) == 1
+
+
+def test_logoff_user_sessions_rejects_unverifiable_after_enumeration(monkeypatch):
+    outputs = iter([
+        {
+            "output": " localuser             console             1  Active      none   now\r\n",
+            "status_code": 0,
+        },
+        {
+            "output": "Access is denied.",
+            "status_code": 1,
+        },
+    ])
+    scripts = []
+    monkeypatch.setattr(deploy, "query_user_sessions", lambda session: next(outputs))
+    monkeypatch.setattr(
+        deploy,
+        "run_ps",
+        lambda session, script: scripts.append(script) or {
+            "status_code": 0,
+            "stdout": "",
+            "stderr": "",
+        },
+    )
+
+    with pytest.raises(deploy.DeployError, match="Could not verify Windows sessions after logoff"):
+        deploy.logoff_user_sessions(object(), "localuser")
+
+    assert len(scripts) == 1
+
+
+def test_logoff_user_cli_exits_nonzero_for_empty_initial_enumeration(monkeypatch, capsys):
+    monkeypatch.setattr(
+        deploy,
+        "select_ludus_host",
+        lambda args: {
+            "inventory_hostname": "TEST-SRV02",
+            "ansible_host": "192.0.2.22",
+        },
+    )
+    monkeypatch.setattr(deploy, "winrm_session", lambda *args: object())
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": "quser : No User exists for *",
+            "status_code": 1,
+        },
+    )
+
+    status = asyncio.run(deploy.async_main(["logoff-user", "--username", "localuser"]))
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert captured.out == ""
+    assert "No Windows user sessions are available yet" in captured.err
+
+
 def test_default_remote_filename_preserves_interactive_payload_name():
     assert deploy.default_remote_filename("apollo.exe", "scheduled-task-interactive") == "apollo.exe"
 
