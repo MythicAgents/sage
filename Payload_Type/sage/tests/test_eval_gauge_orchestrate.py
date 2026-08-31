@@ -2232,7 +2232,7 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
             str(SCRIPT),
             "--scenario", "child-control",
             "--gate1p-control-floor-canary",
-            "--live-authority-id", "gate1p-control-floor-canary-allocation-002",
+            "--live-authority-id", "gate1p-control-floor-canary-allocation-003",
         ],
         cwd=ROOT,
         env={"PATH": os.environ.get("PATH", ""), "LANG": "C.UTF-8"},
@@ -2242,7 +2242,7 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
     )
 
     assert '"pair_allocated": true' in result.stdout
-    assert '"allocation_id": "gate1p-control-floor-canary-allocation-002"' in result.stdout
+    assert '"allocation_id": "gate1p-control-floor-canary-allocation-003"' in result.stdout
     assert '"shipping_sage": 1000000' in result.stdout
     assert '"true_naive": 1000000' in result.stdout
     assert '"per_request_context_limit": 200000' in result.stdout
@@ -2250,13 +2250,20 @@ def test_control_floor_canary_dry_run_is_allocated_and_emits_exact_two_arm_plan(
     assert "side=harness" in result.stdout
     assert "side=bare" in result.stdout
     assert result.stdout.count("wipe --yes") == 2
-    assert "gate1p-control-floor/gate1p-control-floor-canary-v2/gate1p-control-floor-canary-pair-002" in result.stdout
-    assert result.stdout.count("--live-authority-id gate1p-control-floor-canary-allocation-002") == 2
+    assert "gate1p-control-floor/gate1p-control-floor-canary-v3/gate1p-control-floor-canary-pair-003" in result.stdout
+    assert result.stdout.count("--live-authority-id gate1p-control-floor-canary-allocation-003") == 2
     assert "run_gauge_live.py compare" not in result.stdout
     assert "control-floor dual-endpoint pair disposition" in result.stdout
 
 
-@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-001"))
+@pytest.mark.parametrize(
+    "authority",
+    (
+        None,
+        "gate1p-control-floor-canary-allocation-001",
+        "gate1p-control-floor-canary-allocation-002",
+    ),
+)
 def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_discovery(authority):
     authority_args = [] if authority is None else ["--live-authority-id", authority]
     result = subprocess.run(
@@ -2278,7 +2285,7 @@ def test_control_floor_canary_go_refuses_wrong_authority_before_reset_or_route_d
     assert result.returncode == 2
     assert (
         "live control-floor execution requires separate --live-authority-id "
-        "gate1p-control-floor-canary-allocation-002"
+        "gate1p-control-floor-canary-allocation-003"
     ) in result.stderr
     assert "rollback " not in result.stdout
     assert "bootstrap_payloads.py" not in result.stdout
@@ -2294,6 +2301,13 @@ def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatc
     )
     retained_v1.parent.mkdir(parents=True)
     retained_v1.write_text("retained-v1-bytes", encoding="utf-8")
+    retained_v2 = (
+        tmp_path / ".sage_history" / "evaluation" / "harness-self-improvement"
+        / "gate1p-control-floor" / "gate1p-control-floor-canary-v2"
+        / "gate1p-control-floor-canary-pair-002" / "pair-control.json"
+    )
+    retained_v2.parent.mkdir(parents=True)
+    retained_v2.write_text("retained-v2-bytes", encoding="utf-8")
     monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
 
     pair_env = orchestrate._control_floor_pair_env(
@@ -2314,6 +2328,7 @@ def test_control_floor_pair_env_ignores_historical_artifact_overrides(monkeypatc
     assert pair_env["API_ENDPOINT"] == "https://model.invalid/v1"
     assert not historical.exists()
     assert retained_v1.read_text(encoding="utf-8") == "retained-v1-bytes"
+    assert retained_v2.read_text(encoding="utf-8") == "retained-v2-bytes"
 
 
 def test_control_floor_pair_control_uses_control_floor_schema_and_namespace(monkeypatch, tmp_path):

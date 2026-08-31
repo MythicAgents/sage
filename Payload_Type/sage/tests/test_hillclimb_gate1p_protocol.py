@@ -100,7 +100,7 @@ def test_control_floor_contract_is_allocated_two_arm_dual_endpoint_and_budget_sy
     contract = protocol.assembled_contract()
 
     assert protocol.pair_allocated is True
-    assert protocol.allocation_id == "gate1p-control-floor-canary-allocation-002"
+    assert protocol.allocation_id == "gate1p-control-floor-canary-allocation-003"
     assert contract["arms"] == ["shipping_sage", "true_naive"]
     assert contract["arm_labels"]["true_naive"] == "same-model raw-tool/raw-history floor"
     assert "not a proxy for Codex, Claude Code" in contract["raw_arm_interpretation"]
@@ -693,7 +693,14 @@ def test_control_floor_runner_dry_path_reports_contract_without_external_action(
     assert "live paired-row execution requires" not in result.stderr
 
 
-@pytest.mark.parametrize("authority", (None, "gate1p-control-floor-canary-allocation-001"))
+@pytest.mark.parametrize(
+    "authority",
+    (
+        None,
+        "gate1p-control-floor-canary-allocation-001",
+        "gate1p-control-floor-canary-allocation-002",
+    ),
+)
 def test_control_floor_runner_go_refuses_wrong_authority_before_external_import_or_call(authority):
     authority_args = [] if authority is None else ["--live-authority-id", authority]
     result = subprocess.run(
@@ -712,7 +719,7 @@ def test_control_floor_runner_go_refuses_wrong_authority_before_external_import_
     assert result.returncode == 2
     assert (
         "live paired-row execution requires separate --live-authority-id "
-        "gate1p-control-floor-canary-allocation-002"
+        "gate1p-control-floor-canary-allocation-003"
     ) in result.stderr
 
 

@@ -12,10 +12,10 @@ except Exception:
 
 
 PROTOCOL_ID = "gate1p-control-floor-dual-endpoint-completed-call-budget-v1"
-MATRIX_ID = "gate1p-control-floor-canary-v2"
-PAIR_ID = "gate1p-control-floor-canary-pair-002"
+MATRIX_ID = "gate1p-control-floor-canary-v3"
+PAIR_ID = "gate1p-control-floor-canary-pair-003"
 PAIR_ALLOCATED = True
-ALLOCATION_ID = "gate1p-control-floor-canary-allocation-002"
+ALLOCATION_ID = "gate1p-control-floor-canary-allocation-003"
 PAIR_IDS = (PAIR_ID,)
 PRIMARY_PAIR_IDS = PAIR_IDS
 RESERVE_PAIR_IDS: tuple[str, ...] = ()
