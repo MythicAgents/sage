@@ -608,6 +608,12 @@ def _row_verdict_hash_matches(row_verdict: Mapping[str, Any]) -> bool:
     return dict(row_verdict) == replay
 
 
+def canonical_row_verdict_is_replay_valid(row_verdict: Mapping[str, Any]) -> bool:
+    """Return whether an exact canonical row verdict deterministically replays."""
+
+    return _row_verdict_hash_matches(row_verdict)
+
+
 def _promotion_row_passes(row_verdict: Mapping[str, Any]) -> bool:
     return bool(
         row_verdict.get("row_status") == "scored"

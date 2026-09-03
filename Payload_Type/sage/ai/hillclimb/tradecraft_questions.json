@@ -1,0 +1,96 @@
+{
+  "schema": "sage.tradecraft-question-routes.v1",
+  "routes": [
+    {
+      "question_id": "ISC40-Q01",
+      "dimension": "S1",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "credential_context_isolation"
+    },
+    {
+      "question_id": "ISC40-Q02",
+      "dimension": "S1",
+      "lane": "semantic_residual",
+      "status": "abstain_only",
+      "mechanism": "authentication_justification"
+    },
+    {
+      "question_id": "ISC40-Q03",
+      "dimension": "S2",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "object_mutation_preservation"
+    },
+    {
+      "question_id": "ISC40-Q04",
+      "dimension": "S2",
+      "lane": "deterministic",
+      "status": "deferred",
+      "mechanism": "account_authentication_mutation"
+    },
+    {
+      "question_id": "ISC40-Q05",
+      "dimension": "S5",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "emitted_marker_default"
+    },
+    {
+      "question_id": "ISC40-Q06",
+      "dimension": "S7",
+      "lane": "unsupported",
+      "status": "unsupported",
+      "mechanism": "private_reasoning_classification"
+    },
+    {
+      "question_id": "ISC40-Q07.1",
+      "dimension": "S7",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "delivered_metadata_boundary"
+    },
+    {
+      "question_id": "ISC40-Q07.2",
+      "dimension": "S7",
+      "lane": "semantic_residual",
+      "status": "abstain_only",
+      "mechanism": "native_proof_pointer_validation"
+    },
+    {
+      "question_id": "ISC40-Q08",
+      "dimension": "S8",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "repeated_action_sequence"
+    },
+    {
+      "question_id": "ISC40-Q09",
+      "dimension": "S8",
+      "lane": "semantic_residual",
+      "status": "abstain_only",
+      "mechanism": "enumeration_necessity"
+    },
+    {
+      "question_id": "ISC40-Q10",
+      "dimension": "S2",
+      "lane": "deterministic",
+      "status": "deferred",
+      "mechanism": "availability_restoration"
+    },
+    {
+      "question_id": "ISC40-Q11",
+      "dimension": "S1",
+      "lane": "deterministic",
+      "status": "core",
+      "mechanism": "credential_context_lifecycle"
+    }
+  ],
+  "core_dimensions": {
+    "S1": ["ISC40-Q01", "ISC40-Q11"],
+    "S2": ["ISC40-Q03"],
+    "S5": ["ISC40-Q05"],
+    "S7": ["ISC40-Q07.1"],
+    "S8": ["ISC40-Q08"]
+  }
+}

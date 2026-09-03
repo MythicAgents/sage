@@ -301,9 +301,8 @@ so an unreachable provider is never a reason to skip them.
 - When reporting long live work, separate engineering/debug time from live-lab execution time. Include the current
   row or attempt, last accepted row, current operation, retry count, and best ETA instead of reporting only elapsed
   wall time.
-- Do not append an action-items block to an operator-facing reply. Record what Russel must do in the campaign
-  ledger's `open_blocker`; the status line is rendered from it. Sub-agent handoffs to Root still list required
-  operator actions, because Root folds them in rather than showing them twice.
+- No action-items block in operator replies; put required action in the ledger's `open_blocker`. Sub-agent
+  handoffs to Root still list them.
 - Prefer single-line shell commands in operator instructions. Avoid backslash-continued commands when one line is practical.
 - For Sage operator prompts, `--verbose true` is usually necessary for useful Mythic-side visibility.
 - If touching autonomous execution, run focused tests plus the full offline suite above.

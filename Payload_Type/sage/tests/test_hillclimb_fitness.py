@@ -61,3 +61,7 @@ def test_verifier_hash_versions_the_gauge():
     assert h1 != h2 and h1.startswith("sha256:")
     # stable for the same version
     assert fitness.verifier_hash(None, "phase0-1") == h1
+
+
+def test_public_canonical_row_replay_validator_rejects_noncanonical_input():
+    assert fitness.canonical_row_verdict_is_replay_valid({}) is False
