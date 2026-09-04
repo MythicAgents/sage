@@ -25,6 +25,7 @@ import io
 import json
 import os
 import zipfile
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
 
 try:
@@ -41,6 +42,15 @@ except ImportError:  # direct module import in focused tests
     )
 
 BARE_TOOL_PROFILE = "naive-raw-mythic-bloodhound-v2"
+_MYTHIC_SDK_OVERRIDE: ContextVar[Any | None] = ContextVar("raw_mythic_sdk_override", default=None)
+
+
+def _mythic_sdk() -> Any:
+    override = _MYTHIC_SDK_OVERRIDE.get()
+    if override is not None:
+        return override
+    from mythic import mythic
+    return mythic
 
 _PAYLOAD_TYPES_QUERY = "query RawPayloadTypes { payloadtype { name } }"
 _CREDENTIALS_QUERY = (
@@ -294,26 +304,26 @@ commandparameters {
 
 async def _list_callbacks(client) -> str:
     """List all active Mythic callbacks (id, host, user, payload type) so the model can see/pivot."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.get_all_active_callbacks(client), default=str)
 
 
 async def _get_payload_types(client) -> str:
     """List the payload types installed on this Mythic (apollo, poseidon, merlin, ...)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     r = await mythic.execute_custom_query(client, _PAYLOAD_TYPES_QUERY)
     return json.dumps([p["name"] for p in (r.get("payloadtype") or [])])
 
 
 async def _get_payloads(client) -> str:
     """List the built/registered payloads in Mythic."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.get_all_payloads(client), default=str)
 
 
 async def _get_all_payload_info(client) -> str:
     """Return raw payload-type, supported-OS, and build-parameter metadata."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(
         await mythic.execute_custom_query(client, _PAYLOAD_INFO_QUERY),
         default=str,
@@ -323,7 +333,7 @@ async def _get_all_payload_info(client) -> str:
 
 async def _get_c2_profiles_for_payload(client, payload_type: str) -> str:
     """Return the raw C2 profile and parameter schemas available to one payload type."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(
         await mythic.execute_custom_query(
             client,
@@ -337,7 +347,7 @@ async def _get_c2_profiles_for_payload(client, payload_type: str) -> str:
 
 async def _get_callback_c2_config(client, callback_display_id: int) -> str:
     """Return raw configured C2 parameter values for one callback."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     result = await mythic.execute_custom_query(
         client,
         _CALLBACK_C2_CONFIG_QUERY,
@@ -364,7 +374,7 @@ c2profileparametersinstances {
 
 async def _get_payload_c2_config(client, payload_uuid: str) -> str:
     """Return raw configured C2 values and file metadata for one built payload."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(
         await mythic.get_payload_by_uuid(
             mythic=client,
@@ -379,14 +389,14 @@ async def _get_payload_c2_config(client, payload_uuid: str) -> str:
 async def _get_commands(client, payload_type: str) -> str:
     """Enumerate every command + full argument schema for a payload type — how the model learns what
     it can run (instead of being handed a hardcoded command list)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.get_all_commands_for_payloadtype(client, payload_type, _COMMANDS_ATTR), default=str)
 
 
 async def _issue_command(client, callback_display_id: int, command: str, parameters: str = "", timeout: int = 300) -> str:
     """Issue ONE command to a callback and wait for its output. Raw issue+wait — keeps only the anti-hang
     ceiling (the same waitfor-poller hang we hit in the gauge), nothing else."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     params = parameters if isinstance(parameters, str) else (json.dumps(parameters) if parameters else "")
     task = await mythic.issue_task(client, command_name=command, parameters=params,
                                    callback_display_id=int(callback_display_id), wait_for_complete=False)
@@ -398,13 +408,13 @@ async def _issue_command(client, callback_display_id: int, command: str, paramet
 
 async def _get_task_history(client, callback_display_id: int) -> str:
     """Full task history for a callback (the model's own past actions/output as context)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.get_all_tasks(mythic=client, callback_display_id=int(callback_display_id)), default=str)
 
 
 async def _get_task_output(client, task_display_id: int) -> str:
     """All output for a task id (base64-decoded for readability)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     rows = await mythic.get_all_task_output_by_id(mythic=client, task_display_id=int(task_display_id))
     out = []
     for r in (rows or []):
@@ -418,14 +428,14 @@ async def _get_task_output(client, task_display_id: int) -> str:
 
 async def _get_uploaded_files(client) -> str:
     """List operator-uploaded files already in Mythic's store (uploadable to a target)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     rows = [row async for row in mythic.get_all_uploaded_files(mythic=client)]
     return json.dumps(rows, default=str)
 
 
 async def _read_credentials(client, realm: str = "", account: str = "") -> str:
     """Read the Mythic credential store, optionally filtered by realm/account (raw — no shared cache)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     r = await mythic.execute_custom_query(client, _CREDENTIALS_QUERY)
     creds = r.get("credential", []) or []
     rcf, acf = (realm or "").strip().casefold(), (account or "").strip().casefold()
@@ -438,7 +448,7 @@ async def _read_credentials(client, realm: str = "", account: str = "") -> str:
 
 async def _add_credential(client, account: str, realm: str, credential: str, credential_type: str = "plaintext") -> str:
     """Add a credential to the Mythic store."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     if not credential:
         return "error: credential value is empty"
     return json.dumps(await mythic.create_credential(
@@ -448,7 +458,7 @@ async def _add_credential(client, account: str, realm: str, credential: str, cre
 
 async def _get_operations(client) -> str:
     """List Mythic operations."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.get_operations(mythic=client), default=str)
 
 
@@ -456,7 +466,7 @@ async def _create_payload(client, payload_type: str, os_name: str, c2_profile: s
                           c2_parameters: dict | None = None, build_parameters: dict | None = None,
                           filename: str = "") -> str:
     """Build a new Mythic payload (raw create_payload)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     return json.dumps(await mythic.create_payload(
         mythic=client, payload_type_name=payload_type, filename=filename or f"{payload_type}.bin",
         operating_system=os_name, c2_profiles=[{"c2_profile": c2_profile,
@@ -467,7 +477,7 @@ async def _create_payload(client, payload_type: str, os_name: str, c2_profile: s
 
 async def _delete_payload(client, payload_uuid: str, confirm: bool = False) -> str:
     """Soft-delete a payload — REFUSES if it still has live callbacks (lab safety; not intelligence)."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
     r = await mythic.execute_custom_query(
         client,
         _PAYLOAD_DELETE_PREFLIGHT_QUERY,
@@ -564,7 +574,7 @@ async def _resolve_collection_source(
     name_contains: str,
 ) -> tuple[str, str, str]:
     """Resolve exactly one explicit raw Mythic source to UUID, filename, and selector label."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
 
     exact_uuid = str(file_uuid or "").strip()
     callback_supplied = callback_display_id is not None
@@ -605,7 +615,7 @@ async def _ingest_collection(
     collection_ingestor: CollectionIngestor | None = None,
 ) -> str:
     """Raw Mythic-download -> BloodHound-upload bridge with no Sage lifecycle treatment."""
-    from mythic import mythic
+    mythic = _mythic_sdk()
 
     if collection_ingestor is None:
         raise RuntimeError("BloodHound file_upload adapter is unavailable")
@@ -708,6 +718,125 @@ TOOLS: dict[str, dict] = {
                                        "bytes to BloodHound; provide exactly one of file_uuid or "
                                        "callback_display_id. Returns raw upload/job status.")},
 }
+
+RAW_MYTHIC_FAKE_ARGUMENTS: dict[str, dict[str, Any]] = {
+    "list_callbacks": {}, "get_payload_types": {}, "get_payloads": {},
+    "get_all_payload_info": {}, "get_c2_profiles_for_payload": {"payload_type": "apollo"},
+    "get_callback_c2_config": {"callback_display_id": 7},
+    "get_payload_c2_config": {"payload_uuid": "payload-1"},
+    "get_commands": {"payload_type": "apollo"},
+    "issue_command": {"callback_display_id": 7, "command": "whoami", "parameters": ""},
+    "get_task_history": {"callback_display_id": 7}, "get_task_output": {"task_display_id": 41},
+    "get_uploaded_files": {}, "read_credentials": {},
+    "add_credential": {"account": "user", "realm": "example", "credential": "value"},
+    "get_operations": {},
+    "create_payload": {"payload_type": "apollo", "os_name": "Windows", "c2_profile": "http"},
+    "delete_payload": {"payload_uuid": "payload-1", "confirm": True},
+    "ingest_collection": {"file_uuid": "collection-1"},
+}
+
+
+def _fake_collection_zip() -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("users.json", '{"data":[{"name":"EXAMPLE"}]}')
+    return output.getvalue()
+
+
+class _DeterministicFakeMythic:
+    """In-memory SDK boundary used by the pre-comparison executable contract."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def _return(self, name: str, value: Any):
+        self.calls.append(name)
+        return value
+
+    async def get_all_active_callbacks(self, *_a, **_k): return await self._return("get_all_active_callbacks", [])
+    async def get_all_payloads(self, *_a, **_k): return await self._return("get_all_payloads", [])
+    async def get_all_commands_for_payloadtype(self, *_a, **_k): return await self._return("get_all_commands_for_payloadtype", [])
+    async def issue_task(self, *_a, **_k): return await self._return("issue_task", {"display_id": 41})
+    async def waitfor_for_task_output(self, *_a, **_k): return await self._return("waitfor_for_task_output", b"ok")
+    async def get_all_tasks(self, *_a, **_k): return await self._return("get_all_tasks", [])
+    async def get_all_task_output_by_id(self, *_a, **_k): return await self._return("get_all_task_output_by_id", [{"response_text": "b2s="}])
+    async def get_payload_by_uuid(self, *_a, **_k): return await self._return("get_payload_by_uuid", {"uuid": "payload-1"})
+    async def download_file(self, *_a, **_k): return await self._return("download_file", _fake_collection_zip())
+    async def create_credential(self, *_a, **_k): return await self._return("create_credential", {"status": "success"})
+    async def get_operations(self, *_a, **_k): return await self._return("get_operations", [])
+    async def create_payload(self, *_a, **_k): return await self._return("create_payload", {"uuid": "payload-1"})
+
+    async def get_all_uploaded_files(self, *_a, **_k):
+        self.calls.append("get_all_uploaded_files")
+        yield {"agent_file_id": "file-1"}
+
+    async def execute_custom_query(self, _client, query, variables=None):
+        self.calls.append("execute_custom_query")
+        if query == _PAYLOAD_TYPES_QUERY: return {"payloadtype": [{"name": "apollo"}]}
+        if query == _CREDENTIALS_QUERY: return {"credential": []}
+        if query == _PAYLOAD_DELETE_PREFLIGHT_QUERY:
+            return {"payload": [{"uuid": "payload-1"}], "callback_aggregate": {"aggregate": {"count": 0}}}
+        if query == _PAYLOAD_DELETE_MUTATION: return {"updatePayload": {"status": "success", "error": ""}}
+        return {"payloadtype": [], "payloadtypec2profile": [], "callback": []}
+
+
+def _fake_args_valid(name: str, args: dict[str, Any]) -> bool:
+    schema = TOOLS[name]["params"]
+    if set(schema.get("required") or ()) - set(args):
+        return False
+    types = {"string": str, "integer": int, "boolean": bool, "object": dict}
+    for key, value in args.items():
+        expected = types.get((schema.get("properties", {}).get(key) or {}).get("type"))
+        if expected is None or not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+            return False
+    return True
+
+
+async def _execute_mythic_call(
+    client: Any, call: dict[str, Any], *, collection_ingestor: CollectionIngestor | None = None,
+) -> str:
+    name, args = call.get("tool", ""), call.get("args", {}) or {}
+    tool = TOOLS.get(name)
+    if tool is None:
+        return f"[unknown tool] {name!r}. Available: {sorted(TOOLS)}"
+    if name == "ingest_collection":
+        return await tool["fn"](client, collection_ingestor=collection_ingestor, **args)
+    return await tool["fn"](client, **args)
+
+
+async def raw_mythic_fake_execution_disposition() -> dict[str, object]:
+    failures: dict[str, str] = {}
+    fake = _DeterministicFakeMythic()
+    token = _MYTHIC_SDK_OVERRIDE.set(fake)
+
+    async def ingest(_name: str, _data: bytes) -> dict[str, str]: return {"status": "accepted"}
+
+    try:
+        for name in sorted(TOOLS):
+            args = RAW_MYTHIC_FAKE_ARGUMENTS.get(name)
+            if not isinstance(args, dict) or not _fake_args_valid(name, args):
+                failures[name] = "fake arguments do not satisfy the runtime schema"
+                continue
+            try:
+                result = await _execute_mythic_call(object(), {"tool": name, "args": args}, collection_ingestor=ingest)
+            except Exception as exc:
+                failures[name] = f"fake execution raised {type(exc).__name__}"
+                continue
+            if not isinstance(result, str) or not result.strip():
+                failures[name] = "runtime result is not nonempty text"
+    finally:
+        _MYTHIC_SDK_OVERRIDE.reset(token)
+    expected = set(TOOLS)
+    if set(RAW_MYTHIC_TO_SHIPPING_TOOL) != expected:
+        failures["shipping_mapping"] = "raw inventory and shipping mapping differ"
+    return {
+        "valid": not failures,
+        "executed_count": len(expected) - len([name for name in failures if name in expected]),
+        "raw_count": len(expected),
+        "shipping_mapping_count": len(RAW_MYTHIC_TO_SHIPPING_TOOL),
+        "sdk_call_count": len(fake.calls),
+        "failures": failures,
+    }
 
 
 def shipping_visible_mythic_tool_names() -> frozenset[str]:
@@ -893,10 +1022,11 @@ async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tup
     bidirectional = raw_mythic_bidirectional_disposition()
     sdk = raw_mythic_sdk_disposition()
     graphql = await raw_mythic_graphql_disposition(client, timeout=timeout)
+    fake_execution = await raw_mythic_fake_execution_disposition()
     failures = [
         name for name, disposition in (
             ("parity", parity), ("bidirectional", bidirectional), ("sdk", sdk),
-            ("graphql", graphql),
+            ("graphql", graphql), ("fake-execution", fake_execution),
         )
         if disposition.get("valid") is not True
     ]
@@ -905,7 +1035,8 @@ async def raw_mythic_surface_preflight(client: Any, *, timeout: int = 30) -> tup
     return True, (
         f"raw Mythic surface validated: {parity['raw_count']} raw <= "
         f"{parity['shipping_count']} shipping tools; {sdk['checked']} SDK calls; "
-        f"{graphql['checked']} exact GraphQL documents"
+        f"{graphql['checked']} exact GraphQL documents; "
+        f"{fake_execution['executed_count']} fake-boundary tool executions"
     )
 
 
@@ -924,20 +1055,11 @@ def make_mythic_dispatcher(
     """A bare-runner tool_executor: dispatch {"tool": name, "args": {...}} to the stripped impl.
     Mirrors live_seams.make_tool_executor's reuse-client-across-asyncio.run pattern."""
     def tool_executor(call: dict) -> str:
-        name = call.get("tool", "")
-        args = call.get("args", {}) or {}
-        t = TOOLS.get(name)
-        if t is None:
-            return f"[unknown tool] {name!r}. Available: {sorted(TOOLS)}"
         try:
-            if t["async"]:
-                if name == "ingest_collection":
-                    return asyncio.run(
-                        t["fn"](client, collection_ingestor=collection_ingestor, **args)
-                    )
-                return asyncio.run(t["fn"](client, **args))
-            return t["fn"](client, **args)
+            return asyncio.run(_execute_mythic_call(
+                client, call, collection_ingestor=collection_ingestor,
+            ))
         except Exception as exc:
-            return f"[tool error] {name}: {type(exc).__name__}: {exc}"
+            return f"[tool error] {call.get('tool', '')}: {type(exc).__name__}: {exc}"
 
     return tool_executor

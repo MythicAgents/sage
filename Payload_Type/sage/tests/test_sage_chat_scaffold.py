@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from sage_chat.config import build_model_kwargs
+from sage_chat.config import build_model_kwargs, resolve_environment_llm_profile
 from sage_chat.models import SAGE_MODELS
 from sage_chat.session import (
     bind_channel_thread_id,
@@ -3838,6 +3838,32 @@ def test_api_key_and_endpoint_resolve_from_config(monkeypatch):
     configurable = build_model_kwargs(req)["config"]["configurable"]
     assert configurable["api_key"] == "cfg-key"
     assert configurable["base_url"] == "http://cfg-endpoint"
+
+
+def test_environment_profile_is_the_shipping_fallback_without_empty_shadowing(monkeypatch):
+    environment = {
+        "provider": " OpenAI ",
+        "model": "exact-model",
+        "API_ENDPOINT": " https://route.invalid/v1 ",
+        "API_KEY": "environment-key",
+        "AWS_DEFAULT_REGION": "",
+    }
+    profile = resolve_environment_llm_profile(environment)
+
+    assert profile.provider == "openai"
+    assert profile.model == "exact-model"
+    assert profile.api_endpoint == "https://route.invalid/v1"
+    assert profile.api_key == "environment-key"
+    assert profile.region == ""
+    assert profile.source_for("api_endpoint") == "environment"
+    assert profile.source_for("region") == "default"
+
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    kwargs = build_model_kwargs(build_chat_request("hi"))
+    assert kwargs["provider"] == profile.provider
+    assert kwargs["model"] == profile.model
+    assert kwargs["config"]["configurable"] == profile.configurable()
 
 
 def test_bedrock_aws_quad_resolves_from_config():

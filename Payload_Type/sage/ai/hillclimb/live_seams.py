@@ -412,25 +412,20 @@ def graph_collected_probe(*, timeout: int = 60) -> Callable[[], bool]:
 
 # --- Sage model defaults (so the BARE model uses the SAME model as Sage; answers "--model") ----------
 
-_SAGE_ENV = str(_REPO / "skills" / "sage-callback-bootstrap" / ".env")
+def load_sage_defaults(environ: Mapping[str, str] | None = None) -> dict:
+    """Project the canonical shipping environment profile into evaluator field names."""
+    try:
+        from sage_chat.config import resolve_environment_llm_profile
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from sage_chat.config import resolve_environment_llm_profile
 
-
-def load_sage_defaults(env_path: str = _SAGE_ENV) -> dict:
-    """Read the Sage payload defaults so the bare model matches Sage — no --model needed.
-    Returns {provider, model, api_key, base_url}. provider lowercased for init_chat_model."""
-    vals: dict = {}
-    p = Path(env_path)
-    if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                vals[k.strip()] = v.strip().strip("'\"")
+    profile = resolve_environment_llm_profile(environ)
     return {
-        "provider": (vals.get("SAGE_PROVIDER") or "").lower() or None,
-        "model": vals.get("SAGE_MODEL") or None,
-        "api_key": vals.get("SAGE_API_KEY") or None,
-        "base_url": vals.get("SAGE_API_ENDPOINT") or None,
+        "provider": profile.provider or None,
+        "model": profile.model or None,
+        "api_key": profile.api_key or None,
+        "base_url": profile.api_endpoint or None,
     }
 
 

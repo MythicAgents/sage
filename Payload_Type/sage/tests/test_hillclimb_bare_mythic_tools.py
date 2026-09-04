@@ -290,6 +290,18 @@ def _patch_valid_structural_preflight(monkeypatch, *, failed_component=""):
         return disposition("graphql", checked=len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS))
 
     monkeypatch.setattr(bmt, "raw_mythic_graphql_disposition", graphql)
+    monkeypatch.setattr(
+        bmt,
+        "raw_mythic_fake_execution_disposition",
+        lambda: _async_value(disposition(
+            "fake-execution", executed_count=18, raw_count=18,
+            shipping_mapping_count=18, sdk_call_count=22,
+        )),
+    )
+
+
+async def _async_value(value):
+    return value
 
 
 def test_raw_mythic_surface_preflight_accepts_zero_files_without_download(monkeypatch):
@@ -305,11 +317,12 @@ def test_raw_mythic_surface_preflight_accepts_zero_files_without_download(monkey
     assert detail == (
         "raw Mythic surface validated: 18 raw <= 31 shipping tools; "
         f"{len(bmt.RAW_MYTHIC_SDK_CONTRACT)} SDK calls; "
-        f"{len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS)} exact GraphQL documents"
+        f"{len(bmt.RAW_MYTHIC_GRAPHQL_DOCUMENTS)} exact GraphQL documents; "
+        "18 fake-boundary tool executions"
     )
 
 
-@pytest.mark.parametrize("failed_component", ["parity", "bidirectional", "sdk", "graphql"])
+@pytest.mark.parametrize("failed_component", ["parity", "bidirectional", "sdk", "graphql", "fake-execution"])
 def test_raw_mythic_surface_preflight_rejects_each_structural_failure(
     monkeypatch, failed_component
 ):
@@ -318,6 +331,42 @@ def test_raw_mythic_surface_preflight_rejects_each_structural_failure(
 
     assert ok is False
     assert detail == f"raw Mythic surface failed {failed_component} validation"
+
+
+def test_fake_boundary_executes_every_raw_tool_with_shipping_mapping_parity():
+    disposition = asyncio.run(bmt.raw_mythic_fake_execution_disposition())
+    assert disposition["valid"] is True
+    assert disposition["executed_count"] == disposition["raw_count"] == len(bmt.TOOLS) == 18
+    assert disposition["shipping_mapping_count"] == len(bmt.RAW_MYTHIC_TO_SHIPPING_TOOL) == 18
+    assert disposition["sdk_call_count"] >= disposition["executed_count"]
+    assert disposition["failures"] == {}
+
+
+def test_fake_boundary_guard_rejects_omitted_invalid_and_nontext_tools(monkeypatch):
+    omitted = bmt.RAW_MYTHIC_FAKE_ARGUMENTS.pop("get_operations")
+    try:
+        result = asyncio.run(bmt.raw_mythic_fake_execution_disposition())
+        assert result["valid"] is False
+        assert "get_operations" in result["failures"]
+    finally:
+        bmt.RAW_MYTHIC_FAKE_ARGUMENTS["get_operations"] = omitted
+
+    monkeypatch.setitem(
+        bmt.RAW_MYTHIC_FAKE_ARGUMENTS,
+        "get_callback_c2_config",
+        {"callback_display_id": "wrong"},
+    )
+    result = asyncio.run(bmt.raw_mythic_fake_execution_disposition())
+    assert result["failures"]["get_callback_c2_config"] == (
+        "fake arguments do not satisfy the runtime schema"
+    )
+
+    async def nontext(_client):
+        return {"not": "text"}
+
+    monkeypatch.setitem(bmt.TOOLS["list_callbacks"], "fn", nontext)
+    result = asyncio.run(bmt.raw_mythic_fake_execution_disposition())
+    assert result["failures"]["list_callbacks"] == "runtime result is not nonempty text"
 
 
 def test_excluded_secret_sauce_not_exposed():

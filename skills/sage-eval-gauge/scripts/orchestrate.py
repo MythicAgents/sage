@@ -68,14 +68,18 @@ def _load_sage_model_environment() -> dict[str, str]:
     if str(PAYLOAD) not in sys.path:
         sys.path.insert(0, str(PAYLOAD))
     from dotenv_bootstrap import load_sage_dotenv
+    from sage_chat.config import resolve_environment_llm_profile
 
     applied = load_sage_dotenv(str(PAYLOAD))
     try:
-        return {
-            key: value
-            for key in ("API_ENDPOINT", "API_KEY")
-            if (value := str(os.environ.get(key) or "").strip())
+        profile = resolve_environment_llm_profile()
+        resolved = {
+            "provider": profile.provider,
+            "model": profile.model,
+            "API_ENDPOINT": profile.api_endpoint,
+            "API_KEY": profile.api_key,
         }
+        return {key: value for key, value in resolved.items() if value}
     finally:
         for key in applied:
             os.environ.pop(key, None)

@@ -19,7 +19,7 @@ import logging
 import os
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Mapping
 
 from mythic_container.ChatBase import ChatConfigView, ChatRequest, ChatSecretView
 from ai.langgraph.policy import POLICY_DEFAULT, resolve_policy_mode
@@ -172,6 +172,42 @@ def _nonblank(value: Any) -> str:
     return text if text.strip() else ""
 
 
+def _normalized_llm_profile(
+    values: Mapping[str, str],
+    sources: list[tuple[str, str]],
+) -> ResolvedLLMProfile:
+    normalized = dict(values)
+    normalized["provider"] = normalized["provider"].strip().casefold() or "openai"
+    normalized["model"] = normalized["model"].strip()
+    normalized["api_endpoint"] = normalized["api_endpoint"].strip()
+    return ResolvedLLMProfile(**normalized, sources=tuple(sources))
+
+
+def resolve_environment_llm_profile(
+    environ: Mapping[str, str] | None = None,
+    *,
+    key_map: Mapping[str, str] = SAGE_LLM_KEY_MAP,
+) -> ResolvedLLMProfile:
+    """Resolve the process-only projection used by shipping and evaluation paths.
+
+    This is the canonical environment boundary.  ``resolve_llm_profile`` layers Mythic's
+    per-request Config and Secret values over this exact projection; headless evaluators import
+    it directly instead of maintaining another endpoint/key namespace.
+    """
+    source = os.environ if environ is None else environ
+    resolved: dict[str, str] = {}
+    sources: list[tuple[str, str]] = []
+    for logical_field, env_key in key_map.items():
+        value = _nonblank(source.get(env_key, ""))
+        if value:
+            resolved[logical_field] = value
+            sources.append((logical_field, "environment"))
+        else:
+            resolved[logical_field] = "openai" if logical_field == "provider" else ""
+            sources.append((logical_field, "default"))
+    return _normalized_llm_profile(resolved, sources)
+
+
 def _resolve_with_source(
     config: ChatConfigView,
     secrets: ChatSecretView,
@@ -207,6 +243,7 @@ def resolve_llm_profile(
 
     config = ChatConfigView.from_request(request)
     secrets = ChatSecretView.from_request(request)
+    environment_profile = resolve_environment_llm_profile(key_map=key_map)
     resolved: dict[str, str] = {}
     sources: list[tuple[str, str]] = []
     for logical_field, key in key_map.items():
@@ -214,17 +251,16 @@ def resolve_llm_profile(
             config,
             secrets,
             key,
-            env_key=key,
-            default="openai" if logical_field == "provider" else "",
+            env_key="",
+            default=getattr(environment_profile, logical_field),
             allow_secret=(provider_model_secrets or logical_field not in {"provider", "model"}),
             include_secrets=include_secrets,
         )
+        if source == "default":
+            source = environment_profile.source_for(logical_field)
         resolved[logical_field] = value
         sources.append((logical_field, source))
-    resolved["provider"] = resolved["provider"].strip().casefold() or "openai"
-    resolved["model"] = resolved["model"].strip()
-    resolved["api_endpoint"] = resolved["api_endpoint"].strip()
-    return ResolvedLLMProfile(**resolved, sources=tuple(sources))
+    return _normalized_llm_profile(resolved, sources)
 
 
 def resolve_watcher_llm_profile(

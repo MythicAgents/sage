@@ -51,6 +51,8 @@ def test_live_driver_uses_sage_route_over_stale_eval_credentials(monkeypatch):
     monkeypatch.setattr(dotenv_bootstrap, "load_sage_dotenv", lambda _directory: [])
     monkeypatch.setenv("API_ENDPOINT", "https://sage-route.example/v1")
     monkeypatch.setenv("API_KEY", "sage-secret")
+    monkeypatch.setenv("provider", "OpenAI")
+    monkeypatch.setenv("model", "exact-model")
     monkeypatch.setenv("SAGE_EVAL_API_ENDPOINT", "https://stale-route.invalid/v1")
     monkeypatch.setenv("SAGE_EVAL_API_KEY", "stale-secret")
     monkeypatch.setattr(
@@ -63,6 +65,8 @@ def test_live_driver_uses_sage_route_over_stale_eval_credentials(monkeypatch):
 
     assert seen["cfg"].model_api_endpoint == "https://sage-route.example/v1"
     assert seen["cfg"].model_api_key == "sage-secret"
+    assert seen["cfg"].model_provider == "openai"
+    assert seen["cfg"].model_id == "exact-model"
 
 
 def test_live_driver_rejects_legacy_eval_credentials_without_sage_route(monkeypatch):

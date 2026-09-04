@@ -2944,6 +2944,7 @@ def test_treatment_route_rejects_legacy_eval_credentials_without_sage_route(monk
 
 def test_orchestrator_loads_sage_dotenv_with_local_precedence(monkeypatch, tmp_path):
     (tmp_path / ".env.local").write_text(
+        "provider=OpenAI\nmodel=local-model\n"
         "API_ENDPOINT=https://local.example/v1\nAPI_KEY=local-secret\n",
         encoding="utf-8",
     )
@@ -2954,10 +2955,14 @@ def test_orchestrator_loads_sage_dotenv_with_local_precedence(monkeypatch, tmp_p
     monkeypatch.setattr(orchestrate, "PAYLOAD", tmp_path)
     monkeypatch.delenv("API_ENDPOINT", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("provider", raising=False)
+    monkeypatch.delenv("model", raising=False)
 
     resolved = orchestrate._load_sage_model_environment()
 
     assert resolved == {
+        "provider": "openai",
+        "model": "local-model",
         "API_ENDPOINT": "https://local.example/v1",
         "API_KEY": "local-secret",
     }
@@ -2967,16 +2972,21 @@ def test_orchestrator_loads_sage_dotenv_with_local_precedence(monkeypatch, tmp_p
 
 def test_orchestrator_preserves_explicit_sage_route_over_dotenv(monkeypatch, tmp_path):
     (tmp_path / ".env.local").write_text(
+        "provider=bedrock\nmodel=file-model\n"
         "API_ENDPOINT=https://file.example/v1\nAPI_KEY=file-secret\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(orchestrate, "PAYLOAD", tmp_path)
     monkeypatch.setenv("API_ENDPOINT", "https://explicit.example/v1")
     monkeypatch.setenv("API_KEY", "explicit-secret")
+    monkeypatch.setenv("provider", "openai")
+    monkeypatch.setenv("model", "explicit-model")
 
     resolved = orchestrate._load_sage_model_environment()
 
     assert resolved == {
+        "provider": "openai",
+        "model": "explicit-model",
         "API_ENDPOINT": "https://explicit.example/v1",
         "API_KEY": "explicit-secret",
     }

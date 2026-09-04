@@ -1666,13 +1666,16 @@ def compare(cfg: Config, scenario_name: str) -> None:
 
 def main(argv=None) -> int:
     from dotenv_bootstrap import load_sage_dotenv
+    from sage_chat.config import resolve_environment_llm_profile
 
     applied = load_sage_dotenv(str(Path(__file__).resolve().parents[2]))
     try:
+        profile = resolve_environment_llm_profile()
         sage_model_environment = {
-            key: value
-            for key in ("API_ENDPOINT", "API_KEY")
-            if (value := str(os.environ.get(key) or "").strip())
+            "provider": profile.provider,
+            "model": profile.model,
+            "API_ENDPOINT": profile.api_endpoint,
+            "API_KEY": profile.api_key,
         }
     finally:
         for key in applied:
@@ -1734,6 +1737,8 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = Config()
+    cfg.model_provider = sage_model_environment.get("provider") or None
+    cfg.model_id = sage_model_environment.get("model") or None
     cfg.model_api_endpoint = sage_model_environment.get("API_ENDPOINT") or None
     cfg.model_api_key = sage_model_environment.get("API_KEY") or None
     if getattr(args, "provider", None):

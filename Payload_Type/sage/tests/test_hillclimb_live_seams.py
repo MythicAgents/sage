@@ -351,11 +351,14 @@ def test_parse_domain_count():
     assert ls.parse_domain_count("connection refused") == 0
 
 
-def test_load_sage_defaults(tmp_path):
-    env = tmp_path / ".env"
-    env.write_text("# Local Sage defaults\nSAGE_PROVIDER=OpenAI\nSAGE_MODEL=gpt-5.5-cyber-preview\n"
-                   "SAGE_API_ENDPOINT=http://127.0.0.1:8100/v1\nSAGE_API_KEY=sk-abc\n")
-    d = ls.load_sage_defaults(str(env))
+def test_load_sage_defaults_uses_the_shipping_environment_profile(monkeypatch):
+    monkeypatch.setenv("provider", "OpenAI")
+    monkeypatch.setenv("model", "gpt-5.5-cyber-preview")
+    monkeypatch.setenv("API_ENDPOINT", "http://127.0.0.1:8100/v1")
+    monkeypatch.setenv("API_KEY", "sk-abc")
+    monkeypatch.setenv("SAGE_API_ENDPOINT", "https://stale.invalid/v1")
+    monkeypatch.setenv("SAGE_API_KEY", "stale-key")
+    d = ls.load_sage_defaults()
     assert d["provider"] == "openai"            # lowercased for init_chat_model
     assert d["model"] == "gpt-5.5-cyber-preview"
     assert d["base_url"] == "http://127.0.0.1:8100/v1"
