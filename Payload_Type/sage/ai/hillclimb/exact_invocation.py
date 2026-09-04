@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from sage_chat.config import resolve_environment_llm_profile
+from ssl_bootstrap import configure_sage_ssl_cert_file
 
 
 ENVIRONMENT_PROFILE_RESOLVER = resolve_environment_llm_profile
@@ -178,6 +179,7 @@ def make_responses_client(
     """Construct the canonical zero-retry client from the resolved route."""
     if route.provider.strip().casefold() != "openai":
         raise ExactInvocationError("Responses transport currently requires provider=openai")
+    configure_sage_ssl_cert_file()
     import httpx
     from openai import AsyncOpenAI
 

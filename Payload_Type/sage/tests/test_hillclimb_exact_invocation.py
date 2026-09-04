@@ -13,6 +13,7 @@ import openai
 
 from ai.hillclimb import exact_invocation as exact
 from sage_chat.config import resolve_environment_llm_profile
+from ssl_bootstrap import configure_sage_ssl_cert_file
 
 
 class _Stream:
@@ -123,13 +124,18 @@ def test_request_builder_carries_the_exact_route_configuration():
 
 def test_client_factory_carries_auth_endpoint_headers_and_zero_retries(monkeypatch):
     seen = {}
+    events = []
 
     def fake_client(**kwargs):
+        events.append("client")
         seen.update(kwargs)
         return object()
 
+    assert exact.configure_sage_ssl_cert_file is configure_sage_ssl_cert_file
+    monkeypatch.setattr(exact, "configure_sage_ssl_cert_file", lambda: events.append("tls"))
     monkeypatch.setattr(openai, "AsyncOpenAI", fake_client)
     exact.make_responses_client(_route(), default_headers={"x-source": "preflight"})
+    assert events == ["tls", "client"]
     assert seen["api_key"] == "secret"
     assert str(seen["base_url"]) == "https://provider.invalid/v1"
     assert seen["default_headers"] == {"x-source": "preflight"}
