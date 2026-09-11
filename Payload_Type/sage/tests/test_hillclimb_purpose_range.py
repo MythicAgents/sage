@@ -54,4 +54,4 @@ def test_purpose_range_scenarios_use_range_referee_domain():
         "purpose-range-ca-export-replanning",
         "purpose-range-gpo-dc-scope-late-blocker",
     ]
-    assert run_gauge_live._scored_referee_domains(scenarios[0]) == {"range.local"}
+    assert run_gauge_live._scored_referee_domains(scenarios[0]) == set()

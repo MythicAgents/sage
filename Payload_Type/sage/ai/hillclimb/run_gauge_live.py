@@ -5,10 +5,10 @@
     ONE side on ONE scenario per `--go` invocation and RECORDS the ScoreCard; you reset between runs;
     then `compare` combines the records. Safe to import / dry-run; only `--go` acts.
 
-Both sides are scored by the SAME ledger-independent probes (collection-independent where it matters):
-  * KRBTGT_DUMPED -> Mythic loot (mythic_credential_probe): FAIR — reflects what was actually dumped.
-  * DA_CHILD / OBJECTIVE -> BloodHound cypher: COLLECTION-BIASED (favors Sage, which ingests BloodHound);
-    treat as provisional until an AD-direct probe replaces them.
+Both sides are scored by the same versioned independent-verifier registry. Legacy fail-soft readers are
+positive-only and freshness-gated; unavailable or invalid evidence cannot become a measured negative or earn
+credit. Domain Administrator proof remains explicitly unmeasured until a matched Mythic allow/deny differential
+is supplied.
 
 Operator loop per scenario:
   reset -> `run --go --side harness --scenario child-da`
@@ -28,9 +28,9 @@ from pathlib import Path
 from typing import Callable
 
 try:
-    from . import (gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams, bare_runner,
-                   bare_mythic_tools, bare_bloodhound, probes as probes_mod)
-    from .scenarios import all_scenarios, CHILD, CHILD_DC, OBJECTIVE
+    from . import (effect_registry, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams,
+                   bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod)
+    from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
     from .fitness import ScoreCard
 except Exception:
@@ -39,13 +39,14 @@ except Exception:
         gate1p_stagea,
         gate1p_stageb,
         gate1p_protocol,
+        effect_registry,
         live_seams,
         bare_runner,
         bare_mythic_tools,
         bare_bloodhound,
         probes as probes_mod,
     )
-    from ai.hillclimb.scenarios import all_scenarios, CHILD, CHILD_DC, OBJECTIVE  # type: ignore
+    from ai.hillclimb.scenarios import all_scenarios, CHILD, OBJECTIVE  # type: ignore
     from ai.hillclimb.range_state import Milestone  # type: ignore
     from ai.hillclimb.fitness import ScoreCard  # type: ignore
 
@@ -256,99 +257,68 @@ def _resolved_harness_model_route(cfg: Config) -> dict[str, str | None]:
     }
 
 
-def _stageb_proof_adapters(
-    reader,
-    baseline: dict,
-    *,
-    objective_domain: str,
-    directory_probe: Callable[[], bool] | None = None,
-):
-    baseline_members = set(baseline.get(objective_domain, set()))
-
-    def directory_delta() -> bool:
-        return bool(set(reader(objective_domain)) - baseline_members)
-
-    def typed(name: str, probe: Callable[[], bool], *, require_fresh: bool = True):
-        def read() -> bool:
-            try:
-                value = probe()
-            except live_seams.ProbeReadError as exc:
-                raise gate1p_stageb.ProofUnavailable(str(exc)) from exc
-            if type(value) is not bool:
-                raise gate1p_stagea.ObserverUnavailable(
-                    f"malformed {name} proof baseline: Boolean state required"
-                )
-            return value
-
-        baseline_available = True
-        baseline_value = False
-        if require_fresh:
-            try:
-                baseline_value = read()
-            except gate1p_stageb.ProofUnavailable:
-                baseline_available = False
-
-        def observe() -> bool:
-            if not baseline_available:
-                raise gate1p_stageb.ProofUnavailable(
-                    f"{name} proof baseline was unavailable"
-                )
-            current = read()
-            return current and not baseline_value if require_fresh else current
-
-        return gate1p_stageb.make_proof_adapter(name, observe)
-
-    return (
-        typed("directory_delta", directory_probe or directory_delta, require_fresh=False),
-        typed(
-            "certificate_control",
-            live_seams.certificate_admin_control_probe(None, realm=objective_domain),
-        ),
-        typed("ticket_control", live_seams.ticket_admin_control_probe(realm=objective_domain)),
-        typed("krbtgt_control", live_seams.krbtgt_dumped_probe(realm=objective_domain)),
-        typed(
-            "system_on_child_dc",
-            live_seams.system_execution_probe(realm=objective_domain, host=CHILD_DC),
-        ),
-        typed(
-            "remote_exec_child_dc",
-            live_seams.remote_execution_probe(CHILD_DC, realm=objective_domain),
-        ),
-    )
-
-
 def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                  settle_interval: float = 20) -> dict:
-    """Build ledger-independent range probes shared by harness and bare-model runs.
+    """Build typed, registry-bound probes shared by harness and bare-model runs.
 
-    The scorer consumes typed probe callables, not a protocol. SYSTEM/KRBTGT and task-backed objective
-    proofs come from Mythic control-plane records. Directory-membership proof uses the injected,
-    logically observation-only evaluation-plane reader, which may use any contract-declared protocol.
+    Legacy readers in ``live_seams`` are fail-soft Booleans. They are therefore admitted only on a positive
+    result; False remains UNMEASURED because it cannot distinguish an absent fact from an adapter failure.
     """
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
     domains = dict(getattr(scenario, "domains", {}) or {})
     child_domain = str(domains.get("child") or CHILD)
     objective_domain = str(domains.get("objective") or OBJECTIVE)
     probes = {}
+
+    def typed_positive(milestone, raw_probe, *, origin, proof_kind, target=""):
+        return probes_mod.registered_probe(
+            milestone,
+            probes_mod.fresh_positive(raw_probe, f"{proof_kind} was absent or unreadable"),
+            origin=origin,
+            proof_kind=proof_kind,
+            target=target,
+        )
+
+    def krbtgt_paths(milestone, realm, target):
+        return probes_mod.any_registered_probe(
+            typed_positive(
+                milestone,
+                live_seams.mythic_credential_probe(
+                    "krbtgt", realm=realm, require_bound_realm=True,
+                ),
+                origin=effect_registry.ProofOrigin.MYTHIC_CREDENTIAL_STORE,
+                proof_kind="krbtgt_material",
+                target=target,
+            ),
+            typed_positive(
+                milestone,
+                lambda: live_seams._krbtgt_task_output_has_material(realm=realm),
+                origin=effect_registry.ProofOrigin.MYTHIC_TASK_OUTPUT,
+                proof_kind="krbtgt_material",
+                target=target,
+            ),
+        )
+
     if Milestone.SYSTEM_ON_HOST in sub:
-        probes[Milestone.SYSTEM_ON_HOST] = live_seams.system_execution_probe(realm=child_domain)
+        probes[Milestone.SYSTEM_ON_HOST] = typed_positive(
+            Milestone.SYSTEM_ON_HOST,
+            live_seams.system_execution_probe(realm=child_domain),
+            origin=effect_registry.ProofOrigin.MYTHIC_TASK_OUTPUT,
+            proof_kind="system_identity",
+            target=child_domain,
+        )
     if Milestone.KRBTGT_DUMPED in sub:
-        probes[Milestone.KRBTGT_DUMPED] = live_seams.krbtgt_dumped_probe(realm=child_domain)
+        probes[Milestone.KRBTGT_DUMPED] = krbtgt_paths(
+            Milestone.KRBTGT_DUMPED, child_domain, child_domain
+        )
     if Milestone.DA_CHILD in sub:
-        probes[Milestone.DA_CHILD] = live_seams.ad_domain_admins_probe_via_reader(
-            reader, child_domain, baseline=baseline.get(child_domain, set()),
-            settle_timeout=settle_timeout, settle_interval=settle_interval)
+        probes[Milestone.DA_CHILD] = probes_mod.unavailable_probe(
+            "matched admin/non-admin Mythic task evidence is not configured"
+        )
     if Milestone.OBJECTIVE in sub:
         if getattr(scenario, "name", "") == gate1p_stageb.SCENARIO:
-            objective_oracle = gate1p_stageb.build_objective_oracle(
-                _stageb_proof_adapters(reader, baseline, objective_domain=objective_domain),
-                artifact_pointer="unretained:stageb-probe-assembly",
-                domain=objective_domain,
-            )
-            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
-                lambda: bool(objective_oracle()["success"]),
-                settle_timeout=settle_timeout,
-                settle_interval=settle_interval,
+            probes[Milestone.OBJECTIVE] = krbtgt_paths(
+                Milestone.OBJECTIVE, objective_domain, objective_domain
             )
         elif _objective_uses_remote_exec_probe(scenario):
             remote_targets = _objective_remote_exec_targets(scenario)
@@ -358,35 +328,46 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                 )
             target_host, target_domain = remote_targets[0]
             target_domain = target_domain or objective_domain
-            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
+            probes[Milestone.OBJECTIVE] = typed_positive(
+                Milestone.OBJECTIVE,
                 live_seams.remote_execution_probe(target_host, realm=target_domain),
-                settle_timeout=settle_timeout,
-                settle_interval=settle_interval,
+                origin=effect_registry.ProofOrigin.MYTHIC_ARTIFACT,
+                proof_kind="remote_exec_callback",
+                target=target_domain,
             )
         else:
-            probes[Milestone.OBJECTIVE] = live_seams.any_probe(
-                live_seams.certificate_admin_control_probe(
-                    None if getattr(scenario, "name", "") == gate1p_stagea.SCENARIO else "administrator",
-                    realm=objective_domain,
-                ),
-                live_seams.ticket_admin_control_probe(realm=objective_domain),
-                live_seams.ad_domain_admins_probe_via_reader(
-                    reader,
-                    objective_domain,
-                    baseline=baseline.get(objective_domain, set()),
-                    settle_timeout=0,
-                ),
-                settle_timeout=settle_timeout,
-                settle_interval=settle_interval,
+            probes[Milestone.OBJECTIVE] = krbtgt_paths(
+                Milestone.OBJECTIVE, objective_domain, objective_domain
             )
     if Milestone.GRAPH_COLLECTED in sub:
-        # Ground-truth, ledger-independent: BloodHound holds >=1 ingested Domain == a SharpHound
-        # collection was successfully run AND uploaded. Independent of Sage's self-reported
-        # `graph-built:` predicate, so range_state's disagreement check ("who verifies the verifier")
-        # can finally catch a collection self-report that reality does not back. Scenarios that do not
-        # score GRAPH_COLLECTED (e.g. child-da) never build this probe.
-        probes[Milestone.GRAPH_COLLECTED] = live_seams.graph_collected_probe()
+        probes[Milestone.GRAPH_COLLECTED] = typed_positive(
+            Milestone.GRAPH_COLLECTED,
+            live_seams.graph_collected_probe(),
+            origin=effect_registry.ProofOrigin.PAYLOAD_BLOODHOUND_FACT,
+            proof_kind="graph_fact",
+        )
     return probes
+
+
+def _admitted_row_objective_probe(
+    canonical_outcome: dict[str, object],
+    proof_result: effect_registry.ProofResult | None,
+):
+    """Reuse the exact typed observation already admitted by the row oracle."""
+    def read() -> effect_registry.OracleObservation:
+        if not isinstance(proof_result, effect_registry.ProofResult):
+            raise probes_mod.ProbeUnavailable("row objective has no admitted typed proof result")
+        if proof_result.disposition not in {
+            effect_registry.ProofDisposition.PROVEN,
+            effect_registry.ProofDisposition.DISPROVEN,
+        } or proof_result.observation is None:
+            raise probes_mod.ProbeUnavailable("row objective proof result is not measured")
+        expected = canonical_outcome.get("objective_success")
+        if type(expected) is not bool or proof_result.proven is not expected:
+            raise probes_mod.ProbeUnavailable("row objective outcome disagrees with typed proof")
+        return proof_result.observation
+
+    return read
 
 
 def _scenario(cfg: Config, name: str):
@@ -425,25 +406,9 @@ def objective_recognizable(objective: str) -> tuple[bool, str]:
     return True, "recognizable: non-opaque; completion via no-next-hop/milestone fallback (no DA-phrase target)"
 
 
-def _scored_referee_domains(scn) -> set:
-    """AD-direct domains a scenario SCORES (so the run needs out-of-band referee LDAP creds for each).
-    Mirrors run_side's baseline scope EXACTLY, so the preflight validates precisely the creds the run will
-    require — no more, no less."""
-    sub = set(getattr(scn, "milestone_subset", None) or tuple(Milestone))
-    domains = dict(getattr(scn, "domains", {}) or {})
-    scored: set[str] = set()
-    if Milestone.DA_CHILD in sub:
-        child = str(domains.get("child") or "").strip()
-        if child:
-            scored.add(child)
-    if Milestone.OBJECTIVE in sub and (
-        getattr(scn, "name", "") == gate1p_stageb.SCENARIO
-        or not _objective_uses_remote_exec_probe(scn)
-    ):
-        objective = str(domains.get("objective") or "").strip()
-        if objective:
-            scored.add(objective)
-    return scored
+def _scored_referee_domains(_scn) -> set:
+    """The independent registry admits no direct-LDAP outcome proof."""
+    return set()
 
 
 def _objective_effect_prefixes(scenario) -> tuple[str, ...]:
@@ -466,22 +431,6 @@ def _objective_remote_exec_targets(scenario) -> list[tuple[str, str]]:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
         import engagement_state as _es  # type: ignore
     return list(_es._objective_remote_exec_targets(str(getattr(scenario, "objective", "") or "")))
-
-
-def _referee_creds_present(domain: str) -> tuple[bool, str]:
-    """OFFLINE check: the referee config has dc_ip+user+password for `domain` (reads the JSON config; does
-    NOT bind to LDAP). This is the cheap tier of the cred precondition — the live tier (can we actually bind
-    to the DC) genuinely needs the range up, so only the offline tier is hoisted before the reset."""
-    try:
-        from . import live_seams as _ls
-    except Exception:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import live_seams as _ls  # type: ignore
-    try:
-        _ls.referee_domain_entry(domain, config=_ls.load_referee_ldap_config())
-        return True, f"referee creds present for {domain}"
-    except Exception as e:
-        return False, str(e)
 
 
 def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
@@ -522,8 +471,6 @@ def scenario_preconditions(cfg: "Config", scenario_name: str) -> list:
             "smoke",
             lambda: live_seams.bloodhound_raw_surface_valid(),
         ))
-    for d in sorted(_scored_referee_domains(scn)):
-        checks.append((f"referee-creds:{d}", "offline", (lambda d=d: _referee_creds_present(d))))
     return checks
 
 
@@ -1023,6 +970,7 @@ def run_side(
         _append_jsonl(cfg.results_path, snapshot_record)
     observer = None
     gate1p_oracle = None
+    gate1p_objective_result: effect_registry.ProofResult | None = None
     gate1p_evaluator_state: dict[str, object] = {}
     if row_arm:
         objective_domain = str((getattr(scn, "domains", {}) or {}).get("objective") or CHILD)
@@ -1033,19 +981,47 @@ def run_side(
             "final_members": sorted(baseline_members),
         }
 
-        def _directory_delta_probe() -> bool:
-            final_members = set(reader(objective_domain))
-            gate1p_evaluator_state["final_members"] = sorted(final_members)
-            return bool(final_members - baseline_members)
+        def _unavailable_stagea_proof() -> bool:
+            raise gate1p_stagea.ObserverUnavailable(
+                "legacy Stage A proof class is not admitted by the independent verifier"
+            )
+
+        def _typed_stageb_krbtgt_proof() -> bool:
+            nonlocal gate1p_objective_result
+            try:
+                observation = probes[Milestone.OBJECTIVE]()
+            except Exception as exc:
+                raise gate1p_stageb.ProofUnavailable(str(exc)) from exc
+            result = effect_registry.admit_observation(
+                Milestone.OBJECTIVE,
+                observation,
+                expected_target=objective_domain,
+            )
+            gate1p_objective_result = result
+            if result.disposition is effect_registry.ProofDisposition.PROVEN:
+                return True
+            if result.disposition is effect_registry.ProofDisposition.DISPROVEN:
+                return False
+            raise gate1p_stageb.ProofUnavailable(result.reason)
+
+        def _unavailable_stageb_proof() -> bool:
+            raise gate1p_stageb.ProofUnavailable(
+                "legacy proof class is not admitted by the independent verifier"
+            )
 
         if (
             row_protocol.module is gate1p_stageb
             or getattr(row_protocol.module, "PROOF_ADAPTER_FAMILY", "") == "stageb"
         ):
             gate1p_oracle = row_protocol.build_objective_oracle(
-                _stageb_proof_adapters(
-                    reader, baseline, objective_domain=objective_domain,
-                    directory_probe=_directory_delta_probe,
+                tuple(
+                    gate1p_stageb.make_proof_adapter(
+                        name,
+                        _typed_stageb_krbtgt_proof
+                        if name == "krbtgt_control"
+                        else _unavailable_stageb_proof,
+                    )
+                    for name in gate1p_stageb.OBJECTIVE_PROOF_CLASSES
                 ),
                 artifact_pointer=str(gate1p_artifact_path),
                 domain=objective_domain,
@@ -1053,11 +1029,8 @@ def run_side(
         else:
             gate1p_oracle = row_protocol.build_objective_oracle(
                 {
-                    "directory_delta": _directory_delta_probe,
-                    "certificate_control": live_seams.certificate_admin_control_probe(
-                        None, realm=objective_domain,
-                    ),
-                    "ticket_control": live_seams.ticket_admin_control_probe(realm=objective_domain),
+                    name: _unavailable_stagea_proof
+                    for name in gate1p_stagea.OBJECTIVE_PROOF_CLASSES
                 },
                 artifact_pointer=str(gate1p_artifact_path),
                 summary_factory=lambda: {
@@ -1213,7 +1186,9 @@ def run_side(
                 "request_completed": canonical_outcome["clean_stop"] is True,
             })
         if canonical_outcome.get("countable") is True:
-            probes[Milestone.OBJECTIVE] = lambda: bool(canonical_outcome["objective_success"])
+            probes[Milestone.OBJECTIVE] = _admitted_row_objective_probe(
+                canonical_outcome, gate1p_objective_result,
+            )
         elif observer_result:
             def _observer_unavailable():
                 raise gate1p_stagea.ObserverUnavailable(
@@ -1294,7 +1269,9 @@ def run_side(
                 else {"countable": False, "reason": usage_evidence.get("reason")}
             )
         if canonical_outcome.get("countable") is True:
-            probes[Milestone.OBJECTIVE] = lambda: bool(canonical_outcome["objective_success"])
+            probes[Milestone.OBJECTIVE] = _admitted_row_objective_probe(
+                canonical_outcome, gate1p_objective_result,
+            )
         elif observer_result:
             def _observer_unavailable():
                 raise gate1p_stagea.ObserverUnavailable(

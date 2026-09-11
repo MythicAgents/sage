@@ -62,7 +62,7 @@ except Exception:  # script / sys.path import
 try:  # package import
     from .range_state import Milestone, GroundTruth, DEFAULT_SPEC
     from .process_state import ProcessSignals
-    from . import evaluator_evidence
+    from . import effect_registry, evaluator_evidence
 except Exception:  # script / sys.path import
     import sys
     from pathlib import Path
@@ -70,6 +70,7 @@ except Exception:  # script / sys.path import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from range_state import Milestone, GroundTruth, DEFAULT_SPEC  # type: ignore
     from process_state import ProcessSignals  # type: ignore
+    import effect_registry  # type: ignore
     import evaluator_evidence  # type: ignore
 
 
@@ -117,6 +118,7 @@ def verifier_hash(scenario=None, gauge_version: str = GAUGE_VERSION) -> str:
         "gauge_version": gauge_version,
         "dense_reward_version": DENSE_REWARD_VERSION,
         "evaluator_evidence_schema": evaluator_evidence.EVALUATOR_EVIDENCE_SCHEMA,
+        "independent_effect_registry": effect_registry.registry_payload(),
         "milestones": [m.name for m in Milestone],
         "default_spec": {
             m.name: [list(s.effect_prefixes), (s.domain_role or "")]
@@ -164,6 +166,7 @@ class ScoreCard:
     failure_class_counts: dict = field(default_factory=dict)
     # --- validity alarms (C1) ---
     probe_disagreements: list = field(default_factory=list)
+    proof_dispositions: dict[str, str] = field(default_factory=dict)
     # --- objective-recognition / clean-stop (Phase-1 signal) ---
     # True iff the run reached the scenario's TERMINAL milestone by GROUND TRUTH (probe-verified, not the
     # agent's self-report) AND terminated on its own (clean status, not a churn-to-timeout). This is the
@@ -1049,8 +1052,12 @@ def score(
         per_agent_tokens=dict(r.get("per_agent_tokens") or {}),
         unclassified_rate=(process.unclassified_rate if process else 0.0),
         failure_class_counts=(dict(process.failure_class_counts) if process else {}),
-        probe_disagreements=[m.name if isinstance(m, Milestone) else str(m)
+        probe_disagreements=[getattr(m, "name", str(m))
                              for m in (ground_truth.probe_disagreements or [])],
+        proof_dispositions={
+            getattr(m, "name", str(m)): result.disposition.value
+            for m, result in getattr(ground_truth, "proof_results", {}).items()
+        },
         objective_clean_stop=objective_clean_stop,
         request_completed=request_completed,
         objective_recognized=objective_recognized,

@@ -6,7 +6,7 @@ prove. Domains are the GOAD defaults; the `engagement_id` (the Mythic operation 
 is operator-configurable per lab.
 """
 try:  # package import
-    from . import live_seams
+    from . import probes as probes_mod
     from . import laps_family_transfer_holdout as laps_contract
     from . import trust_context_corroboration as trust_contract
     from .range_state import Scenario, MilestoneSpec, Milestone
@@ -15,7 +15,7 @@ except Exception:  # script / sys.path import
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import live_seams  # type: ignore
+    import probes as probes_mod  # type: ignore
     import laps_family_transfer_holdout as laps_contract  # type: ignore
     import trust_context_corroboration as trust_contract  # type: ignore
     from range_state import Scenario, MilestoneSpec, Milestone  # type: ignore
@@ -37,6 +37,12 @@ _REPLICATION_PURPOSE_RANGE_DOMAINS = {
     "parent": REPLICATION_PURPOSE_RANGE_DOMAIN,
     "objective": REPLICATION_PURPOSE_RANGE_DOMAIN,
 }
+
+
+def _graph_probe():
+    return probes_mod.unavailable_probe(
+        "the replay path has no pre-arm BloodHound baseline"
+    )
 
 
 def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
@@ -90,7 +96,7 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
             domains=_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=tuple(m for m in Milestone if m != Milestone.CERT_FORGED),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             # These verifier factories need run-context inputs (credential store reader, referee baseline)
             # and are built by run_gauge_live.build_probes at live-run time. Their results are captured once
             # while the range is live and replayed from the ledger for offline/hermetic scoring.
@@ -131,7 +137,7 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
             domains=_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
         # Replanning holdout: same direct-LAPS shared lane as above, but the eval harness injects a
@@ -144,7 +150,7 @@ def goad_scenarios(engagement_id: str = "Operation_GOAD") -> list[Scenario]:
             domains=_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
         # Gate 1P Stage A: the first Trust Walker outcome checkpoint.  The GPO computer task used by the
@@ -178,7 +184,7 @@ def purpose_range_scenarios(engagement_id: str = "Operation_SAGE_POLICY_RANGE") 
             domains=_PURPOSE_RANGE_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
         Scenario(
@@ -188,7 +194,7 @@ def purpose_range_scenarios(engagement_id: str = "Operation_SAGE_POLICY_RANGE") 
             domains=_PURPOSE_RANGE_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
         Scenario(
@@ -198,7 +204,7 @@ def purpose_range_scenarios(engagement_id: str = "Operation_SAGE_POLICY_RANGE") 
             domains=_PURPOSE_RANGE_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
         Scenario(
@@ -208,7 +214,7 @@ def purpose_range_scenarios(engagement_id: str = "Operation_SAGE_POLICY_RANGE") 
             domains=_PURPOSE_RANGE_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
     ]
@@ -229,7 +235,7 @@ def replication_purpose_range_scenarios(
             domains=_REPLICATION_PURPOSE_RANGE_DOMAINS,
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("da:", "ea:"), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         ),
     ]
@@ -251,7 +257,7 @@ def laps_family_transfer_holdout_scenarios(
             },
             spec_overrides={Milestone.OBJECTIVE: MilestoneSpec(("remote-exec:",), domain_role="objective")},
             milestone_subset=(Milestone.FOOTHOLD, Milestone.GRAPH_COLLECTED, Milestone.OBJECTIVE),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.OBJECTIVE}),
         )
         for variant in laps_contract.LAPS_FAMILY_TRANSFER_HOLDOUT.objective_variants
@@ -279,7 +285,7 @@ def trust_context_corroboration_scenarios(
                 Milestone.KRBTGT_DUMPED,
                 Milestone.OBJECTIVE,
             ),
-            direct_probes={Milestone.GRAPH_COLLECTED: live_seams.graph_collected_probe()},
+            direct_probes={Milestone.GRAPH_COLLECTED: _graph_probe()},
             recorded_probe_milestones=frozenset({Milestone.KRBTGT_DUMPED, Milestone.OBJECTIVE}),
         ),
     ]

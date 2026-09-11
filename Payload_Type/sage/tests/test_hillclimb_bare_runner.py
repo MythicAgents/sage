@@ -13,7 +13,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb"))
 
 import bare_runner as br  # noqa: E402
+import effect_registry as er  # noqa: E402
 import fitness  # noqa: E402
+import probes as probe_mod  # noqa: E402
 from range_state import Milestone, GroundTruth  # noqa: E402
 from scenarios import goad_scenarios  # noqa: E402
 
@@ -250,7 +252,13 @@ def test_each_dispatcher_error_class_is_recoverable_and_retained():
 def test_score_bare_run_uses_probes():
     scn = goad_scenarios()[0]
     res = br.BareModelResult(objective="obj", steps=4, stopped="done")
-    probes = {Milestone.GRAPH_COLLECTED: lambda: True, Milestone.SYSTEM_ON_HOST: lambda: True}
+    probes = {Milestone.SYSTEM_ON_HOST: probe_mod.registered_probe(
+        Milestone.SYSTEM_ON_HOST,
+        lambda: True,
+        origin=er.ProofOrigin.MYTHIC_TASK_OUTPUT,
+        proof_kind="system_identity",
+        target=scn.domains["child"],
+    )}
     card = br.score_bare_run(res, scn, probes)
     assert card.furthest_milestone == "SYSTEM_ON_HOST"
     assert card.substring_score == 0.0          # substring eval doesn't apply to a bare model

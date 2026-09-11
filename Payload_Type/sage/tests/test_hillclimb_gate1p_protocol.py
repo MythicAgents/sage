@@ -310,7 +310,7 @@ def test_stagea_adapter_contract_remains_allocated_to_pair_024():
     assert protocol.validate_request(require_allocation=True, **_request(protocol)) == "shipping_sage"
 
 
-def test_stageb_mixed_proof_scenario_builds_or_composed_probes_without_exclusive_remote_route(
+def test_stageb_objective_uses_fresh_independent_krbtgt_proof(
     monkeypatch,
 ):
     calls = {}
@@ -324,23 +324,24 @@ def test_stageb_mixed_proof_scenario_builds_or_composed_probes_without_exclusive
         "ticket_admin_control_probe",
         lambda **_kwargs: (lambda: False),
     )
+    credential_states = iter((False, True))
     monkeypatch.setattr(
         rgl.live_seams,
-        "krbtgt_dumped_probe",
-        lambda **_kwargs: (lambda: False),
+        "mythic_credential_probe",
+        lambda *_a, **_k: (lambda: next(credential_states)),
     )
+    monkeypatch.setattr(rgl.live_seams, "_krbtgt_task_output_has_material", lambda **_k: False)
 
-    def system_probe(*, realm, host=None, **_kwargs):
-        calls["system"] = (host, realm)
-        states = iter((False, True))
-        return lambda: next(states)
-
-    def remote_probe(host, *, realm, **_kwargs):
-        calls["remote"] = (host, realm)
-        return lambda: False
-
-    monkeypatch.setattr(rgl.live_seams, "system_execution_probe", system_probe)
-    monkeypatch.setattr(rgl.live_seams, "remote_execution_probe", remote_probe)
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "system_execution_probe",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("SYSTEM is not domain-control proof")),
+    )
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "remote_execution_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("remote exec is not domain-control proof")),
+    )
     scenario = rgl._scenario(rgl.Config(), gate1p_stageb.SCENARIO)
     probes = rgl.build_probes(
         lambda _domain: {"new-domain-admin"},
@@ -348,23 +349,29 @@ def test_stageb_mixed_proof_scenario_builds_or_composed_probes_without_exclusive
         scenario,
     )
 
-    assert probes[Milestone.OBJECTIVE]() is True
-    assert calls == {
-        "system": ("WINTERFELL", gate1p_stageb.OBJECTIVE_DOMAIN),
-        "remote": ("WINTERFELL", gate1p_stageb.OBJECTIVE_DOMAIN),
-    }
-    assert rgl._scored_referee_domains(scenario) == {gate1p_stageb.OBJECTIVE_DOMAIN}
+    result = rgl.effect_registry.admit_observation(
+        Milestone.OBJECTIVE,
+        probes[Milestone.OBJECTIVE](),
+        expected_target=gate1p_stageb.OBJECTIVE_DOMAIN,
+    )
+    assert result.disposition is rgl.effect_registry.ProofDisposition.PROVEN
+    assert calls == {}
+    assert rgl._scored_referee_domains(scenario) == set()
 
 
-def test_stageb_optional_probe_unavailability_does_not_erase_valid_certificate_route(monkeypatch):
-    certificate_states = iter((False, True))
+def test_stageb_shipping_certificate_verifier_is_not_an_independent_proof_route(monkeypatch):
     monkeypatch.setattr(
         rgl.live_seams,
         "certificate_admin_control_probe",
-        lambda *_args, **_kwargs: (lambda: next(certificate_states)),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("shipping verifier reused")),
     )
-    monkeypatch.setattr(rgl.live_seams, "ticket_admin_control_probe", lambda **_kwargs: (lambda: False))
-    monkeypatch.setattr(rgl.live_seams, "krbtgt_dumped_probe", lambda **_kwargs: (lambda: False))
+    monkeypatch.setattr(
+        rgl.live_seams,
+        "ticket_admin_control_probe",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("shipping verifier reused")),
+    )
+    monkeypatch.setattr(rgl.live_seams, "mythic_credential_probe", lambda *_a, **_k: (lambda: False))
+    monkeypatch.setattr(rgl.live_seams, "_krbtgt_task_output_has_material", lambda **_k: False)
     monkeypatch.setattr(rgl.live_seams, "system_execution_probe", lambda **_kwargs: (lambda: False))
 
     def unavailable_remote(*_args, **_kwargs):
@@ -381,7 +388,8 @@ def test_stageb_optional_probe_unavailability_does_not_erase_valid_certificate_r
         scenario,
     )
 
-    assert probes[Milestone.OBJECTIVE]() is True
+    with pytest.raises(rgl.probes_mod.ProbeUnavailable):
+        probes[Milestone.OBJECTIVE]()
 
 
 def test_stageb_task_and_callback_routes_reject_evidence_true_before_the_arm(monkeypatch):
@@ -391,7 +399,8 @@ def test_stageb_task_and_callback_routes_reject_evidence_true_before_the_arm(mon
         lambda *_args, **_kwargs: (lambda: True),
     )
     monkeypatch.setattr(rgl.live_seams, "ticket_admin_control_probe", lambda **_kwargs: (lambda: True))
-    monkeypatch.setattr(rgl.live_seams, "krbtgt_dumped_probe", lambda **_kwargs: (lambda: True))
+    monkeypatch.setattr(rgl.live_seams, "mythic_credential_probe", lambda *_a, **_k: (lambda: True))
+    monkeypatch.setattr(rgl.live_seams, "_krbtgt_task_output_has_material", lambda **_k: True)
     monkeypatch.setattr(rgl.live_seams, "system_execution_probe", lambda **_kwargs: (lambda: True))
     monkeypatch.setattr(rgl.live_seams, "remote_execution_probe", lambda *_args, **_kwargs: (lambda: True))
     scenario = rgl._scenario(rgl.Config(), gate1p_stageb.SCENARIO)
@@ -401,7 +410,8 @@ def test_stageb_task_and_callback_routes_reject_evidence_true_before_the_arm(mon
         scenario,
     )
 
-    assert probes[Milestone.OBJECTIVE]() is False
+    with pytest.raises(rgl.probes_mod.ProbeUnavailable, match="no fresh positive transition"):
+        probes[Milestone.OBJECTIVE]()
 
 
 def test_stageb_live_run_rejects_missing_authority_before_any_live_seam(monkeypatch):

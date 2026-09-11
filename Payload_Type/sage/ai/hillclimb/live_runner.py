@@ -30,9 +30,9 @@ from pathlib import Path
 from typing import Callable
 
 try:  # package import
-    from . import live_seams, probes as probes_mod, run_gauge_live
+    from . import effect_registry, live_seams, probes as probes_mod, run_gauge_live
     from .gate_experiment import build_scorecard_from_run
-    from .fitness import GAUGE_VERSION, ScoreCard
+    from .fitness import GAUGE_VERSION, ScoreCard, verifier_hash as current_verifier_hash
     from .range_state import Milestone, PROBEABLE_MILESTONES
     from ..langgraph import engagement_ledger
 except Exception:  # script / sys.path import
@@ -40,9 +40,9 @@ except Exception:  # script / sys.path import
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
-    import live_seams, probes as probes_mod, run_gauge_live  # type: ignore
+    import effect_registry, live_seams, probes as probes_mod, run_gauge_live  # type: ignore
     from gate_experiment import build_scorecard_from_run  # type: ignore
-    from fitness import GAUGE_VERSION, ScoreCard  # type: ignore
+    from fitness import GAUGE_VERSION, ScoreCard, verifier_hash as current_verifier_hash  # type: ignore
     from range_state import Milestone, PROBEABLE_MILESTONES  # type: ignore
     import engagement_ledger  # type: ignore
 
@@ -83,34 +83,33 @@ def _captureable_probe_milestones(scenario) -> tuple[Milestone, ...]:
     """
     direct = set(getattr(scenario, "direct_probes", {}) or {})
     recorded = set(getattr(scenario, "recorded_probe_milestones", frozenset()) or frozenset())
-    exempt = set(getattr(scenario, "self_report_exempt", frozenset()) or frozenset())
-    declared = direct | recorded | exempt
+    declared = direct | recorded
     return tuple(m for m in _scored_milestones(scenario) if m in PROBEABLE_MILESTONES and m in declared)
 
 
 def _persist_ground_truth_probe_results(
     engagement_id: str,
-    milestones: dict,
+    proof_results: dict,
     *,
     recorded_milestones: set[Milestone],
     verifier_hash: str | None = None,
 ) -> dict:
     """Add the captured live-probe vector to the engagement ledger.
 
-    The write is deliberately additive: existing hop/evidence keys are loaded, preserved, and saved through
-    engagement_ledger. Only milestones backed by a probe in this capture are written, using Milestone.name so
-    the JSON stays stable and inspectable across enum value changes.
+    The write is deliberately additive: existing hop/evidence keys are preserved. Only registry-validated
+    ``ProofResult`` records from this capture are written, keyed by stable ``Milestone.name`` values.
     """
-    values: dict[str, bool] = {}
-    for milestone, value in milestones.items():
-        if milestone in recorded_milestones:
-            values[milestone.name] = bool(value)
+    values: dict[str, dict] = {}
+    for milestone, result in proof_results.items():
+        if milestone in recorded_milestones and isinstance(result, effect_registry.ProofResult):
+            values[milestone.name] = result.to_record()
     if not values:
         return {}
     record: dict[str, object] = {
         **values,
         "_captured_at": datetime.now(timezone.utc).isoformat(),
-        "_source": "probe",
+        "_source": "independent_evaluator",
+        "_registry_version": effect_registry.REGISTRY_VERSION,
     }
     if verifier_hash:
         record["_verifier_hash"] = verifier_hash
@@ -219,8 +218,9 @@ class LiveRunner:
         gt = probes_mod.read_ground_truth_from_probes(scenario, probes)
         return _persist_ground_truth_probe_results(
             engagement_id,
-            gt.milestones,
+            gt.proof_results,
             recorded_milestones=recordable,
+            verifier_hash=current_verifier_hash(scenario, self.gauge_version),
         )
 
     def run_batch(self, config, scenario, seeds: int = 5) -> list[ScoreCard]:

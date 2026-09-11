@@ -1,31 +1,151 @@
-"""C1 direct-probe layer — ledger-INDEPENDENT ground truth for the eval gauge.
-
-range_state.py reads verified milestones from Sage's engagement ledger — perfect for comparing Sage
-configs, but useless for a NON-Sage agent (a bare model never writes that ledger). To compare bare
-model vs harness fairly you need ground truth from a source they BOTH share: the actual range state.
-
-This module reads milestones straight from the range (BloodHound, credential presence, …), independent
-of the ledger. It returns the same `GroundTruth` shape range_state does, so it drops straight into C2.
-
-Live queries are an INJECTED seam (`cypher_run`): wire it to the BloodHound MCP `bloodhound_query` tool
-(info_type='run', single-column RETURN, values from data.literals — see graph_reconciler). Kept injected
-so the logic is unit-tested here and only the live MCP call is the operator's lab step. The example
-cyphers below are illustrative — verify them against your BloodHound schema on first run.
-"""
+"""Typed direct-probe adapters for the independent eval-gauge verifier."""
 from __future__ import annotations
 
 from typing import Callable
+import uuid
 
 try:  # package import
+    from . import effect_registry
     from .range_state import Milestone, GroundTruth
 except Exception:  # script / sys.path import
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import effect_registry  # type: ignore
     from range_state import Milestone, GroundTruth  # type: ignore
 
 DirectProbe = Callable[[], bool]
+TypedProbe = Callable[[], effect_registry.OracleObservation]
+
+
+class ProbeUnavailable(RuntimeError):
+    """The declared oracle could not produce an observation."""
+
+
+def registered_probe(
+    milestone: Milestone,
+    probe: DirectProbe,
+    *,
+    origin: effect_registry.ProofOrigin,
+    proof_kind: str,
+    target: str = "",
+) -> TypedProbe:
+    """Bind a trusted evaluator adapter to its immutable registry identity."""
+    contract = effect_registry.contract_for(milestone)
+
+    def read() -> effect_registry.OracleObservation:
+        value = probe()
+        return effect_registry.OracleObservation(
+            registry_version=effect_registry.REGISTRY_VERSION,
+            oracle_id=contract.oracle_id,
+            origin=origin,
+            proof_kind=proof_kind,
+            outcome=value,
+            observation_id=uuid.uuid4().hex,
+            target=target,
+        )
+
+    return read
+
+
+def unavailable_probe(reason: str) -> TypedProbe:
+    def read() -> effect_registry.OracleObservation:
+        raise ProbeUnavailable(reason)
+
+    return read
+
+
+def positive_only(probe: DirectProbe, reason: str) -> DirectProbe:
+    """Adapt a legacy fail-soft reader without misclassifying its False as measured evidence."""
+    def read() -> bool:
+        value = probe()
+        if value is True:
+            return True
+        raise ProbeUnavailable(reason)
+
+    return read
+
+
+def fresh_positive(probe: DirectProbe, reason: str) -> DirectProbe:
+    """Require a False pre-arm baseline and a later True observation."""
+    try:
+        baseline = probe()
+    except Exception as exc:
+        baseline_error = exc
+        baseline = None
+    else:
+        baseline_error = None
+
+    def read() -> bool:
+        if baseline_error is not None or type(baseline) is not bool:
+            raise ProbeUnavailable(f"{reason}; pre-arm baseline unavailable")
+        current = probe()
+        if type(current) is not bool:
+            raise ProbeUnavailable(f"{reason}; observation was not Boolean")
+        if current and not baseline:
+            return True
+        raise ProbeUnavailable(f"{reason}; no fresh positive transition")
+
+    return read
+
+
+def any_registered_probe(*candidates: TypedProbe) -> TypedProbe:
+    """Preserve the first independently successful path and its exact origin."""
+    def read() -> effect_registry.OracleObservation:
+        first_negative = None
+        errors: list[Exception] = []
+        for candidate in candidates:
+            try:
+                observation = candidate()
+            except Exception as exc:
+                errors.append(exc)
+                continue
+            if not isinstance(observation, effect_registry.OracleObservation):
+                return observation
+            if type(observation.outcome) is bool and observation.outcome:
+                return observation
+            if first_negative is None:
+                first_negative = observation
+        if first_negative is not None:
+            return first_negative
+        if errors:
+            raise errors[0]
+        raise ProbeUnavailable("no independent proof path configured")
+
+    return read
+
+
+def domain_admin_differential_probe(
+    admin_probe: DirectProbe,
+    non_admin_denied_probe: DirectProbe,
+    *,
+    target: str,
+    envelope_id: str,
+    admin_subject: str,
+    non_admin_subject: str,
+) -> TypedProbe:
+    """Build the matched allow/deny observation required for Domain Administrator proof."""
+    contract = effect_registry.contract_for(Milestone.DA_CHILD)
+
+    def read() -> effect_registry.OracleObservation:
+        return effect_registry.OracleObservation(
+            registry_version=effect_registry.REGISTRY_VERSION,
+            oracle_id=contract.oracle_id,
+            origin=effect_registry.ProofOrigin.MYTHIC_TASK_OUTPUT,
+            proof_kind="domain_admin_differential",
+            outcome=admin_probe(),
+            observation_id=uuid.uuid4().hex,
+            target=target,
+            subject=admin_subject,
+            envelope_id=envelope_id,
+            negative_control_denied=non_admin_denied_probe(),
+            control_target=target,
+            control_subject=non_admin_subject,
+            control_envelope_id=envelope_id,
+        )
+
+    return read
 
 
 def read_ground_truth_from_probes(
@@ -34,29 +154,43 @@ def read_ground_truth_from_probes(
     *,
     foothold_seen: bool | None = None,
 ) -> GroundTruth:
-    """Build the milestone vector PURELY from direct range probes — no engagement ledger.
-
-    The ground truth that works for ANY agent (incl. a bare model) and is what bare-vs-harness needs.
-    A milestone with no probe is False (unmeasured). A probe that raises is False AND recorded in
-    `probe_disagreements` (here meaning "probe could not run"), so failures are visible, not silently
-    negative. Returns the same `GroundTruth` shape as range_state, so it flows straight into C2.
-    """
+    """Build ground truth from typed independent probes, never raw Boolean claims."""
     candidates = scenario.milestone_subset or tuple(m for m in Milestone)
     milestones: dict = {}
-    errored: list = []
+    results: dict = {}
     for m in candidates:
         if m == Milestone.FOOTHOLD and foothold_seen is not None:
-            milestones[m] = bool(foothold_seen)
-            continue
-        probe = probes.get(m)
-        if probe is None:
-            milestones[m] = False
-            continue
-        try:
-            milestones[m] = bool(probe())
-        except Exception:
-            milestones[m] = False
-            errored.append(m)
+            contract = effect_registry.contract_for(m)
+            result = effect_registry.admit_observation(
+                m,
+                effect_registry.OracleObservation(
+                    registry_version=effect_registry.REGISTRY_VERSION,
+                    oracle_id=contract.oracle_id,
+                    origin=effect_registry.ProofOrigin.MYTHIC_ARTIFACT,
+                    proof_kind="starting_callback",
+                    outcome=foothold_seen,
+                    observation_id=f"starting:{getattr(scenario, 'name', 'scenario')}",
+                    target=str(getattr(scenario, "domains", {}).get(contract.target_role, "")),
+                ),
+                expected_target=str(getattr(scenario, "domains", {}).get(contract.target_role, "")),
+            )
+        else:
+            probe = probes.get(m)
+            if probe is None:
+                result = effect_registry.unavailable_result(m, "no independent probe configured")
+            else:
+                try:
+                    observation = probe()
+                except Exception as exc:
+                    result = effect_registry.unavailable_result(
+                        m, f"independent probe unavailable: {type(exc).__name__}"
+                    )
+                else:
+                    contract = effect_registry.contract_for(m)
+                    expected = str(getattr(scenario, "domains", {}).get(contract.target_role, ""))
+                    result = effect_registry.admit_observation(m, observation, expected_target=expected)
+        results[m] = result
+        milestones[m] = result.proven
 
     furthest = Milestone.FOOTHOLD
     for m in sorted(milestones):
@@ -67,7 +201,12 @@ def read_ground_truth_from_probes(
         scenario=getattr(scenario, "name", "scn"),
         milestones=milestones,            # enum-keyed, like range_state.read_ground_truth
         furthest=furthest,
-        probe_disagreements=errored,      # milestones whose probe could not run
+        probe_disagreements=[
+            milestone for milestone, result in results.items()
+            if result.disposition in {effect_registry.ProofDisposition.UNMEASURED,
+                                      effect_registry.ProofDisposition.INVALID}
+        ],
+        proof_results=results,
     )
 
 

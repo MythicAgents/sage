@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "hillclimb")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ai" / "langgraph"))
 
 import engagement_ledger  # noqa: E402
+import effect_registry as er  # noqa: E402
 import live_runner as lr  # noqa: E402
 import gate_experiment as gx  # noqa: E402
 from range_state import Milestone  # noqa: E402
@@ -103,12 +104,35 @@ def test_run_batch_capture_persists_ground_truth_probes_by_engagement_id(monkeyp
 
     def capture(_scenario, token):
         tokens.append(token)
+        def result(milestone, outcome):
+            contract = er.contract_for(milestone)
+            proof_kind = "domain_admin_differential" if milestone is Milestone.DA_CHILD else "krbtgt_material"
+            observation = er.OracleObservation(
+                registry_version=er.REGISTRY_VERSION,
+                oracle_id=contract.oracle_id,
+                origin=(er.ProofOrigin.MYTHIC_TASK_OUTPUT if milestone is Milestone.DA_CHILD
+                        else er.ProofOrigin.MYTHIC_CREDENTIAL_STORE),
+                proof_kind=proof_kind,
+                outcome=outcome,
+                observation_id=f"obs-{milestone.name}",
+                target=_scenario.domains["child"],
+                subject=(f"administrator@{_scenario.domains['child']}"
+                         if milestone is Milestone.DA_CHILD else ""),
+                envelope_id="run-1" if milestone is Milestone.DA_CHILD else "",
+                negative_control_denied=True if milestone is Milestone.DA_CHILD else None,
+                control_target=_scenario.domains["child"] if milestone is Milestone.DA_CHILD else "",
+                control_subject=(f"samwell@{_scenario.domains['child']}"
+                                 if milestone is Milestone.DA_CHILD else ""),
+                control_envelope_id="run-1" if milestone is Milestone.DA_CHILD else "",
+            )
+            return er.admit_observation(
+                milestone, observation, expected_target=_scenario.domains["child"]
+            )
         return lr._persist_ground_truth_probe_results(
             token,
             {
-                Milestone.FOOTHOLD: False,
-                Milestone.DA_CHILD: True,
-                Milestone.KRBTGT_DUMPED: False,
+                Milestone.DA_CHILD: result(Milestone.DA_CHILD, True),
+                Milestone.KRBTGT_DUMPED: result(Milestone.KRBTGT_DUMPED, False),
             },
             recorded_milestones={Milestone.DA_CHILD, Milestone.KRBTGT_DUMPED},
         )
@@ -118,10 +142,11 @@ def test_run_batch_capture_persists_ground_truth_probes_by_engagement_id(monkeyp
 
     assert len(tokens) == 1
     data = engagement_ledger.load(tokens[0])
-    assert data["ground_truth_probes"]["DA_CHILD"] is True
-    assert data["ground_truth_probes"]["KRBTGT_DUMPED"] is False
+    assert data["ground_truth_probes"]["DA_CHILD"]["disposition"] == "proven"
+    assert data["ground_truth_probes"]["KRBTGT_DUMPED"]["disposition"] == "disproven"
     assert "FOOTHOLD" not in data["ground_truth_probes"]
-    assert data["ground_truth_probes"]["_source"] == "probe"
+    assert data["ground_truth_probes"]["_source"] == "independent_evaluator"
+    assert data["ground_truth_probes"]["_registry_version"] == er.REGISTRY_VERSION
     assert isinstance(data["ground_truth_probes"]["_captured_at"], str)
 
 

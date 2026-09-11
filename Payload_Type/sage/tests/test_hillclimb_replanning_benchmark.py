@@ -53,4 +53,4 @@ def test_replanning_benchmark_scenario_uses_existing_purpose_range_referee_domai
     assert "purpose-range-ca-export-replanning" in {
         item.name for item in all_scenarios("replanning-eval")
     }
-    assert run_gauge_live._scored_referee_domains(scenario) == {"range.local"}
+    assert run_gauge_live._scored_referee_domains(scenario) == set()

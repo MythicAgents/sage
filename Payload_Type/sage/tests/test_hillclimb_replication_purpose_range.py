@@ -54,4 +54,4 @@ def test_replication_purpose_range_scenario_uses_replication_referee_domain():
     assert "replication-purpose-range-visible-cost" in {
         scenario.name for scenario in all_scenarios("replication-eval")
     }
-    assert run_gauge_live._scored_referee_domains(scenarios[0]) == {"replication.local"}
+    assert run_gauge_live._scored_referee_domains(scenarios[0]) == set()
