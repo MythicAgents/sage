@@ -15,6 +15,35 @@ SPEC = importlib.util.spec_from_file_location("reset_orchestrator", SCRIPT)
 reset = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(reset)
+READINESS_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "readiness_contract.py"
+READINESS_SPEC = importlib.util.spec_from_file_location("reset_readiness_contract", READINESS_SCRIPT)
+readiness = importlib.util.module_from_spec(READINESS_SPEC)
+assert READINESS_SPEC and READINESS_SPEC.loader
+READINESS_SPEC.loader.exec_module(readiness)
+
+
+def _ready_sections(lane: str) -> dict:
+    return {
+        name: {"ready": True, "blockers": []}
+        for name in readiness.READINESS_LANE_SECTIONS[lane]
+    }
+
+
+def _canonical_ready_output(lane: str) -> dict:
+    decision = readiness.evaluate_readiness(
+        lane=lane,
+        sections=_ready_sections(lane),
+        observation_id=f"{lane}-test-observation",
+    )
+    if lane == "range_boot":
+        return decision
+    return {
+        "schema": readiness.READINESS_CONTRACT_SCHEMA,
+        "ready": True,
+        "observation_id": decision["observation_id"],
+        "readiness": decision,
+        **_ready_sections(lane),
+    }
 
 
 def _config() -> dict:
@@ -44,8 +73,10 @@ def _successful_phase(
     name: str, command: list[str], _config: dict
 ) -> dict:
     assert command
-    if name in reset.READY_RESULT_PHASES:
-        return {"ready": True, "blockers": []}
+    if name == "wait-range-ips":
+        return _canonical_ready_output("range_boot")
+    if name == "final-readiness":
+        return _canonical_ready_output("full")
     return {"ok": True, "phase": name}
 
 
@@ -77,11 +108,12 @@ def _complete_phase(phase: dict) -> None:
     phase["status"] = "completed"
     phase["started_at"] = "2026-07-23T00:00:00+00:00"
     phase["finished_at"] = "2026-07-23T00:00:01+00:00"
-    output = (
-        {"ready": True, "blockers": []}
-        if phase["name"] in reset.READY_RESULT_PHASES
-        else {"ok": True}
-    )
+    if phase["name"] == "wait-range-ips":
+        output = _canonical_ready_output("range_boot")
+    elif phase["name"] == "final-readiness":
+        output = _canonical_ready_output("full")
+    else:
+        output = {"ok": True}
     phase["result_summary"] = reset._completed_result(
         phase["name"], output
     )
@@ -137,6 +169,50 @@ def test_plan_has_canonical_order_and_never_deploys_payload():
     assert commands["bootstrap-chat-and-foothold"][-1] != "--prepare-chat"
     assert "--no-prepare-chat" in commands["bootstrap-chat-and-foothold"]
     assert "--no-require-prepared-channel" in commands["final-readiness"]
+
+
+def test_wait_for_range_delegates_to_canonical_fresh_poller(monkeypatch):
+    calls = []
+
+    class _Contract:
+        LUDUS_PROBE_TIMEOUT_SECONDS = 30.0
+        DEFAULT_TIMEOUT_GRACE_SECONDS = 5.0
+
+        @staticmethod
+        def range_boot_observation():
+            raise AssertionError("the injected poller owns probe execution")
+
+        @staticmethod
+        def poll_readiness(probe, **kwargs):
+            calls.append((probe, kwargs))
+            return _canonical_ready_output("range_boot")
+
+    monkeypatch.setattr(reset, "_load_module", lambda *_args: _Contract)
+
+    result = reset._wait_for_range(_config(), sleep=lambda _seconds: None)
+
+    assert result["ready"] is True
+    assert len(calls) == 1
+    assert calls[0][0] is _Contract.range_boot_observation
+    assert calls[0][1]["lane"] == "range_boot"
+    assert calls[0][1]["outer_timeout_seconds"] == 60
+
+
+def test_cli_rejects_outer_timeout_not_greater_than_child_plus_grace():
+    args = reset.build_parser().parse_args(
+        [
+            "plan",
+            "--snapshot",
+            "exact-clean-snapshot",
+            "--callback-host",
+            "http://100.64.0.1",
+            "--range-ready-timeout",
+            "35",
+        ]
+    )
+
+    with pytest.raises(reset.ResetError, match="strictly greater"):
+        reset._config_from_args(args)
 
 
 def test_start_pauses_at_operator_boundary_with_zero_task_delta(tmp_path):
@@ -237,7 +313,7 @@ def test_final_readiness_requires_literal_json_boolean_true(
     assert checkpoint["terminal"]["state"] == "blocked"
     final = checkpoint["phases"][-1]
     assert final["status"] == "failed"
-    assert "ready=true as a JSON boolean" in final["error"]
+    assert "canonical full readiness" in final["error"]
     assert [
         row["phase"] for row in checkpoint["task_observations"]
     ] == [
@@ -266,11 +342,9 @@ def test_literal_boolean_true_final_readiness_completes(tmp_path):
 
     assert code == 0
     assert checkpoint["terminal"]["state"] == "complete"
-    assert checkpoint["phases"][-1]["result_summary"] == {
-        "phase": "final-readiness",
-        "succeeded": True,
-        "output": {"ready": True, "blockers": []},
-    }
+    assert checkpoint["phases"][-1]["result_summary"]["phase"] == "final-readiness"
+    assert checkpoint["phases"][-1]["result_summary"]["succeeded"] is True
+    assert checkpoint["phases"][-1]["result_summary"]["output"]["ready"] is True
 
 
 def test_nonzero_task_delta_blocks_before_operator_boundary(tmp_path):

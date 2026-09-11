@@ -228,7 +228,7 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "APOLLO_CALLBACK_HOST"
         )
     restart_env = _parse_restart_env(args.restart_env)
-    return {
+    config = {
         "snapshot": snapshot,
         "bootstrap_mode": bootstrap_mode,
         "retained_callback_config": retained_path,
@@ -249,6 +249,18 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             else ""
         ),
     }
+    contract = _load_module(
+        "sage_reset_readiness_contract_config", READINESS_CONTRACT
+    )
+    try:
+        contract.validate_timeout_budget(
+            outer_timeout_seconds=config["range_ready_timeout"],
+            child_timeout_seconds=contract.LUDUS_PROBE_TIMEOUT_SECONDS,
+            grace_seconds=contract.DEFAULT_TIMEOUT_GRACE_SECONDS,
+        )
+    except ValueError as exc:
+        raise ResetError(str(exc)) from exc
+    return config
 
 
 def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
@@ -464,11 +476,24 @@ def _validate_phase_output(
 ) -> dict[str, Any]:
     if not isinstance(output, dict):
         error(f"{phase_name} result must be an object")
-    if (
-        phase_name in READY_RESULT_PHASES
-        and output.get("ready") is not True
-    ):
-        error(f"{phase_name} requires ready=true as a JSON boolean")
+    if phase_name == "wait-range-ips":
+        if (
+            output.get("schema") != "sage-readiness-decision-v1"
+            or output.get("lane") != "range_boot"
+            or output.get("ready") is not True
+            or output.get("launch_released") is not True
+        ):
+            error("wait-range-ips requires the canonical range_boot readiness decision")
+    if phase_name == "final-readiness":
+        contract = _load_module(
+            "sage_reset_readiness_contract_output", READINESS_CONTRACT
+        )
+        decision = contract.parse_release_output(output, expected_lane="full")
+        if decision.get("ready") is not True:
+            error(
+                "final-readiness requires canonical full readiness: "
+                + "; ".join(decision.get("blockers") or [])
+            )
     if phase_name == "await-operator-foothold-launch" and (
         output.get("operator_acknowledged") is not True
         or not _is_int(output.get("payload_tasks_issued"))
@@ -1042,17 +1067,21 @@ def _wait_for_range(
     contract = _load_module(
         "sage_reset_readiness_contract", READINESS_CONTRACT
     )
-    deadline = time.monotonic() + config["range_ready_timeout"]
-    last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        last = contract.probe_ludus_status()
-        if last.get("ready") is True:
-            return last
-        sleep(config["range_poll_interval"])
-    raise ResetError(
-        "range did not reach exact six-VM/IP readiness; blockers="
-        + json.dumps(last.get("blockers") or [])
+    decision = contract.poll_readiness(
+        contract.range_boot_observation,
+        lane="range_boot",
+        outer_timeout_seconds=config["range_ready_timeout"],
+        child_timeout_seconds=contract.LUDUS_PROBE_TIMEOUT_SECONDS,
+        grace_seconds=contract.DEFAULT_TIMEOUT_GRACE_SECONDS,
+        poll_seconds=config["range_poll_interval"],
+        sleep=sleep,
     )
+    if decision.get("ready") is not True:
+        raise ResetError(
+            "range did not reach exact six-VM/IP readiness; blockers="
+            + json.dumps(decision.get("blockers") or [])
+        )
+    return decision
 
 
 def run_phase_command(

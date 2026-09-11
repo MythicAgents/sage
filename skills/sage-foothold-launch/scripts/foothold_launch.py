@@ -37,6 +37,8 @@ REPO = Path(__file__).resolve().parents[3]
 PY = str(REPO / ".venv" / "bin" / "python")
 CERT = str(REPO / "Payload_Type" / "sage" / "certs" / "combined-bundle.pem")
 RUN_AS_RESOLVER_PATH = Path(__file__).resolve().with_name("run_as_resolver.py")
+READINESS_CONTRACT_PATH = REPO / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
+SYNC_RANGE_TIME_PATH = REPO / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py"
 
 LUDUS = "skills/sage-goad-reset/scripts/ludus.py"
 CLOCK = "skills/sage-goad-reset/scripts/sync_range_time.py"
@@ -50,16 +52,18 @@ DEFAULT_RUN_AS = "NORTH\\samwell.tarly"
 DEFAULT_SERVE_HOST = os.environ.get("SAGE_SERVE_HOST", "100.108.59.85")  # operator Tailscale IP
 
 
-def _load_run_as_resolver():
-    spec = importlib.util.spec_from_file_location("sage_operator_run_as_resolver", RUN_AS_RESOLVER_PATH)
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load run-as resolver: {RUN_AS_RESOLVER_PATH}")
+        raise RuntimeError(f"could not load helper module: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_RUN_AS_RESOLVER = _load_run_as_resolver()
+_RUN_AS_RESOLVER = _load_module("sage_operator_run_as_resolver", RUN_AS_RESOLVER_PATH)
+_READINESS = _load_module("sage_foothold_readiness_contract", READINESS_CONTRACT_PATH)
+_SYNC_RANGE_TIME = _load_module("sage_foothold_sync_range_time", SYNC_RANGE_TIME_PATH)
 
 
 def _env() -> dict:
@@ -157,8 +161,23 @@ def do_verify(args) -> dict:
     return {"step": "verify", "foothold": inspect_foothold()}
 
 
+def _wait_for_callback_readiness(args) -> dict:
+    return _READINESS.poll_readiness(
+        _READINESS.callback_readiness_observation,
+        lane="callback",
+        outer_timeout_seconds=args.readiness_wait_seconds,
+        child_timeout_seconds=_READINESS.CALLBACK_PROBE_TIMEOUT_SECONDS,
+        grace_seconds=_READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS,
+        poll_seconds=args.poll_interval,
+    )
+
+
 def do_launch(args) -> dict:
-    steps = []
+    readiness = _wait_for_callback_readiness(args)
+    steps = [{"pre_launch_readiness": readiness}]
+    if readiness.get("ready") is not True:
+        return {"step": "launch", "verdict": "readiness_blocked", "readiness": readiness,
+                "new_live_callbacks": [], "steps": steps}
     # Baseline live Apollo callbacks before the launch, so uniqueness is measured, not assumed.
     before = inspect_foothold()
     before_live = {c["display_id"] for c in (before.get("callbacks") or []) if c.get("live")}
@@ -232,43 +251,42 @@ def do_launch(args) -> dict:
     return {"step": "launch", "verdict": verdict, "new_live_callbacks": new_live, "steps": steps}
 
 
-def _vms_on(status_stdout: str) -> int:
-    """Count range VM lines reporting ON (status prints one `  ON  <name>` line per VM)."""
-    n = 0
-    for line in (status_stdout or "").splitlines():
-        toks = line.strip().split()
-        if toks and toks[0] == "ON":
-            n += 1
-    return n
-
-
 def do_rebuild(args) -> dict:
+    _READINESS.validate_timeout_budget(
+        outer_timeout_seconds=args.boot_wait_seconds,
+        child_timeout_seconds=_READINESS.LUDUS_PROBE_TIMEOUT_SECONDS,
+        grace_seconds=_READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS,
+    )
+    _READINESS.validate_timeout_budget(
+        outer_timeout_seconds=args.clock_wait_seconds,
+        child_timeout_seconds=_SYNC_RANGE_TIME.DEFAULT_AUTH_WAIT_SECONDS,
+        grace_seconds=args.clock_timeout_grace_seconds,
+    )
     steps = []
     rb = run([PY, LUDUS, "rollback", args.snapshot, "--yes"], timeout=600)
     steps.append({"rollback": {"rc": rb.get("rc"), "out": (rb.get("stdout") or "")[-400:],
                                "err": (rb.get("stderr") or "")[-300:]}})
     po = run([PY, LUDUS, "poweron", "all"], timeout=600)
     steps.append({"poweron": {"rc": po.get("rc"), "out": (po.get("stdout") or "")[-300:]}})
-    # Wait for all six VMs to report ON before touching WinRM.
-    on_deadline = time.monotonic() + args.boot_wait_seconds
-    vms_on = 0
-    while time.monotonic() < on_deadline:
-        st = run([PY, LUDUS, "status"], timeout=120)
-        vms_on = _vms_on(st.get("stdout") or "")
-        if vms_on >= 6:
-            break
-        time.sleep(args.poll_interval)
-    steps.append({"vms_on_wait": {"vms_on": vms_on}})
-    # Clock sync (Kerberos/domain auth for the samwell scheduled task depends on it). Retry until ready.
-    clock = None
-    clk_deadline = time.monotonic() + args.clock_wait_seconds
-    while time.monotonic() < clk_deadline:
-        clock = run([PY, CLOCK, "sync", "--yes"], timeout=300)
-        cj = clock.get("json") or {}
-        if cj.get("ready"):
-            break
-        time.sleep(args.retry_sleep)
-    steps.append({"clock_sync": (clock or {}).get("json") or "no-json"})
+    boot = _READINESS.poll_readiness(
+        _READINESS.range_boot_observation,
+        lane="range_boot",
+        outer_timeout_seconds=args.boot_wait_seconds,
+        child_timeout_seconds=_READINESS.LUDUS_PROBE_TIMEOUT_SECONDS,
+        grace_seconds=_READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS,
+        poll_seconds=args.poll_interval,
+    )
+    steps.append({"range_boot_readiness": boot})
+    if boot.get("ready") is not True:
+        return {"step": "rebuild", "snapshot": args.snapshot, "reset_steps": steps,
+                "verdict": "readiness_blocked", "readiness": boot}
+    # The sync helper already performs bounded WinRM-auth polling. Its parent timeout must leave grace.
+    clock = run([PY, CLOCK, "sync", "--yes"], timeout=args.clock_wait_seconds)
+    clock_result = clock.get("json")
+    steps.append({"clock_sync": clock_result or "no-json"})
+    if not isinstance(clock_result, dict) or clock_result.get("ready") is not True:
+        return {"step": "rebuild", "snapshot": args.snapshot, "reset_steps": steps,
+                "verdict": "readiness_blocked"}
     launch = do_launch(args)
     return {"step": "rebuild", "snapshot": args.snapshot, "reset_steps": steps, "launch": launch,
             "verdict": launch.get("verdict")}
@@ -291,7 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--settle-seconds", type=int, default=120)
         sp.add_argument("--poll-interval", type=int, default=10)
         sp.add_argument("--boot-wait-seconds", type=int, default=300)
-        sp.add_argument("--clock-wait-seconds", type=int, default=300)
+        sp.add_argument("--clock-wait-seconds", type=int, default=600)
+        sp.add_argument("--clock-timeout-grace-seconds", type=int, default=30)
+        sp.add_argument("--readiness-wait-seconds", type=int, default=240)
         sp.add_argument("--no-grant-batch-right", action="store_true",
                         help="skip granting SeBatchLogonRight to the run-as user before the batch launch")
     return p

@@ -18,6 +18,28 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(orchestrate)
 
 
+def _canonical_full_output(ready: bool) -> str:
+    sections = {
+        name: {"ready": ready, "blockers": [] if ready else ["not ready"]}
+        for name in orchestrate._READINESS.READINESS_LANE_SECTIONS["full"]
+    }
+    decision = orchestrate._READINESS.evaluate_readiness(
+        lane="full",
+        sections=sections,
+        observation_id=f"full-{ready}",
+        terminal=not ready,
+    )
+    return json.dumps(
+        {
+            "schema": orchestrate._READINESS.READINESS_CONTRACT_SCHEMA,
+            "ready": decision["ready"],
+            "observation_id": decision["observation_id"],
+            "readiness": decision,
+            **sections,
+        }
+    )
+
+
 def _load_foothold_launcher():
     spec = importlib.util.spec_from_file_location("sage_foothold_launcher_cross_boundary", FOOTHOLD_SCRIPT)
     assert spec and spec.loader
@@ -524,25 +546,35 @@ def test_phase8_eval_env_rejects_policy_arm_mismatch():
         )
 
 
-def test_range_guest_ip_gate_requires_every_reported_vm_on_with_ip():
-    assert orchestrate._range_guests_have_ips(
-        "  ON  range-router  ip=10.11.10.254  pmx=1\n"
-        "  ON  range-dc01    ip=10.11.10.10   pmx=2\n"
-        "  ON  range-ws01    ip=10.11.10.31   pmx=3\n"
-    ) is True
-    assert orchestrate._range_guests_have_ips(
-        "  ON  range-router  ip=10.11.10.254  pmx=1\n"
-        "  ON  range-dc01    ip=null          pmx=2\n"
-    ) is False
-    assert orchestrate._range_guests_have_ips(
-        "  ON   range-router  ip=10.11.10.254  pmx=1\n"
-        "  off  range-dc01    ip=null          pmx=2\n"
-    ) is False
+def test_range_boot_gate_delegates_to_canonical_typed_poller(monkeypatch):
+    calls = []
+
+    def fake_poll(probe, **kwargs):
+        calls.append((probe, kwargs))
+        return {"ready": True, "blockers": []}
+
+    monkeypatch.setattr(orchestrate._READINESS, "poll_readiness", fake_poll)
+
+    decision = orchestrate._wait_for_range_boot(
+        range_id="range-id",
+        mcp_server="range-server",
+        timeout=1800,
+        interval=0,
+    )
+
+    assert decision["ready"] is True
+    assert len(calls) == 1
+    assert calls[0][1]["lane"] == "range_boot"
+    assert calls[0][1]["outer_timeout_seconds"] == 1800
 
 
 def test_range_clock_probe_gate_ignores_expected_skew_but_requires_no_errors():
+    hosts = [
+        {"inventory_hostname": name}
+        for name in ("DC01", "DC02", "DC03", "CASTELBLACK", "BRAAVOS")
+    ]
     assert orchestrate._range_clock_probes_reachable(
-        '{"ready":false,"hosts":[{"inventory_hostname":"range-dc01"}],"errors":[],"over_limit":["range-dc01"]}'
+        json.dumps({"ready": False, "hosts": hosts, "errors": [], "over_limit": ["DC01"]})
     ) is True
     assert orchestrate._range_clock_probes_reachable(
         '{"ready":false,"hosts":[],"errors":[{"inventory_hostname":"range-dc01","error":"401"}]}'
@@ -570,10 +602,15 @@ def test_poll_fails_closed_on_nonzero_status_before_accepting_stdout(monkeypatch
 
 
 def test_poll_can_evaluate_declared_status_one_for_reachable_skew(monkeypatch):
-    payload = (
-        '{"ready":false,"hosts":[{"inventory_hostname":"range-dc01"}],'
-        '"errors":[],"over_limit":["range-dc01"]}'
-    )
+    payload = json.dumps({
+        "ready": False,
+        "hosts": [
+            {"inventory_hostname": name}
+            for name in ("DC01", "DC02", "DC03", "CASTELBLACK", "BRAAVOS")
+        ],
+        "errors": [],
+        "over_limit": ["DC01"],
+    })
     monkeypatch.setattr(
         orchestrate.subprocess,
         "run",
@@ -627,10 +664,10 @@ def test_poll_can_wait_on_status_one_until_typed_readiness_is_true(monkeypatch):
     results = iter(
         (
             subprocess.CompletedProcess(
-                args=[], returncode=1, stdout='{"ready":false}', stderr=""
+                args=[], returncode=1, stdout=_canonical_full_output(False), stderr=""
             ),
             subprocess.CompletedProcess(
-                args=[], returncode=1, stdout='{"ready":true}', stderr=""
+                args=[], returncode=1, stdout=_canonical_full_output(True), stderr=""
             ),
         )
     )
@@ -647,7 +684,7 @@ def test_poll_can_wait_on_status_one_until_typed_readiness_is_true(monkeypatch):
         predicate_returncodes=(0, 1),
     )
 
-    assert observed == '{"ready":true}'
+    assert observed == _canonical_full_output(True)
 
 
 def test_poll_still_aborts_on_undeclared_status_with_clock_exception(monkeypatch):
@@ -1888,6 +1925,12 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
 
     monkeypatch.setattr(orchestrate, "_run", fake_run)
     monkeypatch.setattr(orchestrate, "_poll", fake_poll)
+    monkeypatch.setattr(
+        orchestrate,
+        "_wait_for_range_boot",
+        lambda **_kwargs: events.append(("readiness", "range boot"))
+        or {"ready": True},
+    )
     monkeypatch.setattr(orchestrate, "discover_callbacks", lambda _foothold: 7)
 
     foothold = orchestrate.FootholdSpec(
@@ -1905,7 +1948,7 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
     ) == (None, 7)
 
     poweron_index = next(index for index, event in enumerate(events) if event[:2] == ("run", "ludus poweron"))
-    guest_poll_index = next(index for index, event in enumerate(events) if event[:2] == ("poll", "range guests report IPs"))
+    guest_poll_index = next(index for index, event in enumerate(events) if event == ("readiness", "range boot"))
     winrm_poll_index = next(index for index, event in enumerate(events) if event[:2] == ("poll", "range WinRM clock probes respond"))
     sync_index = next(index for index, event in enumerate(events) if event[:2] == ("run", "sync range time"))
     assert poweron_index < guest_poll_index < winrm_poll_index < sync_index
@@ -1921,7 +1964,6 @@ def test_full_reset_syncs_range_time_after_all_guests_report_ips(monkeypatch):
     assert events[winrm_poll_index][3] == (0, 1)
     poll_returncodes = {event[1]: event[3] for event in events if event[0] == "poll"}
     assert poll_returncodes == {
-        "range guests report IPs": (0,),
         "range WinRM clock probes respond": (0, 1),
         "BloodHound authoritative domain count is zero": (0,),
         "CINDER-WS01 powered on": (0,),

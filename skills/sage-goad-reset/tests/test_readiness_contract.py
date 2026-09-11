@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "readiness_contract.py"
@@ -30,6 +33,7 @@ def test_build_readiness_report_requires_every_section_and_redacts_secrets(tmp_p
         runtime_databases={"ready": True, "blockers": []},
         ludus={"ready": True, "blockers": []},
         clock={"ready": True, "blockers": []},
+        authentication={"ready": True, "blockers": []},
         bloodhound_api={"ready": True, "blockers": []},
         bloodhound_mcp={"ready": True, "blockers": []},
         mythic_chat={"ready": True, "blockers": []},
@@ -39,11 +43,228 @@ def test_build_readiness_report_requires_every_section_and_redacts_secrets(tmp_p
 
     assert report["schema"] == "sage-readiness-contract-v1"
     assert report["ready"] is True
+    assert report["readiness"]["lane"] == "full"
+    assert report["readiness"]["launch_released"] is True
     assert report["runtime_identity"]["api_key"] == "<redacted>"
     assert report["runtime_identity"]["credential_text"] == "<redacted>"
     assert report["runtime_identity"]["private_key"] == "<redacted>"
     assert report["runtime_identity"]["token_id"] == "retain-me"
     assert MODULE.hash_file(artifact)["sha256"]
+
+
+def _ready_sections(lane: str) -> dict:
+    names = MODULE.READINESS_LANE_SECTIONS[lane]
+    return {name: {"ready": True, "blockers": []} for name in names}
+
+
+@pytest.mark.parametrize("lane", ["range_boot", "callback", "full"])
+def test_typed_readiness_requires_each_lane_section_as_literal_true(lane):
+    sections = _ready_sections(lane)
+    ready = MODULE.evaluate_readiness(
+        lane=lane,
+        sections=sections,
+        observation_id="fresh-1",
+    )
+    assert ready["ready"] is True
+    assert ready["state"] == "ready"
+    assert ready["launch_released"] is True
+    assert ready["capture_attempt_consumed"] is False
+
+    for name in MODULE.READINESS_LANE_SECTIONS[lane]:
+        invalid = dict(sections)
+        invalid[name] = {"ready": 1, "blockers": []}
+        blocked = MODULE.evaluate_readiness(
+            lane=lane,
+            sections=invalid,
+            observation_id=f"bad-{name}",
+        )
+        assert blocked["ready"] is False
+        assert blocked["launch_released"] is False
+        assert any(name in item for item in blocked["blockers"])
+
+
+def test_callback_lane_allows_intentionally_absent_sage_but_full_lane_does_not():
+    callback = MODULE.evaluate_readiness(
+        lane="callback",
+        sections=_ready_sections("callback"),
+        observation_id="callback-1",
+    )
+    full_sections = _ready_sections("full")
+    full_sections["sage_deployment"] = {
+        "ready": False,
+        "blockers": ["intentionally absent"],
+    }
+    full_sections["mythic_chat"] = {
+        "ready": False,
+        "blockers": ["intentionally absent"],
+    }
+    full = MODULE.evaluate_readiness(
+        lane="full",
+        sections=full_sections,
+        observation_id="full-1",
+    )
+
+    assert callback["ready"] is True
+    assert full["ready"] is False
+
+
+@pytest.mark.parametrize(
+    ("outer", "child", "grace"),
+    [(300, 300, 0), (330, 300, 30), (299, 300, 0)],
+)
+def test_timeout_budget_must_be_strictly_greater_than_child_plus_grace(
+    outer, child, grace
+):
+    with pytest.raises(ValueError, match="strictly greater"):
+        MODULE.validate_timeout_budget(
+            outer_timeout_seconds=outer,
+            child_timeout_seconds=child,
+            grace_seconds=grace,
+        )
+
+    valid = MODULE.validate_timeout_budget(
+        outer_timeout_seconds=331,
+        child_timeout_seconds=300,
+        grace_seconds=30,
+    )
+    assert valid["valid"] is True
+
+
+def test_poll_readiness_reprobes_null_ip_until_fresh_hydrated_observation():
+    calls = []
+    observations = iter(
+        [
+            {
+                "observation_id": "range-1",
+                "sections": {"ludus": {"ready": False, "blockers": ["null ip"]}},
+            },
+            {
+                "observation_id": "range-2",
+                "sections": {"ludus": {"ready": True, "blockers": []}},
+            },
+        ]
+    )
+
+    def probe():
+        calls.append("probe")
+        return next(observations)
+
+    decision = MODULE.poll_readiness(
+        probe,
+        lane="range_boot",
+        outer_timeout_seconds=10,
+        child_timeout_seconds=1,
+        grace_seconds=1,
+        poll_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert decision["ready"] is True
+    assert decision["observation_id"] == "range-2"
+    assert decision["poll_count"] == 2
+    assert calls == ["probe", "probe"]
+
+
+def test_planted_stale_observation_cannot_release_readiness():
+    observations = iter(
+        [
+            {
+                "observation_id": "cached-range",
+                "sections": {"ludus": {"ready": False, "blockers": ["null ip"]}},
+            },
+            {
+                "observation_id": "cached-range",
+                "sections": {"ludus": {"ready": True, "blockers": []}},
+            },
+        ]
+    )
+
+    decision = MODULE.poll_readiness(
+        lambda: next(observations),
+        lane="range_boot",
+        outer_timeout_seconds=10,
+        child_timeout_seconds=1,
+        grace_seconds=1,
+        poll_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert decision["ready"] is False
+    assert decision["state"] == "blocked"
+    assert decision["launch_released"] is False
+    assert any("stale observation_id" in item for item in decision["blockers"])
+
+
+def test_poll_never_starts_child_without_timeout_plus_grace_remaining():
+    calls = []
+    moments = iter((0.0, 0.0, 2.0))
+
+    decision = MODULE.poll_readiness(
+        lambda: calls.append("probe")
+        or {
+            "observation_id": "still-booting",
+            "sections": {"ludus": {"ready": False, "blockers": ["null ip"]}},
+        },
+        lane="range_boot",
+        outer_timeout_seconds=4,
+        child_timeout_seconds=2,
+        grace_seconds=1,
+        poll_seconds=0,
+        sleep=lambda _seconds: None,
+        now=lambda: next(moments),
+    )
+
+    assert calls == ["probe"]
+    assert decision["state"] == "blocked"
+    assert decision["capture_attempt_consumed"] is False
+    assert any("safe child probe" in item for item in decision["blockers"])
+
+
+@pytest.mark.parametrize("raw", ["", "not-json", "[]", '{"ready": true}', '{"ready": 1}'])
+def test_planted_malformed_output_cannot_release_launch(raw):
+    decision = MODULE.parse_release_output(raw, expected_lane="full")
+
+    assert decision["ready"] is False
+    assert decision["state"] == "blocked"
+    assert decision["launch_released"] is False
+
+
+def test_canonical_full_output_is_the_only_release_shape():
+    report = {
+        "schema": "sage-readiness-contract-v1",
+        "ready": True,
+        "observation_id": "full-output-1",
+        "readiness": MODULE.evaluate_readiness(
+            lane="full",
+            sections=_ready_sections("full"),
+            observation_id="full-output-1",
+        ),
+        **_ready_sections("full"),
+    }
+
+    parsed = MODULE.parse_release_output(json.dumps(report), expected_lane="full")
+
+    assert parsed["ready"] is True
+    assert parsed["launch_released"] is True
+
+
+def test_partial_canonical_output_cannot_release_launch():
+    sections = _ready_sections("full")
+    decision = MODULE.evaluate_readiness(
+        lane="full", sections=sections, observation_id="partial-output"
+    )
+    report = {
+        "schema": MODULE.READINESS_CONTRACT_SCHEMA,
+        "ready": True,
+        "observation_id": "partial-output",
+        "readiness": decision,
+        **{name: section for name, section in sections.items() if name != "authentication"},
+    }
+
+    parsed = MODULE.parse_release_output(report, expected_lane="full")
+
+    assert parsed["ready"] is False
+    assert parsed["launch_released"] is False
 
 
 def test_ludus_status_requires_exact_six_vm_ips():

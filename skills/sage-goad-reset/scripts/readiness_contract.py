@@ -11,13 +11,16 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -30,6 +33,28 @@ DEFAULT_STARTUP_IDENTITY_PATH = Path(
 )
 REQUIRED_BLOODHOUND_TOOLS = frozenset({"file_upload", "domain_info", "cypher_query"})
 REQUIRED_STARTUP_ENV = ("SAGE_ENGAGEMENT_GATE", "SAGE_BLOODHOUND_MCP_DIR")
+READINESS_DECISION_SCHEMA = "sage-readiness-decision-v1"
+READINESS_CONTRACT_SCHEMA = "sage-readiness-contract-v1"
+LUDUS_PROBE_TIMEOUT_SECONDS = 30.0
+CALLBACK_PROBE_TIMEOUT_SECONDS = 210.0
+DEFAULT_TIMEOUT_GRACE_SECONDS = 5.0
+READINESS_LANE_SECTIONS = {
+    "range_boot": ("ludus",),
+    "callback": ("ludus", "clock", "authentication"),
+    "full": (
+        "sage_deployment",
+        "runtime_identity",
+        "runtime_databases",
+        "ludus",
+        "clock",
+        "authentication",
+        "bloodhound_api",
+        "bloodhound_mcp",
+        "mythic_chat",
+        "foothold",
+        "channel",
+    ),
+}
 EXPECTED_LUDUS_VMS = {
     "router": "10.4.10.254",
     "dc01": "10.4.10.10",
@@ -154,6 +179,202 @@ def redact_structure(value: Any) -> Any:
     if isinstance(value, tuple):
         return [redact_structure(item) for item in value]
     return value
+
+
+def _new_observation_id() -> str:
+    return uuid4().hex
+
+
+def evaluate_readiness(
+    *,
+    lane: str,
+    sections: dict[str, Any],
+    observation_id: str,
+    terminal: bool = False,
+    poll_count: int = 1,
+) -> dict[str, Any]:
+    """Return the sole typed release decision for every readiness consumer."""
+    if lane not in READINESS_LANE_SECTIONS:
+        raise ValueError(f"unknown readiness lane: {lane!r}")
+    blockers: list[str] = []
+    observation_id = str(observation_id or "").strip()
+    if not observation_id:
+        blockers.append("observation_id is missing")
+    for name in READINESS_LANE_SECTIONS[lane]:
+        section = sections.get(name)
+        if not isinstance(section, dict):
+            blockers.append(f"{name}: typed readiness section is missing")
+            continue
+        if section.get("ready") is not True:
+            detail = section.get("blockers")
+            if isinstance(detail, list) and detail:
+                blockers.extend(f"{name}: {item}" for item in detail)
+            else:
+                blockers.append(f"{name}: ready must be the JSON boolean true")
+    ready = not blockers
+    return {
+        "schema": READINESS_DECISION_SCHEMA,
+        "lane": lane,
+        "state": "ready" if ready else ("blocked" if terminal else "waiting"),
+        "ready": ready,
+        "launch_released": ready,
+        "capture_attempt_consumed": False,
+        "observation_id": observation_id,
+        "poll_count": int(poll_count),
+        "required_sections": list(READINESS_LANE_SECTIONS[lane]),
+        "blockers": blockers,
+    }
+
+
+def _blocked_release(lane: str, blocker: str) -> dict[str, Any]:
+    return {
+        "schema": READINESS_DECISION_SCHEMA,
+        "lane": lane,
+        "state": "blocked",
+        "ready": False,
+        "launch_released": False,
+        "capture_attempt_consumed": False,
+        "observation_id": "invalid-output",
+        "poll_count": 0,
+        "required_sections": list(READINESS_LANE_SECTIONS.get(lane, ())),
+        "blockers": [blocker],
+    }
+
+
+def parse_release_output(value: Any, *, expected_lane: str) -> dict[str, Any]:
+    """Validate a serialized readiness report without trusting a loose ``ready`` field."""
+    if expected_lane not in READINESS_LANE_SECTIONS:
+        raise ValueError(f"unknown readiness lane: {expected_lane!r}")
+    try:
+        payload = json.loads(value) if isinstance(value, str) else value
+    except Exception as exc:
+        return _blocked_release(expected_lane, f"readiness output is not JSON: {exc}")
+    if not isinstance(payload, dict):
+        return _blocked_release(expected_lane, "readiness output must be a JSON object")
+    decision = payload.get("readiness")
+    if payload.get("schema") != READINESS_CONTRACT_SCHEMA or not isinstance(decision, dict):
+        return _blocked_release(expected_lane, "canonical readiness contract is missing")
+    sections = {name: payload.get(name) for name in READINESS_LANE_SECTIONS[expected_lane]}
+    recomputed = evaluate_readiness(
+        lane=expected_lane,
+        sections=sections,
+        observation_id=str(decision.get("observation_id") or ""),
+        terminal=True,
+        poll_count=1,
+    )
+    checks = (
+        (decision.get("schema") == READINESS_DECISION_SCHEMA, "typed readiness decision is missing"),
+        (decision.get("lane") == expected_lane, "readiness lane does not match the consumer"),
+        (isinstance(decision.get("observation_id"), str) and bool(decision["observation_id"].strip()),
+         "readiness observation_id is missing"),
+        (type(decision.get("ready")) is bool, "readiness ready field is not a JSON boolean"),
+        (type(decision.get("launch_released")) is bool,
+         "readiness launch_released field is not a JSON boolean"),
+        (type(payload.get("ready")) is bool, "contract ready field is not a JSON boolean"),
+        (payload.get("ready") is decision.get("ready"), "contract and decision readiness disagree"),
+        (payload.get("observation_id") == decision.get("observation_id"),
+         "contract and decision observation IDs disagree"),
+        (decision.get("ready") is recomputed.get("ready"),
+         "typed sections and decision readiness disagree"),
+        (decision.get("blockers") == recomputed.get("blockers"),
+         "typed sections and decision blockers disagree"),
+        (decision.get("launch_released") is decision.get("ready"),
+         "launch release does not match readiness"),
+        (decision.get("state") == ("ready" if decision.get("ready") else "blocked"),
+         "readiness state is not terminal"),
+    )
+    for passed, blocker in checks:
+        if not passed:
+            return _blocked_release(expected_lane, blocker)
+    return dict(decision)
+
+
+def validate_timeout_budget(
+    *,
+    outer_timeout_seconds: float,
+    child_timeout_seconds: float,
+    grace_seconds: float,
+) -> dict[str, Any]:
+    values = (outer_timeout_seconds, child_timeout_seconds, grace_seconds)
+    if not all(math.isfinite(float(value)) and float(value) >= 0 for value in values):
+        raise ValueError("readiness timeouts must be finite non-negative values")
+    if float(outer_timeout_seconds) <= float(child_timeout_seconds) + float(grace_seconds):
+        raise ValueError(
+            "outer readiness timeout must be strictly greater than child timeout plus grace"
+        )
+    return {
+        "valid": True,
+        "outer_timeout_seconds": float(outer_timeout_seconds),
+        "child_timeout_seconds": float(child_timeout_seconds),
+        "grace_seconds": float(grace_seconds),
+    }
+
+
+def poll_readiness(
+    probe: Callable[[], dict[str, Any]],
+    *,
+    lane: str,
+    outer_timeout_seconds: float,
+    child_timeout_seconds: float,
+    grace_seconds: float,
+    poll_seconds: float,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Poll fresh typed observations and return one terminal release decision."""
+    validate_timeout_budget(
+        outer_timeout_seconds=outer_timeout_seconds,
+        child_timeout_seconds=child_timeout_seconds,
+        grace_seconds=grace_seconds,
+    )
+    if not math.isfinite(float(poll_seconds)) or float(poll_seconds) < 0:
+        raise ValueError("readiness poll interval must be finite and non-negative")
+    deadline = now() + float(outer_timeout_seconds)
+    minimum_child_budget = float(child_timeout_seconds) + float(grace_seconds)
+    seen: set[str] = set()
+    count = 0
+    last = _blocked_release(lane, "no readiness observation was collected")
+    while True:
+        remaining = deadline - now()
+        if remaining <= minimum_child_budget:
+            blocked = dict(last)
+            blocked.update(state="blocked", ready=False, launch_released=False)
+            blocked["blockers"] = [
+                *last["blockers"],
+                "readiness timeout exhausted before another safe child probe",
+            ]
+            return blocked
+        count += 1
+        try:
+            observation = probe()
+        except Exception as exc:
+            return _blocked_release(lane, f"readiness probe failed: {type(exc).__name__}: {exc}")
+        if not isinstance(observation, dict) or not isinstance(observation.get("sections"), dict):
+            return _blocked_release(lane, "readiness probe did not return typed sections")
+        observation_id = str(observation.get("observation_id") or "").strip()
+        if not observation_id:
+            return _blocked_release(lane, "readiness probe did not return observation_id")
+        if observation_id in seen:
+            return _blocked_release(lane, f"stale observation_id was reused: {observation_id}")
+        seen.add(observation_id)
+        last = evaluate_readiness(
+            lane=lane,
+            sections=observation["sections"],
+            observation_id=observation_id,
+            poll_count=count,
+        )
+        remaining = deadline - now()
+        if last["ready"] and remaining > 0:
+            return last
+        if remaining <= minimum_child_budget:
+            blocked = dict(last)
+            blocked.update(state="blocked", ready=False, launch_released=False)
+            blocked["blockers"] = [
+                *last["blockers"],
+                "readiness timeout exhausted before another safe child probe",
+            ]
+            return blocked
+        sleep(min(float(poll_seconds), remaining - minimum_child_budget))
 
 
 def hash_file(path: str | Path) -> dict[str, str]:
@@ -392,6 +613,46 @@ def clock_status(observation: dict[str, Any] | None) -> dict[str, Any]:
         "over_limit": observation.get("over_limit") or [],
         "time_service_enabled": observation.get("time_service_enabled") or [],
         "errors": observation.get("errors") or [],
+        "blockers": blockers,
+    }
+
+
+def authentication_status(observation: dict[str, Any] | None) -> dict[str, Any]:
+    """Prove that every expected Windows guest completed an authenticated clock probe."""
+    observation = dict(observation or {})
+    hosts = observation.get("hosts") if isinstance(observation.get("hosts"), list) else []
+    errors = observation.get("errors") if isinstance(observation.get("errors"), list) else []
+    expected = set(EXPECTED_LUDUS_VMS).difference({"router"})
+    observed: list[str] = []
+    duplicates: set[str] = set()
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        canonical = _canonical_ludus_vm_name(
+            host.get("inventory_hostname") or host.get("computer")
+        )
+        if canonical is None:
+            continue
+        if canonical in observed:
+            duplicates.add(canonical)
+        observed.append(canonical)
+    observed_set = set(observed)
+    missing = sorted(expected.difference(observed_set))
+    unexpected = sorted(observed_set.difference(expected))
+    blockers = []
+    if errors:
+        blockers.append("WinRM authentication probe returned errors")
+    if missing:
+        blockers.append(f"WinRM authentication missing hosts: {', '.join(missing)}")
+    if unexpected:
+        blockers.append(f"WinRM authentication included unexpected hosts: {', '.join(unexpected)}")
+    if duplicates:
+        blockers.append(f"WinRM authentication duplicated hosts: {', '.join(sorted(duplicates))}")
+    return {
+        "ready": not blockers,
+        "expected_hosts": sorted(expected),
+        "observed_hosts": sorted(observed_set),
+        "errors": errors,
         "blockers": blockers,
     }
 
@@ -635,6 +896,7 @@ def build_readiness_report(
     runtime_databases: dict[str, Any],
     ludus: dict[str, Any],
     clock: dict[str, Any],
+    authentication: dict[str, Any],
     bloodhound_api: dict[str, Any],
     bloodhound_mcp: dict[str, Any],
     mythic_chat: dict[str, Any],
@@ -647,20 +909,27 @@ def build_readiness_report(
         "runtime_databases": runtime_databases,
         "ludus": ludus,
         "clock": clock,
+        "authentication": authentication,
         "bloodhound_api": bloodhound_api,
         "bloodhound_mcp": bloodhound_mcp,
         "mythic_chat": mythic_chat,
         "foothold": foothold,
         "channel": channel,
     }
-    blockers = []
-    for name, section in sections.items():
-        for blocker in section.get("blockers") or []:
-            blockers.append(f"{name}: {blocker}")
+    observation_id = _new_observation_id()
+    decision = evaluate_readiness(
+        lane="full",
+        sections=sections,
+        observation_id=observation_id,
+        terminal=True,
+    )
     return redact_structure({
-        "schema": "sage-readiness-contract-v1",
-        "ready": all(bool(section.get("ready")) for section in sections.values()),
-        "blockers": blockers,
+        "schema": READINESS_CONTRACT_SCHEMA,
+        "ready": decision["ready"],
+        "state": decision["state"],
+        "observation_id": observation_id,
+        "blockers": decision["blockers"],
+        "readiness": decision,
         **sections,
     })
 
@@ -690,21 +959,56 @@ async def probe_bloodhound_mcp_tools(directory: str | Path | None = None) -> dic
     return bloodhound_mcp_status(path, names)
 
 
-def probe_ludus_status() -> dict[str, Any]:
+def probe_ludus_status(
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, Any]:
     module = _load_module("sage_readiness_ludus", REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py")
-    code, payload = module._call("GET", "/api/v2/range")
+    code, payload = module._call(
+        "GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server
+    )
     if code != 200 or not isinstance(payload, dict):
         return ludus_status({})
     return ludus_status(payload)
 
 
-def probe_clock_status() -> dict[str, Any]:
+def probe_clock_status(
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, Any]:
     module = _load_module(
         "sage_readiness_clock",
         REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "sync_range_time.py",
     )
-    hosts = module.windows_hosts(module.load_inventory(module.DEFAULT_MCP_PATH))
+    hosts = module.windows_hosts(
+        module.load_inventory(module.DEFAULT_MCP_PATH, range_id, mcp_server)
+    )
     return clock_status(module.check_clocks(hosts, module.DEFAULT_MAX_SKEW_SECONDS))
+
+
+def range_boot_observation(
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "observation_id": _new_observation_id(),
+        "sections": {"ludus": probe_ludus_status(range_id, mcp_server)},
+    }
+
+
+def callback_readiness_observation(
+    range_id: str | None = None,
+    mcp_server: str | None = None,
+) -> dict[str, Any]:
+    clock = probe_clock_status(range_id, mcp_server)
+    return {
+        "observation_id": _new_observation_id(),
+        "sections": {
+            "ludus": probe_ludus_status(range_id, mcp_server),
+            "clock": clock,
+            "authentication": authentication_status(clock),
+        },
+    }
 
 
 def probe_bloodhound_api_status() -> dict[str, Any]:
@@ -753,6 +1057,7 @@ async def collect_operator_readiness(
         runtime_databases=runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived),
         ludus=ludus_section,
         clock=clock_section,
+        authentication=authentication_status(clock_section),
         bloodhound_api=bloodhound_api_section,
         bloodhound_mcp=bloodhound_mcp_section,
         mythic_chat=mythic_chat_status(chat_containers, api_token),

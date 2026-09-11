@@ -42,6 +42,9 @@ DEFAULT_ROUTE_ENV = ROOT / "skills" / "sage-eval-gauge" / ".env.local"
 RUN_AS_RESOLVER_PATH = (
     ROOT / "skills" / "sage-foothold-launch" / "scripts" / "run_as_resolver.py"
 )
+READINESS_CONTRACT_PATH = (
+    ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
+)
 DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '{"NORTH":"north.sevenkingdoms.local",'
     '"SEVENKINGDOMS":"sevenkingdoms.local",'
@@ -61,6 +64,20 @@ def _load_run_as_resolver():
 
 
 _RUN_AS_RESOLVER = _load_run_as_resolver()
+
+
+def _load_readiness_contract():
+    spec = importlib.util.spec_from_file_location(
+        "sage_eval_readiness_contract", READINESS_CONTRACT_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load readiness contract: {READINESS_CONTRACT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_READINESS = _load_readiness_contract()
 
 
 def _load_sage_model_environment() -> dict[str, str]:
@@ -715,23 +732,12 @@ def _poll(
 
 
 def _readiness_ok(out: str) -> bool:
-    """True iff bootstrap_payloads.py `readiness` reports overall ready. That command prints a JSON object
-    (`json.dumps`), so parse it and check the TOP-LEVEL `ready` key — a substring match would also catch the
-    nested runtime_databases/callbacks `ready` flags and pass prematurely. Fail-safe to False (keep polling)
-    on any parse error or partial output."""
-    try:
-        return json.loads(out).get("ready") is True
-    except Exception:
-        return False
+    """Only the canonical typed full-lane decision can release the gauge."""
+    return _READINESS.parse_release_output(out, expected_lane="full").get("ready") is True
 
 
 def _foothold_guest_up(out: str, foothold_ip: str = DEFAULT_FOOTHOLD_IP) -> bool:
     return bool(re.search(rf"^\s*ON\s+\S+\s+ip={re.escape(foothold_ip)}\b", out, re.MULTILINE))
-
-
-def _range_guests_have_ips(out: str) -> bool:
-    rows = re.findall(r"^\s*(ON|off)\s+\S+\s+ip=(\S+)\b", out, re.MULTILINE | re.IGNORECASE)
-    return bool(rows) and all(state.casefold() == "on" and ip.casefold() != "null" for state, ip in rows)
 
 
 def _range_clock_probes_reachable(out: str) -> bool:
@@ -745,7 +751,30 @@ def _range_clock_probes_reachable(out: str) -> bool:
         payload = json.loads(out)
     except Exception:
         return False
-    return bool(payload.get("hosts")) and not payload.get("errors")
+    return _READINESS.authentication_status(payload).get("ready") is True
+
+
+def _wait_for_range_boot(
+    *,
+    range_id: str | None,
+    mcp_server: str | None,
+    timeout: float,
+    interval: float = 20,
+) -> dict:
+    decision = _READINESS.poll_readiness(
+        lambda: _READINESS.range_boot_observation(range_id, mcp_server),
+        lane="range_boot",
+        outer_timeout_seconds=timeout,
+        child_timeout_seconds=_READINESS.LUDUS_PROBE_TIMEOUT_SECONDS,
+        grace_seconds=_READINESS.DEFAULT_TIMEOUT_GRACE_SECONDS,
+        poll_seconds=interval,
+    )
+    if decision.get("ready") is not True:
+        raise SystemExit(
+            "ABORT: range did not reach typed host/power/IP readiness: "
+            + "; ".join(decision.get("blockers") or [])
+        )
+    return decision
 
 
 def _bloodhound_is_empty(out: str) -> bool:
@@ -931,13 +960,10 @@ def full_reset_and_ready(
                 mcp_server=ludus_mcp_server,
             )
         if name == "sync range time":
-            _poll(
-                "range guests report IPs",
-                _ludus_argv("status", range_id=ludus_range_id, mcp_server=ludus_mcp_server),
-                ROOT,
-                _range_guests_have_ips,
+            _wait_for_range_boot(
+                range_id=ludus_range_id,
+                mcp_server=ludus_mcp_server,
                 timeout=1800,
-                env=range_env,
             )
             _poll(
                 "range WinRM clock probes respond",
