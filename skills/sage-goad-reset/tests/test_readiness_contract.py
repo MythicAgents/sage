@@ -348,7 +348,7 @@ def test_ludus_status_rejects_duplicate_canonical_vm_identities():
     assert "duplicate Ludus VM identities: dc01" in report["blockers"]
 
 
-def test_profile_drives_non_goad_inventory_but_qualification_blocks_release():
+def test_live_qualified_profile_drives_non_goad_inventory():
     report = MODULE.ludus_status({
         "rangeNumber": 7,
         "rangeState": "SUCCESS",
@@ -360,12 +360,10 @@ def test_profile_drives_non_goad_inventory_but_qualification_blocks_release():
         ],
     }, "sage-replication-range")
 
-    assert report["ready"] is False
+    assert report["ready"] is True
     assert report["expected_ips"]["ws01"] == "10.7.10.31"
     assert report["range_profile"]["id"] == "sage-replication-range"
-    assert report["blockers"] == [
-        "range profile sage-replication-range is historically_observed, not live-qualified"
-    ]
+    assert report["blockers"] == []
 
 
 def test_profile_drives_authenticated_windows_guest_set():
@@ -380,10 +378,8 @@ def test_profile_drives_authenticated_windows_guest_set():
 
     assert report["expected_hosts"] == ["dc01", "srv02", "ws01"]
     assert report["observed_hosts"] == ["dc01", "srv02", "ws01"]
-    assert report["ready"] is False
-    assert report["blockers"] == [
-        "range profile sage-replication-range is historically_observed, not live-qualified"
-    ]
+    assert report["ready"] is True
+    assert report["blockers"] == []
 
 
 def test_bloodhound_mcp_status_requires_exact_tool_names(tmp_path):

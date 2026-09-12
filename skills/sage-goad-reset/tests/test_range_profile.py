@@ -29,7 +29,10 @@ def test_catalog_inventories_distinct_source_controlled_topologies():
     assert profile.require_scenario(
         catalog["goad-trust-walker"], "trust-context-parent-dcsync"
     )["snapshot"] == "sage-seed-apollo-staged-20260710"
-    assert catalog["sage-replication-range"]["qualification"]["state"] == "historically_observed"
+    assert catalog["sage-replication-range"]["qualification"] == {
+        "state": "live_qualified",
+        "receipt": "gate1c-replication-live-qualification-v1",
+    }
     assert "abuse-child-domain-gpo" in catalog["sage-structural-a"]["topology"]["capabilities"]
     assert "read-partner-managed-local-admin-secret" in catalog["sage-structural-b"]["topology"]["capabilities"]
     assert all(

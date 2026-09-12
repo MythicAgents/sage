@@ -180,14 +180,14 @@ def test_plan_has_canonical_order_and_never_deploys_payload():
 def test_unqualified_profile_can_be_planned_but_not_started(capsys):
     common = [
         "--snapshot", "snapshot-v1",
-        "--range-profile", "sage-replication-range",
+        "--range-profile", "sage-structural-b",
         "--callback-host", "http://example.invalid",
         "--mythic-env-path", "/tmp/mythic.env",
     ]
 
     assert reset.main(["plan", *common]) == 0
     planned = json.loads(capsys.readouterr().out)
-    assert planned["inputs"]["range_profile_id"] == "sage-replication-range"
+    assert planned["inputs"]["range_profile_id"] == "sage-structural-b"
     assert planned["live_activity_performed"] is False
 
     assert reset.main(["start", *common, "--yes"]) == 2

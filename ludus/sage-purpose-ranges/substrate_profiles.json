@@ -35,7 +35,7 @@
     {
       "id": "sage-replication-range",
       "source": {"kind": "repo", "path": "ludus/sage-purpose-ranges/blueprints/sage-replication-range"},
-      "qualification": {"state": "historically_observed", "receipt": ""},
+      "qualification": {"state": "live_qualified", "receipt": "gate1c-replication-live-qualification-v1"},
       "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
       "vms": [
         {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64"], "last_octet": 254, "os": "linux"},

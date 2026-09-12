@@ -1,4 +1,5 @@
 import subprocess
+import copy
 import importlib.util
 import json
 import os
@@ -3059,7 +3060,7 @@ def test_dry_run_reports_explicit_range_profile(capsys):
 
     output = capsys.readouterr().out
     assert '"id": "sage-replication-range"' in output
-    assert '"qualification": {"receipt": "", "state": "historically_observed"}' in output
+    assert '"qualification": {"receipt": "gate1c-replication-live-qualification-v1", "state": "live_qualified"}' in output
     assert '"foothold_host": "SAGEREPL-WS01"' in output
 
 
@@ -3097,6 +3098,15 @@ def test_explicit_profile_foothold_mismatch_stops_before_dry_run(monkeypatch, ca
 
 def test_live_gauge_rejects_unqualified_profile_before_reset(monkeypatch, capsys):
     monkeypatch.setattr(orchestrate, "_load_sage_model_environment", lambda: {})
+    unqualified = copy.deepcopy(
+        orchestrate._RANGE_PROFILES.get_profile("sage-replication-range")
+    )
+    unqualified["qualification"] = {"state": "historically_observed", "receipt": ""}
+    monkeypatch.setattr(
+        orchestrate._RANGE_PROFILES,
+        "get_profile",
+        lambda _profile_id: unqualified,
+    )
 
     with pytest.raises(SystemExit) as raised:
         orchestrate.main([
