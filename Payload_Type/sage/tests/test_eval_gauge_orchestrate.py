@@ -3034,3 +3034,75 @@ def test_orchestrator_preserves_explicit_sage_route_over_dotenv(monkeypatch, tmp
     }
     assert orchestrate.os.environ["API_ENDPOINT"] == "https://explicit.example/v1"
     assert orchestrate.os.environ["API_KEY"] == "explicit-secret"
+
+
+def test_dry_run_reports_explicit_range_profile(capsys):
+    foothold = orchestrate.FootholdSpec(
+        host="SAGEREPL-WS01",
+        ip="10.7.10.31",
+        user=r"REPLICATION\user1",
+        callback_host="WS01",
+        callback_user="user1",
+        password_env="SAGE_REPLICATION_USER1_PASSWORD",
+        range_profile_id="sage-replication-range",
+    )
+
+    orchestrate._dry_run_plan(
+        "replication-purpose-range-visible-cost",
+        "harness",
+        0,
+        1800,
+        "llm",
+        foothold=foothold,
+        snapshot="sage-replication-range-apollo-staged-v1",
+    )
+
+    output = capsys.readouterr().out
+    assert '"id": "sage-replication-range"' in output
+    assert '"qualification": {"receipt": "", "state": "historically_observed"}' in output
+    assert '"foothold_host": "SAGEREPL-WS01"' in output
+
+
+def test_explicit_profile_snapshot_mismatch_stops_before_dry_run(monkeypatch, capsys):
+    monkeypatch.setattr(orchestrate, "_load_sage_model_environment", lambda: {})
+
+    with pytest.raises(SystemExit) as raised:
+        orchestrate.main([
+            "--scenario", "replication-purpose-range-visible-cost",
+            "--range-profile", "sage-replication-range",
+            "--seeds", "0",
+            "--foothold-host", "SAGEREPL-WS01",
+        ])
+
+    assert raised.value.code == 2
+    assert "binds scenario" in capsys.readouterr().err
+
+
+def test_explicit_profile_foothold_mismatch_stops_before_dry_run(monkeypatch, capsys):
+    monkeypatch.setattr(orchestrate, "_load_sage_model_environment", lambda: {})
+
+    with pytest.raises(SystemExit) as raised:
+        orchestrate.main([
+            "--scenario", "replication-purpose-range-visible-cost",
+            "--range-profile", "sage-replication-range",
+            "--snapshot", "sage-replication-range-apollo-staged-v1",
+            "--seeds", "0",
+            "--foothold-host", "SAGEREPL-WS01",
+            "--foothold-ip", "10.7.10.31",
+        ])
+
+    assert raised.value.code == 2
+    assert "different foothold" in capsys.readouterr().err
+
+
+def test_live_gauge_rejects_unqualified_profile_before_reset(monkeypatch, capsys):
+    monkeypatch.setattr(orchestrate, "_load_sage_model_environment", lambda: {})
+
+    with pytest.raises(SystemExit) as raised:
+        orchestrate.main([
+            "--scenario", "replication-purpose-range-visible-cost",
+            "--range-profile", "sage-replication-range",
+            "--go",
+        ])
+    assert raised.value.code == 2
+    assert "not live-qualified" in capsys.readouterr().err

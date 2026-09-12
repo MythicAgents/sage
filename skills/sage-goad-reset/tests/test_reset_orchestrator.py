@@ -49,6 +49,9 @@ def _canonical_ready_output(lane: str) -> dict:
 def _config() -> dict:
     return {
         "snapshot": "exact-clean-snapshot",
+        "range_profile_id": "goad-trust-walker",
+        "ludus_range_id": "GOAD",
+        "ludus_mcp_server": "ludus_goad",
         "bootstrap_mode": "fresh-apollo",
         "retained_callback_config": "",
         "foothold_payload_type": "apollo",
@@ -169,18 +172,41 @@ def test_plan_has_canonical_order_and_never_deploys_payload():
     assert commands["bootstrap-chat-and-foothold"][-1] != "--prepare-chat"
     assert "--no-prepare-chat" in commands["bootstrap-chat-and-foothold"]
     assert "--no-require-prepared-channel" in commands["final-readiness"]
+    assert commands["rollback-range"][2:6] == [
+        "--mcp-server", "ludus_goad", "--range-id", "GOAD"
+    ]
+
+
+def test_unqualified_profile_can_be_planned_but_not_started(capsys):
+    common = [
+        "--snapshot", "snapshot-v1",
+        "--range-profile", "sage-replication-range",
+        "--callback-host", "http://example.invalid",
+        "--mythic-env-path", "/tmp/mythic.env",
+    ]
+
+    assert reset.main(["plan", *common]) == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["inputs"]["range_profile_id"] == "sage-replication-range"
+    assert planned["live_activity_performed"] is False
+
+    assert reset.main(["start", *common, "--yes"]) == 2
+    blocked = json.loads(capsys.readouterr().out)
+    assert "not live-qualified" in blocked["error"]
 
 
 def test_wait_for_range_delegates_to_canonical_fresh_poller(monkeypatch):
     calls = []
+    probe_calls = []
 
     class _Contract:
         LUDUS_PROBE_TIMEOUT_SECONDS = 30.0
         DEFAULT_TIMEOUT_GRACE_SECONDS = 5.0
 
         @staticmethod
-        def range_boot_observation():
-            raise AssertionError("the injected poller owns probe execution")
+        def range_boot_observation(*_args):
+            probe_calls.append(_args)
+            return {}
 
         @staticmethod
         def poll_readiness(probe, **kwargs):
@@ -193,9 +219,27 @@ def test_wait_for_range_delegates_to_canonical_fresh_poller(monkeypatch):
 
     assert result["ready"] is True
     assert len(calls) == 1
-    assert calls[0][0] is _Contract.range_boot_observation
+    calls[0][0]()
+    assert probe_calls == [("GOAD", "ludus_goad", "goad-trust-walker")]
     assert calls[0][1]["lane"] == "range_boot"
     assert calls[0][1]["outer_timeout_seconds"] == 60
+
+
+def test_phase_runner_exports_persisted_profile_and_range_route(monkeypatch):
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(reset.subprocess, "run", fake_run)
+
+    reset.run_phase_command("final-readiness", ["readiness"], _config())
+
+    assert observed["env"]["SAGE_RANGE_PROFILE_ID"] == "goad-trust-walker"
+    assert observed["env"]["SAGE_LUDUS_RANGE_ID"] == "GOAD"
+    assert observed["env"]["SAGE_LUDUS_MCP_SERVER"] == "ludus_goad"
 
 
 def test_cli_rejects_outer_timeout_not_greater_than_child_plus_grace():

@@ -29,8 +29,9 @@ BOOTSTRAP = (
     / "bootstrap_payloads.py"
 )
 READINESS_CONTRACT = RESET_DIR / "scripts" / "readiness_contract.py"
+RANGE_PROFILE = RESET_DIR / "scripts" / "range_profile.py"
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / ".sage_engagement" / "reset_runs"
-SCHEMA = "sage-goad-reset-orchestration-v1"
+SCHEMA = "sage-goad-reset-orchestration-v2"
 TASK_COUNT_QUERY = """
 query SageResetTaskCount($operationId: Int!) {
   whoami {
@@ -113,6 +114,9 @@ INTERACTIVE_STATUSES = {
 }
 INPUT_KEYS = {
     "snapshot",
+    "range_profile_id",
+    "ludus_range_id",
+    "ludus_mcp_server",
     "bootstrap_mode",
     "retained_callback_config",
     "foothold_payload_type",
@@ -228,8 +232,16 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "APOLLO_CALLBACK_HOST"
         )
     restart_env = _parse_restart_env(args.restart_env)
+    profile_module = _load_module("sage_reset_range_profile_config", RANGE_PROFILE)
+    try:
+        profile = profile_module.get_profile(args.range_profile)
+    except ValueError as exc:
+        raise ResetError(str(exc)) from exc
     config = {
         "snapshot": snapshot,
+        "range_profile_id": profile["id"],
+        "ludus_range_id": str(args.ludus_range_id or "").strip(),
+        "ludus_mcp_server": str(args.ludus_mcp_server or "").strip(),
         "bootstrap_mode": bootstrap_mode,
         "retained_callback_config": retained_path,
         "foothold_payload_type": str(args.foothold_payload_type),
@@ -264,6 +276,13 @@ def _config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
+    ludus_prefix = [str(PYTHON), str(RESET_DIR / "scripts" / "ludus.py")]
+    sync_prefix = [str(PYTHON), str(RESET_DIR / "scripts" / "sync_range_time.py")]
+    for prefix in (ludus_prefix, sync_prefix):
+        if config["ludus_mcp_server"]:
+            prefix.extend(["--mcp-server", config["ludus_mcp_server"]])
+        if config["ludus_range_id"]:
+            prefix.extend(["--range-id", config["ludus_range_id"]])
     bootstrap = [
         str(PYTHON),
         str(BOOTSTRAP),
@@ -327,15 +346,13 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
             "--yes",
         ],
         "rollback-range": [
-            str(PYTHON),
-            str(RESET_DIR / "scripts" / "ludus.py"),
+            *ludus_prefix,
             "rollback",
             config["snapshot"],
             "--yes",
         ],
         "poweron-range": [
-            str(PYTHON),
-            str(RESET_DIR / "scripts" / "ludus.py"),
+            *ludus_prefix,
             "poweron",
             "all",
         ],
@@ -344,8 +361,7 @@ def _phase_commands(config: dict[str, Any]) -> dict[str, list[str]]:
             str(config["range_ready_timeout"]),
         ],
         "sync-range-time": [
-            str(PYTHON),
-            str(RESET_DIR / "scripts" / "sync_range_time.py"),
+            *sync_prefix,
             "sync",
             "--yes",
         ],
@@ -564,6 +580,7 @@ def _validate_inputs(inputs: Any, path: Path) -> dict[str, Any]:
         )
     required_strings = (
         "snapshot",
+        "range_profile_id",
         "foothold_payload_type",
         "foothold_host",
         "foothold_user_match",
@@ -574,9 +591,19 @@ def _validate_inputs(inputs: Any, path: Path) -> dict[str, Any]:
     for key in required_strings:
         if not isinstance(inputs.get(key), str) or not inputs[key].strip():
             _raise_invalid(path, f"inputs.{key} must be a non-empty string")
-    for key in ("retained_callback_config", "callback_host", "download_dir"):
+    for key in (
+        "retained_callback_config", "callback_host", "download_dir",
+        "ludus_range_id", "ludus_mcp_server",
+    ):
         if not isinstance(inputs.get(key), str):
             _raise_invalid(path, f"inputs.{key} must be a string")
+    profile_module = _load_module("sage_reset_range_profile_checkpoint", RANGE_PROFILE)
+    try:
+        profile_module.require_live_qualified(
+            profile_module.get_profile(inputs["range_profile_id"])
+        )
+    except ValueError as exc:
+        _raise_invalid(path, f"inputs.range_profile_id is not releasable: {exc}")
     if inputs.get("bootstrap_mode") not in {
         "fresh-apollo",
         "retained-callback",
@@ -1067,8 +1094,13 @@ def _wait_for_range(
     contract = _load_module(
         "sage_reset_readiness_contract", READINESS_CONTRACT
     )
+    probe = lambda: contract.range_boot_observation(
+        config["ludus_range_id"] or None,
+        config["ludus_mcp_server"] or None,
+        config["range_profile_id"],
+    )
     decision = contract.poll_readiness(
-        contract.range_boot_observation,
+        probe,
         lane="range_boot",
         outer_timeout_seconds=config["range_ready_timeout"],
         child_timeout_seconds=contract.LUDUS_PROBE_TIMEOUT_SECONDS,
@@ -1078,7 +1110,7 @@ def _wait_for_range(
     )
     if decision.get("ready") is not True:
         raise ResetError(
-            "range did not reach exact six-VM/IP readiness; blockers="
+            f"range did not reach {config['range_profile_id']} readiness; blockers="
             + json.dumps(decision.get("blockers") or [])
         )
     return decision
@@ -1091,6 +1123,12 @@ def run_phase_command(
 ) -> dict[str, Any]:
     if phase_name == "wait-range-ips":
         return _wait_for_range(config)
+    env = dict(os.environ)
+    env["SAGE_RANGE_PROFILE_ID"] = config["range_profile_id"]
+    if config["ludus_range_id"]:
+        env["SAGE_LUDUS_RANGE_ID"] = config["ludus_range_id"]
+    if config["ludus_mcp_server"]:
+        env["SAGE_LUDUS_MCP_SERVER"] = config["ludus_mcp_server"]
     result = subprocess.run(
         command,
         cwd=str(REPO_ROOT),
@@ -1098,6 +1136,7 @@ def run_phase_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=env,
     )
     if result.returncode:
         raise ResetError(
@@ -1389,6 +1428,9 @@ class ResetOrchestrator:
 
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--snapshot", required=True)
+    parser.add_argument("--range-profile", default="goad-trust-walker")
+    parser.add_argument("--ludus-range-id", default=os.environ.get("SAGE_LUDUS_RANGE_ID") or "")
+    parser.add_argument("--ludus-mcp-server", default=os.environ.get("SAGE_LUDUS_MCP_SERVER") or "")
     parser.add_argument(
         "--bootstrap-mode",
         choices=("fresh-apollo", "retained-callback"),
@@ -1492,6 +1534,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "start":
             config = _config_from_args(args)
+            profile_module = _load_module("sage_reset_range_profile_start", RANGE_PROFILE)
+            try:
+                profile_module.require_live_qualified(
+                    profile_module.get_profile(config["range_profile_id"])
+                )
+            except ValueError as exc:
+                raise ResetError(str(exc)) from exc
             run_id = (
                 f"reset-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
             )

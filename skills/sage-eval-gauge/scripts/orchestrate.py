@@ -45,6 +45,7 @@ RUN_AS_RESOLVER_PATH = (
 READINESS_CONTRACT_PATH = (
     ROOT / "skills" / "sage-goad-reset" / "scripts" / "readiness_contract.py"
 )
+RANGE_PROFILE_PATH = ROOT / "skills" / "sage-goad-reset" / "scripts" / "range_profile.py"
 DEFAULT_ENGAGEMENT_NETBIOS_MAP = (
     '{"NORTH":"north.sevenkingdoms.local",'
     '"SEVENKINGDOMS":"sevenkingdoms.local",'
@@ -78,6 +79,18 @@ def _load_readiness_contract():
 
 
 _READINESS = _load_readiness_contract()
+
+
+def _load_range_profiles():
+    spec = importlib.util.spec_from_file_location("sage_eval_range_profile", RANGE_PROFILE_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load range profiles: {RANGE_PROFILE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_RANGE_PROFILES = _load_range_profiles()
 
 
 def _load_sage_model_environment() -> dict[str, str]:
@@ -341,6 +354,7 @@ class FootholdSpec:
         password_env: str = DEFAULT_FOOTHOLD_PASSWORD_ENV,
         ludus_range_id: str | None = DEFAULT_LUDUS_RANGE_ID,
         ludus_mcp_server: str | None = DEFAULT_LUDUS_MCP_SERVER,
+        range_profile_id: str = _RANGE_PROFILES.DEFAULT_PROFILE_ID,
         callback_settle_seconds: int = 0,
         require_unique_callback: bool = False,
     ) -> None:
@@ -352,6 +366,7 @@ class FootholdSpec:
         self.password_env = password_env
         self.ludus_range_id = ludus_range_id
         self.ludus_mcp_server = ludus_mcp_server
+        self.range_profile_id = range_profile_id
         self.callback_settle_seconds = max(0, int(callback_settle_seconds))
         self.require_unique_callback = bool(require_unique_callback)
 
@@ -388,6 +403,7 @@ class FootholdSpec:
             env["SAGE_LUDUS_RANGE_ID"] = self.ludus_range_id
         if self.ludus_mcp_server:
             env["SAGE_LUDUS_MCP_SERVER"] = self.ludus_mcp_server
+        env["SAGE_RANGE_PROFILE_ID"] = self.range_profile_id
         return env
 
     def readiness_argv(self) -> list[str]:
@@ -422,6 +438,7 @@ def _configure_foothold_for_scenario(scenario: str, foothold: FootholdSpec | Non
         password_env=foothold.password_env,
         ludus_range_id=foothold.ludus_range_id,
         ludus_mcp_server=foothold.ludus_mcp_server,
+        range_profile_id=foothold.range_profile_id,
         callback_settle_seconds=max(
             foothold.callback_settle_seconds,
             PHASE6_CALLBACK_SETTLE_SECONDS
@@ -492,14 +509,17 @@ def _sync_range_time_argv(
 def _range_env(
     range_id: str | None = None,
     mcp_server: str | None = None,
+    range_profile_id: str | None = None,
 ) -> dict[str, str] | None:
-    if not range_id and not mcp_server:
+    if not range_id and not mcp_server and not range_profile_id:
         return None
     env = dict(os.environ)
     if range_id:
         env["SAGE_LUDUS_RANGE_ID"] = range_id
     if mcp_server:
         env["SAGE_LUDUS_MCP_SERVER"] = mcp_server
+    if range_profile_id:
+        env["SAGE_RANGE_PROFILE_ID"] = range_profile_id
     return env
 
 
@@ -740,7 +760,10 @@ def _foothold_guest_up(out: str, foothold_ip: str = DEFAULT_FOOTHOLD_IP) -> bool
     return bool(re.search(rf"^\s*ON\s+\S+\s+ip={re.escape(foothold_ip)}\b", out, re.MULTILINE))
 
 
-def _range_clock_probes_reachable(out: str) -> bool:
+def _range_clock_probes_reachable(
+    out: str,
+    range_profile_id: str = _RANGE_PROFILES.DEFAULT_PROFILE_ID,
+) -> bool:
     """True once the WinRM clock probe can authenticate to every reported Windows guest.
 
     A rollback can restore guest-agent IP reporting before WinRM is ready to accept inventory credentials.
@@ -751,18 +774,19 @@ def _range_clock_probes_reachable(out: str) -> bool:
         payload = json.loads(out)
     except Exception:
         return False
-    return _READINESS.authentication_status(payload).get("ready") is True
+    return _READINESS.authentication_status(payload, range_profile_id).get("ready") is True
 
 
 def _wait_for_range_boot(
     *,
     range_id: str | None,
     mcp_server: str | None,
+    range_profile_id: str = _RANGE_PROFILES.DEFAULT_PROFILE_ID,
     timeout: float,
     interval: float = 20,
 ) -> dict:
     decision = _READINESS.poll_readiness(
-        lambda: _READINESS.range_boot_observation(range_id, mcp_server),
+        lambda: _READINESS.range_boot_observation(range_id, mcp_server, range_profile_id),
         lane="range_boot",
         outer_timeout_seconds=timeout,
         child_timeout_seconds=_READINESS.LUDUS_PROBE_TIMEOUT_SECONDS,
@@ -941,7 +965,7 @@ def full_reset_and_ready(
     foothold = foothold or FootholdSpec()
     ludus_range_id = ludus_range_id or foothold.ludus_range_id
     ludus_mcp_server = ludus_mcp_server or foothold.ludus_mcp_server
-    range_env = _range_env(ludus_range_id, ludus_mcp_server)
+    range_env = _range_env(ludus_range_id, ludus_mcp_server, foothold.range_profile_id)
     for name, argv, cwd, timeout in RESET_STEPS:
         step_argv = argv
         if name == "ludus rollback" and snapshot:
@@ -963,6 +987,7 @@ def full_reset_and_ready(
             _wait_for_range_boot(
                 range_id=ludus_range_id,
                 mcp_server=ludus_mcp_server,
+                range_profile_id=foothold.range_profile_id,
                 timeout=1800,
             )
             _poll(
@@ -973,7 +998,7 @@ def full_reset_and_ready(
                     mcp_server=ludus_mcp_server,
                 ),
                 ROOT,
-                _range_clock_probes_reachable,
+                lambda out: _range_clock_probes_reachable(out, foothold.range_profile_id),
                 timeout=600,
                 env=range_env,
                 predicate_returncodes=(0, 1),
@@ -2235,6 +2260,25 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
     ludus_mcp_server = ludus_mcp_server or foothold.ludus_mcp_server
     step_timeout = max(3600, solve_timeout + _GAUGE_STEP_OVERHEAD_S)
     print("DRY RUN (no --go). Plan — each gauge run gets its OWN fresh range:\n")
+    profile = _RANGE_PROFILES.get_profile(foothold.range_profile_id)
+    try:
+        declared_binding = _RANGE_PROFILES.require_scenario(profile, scenario)
+    except ValueError:
+        declared_binding = None
+    print(json.dumps({
+        "range_profile": _RANGE_PROFILES.profile_summary(profile),
+        "declared_binding": declared_binding,
+        "selected_binding": {
+            "snapshot": snapshot,
+            "ludus_range_id": ludus_range_id,
+            "ludus_mcp_server": ludus_mcp_server,
+            "foothold_host": foothold.host,
+            "foothold_ip": foothold.ip,
+            "foothold_user": foothold.user,
+            "callback_host": foothold.callback_host,
+            "callback_user": foothold.callback_user,
+        },
+    }, sort_keys=True))
     print(f"  solve-timeout={solve_timeout}s per solve; per-run subprocess cap={step_timeout}s\n")
     selected = None
     if protocol_id and measurement_kind == "row":
@@ -2457,6 +2501,11 @@ def main(argv=None) -> int:
     ap.add_argument("--snapshot", default=DEFAULT_SNAPSHOT,
                     help=f"Ludus staged-Apollo restore target (default: {DEFAULT_SNAPSHOT})")
     ap.add_argument(
+        "--range-profile",
+        default=None,
+        help="source-controlled substrate profile (default: goad-trust-walker)",
+    )
+    ap.add_argument(
         "--ludus-range-id",
         default=DEFAULT_LUDUS_RANGE_ID,
         help="Ludus range ID override for reset, inventory, and foothold deployment.",
@@ -2550,6 +2599,15 @@ def main(argv=None) -> int:
     ap.add_argument("--controller", action="store_true",
                     help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    try:
+        range_profile = _RANGE_PROFILES.get_profile(args.range_profile)
+        range_binding = None
+        if args.range_profile is not None:
+            range_binding = _RANGE_PROFILES.require_scenario(range_profile, args.scenario)
+        if args.go:
+            _RANGE_PROFILES.require_live_qualified(range_profile)
+    except ValueError as exc:
+        ap.error(str(exc))
     foothold = FootholdSpec(
         host=args.foothold_host,
         ip=args.foothold_ip,
@@ -2559,8 +2617,29 @@ def main(argv=None) -> int:
         password_env=args.foothold_password_env,
         ludus_range_id=args.ludus_range_id,
         ludus_mcp_server=args.ludus_mcp_server,
+        range_profile_id=range_profile["id"],
     )
     foothold = _configure_foothold_for_scenario(args.scenario, foothold)
+    if range_binding is not None:
+        if args.snapshot != range_binding["snapshot"]:
+            ap.error(
+                f"range profile {range_profile['id']!r} binds scenario {args.scenario!r} "
+                f"to snapshot {range_binding['snapshot']!r}"
+            )
+        foothold_mismatches = _RANGE_PROFILES.foothold_mismatches(
+            range_profile,
+            host=foothold.host,
+            ip=foothold.ip,
+            principal=foothold.user,
+            callback_host=foothold.callback_host,
+            callback_user=foothold.callback_user,
+            password_env=foothold.password_env,
+        )
+        if foothold_mismatches:
+            ap.error(
+                f"range profile {range_profile['id']!r} binds scenario {args.scenario!r} "
+                "to a different foothold: " + ", ".join(foothold_mismatches)
+            )
     _phase7_trust_context_eval_env(
         args.scenario,
         control=args.phase7_control,

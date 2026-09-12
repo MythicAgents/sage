@@ -35,6 +35,7 @@ REQUIRED_BLOODHOUND_TOOLS = frozenset({"file_upload", "domain_info", "cypher_que
 REQUIRED_STARTUP_ENV = ("SAGE_ENGAGEMENT_GATE", "SAGE_BLOODHOUND_MCP_DIR")
 READINESS_DECISION_SCHEMA = "sage-readiness-decision-v1"
 READINESS_CONTRACT_SCHEMA = "sage-readiness-contract-v1"
+RANGE_PROFILE_PATH = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "range_profile.py"
 LUDUS_PROBE_TIMEOUT_SECONDS = 30.0
 CALLBACK_PROBE_TIMEOUT_SECONDS = 210.0
 DEFAULT_TIMEOUT_GRACE_SECONDS = 5.0
@@ -55,35 +56,6 @@ READINESS_LANE_SECTIONS = {
         "channel",
     ),
 }
-EXPECTED_LUDUS_VMS = {
-    "router": "10.4.10.254",
-    "dc01": "10.4.10.10",
-    "dc02": "10.4.10.11",
-    "dc03": "10.4.10.12",
-    "srv02": "10.4.10.22",
-    "srv03": "10.4.10.23",
-}
-_VM_ALIASES = {
-    "router": "router",
-    "dc01": "dc01",
-    "dc02": "dc02",
-    "dc03": "dc03",
-    "srv02": "srv02",
-    "castelblack": "srv02",
-    "srv03": "srv03",
-    "braavos": "srv03",
-}
-_LUDUS_RANGE_FIELD = r"[a-z0-9]+"
-_LUDUS_GENERATED_VM_PATTERNS = (
-    re.compile(
-        rf"^(?P<range>{_LUDUS_RANGE_FIELD})-router-(?P<image>debian11-x64)$",
-        flags=re.ASCII,
-    ),
-    re.compile(
-        rf"^(?P<range>{_LUDUS_RANGE_FIELD})-goad-(?P<role>dc01|dc02|dc03|srv02|srv03)$",
-        flags=re.ASCII,
-    ),
-)
 _SECRETISH_KEYS = {
     "api_key",
     "aes",
@@ -120,21 +92,13 @@ def _normalize_name(value: Any) -> str:
     return str(value or "").strip().casefold()
 
 
-def _canonical_ludus_vm_name(value: Any) -> str | None:
-    normalized = _normalize_name(value)
-    if not normalized:
-        return None
-    alias = _VM_ALIASES.get(normalized)
-    if alias is not None:
-        return alias
-    for pattern in _LUDUS_GENERATED_VM_PATTERNS:
-        match = pattern.fullmatch(normalized)
-        if match is None:
-            continue
-        if "role" in match.groupdict() and match.group("role"):
-            return _VM_ALIASES.get(match.group("role"))
-        return "router"
-    return None
+def _range_profile_module():
+    return _load_module("sage_readiness_range_profile", RANGE_PROFILE_PATH)
+
+
+def _range_profile(value: str | dict[str, Any] | None = None) -> tuple[Any, dict[str, Any]]:
+    module = _range_profile_module()
+    return module, module.get_profile(value)
 
 
 def _route_summary(value: Any) -> str:
@@ -547,13 +511,25 @@ def write_startup_identity(
     return payload
 
 
-def ludus_status(range_state: dict[str, Any] | None) -> dict[str, Any]:
+def ludus_status(
+    range_state: dict[str, Any] | None,
+    profile: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile_module, selected = _range_profile(profile)
+    range_number = (range_state or {}).get("rangeNumber")
+    try:
+        expected_ips = profile_module.expected_ips(selected, range_number)
+    except ValueError as exc:
+        expected_ips = {}
+        profile_error = str(exc)
+    else:
+        profile_error = ""
     rows = []
     by_name: dict[str, dict[str, Any]] = {}
     duplicates: set[str] = set()
     unexpected: list[str] = []
     for vm in (range_state or {}).get("VMs", []) or []:
-        canonical = _canonical_ludus_vm_name(vm.get("name"))
+        canonical = profile_module.canonical_vm_name(vm.get("name"), selected)
         row = {
             "name": str(vm.get("name") or ""),
             "canonical_name": canonical,
@@ -568,18 +544,24 @@ def ludus_status(range_state: dict[str, Any] | None) -> dict[str, Any]:
             duplicates.add(canonical)
             continue
         by_name[canonical] = row
-    missing = [name for name in EXPECTED_LUDUS_VMS if name not in by_name]
+    missing = [name for name in expected_ips if name not in by_name]
     wrong_ip = [
         name
-        for name, expected_ip in EXPECTED_LUDUS_VMS.items()
+        for name, expected_ip in expected_ips.items()
         if name in by_name and str(by_name[name].get("ip") or "") != expected_ip
     ]
     powered_off = [
         name
-        for name in EXPECTED_LUDUS_VMS
+        for name in expected_ips
         if name in by_name and not by_name[name].get("powered_on")
     ]
     blockers = []
+    if profile_error:
+        blockers.append(f"range profile could not derive expected IPs: {profile_error}")
+    if selected["qualification"]["state"] != "live_qualified":
+        blockers.append(
+            f"range profile {selected['id']} is {selected['qualification']['state']}, not live-qualified"
+        )
     if missing:
         blockers.append(f"missing Ludus VMs: {', '.join(missing)}")
     if unexpected:
@@ -592,9 +574,10 @@ def ludus_status(range_state: dict[str, Any] | None) -> dict[str, Any]:
         blockers.append(f"Ludus VMs not powered on: {', '.join(powered_off)}")
     return {
         "ready": not blockers,
-        "range_number": (range_state or {}).get("rangeNumber"),
+        "range_profile": profile_module.profile_summary(selected),
+        "range_number": range_number,
         "range_state": (range_state or {}).get("rangeState"),
-        "expected_ips": dict(EXPECTED_LUDUS_VMS),
+        "expected_ips": expected_ips,
         "vms": rows,
         "blockers": blockers,
     }
@@ -617,19 +600,23 @@ def clock_status(observation: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def authentication_status(observation: dict[str, Any] | None) -> dict[str, Any]:
+def authentication_status(
+    observation: dict[str, Any] | None,
+    profile: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Prove that every expected Windows guest completed an authenticated clock probe."""
     observation = dict(observation or {})
     hosts = observation.get("hosts") if isinstance(observation.get("hosts"), list) else []
     errors = observation.get("errors") if isinstance(observation.get("errors"), list) else []
-    expected = set(EXPECTED_LUDUS_VMS).difference({"router"})
+    profile_module, selected = _range_profile(profile)
+    expected = {vm["role"] for vm in selected["vms"] if vm["os"] == "windows"}
     observed: list[str] = []
     duplicates: set[str] = set()
     for host in hosts:
         if not isinstance(host, dict):
             continue
-        canonical = _canonical_ludus_vm_name(
-            host.get("inventory_hostname") or host.get("computer")
+        canonical = profile_module.canonical_vm_name(
+            host.get("inventory_hostname") or host.get("computer"), selected
         )
         if canonical is None:
             continue
@@ -640,6 +627,10 @@ def authentication_status(observation: dict[str, Any] | None) -> dict[str, Any]:
     missing = sorted(expected.difference(observed_set))
     unexpected = sorted(observed_set.difference(expected))
     blockers = []
+    if selected["qualification"]["state"] != "live_qualified":
+        blockers.append(
+            f"range profile {selected['id']} is {selected['qualification']['state']}, not live-qualified"
+        )
     if errors:
         blockers.append("WinRM authentication probe returned errors")
     if missing:
@@ -650,6 +641,7 @@ def authentication_status(observation: dict[str, Any] | None) -> dict[str, Any]:
         blockers.append(f"WinRM authentication duplicated hosts: {', '.join(sorted(duplicates))}")
     return {
         "ready": not blockers,
+        "range_profile": profile_module.profile_summary(selected),
         "expected_hosts": sorted(expected),
         "observed_hosts": sorted(observed_set),
         "errors": errors,
@@ -962,14 +954,15 @@ async def probe_bloodhound_mcp_tools(directory: str | Path | None = None) -> dic
 def probe_ludus_status(
     range_id: str | None = None,
     mcp_server: str | None = None,
+    profile: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     module = _load_module("sage_readiness_ludus", REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py")
     code, payload = module._call(
         "GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server
     )
     if code != 200 or not isinstance(payload, dict):
-        return ludus_status({})
-    return ludus_status(payload)
+        return ludus_status({}, profile)
+    return ludus_status(payload, profile)
 
 
 def probe_clock_status(
@@ -989,24 +982,26 @@ def probe_clock_status(
 def range_boot_observation(
     range_id: str | None = None,
     mcp_server: str | None = None,
+    profile: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "observation_id": _new_observation_id(),
-        "sections": {"ludus": probe_ludus_status(range_id, mcp_server)},
+        "sections": {"ludus": probe_ludus_status(range_id, mcp_server, profile)},
     }
 
 
 def callback_readiness_observation(
     range_id: str | None = None,
     mcp_server: str | None = None,
+    profile: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clock = probe_clock_status(range_id, mcp_server)
     return {
         "observation_id": _new_observation_id(),
         "sections": {
-            "ludus": probe_ludus_status(range_id, mcp_server),
+            "ludus": probe_ludus_status(range_id, mcp_server, profile),
             "clock": clock,
-            "authentication": authentication_status(clock),
+            "authentication": authentication_status(clock, profile),
         },
     }
 
@@ -1034,9 +1029,23 @@ async def collect_operator_readiness(
     bloodhound_mcp_observation: dict[str, Any] | None = None,
     require_prepared_channel: bool = True,
     sage_deployment_observation: dict[str, Any] | None = None,
+    range_profile: str | dict[str, Any] | None = None,
+    ludus_range_id: str | None = None,
+    ludus_mcp_server: str | None = None,
 ) -> dict[str, Any]:
-    ludus_section = ludus_observation if ludus_observation is not None else probe_ludus_status()
-    clock_section = clock_observation if clock_observation is not None else probe_clock_status()
+    selected_profile = range_profile or os.environ.get("SAGE_RANGE_PROFILE_ID")
+    range_id = ludus_range_id or os.environ.get("SAGE_LUDUS_RANGE_ID")
+    mcp_server = ludus_mcp_server or os.environ.get("SAGE_LUDUS_MCP_SERVER")
+    ludus_section = (
+        ludus_observation
+        if ludus_observation is not None
+        else probe_ludus_status(range_id, mcp_server, selected_profile)
+    )
+    clock_section = (
+        clock_observation
+        if clock_observation is not None
+        else probe_clock_status(range_id, mcp_server)
+    )
     bloodhound_api_section = (
         bloodhound_api_observation
         if bloodhound_api_observation is not None
@@ -1057,7 +1066,7 @@ async def collect_operator_readiness(
         runtime_databases=runtime_db_status(repo_root, runtime_dbs_archived=runtime_dbs_archived),
         ludus=ludus_section,
         clock=clock_section,
-        authentication=authentication_status(clock_section),
+        authentication=authentication_status(clock_section, selected_profile),
         bloodhound_api=bloodhound_api_section,
         bloodhound_mcp=bloodhound_mcp_section,
         mythic_chat=mythic_chat_status(chat_containers, api_token),

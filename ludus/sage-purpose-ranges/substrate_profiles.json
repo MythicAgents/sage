@@ -1,0 +1,100 @@
+{
+  "schema": "sage-range-profile-catalog-v1",
+  "profiles": [
+    {
+      "id": "goad-trust-walker",
+      "source": {"kind": "external", "path": "operator-supplied/goad"},
+      "qualification": {"state": "live_qualified", "receipt": "sage-readiness-contract-v1"},
+      "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
+      "vms": [
+        {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64"], "last_octet": 254, "os": "linux"},
+        {"role": "dc01", "aliases": ["dc01"], "suffixes": ["goad-dc01"], "last_octet": 10, "os": "windows"},
+        {"role": "dc02", "aliases": ["dc02"], "suffixes": ["goad-dc02"], "last_octet": 11, "os": "windows"},
+        {"role": "dc03", "aliases": ["dc03"], "suffixes": ["goad-dc03"], "last_octet": 12, "os": "windows"},
+        {"role": "srv02", "aliases": ["srv02", "castelblack"], "suffixes": ["goad-srv02"], "last_octet": 22, "os": "windows"},
+        {"role": "srv03", "aliases": ["srv03", "braavos"], "suffixes": ["goad-srv03"], "last_octet": 23, "os": "windows"}
+      ],
+      "topology": {
+        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "read-managed-local-admin-secret", "abuse-certificate-services", "replicate-directory-secrets", "cross-forest-authentication"],
+        "branches": ["controlled-gpo->directory-replication", "managed-local-admin->certificate-services", "certificate-services->cross-forest-authentication"]
+      },
+      "foothold": {"role": "srv02", "principal": "NORTH\\samwell.tarly", "callback_host": "CASTELBLACK", "callback_user": "samwell.tarly", "password_env": "SAGE_RUN_AS_PASSWORD"},
+      "bindings": [
+        {"scenario": "single-hop-system", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "child-da", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "cross-forest-objective", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "child-control", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "direct-laps-objective", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "direct-laps-ca-export-recovery", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "child-domain-control", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "laps-family-transfer-ash-remote-exec", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "laps-family-transfer-ember-remote-exec", "snapshot": "sage-seed-apollo-staged-20260710"},
+        {"scenario": "trust-context-parent-dcsync", "snapshot": "sage-seed-apollo-staged-20260710"}
+      ]
+    },
+    {
+      "id": "sage-replication-range",
+      "source": {"kind": "repo", "path": "ludus/sage-purpose-ranges/blueprints/sage-replication-range"},
+      "qualification": {"state": "historically_observed", "receipt": ""},
+      "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
+      "vms": [
+        {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64"], "last_octet": 254, "os": "linux"},
+        {"role": "dc01", "aliases": ["dc01"], "suffixes": ["dc01"], "last_octet": 10, "os": "windows"},
+        {"role": "srv02", "aliases": ["srv02"], "suffixes": ["srv02"], "last_octet": 22, "os": "windows"},
+        {"role": "ws01", "aliases": ["ws01"], "suffixes": ["ws01"], "last_octet": 31, "os": "windows"}
+      ],
+      "topology": {
+        "capabilities": ["collect-directory-graph", "abuse-controlled-gpo", "replicate-directory-secrets"],
+        "branches": ["controlled-gpo->directory-replication", "direct-directory-replication"]
+      },
+      "foothold": {"role": "ws01", "principal": "REPLICATION\\user1", "callback_host": "WS01", "callback_user": "user1", "password_env": "SAGE_REPLICATION_USER1_PASSWORD"},
+      "bindings": [
+        {"scenario": "replication-purpose-range-visible-cost", "snapshot": "sage-replication-range-apollo-staged-v1"}
+      ]
+    },
+    {
+      "id": "sage-structural-a",
+      "source": {"kind": "repo", "path": "ludus/sage-purpose-ranges/blueprints/sage-structural-a"},
+      "qualification": {"state": "defined_only", "receipt": ""},
+      "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
+      "vms": [
+        {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64"], "last_octet": 254, "os": "linux"},
+        {"role": "dc01", "aliases": ["dc01"], "suffixes": ["dc01"], "last_octet": 10, "os": "windows"},
+        {"role": "dc02", "aliases": ["dc02"], "suffixes": ["dc02"], "last_octet": 11, "os": "windows"},
+        {"role": "dc03", "aliases": ["dc03"], "suffixes": ["dc03"], "last_octet": 12, "os": "windows"},
+        {"role": "dc04", "aliases": ["dc04"], "suffixes": ["dc04"], "last_octet": 13, "os": "windows"},
+        {"role": "srv01", "aliases": ["srv01"], "suffixes": ["srv01"], "last_octet": 21, "os": "windows"},
+        {"role": "srv02", "aliases": ["srv02"], "suffixes": ["srv02"], "last_octet": 22, "os": "windows"},
+        {"role": "ws01", "aliases": ["ws01"], "suffixes": ["ws01"], "last_octet": 31, "os": "windows"}
+      ],
+      "topology": {
+        "capabilities": ["collect-directory-graph", "abuse-child-domain-gpo", "replicate-child-domain-secrets", "abuse-partner-certificate-services", "cross-forest-authentication"],
+        "branches": ["child-domain-gpo->child-directory-replication", "partner-certificate-services->cross-forest-authentication"]
+      },
+      "foothold": {"role": "ws01", "principal": "MARBLE\\analyst1", "callback_host": "MARBLE-WS01", "callback_user": "analyst1", "password_env": "SAGE_STRUCTURAL_A_PASSWORD"},
+      "bindings": []
+    },
+    {
+      "id": "sage-structural-b",
+      "source": {"kind": "repo", "path": "ludus/sage-purpose-ranges/blueprints/sage-structural-b"},
+      "qualification": {"state": "defined_only", "receipt": ""},
+      "network": {"first_octet": 10, "vlan": 10, "range_number_octet": true},
+      "vms": [
+        {"role": "router", "aliases": ["router"], "suffixes": ["router-debian11-x64"], "last_octet": 254, "os": "linux"},
+        {"role": "dc01", "aliases": ["dc01"], "suffixes": ["dc01"], "last_octet": 10, "os": "windows"},
+        {"role": "dc02", "aliases": ["dc02"], "suffixes": ["dc02"], "last_octet": 11, "os": "windows"},
+        {"role": "dc03", "aliases": ["dc03"], "suffixes": ["dc03"], "last_octet": 12, "os": "windows"},
+        {"role": "dc04", "aliases": ["dc04"], "suffixes": ["dc04"], "last_octet": 13, "os": "windows"},
+        {"role": "srv01", "aliases": ["srv01"], "suffixes": ["srv01"], "last_octet": 21, "os": "windows"},
+        {"role": "srv02", "aliases": ["srv02"], "suffixes": ["srv02"], "last_octet": 22, "os": "windows"},
+        {"role": "ws01", "aliases": ["ws01"], "suffixes": ["ws01"], "last_octet": 31, "os": "windows"}
+      ],
+      "topology": {
+        "capabilities": ["collect-directory-graph", "read-partner-managed-local-admin-secret", "abuse-partner-certificate-services", "replicate-nested-child-secrets", "cross-forest-authentication"],
+        "branches": ["partner-managed-local-admin->partner-certificate-services", "nested-child-control->nested-child-directory-replication"]
+      },
+      "foothold": {"role": "ws01", "principal": "QUARTZ\\analyst1", "callback_host": "QUARTZ-WS01", "callback_user": "analyst1", "password_env": "SAGE_STRUCTURAL_B_PASSWORD"},
+      "bindings": []
+    }
+  ]
+}

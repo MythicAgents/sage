@@ -168,8 +168,14 @@ The Sage-side staging flow is:
 The gauge must be pointed at the staged snapshot and the split host labels:
 
 ```bash
-SAGE_LUDUS_MCP_SERVER=ludus_sagerepl SAGE_LUDUS_RANGE_ID=SAGEREPL SAGE_REPLICATION_USER1_PASSWORD='<password>' .venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario replication-purpose-range-visible-cost --side harness --go --snapshot sage-replication-range-apollo-staged-v1 --ludus-range-id SAGEREPL --retained-callback-config skills/sage-callback-bootstrap/apollo_replication_range_ws01_callback_config.json --foothold-host SAGEREPL-WS01 --foothold-callback-host WS01 --foothold-ip 10.7.10.31 --foothold-user 'REPLICATION\user1' --foothold-callback-user user1 --foothold-password-env SAGE_REPLICATION_USER1_PASSWORD
+SAGE_LUDUS_MCP_SERVER=ludus_sagerepl SAGE_LUDUS_RANGE_ID=SAGEREPL SAGE_REPLICATION_USER1_PASSWORD='<password>' .venv/bin/python skills/sage-eval-gauge/scripts/orchestrate.py --scenario replication-purpose-range-visible-cost --range-profile sage-replication-range --side harness --go --snapshot sage-replication-range-apollo-staged-v1 --ludus-range-id SAGEREPL --retained-callback-config skills/sage-callback-bootstrap/apollo_replication_range_ws01_callback_config.json --foothold-host SAGEREPL-WS01 --foothold-callback-host WS01 --foothold-ip 10.7.10.31 --foothold-user 'REPLICATION\user1' --foothold-callback-user user1 --foothold-password-env SAGE_REPLICATION_USER1_PASSWORD
 ```
+
+The source-controlled substrate catalog is `substrate_profiles.json`. It records
+inventory and topology identity independently of host/domain labels. Only a
+profile with `qualification.state=live_qualified` can release a live reset or
+gauge run; defined or historically observed profiles remain dry-run-only until
+their qualification receipt is added deliberately.
 
 For Sage runs that may take the GPO branch, start Sage with:
 
