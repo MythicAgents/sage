@@ -154,53 +154,6 @@ def test_contract_and_environment_are_fixed():
         pilot.PilotContract(arm_order=(pilot.ARM_ORDER[0], pilot.ARM_ORDER[0])).validate()
 
 
-def test_early_proof_profile_preserves_budgets_and_only_changes_treatment_environment():
-    contract = pilot.ImprovementContract("a" * 64, "b" * 64, experiment=pilot.EARLY_PROOF_EXPERIMENT)
-    contract.validate()
-    baseline = pilot.arm_environment(contract, "baseline-sage")
-    candidate = pilot.arm_environment(contract, "candidate-sage")
-    assert baseline.pop("SAGE_CAPABILITY_EARLY_PROOF_POLLING") == "0"
-    assert candidate.pop("SAGE_CAPABILITY_EARLY_PROOF_POLLING") == "1"
-    assert baseline == candidate == pilot.arm_environment(pilot.PilotContract())
-    assert contract.to_record()["schema"] != pilot.IMPROVEMENT_SCHEMA
-    with pytest.raises(pilot.PilotError, match="baseline-first"):
-        pilot.ImprovementContract("a" * 64, "b" * 64, experiment=pilot.EARLY_PROOF_EXPERIMENT,
-                                  arm_order=tuple(reversed(pilot.IMPROVEMENT_ARM_ORDER))).validate()
-
-
-@pytest.mark.parametrize("candidate_latency,objectives,expected", [(60, True, True), (270, True, False),
-                                                                 (310, True, False), (60, False, False),
-                                                                 (None, True, False)])
-def test_early_proof_summary_is_descriptive_and_preserves_unfavorable_observations(candidate_latency, objectives, expected):
-    reports = []
-    for arm, latency in zip(pilot.IMPROVEMENT_ARM_ORDER, [310, candidate_latency]):
-        reports.append({"arm": arm, "objective_disposition": "proven" if objectives else "disproven",
-                        "terminal_snapshot": {"early_proof_primary_metric": {
-                            "complete": latency is not None, "latency_seconds": latency,
-                            "principal": "alice", "domain": "lab.local"}}})
-    metric = pilot._early_proof_metric_report(reports)
-    assert metric["meaningful_effect_met"] is expected
-    assert len(metric["arms"]) == 2
-    assert "not replicated superiority" in metric["interpretation"]
-
-
-def test_early_proof_pair_calls_the_real_arm_environment_boundary(tmp_path, monkeypatch):
-    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
-    events = []
-    contract = pilot.ImprovementContract("a" * 64, "b" * 64, experiment=pilot.EARLY_PROOF_EXPERIMENT)
-    deps = dependencies(events)
-    def reset(arm, env):
-        events.append(("treatment", arm, env["SAGE_CAPABILITY_EARLY_PROOF_POLLING"]))
-        return start_manifest(source_identity=contract.source_identity_for_arm(arm))
-    deps.reset = reset
-    result = pilot.run_pair(contract, tmp_path / "early-proof", deps)
-    assert result["run_complete"] is True  # Missing metric is not a protocol failure.
-    assert result["primary_metric"]["meaningful_effect_met"] is False
-    assert result["schema"] == pilot.EARLY_PROOF_SCHEMA
-    assert [row for row in events if row[0] == "treatment"] == [
-        ("treatment", "baseline-sage", "0"), ("treatment", "candidate-sage", "1")]
-
-
 def test_pair_runs_exactly_two_arms_in_order_and_retains_comparison(tmp_path, monkeypatch):
     monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
     events = []

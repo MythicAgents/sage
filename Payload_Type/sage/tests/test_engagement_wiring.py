@@ -2514,9 +2514,8 @@ def test_execute_capability_gpo_fallback_retries_delayed_membership_proof(monkey
     ("denied_after_pending", 8, [300, 330], "partial"),
 ])
 def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
-    monkeypatch, effect_at, retries, expected_polls, verdict, early=False, task_seconds=0, budget_limit=None,
+    monkeypatch, effect_at, retries, expected_polls, verdict,
 ):
-    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "1" if early else "0")
     mt = _make_tools()
     mt._fetch_command_schema = lambda *_args: asyncio.sleep(0, result=[])
     mt._validate_command_parameters = lambda *_args: asyncio.sleep(0, result=None)
@@ -2526,7 +2525,6 @@ def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
         timestamp="2026-09-17T00:00:00Z",
     )]
     clock = 0
-    monkeypatch.setattr(mythic_tools, "monotonic", lambda: clock, raising=False)
     polls = []
     calls = {}
 
@@ -2538,7 +2536,6 @@ def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
     monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
 
     def output():
-        nonlocal clock
         if len(calls["issued"]) == 1:
             return (
                 "scheduled task xml valid: synthetic.xml\n"
@@ -2546,13 +2543,8 @@ def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
                 "ldap version bumped: 1 -> 2\ngpt.ini version bumped: 2\n"
                 "command path present: cmd.exe\n"
             )
-        clock += task_seconds
         polls.append(clock)
-        if (
-            effect_at == "denied"
-            or (effect_at == "denied_after_pending" and clock >= 330)
-            or (effect_at == "denied_on_second_check" and len(polls) >= 2)
-        ):
+        if effect_at == "denied" or (effect_at == "denied_after_pending" and clock >= 330):
             return "Access is denied."
         members = "Administrator"
         if isinstance(effect_at, int) and clock >= effect_at:
@@ -2572,11 +2564,7 @@ def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
             task["display_id"] = 900 + calls["issue"]
             return task
 
-        budget = None if budget_limit is None else mythic_tools.task_budget.TaskBudget(
-            limit=budget_limit, deadline=mythic_tools.task_budget.time.monotonic() + 60,
-        )
-        with patch.object(mythic_tools.mythic, "issue_task", unique_issue), \
-                mythic_tools.task_budget.task_budget_scope(budget):
+        with patch.object(mythic_tools.mythic, "issue_task", unique_issue):
             result = json.loads(asyncio.run(mt.execute_capability(
                 {"capability": "gpo-controlled-system-exec", "domain": "lab.local",
                  "gpo": "workstation-policy", "callback_id": 3},
@@ -2597,72 +2585,6 @@ def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
         proven = [hop for hop in mt._engagement_hops if hop.status == "achieved"]
         assert proven
         assert all(str(hop.proof_envelope["task_id"]) == str(task_ids[-1]) for hop in proven)
-
-
-@pytest.mark.parametrize("effect_at,retries,expected_polls,verdict,task_seconds", [
-    (60, 8, [60], "achieved", 0),
-    (180, 8, [60, 120, 180], "achieved", 0),
-    (480, 8, [60, 120, 180, 240] + list(range(300, 481, 30)), "achieved", 0),
-    (None, 8, [60, 120, 180, 240] + list(range(300, 541, 30)), "partial", 0),
-    (None, 0, [60, 120, 180, 240, 300], "partial", 0),
-    (None, 2, [60, 120, 180, 240, 300, 330, 360], "partial", 0),
-    ("denied", 8, [60], "partial", 0),
-    ("denied_on_second_check", 8, [60, 120], "partial", 0),
-    ("denied_after_pending", 8, [60, 120, 180, 240, 300, 330], "partial", 0),
-    (None, 8, [66, 126, 186, 246] + list(range(306, 595, 36)), "partial", 6),
-])
-def test_early_proof_polling_keeps_the_original_late_recovery_window(
-    monkeypatch, effect_at, retries, expected_polls, verdict, task_seconds,
-):
-    test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
-        monkeypatch, effect_at, retries, expected_polls, verdict, early=True, task_seconds=task_seconds,
-    )
-
-
-def test_early_proof_polling_cannot_submit_past_the_run_task_budget(monkeypatch):
-    test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
-        monkeypatch, None, 8, [60, 120], "partial", early=True, budget_limit=3,
-    )
-
-
-@pytest.mark.parametrize("seconds,offsets", [
-    (30, []), (60, []), (61, [61]), (180, [120, 180]),
-    (300, [120, 180, 240, 300]), (600, [120, 180, 240, 600]),
-    (900, [120, 180, 240, 600]), ("invalid", []),
-])
-def test_early_probe_schedule_is_bounded_and_does_not_mutate_the_plan(monkeypatch, seconds, offsets):
-    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "1")
-    monkeypatch.setattr(mythic_tools, "monotonic", lambda: 1000)
-    mt = _make_tools()
-    wait = {"command": "wait_for_seconds", "parameters": {"seconds": seconds, "reason": "delayed effect"}}
-    probe = {"expected_probe": "extract_gpo_domain_admin_membership_probe", "consumes": ["event:refresh"]}
-    changed, deadlines = mt._capability_executor_early_probe_wait(wait, probe)
-    assert wait["parameters"]["seconds"] == seconds
-    assert deadlines == [1000 + offset for offset in offsets]
-    assert len(deadlines) <= 4
-    if offsets:
-        assert changed["parameters"] == {"seconds": 60, "reason": "delayed effect"}
-    else:
-        assert changed is wait
-
-
-@pytest.mark.parametrize("enabled,command,expected_probe,consumes", [
-    ("0", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
-    ("true", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
-    ("1", "shell", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
-    ("1", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", []),
-    ("1", "wait_for_seconds", "extract_gpo_system_exec_probe", ["event:refresh"]),
-])
-def test_early_probe_schedule_does_not_apply_outside_the_opted_in_delayed_final_pair(
-    monkeypatch, enabled, command, expected_probe, consumes,
-):
-    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", enabled)
-    mt = _make_tools()
-    wait = {"command": command, "parameters": {"seconds": 300}}
-    probe = {"expected_probe": expected_probe, "consumes": consumes}
-    unchanged, deadlines = mt._capability_executor_early_probe_wait(wait, probe)
-    assert unchanged is wait
-    assert deadlines == []
 
 
 @pytest.mark.parametrize("delayed", [True, False])

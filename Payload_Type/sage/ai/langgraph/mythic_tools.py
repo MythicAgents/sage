@@ -6,7 +6,6 @@ import contextvars
 import inspect
 from pathlib import Path
 import sys
-from time import monotonic
 
 try:
     from ai import task_budget
@@ -9794,7 +9793,6 @@ class MythicTools:
             forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
             core_action_issued = False
             command_objects = list(build_payload.get("commands") or [])
-            early_proof_deadlines: dict[int, list[float]] = {}
             for command_index, command_obj in enumerate(command_objects):
                 is_current_context_preflight = self._capability_executor_is_current_context_preflight(command_obj)
                 refresh_current_context = (
@@ -9824,12 +9822,6 @@ class MythicTools:
                         "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
                     }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
 
-                following_command = command_objects[command_index + 1] if command_index + 1 < len(command_objects) else {}
-                command_obj, early_deadlines = self._capability_executor_early_probe_wait(
-                    command_obj, following_command,
-                )
-                if early_deadlines:
-                    early_proof_deadlines[command_index + 1] = early_deadlines
                 issued_item = await self._execute_capability_command(
                     command_obj,
                     int(callback_id),
@@ -9998,11 +9990,7 @@ class MythicTools:
                         }, sort_keys=True)
                     if final_probe:
                         retry_attempt = 0
-                        early_deadlines = early_proof_deadlines.get(command_index, [])
-                        max_probe_retries = (
-                            self._capability_executor_final_probe_retry_limit(input_values, command_obj)
-                            + len(early_deadlines)
-                        )
+                        max_probe_retries = self._capability_executor_final_probe_retry_limit(input_values, command_obj)
                         while self._capability_should_retry_final_probe(
                             command_obj,
                             retry_guard_probe,
@@ -10012,10 +10000,6 @@ class MythicTools:
                         ):
                             retry_attempt += 1
                             retry_delay = self._capability_executor_final_probe_retry_delay(input_values, command_obj)
-                            if retry_attempt <= len(early_deadlines):
-                                # Account for time spent observing: early reads must not shift the
-                                # original first check or consume any of its later retry allowance.
-                                retry_delay = max(0.0, early_deadlines[retry_attempt - 1] - monotonic())
                             if retry_delay > 0:
                                 await asyncio.sleep(retry_delay)
                             retry_item = await self._execute_capability_command(
@@ -12755,28 +12739,6 @@ class MythicTools:
             item["cleanup"] = True
             issued.append(item)
         return issued
-
-    def _capability_executor_early_probe_wait(self, command_obj: dict, following_command: dict) -> tuple[dict, list[float]]:
-        """Opt-in early reads before an existing wait/final-probe pair, retaining its recovery window."""
-        if (
-            os.environ.get("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "").strip() != "1"
-            or command_obj.get("command") != "wait_for_seconds"
-            or not self._capability_executor_allows_repeated_probe(following_command)
-        ):
-            return command_obj, []
-        parameters = command_obj.get("parameters")
-        if not isinstance(parameters, dict):
-            return command_obj, []
-        try:
-            seconds = max(1, min(int(parameters.get("seconds") or 300), 600))
-        except (TypeError, ValueError):
-            return command_obj, []
-        offsets = list(range(60, min(seconds, 300), 60))
-        if not offsets:
-            return command_obj, []
-        started = monotonic()
-        deadlines = [started + offset for offset in offsets[1:] + [seconds]]
-        return {**command_obj, "parameters": {**parameters, "seconds": offsets[0]}}, deadlines
 
     def _capability_executor_allows_repeated_probe(self, command_obj: dict) -> bool:
         if not self._capability_executor_is_final_probe(command_obj):
