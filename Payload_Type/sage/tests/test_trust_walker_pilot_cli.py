@@ -95,6 +95,159 @@ def write_standing_authority(path: Path, *contracts, **changes) -> dict:
     return document
 
 
+def _early_proof_rows(*, latency=60, net_user=False):
+    started = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    def stamp(seconds):
+        return (started + timedelta(seconds=seconds)).isoformat()
+    def response(number, seconds, text):
+        return {"id": number, "sequence_number": number, "timestamp": stamp(seconds),
+                "response_text": base64.b64encode(text.encode()).decode()}
+    def task(number, created, params, responses):
+        return {"operation_id": 8, "display_id": number, "command_name": "shell",
+                "original_params": params, "completed": True,
+                "status_timestamp_preprocessing": stamp(created),
+                "status_timestamp_processed": stamp(created + 1),
+                "timestamp": responses[-1]["timestamp"],
+                "callback": {"display_id": 2, "domain": "NORTH", "user": "alice"},
+                "responses": responses}
+    xml = ('<ScheduledTasks><Task><Actions><Exec><Command>cmd.exe</Command><Arguments>'
+           '/c net group "Domain Admins" alice /add /domain'
+           '</Arguments></Exec></Actions></Task></ScheduledTasks>')
+    output = ("The request will be processed at a domain controller for domain north.sevenkingdoms.local.\n"
+              + ("User name                    alice\nGlobal Group memberships     *Domain Admins\n"
+                 if net_user else "Group name     Domain Admins\nMembers\n------------------\nAdministrator alice\n")
+              + "The command completed successfully.\n")
+    rows = [task(7, 5, r'type \\north.sevenkingdoms.local\SYSVOL\north.sevenkingdoms.local\Policies\{guid}\ScheduledTasks.xml',
+                 [response(70, 10, xml)]),
+            task(8, 10 + latency - 2, 'net user alice /domain' if net_user else 'net group "Domain Admins" /domain',
+                 [response(80, 10 + latency - 1, "pending\n"), response(81, 10 + latency, output)])]
+    return rows, {"operation_id": 8, "arm_started_at": stamp(0), "arm_deadline_at": stamp(2700)}
+
+
+@pytest.mark.parametrize("net_user", [False, True])
+def test_early_proof_metric_binds_real_xml_and_first_valid_response_prefix(net_user):
+    rows, context = _early_proof_rows(net_user=net_user)
+    metric = cli.early_proof_primary_metric(rows, **context)
+    assert metric["complete"] is True
+    assert metric["latency_seconds"] == 60
+    assert metric["proof_response_id"] == 81
+    assert metric["setup_task_id"] == 7 and metric["proof_task_id"] == 8
+    assert metric["principal"] == "alice"
+    assert metric["domain"] == "north.sevenkingdoms.local"
+
+
+@pytest.mark.parametrize("change", [
+    "wrong_principal", "wrong_callback", "wrong_domain", "wrong_output_domain", "wrong_setup_domain",
+    "pre_setup", "stale", "incomplete_task", "late_proof", "missing_time", "reversed_time", "invalid_xml",
+    "incomplete_output", "near_principal", "wrong_net_user", "missing_output_domain",
+])
+def test_early_proof_metric_rejects_binding_and_timing_counterexamples(change):
+    rows, context = _early_proof_rows(net_user=change == "wrong_net_user")
+    proof = rows[1]
+    if change == "wrong_principal": proof["callback"]["user"] = "bob"
+    elif change == "wrong_callback": proof["callback"]["display_id"] = 3
+    elif change == "wrong_domain": proof["callback"]["domain"] = "ESSOS"
+    elif change == "wrong_setup_domain": rows[0]["original_params"] = rows[0]["original_params"].replace("north.sevenkingdoms.local", "essos.local")
+    elif change == "pre_setup": proof["status_timestamp_preprocessing"] = rows[0]["status_timestamp_preprocessing"]
+    elif change == "stale": rows[0]["status_timestamp_preprocessing"] = "2026-09-16T12:00:00Z"
+    elif change == "incomplete_task": proof["completed"] = False
+    elif change == "late_proof": proof["responses"][-1]["timestamp"] = proof["timestamp"] = "2026-09-17T12:45:01Z"
+    elif change == "missing_time": proof["responses"][-1]["timestamp"] = None
+    elif change == "reversed_time": proof["responses"][0]["timestamp"] = "2026-09-17T12:02:00Z"
+    else:
+        row = rows[0] if change == "invalid_xml" else proof
+        output = base64.b64decode(row["responses"][-1]["response_text"]).decode()
+        if change == "invalid_xml": output = output.replace("</ScheduledTasks>", "")
+        elif change == "wrong_output_domain": output = output.replace("north.sevenkingdoms.local", "essos.local")
+        elif change == "missing_output_domain": output = "\n".join(output.splitlines()[1:])
+        elif change == "incomplete_output": output = output.replace("The command completed successfully.", "")
+        elif change == "near_principal": output = output.replace("alice", "malice")
+        elif change == "wrong_net_user": output = output.replace("User name                    alice", "User name                    bob")
+        row["responses"][-1]["response_text"] = base64.b64encode(output.encode()).decode()
+    metric = cli.early_proof_primary_metric(rows, **context)
+    assert metric["complete"] is False
+    assert metric["latency_seconds"] is None
+    assert metric["diagnostics"]
+
+
+def test_early_proof_metric_accepts_normalized_native_run_parameters():
+    rows, context = _early_proof_rows(net_user=True)
+    rows[0]["command_name"] = rows[1]["command_name"] = "run"
+    rows[0]["original_params"] = json.dumps({"executable": "more.com", "arguments": rows[0]["original_params"][5:]})
+    rows[1]["original_params"] = json.dumps({"executable": "net.exe", "arguments": "user alice /domain"})
+    assert cli.early_proof_primary_metric(rows, **context)["complete"] is True
+
+
+def test_old_standing_authority_rejects_new_early_proof_binding(tmp_path):
+    old = cli.ImprovementContract("a" * 64, "b" * 64)
+    new = cli.ImprovementContract("a" * 64, "b" * 64, experiment=cli.EARLY_PROOF_EXPERIMENT)
+    path = tmp_path / "authority.json"
+    write_standing_authority(path, old)
+    with pytest.raises(cli.PilotError, match="exact frozen live contract"):
+        cli._load_standing_live_authority(path, command="run-improvement-pair", contract=new)
+    assert "experiment" not in old.to_record()
+    assert cli._live_contract_binding(new)["treatment"]["maximum_extra_payload_reads"] == 4
+
+
+def test_early_proof_observer_retains_raw_support_without_certificate_metric(monkeypatch, tmp_path):
+    rows, context = _early_proof_rows()
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path
+    runtime.experiment = cli.EARLY_PROOF_EXPERIMENT
+    runtime.current_client = object()
+    runtime.current_operation_id = context["operation_id"]
+    runtime.current_started_at = datetime.fromisoformat(context["arm_started_at"])
+    runtime.current_deadline_at = datetime.fromisoformat(context["arm_deadline_at"])
+    runtime._operation_snapshot = lambda *_args: {"task": rows, "credential": [], "callback": []}
+    monkeypatch.setattr(cli.live_seams, "bloodhound_domain_count", lambda **_kwargs: 3)
+    snapshot = runtime.observe("candidate-sage", {}, {"task_budget": {"limit": 100, "reservations": 2,
+                              "confirmed_task_ids": [7, 8]}}, {})
+    assert "certificate_auth_primary_metric" not in snapshot
+    metric = snapshot["early_proof_primary_metric"]
+    assert metric["complete"] is True
+    path = Path(metric["retained_evidence"]["path"])
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text())["task"] == rows
+    assert metric["retained_evidence"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    # The timing instrument does not manufacture the separately classified essos objective.
+    assert classify_terminal_snapshot(snapshot).disposition != "proven"
+
+
+def test_early_proof_cli_plan_uses_one_pair_and_new_metric(capsys):
+    assert cli.main(["improvement-plan", "--experiment", cli.EARLY_PROOF_EXPERIMENT,
+                     "--baseline-source-identity", "a" * 64, "--candidate-source-identity", "b" * 64]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert list(plan["supported_pair_orders"]) == ["baseline-first"]
+    assert plan["contract"]["primary_metric"]["minimum_reduction_seconds"] == 60
+    assert plan["final_summary_surface"] != "summarize-improvement"
+
+
+@pytest.mark.parametrize("effective", ["0", "1", None])
+def test_effective_early_proof_switch_is_read_from_source_bound_process(monkeypatch, tmp_path, effective):
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.source_root = tmp_path
+    runtime.current_operation_id = 8
+    runtime.current_callback_id = 2
+    runtime.current_arm = "candidate-sage"
+    runtime._engagement_id = lambda _arm: "test-early-proof"
+    runtime.current_treatment_environment = {"SAGE_CAPABILITY_EARLY_PROOF_POLLING": "1"}
+    startup = {"ready": True, "pid": 123, "cwd": str(tmp_path / "Payload_Type" / "sage")}
+    runtime.native = SimpleNamespace(_readiness_contract_module=lambda: SimpleNamespace(startup_identity_from_env=lambda: startup))
+    actual_read = Path.read_bytes
+    def read(path):
+        if str(path) == "/proc/123/environ":
+            return b"SECRET=not-retained\0" + (("SAGE_CAPABILITY_EARLY_PROOF_POLLING=" + effective + "\0").encode() if effective is not None else b"")
+        return actual_read(path)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    if effective == "1":
+        identity = runtime.runtime_identity()
+        assert identity["effective_treatment_environment"] == runtime.current_treatment_environment
+        assert "not-retained" not in json.dumps(identity)
+    else:
+        with pytest.raises(cli.PilotError, match="effective Sage early-proof treatment"):
+            runtime.runtime_identity()
+
+
 def test_standing_authority_accepts_successor_identities_and_returns_safe_receipt(tmp_path):
     authority_path = tmp_path / "authority.json"
     frozen = cli.ImprovementContract("a" * 64, "b" * 64)

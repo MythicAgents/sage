@@ -6,6 +6,7 @@ import contextvars
 import inspect
 from pathlib import Path
 import sys
+from time import monotonic
 
 try:
     from ai import task_budget
@@ -5399,7 +5400,14 @@ class MythicTools:
         # not been cleared by intervening progress. Refuse to re-issue it (the failure breaker can't, because
         # the command SUCCEEDS) so a post-success loop (e.g. `shell klist`) cannot keep consuming the budget.
         _loop_action_key = self._unproductive_action_key(command, callback_display_id, parameters)
-        if _loop_action_key in self._unproductive_tripped:
+        # Only the private capability executor can supply this per-call exception. Its delayed final
+        # verifier owns a bounded retry loop: unchanged successful reads can mean "not ready yet".
+        # Read ambient context, never the public visibility_context argument; parameter normalization
+        # above must not change the scope of the exception or require clearing unrelated guard state.
+        bounded_delayed_proof_poll = (
+            (_task_visibility_context.get() or {}).get("bounded_delayed_proof_poll") is True
+        )
+        if _loop_action_key in self._unproductive_tripped and not bounded_delayed_proof_poll:
             return (
                 f"STOP — '{command}' on callback {callback_display_id} was already flagged as an unproductive "
                 f"loop (it returned the same output {self._unproductive_repeat_limit}× with no new progress). Do "
@@ -5700,7 +5708,7 @@ class MythicTools:
             # Loop-guard: detect a SUCCESSFUL-but-unproductive repeat (same command/params/normalized output)
             # that the failure breaker resets past. On the Nth identical success, surface a STOP nudge and flag
             # the action so the pre-issue guard refuses further repeats.
-            _unprod_nudge = self._unproductive_repeat_nudge(
+            _unprod_nudge = None if bounded_delayed_proof_poll else self._unproductive_repeat_nudge(
                 command, callback_display_id, parameters, results_str, result_class
             )
             if _unprod_nudge:
@@ -9786,6 +9794,7 @@ class MythicTools:
             forge_cross_domain_parent = self._cross_domain_forge_parent(action_obj, input_values)
             core_action_issued = False
             command_objects = list(build_payload.get("commands") or [])
+            early_proof_deadlines: dict[int, list[float]] = {}
             for command_index, command_obj in enumerate(command_objects):
                 is_current_context_preflight = self._capability_executor_is_current_context_preflight(command_obj)
                 refresh_current_context = (
@@ -9815,6 +9824,12 @@ class MythicTools:
                         "recorded_effects": sorted(self._capability_achieved_effects() - before_effects),
                     }, action_obj, input_values, callback_id, issued=all_issued, build_payload=build_payload)
 
+                following_command = command_objects[command_index + 1] if command_index + 1 < len(command_objects) else {}
+                command_obj, early_deadlines = self._capability_executor_early_probe_wait(
+                    command_obj, following_command,
+                )
+                if early_deadlines:
+                    early_proof_deadlines[command_index + 1] = early_deadlines
                 issued_item = await self._execute_capability_command(
                     command_obj,
                     int(callback_id),
@@ -9899,6 +9914,9 @@ class MythicTools:
                     capabilities,
                 )
                 if verification is not None:
+                    # Retry admission needs the latest observation, including hard
+                    # negatives intentionally excluded from accumulated success facts.
+                    retry_guard_probe = dict(probe or {})
                     if probe:
                         accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, probe)
                         verification = capabilities.verify_capability(
@@ -9980,16 +9998,24 @@ class MythicTools:
                         }, sort_keys=True)
                     if final_probe:
                         retry_attempt = 0
-                        max_probe_retries = self._capability_executor_final_probe_retry_limit(input_values, command_obj)
+                        early_deadlines = early_proof_deadlines.get(command_index, [])
+                        max_probe_retries = (
+                            self._capability_executor_final_probe_retry_limit(input_values, command_obj)
+                            + len(early_deadlines)
+                        )
                         while self._capability_should_retry_final_probe(
                             command_obj,
-                            probe or {},
+                            retry_guard_probe,
                             verification,
                             retry_attempt,
                             max_probe_retries,
                         ):
                             retry_attempt += 1
                             retry_delay = self._capability_executor_final_probe_retry_delay(input_values, command_obj)
+                            if retry_attempt <= len(early_deadlines):
+                                # Account for time spent observing: early reads must not shift the
+                                # original first check or consume any of its later retry allowance.
+                                retry_delay = max(0.0, early_deadlines[retry_attempt - 1] - monotonic())
                             if retry_delay > 0:
                                 await asyncio.sleep(retry_delay)
                             retry_item = await self._execute_capability_command(
@@ -10028,6 +10054,7 @@ class MythicTools:
                             )
                             if retry_verification is None:
                                 break
+                            retry_guard_probe = dict(retry_probe or {})
                             if retry_probe:
                                 accumulated_probe = self._capability_executor_merge_probe(accumulated_probe, retry_probe)
                                 retry_verification = capabilities.verify_capability(
@@ -11402,6 +11429,7 @@ class MythicTools:
                 "policy_decision": dict(command_context.get("policy_decision") or {}),
                 "transaction_id": self._capability_text(command_context.get("transaction_id")),
                 "authorization": authorization,
+                "bounded_delayed_proof_poll": self._capability_executor_allows_repeated_probe(command_obj),
             })
             try:
                 output = await self.issue_task_and_waitfor_task_output(
@@ -12727,6 +12755,28 @@ class MythicTools:
             item["cleanup"] = True
             issued.append(item)
         return issued
+
+    def _capability_executor_early_probe_wait(self, command_obj: dict, following_command: dict) -> tuple[dict, list[float]]:
+        """Opt-in early reads before an existing wait/final-probe pair, retaining its recovery window."""
+        if (
+            os.environ.get("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "").strip() != "1"
+            or command_obj.get("command") != "wait_for_seconds"
+            or not self._capability_executor_allows_repeated_probe(following_command)
+        ):
+            return command_obj, []
+        parameters = command_obj.get("parameters")
+        if not isinstance(parameters, dict):
+            return command_obj, []
+        try:
+            seconds = max(1, min(int(parameters.get("seconds") or 300), 600))
+        except (TypeError, ValueError):
+            return command_obj, []
+        offsets = list(range(60, min(seconds, 300), 60))
+        if not offsets:
+            return command_obj, []
+        started = monotonic()
+        deadlines = [started + offset for offset in offsets[1:] + [seconds]]
+        return {**command_obj, "parameters": {**parameters, "seconds": offsets[0]}}, deadlines
 
     def _capability_executor_allows_repeated_probe(self, command_obj: dict) -> bool:
         if not self._capability_executor_is_final_probe(command_obj):

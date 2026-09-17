@@ -18,6 +18,7 @@ import sys
 import time
 import signal
 import threading
+import xml.etree.ElementTree as ET
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
@@ -43,6 +44,7 @@ from ai.hillclimb.trust_walker_pilot import (
     RECOVERY_CLEANUP_ATTEMPT_LIMIT, TASK_SETTLEMENT_SECONDS,
     SETUP_REHEARSAL_ATTEMPT_LIMIT, SETUP_REHEARSAL_SUCCESSES,
     ImprovementContract, PilotContract, PilotDependencies, PilotError,
+    EARLY_PROOF_EXPERIMENT,
     append_record, arm_environment, assert_rejected_kernel_absent,
     compare_start_manifests, matched_start_identity, read_records, run_pair,
     validate_artifact_dir, validate_runtime_identity,
@@ -552,6 +554,8 @@ def _live_contract_binding(contract: PilotContract | ImprovementContract) -> dic
         "setup_rehearsal_attempt_limit",
         "runs_per_arm",
         "primary_metric",
+        "experiment",
+        "treatment",
         "timing_policy",
     )
     return {key: record[key] for key in keys if key in record}
@@ -1515,6 +1519,189 @@ def certificate_auth_primary_metric(rows: object) -> dict[str, Any]:
     }
 
 
+def early_proof_primary_metric(
+    rows: object, *, operation_id: int, arm_started_at: str, arm_deadline_at: str,
+) -> dict[str, Any]:
+    """Time an independently parsed GPO XML readback to its same-subject membership proof.
+
+    This is deliberately a narrow measurement of the existing XML/group-add producer,
+    not a second objective oracle or a score for alternate GPO strategies.
+    """
+    from ai.langgraph import capabilities
+
+    diagnostics = []
+    observed_ids = []
+    result = {"complete": False, "disposition": "unmeasured", "latency_seconds": None,
+              "diagnostics": diagnostics, "observed_task_ids": observed_ids}
+
+    def timestamp(value):
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        except (TypeError, ValueError):
+            return None
+
+    start, deadline = timestamp(arm_started_at), timestamp(arm_deadline_at)
+    if (not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows)
+            or start is None or deadline is None or deadline <= start):
+        return {**result, "reason": "task lineage or arm timing is malformed"}
+
+    aliases = {key.casefold(): value for key, value in json.loads(NETBIOS_MAP).items()}
+
+    def realm(value):
+        value = str(value or "").strip().casefold().rstrip(".")
+        return aliases.get(value, value)
+
+    def parameters(row):
+        value = row.get("original_params") or row.get("display_params") or ""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                pass
+        if isinstance(value, Mapping):
+            return " ".join(str(value.get(key) or "") for key in ("executable", "arguments", "args", "command"))
+        return str(value)
+
+    def subject(row):
+        callback = row.get("callback") or {}
+        if not isinstance(callback, Mapping):
+            return None
+        domain = realm(callback.get("domain"))
+        user = str(callback.get("user") or "").casefold()
+        if "\\" in user:
+            prefix, user = user.rsplit("\\", 1)
+            if realm(prefix) != domain:
+                return None
+        if "@" in user:
+            user, suffix = user.split("@", 1)
+            if realm(suffix) != domain:
+                return None
+        callback_id = callback.get("display_id")
+        return (callback_id, user, domain) if type(callback_id) is int and callback_id > 0 and user and domain else None
+
+    def eligible(row):
+        created = timestamp(row.get("status_timestamp_preprocessing"))
+        return (row.get("operation_id") == operation_id and row.get("completed") is True
+                and type(row.get("display_id")) is int and created is not None
+                and start <= created <= deadline)
+
+    def response_time(row, prefix):
+        responses = row.get("responses")
+        if not isinstance(responses, list) or not responses:
+            return None
+        if any(not isinstance(item, Mapping) or type(item.get("id")) is not int for item in responses):
+            return None
+        times = [timestamp(item.get("timestamp")) for item in responses if isinstance(item, Mapping)]
+        if len(times) != len(responses) or any(value is None for value in times):
+            return None
+        effect_at = timestamp(prefix.get("effect_at"))
+        created = timestamp(row.get("status_timestamp_preprocessing"))
+        updated = timestamp(row.get("timestamp"))
+        if (effect_at is None or created is None or updated is None
+                or not created <= effect_at <= min(updated, deadline)
+                or any(value < created or value > updated for value in times)):
+            return None
+        # The selected cumulative prefix cannot precede any response it contains.
+        ordered = sorted(responses, key=lambda item: (
+            item.get("sequence_number") if type(item.get("sequence_number")) is int else 10**12,
+            item.get("id") if type(item.get("id")) is int else 0,
+        ))
+        for item in ordered:
+            if timestamp(item.get("timestamp")) > effect_at:
+                return None
+            if item.get("id") == prefix.get("response_id"):
+                return effect_at
+        return None
+
+    setups = []
+    for row in rows:
+        params = parameters(row)
+        path = re.search(r"\\\\[^\\\s]+\\SYSVOL\\([^\\\s]+)\\[^\r\n]*ScheduledTasks\.xml", params, re.I)
+        read_command = re.match(r'^\s*(?:type\s+|(?:["\w:\\.-]*more(?:\.com)?[" ]+)\s*)', params, re.I)
+        if path is None or read_command is None or str(row.get("command_name")).casefold() not in {"run", "shell"}:
+            continue
+        observed_ids.append(row.get("display_id"))
+        binding = subject(row)
+        if not eligible(row) or binding is None or realm(path.group(1)) != binding[2]:
+            diagnostics.append({"task_id": row.get("display_id"), "reason": "setup lineage/domain mismatch"})
+            continue
+
+        def setup_valid(output):
+            if capabilities.validate_structured_artifacts(output).get("artifact_valid") is not True:
+                return False
+            root = ET.fromstring(capabilities._extract_first_xml_document(output))
+            if root.tag.rsplit("}", 1)[-1] != "ScheduledTasks":
+                return False
+            for node in root.iter():
+                if node.tag.rsplit("}", 1)[-1] != "Exec":
+                    continue
+                fields = {child.tag.rsplit("}", 1)[-1]: child.text or "" for child in node}
+                match = re.fullmatch(r'\s*/c\s+net\s+group\s+"Domain Admins"\s+"?([^"\s]+)"?\s+/add\s+/domain\s*', fields.get("Arguments", ""), re.I)
+                if fields.get("Command", "").casefold() in {"cmd", "cmd.exe"} and match:
+                    principal = match.group(1).casefold()
+                    if principal in {binding[1], binding[1] + "@" + binding[2]}:
+                        return True
+            return False
+
+        prefix = _first_response_prefix_satisfying(row.get("responses"), setup_valid)
+        proof_at = response_time(row, prefix) if prefix else None
+        # Anchor readback completion, not the first fragment of an XML document.
+        all_times = [timestamp(item.get("timestamp")) for item in row.get("responses") or []]
+        completed_at = max(all_times) if all_times and all(value is not None for value in all_times) else None
+        if proof_at is None or completed_at is None or completed_at > deadline:
+            diagnostics.append({"task_id": row.get("display_id"), "reason": "setup XML/subject/timing incomplete"})
+            continue
+        setups.append((row, binding, completed_at))
+    if len(setups) != 1:
+        return {**result, "reason": "expected one eligible same-principal GPO setup readback", "setup_count": len(setups)}
+    setup, binding, setup_at = setups[0]
+    result.update({"setup_task_id": setup["display_id"], "setup_completed_at": setup_at.isoformat(),
+                   "callback_id": binding[0], "principal": binding[1], "domain": binding[2]})
+    proofs = []
+    for row in rows:
+        params = parameters(row)
+        match = re.fullmatch(r'\s*(?:net(?:\.exe)?\s+)?(?:group\s+"Domain Admins"|user\s+"?([^"\s]+)"?)\s+/domain\s*', params, re.I)
+        if match is None or str(row.get("command_name")).casefold() not in {"run", "shell"}:
+            continue
+        observed_ids.append(row.get("display_id"))
+        created = timestamp(row.get("status_timestamp_preprocessing"))
+        if (not eligible(row) or subject(row) != binding or created < setup_at
+                or (match.group(1) and match.group(1).casefold() != binding[1])):
+            diagnostics.append({"task_id": row.get("display_id"), "reason": "proof lineage/subject/pre-setup mismatch"})
+            continue
+
+        def membership(output):
+            low = output.casefold()
+            if any(value in low for value in ("access is denied", "access denied", "system error", "could not be found")):
+                return False
+            banner = re.search(r"request will be processed at a domain controller for domain ([^\s]+)", low)
+            if banner is None or realm(banner.group(1)) != binding[2]:
+                return False
+            if "the command completed successfully." not in low:
+                return False
+            if match.group(1):
+                user = re.search(r"^user name\s+(\S+)\s*$", low, re.M)
+                groups = re.search(r"^global group memberships\s+(.+?)(?:\n\S|\Z)", low, re.M | re.S)
+                return bool(user and user.group(1) == binding[1] and groups
+                            and re.search(r"\*domain admins(?:\s|$)", groups.group(1)))
+            members = re.search(r"^group name\s+domain admins\s*$.*?^members\s*$\s*^-+\s*$(.*?)the command completed successfully\.", low, re.M | re.S)
+            return bool(members and binding[1] in members.group(1).split())
+
+        prefix = _first_response_prefix_satisfying(row.get("responses"), membership)
+        effect_at = response_time(row, prefix) if prefix else None
+        if effect_at is None or effect_at < setup_at:
+            diagnostics.append({"task_id": row.get("display_id"), "reason": "membership absent or proof timing ineligible"})
+            continue
+        proofs.append((effect_at, row["display_id"], prefix["response_id"]))
+    if not proofs:
+        return {**result, "disposition": "not_observed", "reason": "no eligible same-principal membership proof"}
+    effect_at, task_id, response_id = min(proofs)
+    return {**result, "complete": True, "disposition": "proven", "proof_task_id": task_id,
+            "proof_response_id": response_id, "proof_at": effect_at.isoformat(),
+            "latency_seconds": (effect_at - setup_at).total_seconds()}
+
+
 class RuntimePilot:
     def __init__(
         self,
@@ -1524,6 +1711,7 @@ class RuntimePilot:
         *,
         source_roots: Mapping[str, Path] | None = None,
         source_identities: Mapping[str, str] | None = None,
+        experiment: str = "isc8-certificate-auth",
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1533,6 +1721,8 @@ class RuntimePilot:
             for arm, path in (source_roots or {}).items()
         }
         self.source_identities = dict(source_identities or {})
+        self.experiment = experiment
+        self.current_treatment_environment = {}
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -2093,6 +2283,10 @@ class RuntimePilot:
 
     def reset(self, arm: str, arm_env: Mapping[str, str]) -> Mapping[str, Any]:
         self.current_reset_started = False
+        self.current_treatment_environment = {
+            key: value for key, value in arm_env.items()
+            if key == "SAGE_CAPABILITY_EARLY_PROOF_POLLING"
+        }
         self._activate_source(arm)
         _validate_protected_at(self.protected_manifest, self.source_root)
         assert_rejected_kernel_absent()
@@ -2201,7 +2395,7 @@ class RuntimePilot:
         }
 
     def runtime_identity(self) -> Mapping[str, Any]:
-        return {
+        identity = {
             "operation_id": self.current_operation_id,
             "callback_id": self.current_callback_id,
             "arm": self.current_arm,
@@ -2209,7 +2403,28 @@ class RuntimePilot:
                 self._engagement_id(self.current_arm) if self.current_arm else None
             ),
             "source_root": str(self.source_root),
+            "requested_treatment_environment": dict(getattr(self, "current_treatment_environment", {})),
         }
+        requested = getattr(self, "current_treatment_environment", {})
+        if requested:
+            startup = self.native._readiness_contract_module().startup_identity_from_env()
+            pid = startup.get("pid")
+            if (startup.get("ready") is not True or type(pid) is not int or pid <= 0
+                    or Path(str(startup.get("cwd") or "")).resolve()
+                    != (self.source_root / "Payload_Type" / "sage").resolve()):
+                raise PilotError("early-proof treatment has no source-bound running Sage PID")
+            try:
+                entries = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
+            except OSError as exc:
+                raise PilotError("cannot inspect the source-bound Sage treatment environment") from exc
+            key = "SAGE_CAPABILITY_EARLY_PROOF_POLLING"
+            matches = [entry.split(b"=", 1)[1].decode("utf-8", errors="replace")
+                       for entry in entries if entry.startswith(key.encode() + b"=")]
+            if matches != [requested[key]]:
+                raise PilotError("effective Sage early-proof treatment does not match the exact arm")
+            identity["effective_treatment_environment"] = {key: matches[0]}
+            identity["treatment_process_id"] = pid
+        return identity
 
     def _deactivate_active_callbacks(self) -> dict[str, Any]:
         """Mark every active callback in the freshly reset pilot operation inactive."""
@@ -2826,7 +3041,20 @@ class RuntimePilot:
             "arm": arm,
             "intermediate_milestones": intermediate,
         }
-        if arm in IMPROVEMENT_ARM_ORDER:
+        if arm in IMPROVEMENT_ARM_ORDER and getattr(self, "experiment", None) == EARLY_PROOF_EXPERIMENT:
+            metric = early_proof_primary_metric(
+                rows, operation_id=self.current_operation_id,
+                arm_started_at=snapshot["arm_started_at"], arm_deadline_at=snapshot["arm_deadline_at"],
+            )
+            supporting_ids = set(metric.get("observed_task_ids") or [])
+            metric["retained_evidence"] = _write_private(
+                self.artifact_dir / f"{arm}-early-proof-task-evidence.json",
+                {"operation_id": self.current_operation_id,
+                 "arm_started_at": snapshot["arm_started_at"], "arm_deadline_at": snapshot["arm_deadline_at"],
+                 "task": [row for row in rows or [] if row.get("display_id") in supporting_ids]},
+            )
+            snapshot["early_proof_primary_metric"] = metric
+        elif arm in IMPROVEMENT_ARM_ORDER:
             snapshot["certificate_auth_primary_metric"] = certificate_auth_primary_metric(rows)
         return snapshot
 
@@ -3137,10 +3365,13 @@ def _runtime(
         Path(args.route_smoke).expanduser().resolve(),
         source_roots=source_roots,
         source_identities=source_identities,
+        experiment=contract.experiment if isinstance(contract, ImprovementContract) else "isc8-certificate-auth",
     )
 
 
 def _add_improvement_identity_args(command: argparse.ArgumentParser, *, roots: bool) -> None:
+    command.add_argument("--experiment", choices=("isc8-certificate-auth", EARLY_PROOF_EXPERIMENT),
+                         default="isc8-certificate-auth")
     command.add_argument("--baseline-source-identity", required=True)
     command.add_argument("--candidate-source-identity", required=True)
     if roots:
@@ -3184,6 +3415,7 @@ def _improvement_contract(args) -> ImprovementContract:
         baseline_source_identity=str(args.baseline_source_identity),
         candidate_source_identity=str(args.candidate_source_identity),
         arm_order=order,
+        experiment=getattr(args, "experiment", "isc8-certificate-auth"),
     )
     contract.validate()
     return contract
@@ -3233,6 +3465,8 @@ def summarize_improvement_comparisons(
     comparisons: tuple[Mapping[str, Any], Mapping[str, Any]],
     contract: ImprovementContract,
 ) -> dict[str, Any]:
+    if contract.experiment != "isc8-certificate-auth":
+        raise PilotError("early-proof experiment is summarized by its single pair, not the ISC-8 two-pair summary")
     """Apply the same frozen decision to live summaries or separately derived reanalysis."""
     first, second = comparisons
     expected_orders = (list(IMPROVEMENT_ARM_ORDER), list(reversed(IMPROVEMENT_ARM_ORDER)))
@@ -3373,14 +3607,15 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2, sort_keys=True))
         return 0
     if args.command == "improvement-plan":
+        early = contract.experiment == EARLY_PROOF_EXPERIMENT
         print(json.dumps({
             "contract": contract.to_record(),
             "supported_pair_orders": {
                 "baseline-first": list(IMPROVEMENT_ARM_ORDER),
-                "candidate-first": list(reversed(IMPROVEMENT_ARM_ORDER)),
+                **({} if early else {"candidate-first": list(reversed(IMPROVEMENT_ARM_ORDER))}),
             },
             "live_surface": "run-improvement-pair",
-            "final_summary_surface": "summarize-improvement",
+            "final_summary_surface": "run-improvement-pair comparison record" if early else "summarize-improvement",
             "single_arm_surface": False,
             "target_io": "Mythic payload tasks only",
         }, indent=2, sort_keys=True))

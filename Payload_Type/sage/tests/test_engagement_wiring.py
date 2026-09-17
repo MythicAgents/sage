@@ -2504,6 +2504,279 @@ def test_execute_capability_gpo_fallback_retries_delayed_membership_proof(monkey
     assert "system-exec:gpo:starkwallpaper@north.sevenkingdoms.local" in result["achieved_effects"]
 
 
+@pytest.mark.parametrize("effect_at,retries,expected_polls,verdict", [
+    (300, 8, [300], "achieved"),
+    (480, 8, list(range(300, 481, 30)), "achieved"),
+    (None, 8, list(range(300, 541, 30)), "partial"),
+    (None, 2, [300, 330, 360], "partial"),
+    (None, 0, [300], "partial"),
+    ("denied", 8, [300], "partial"),
+    ("denied_after_pending", 8, [300, 330], "partial"),
+])
+def test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
+    monkeypatch, effect_at, retries, expected_polls, verdict, early=False, task_seconds=0, budget_limit=None,
+):
+    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "1" if early else "0")
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda *_args: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda *_args: asyncio.sleep(0, result=None)
+    mt._engagement_footholds = [engagement_state.Foothold(
+        callback_id="3", agent="apollo", host="WORKSTATION01", forest="lab.local",
+        identity=r"LAB\alice", integrity="medium", alive=True, source="test",
+        timestamp="2026-09-17T00:00:00Z",
+    )]
+    clock = 0
+    monkeypatch.setattr(mythic_tools, "monotonic", lambda: clock, raising=False)
+    polls = []
+    calls = {}
+
+    async def fake_sleep(seconds, result=None):
+        nonlocal clock
+        clock += seconds
+        return result
+
+    monkeypatch.setattr(mythic_tools.asyncio, "sleep", fake_sleep)
+
+    def output():
+        nonlocal clock
+        if len(calls["issued"]) == 1:
+            return (
+                "scheduled task xml valid: synthetic.xml\n"
+                "cse extension registered: scheduled tasks extension\n"
+                "ldap version bumped: 1 -> 2\ngpt.ini version bumped: 2\n"
+                "command path present: cmd.exe\n"
+            )
+        clock += task_seconds
+        polls.append(clock)
+        if (
+            effect_at == "denied"
+            or (effect_at == "denied_after_pending" and clock >= 330)
+            or (effect_at == "denied_on_second_check" and len(polls) >= 2)
+        ):
+            return "Access is denied."
+        members = "Administrator"
+        if isinstance(effect_at, int) and clock >= effect_at:
+            members += " alice"
+        return (
+            "Group name     Domain Admins\nMembers\n"
+            "-------------------------------------------------------------------------------\n"
+            + members + "\nThe command completed successfully.\n"
+        )
+
+    with patch.object(access_reconciler, "reconcile_access", _seeded_reconcile(mt)), \
+            _split_issue(output, calls):
+        original_issue = mythic_tools.mythic.issue_task
+
+        async def unique_issue(**kwargs):
+            task = await original_issue(**kwargs)
+            task["display_id"] = 900 + calls["issue"]
+            return task
+
+        budget = None if budget_limit is None else mythic_tools.task_budget.TaskBudget(
+            limit=budget_limit, deadline=mythic_tools.task_budget.time.monotonic() + 60,
+        )
+        with patch.object(mythic_tools.mythic, "issue_task", unique_issue), \
+                mythic_tools.task_budget.task_budget_scope(budget):
+            result = json.loads(asyncio.run(mt.execute_capability(
+                {"capability": "gpo-controlled-system-exec", "domain": "lab.local",
+                 "gpo": "workstation-policy", "callback_id": 3},
+                {"callback_id": 3, "method": "gpp-immediate-task-fallback",
+                 "primary_failure_observed": True, "command": "cmd.exe",
+                 "arguments": '/c net group "Domain Admins" alice /add /domain',
+                 "wait_seconds": 300, "proof_retries": retries,
+                 "proof_retry_delay_seconds": 30},
+            )))
+    assert polls == expected_polls
+    assert result["verdict"] == verdict
+    assert result["ok"] is (verdict == "achieved")
+    assert ("da:lab.local" in result.get("achieved_effects", [])) is (verdict == "achieved")
+    assert calls["issue"] == 1 + len(expected_polls)
+    task_ids = [item["task_id"] for item in result["issued"] if item.get("task_id")]
+    assert len(set(task_ids)) == len(task_ids) == calls["issue"]
+    if verdict == "achieved":
+        proven = [hop for hop in mt._engagement_hops if hop.status == "achieved"]
+        assert proven
+        assert all(str(hop.proof_envelope["task_id"]) == str(task_ids[-1]) for hop in proven)
+
+
+@pytest.mark.parametrize("effect_at,retries,expected_polls,verdict,task_seconds", [
+    (60, 8, [60], "achieved", 0),
+    (180, 8, [60, 120, 180], "achieved", 0),
+    (480, 8, [60, 120, 180, 240] + list(range(300, 481, 30)), "achieved", 0),
+    (None, 8, [60, 120, 180, 240] + list(range(300, 541, 30)), "partial", 0),
+    (None, 0, [60, 120, 180, 240, 300], "partial", 0),
+    (None, 2, [60, 120, 180, 240, 300, 330, 360], "partial", 0),
+    ("denied", 8, [60], "partial", 0),
+    ("denied_on_second_check", 8, [60, 120], "partial", 0),
+    ("denied_after_pending", 8, [60, 120, 180, 240, 300, 330], "partial", 0),
+    (None, 8, [66, 126, 186, 246] + list(range(306, 595, 36)), "partial", 6),
+])
+def test_early_proof_polling_keeps_the_original_late_recovery_window(
+    monkeypatch, effect_at, retries, expected_polls, verdict, task_seconds,
+):
+    test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
+        monkeypatch, effect_at, retries, expected_polls, verdict, early=True, task_seconds=task_seconds,
+    )
+
+
+def test_early_proof_polling_cannot_submit_past_the_run_task_budget(monkeypatch):
+    test_delayed_proof_polling_uses_real_observations_through_its_retry_window(
+        monkeypatch, None, 8, [60, 120], "partial", early=True, budget_limit=3,
+    )
+
+
+@pytest.mark.parametrize("seconds,offsets", [
+    (30, []), (60, []), (61, [61]), (180, [120, 180]),
+    (300, [120, 180, 240, 300]), (600, [120, 180, 240, 600]),
+    (900, [120, 180, 240, 600]), ("invalid", []),
+])
+def test_early_probe_schedule_is_bounded_and_does_not_mutate_the_plan(monkeypatch, seconds, offsets):
+    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", "1")
+    monkeypatch.setattr(mythic_tools, "monotonic", lambda: 1000)
+    mt = _make_tools()
+    wait = {"command": "wait_for_seconds", "parameters": {"seconds": seconds, "reason": "delayed effect"}}
+    probe = {"expected_probe": "extract_gpo_domain_admin_membership_probe", "consumes": ["event:refresh"]}
+    changed, deadlines = mt._capability_executor_early_probe_wait(wait, probe)
+    assert wait["parameters"]["seconds"] == seconds
+    assert deadlines == [1000 + offset for offset in offsets]
+    assert len(deadlines) <= 4
+    if offsets:
+        assert changed["parameters"] == {"seconds": 60, "reason": "delayed effect"}
+    else:
+        assert changed is wait
+
+
+@pytest.mark.parametrize("enabled,command,expected_probe,consumes", [
+    ("0", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
+    ("true", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
+    ("1", "shell", "extract_gpo_domain_admin_membership_probe", ["event:refresh"]),
+    ("1", "wait_for_seconds", "extract_gpo_domain_admin_membership_probe", []),
+    ("1", "wait_for_seconds", "extract_gpo_system_exec_probe", ["event:refresh"]),
+])
+def test_early_probe_schedule_does_not_apply_outside_the_opted_in_delayed_final_pair(
+    monkeypatch, enabled, command, expected_probe, consumes,
+):
+    monkeypatch.setenv("SAGE_CAPABILITY_EARLY_PROOF_POLLING", enabled)
+    mt = _make_tools()
+    wait = {"command": command, "parameters": {"seconds": 300}}
+    probe = {"expected_probe": expected_probe, "consumes": consumes}
+    unchanged, deadlines = mt._capability_executor_early_probe_wait(wait, probe)
+    assert unchanged is wait
+    assert deadlines == []
+
+
+@pytest.mark.parametrize("delayed", [True, False])
+@pytest.mark.parametrize("schema_alias", [True, False])
+def test_delayed_probe_exception_is_scoped_and_survives_parameter_normalization(
+    monkeypatch, delayed, schema_alias,
+):
+    mt = _make_tools()
+    command_line = 'net group "Domain Admins" /domain'
+    parameters = {"arguments": command_line} if schema_alias else command_line
+    normalized = {"args": command_line} if schema_alias else command_line
+
+    async def schema(*_args):
+        return _merlin_shell_schema() if schema_alias else []
+
+    monkeypatch.setattr(mt, "_fetch_command_schema", schema)
+    command_obj = {
+        "command": "shell", "parameters": parameters,
+        "expected_probe": "extract_gpo_domain_admin_membership_probe",
+        "consumes": ["event:group_policy_refresh"] if delayed else [],
+        "produces": [], "purpose": "observe delayed membership",
+    }
+    key = mt._unproductive_action_key("shell", 2, normalized)
+    other_key = mt._unproductive_action_key("shell", 4, normalized)
+    mt._unproductive_tripped.update([key, other_key])
+    calls = {}
+
+    async def exercise():
+        for _ in range(5):
+            await mt._execute_capability_command(command_obj, 2, timeout=5)
+        # Public presentation metadata cannot grant the private polling exception.
+        return await mt.issue_task_and_waitfor_task_output(
+            "shell", parameters, 2, timeout=5,
+            visibility_context={"bounded_delayed_proof_poll": True},
+        )
+
+    with _split_issue("unchanged membership", calls):
+        ad_hoc = asyncio.run(exercise())
+    assert calls.get("issue", 0) == (5 if delayed else 0)
+    assert "unproductive" in ad_hoc
+    assert mt._unproductive_tripped == {key, other_key}
+    assert mythic_tools._task_visibility_context.get() is None
+    if delayed:
+        assert all(call["parameters"] == normalized for call in calls["issued"])
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_delayed_probe_exception_cannot_bypass_task_budget(monkeypatch, expired):
+    mt = _make_tools()
+    mt._fetch_command_schema = lambda *_args: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda *_args: asyncio.sleep(0, result=None)
+    command_obj = {
+        "command": "shell", "parameters": "read delayed effect",
+        "expected_probe": "extract_gpo_domain_admin_membership_probe",
+        "consumes": ["event:group_policy_refresh"], "produces": [],
+    }
+    budget = mythic_tools.task_budget.TaskBudget(
+        limit=2, deadline=mythic_tools.task_budget.time.monotonic() + (-1 if expired else 60),
+    )
+    calls = {}
+
+    async def exercise():
+        with mythic_tools.task_budget.task_budget_scope(budget):
+            for _ in range(5):
+                await mt._execute_capability_command(command_obj, 2, timeout=5)
+            assert mythic_tools._task_visibility_context.get() is None
+
+    with _split_issue("unchanged membership", calls):
+        original_issue = mythic_tools.mythic.issue_task
+
+        async def unique_issue(**kwargs):
+            task = await original_issue(**kwargs)
+            task["display_id"] = 900 + calls["issue"]
+            return task
+
+        with patch.object(mythic_tools.mythic, "issue_task", unique_issue):
+            asyncio.run(exercise())
+    assert calls.get("issue", 0) == (0 if expired else 2)
+    assert budget.submissions == (0 if expired else 2)
+    assert len(budget.task_ids) == budget.submissions
+    assert budget.closed
+
+
+@pytest.mark.parametrize("exception_type", [RuntimeError, asyncio.CancelledError])
+def test_delayed_probe_context_is_restored_after_error_or_cancellation(monkeypatch, exception_type):
+    mt = _make_tools()
+    command_obj = {
+        "command": "shell", "parameters": "read delayed effect",
+        "expected_probe": "extract_gpo_domain_admin_membership_probe",
+        "consumes": ["event:group_policy_refresh"], "produces": [],
+    }
+
+    async def fail(*_args, **_kwargs):
+        assert mythic_tools._task_visibility_context.get()["bounded_delayed_proof_poll"] is True
+        raise exception_type("synthetic failure")
+
+    monkeypatch.setattr(mt, "issue_task_and_waitfor_task_output", fail)
+
+    async def exercise():
+        original_context = {"purpose": "outer context"}
+        token = mythic_tools._task_visibility_context.set(original_context)
+        try:
+            with pytest.raises(exception_type):
+                await mt._issue_capability_callback_command(
+                    command_obj=command_obj, command_name="shell", parameters="read delayed effect",
+                    callback_id=2, timeout=5, capability_name="gpo-controlled-system-exec",
+                )
+            assert mythic_tools._task_visibility_context.get() is original_context
+        finally:
+            mythic_tools._task_visibility_context.reset(token)
+
+    asyncio.run(exercise())
+
+
 def test_execute_capability_gpo_rewrites_live_fallback_proof_marker_to_primary_group_add(monkeypatch):
     monkeypatch.setenv("SAGE_TRAJECTORY_DISABLE", "1")
     mt = _make_tools()
