@@ -4049,7 +4049,7 @@ def test_enrolled_certificate_unlocks_certificate_auth_without_ca_key_material()
     assert action.intent["certificate_already_forged"] is True
     assert plan.ok is True
     assert "adcs-certificate-forge" not in [step.operation for step in plan.steps]
-    assert plan.steps[2].operation == "certificate-pkinit-tgt"
+    assert plan.steps[2].operation == "certificate-schannel-ldap-proof"
     assert plan.steps[2].parameters["certificate_path"] == r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx"
 
 
@@ -4269,6 +4269,7 @@ def test_build_adcs_certificate_auth_plan_uses_pkinit_artifact_not_ptt():
     plan = capabilities.build_capability_execution_plan(action, {
         "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
         "proof_host": "dc01.lab.local",
+        "certificate_auth_method": "pkinit",
     })
 
     assert missing.ok is False
@@ -4320,6 +4321,7 @@ def test_build_adcs_certificate_auth_plan_can_use_pre_forged_certificate():
     )
 
     plan = capabilities.build_capability_execution_plan(action, {
+        "certificate_auth_method": "pkinit",
         "certificate_already_forged": True,
         "forged_pfx_path": r"C:\Windows\Temp\admin.pfx",
         "forged_pfx_password": "CertSecret!",
@@ -4339,6 +4341,66 @@ def test_build_adcs_certificate_auth_plan_can_use_pre_forged_certificate():
     assert plan.steps[2].parameters["certificate_path"] == r"C:\Windows\Temp\admin.pfx"
     assert plan.steps[2].prerequisites == ["artifact:pre_forged_certificate_pfx"]
     _assert_payload_agnostic_plan(plan)
+
+
+def test_build_adcs_certificate_auth_plan_defaults_control_only_action_to_schannel_first():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-private-key:ca01@lab.local", "live-callback:13"],
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
+        "proof_host": "dc01.lab.local",
+    })
+
+    assert plan.ok is True
+    assert [step.operation for step in plan.steps] == [
+        "kerberos-ticket-list",
+        "kerberos-context-service-proof",
+        "adcs-certificate-forge",
+        "certificate-schannel-ldap-proof",
+    ]
+    assert all(step.operation != "certificate-pkinit-tgt" for step in plan.steps)
+
+
+def test_build_adcs_certificate_auth_plan_keeps_ticket_required_action_pkinit_first():
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;ca_host=ca01;callback=13",
+        preconditions=["adcs-ca-private-key:ca01@lab.local", "live-callback:13"],
+        effects=[
+            "da:lab.local",
+            "certificate-auth:administrator@lab.local",
+            "kerberos-context:lab.local@callback:13",
+        ],
+        intent={
+            "capability": "adcs-certificate-auth",
+            "domain": "lab.local",
+            "account": "administrator",
+            "ca_host": "ca01",
+            "callback_id": "13",
+        },
+    )
+
+    plan = capabilities.build_capability_execution_plan(action, {
+        "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
+        "proof_host": "dc01.lab.local",
+    })
+
+    assert plan.ok is True
+    operations = [step.operation for step in plan.steps]
+    assert operations[3] == "certificate-pkinit-tgt"
+    assert "certificate-schannel-ldap-proof" not in operations
 
 
 def test_build_adcs_certificate_auth_plan_can_use_schannel_ldap_certificate():
@@ -4719,9 +4781,7 @@ def test_adcs_certificate_auth_probe_rejects_da_only_read_when_control_not_denie
 
 
 def test_adcs_certificate_auth_plan_prefers_schannel_when_pkinit_unsupported_observed():
-    """Observation-driven selection: with no explicit method, an observed pkinit_not_supported
-    signal routes to the Schannel plan (no forced Rubeus); absent the signal the generic PKINIT
-    default stands."""
+    """An observed PKINIT incompatibility and a control-only default both avoid forced Rubeus."""
     action = capabilities._adcs_certificate_auth_action("lab.local", "ca01", "administrator", "13")
 
     observed = capabilities.build_capability_execution_plan(
@@ -4733,7 +4793,8 @@ def test_adcs_certificate_auth_plan_prefers_schannel_when_pkinit_unsupported_obs
     default = capabilities.build_capability_execution_plan(
         action, {"certificate_already_forged": True},
     )
-    assert any(step.operation == "certificate-pkinit-tgt" for step in default.steps)
+    assert any(step.operation == "certificate-schannel-ldap-proof" for step in default.steps)
+    assert all(step.operation != "certificate-pkinit-tgt" for step in default.steps)
 
 
 def test_remote_execution_probe_requires_target_side_marker():

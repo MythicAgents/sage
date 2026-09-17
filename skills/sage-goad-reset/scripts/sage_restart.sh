@@ -97,7 +97,14 @@ require_bloodhound_dir() {
 }
 
 # 1. Locate Sage as the main.py child of the `sage` tmux pane (robust to the cmdline form).
-tmux has-session -t "$SESSION" 2>/dev/null || { echo "ERR: tmux session '$SESSION' not found" >&2; exit 1; }
+# A clean reset intentionally stops the local process and may leave no tmux session at all.  Create
+# the maintained session here so this helper's documented fresh-start path is actually reachable.
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  [[ -d "$DEFAULT_CWD" ]] || { echo "ERR: Sage cwd $DEFAULT_CWD not found" >&2; exit 1; }
+  tmux new-session -d -s "$SESSION" -c "$DEFAULT_CWD" \
+    || { echo "ERR: could not create tmux session '$SESSION'" >&2; exit 1; }
+  echo "▶ created tmux session '$SESSION' for fresh local Sage start" >&2
+fi
 PANE_PID="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' | head -1)"
 PID="$(pgrep -P "$PANE_PID" -f 'main.py' | head -1 || true)"
 

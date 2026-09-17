@@ -27,6 +27,7 @@ import os
 import zipfile
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable
+from ai import task_budget
 
 try:
     from ..comparison_tool_surface import (
@@ -398,11 +399,37 @@ async def _issue_command(client, callback_display_id: int, command: str, paramet
     ceiling (the same waitfor-poller hang we hit in the gauge), nothing else."""
     mythic = _mythic_sdk()
     params = parameters if isinstance(parameters, str) else (json.dumps(parameters) if parameters else "")
-    task = await mythic.issue_task(client, command_name=command, parameters=params,
-                                   callback_display_id=int(callback_display_id), wait_for_complete=False)
+    admitted_remaining = task_budget.admit_task()
+    issue_timeout = min(float(timeout), admitted_remaining) if admitted_remaining is not None else float(timeout)
+    if issue_timeout <= 0:
+        raise task_budget.TaskBudgetExceeded("task execution deadline reached")
+    task = await asyncio.wait_for(
+        mythic.issue_task(
+            client,
+            command_name=command,
+            parameters=params,
+            callback_display_id=int(callback_display_id),
+            wait_for_complete=False,
+        ),
+        timeout=issue_timeout,
+    )
+    task_id = task.get("display_id") if isinstance(task, dict) else None
+    if type(task_id) is not int or task_id <= 0:
+        raise RuntimeError("Mythic task submission omitted a positive display_id")
+    task_budget.record_task_id(task_id)
+    remaining = task_budget.current_remaining_seconds()
+    wait_timeout = min(float(timeout), remaining) if remaining is not None else float(timeout)
+    if wait_timeout <= 0:
+        raise task_budget.TaskBudgetExceeded("task execution deadline reached after submission")
     out = await asyncio.wait_for(
-        mythic.waitfor_for_task_output(client, task_display_id=task["display_id"], timeout=timeout),
-        timeout=timeout + 20)
+        mythic.waitfor_for_task_output(
+            client,
+            task_display_id=task_id,
+            timeout=max(1, int(wait_timeout)),
+        ),
+        timeout=wait_timeout,
+    )
+    task_budget.record_task_result(task_id)
     return out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
 
 

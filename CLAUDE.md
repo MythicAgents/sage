@@ -1,98 +1,11 @@
 # Sage Assistant Compatibility Guide
 
-`AGENTS.md` is the canonical instruction file for Sage development, regardless of whether the active assistant is
-Codex, Claude Code, or another tool. Read it before changing code or operating the lab.
-
 @AGENTS.md
 
-The `@`-import above makes that load mechanical for Claude Code, matching the auto-load Codex already gets from
-the AGENTS.md convention. Added 2026-07-28: the sentence alone was advisory, and an assistant that never opened
-`AGENTS.md` ran a full autonomous solve against the live range while believing it was issuing a read-only probe.
-Everything below is the condensed always-relevant subset; `AGENTS.md` remains the single source of truth.
+`AGENTS.md` is the canonical Sage guide for every assistant. Its authority, target-I/O, secret isolation,
+database archival, testing, and live-budget rules apply here.
 
-## Current system
-
-Sage is a native Mythic v4 chat container. It runs locally in the `sage` tmux session during development and
-registers with Docker-backed Mythic. It is a control-plane service, not a target implant or a Sage callback.
-
-Verify important claims against source, tests, Mythic, BloodHound, and the current range — not against prose.
-
-The maintainer's operational frontier lives in `Plans/`, which is private and gitignored. If you are working
-from a clone, it is absent and nothing here should require it. Russel's own pointers into it live in
-`CLAUDE.local.md`, which is gitignored and loads automatically alongside this file.
-
-## Required workflows
-
-- Start or restart local Sage with `skills/sage-goad-reset/scripts/sage_restart.sh`.
-- Archive active Sage and Phoenix databases with
-  `skills/sage-goad-reset/scripts/archive_runtime_dbs.py`; never delete them for a clean run.
-- Use `skills/sage-goad-reset` for the complete reset and readiness lifecycle.
-- Use `skills/sage-callback-bootstrap` for payload and foothold establishment.
-- Use `skills/sage-live-runner` for native chat requests and monitoring.
-- Use `skills/sage-focused-capability-tests` before a full offline suite or live run.
-- Use `skills/sage-trace-analysis` for Phoenix/Mythic/ledger inspection.
-- Use `skills/sage-architecture-governor` before high-risk architecture edits.
-
-`skills/README.md` is the operator-tool index. Reusable scripts belong in an existing or new skill, not in
-`Plans/`.
-
-Claude Code does not discover `skills/` on its own — it reads `.claude/skills/`. **That directory is committed,
-so on Linux and macOS a fresh clone has every skill the moment you start Claude Code. No setup step.**
-
-If you are on Windows without Developer Mode, git will have materialized those symlinks as inert text files
-containing their target paths (`core.symlinks=false`, the Git-for-Windows default; it does this silently). Delete
-the directory and re-create the links from an elevated shell:
-
-```
-for d in skills/*/; do n=$(basename "$d"); ln -sfn "../../skills/$n" ".claude/skills/$n"; done
-```
-
-Link, never copy — a hand-made copy drifts, and the last set of them silently reintroduced absolute paths this
-repo's contract forbids. `.claude/settings.json` is also committed, carrying the same guardrail hooks Codex gets
-from `.codex/config.toml`; that gate hard-denies only `Payload_Type/sage/prompts/**` and advises elsewhere, see
-`AGENTS.md` § Operating Rules. `.claude/settings.local.json` is **not** committed and must not be: it accretes
-personal absolute paths and private model pins.
-
-## Hard boundaries
-
-- Sage may query Mythic and BloodHound control-plane data.
-- Sage must not connect directly to target LDAP, SMB, Kerberos, WinRM, RPC, HTTP, or equivalent services.
-- Target-facing activity and proof must come through Mythic payload tasks or payload-derived BloodHound data.
-- Do not hardcode GOAD identities or a Trust Walker path into product code or base prompts.
-- Do not delete runtime databases, rewrite retained evidence, or silently reseal rejected evaluation artifacts.
-- Do not commit unless the maintainer explicitly requests it.
-
-## Testing
-
-Run focused tests first, then the maintained offline tier:
-
-```bash
-.venv/bin/python skills/sage-focused-capability-tests/scripts/run_offline_suite.py
-```
-
-One tier, no exclusions. The four rejected successor-portfolio suites moved to `.sage_history/` as retained
-evaluation evidence. See `docs/development/TEST_TIERS.md`.
-
-**Test the assembled artifact, not only its parts.** Component tests cannot prove wiring, and wiring is where
-individually-correct features collide. Four layers, defined in `docs/development/TEST_TIERS.md` § Test layers:
-**build** (real graph, dummy key, mocked Mythic — no network), **scripted** (fake chat model), **recorded**
-(replayed HTTP), **live** (real provider and range). Build and scripted need no API key, no VPN and no AWS
-session, so there is never a reason to skip them.
-
-If you touch anything the graph is built from — node, edge, middleware, node default, error handler,
-checkpointer — `tests/test_graph_builds.py` must pass, and a new configuration branch needs a new case in it.
-For agent routing and handoffs, copy the harness in `tests/test_scripted_handoff.py` instead of reinventing it.
-Never assert on source text (`ast` string matching) when you can assert on the built object; that exact
-substitution shipped a total outage on 2026-08-10 with 3955 tests green.
-
-## Mythic output
-
-Native chat renders markdown and updating tool-use cards. Use tables for enumerations and fenced blocks for
-commands or raw output. Do not add textual timestamps; Mythic already timestamps messages. Do not duplicate tool
-cards with legacy text output on the chat path.
-
-## Repository architecture
-
-The monorepo boundary and future migration criteria are documented in
-`docs/architecture/REPOSITORY_BOUNDARIES.md`. Product runtime must never import development evaluation, range,
-operator-skill, private-plan, or generated-evidence packages.
+Read `skills/README.md` to locate a workflow, then the operational skill before executing it.
+Claude discovers the committed `.claude/skills/` symlinks. Keep links rather than copied skills to prevent drift.
+`.claude/settings.json` carries the project prompt-edit and advisory architecture/retention hooks.
+Personal settings belong in the gitignored local configuration and must not be published.

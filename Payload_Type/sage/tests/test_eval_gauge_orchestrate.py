@@ -3116,3 +3116,350 @@ def test_live_gauge_rejects_unqualified_profile_before_reset(monkeypatch, capsys
         ])
     assert raised.value.code == 2
     assert "not live-qualified" in capsys.readouterr().err
+
+
+def _isc11_contract_fixture() -> dict:
+    profile = orchestrate._RANGE_PROFILES.get_profile("sage-replication-range")
+    summary = orchestrate._RANGE_PROFILES.profile_summary(profile)
+    return {
+        "schema": "sage-isc11-non-goad-replication-experiment-contract-v1",
+        "contract_id": "isc11-replication-purpose-range-gauge-v2",
+        "source_identity": {
+            "branch": "harness-eval",
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "profile_catalog_sha256": "c" * 64,
+            "topology_identity": summary["topology_identity"],
+            "qualification_receipt": summary["qualification"]["receipt"],
+        },
+        "range_binding": {
+            "profile": "sage-replication-range",
+            "scenario": "replication-purpose-range-visible-cost",
+            "objective_domain": "replication.local",
+            "ludus_mcp_server": "ludus_sagerepl",
+            "ludus_range_id": "SAGEREPL",
+            "snapshot": "sage-replication-range-apollo-staged-v1",
+            "foothold_host": "SAGEREPL-WS01",
+            "foothold_callback_host": "WS01",
+            "foothold_ip": "10.7.10.31",
+            "foothold_principal": r"REPLICATION\user1",
+            "foothold_callback_user": "user1",
+            "foothold_password_env": "SAGE_REPLICATION_USER1_PASSWORD",
+            "retained_callback_config": (
+                "skills/sage-callback-bootstrap/"
+                "apollo_replication_range_ws01_callback_config.json"
+            ),
+        },
+        "execution_identity": {
+            "side": "harness",
+            "provider": "openai",
+            "model": "bedrock-claude-4-6-sonnet",
+            "completed_call_token_ceiling_per_row": 250_000,
+            "model_context_limit": 200_000,
+            "max_output_tokens": 8192,
+            "solve_timeout_seconds": 1800,
+        },
+        "matrix": {
+            "total_rows": 9,
+            "order": ["symbolic", "llm", "hybrid", "hybrid", "symbolic", "llm", "llm", "hybrid", "symbolic"],
+            "initial_live_tranche": {
+                "rows": [1, 2, 3],
+                "policies": ["symbolic", "llm", "hybrid"],
+                "whole_row_retries": 0,
+            },
+        },
+        "authority_gate": {"live_authority_id": "isc11-canary-authority-001"},
+        "contamination_policy": {
+            "kind": "forbidden_identifiers_v1",
+            "markers": [
+                "goad", "braavos", "kingslanding", "north.sevenkingdoms",
+                "sevenkingdoms.local", "essos.local", "samwell.tarly",
+                "jorah.mormont", "castelblack", "operation_goad",
+                "goad-trust-walker",
+            ],
+        },
+        "execution_path": {
+            "scenario_objective": (
+                "From the current foothold, achieve administrative control of replication.local."
+            ),
+            "results_root": ".sage_history/evaluation/isc11-test",
+            "results_ledger": "results.jsonl",
+        },
+        "prospective_signal": {
+            "decisive_frontier_hash": "sha256:frontier",
+            "expected_candidate_count": 2,
+            "expected_choice": {
+                "symbolic": "gpo-controlled-system-exec",
+                "llm": "dcsync-krbtgt",
+                "hybrid": "dcsync-krbtgt",
+            },
+            "expected_vectors": {
+                "symbolic": [4, 4, 4],
+                "llm": [3, 3, 3],
+                "hybrid": [3, 3, 3],
+            },
+        },
+    }
+
+
+def _isc11_foothold() -> object:
+    return orchestrate.FootholdSpec(
+        host="SAGEREPL-WS01",
+        ip="10.7.10.31",
+        user=r"REPLICATION\user1",
+        callback_host="WS01",
+        callback_user="user1",
+        password_env="SAGE_REPLICATION_USER1_PASSWORD",
+        ludus_range_id="SAGEREPL",
+        ludus_mcp_server="ludus_sagerepl",
+        range_profile_id="sage-replication-range",
+        direct_retained_launch=True,
+    )
+
+
+def test_isc11_direct_launch_vectors_are_exact_and_do_not_use_goad_wrapper():
+    vectors = orchestrate._replication_direct_launch_vectors(_isc11_foothold())
+    rendered = json.dumps(vectors, sort_keys=True)
+
+    assert "launch_apollo_foothold.sh" not in rendered
+    assert vectors["logoff"][-2:] == ["--username", "localuser"]
+    assert "open_rdp_session.py" in vectors["rdp"][1]
+    assert vectors["launch"][2] == "launch-existing"
+    assert vectors["launch"][-5:] == [
+        "--callback-settle-seconds", "90", "--require-unique-callback",
+        "--wait-interactive-session-seconds", "600",
+    ]
+    assert vectors["launch"][vectors["launch"].index("--callback-settle-seconds") + 1] == "90"
+
+
+def test_isc11_direct_launch_accepts_only_qualified_absent_localuser_and_reaps_rdp(monkeypatch):
+    expected = "No session owned by 'localuser' was found; refusing to report cleanup success."
+    monkeypatch.setattr(
+        orchestrate.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=2, stderr=json.dumps({"error": expected}), stdout="",
+        ),
+    )
+    events = []
+
+    class Rdp:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            return 0
+
+    monkeypatch.setattr(orchestrate.subprocess, "Popen", lambda *_args, **_kwargs: Rdp())
+    monkeypatch.setattr(orchestrate, "_run", lambda name, *_args, **_kwargs: events.append(name))
+    monkeypatch.setattr(orchestrate, "_resolve_password_source", lambda _key: "secret")
+
+    orchestrate._launch_replication_foothold_direct(_isc11_foothold())
+
+    assert events == ["launch retained replication Apollo", "terminate", ("wait", 15)]
+
+
+def test_isc11_contract_validation_binds_profile_route_tranche_and_authority():
+    contract = _isc11_contract_fixture()
+    args = SimpleNamespace(
+        scenario="replication-purpose-range-visible-cost",
+        ludus_mcp_server="ludus_sagerepl",
+        ludus_range_id="SAGEREPL",
+        snapshot="sage-replication-range-apollo-staged-v1",
+        retained_callback_config=ROOT / contract["range_binding"]["retained_callback_config"],
+        provider="openai",
+        model="bedrock-claude-4-6-sonnet",
+        solve_timeout=1800,
+        model_context_limit=200_000,
+        max_output_tokens=8192,
+        live_authority_id="isc11-canary-authority-001",
+    )
+    profile = orchestrate._RANGE_PROFILES.get_profile("sage-replication-range")
+
+    orchestrate._validate_isc11_contract(
+        contract,
+        contract_hash="d" * 64,
+        expected_contract_hash="d" * 64,
+        args=args,
+        range_profile=profile,
+        foothold=_isc11_foothold(),
+        require_live=True,
+    )
+    args.live_authority_id = "stale-authority"
+    with pytest.raises(SystemExit, match="live_authority_id"):
+        orchestrate._validate_isc11_contract(
+            contract,
+            contract_hash="d" * 64,
+            expected_contract_hash="d" * 64,
+            args=args,
+            range_profile=profile,
+            foothold=_isc11_foothold(),
+            require_live=True,
+        )
+    with pytest.raises(SystemExit, match="contract_hash"):
+        orchestrate._validate_isc11_contract(
+            contract,
+            contract_hash="d" * 64,
+            expected_contract_hash="e" * 64,
+            args=args,
+            range_profile=profile,
+            foothold=_isc11_foothold(),
+            require_live=False,
+        )
+
+
+def test_isc11_canary_runs_exact_three_row_order_with_retry_zero_and_cleanup(monkeypatch, tmp_path):
+    contract = _isc11_contract_fixture()
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+    row_env = orchestrate._isc11_results_environment(contract, {})
+    calls = []
+    monkeypatch.setattr(orchestrate, "_validate_isc11_source", lambda _contract: None)
+    monkeypatch.setattr(orchestrate, "_isc11_results_environment", lambda *_args: row_env)
+    kernel = orchestrate._development_row_kernel()
+    monkeypatch.setattr(
+        orchestrate,
+        "_development_row_kernel",
+        lambda: SimpleNamespace(
+            append_jsonl_durable=kernel.append_jsonl_durable,
+            begin_row=kernel.begin_row,
+            admission_disposition=lambda *_args, **_kwargs: {"countable": True, "failures": []},
+        ),
+    )
+
+    def fake_run_side(_scenario, side, **kwargs):
+        kwargs["before_reset"]()
+        calls.append((kwargs["row_id"], kwargs["policy_mode"], side))
+        orchestrate._isc11_append(row_env, {
+            "record_type": "result",
+            "row_id": kwargs["row_id"],
+            "row_admission": {"countable": True, "failures": []},
+            "row_state": "admitted",
+            "burned": False,
+        })
+        return 40 + len(calls)
+
+    def fake_cleanup(**kwargs):
+        orchestrate._isc11_append(row_env, {
+            "record_type": "cleanup",
+            "row_id": kwargs["row_id"],
+            "callback_id": kwargs["callback_id"],
+            "complete": True,
+        })
+
+    monkeypatch.setattr(orchestrate, "run_side", fake_run_side)
+    monkeypatch.setattr(orchestrate, "_isc11_cleanup", fake_cleanup)
+    args = SimpleNamespace(
+        scenario="replication-purpose-range-visible-cost",
+        solve_timeout=1800,
+        provider="openai",
+        model="bedrock-claude-4-6-sonnet",
+        snapshot="sage-replication-range-apollo-staged-v1",
+        retained_callback_config=Path("retained.json"),
+        ludus_range_id="SAGEREPL",
+        ludus_mcp_server="ludus_sagerepl",
+        engagement_netbios_map=None,
+        model_context_limit=200_000,
+        max_output_tokens=8192,
+        live_authority_id="isc11-canary-authority-001",
+    )
+
+    disposition = orchestrate._run_isc11_canary(
+        args, contract, tmp_path / "contract.json", expected_contract_hash="d" * 64,
+        route_env={}, foothold=_isc11_foothold(),
+    )
+
+    assert calls == [
+        ("isc11-row-001", "symbolic", "harness"),
+        ("isc11-row-002", "llm", "harness"),
+        ("isc11-row-003", "hybrid", "harness"),
+    ]
+    assert disposition["countable_rows"] == 3
+
+
+def test_isc11_canary_runs_cleanup_after_started_row_failure(monkeypatch, tmp_path):
+    contract = _isc11_contract_fixture()
+    monkeypatch.setattr(orchestrate, "ROOT", tmp_path)
+    row_env = orchestrate._isc11_results_environment(contract, {})
+    cleaned = []
+    monkeypatch.setattr(orchestrate, "_validate_isc11_source", lambda _contract: None)
+    monkeypatch.setattr(orchestrate, "_isc11_results_environment", lambda *_args: row_env)
+    kernel = orchestrate._development_row_kernel()
+    monkeypatch.setattr(
+        orchestrate,
+        "_development_row_kernel",
+        lambda: SimpleNamespace(
+            append_jsonl_durable=kernel.append_jsonl_durable,
+            begin_row=kernel.begin_row,
+            admission_disposition=lambda *_args, **_kwargs: {"countable": True, "failures": []},
+        ),
+    )
+
+    def fail_after_reset(_scenario, _side, **kwargs):
+        kwargs["before_reset"]()
+        raise RuntimeError("row failed")
+
+    monkeypatch.setattr(orchestrate, "run_side", fail_after_reset)
+    monkeypatch.setattr(
+        orchestrate, "_isc11_cleanup",
+        lambda **kwargs: cleaned.append((kwargs["row_id"], kwargs["callback_id"])),
+    )
+    args = SimpleNamespace(
+        scenario="replication-purpose-range-visible-cost", solve_timeout=1800,
+        provider="openai", model="bedrock-claude-4-6-sonnet",
+        snapshot="sage-replication-range-apollo-staged-v1",
+        retained_callback_config=Path("retained.json"), ludus_range_id="SAGEREPL",
+        ludus_mcp_server="ludus_sagerepl", engagement_netbios_map=None,
+        model_context_limit=200_000, max_output_tokens=8192,
+        live_authority_id="isc11-canary-authority-001",
+    )
+
+    with pytest.raises(RuntimeError, match="row failed"):
+            orchestrate._run_isc11_canary(
+                args, contract, tmp_path / "contract.json", expected_contract_hash="d" * 64,
+                route_env={}, foothold=_isc11_foothold(),
+            )
+
+    assert cleaned == [("isc11-row-001", None)]
+    records = orchestrate._isc11_result_records(row_env)
+    assert [record["record_type"] for record in records] == ["row_started"]
+    assert records[0]["row_id"] == "isc11-row-001"
+    assert records[0]["row_state"] == "started"
+
+
+def test_isc11_coordinator_recomputes_prior_row_instead_of_trusting_producer(monkeypatch, tmp_path):
+    contract = _isc11_contract_fixture()
+    ledger = tmp_path / "results.jsonl"
+    ledger.write_text(
+        "\n".join(json.dumps(record) for record in (
+            {
+                "record_type": "result", "row_id": "isc11-row-001",
+                "row_admission": {"countable": True, "failures": []},
+                "row_state": "admitted", "burned": False,
+            },
+            {"record_type": "cleanup", "row_id": "isc11-row-001", "complete": True},
+        )) + "\n",
+        encoding="utf-8",
+    )
+    row_env = {"SAGE_EVAL_RESULTS_PATH": str(ledger)}
+    monkeypatch.setattr(orchestrate, "_validate_isc11_source", lambda _contract: None)
+    monkeypatch.setattr(orchestrate, "_isc11_results_environment", lambda *_args: row_env)
+    monkeypatch.setattr(
+        orchestrate,
+        "_development_row_kernel",
+        lambda: SimpleNamespace(
+            admission_disposition=lambda *_args, **_kwargs: {
+                "countable": False, "failures": ["terminal_evidence_invalid"],
+            },
+        ),
+    )
+    args = SimpleNamespace()
+
+    with pytest.raises(SystemExit, match="prior row is not admitted"):
+        orchestrate._run_isc11_canary(
+            args, contract, tmp_path / "contract.json", expected_contract_hash="d" * 64,
+            route_env={}, foothold=_isc11_foothold(),
+        )

@@ -243,9 +243,16 @@ def admit_observation(
             return invalid_result(milestone, "domain-admin control target mismatch", observation)
         admin_account, admin_domain = parse_identity(observation.subject)
         control_account, control_domain = parse_identity(observation.control_subject)
-        if not admin_account or not control_account or admin_account == control_account:
+        if (
+            not admin_account or not control_account
+            or (admin_account, admin_domain) == (control_account, control_domain)
+        ):
             return invalid_result(milestone, "domain-admin control identities are missing or identical", observation)
-        if any(domain and domain != observed for domain in (admin_domain, control_domain)):
+        if not admin_domain or admin_domain != observed:
+            return invalid_result(milestone, "domain-admin identity domain mismatch", observation)
+        if not control_domain:
+            return invalid_result(milestone, "domain-admin control identity domain is missing", observation)
+        if contract.requires_differential and control_domain != observed:
             return invalid_result(milestone, "domain-admin identity domain mismatch", observation)
         if observation.negative_control_denied is not True:
             return invalid_result(milestone, "domain-admin negative control unexpectedly succeeded", observation)

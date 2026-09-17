@@ -116,6 +116,14 @@ query PreparedSageChannels {
   }
 }
 """
+CHANNEL_RUNTIME_IDENTITY_QUERY = """
+query SageChannelRuntimeIdentity($channelId: Int!, $operationId: Int!) {
+  chat_channel(
+    where: {id: {_eq: $channelId}, operation_id: {_eq: $operationId}}
+    limit: 2
+  ) { id ai_metadata }
+}
+"""
 
 CREATE_CHANNEL_MUTATION = """
 mutation CreateSageChannel(
@@ -746,6 +754,21 @@ async def find_prepared_channel(client: Any) -> dict[str, Any] | None:
     return None
 
 
+async def fetch_channel_runtime_identity(client: Any, channel_id: int) -> dict[str, Any]:
+    operation_id = _require_exact_int(
+        getattr(client, "current_operation_id", None), "Current Mythic operation id"
+    )
+    observed = await mythic.execute_custom_query(
+        client,
+        CHANNEL_RUNTIME_IDENTITY_QUERY,
+        variables={"channelId": int(channel_id), "operationId": operation_id},
+    )
+    rows = observed.get("chat_channel") if isinstance(observed, dict) else None
+    if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("id") != int(channel_id):
+        raise RuntimeError("created chat channel could not be re-read in the bound operation")
+    return _chat_runtime_identity_from_metadata(rows[0].get("ai_metadata"))
+
+
 async def prepare_locked_channel(
     client: Any,
     *,
@@ -1192,6 +1215,85 @@ async def resolve_request_selector(
     )
 
 
+class RequestWaitTimeout(TimeoutError):
+    """The observer stopped waiting; remote execution has not been confirmed stopped."""
+
+    def __init__(self, request_id: int, timeout_seconds: float, last_snapshot: dict | None):
+        self.request_id = request_id
+        self.last_snapshot = last_snapshot
+        self.remote_stop_confirmed = False
+        last_status = (last_snapshot or {}).get("request", {}).get("status")
+        super().__init__(
+            f"Mythic chat request {request_id} did not finish within {timeout_seconds}s; "
+            f"last status={last_status!r}; remote stop is not confirmed"
+        )
+
+
+async def stop_native_chat_request(
+    client: Any,
+    *,
+    channel_id: int,
+    request_id: int,
+    timeout_seconds: float = 120,
+    poll_interval_seconds: float = 2.0,
+    progress_sink: Any | None = None,
+) -> dict[str, Any]:
+    """Send one native ``/stop`` and observe both requests to a bounded terminal state.
+
+    The returned record distinguishes a successfully delivered stop request from confirmation that
+    the original producer actually terminated.  Callers retain the record even when either wait
+    times out; they must never infer remote stop from delivery alone.
+    """
+    channel_id = _require_exact_int(channel_id, "Stopped Mythic chat channel id")
+    request_id = _require_exact_int(request_id, "Stopped Mythic chat request id")
+    if not isinstance(timeout_seconds, (int, float)) or isinstance(timeout_seconds, bool) or timeout_seconds <= 0:
+        raise ValueError("stop timeout must be positive")
+    stop_message = await create_message(client, channel_id, "/stop")
+    stop_request_id = _require_exact_int(
+        stop_message.get("chat_request_id"), "Mythic /stop request id"
+    )
+    record: dict[str, Any] = {
+        "channel_id": channel_id,
+        "request_id": request_id,
+        "stop_request_id": stop_request_id,
+        "stop_sent": True,
+        "stop_request_terminal": False,
+        "original_request_terminal": False,
+        "remote_stop_confirmed": False,
+    }
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    async def bounded_wait(selected_request_id: int) -> dict[str, Any] | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return await wait_for_request(
+                client,
+                selected_request_id,
+                timeout_seconds=remaining,
+                poll_interval_seconds=min(poll_interval_seconds, remaining),
+                progress_sink=progress_sink,
+            )
+        except RequestWaitTimeout as exc:
+            return exc.last_snapshot
+
+    stop_snapshot = await bounded_wait(stop_request_id)
+    if isinstance(stop_snapshot, dict):
+        stop_status = str((stop_snapshot.get("request") or {}).get("status") or "").casefold()
+        record["stop_request_status"] = stop_status
+        record["stop_request_terminal"] = stop_status in TERMINAL_STATUSES
+    original_snapshot = await bounded_wait(request_id)
+    if isinstance(original_snapshot, dict):
+        original_status = str((original_snapshot.get("request") or {}).get("status") or "").casefold()
+        record["original_request_status"] = original_status
+        record["original_request_terminal"] = original_status in TERMINAL_STATUSES
+    record["remote_stop_confirmed"] = bool(
+        record["stop_request_terminal"] and record["original_request_terminal"]
+    )
+    return record
+
+
 async def wait_for_request(
     client: Any,
     request_id: int,
@@ -1205,24 +1307,37 @@ async def wait_for_request(
     started_at = time.monotonic()
     deadline = started_at + timeout_seconds
     last: dict[str, Any] | None = None
-    last_progress_signature: tuple[str, int, str | None, str | None, int | None] | None = None
+    last_snapshot: dict[str, Any] | None = None
+    last_progress_signature: tuple[Any, ...] | None = None
     last_progress_emit_at = started_at
     while time.monotonic() < deadline:
         try:
-            snapshot = await fetch_request_snapshot(client, request_id)
+            snapshot = await asyncio.wait_for(
+                fetch_request_snapshot(client, request_id),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except TimeoutError:
+            break
         except RuntimeError:
             snapshot = None
         if snapshot is not None:
+            last_snapshot = snapshot
             last = snapshot["request"]
+            if time.monotonic() >= deadline:
+                break
             status = str(last.get("status") or "").casefold()
             messages = snapshot["messages"]
             progress_metadata = _extract_progress_metadata(messages)
+            runtime_telemetry = extract_runtime_telemetry(messages)
+            task_budget = runtime_telemetry.get("task_budget")
             signature = (
                 status,
                 len(messages),
                 progress_metadata.get("current_operation"),
                 progress_metadata.get("tool_name"),
                 progress_metadata.get("retry_count"),
+                runtime_telemetry.get("model_calls"),
+                (task_budget or {}).get("submissions") if isinstance(task_budget, dict) else None,
             )
             now = time.monotonic()
             elapsed_seconds = max(0, int(now - started_at))
@@ -1241,6 +1356,12 @@ async def wait_for_request(
                     "updated_at": last.get("updated_at"),
                     "elapsed_seconds": elapsed_seconds,
                     "remaining_seconds": remaining_seconds,
+                    "runtime_cost": {
+                        "model_calls": runtime_telemetry.get("model_calls"),
+                        "model_response_records": runtime_telemetry.get("model_response_records")
+                        or runtime_telemetry.get("effective_backend_requests"),
+                        "task_budget": task_budget,
+                    },
                     **progress_metadata,
                 })
                 last_progress_signature = signature
@@ -1257,10 +1378,13 @@ async def wait_for_request(
         if remaining <= 0:
             break
         await asyncio.sleep(min(poll_interval_seconds, remaining))
-    raise TimeoutError(
-        f"Mythic chat request {request_id} did not finish within {timeout_seconds}s; "
-        f"last status={None if last is None else last.get('status')!r}"
-    )
+    if progress_sink is not None:
+        progress_sink({
+            "event": "request_wait_timeout",
+            "chat_request_id": int(request_id),
+            "remote_stop_confirmed": False,
+        })
+    raise RequestWaitTimeout(request_id, timeout_seconds, last_snapshot)
 
 
 def request_snapshot_result(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1603,6 +1727,7 @@ async def run_native_chat_turn(
     manifest_context: dict[str, Any] | None = None,
     runtime_dbs_archived: bool = False,
     stop_on_input_requested: bool = False,
+    expected_runtime_identity: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if manifest_path and not runtime_dbs_archived:
         raise RuntimeError("--manifest-path requires --runtime-dbs-archived.")
@@ -1640,6 +1765,19 @@ async def run_native_chat_turn(
             api_token_id=api_token_id,
             metadata=metadata,
         )
+    if expected_runtime_identity is not None:
+        observed_identity = await fetch_channel_runtime_identity(
+            client, int(channel["chat_channel_id"])
+        )
+        expected_identity = {
+            key: str(expected_runtime_identity.get(key) or "").strip()
+            for key in ("provider", "model", "route")
+        }
+        if not isinstance(observed_identity, dict) or any(
+            str(observed_identity.get(key) or "").strip() != expected_identity[key]
+            for key in expected_identity
+        ):
+            raise RuntimeError("created chat channel runtime identity mismatch before prompt submission")
     message = await create_message(client, channel["chat_channel_id"], prompt)
     if progress_sink is not None:
         progress_sink({

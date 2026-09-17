@@ -18,9 +18,11 @@ Operator loop per scenario:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import json
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -28,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 try:
-    from . import (effect_registry, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams,
+    from . import (development_row_kernel, effect_registry, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams,
                    bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod)
     from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
@@ -39,6 +41,7 @@ except Exception:
         gate1p_stagea,
         gate1p_stageb,
         gate1p_protocol,
+        development_row_kernel,
         effect_registry,
         live_seams,
         bare_runner,
@@ -77,9 +80,16 @@ class Config:
     max_output_tokens: int | None = None
     source_version: str | None = None
     live_authority_id: str | None = None
+    row_contract_path: str | None = None
+    row_contract_sha256: str | None = None
+    row_id: str | None = None
+    development_results_path: Path | None = None
+    development_artifact_dir: Path | None = None
 
     @property
     def results_path(self) -> Path:
+        if self.development_results_path is not None:
+            return self.development_results_path
         override = str(os.environ.get("SAGE_EVAL_RESULTS_PATH") or "").strip()
         if override:
             return Path(override).expanduser()
@@ -87,9 +97,286 @@ class Config:
 
     @property
     def artifact_dir(self) -> Path | None:
+        if self.development_artifact_dir is not None:
+            return self.development_artifact_dir
         value = str(os.environ.get("SAGE_EVAL_ARTIFACT_DIR") or "").strip()
         return Path(value).expanduser() if value else None
 
+
+_DEVELOPMENT_ROW_SCHEMA = development_row_kernel.CONTRACT_SCHEMA
+_DEVELOPMENT_ROW_OBSERVER_VERSION = development_row_kernel.OBSERVER_VERSION
+_DEVELOPMENT_ROW_ID = development_row_kernel.ROW_ID
+def _hash_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class DevelopmentRowProtocol:
+    """Typed, contract-driven row envelope for non-Gate1P development measurements."""
+
+    def __init__(
+        self,
+        contract_path: str | Path,
+        *,
+        row_id: str,
+        expected_contract_sha256: str | None = None,
+    ):
+        self.path = Path(contract_path).expanduser().resolve()
+        self.row_id = str(row_id)
+        self.contract, self.contract_sha256 = development_row_kernel.load_contract(
+            self.path,
+            expected_sha256=expected_contract_sha256,
+        )
+        development_row_kernel.contamination_markers(self.contract)
+        self.row_index, self.policy_mode = development_row_kernel.matrix_row(
+            self.contract, self.row_id
+        )
+        self.protocol_id = str(self.contract.get("contract_id") or "")
+        if not self.protocol_id:
+            raise gate1p_stagea.ProtocolError("development-row contract_id is required")
+        if not str(self.range_binding.get("objective_domain") or "").strip():
+            raise gate1p_stagea.ProtocolError("development-row objective_domain is required")
+
+    def storage_paths(self, *, repo_root: Path) -> tuple[Path, Path]:
+        return development_row_kernel.contract_storage_paths(
+            self.contract,
+            repo_root=repo_root,
+        )
+
+    @property
+    def execution(self) -> dict:
+        value = self.contract.get("execution_identity")
+        if not isinstance(value, dict):
+            raise gate1p_stagea.ProtocolError("development-row execution identity is missing")
+        return value
+
+    @property
+    def source(self) -> dict:
+        value = self.contract.get("source_identity")
+        if not isinstance(value, dict):
+            raise gate1p_stagea.ProtocolError("development-row source identity is missing")
+        return value
+
+    @property
+    def range_binding(self) -> dict:
+        value = self.contract.get("range_binding")
+        if not isinstance(value, dict):
+            raise gate1p_stagea.ProtocolError("development-row range binding is missing")
+        return value
+
+    @property
+    def signal(self) -> dict:
+        value = self.contract.get("prospective_signal")
+        if not isinstance(value, dict):
+            raise gate1p_stagea.ProtocolError("development-row prospective signal is missing")
+        return value
+
+    @property
+    def expected_choice(self) -> str:
+        choices = self.signal.get("expected_choice")
+        if not isinstance(choices, dict) or not str(choices.get(self.policy_mode) or ""):
+            raise gate1p_stagea.ProtocolError("development-row expected policy choice is missing")
+        return str(choices[self.policy_mode])
+
+    @property
+    def expected_cost(self) -> int:
+        vectors = self.signal.get("expected_vectors")
+        values = vectors.get(self.policy_mode) if isinstance(vectors, dict) else None
+        occurrence = sum(
+            1
+            for item in self.contract["matrix"]["order"][: self.row_index]
+            if item == self.policy_mode
+        )
+        if not isinstance(values, list) or occurrence > len(values) or type(values[occurrence - 1]) is not int:
+            raise gate1p_stagea.ProtocolError("development-row expected cost vector is malformed")
+        return int(values[occurrence - 1])
+
+    @property
+    def live_authority_id(self) -> str:
+        gate = self.contract.get("authority_gate")
+        return str(gate.get("live_authority_id") or "") if isinstance(gate, dict) else ""
+
+    @property
+    def objective(self) -> str:
+        execution_path = self.contract.get("execution_path")
+        objective = (
+            str(execution_path.get("scenario_objective") or "").strip()
+            if isinstance(execution_path, dict)
+            else ""
+        )
+        if not objective:
+            raise gate1p_stagea.ProtocolError(
+                "development-row scenario_objective is required"
+            )
+        return objective
+
+    def validate_request(
+        self,
+        *,
+        scenario: str,
+        side: str,
+        provider: str | None,
+        model: str | None,
+        policy_mode: str,
+        solve_timeout: int,
+        token_ceiling: int,
+        model_context_limit: int | None,
+        max_output_tokens: int | None,
+        source_version: str | None,
+        live_authority_id: str | None,
+        require_live_authority: bool,
+    ) -> str:
+        expected_source = str(self.source.get("tree") or self.source.get("commit") or "")
+        checks = {
+            "scenario": scenario == self.range_binding.get("scenario"),
+            "side": side == self.execution.get("side") == "harness",
+            "provider": str(provider or "").casefold() == str(self.execution.get("provider") or "").casefold(),
+            "model": str(model or "") == str(self.execution.get("model") or ""),
+            "policy_mode": policy_mode == self.policy_mode,
+            "solve_timeout": type(solve_timeout) is int and solve_timeout == self.execution.get("solve_timeout_seconds"),
+            "token_ceiling": type(token_ceiling) is int and token_ceiling == self.execution.get("completed_call_token_ceiling_per_row"),
+            "model_context_limit": model_context_limit == self.execution.get("model_context_limit"),
+            "max_output_tokens": max_output_tokens == self.execution.get("max_output_tokens"),
+            "source_version": bool(expected_source) and str(source_version or "") == expected_source,
+        }
+        failed = sorted(name for name, passed in checks.items() if not passed)
+        if failed:
+            raise gate1p_stagea.ProtocolError(
+                "development-row request differs from the frozen contract: " + ", ".join(failed)
+            )
+        if require_live_authority:
+            development_row_kernel.validate_live_authority(
+                self.contract,
+                row_id=self.row_id,
+                live_authority_id=live_authority_id,
+            )
+        return self.row_id
+
+    def response_usage_disposition(self, response_records: object, *, model_calls: object) -> dict:
+        return development_row_kernel.response_usage_disposition(
+            self.contract, self.row_id, response_records, model_calls=model_calls
+        )
+
+    def canonical_oracle_fact(self, raw: object) -> dict[str, object]:
+        return development_row_kernel.canonical_oracle_fact(self.contract, raw)
+
+    def build_objective_oracle(self, probe: Callable[[], object], *, artifact_pointer: str, target: str):
+        protocol = self
+
+        class ObjectiveOracle:
+            last_result: effect_registry.ProofResult | None = None
+
+            def __call__(self) -> dict[str, object]:
+                result = effect_registry.admit_observation(
+                    Milestone.OBJECTIVE,
+                    probe(),
+                    expected_target=target,
+                )
+                self.last_result = result
+                if result.disposition not in {
+                    effect_registry.ProofDisposition.PROVEN,
+                    effect_registry.ProofDisposition.DISPROVEN,
+                }:
+                    raise gate1p_stagea.ObserverUnavailable(result.reason)
+                return protocol.canonical_oracle_fact({
+                    "success": result.proven,
+                    "proof_record": result.to_record(),
+                    "artifact_pointer": artifact_pointer,
+                })
+
+        return ObjectiveOracle()
+
+    def build_episode_observer(self, **kwargs):
+        return gate1p_stagea.LiveEpisodeObserver(
+            **kwargs,
+            oracle_canonicalizer=self.canonical_oracle_fact,
+            observer_version=_DEVELOPMENT_ROW_OBSERVER_VERSION,
+            thread_name_prefix="sage-development-row",
+        )
+
+    def observer_facts_disposition(self, observer: object, *, arm: str) -> dict:
+        return development_row_kernel.observer_facts_disposition(
+            self.contract, arm, observer
+        )
+
+    def episode_outcome_disposition(
+        self, observer: object, *, arm: str, total_tokens: object, token_ceiling: object,
+    ) -> dict:
+        expected = self.execution.get("completed_call_token_ceiling_per_row")
+        if token_ceiling != expected:
+            return {"countable": False, "reason": "token ceiling differs from the contract"}
+        return development_row_kernel.outcome_disposition(
+            self.contract, arm, observer, total_tokens=total_tokens
+        )
+
+    def snapshot(self, *, cfg: Config, side: str, scenario: str, model_route: dict) -> dict:
+        source = self.source
+        binding = self.range_binding
+        return {
+            "protocol_id": self.protocol_id,
+            "pair_id": self.protocol_id,
+            "arm": self.row_id,
+            "contract_sha256": self.contract_sha256,
+            "measurement_kind": "row",
+            "row_id": self.row_id,
+            "row_index": self.row_index,
+            "scenario": scenario,
+            "side": side,
+            "policy_mode": self.policy_mode,
+            "model_provider": model_route.get("provider"),
+            "model_id": model_route.get("model"),
+            "solve_timeout_seconds": cfg.solve_timeout,
+            "completed_call_token_ceiling": cfg.model_token_budget,
+            "model_context_limit": cfg.model_context_limit,
+            "max_output_tokens": cfg.max_output_tokens,
+            "source_version": cfg.source_version,
+            "source_tree": source.get("tree"),
+            "source_branch": source.get("branch"),
+            "profile_catalog_sha256": source.get("profile_catalog_sha256"),
+            "topology_identity": source.get("topology_identity"),
+            "qualification_receipt": source.get("qualification_receipt"),
+            "range_profile": binding.get("profile"),
+            "ludus_mcp_server": binding.get("ludus_mcp_server"),
+            "ludus_range_id": binding.get("ludus_range_id"),
+            "snapshot": binding.get("snapshot"),
+            "foothold_host": binding.get("foothold_host"),
+            "foothold_callback_host": binding.get("foothold_callback_host"),
+            "foothold_ip": binding.get("foothold_ip"),
+            "foothold_principal": binding.get("foothold_principal"),
+            "foothold_callback_user": binding.get("foothold_callback_user"),
+            "expected_frontier_hash": self.signal.get("decisive_frontier_hash"),
+            "expected_candidate_count": self.signal.get("expected_candidate_count"),
+            "expected_selected_capability": self.expected_choice,
+            "expected_semantic_transaction_count": self.expected_cost,
+        }
+
+    def admission_disposition(self, row: object) -> dict[str, object]:
+        """Recompute one generic row's admission from retained typed evidence."""
+        history_root, _ledger = self.storage_paths(
+            repo_root=Path(__file__).resolve().parents[4],
+        )
+        return development_row_kernel.admission_disposition(
+            self.contract,
+            contract_sha256=self.contract_sha256,
+            row=row,
+            history_root=history_root,
+        )
+
+
+def _bind_development_row_storage(
+    cfg: Config,
+    protocol: DevelopmentRowProtocol,
+    *,
+    repo_root: Path | None = None,
+) -> None:
+    root, ledger = protocol.storage_paths(
+        repo_root=repo_root or Path(__file__).resolve().parents[4],
+    )
+    cfg.development_artifact_dir = root
+    cfg.development_results_path = ledger
 
 def _gate1p_arm_artifact_path(cfg: Config, arm: str) -> Path:
     if cfg.artifact_dir is None:
@@ -608,16 +895,41 @@ _GATE1P_PRIMARY_SCENARIOS = gate1p_protocol.primary_scenarios()
 
 
 def _row_outcome_disposition(
-    row_protocol: gate1p_protocol.Gate1PProtocol | None,
+    row_protocol: gate1p_protocol.Gate1PProtocol | DevelopmentRowProtocol | None,
     pair_id: str | None,
 ) -> Callable[..., dict]:
     if row_protocol is None:
         return gate1p_stagea.episode_outcome_disposition
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        return row_protocol.episode_outcome_disposition
     return lambda observer, **kwargs: row_protocol.episode_outcome_disposition(
         observer,
         pair_id=pair_id,
         **kwargs,
     )
+
+
+def _response_usage_disposition(
+    row_protocol: gate1p_protocol.Gate1PProtocol | DevelopmentRowProtocol | None,
+    response_records: object,
+    *,
+    model_calls: object,
+) -> dict:
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        return row_protocol.response_usage_disposition(response_records, model_calls=model_calls)
+    return gate1p_stagea.response_usage_disposition(response_records, model_calls=model_calls)
+
+
+def _observer_facts_disposition(
+    row_protocol: gate1p_protocol.Gate1PProtocol | DevelopmentRowProtocol,
+    observer: object,
+    *,
+    arm: str,
+    pair_id: str | None,
+) -> dict:
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        return row_protocol.observer_facts_disposition(observer, arm=arm)
+    return row_protocol.observer_facts_disposition(observer, arm=arm, pair_id=pair_id)
 
 
 def measurement_dimensions(
@@ -634,13 +946,14 @@ def measurement_dimensions(
     model_calls: object = None,
     token_ceiling: object = None,
     outcome_disposition: Callable[..., dict] = gate1p_stagea.episode_outcome_disposition,
+    usage_disposition: Callable[..., dict] = gate1p_stagea.response_usage_disposition,
 ) -> dict:
     """Report independent countability dimensions without converting missing evidence to failure or zero."""
     kind = str(measurement_kind or "legacy")
     probe_available = not bool(getattr(card, "probe_disagreements", []))
     clean_stop_available = bool(stop_observation_available)
     usage = (
-        gate1p_stagea.response_usage_disposition(
+        usage_disposition(
             model_response_records,
             model_calls=model_calls,
         )
@@ -782,8 +1095,22 @@ def harness_terminal_cause(wrapper_status: object, runtime_telemetry: dict) -> d
     return {"cause": "other_declared_boundary", "subtype": "unknown"}
 
 
-def episode_protocol_snapshot(cfg: Config, *, side: str, scenario_name: str, model_route: dict) -> dict:
+def episode_protocol_snapshot(
+    cfg: Config,
+    *,
+    side: str,
+    scenario_name: str,
+    model_route: dict,
+    development_protocol: DevelopmentRowProtocol | None = None,
+) -> dict:
     """The concise per-attempt development-measurement protocol; no sealing or forensic receipt layer."""
+    if development_protocol is not None:
+        return development_protocol.snapshot(
+            cfg=cfg,
+            side=side,
+            scenario=scenario_name,
+            model_route=model_route,
+        )
     snapshot = {
         "protocol_id": cfg.protocol_id,
         "measurement_kind": cfg.measurement_kind,
@@ -862,7 +1189,7 @@ def run_side(
 ) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
     row_arm = ""
-    row_protocol = None
+    row_protocol: gate1p_protocol.Gate1PProtocol | DevelopmentRowProtocol | None = None
     if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
         row_protocol = gate1p_protocol.protocol_for_request(
             protocol_id=cfg.protocol_id,
@@ -895,21 +1222,59 @@ def run_side(
             raise gate1p_stagea.ProtocolError(
                 f"live paired-row execution requires separate authority ID {row_protocol.allocation_id!r}"
             )
+    resolved_model_route = _resolved_harness_model_route(cfg)
+    if cfg.measurement_kind == "row" and scenario_name not in _GATE1P_PRIMARY_SCENARIOS:
+        if not cfg.row_contract_path or not cfg.row_contract_sha256 or not cfg.row_id:
+            raise gate1p_stagea.ProtocolError(
+                "non-Gate1P row mode requires contract path, expected hash, and row identity"
+            )
+        row_protocol = DevelopmentRowProtocol(
+            cfg.row_contract_path,
+            row_id=cfg.row_id,
+            expected_contract_sha256=cfg.row_contract_sha256,
+        )
+        _bind_development_row_storage(cfg, row_protocol)
+        row_arm = row_protocol.validate_request(
+            scenario=scenario_name,
+            side=side,
+            provider=str(resolved_model_route.get("provider") or ""),
+            model=str(resolved_model_route.get("model") or ""),
+            policy_mode=cfg.policy_mode,
+            solve_timeout=cfg.solve_timeout,
+            token_ceiling=cfg.model_token_budget,
+            model_context_limit=cfg.model_context_limit,
+            max_output_tokens=cfg.max_output_tokens,
+            source_version=cfg.source_version,
+            live_authority_id=cfg.live_authority_id,
+            require_live_authority=True,
+        )
+        started = development_row_kernel.started_disposition(
+            row_protocol.contract,
+            repo_root=Path(__file__).resolve().parents[4],
+            row_id=row_protocol.row_id,
+            protocol_id=row_protocol.protocol_id,
+            contract_sha256=row_protocol.contract_sha256,
+        )
+        if started.get("valid") is not True:
+            raise gate1p_stagea.ProtocolError(str(started.get("reason")))
     scn = _scenario(cfg, scenario_name)
     if row_arm and scn.objective != row_protocol.objective:
         raise gate1p_stagea.ProtocolError("assembled scenario objective bytes differ from the accepted protocol")
     if row_arm and _pair_arm_has_started(
         cfg.results_path,
-        pair_id=str(cfg.pair_id),
+        pair_id=(
+            row_protocol.protocol_id
+            if isinstance(row_protocol, DevelopmentRowProtocol)
+            else str(cfg.pair_id)
+        ),
         arm=row_arm,
     ):
         raise gate1p_stagea.ProtocolError(
             f"the retry-zero ledger already contains a started {row_arm!r} arm for {cfg.pair_id!r}"
         )
     gate1p_artifact_path = _validate_gate1p_artifact_destinations(cfg, row_arm) if row_arm else None
-    if row_arm:
+    if row_arm and not isinstance(row_protocol, DevelopmentRowProtocol):
         _validate_gate1p_pair_control(cfg, row_arm, protocol=row_protocol)
-    resolved_model_route = _resolved_harness_model_route(cfg)
     client = live_seams.default_mythic_client()
     mythic_operation_id = getattr(client, "current_operation_id", None)
     if row_arm and (type(mythic_operation_id) is not int or mythic_operation_id <= 0):
@@ -950,6 +1315,9 @@ def run_side(
             "model": resolved_model_route.get("model"),
             "api_endpoint": resolved_model_route.get("api_endpoint"),
         },
+        development_protocol=(
+            row_protocol if isinstance(row_protocol, DevelopmentRowProtocol) else None
+        ),
     )
     if row_arm:
         protocol_snapshot["initial_callback_display_id"] = int(cfg.apollo_cb)
@@ -1009,7 +1377,13 @@ def run_side(
                 "legacy proof class is not admitted by the independent verifier"
             )
 
-        if (
+        if isinstance(row_protocol, DevelopmentRowProtocol):
+            gate1p_oracle = row_protocol.build_objective_oracle(
+                probes[Milestone.OBJECTIVE],
+                artifact_pointer=str(gate1p_artifact_path),
+                target=objective_domain,
+            )
+        elif (
             row_protocol.module is gate1p_stageb
             or getattr(row_protocol.module, "PROOF_ADAPTER_FAMILY", "") == "stageb"
         ):
@@ -1040,7 +1414,11 @@ def run_side(
                 },
             )
         observer = row_protocol.build_episode_observer(
-            pair_id=str(cfg.pair_id),
+            pair_id=(
+                row_protocol.protocol_id
+                if isinstance(row_protocol, DevelopmentRowProtocol)
+                else str(cfg.pair_id)
+            ),
             arm=row_arm,
             objective_probe=gate1p_oracle,
             task_fetcher=lambda: live_seams.mythic_operation_task_states(
@@ -1141,6 +1519,8 @@ def run_side(
             if observer is not None
             else {}
         )
+        if isinstance(row_protocol, DevelopmentRowProtocol):
+            gate1p_objective_result = getattr(gate1p_oracle, "last_result", None)
         telemetry_validation_error = None
         try:
             validate_harness_runtime_telemetry(
@@ -1159,18 +1539,18 @@ def run_side(
                 raise
             telemetry_validation_error = str(exc)
         if row_arm:
-            usage_evidence = gate1p_stagea.response_usage_disposition(
+            usage_evidence = _response_usage_disposition(
+                row_protocol,
                 runtime_telemetry.get("model_response_records"),
                 model_calls=runtime_telemetry.get("model_calls"),
             )
             canonical_response_records = list(usage_evidence.get("canonical_records") or [])
             canonical_outcome = (
-                row_protocol.episode_outcome_disposition(
+                _row_outcome_disposition(row_protocol, cfg.pair_id)(
                     observer_result,
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
                     token_ceiling=cfg.model_token_budget,
-                    pair_id=cfg.pair_id,
                 )
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
@@ -1252,18 +1632,18 @@ def run_side(
             else {}
         )
         if row_arm:
-            usage_evidence = gate1p_stagea.response_usage_disposition(
+            usage_evidence = _response_usage_disposition(
+                row_protocol,
                 result.model_response_records,
                 model_calls=result.model_calls,
             )
             canonical_response_records = list(usage_evidence.get("canonical_records") or [])
             canonical_outcome = (
-                row_protocol.episode_outcome_disposition(
+                _row_outcome_disposition(row_protocol, cfg.pair_id)(
                     observer_result,
                     arm=row_arm,
                     total_tokens=usage_evidence["total_tokens"],
                     token_ceiling=cfg.model_token_budget,
-                    pair_id=cfg.pair_id,
                 )
                 if usage_evidence.get("countable") is True
                 else {"countable": False, "reason": usage_evidence.get("reason")}
@@ -1318,8 +1698,11 @@ def run_side(
         else runtime_telemetry.get("token_usage_complete") is True
     )
     observer_evidence = (
-        row_protocol.observer_facts_disposition(
-            observer_result, arm=row_arm, pair_id=cfg.pair_id,
+        _observer_facts_disposition(
+            row_protocol,
+            observer_result,
+            arm=row_arm,
+            pair_id=cfg.pair_id,
         )
         if row_arm and observer_result
         else {"countable": False}
@@ -1378,7 +1761,11 @@ def run_side(
             else []
         )
         artifact_payload = {
-            "schema": "gate1p-stagea-episode-artifact-v17",
+            "schema": (
+                "sage-development-row-episode-artifact-v1"
+                if isinstance(row_protocol, DevelopmentRowProtocol)
+                else "gate1p-stagea-episode-artifact-v17"
+            ),
             "protocol": protocol_snapshot,
             "side": side,
             "arm": row_arm,
@@ -1391,6 +1778,11 @@ def run_side(
             "response_evidence": list(canonical_response_records),
             "bare_model": bare_model_contract if side == "bare" else None,
             "scorecard": asdict(card),
+            "objective_proof": (
+                gate1p_objective_result.to_record()
+                if isinstance(gate1p_objective_result, effect_registry.ProofResult)
+                else None
+            ),
         }
         try:
             if side == "harness" and not transcript:
@@ -1477,12 +1869,20 @@ def run_side(
                model_calls=getattr(card, "model_calls", None),
                token_ceiling=cfg.model_token_budget,
                outcome_disposition=_row_outcome_disposition(row_protocol, cfg.pair_id),
+               usage_disposition=lambda records, **kwargs: _response_usage_disposition(
+                   row_protocol, records, **kwargs,
+               ),
            ),
            "cost_countable": cost_countable,
            "telemetry_validation_error": telemetry_validation_error,
            "observer": observer_result,
            "runtime_summary": runtime_summary,
            "artifact_capture": artifact_capture,
+           "objective_proof": (
+               gate1p_objective_result.to_record()
+               if isinstance(gate1p_objective_result, effect_registry.ProofResult)
+               else None
+           ),
            # ts = epoch (sortable); ts_iso = local-time human stamp to eyeball-correlate to the archived
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
@@ -1520,17 +1920,39 @@ def run_side(
                 }
                 else value
             )
-    if not row_arm:
+    if not row_arm or isinstance(row_protocol, DevelopmentRowProtocol):
         rec.update(runtime_evidence_fields(runtime_telemetry))
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        rec.update({
+            "row_id": row_protocol.row_id,
+            "row_index": row_protocol.row_index,
+            "policy_switches": list(runtime_telemetry.get("policy_switches") or []),
+            "backend_provenance_complete": (
+                runtime_telemetry.get("backend_provenance_complete") is True
+                if int(runtime_telemetry.get("model_calls", 0) or 0) > 0
+                else row_protocol.policy_mode == "symbolic"
+            ),
+        })
     native_result = getattr(locals().get("solve"), "last_result", None)
     if isinstance(native_result, dict):
         rec["chat_channel_id"] = native_result.get("chat_channel_id")
         rec["chat_request_id"] = native_result.get("chat_request_id")
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        admission = row_protocol.admission_disposition(rec)
+        rec["row_admission"] = admission
+        rec["row_state"] = "admitted" if admission.get("countable") is True else "burned"
+        rec["burned"] = admission.get("countable") is not True
     p = cfg.results_path
     _append_jsonl(p, rec)
     print(f"[{side}/{scenario_name}] capability={card.capability:.3f} furthest={card.furthest_milestone} "
           f"-> recorded to {p}", flush=True)
-    if row_arm:
+    if isinstance(row_protocol, DevelopmentRowProtocol):
+        if rec["row_admission"].get("countable") is not True:
+            raise RuntimeError(
+                "the development row was retained but is not countable: "
+                + ", ".join(rec["row_admission"].get("failures") or [])
+            )
+    elif row_arm:
         arm_admission = row_protocol.module.arm_comparison_disposition(rec)
         if arm_admission.get("countable") is not True:
             raise RuntimeError(
@@ -1693,6 +2115,21 @@ def main(argv=None) -> int:
         default=None,
         help="separate explicit live authority identifier; required with --go in paired-row mode",
     )
+    r.add_argument(
+        "--row-contract",
+        default=None,
+        help="prospective JSON contract for a generic non-Gate1P development row",
+    )
+    r.add_argument(
+        "--row-contract-sha256",
+        default=None,
+        help="independently expected SHA-256 identity of the generic row contract",
+    )
+    r.add_argument(
+        "--row-id",
+        default=None,
+        help="stable generic development-row identity (isc11-row-NNN)",
+    )
     r.add_argument("--da-settle-timeout", type=int, default=None,
                    help="seconds the DA probes poll for GPO/SYSTEM-on-DC membership to propagate before "
                         "scoring (default 300=5min). Returns True the instant it appears; 0 = immediate.")
@@ -1796,6 +2233,12 @@ def main(argv=None) -> int:
         cfg.source_version = args.source_version
     if getattr(args, "live_authority_id", None):
         cfg.live_authority_id = args.live_authority_id
+    if getattr(args, "row_contract", None):
+        cfg.row_contract_path = args.row_contract
+    if getattr(args, "row_contract_sha256", None):
+        cfg.row_contract_sha256 = args.row_contract_sha256
+    if getattr(args, "row_id", None):
+        cfg.row_id = args.row_id
 
     if cfg.measurement_kind == "diagnostic":
         if args.scenario != "child-domain-control" or args.side != "harness":
@@ -1843,12 +2286,55 @@ def main(argv=None) -> int:
                 f"live paired-row execution requires separate --live-authority-id "
                 f"{selected_protocol.allocation_id}"
             )
+    selected_development_row = None
+    if cfg.measurement_kind == "row" and args.scenario not in _GATE1P_PRIMARY_SCENARIOS:
+        if cfg.pair_id is not None or cfg.arm_index is not None:
+            ap.error("generic development rows do not accept --pair-id or --arm-index")
+        if not cfg.row_contract_path or not cfg.row_contract_sha256 or not cfg.row_id:
+            ap.error(
+                "generic development rows require --row-contract, --row-contract-sha256, and --row-id"
+            )
+        try:
+            selected_development_row = DevelopmentRowProtocol(
+                cfg.row_contract_path,
+                row_id=cfg.row_id,
+                expected_contract_sha256=cfg.row_contract_sha256,
+            )
+            selected_development_row.validate_request(
+                scenario=args.scenario,
+                side=args.side,
+                provider=cfg.model_provider,
+                model=cfg.model_id,
+                policy_mode=cfg.policy_mode,
+                solve_timeout=cfg.solve_timeout,
+                token_ceiling=cfg.model_token_budget,
+                model_context_limit=cfg.model_context_limit,
+                max_output_tokens=cfg.max_output_tokens,
+                source_version=cfg.source_version,
+                live_authority_id=cfg.live_authority_id,
+                require_live_authority=bool(args.go),
+            )
+        except gate1p_stagea.ProtocolError as exc:
+            ap.error(str(exc))
 
     if args.cmd == "compare":
         compare(cfg, args.scenario)
         return 0
 
     if not args.go:
+        if selected_development_row is not None:
+            print(json.dumps({
+                "prospective_development_row": selected_development_row.snapshot(
+                    cfg=cfg,
+                    side=args.side,
+                    scenario=args.scenario,
+                    model_route={"provider": cfg.model_provider, "model": cfg.model_id},
+                )
+            }, sort_keys=True))
+            print(
+                "VALIDATED DRY RUN: no reset, model, Mythic, BloodHound, range, target, or row call was made."
+            )
+            return 0
         if (
             selected_protocol is not None
             and (not selected_protocol.pair_allocated or cfg.pair_id is None)

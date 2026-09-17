@@ -833,7 +833,7 @@ def mythic_operation_task_states(
             raise RuntimeError("authenticated Mythic operation identity is unavailable")
         if expected_operation_id is not None and operation_id != expected_operation_id:
             raise RuntimeError("authenticated Mythic operation identity drifted")
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             mythic.execute_custom_query(
                 client,
                 _GATE1P_TASK_STATE_QUERY,
@@ -841,9 +841,10 @@ def mythic_operation_task_states(
             ),
             timeout=timeout,
         )
+        return operation_id, result
 
     try:
-        result = asyncio.run(_q())
+        operation_id, result = asyncio.run(_q())
     except Exception as exc:
         raise RuntimeError(f"Mythic task-state query failed: {exc}") from exc
     rows = result.get("task")
@@ -851,7 +852,36 @@ def mythic_operation_task_states(
         raise RuntimeError("Mythic task-state query omitted the task list")
     if any(not isinstance(row, Mapping) for row in rows):
         raise RuntimeError("Mythic task-state query returned a non-mapping task row")
+    if any(type(row.get("operation_id")) is not int or row["operation_id"] != operation_id for row in rows):
+        raise RuntimeError("Mythic task-state response has mismatched operation identity")
     return [dict(row) for row in rows]
+
+
+def summarize_task_quiescence(rows: Any, *, expected_operation_id: int) -> dict:
+    """Summarize a task-state snapshot without querying or stopping anything.
+
+    True means no unfinished task was observed in this snapshot, not that its producer has stopped.
+    Unavailable, malformed, or mismatched evidence remains unknown.
+    """
+    if type(expected_operation_id) is not int or expected_operation_id <= 0:
+        raise ValueError("expected operation identity must be a positive integer")
+    result = {"operation_id": expected_operation_id, "task_count": None,
+              "task_quiescent": None, "running_task_ids": [], "unknown_reason": "unavailable"}
+    if not isinstance(rows, list):
+        return result
+    seen = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return {**result, "unknown_reason": "malformed_task"}
+        if type(row.get("operation_id")) is not int or row["operation_id"] != expected_operation_id:
+            return {**result, "unknown_reason": "operation_mismatch"}
+        task_id = row.get("display_id")
+        if type(task_id) is not int or task_id <= 0 or task_id in seen or type(row.get("completed")) is not bool:
+            return {**result, "unknown_reason": "malformed_task"}
+        seen.add(task_id)
+    running = [row["display_id"] for row in rows if row["completed"] is False]
+    return {**result, "task_count": len(rows), "task_quiescent": not running,
+            "running_task_ids": running, "unknown_reason": None}
 
 
 def _fetch_credentials_for_probe(*, timeout: int = 60) -> list[dict]:

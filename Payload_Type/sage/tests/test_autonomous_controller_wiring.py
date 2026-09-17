@@ -479,6 +479,40 @@ def test_controller_crossing_response_cannot_execute_selected_capability(monkeyp
     assert telemetry["decisions"][0]["raw_disposition"] == "select"
 
 
+def test_controller_wrong_response_route_is_retained_and_cannot_execute(monkeypatch):
+    calls = []
+    m = _bare_model(json.dumps({"ok": True}), _state_with_remote_exec(), calls)
+    m.policy_mode = "llm"
+    m.provider = "openai"
+    m.model = "expected-model"
+    monkeypatch.setenv("SAGE_EVAL_MODEL_TOKEN_BUDGET", "1000")
+    monkeypatch.setenv("SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER", "openai")
+    monkeypatch.setenv("SAGE_EVAL_EXPECTED_RESPONSE_MODEL", "expected-model")
+
+    class WrongRouteLLM:
+        async def ainvoke(self, _messages):
+            return type("Response", (), {
+                "content": json.dumps({
+                    "disposition": "select",
+                    "capability": "adcs-ca-private-key-export",
+                    "target": "essos.local",
+                }),
+                "response_metadata": {"model_provider": "openai", "model_name": "wrong-model"},
+                "usage_metadata": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            })()
+
+    m.llm = WrongRouteLLM()
+    report = asyncio.run(m._run_autonomous_controller(_state_with_remote_exec().objective))
+
+    assert calls == []
+    assert "halted_no_action" in report
+    telemetry = m.controller_runtime_telemetry()
+    assert telemetry["model_calls"] == 1
+    assert telemetry["total_tokens"] == 7
+    assert telemetry["effective_backends"] == ["openai:wrong-model"]
+    assert "route mismatch" in telemetry["decisions"][0]["rationale"]
+
+
 def test_controller_provider_content_replay_cannot_bypass_crossing_boundary(monkeypatch):
     calls = []
     provider_requests = []

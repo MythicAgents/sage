@@ -441,10 +441,21 @@ class AutonomousController:
             **{"sage.seam.name": name, "sage.cycle.index": getattr(self, "_current_cycle", 0)},
         ) as span:
             try:
+                remaining_wall = None
+                absolute_deadline = getattr(self, "_absolute_deadline", None)
+                if isinstance(absolute_deadline, (int, float)):
+                    remaining_wall = absolute_deadline - asyncio.get_running_loop().time()
+                    if remaining_wall <= 0:
+                        return ("timeout", f"{name} reached wall_clock_budget_s={self.config.wall_clock_budget_s}")
                 value = thunk()
                 if inspect.isawaitable(value):
-                    if self.config.seam_timeout_s:
-                        value = await asyncio.wait_for(value, self.config.seam_timeout_s)
+                    timeout_candidates = [
+                        float(candidate)
+                        for candidate in (self.config.seam_timeout_s, remaining_wall)
+                        if isinstance(candidate, (int, float)) and candidate > 0
+                    ]
+                    if timeout_candidates:
+                        value = await asyncio.wait_for(value, min(timeout_candidates))
                     else:
                         value = await value
             except asyncio.TimeoutError:
@@ -512,6 +523,9 @@ class AutonomousController:
         re-indenting ~190 lines of kernel control flow to add a span is a poor trade against the risk of a
         mis-indent. This covers every exit path, including exceptions, without touching one line of the loop.
         """
+        self._absolute_deadline = (
+            asyncio.get_running_loop().time() + float(self.config.wall_clock_budget_s)
+        )
         with _tracing.kernel_span(
             "sage.kernel.episode",
             **{"sage.episode.id": self._episode_id, "sage.episode.objective": self._objective},

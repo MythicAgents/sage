@@ -389,6 +389,17 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
         env_key="SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON",
         default="",
     ) or None
+    eval_arm_deadline_epoch_raw = _resolve(
+        config,
+        secrets,
+        "SAGE_EVAL_ARM_DEADLINE_EPOCH",
+        env_key="SAGE_EVAL_ARM_DEADLINE_EPOCH",
+        default="",
+    )
+    try:
+        eval_arm_deadline_epoch = float(eval_arm_deadline_epoch_raw) if eval_arm_deadline_epoch_raw else None
+    except (TypeError, ValueError):
+        eval_arm_deadline_epoch = None
 
     max_steps_raw = _resolve(config, secrets, "max_steps", env_key="max_steps", default="")
     try:
@@ -411,6 +422,7 @@ def build_model_kwargs(request: ChatRequest) -> dict[str, Any]:
         "policy_mode_requested": policy_mode_requested,
         "policy_mode_resolution": policy_mode_resolution,
         "eval_force_capability_prefix_json": eval_force_capability_prefix_json,
+        "eval_arm_deadline_epoch": eval_arm_deadline_epoch,
         "max_steps": max_steps,
         "operation_id": request.OperationID,
         # Chat auth context (Section 8A P0): MythicTools mints a channel-scoped bot token from these.

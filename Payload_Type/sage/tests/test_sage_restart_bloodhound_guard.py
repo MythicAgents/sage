@@ -24,6 +24,7 @@ variable lives in the file the runtime prefers, then tells the operator to edit 
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -147,3 +148,74 @@ def test_existing_snapshot_wins_without_touching_files(tmp_path: Path, functions
     assert result.returncode == 0, result.stderr
     assert "GUARD_PASSED" in result.stdout
     assert "SAGE_BLOODHOUND_MCP_DIR=<set>" not in result.stderr, "nothing to override when already set"
+
+
+def test_fresh_start_creates_missing_tmux_session(tmp_path: Path) -> None:
+    """The real launcher must make its documented fresh-start branch reachable.
+
+    Fake only the process-control boundary.  The real shell script still performs its session
+    detection, snapshot construction, launch dispatch, PID discovery, and stability check.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "tmux-calls"
+    pgrep_count = tmp_path / "pgrep-count"
+    sage_cwd = tmp_path / "sage-cwd"
+    sage_cwd.mkdir()
+
+    tmux = fake_bin / "tmux"
+    tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_TMUX_CALLS\"\n"
+        "case \"${1:-}\" in\n"
+        "  has-session) exit 1 ;;\n"
+        "  new-session|send-keys) exit 0 ;;\n"
+        "  list-panes) printf '999999\\n'; exit 0 ;;\n"
+        "esac\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    tmux.chmod(0o755)
+
+    pgrep = fake_bin / "pgrep"
+    pgrep.write_text(
+        "#!/usr/bin/env bash\n"
+        "count=0\n"
+        "[[ -f \"$FAKE_PGREP_COUNT\" ]] && count=$(cat \"$FAKE_PGREP_COUNT\")\n"
+        "count=$((count + 1))\n"
+        "printf '%s' \"$count\" > \"$FAKE_PGREP_COUNT\"\n"
+        "if (( count == 1 )); then exit 1; fi\n"
+        "printf '%s\\n' \"$FAKE_MAIN_PID\"\n",
+        encoding="utf-8",
+    )
+    pgrep.chmod(0o755)
+
+    python = fake_bin / "python"
+    python.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    python.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{fake_bin}:{env['PATH']}",
+        "FAKE_TMUX_CALLS": str(calls),
+        "FAKE_PGREP_COUNT": str(pgrep_count),
+        "FAKE_MAIN_PID": str(os.getpid()),
+        "SAGE_CWD": str(sage_cwd),
+        "SAGE_VENV_PY": str(python),
+        "SAGE_BLOODHOUND_MCP_DIR": str(tmp_path / "bloodhound-mcp"),
+        "RABBITMQ_PASSWORD": "test-only",
+        "SAGE_STARTUP_DISCOVERY_SECONDS": "1",
+        "SAGE_STARTUP_STABILITY_SECONDS": "1",
+    })
+    result = subprocess.run(
+        ["bash", str(RESTART_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "created tmux session 'sage'" in result.stderr
+    assert "new-session -d -s sage -c" in calls.read_text(encoding="utf-8")
+    assert "Sage relaunch verified" in result.stderr

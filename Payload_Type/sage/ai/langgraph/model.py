@@ -7,6 +7,7 @@ import re
 import asyncio
 import aiosqlite
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from langgraph.graph import StateGraph, START, MessagesState, END
@@ -3705,7 +3706,7 @@ class Model:
     _cached_commands: dict[str, Any] | None
     _dynamic_data_loaded: bool
 
-    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "conversation", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None):
+    def __init__(self, provider: str, model: str, system_prompt: str, config: dict, task_id: int, agent_task_id: str, mode: str = "conversation", autonomous_solve: bool = False, policy_mode: str = "", max_steps: int = 200, response_emitter: "Callable[[str], Awaitable[bool]] | None" = None, operation_id: int | None = None, channel_id: int | None = None, apitoken_id: int = 0, mythic_preauth_client: Any = None, policy_mode_resolution: str = "", policy_mode_requested: str = "", eval_force_capability_prefix_json: str | None = None, eval_arm_deadline_epoch: float | None = None):
         """
         Initialize the Model with provider, model, and configuration.
         :param provider: The model provider (e.g., 'anthropic', 'bedrock').
@@ -3773,6 +3774,11 @@ class Model:
         # so post-reset exact-target fixtures cannot rely on the gauge subprocess environment reaching the
         # controller. None preserves the legacy process-env behavior for headless and task-backed paths.
         self._eval_force_capability_prefix_json = eval_force_capability_prefix_json
+        self._eval_arm_deadline_epoch = (
+            float(eval_arm_deadline_epoch)
+            if isinstance(eval_arm_deadline_epoch, (int, float)) and not isinstance(eval_arm_deadline_epoch, bool)
+            else None
+        )
         self._policy_model_calls = 0
         self._policy_episode_id = ""
         self._controller_runtime_telemetry: dict[str, Any] = {}
@@ -9057,6 +9063,10 @@ class Model:
             telemetry["controller_terminal_reason"] = reason
         if objective_recognized is not None:
             telemetry["objective_recognized"] = bool(objective_recognized)
+        from ai import task_budget
+        task_limit = task_budget.current_snapshot()
+        if task_limit is not None:
+            telemetry["task_budget"] = task_limit
         self._controller_runtime_telemetry = telemetry
         return telemetry
 
@@ -9067,12 +9077,19 @@ class Model:
 
     async def _run_autonomous_controller(self, prompt: str) -> str:
         """Run the controller under the fail-closed offensive MCP execution boundary."""
+        from ai import task_budget
+
         self.set_active_agent("Controller")
         execution_context_token = MCPManager.set_execution_context(
             MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
         )
         try:
-            return await self._run_autonomous_controller_kernel(prompt)
+            budget = task_budget.configured_budget(
+                _env_positive_int("SAGE_CONTROLLER_WALL_S", 2700),
+                deadline_epoch=getattr(self, "_eval_arm_deadline_epoch", None),
+            )
+            with task_budget.task_budget_scope(budget):
+                return await self._run_autonomous_controller_kernel(prompt)
         finally:
             MCPManager.reset_execution_context(execution_context_token)
 
@@ -9406,9 +9423,16 @@ class Model:
             evaluation_token_ceiling = 0
         if evaluation_token_ceiling < 0:
             evaluation_token_ceiling = 0
+        configured_wall_seconds = float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700))
+        eval_arm_deadline_epoch = getattr(self, "_eval_arm_deadline_epoch", None)
+        if eval_arm_deadline_epoch is not None:
+            configured_wall_seconds = min(
+                configured_wall_seconds,
+                max(0.001, eval_arm_deadline_epoch - time.time()),
+            )
         cfg = _ctrl.ControllerConfig(
             seam_timeout_s=float(_env_positive_int("SAGE_CONTROLLER_SEAM_TIMEOUT_S", 900)),
-            wall_clock_budget_s=float(_env_positive_int("SAGE_CONTROLLER_WALL_S", 2700)),
+            wall_clock_budget_s=configured_wall_seconds,
             token_budget=(
                 evaluation_token_ceiling
                 or _env_positive_int("SAGE_CONTROLLER_TOKEN_BUDGET", 3_000_000)
@@ -9544,6 +9568,8 @@ class Model:
                 model_id=getattr(self, "model", ""),
                 catalog=_cap.capability_catalog() if policy_mode == _policy.POLICY_LLM else None,
                 completed_call_token_ceiling=(evaluation_token_ceiling or None),
+                expected_response_provider=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_PROVIDER", ""),
+                expected_response_model=os.environ.get("SAGE_EVAL_EXPECTED_RESPONSE_MODEL", ""),
             )
         policy_backend = _EvalForcedInterventionPolicy(policy_backend)
         self._controller_runtime_telemetry = {

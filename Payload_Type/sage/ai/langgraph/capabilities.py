@@ -4572,6 +4572,65 @@ def _build_adcs_esc_certificate_enroll_execution_plan(
     )
 
 
+_ADCS_SCHANNEL_AUTH_METHODS = {
+    "schannel",
+    "schannel-ldap",
+    "ldap-schannel",
+    "ldaps",
+    "certificate-ldap",
+}
+
+
+def adcs_certificate_auth_requires_kerberos(
+    action: CapabilityAction,
+    inputs: dict[str, Any],
+) -> bool:
+    """Return whether this certificate-auth transaction must produce Kerberos state.
+
+    Administrative-control and certificate-auth effects can be proved directly through
+    Schannel LDAP.  Transactions that explicitly require a Kerberos context or ticket
+    must retain the PKINIT-first route.
+    """
+    if any(
+        _input_bool(inputs, key, default=False)
+        for key in (
+            "requires_kerberos_context",
+            "require_kerberos_context",
+            "requires_kerberos_ticket",
+            "require_kerberos_ticket",
+            "pkinit_required",
+        )
+    ):
+        return True
+    kerberos_effect_prefixes = (
+        "kerberos-context:",
+        "kerberos-account-context:",
+        "kerberos-ticket:",
+        "tgt:",
+    )
+    return any(
+        _normalize(effect).startswith(kerberos_effect_prefixes)
+        for effect in list(action.effects or [])
+    )
+
+
+def adcs_certificate_auth_route(
+    action: CapabilityAction,
+    inputs: dict[str, Any],
+) -> tuple[str, bool]:
+    """Select the certificate-auth route and identify the bounded control-first case."""
+    explicit_method = _normalize(
+        _input_text(inputs, "certificate_auth_method", "adcs_certificate_auth_method", "auth_method")
+    )
+    if explicit_method:
+        return explicit_method, False
+    if _input_bool(inputs, "pkinit_not_supported") or _input_bool(inputs, "kdc_pkinit_unsupported"):
+        return "schannel-ldap", False
+    if adcs_certificate_auth_requires_kerberos(action, inputs):
+        return "pkinit-kerberos", False
+    return "schannel-ldap", True
+
+
 def _build_adcs_certificate_auth_execution_plan(
     action: CapabilityAction,
     inputs: dict[str, Any],
@@ -4614,21 +4673,8 @@ def _build_adcs_certificate_auth_execution_plan(
     # post-auth service proof. A CA host is a valid proof target but is not
     # necessarily a domain controller.
     dc = _input_text(inputs, "dc", "domain_controller")
-    auth_method = _normalize(
-        _input_text(inputs, "certificate_auth_method", "adcs_certificate_auth_method", "auth_method")
-    )
-    if not auth_method:
-        # Observation-driven selection: prefer Schannel LDAP when the KDC is observed to not support
-        # PKINIT (a DC with no KDC-authentication certificate, e.g. the stock-GOAD ESSOS case, where
-        # a cert->PKINIT attempt can only return KDC_ERR_PADATA_TYPE_NOSUPP). PKINIT stays the generic
-        # default and a first-class capability wherever the KDC supports it, so this never forces a
-        # doomed Rubeus task once the engagement has learned the KDC cannot PKINIT. An explicit
-        # certificate_auth_method input always wins over this heuristic.
-        if _input_bool(inputs, "pkinit_not_supported") or _input_bool(inputs, "kdc_pkinit_unsupported"):
-            auth_method = "schannel-ldap"
-        else:
-            auth_method = "pkinit-kerberos"
-    schannel_ldap = auth_method in {"schannel", "schannel-ldap", "ldap-schannel", "ldaps", "certificate-ldap"}
+    auth_method, control_proof_first = adcs_certificate_auth_route(action, inputs)
+    schannel_ldap = auth_method in _ADCS_SCHANNEL_AUTH_METHODS
     missing = []
     if not domain:
         missing.append("domain")
@@ -4693,7 +4739,7 @@ def _build_adcs_certificate_auth_execution_plan(
     search_base = _input_text(inputs, "search_base", "base_dn") or _domain_dn(domain)
 
     steps: list[CapabilityExecutionStep] = []
-    if _input_bool(inputs, "preflight_existing_context", default=not schannel_ldap):
+    if _input_bool(inputs, "preflight_existing_context", default=control_proof_first or not schannel_ldap):
         steps.extend([
             CapabilityExecutionStep(
                 operation="kerberos-ticket-list",
@@ -5530,10 +5576,9 @@ def _adcs_certificate_auth_action(
             "steps": [
                 "select or stage the verified CA signing PFX artifact; do not re-extract the CA key",
                 "forge a certificate for the objective-relevant account offline",
-                "request a PKINIT TGT artifact with the forged certificate without pass-the-ticket flags",
-                "create or reuse an isolated logon context on the callback",
-                "import the PKINIT TGT into that context and prove target-domain service access",
-                "record success only when certificate-auth service access is proven on this callback",
+                "attempt Schannel LDAP certificate authentication and verified domain-control proof",
+                "if Schannel has a compatibility or availability failure, use PKINIT with an isolated logon context",
+                "record success only when certificate-auth administrative control is proven on this callback",
             ],
         },
         verifier={
@@ -5561,7 +5606,7 @@ def _adcs_certificate_auth_action(
         },
         reason=(
             "verified ADCS CA signing material can authenticate as a target account; "
-            "prove DA-level service access from an isolated Kerberos context"
+            "prove DA-level control through the least costly sufficient certificate-auth route"
         ),
         source_facts=[ca_key_effect, f"live-callback:{callback_id}"],
     )
@@ -5696,10 +5741,9 @@ def _adcs_certificate_auth_from_enrolled_certificate_action(
             "pre_forged_certificate": True,
             "steps": [
                 "reuse the enrolled account certificate PFX from the prior ADCS enrollment capability",
-                "request a PKINIT TGT artifact with the certificate without pass-the-ticket flags",
-                "create or reuse an isolated logon context on the callback",
-                "import the PKINIT TGT into that context and prove target-domain service access",
-                "record success only when certificate-auth service access is proven on this callback",
+                "attempt Schannel LDAP certificate authentication and verified domain-control proof",
+                "if Schannel has a compatibility or availability failure, use PKINIT with an isolated logon context",
+                "record success only when certificate-auth administrative control is proven on this callback",
             ],
         },
         verifier={

@@ -63,11 +63,22 @@ admitting reset completion.
 
 Do not re-derive Apollo bootstrap manually when these helpers cover the case.
 
-- Fresh clean-baseline foothold: `bootstrap-reset` → payload deploy skill `deploy` with the interactive Apollo
+- Fresh clean-baseline foothold with a newly built downloadable payload: `bootstrap-reset` → payload deploy skill `deploy` with the interactive Apollo
   launch path → `post-callback-preflight` → `readiness --runtime-dbs-archived`.
-- Retained or purpose-range foothold: `bootstrap-reset --use-retained-callback ...` → payload deploy skill
+- Pre-staged interactive foothold with retained callback metadata: `bootstrap-reset --use-retained-callback ...` → payload deploy skill
   `launch-existing` or `launch_apollo_foothold.sh` with a settle window and unique-callback gate →
   `post-callback-preflight` → `readiness --runtime-dbs-archived`.
+- Batch-logon canary foothold: use `sage-foothold-launch` only when the selected Mythic payload is genuinely
+  downloadable and the operation explicitly accepts a batch-logon token.
+
+Imported retained callback metadata can recreate a payload row with an empty server-side file path. That row binds
+the staged executable's identity but cannot supply bytes to `deploy`; do not call `mythic.download_payload` for it.
+It does not prove that an independently selected snapshot contains the same payload. For the qualified Trust Walker
+fixture, validate the atomic snapshot/config/payload/task/executable identity in
+`skills/sage-mythic-payload-deploy/SKILL.md` before launch.
+Headless execution alone never changes the selected bootstrap mode. Satisfy the interactive wrapper's display
+prerequisite or stop before allocation. See the authoritative decision table in
+`skills/sage-mythic-payload-deploy/SKILL.md`.
 
 For retained or purpose-range launches, do not call the foothold ready until the callback lane is unique after the
 settle window. Always rediscover the active callback ID after launch; imported callback rows are historical metadata,

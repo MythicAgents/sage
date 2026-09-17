@@ -17,6 +17,7 @@ authority over the Gate 1P floor.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -100,6 +101,7 @@ class BareModelResult:
     final_text: str = ""
     stopped: str = "budget"                           # "done" | "budget" | "error"
     objective_recognized: bool = False
+    model_attempts: int = 0
     model_calls: int = 0
     total_tokens: int = 0
     wall_seconds: float = 0.0
@@ -158,7 +160,15 @@ class BareModelRunner:
         system_template: str = DEFAULT_SYSTEM,
         token_ceiling: int | None = None,
         require_complete_usage: bool = False,
+        event_sink: Callable[[dict], None] | None = None,
+        response_validator: Callable[[dict], None] | None = None,
     ):
+        if token_ceiling is not None and (type(token_ceiling) is not int or token_ceiling <= 0):
+            raise ValueError("token ceiling must be a positive integer or None")
+        if timeout is not None and (
+            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout < 0
+        ):
+            raise ValueError("timeout must be finite and nonnegative or None")
         self.model_fn = model_fn
         self.tool_executor = tool_executor
         self.tools_spec = tools_spec or []
@@ -168,6 +178,8 @@ class BareModelRunner:
         self.system_template = system_template
         self.token_ceiling = int(token_ceiling) if token_ceiling is not None else None
         self.require_complete_usage = bool(require_complete_usage)
+        self.event_sink = event_sink
+        self.response_validator = response_validator
 
     def _tool_names(self) -> str:
         names = []
@@ -185,6 +197,7 @@ class BareModelRunner:
         log = self.logger or (lambda _m: None)
         start = time.monotonic()
         step = 0
+        model_attempts = 0
         model_calls = 0
         total_tokens = 0
         backend_requests: list[dict] = []
@@ -208,12 +221,20 @@ class BareModelRunner:
                 log(f"⏱ wall-clock timeout after {step} steps")
                 break
             step += 1
+            model_attempts += 1
+            if self.event_sink is not None:
+                self.event_sink({"event": "model_request_started", "model_attempt": model_attempts})
             try:
                 decision = self.model_fn(system, self.tools_spec, history)
                 model_calls += 1
             except KeyboardInterrupt:
                 stopped = "interrupted"
                 log("⎈ interrupted by operator — stopping; the range will still be scored")
+                break
+            except TimeoutError as exc:
+                stopped = "timeout"
+                model_error = exc
+                log(f"⏱ model request crossed the wall deadline at step {step}")
                 break
             except Exception as exc:
                 stopped = "error"
@@ -234,7 +255,22 @@ class BareModelRunner:
                 if isinstance(backend, dict):
                     backend_record.update(dict(backend))
                 backend_requests.append(backend_record)
-                response_records.append({**backend_record, **usage_record})
+                response_record = {**backend_record, **usage_record}
+                response_records.append(response_record)
+                if self.event_sink is not None:
+                    self.event_sink({
+                        "event": "model_response_retained",
+                        "model_call": model_calls,
+                        "response_record": dict(response_record),
+                    })
+                if self.response_validator is not None:
+                    try:
+                        self.response_validator(response_record)
+                    except Exception as exc:
+                        stopped = "measurement_error"
+                        model_error = exc
+                        log(f"✗ step {step} response validation failed: {type(exc).__name__}: {exc}")
+                        break
                 if self.require_complete_usage and usage_record["usage_complete"] is not True:
                     stopped = "measurement_error"
                     log(f"✗ step {step} response omitted complete token usage")
@@ -272,6 +308,13 @@ class BareModelRunner:
                 break
             try:
                 action_response_ids.append(str(response_records[-1]["response_id"]))
+                if self.event_sink is not None:
+                    self.event_sink({
+                        "event": "tool_dispatch_started",
+                        "step": step,
+                        "tool": str(decision.get("tool") or ""),
+                        "response_id": action_response_ids[-1],
+                    })
                 obs = self.tool_executor(decision)
             except KeyboardInterrupt:
                 stopped = "interrupted"
@@ -295,6 +338,14 @@ class BareModelRunner:
                 "call": decision,
                 "obs": obs,
             })
+            if self.event_sink is not None:
+                self.event_sink({
+                    "event": "tool_result_retained",
+                    "step": step,
+                    "tool": str(decision.get("tool") or ""),
+                    "response_id": action_response_ids[-1],
+                    "recoverable_error_category": error_category,
+                })
         log(f"● BARE END — stopped={stopped} steps={len(history)}")
         return BareModelResult(
             objective=objective,
@@ -303,13 +354,14 @@ class BareModelRunner:
             final_text=final_txt,
             stopped=stopped,
             objective_recognized=objective_recognized,
+            model_attempts=model_attempts,
             model_calls=model_calls,
             total_tokens=total_tokens,
             wall_seconds=max(0.0, time.monotonic() - start),
             effective_backend_requests=backend_requests,
             model_response_records=response_records,
             action_response_ids=action_response_ids,
-            token_usage_complete=token_budget.usage_complete,
+            token_usage_complete=(token_budget.usage_complete and model_attempts == model_calls),
             token_budget_exhausted=bool(self.token_ceiling is not None and token_budget.exhausted),
             token_budget_overshoot=bool(self.token_ceiling is not None and token_budget.overshoot),
             recoverable_tool_errors=recoverable_tool_errors,
@@ -429,27 +481,39 @@ def score_bare_run(
 @dataclass
 class BareVsHarness:
     scenario: str
-    bare_objective_success_rate: float
-    harness_objective_success_rate: float
-    delta: float                       # harness - bare (positive => harness better)
+    bare_objective_success_rate: float | None
+    harness_objective_success_rate: float | None
+    delta: float | None                # harness - bare; unavailable when either has no observed outcomes
     bare_success_variance: float
     harness_success_variance: float
-    bare_clean_stop_rate: float
-    harness_clean_stop_rate: float
+    bare_clean_stop_rate: float | None
+    harness_clean_stop_rate: float | None
     min_detectable_effect: float
     resolved: bool                     # |delta| > conservative binary uncertainty
     verdict: str                       # harness-better | bare-better | indistinguishable-at-current-sample
     bare_cost_mean: dict = field(default_factory=dict)
     harness_cost_mean: dict = field(default_factory=dict)
+    bare_outcomes: dict = field(default_factory=dict)
+    harness_outcomes: dict = field(default_factory=dict)
+    bare_success_interval: tuple = (0.0, 1.0)
+    harness_success_interval: tuple = (0.0, 1.0)
 
 
 def _binary_arm_summary(cards: list) -> dict:
-    values = [
-        1.0 if bool(card.objective_proven) else 0.0
-        for card in cards
-    ]
+    counts = dict.fromkeys(("proven", "disproven", "unmeasured", "invalid"), 0)
+    for card in cards:
+        value = getattr(card, "objective_proven", None)
+        disposition = getattr(card, "objective_proof_disposition", None)
+        if disposition is None:
+            disposition = "proven" if value is True else "disproven" if value is False else "unmeasured"
+        if not isinstance(disposition, str) or disposition not in counts or (
+            disposition in {"proven", "disproven"} and value is not (disposition == "proven")
+        ):
+            disposition = "invalid"
+        counts[disposition] += 1
+    values = [1.0] * counts["proven"] + [0.0] * counts["disproven"]
     n = len(values)
-    rate = sum(values) / n if n else 0.0
+    rate = sum(values) / n if n else None
     variance = (
         sum((value - rate) ** 2 for value in values) / (n - 1)
         if n > 1
@@ -477,19 +541,24 @@ def _binary_arm_summary(cards: list) -> dict:
             availability = getattr(card, "cost_countable", None)
             if not isinstance(availability, dict) or availability.get(field) is not True:
                 return None
-            values.append(float(getattr(card, field)))
+            value = getattr(card, field, None)
+            if type(value) not in {int, float} or value < 0 or not math.isfinite(value):
+                return None
+            values.append(float(value))
         return sum(values) / len(values) if values else None
 
+    clean_stops = [getattr(card, "clean_stop", None) for card in cards]
     return {
         "n": n,
+        "outcomes": {"total": len(cards), "observed": n, **counts},
         "rate": rate,
         "variance": variance,
         "interval": interval,
         "half_width": half_width,
         "clean_stop_rate": (
-            sum(1.0 if bool(getattr(card, "clean_stop", False)) else 0.0 for card in cards) / n
-            if n
-            else 0.0
+            sum(clean_stops) / len(clean_stops)
+            if clean_stops and all(type(value) is bool for value in clean_stops)
+            else None
         ),
         "cost_mean": {
             "tool_calls": _mean("tool_calls"),
@@ -504,17 +573,31 @@ def compare_bare_vs_harness(
     scenario_name: str,
     bare_cards: list,
     harness_cards: list,
+    *,
+    allow_missing_rates: bool = False,
 ) -> BareVsHarness:
     """Compare binary independently verified objective success for the two primary arms.
 
-    The conservative detectable difference is the sum of the two Wilson 95% half-widths.
-    It is intentionally descriptive: N>=5 is a starting sample, not automatic resolution."""
+    Resolution requires complete observed outcomes and disjoint Wilson 95% intervals.
+    Rates use explicitly observed outcomes; the returned counts retain missing/invalid evidence.
+    This is descriptive, not a pairing, protocol-validity, or promotion decision.
+    Legacy numeric consumers fail clearly without observed rates; missing-aware reports may opt in."""
     bare = _binary_arm_summary(bare_cards)
     harness = _binary_arm_summary(harness_cards)
-    delta = harness["rate"] - bare["rate"]
+    delta = harness["rate"] - bare["rate"] if bare["n"] and harness["n"] else None
+    if delta is None and not allow_missing_rates:
+        raise ValueError("objective rates are unavailable; use the passive report to retain missing evidence")
     mde = min(1.0, bare["half_width"] + harness["half_width"])
-    resolved = abs(delta) > mde
-    if not resolved:
+    complete = all(
+        arm["n"] and arm["n"] == arm["outcomes"]["total"] for arm in (bare, harness)
+    )
+    resolved = bool(complete and (
+        bare["interval"][1] < harness["interval"][0]
+        or harness["interval"][1] < bare["interval"][0]
+    ))
+    if not complete:
+        verdict = "insufficient-outcome-evidence"
+    elif not resolved:
         verdict = "indistinguishable-at-current-sample"
     elif delta > 0:
         verdict = "harness-better"
@@ -534,4 +617,8 @@ def compare_bare_vs_harness(
         verdict=verdict,
         bare_cost_mean=bare["cost_mean"],
         harness_cost_mean=harness["cost_mean"],
+        bare_outcomes=bare["outcomes"],
+        harness_outcomes=harness["outcomes"],
+        bare_success_interval=bare["interval"],
+        harness_success_interval=harness["interval"],
     )

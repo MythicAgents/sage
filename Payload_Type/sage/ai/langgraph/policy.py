@@ -636,6 +636,8 @@ class LLMPolicy:
         model_id: str = "",
         catalog: list[dict[str, Any]] | None = None,
         completed_call_token_ceiling: int | None = None,
+        expected_response_provider: str = "",
+        expected_response_model: str = "",
     ):
         self._decide = decide
         self.provider = str(provider or "")
@@ -650,6 +652,10 @@ class LLMPolicy:
         ):
             raise ValueError("completed_call_token_ceiling must be a positive integer")
         self.completed_call_token_ceiling = completed_call_token_ceiling
+        self.expected_response_provider = str(expected_response_provider or "").strip()
+        self.expected_response_model = str(expected_response_model or "").strip()
+        if bool(self.expected_response_provider) != bool(self.expected_response_model):
+            raise ValueError("expected response provider and model must be configured together")
 
     @staticmethod
     def _completed_response_usage_total(history: list[PolicyDecision]) -> int | None:
@@ -841,6 +847,28 @@ class LLMPolicy:
         model_response_observed = not (
             trusted_policy_control.get("_policy_model_response_observed") is False
         )
+        if self.expected_response_provider and model_response_observed and (
+            provenance.get("effective_model_provider") != self.expected_response_provider
+            or provenance.get("effective_model_id") != self.expected_response_model
+            or provenance.get("effective_backend")
+            != f"{self.expected_response_provider}:{self.expected_response_model}"
+        ):
+            return self._stop(
+                episode_id,
+                c_hash,
+                "response-derived model route mismatch; refusing response-derived action",
+                candidate_count=len(candidates),
+                raw_response=raw_response,
+                raw_disposition=disposition,
+                raw_rationale=rationale,
+                model_response_observed=True,
+                provenance=provenance,
+                candidates=candidates,
+                decision_owner=decision_owner,
+                request_schema_hash=request_schema_hash,
+                decision_packet=decision_packet,
+                decision_packet_hash=decision_packet_hash,
+            )
         if self.completed_call_token_ceiling is not None and model_response_observed:
             usage = provenance.get("token_usage")
             values = (

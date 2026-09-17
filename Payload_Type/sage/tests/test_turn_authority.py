@@ -2508,6 +2508,150 @@ def test_contract_ingest_uses_one_authoritative_filename_in_every_downstream_sin
     assert len(calls["graph"]) == 1
 
 
+@pytest.fixture
+def assembled_ingest_graph_path(monkeypatch):
+    """Keep ingestion, graph reconciliation, proof construction and ledger recording real."""
+    model_mod = importlib.import_module("ai.langgraph.model")
+    mythic_mod = importlib.import_module("ai.langgraph.mythic_tools")
+    mcp_mod = importlib.import_module("ai.mcp")
+    engagement = importlib.import_module("ai.langgraph.engagement_state")
+    authority = _resolve_collection_authority(
+        _load_turn_authority().compile_turn_authority(
+            "Complete the objective.",
+            objective_classifier=model_mod.Model._looks_like_explicit_objective_prompt,
+            stored_operator_objective="Collect and ingest the current graph.",
+        )
+    )
+    tools = mythic_mod.MythicTools(channel_id=10)
+    tools.client = object()
+    _prime_contract_transaction(tools, authority)
+    tools._engagement_footholds = [engagement.Foothold(
+        callback_id="7", agent="apollo", host="workstation01", forest="corp.local",
+        identity=r"corp\operator", integrity="medium", alive=True, source="test",
+        timestamp="2026-09-17T00:00:00+00:00",
+    )]
+    collected = {"data": [{"name": "CORP.LOCAL", "collected": True},
+                          {"name": "stub.local", "collected": False}]}
+    state = SimpleNamespace(
+        tools=tools, status="Complete", domain_responses=[collected],
+        domains=[], uploads=[], queries=[], sleeps=[], collected=collected,
+    )
+
+    async def metadata(_file_uuid):
+        return _transaction_filemeta(authority.objective_contract)
+
+    async def download(**_kwargs):
+        return _bloodhound_zip_bytes()
+
+    async def sleep(seconds):
+        state.sleeps.append(seconds)
+
+    class Upload:
+        name = "file_upload"
+
+        async def ainvoke(self, args):
+            state.uploads.append(dict(args))
+            return {"data": {"job_id": "job-new"} if args["info_type"] == "upload_bytes"
+                    else {"status_message": state.status}}
+
+    class Domains:
+        name = "domain_info"
+
+        async def ainvoke(self, args):
+            state.domains.append(dict(args))
+            response = state.domain_responses[min(len(state.domains) - 1,
+                                                 len(state.domain_responses) - 1)]
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    class Cypher:
+        name = "cypher_query"
+
+        async def ainvoke(self, args):
+            state.queries.append(dict(args))
+            values = ([{"value": "workstation02.corp.local"}]
+                      if "(t:Computer)" in args["query"] else [])
+            return {"data": {"literals": values}}
+
+    monkeypatch.setattr(tools, "_get_file_metadata", metadata)
+    monkeypatch.setattr(mythic_mod.mythic, "download_file", download)
+    monkeypatch.setattr(mythic_mod.asyncio, "sleep", sleep)
+    monkeypatch.setattr(tools, "_evaluation_authorize_bloodhound_ingest",
+                        lambda **_kwargs: SimpleNamespace(enabled=False, allowed=True, authorization={}))
+    monkeypatch.setattr(mcp_mod.MCPManager, "get_connected_servers", lambda: ["BloodHound"])
+    monkeypatch.setattr(mcp_mod.MCPManager, "is_bloodhound_server", lambda _server: True)
+    monkeypatch.setattr(mcp_mod.MCPManager, "get_tools_by_server",
+                        lambda _server: [Upload(), Domains(), Cypher()])
+    return state
+
+
+@pytest.mark.parametrize("first_read", ("collected", "empty", "failed", "malformed", "stays_empty"))
+def test_completed_ingest_reuses_positive_domain_snapshot_and_preserves_retry(
+    assembled_ingest_graph_path, first_read,
+):
+    path = assembled_ingest_graph_path
+    first = {
+        "collected": path.collected, "empty": {"data": []},
+        "failed": RuntimeError("temporary metadata failure"),
+        "malformed": {"data": "not domain rows"}, "stays_empty": {"data": []},
+    }[first_read]
+    path.domain_responses = [first, {"data": []} if first_read == "stays_empty" else path.collected]
+    result = json.loads(asyncio.run(path.tools.ingest_collection(file_uuid="file-123")))
+
+    assert result["status"] == "ingested"
+    assert result["graph_verified"] is True
+    coverage = ["corp.local"] if first_read == "collected" else []
+    assert result["covered_domains"] == coverage
+    proof = path.tools._last_bloodhound_ingest_proof_envelope
+    assert proof
+    hops = [hop for hop in path.tools._engagement_hops if hop.technique == "collect-graph"]
+    assert len(hops) == 1
+    assert hops[0].status == "achieved"
+    assert hops[0].evidence["covered_domains"] == coverage
+    assert hops[0].proof_envelope == proof
+    facts = path.tools._engagement_graph_facts
+    expected = {"generic-write:computer:workstation02"}
+    if first_read != "stays_empty":
+        expected.add("domain-collected:corp.local")
+    assert {fact.predicate for fact in facts} == expected
+    assert all(fact.proof_envelope == proof for fact in facts)
+    assert len(path.queries) == 8
+    assert [call["info_type"] for call in path.uploads] == ["upload_bytes", "status"]
+    assert path.sleeps == [6]
+    # Fail on the reference implementation: successful ingestion reads the same metadata twice.
+    assert len(path.domains) == (1 if first_read == "collected" else 2)
+
+
+@pytest.mark.parametrize("status,polls", (("Processing", 20), ("Failed", 1)))
+def test_unverified_ingest_still_refreshes_without_claiming_completed_coverage(
+    assembled_ingest_graph_path, status, polls,
+):
+    path = assembled_ingest_graph_path
+    path.status = status
+    result = json.loads(asyncio.run(path.tools.ingest_collection(file_uuid="file-123")))
+    assert result["status"] == ("ingest_failed" if status == "Failed" else "uploaded_pending_ingest")
+    assert result["graph_verified"] is False
+    assert result["covered_domains"] == []
+    assert not path.tools._engagement_hops
+    assert len(path.domains) == 1
+    assert len(path.queries) == 8
+    assert len(path.uploads) == polls + 1
+    assert path.sleeps == [6] * polls
+    assert not any(fact.proof_envelope for fact in path.tools._engagement_graph_facts)
+
+
+def test_standalone_graph_refresh_reads_current_domain_metadata(assembled_ingest_graph_path):
+    path = assembled_ingest_graph_path
+    asyncio.run(path.tools._refresh_graph_facts_if_stale("2026-09-17T00:01:00+00:00"))
+    assert len(path.domains) == 1
+    assert len(path.queries) == 8
+    assert path.uploads == []
+    assert {fact.predicate for fact in path.tools._engagement_graph_facts} == {
+        "generic-write:computer:workstation02", "domain-collected:corp.local",
+    }
+
+
 @pytest.mark.parametrize("resolution", ("uuid", "callback"))
 def test_contract_ingest_rejects_valid_token_alias_mismatch_before_any_downstream_side_effect(
     monkeypatch,

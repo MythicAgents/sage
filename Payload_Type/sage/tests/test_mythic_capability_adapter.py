@@ -2320,6 +2320,7 @@ def test_adapter_translates_adcs_certificate_auth_to_certify_pkinit_context_sequ
         },
     )
     execution_plan = capabilities.build_capability_execution_plan(action, {
+        "certificate_auth_method": "pkinit",
         "ca_pfx_path": r"C:\Windows\Temp\ca.pfx",
         "ca_pfx_password": "CA Secret!",
         "account_sid": "S-1-5-21-111-222-333-500",

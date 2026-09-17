@@ -2105,3 +2105,412 @@ def test_preflight_model_route_authentication_fails_closed_when_route_incomplete
     ok, detail = checks["llm-endpoint-authenticated"]()
     assert ok is False
     assert "incomplete" in detail
+
+
+def _development_row_contract(tmp_path, *, policy_order=None):
+    order = policy_order or ["symbolic", "llm", "hybrid"]
+    contract = {
+        "schema": "sage-isc11-non-goad-replication-experiment-contract-v1",
+        "contract_id": "isc11-replication-purpose-range-gauge-v4",
+        "source_identity": {
+            "branch": "harness-eval",
+            "commit": "source-commit",
+            "tree": "source-tree",
+            "profile_catalog_sha256": "catalog-hash",
+            "topology_identity": "topology-hash",
+            "qualification_receipt": "qualification-receipt",
+        },
+        "range_binding": {
+            "profile": "replication-profile",
+            "scenario": "replication-purpose-range-visible-cost",
+            "objective_domain": "replication.local",
+            "ludus_mcp_server": "replication-route",
+            "ludus_range_id": "REPLICATION-RANGE",
+            "snapshot": "replication-snapshot",
+            "foothold_host": "REPLICATION-WS01",
+            "foothold_callback_host": "WS01",
+            "foothold_ip": "10.7.10.31",
+            "foothold_principal": "REPLICATION\\user1",
+            "foothold_callback_user": "user1",
+        },
+        "execution_identity": {
+            "side": "harness",
+            "provider": "openai",
+            "model": "exact-model",
+            "completed_call_token_ceiling_per_row": 250000,
+            "model_context_limit": 200000,
+            "max_output_tokens": 8192,
+            "solve_timeout_seconds": 1800,
+        },
+        "matrix": {
+            "total_rows": len(order),
+            "order": order,
+            "initial_live_tranche": {
+                "rows": [1, 2, 3],
+                "policies": ["symbolic", "llm", "hybrid"],
+                "whole_row_retries": 0,
+            },
+        },
+        "prospective_signal": {
+            "decisive_frontier_hash": "sha256:frontier",
+            "expected_candidate_count": 2,
+            "expected_choice": {
+                "symbolic": "detour",
+                "llm": "direct",
+                "hybrid": "direct",
+            },
+            "expected_vectors": {
+                "symbolic": [4],
+                "llm": [3],
+                "hybrid": [3],
+            },
+        },
+        "authority_gate": {"live_authority_id": "isc11-canary-authority-v1"},
+        "contamination_policy": {
+            "kind": "forbidden_identifiers_v1",
+            "markers": [
+                "goad", "braavos", "kingslanding", "north.sevenkingdoms",
+                "sevenkingdoms.local", "essos.local", "samwell.tarly",
+                "jorah.mormont", "castelblack", "operation_goad",
+                "goad-trust-walker",
+            ],
+        },
+        "execution_path": {
+            "scenario_objective": (
+                "From the current foothold, achieve administrative control of replication.local."
+            ),
+            "results_root": ".sage_history/evaluation/isc11-test",
+            "results_ledger": "results.jsonl",
+        },
+    }
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    return path
+
+
+def _development_row_proof():
+    observation = rgl.effect_registry.OracleObservation(
+        registry_version=rgl.effect_registry.REGISTRY_VERSION,
+        oracle_id="independent.objective-control.v1",
+        origin=rgl.effect_registry.ProofOrigin.MYTHIC_CREDENTIAL_STORE,
+        proof_kind="krbtgt_material",
+        outcome=True,
+        observation_id="replication-row-proof-1",
+        target="replication.local",
+    )
+    return rgl.effect_registry.admit_observation(
+        Milestone.OBJECTIVE,
+        observation,
+        expected_target="replication.local",
+    ).to_record()
+
+
+def test_development_row_protocol_admits_symbolic_zero_model_calls(tmp_path):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-001"
+    )
+
+    usage = protocol.response_usage_disposition([], model_calls=0)
+
+    assert usage == {
+        "countable": True,
+        "reason": "symbolic policy made no model calls",
+        "observed_route": None,
+        "total_tokens": 0,
+        "normalized_usage": [],
+        "canonical_records": [],
+    }
+    assert protocol.objective == (
+        "From the current foothold, achieve administrative control of replication.local."
+    )
+
+
+def test_development_row_protocol_rejects_zero_model_calls_for_model_policy(tmp_path):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-002"
+    )
+
+    usage = protocol.response_usage_disposition([], model_calls=0)
+
+    assert usage["countable"] is False
+    assert "positive" in usage["reason"]
+
+
+def test_development_row_observer_keeps_exact_typed_proof_and_row_identity(tmp_path):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-001"
+    )
+    proof = _development_row_proof()
+    observer = {
+        "observer_version": rgl._DEVELOPMENT_ROW_OBSERVER_VERSION,
+        "oracle": {
+            "success": True,
+            "proof_record": proof,
+            "artifact_pointer": ".sage_history/row-001.json",
+        },
+        "task_window_observed": True,
+        "wrapper_objective_recognized": True,
+        "tasks": [{
+            "operation_id": 99,
+            "display_id": 101,
+            "completed": True,
+            "callback": {
+                "display_id": 41,
+                "host": "WS01",
+                "domain": "REPLICATION",
+                "user": "user1",
+            },
+        }],
+        "events": [
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:coordinator:1",
+                "source": "coordinator",
+                "kind": "arm_started",
+                "sequence": 1,
+                "monotonic_ns": 1,
+            },
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:oracle:2",
+                "source": "oracle",
+                "kind": "objective_positive",
+                "sequence": 2,
+                "monotonic_ns": 2,
+            },
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:wrapper:3",
+                "source": "wrapper",
+                "kind": "terminal",
+                "sequence": 3,
+                "monotonic_ns": 3,
+                "status": "done",
+            },
+        ],
+    }
+
+    disposition = protocol.episode_outcome_disposition(
+        observer,
+        arm="isc11-row-001",
+        total_tokens=0,
+        token_ceiling=250000,
+    )
+
+    assert disposition["countable"] is True
+    assert disposition["objective_success"] is True
+    assert disposition["clean_stop"] is True
+    assert observer["oracle"]["proof_record"] == proof
+
+
+def test_development_row_outcome_rejects_empty_task_evidence(tmp_path):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-001"
+    )
+    proof = _development_row_proof()
+    observer = {
+        "observer_version": rgl._DEVELOPMENT_ROW_OBSERVER_VERSION,
+        "oracle": {
+            "success": True,
+            "proof_record": proof,
+            "artifact_pointer": ".sage_history/row-001.json",
+        },
+        "task_window_observed": True,
+        "wrapper_objective_recognized": True,
+        "tasks": [],
+        "events": [
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:coordinator:1",
+                "source": "coordinator",
+                "kind": "arm_started",
+                "sequence": 1,
+                "monotonic_ns": 1,
+            },
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:oracle:2",
+                "source": "oracle",
+                "kind": "objective_positive",
+                "sequence": 2,
+                "monotonic_ns": 2,
+            },
+            {
+                "event_id": f"{protocol.protocol_id}:isc11-row-001:wrapper:3",
+                "source": "wrapper",
+                "kind": "terminal",
+                "sequence": 3,
+                "monotonic_ns": 3,
+                "status": "done",
+            },
+        ],
+    }
+
+    disposition = protocol.episode_outcome_disposition(
+        observer,
+        arm="isc11-row-001",
+        total_tokens=0,
+        token_ceiling=250000,
+    )
+
+    assert disposition["countable"] is False
+    assert "task" in disposition["reason"]
+
+
+def test_development_row_request_requires_exact_authority_and_policy(tmp_path):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-002"
+    )
+    request = dict(
+        scenario="replication-purpose-range-visible-cost",
+        side="harness",
+        provider="openai",
+        model="exact-model",
+        policy_mode="llm",
+        solve_timeout=1800,
+        token_ceiling=250000,
+        model_context_limit=200000,
+        max_output_tokens=8192,
+        source_version="source-tree",
+        live_authority_id="isc11-canary-authority-v1",
+        require_live_authority=True,
+    )
+
+    assert protocol.validate_request(**request) == "isc11-row-002"
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="separate authority"):
+        protocol.validate_request(**{**request, "live_authority_id": "wrong"})
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="policy_mode"):
+        protocol.validate_request(**{**request, "policy_mode": "hybrid"})
+
+
+def test_development_row_protocol_requires_independently_expected_contract_hash(tmp_path):
+    path = _development_row_contract(tmp_path)
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="expected identity"):
+        rgl.DevelopmentRowProtocol(
+            path,
+            row_id="isc11-row-001",
+            expected_contract_sha256="0" * 64,
+        )
+
+
+def test_development_row_retry_zero_start_is_durable_and_unique(tmp_path):
+    path = _development_row_contract(tmp_path)
+    protocol = rgl.DevelopmentRowProtocol(path, row_id="isc11-row-001")
+    root, ledger = protocol.storage_paths(repo_root=tmp_path)
+
+    record = rgl.development_row_kernel.begin_row(
+        protocol.contract,
+        repo_root=tmp_path,
+        row_id=protocol.row_id,
+        protocol_id=protocol.protocol_id,
+        contract_sha256=protocol.contract_sha256,
+        timestamp=1.0,
+    )
+
+    assert record["row_state"] == "started"
+    assert ledger == root / "results.jsonl"
+    assert rgl.development_row_kernel.started_disposition(
+        protocol.contract,
+        repo_root=tmp_path,
+        row_id=protocol.row_id,
+        protocol_id=protocol.protocol_id,
+        contract_sha256=protocol.contract_sha256,
+    )["valid"] is True
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="already has retained state"):
+        rgl.development_row_kernel.begin_row(
+            protocol.contract,
+            repo_root=tmp_path,
+            row_id=protocol.row_id,
+            protocol_id=protocol.protocol_id,
+            contract_sha256=protocol.contract_sha256,
+            timestamp=2.0,
+        )
+
+
+def test_development_row_storage_ignores_alternate_environment_ledgers(tmp_path, monkeypatch):
+    protocol = rgl.DevelopmentRowProtocol(
+        _development_row_contract(tmp_path), row_id="isc11-row-001"
+    )
+    alternate_root = tmp_path / "alternate"
+    monkeypatch.setenv("SAGE_EVAL_ARTIFACT_DIR", str(alternate_root))
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(alternate_root / "results.jsonl"))
+    cfg = rgl.Config(measurement_kind="row")
+
+    rgl._bind_development_row_storage(cfg, protocol, repo_root=tmp_path)
+    expected_root, expected_ledger = protocol.storage_paths(repo_root=tmp_path)
+
+    assert cfg.artifact_dir == expected_root
+    assert cfg.results_path == expected_ledger
+    assert cfg.results_path != alternate_root / "results.jsonl"
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        None,
+        {},
+        {"kind": "wrong", "markers": ["benchmark-name"]},
+        {"kind": "forbidden_identifiers_v1", "markers": []},
+        {"kind": "forbidden_identifiers_v1", "markers": ["same", "SAME"]},
+        {"kind": "forbidden_identifiers_v1", "markers": ["abc"]},
+    ],
+)
+def test_development_row_protocol_rejects_malformed_contamination_policy(tmp_path, policy):
+    path = _development_row_contract(tmp_path)
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    if policy is None:
+        contract.pop("contamination_policy")
+    else:
+        contract["contamination_policy"] = policy
+    path.write_text(json.dumps(contract), encoding="utf-8")
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="contamination"):
+        rgl.DevelopmentRowProtocol(path, row_id="isc11-row-001")
+
+
+@pytest.mark.parametrize(
+    "results_root,results_ledger",
+    [
+        ("../outside", "results.jsonl"),
+        ("/tmp/outside", "results.jsonl"),
+        (".sage_history", "results.jsonl"),
+        (".sage_history/evaluation/isc11-test", "nested/results.jsonl"),
+    ],
+)
+def test_development_row_protocol_rejects_noncanonical_storage(
+    tmp_path, results_root, results_ledger
+):
+    path = _development_row_contract(tmp_path)
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    contract["execution_path"].update({
+        "results_root": results_root,
+        "results_ledger": results_ledger,
+    })
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    protocol = rgl.DevelopmentRowProtocol(path, row_id="isc11-row-001")
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="storage|result root"):
+        protocol.storage_paths(repo_root=tmp_path)
+
+
+def test_development_row_live_authority_rejects_row_outside_exact_canary(tmp_path):
+    path = _development_row_contract(
+        tmp_path,
+        policy_order=[
+            "symbolic", "llm", "hybrid", "hybrid", "symbolic",
+            "llm", "llm", "hybrid", "symbolic",
+        ],
+    )
+    protocol = rgl.DevelopmentRowProtocol(path, row_id="isc11-row-004")
+
+    with pytest.raises(rgl.gate1p_stagea.ProtocolError, match="authorized live tranche"):
+        protocol.validate_request(
+            scenario="replication-purpose-range-visible-cost",
+            side="harness",
+            provider="openai",
+            model="exact-model",
+            policy_mode="hybrid",
+            solve_timeout=1800,
+            token_ceiling=250000,
+            model_context_limit=200000,
+            max_output_tokens=8192,
+            source_version="source-tree",
+            live_authority_id="isc11-canary-authority-v1",
+            require_live_authority=True,
+        )

@@ -16,27 +16,21 @@ from itertools import combinations
 import hashlib
 import json
 from pathlib import Path
+import re
 from statistics import mean
 import sys
 from typing import Any
 
 try:  # package import
-    from . import null_model_factorial
+    from . import development_row_kernel, effect_registry, null_model_factorial
 except Exception:  # script / flat import
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import null_model_factorial  # type: ignore
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from ai.hillclimb import development_row_kernel, effect_registry, null_model_factorial  # type: ignore
 
 
 DEFAULT_MANIFEST_PATH = Path(__file__).with_name("policy_replay_calibration_manifest.json")
 DEFAULT_RESULTS_ROOT = Path(__file__).resolve().parents[2] / ".hillclimb" / "results"
 POLICY_MODES = ("symbolic", "llm", "hybrid")
-FORBIDDEN_GOAD_LITERALS = (
-    "north.sevenkingdoms",
-    "sevenkingdoms.local",
-    "essos.local",
-    "samwell.tarly",
-    "jorah.mormont",
-)
 REQUIRED_LIVE_ROW_CHECKS = (
     "objective_proven",
     "clean_stop",
@@ -174,6 +168,15 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         flattened = [item for group in expected_order for item in group]
         if sorted(str(item).casefold() for item in flattened) != sorted(POLICY_MODES):
             raise CalibrationError(f"{case_id}: expected_policy_order must cover symbolic, llm, and hybrid once")
+        admission = case.get("row_admission")
+        if admission is not None:
+            required = {
+                "kind", "contract_sha256", "contract_path",
+            }
+            if not isinstance(admission, dict) or set(admission) != required:
+                raise CalibrationError(f"{case_id}: development row admission schema is not exact")
+            if admission.get("kind") != "development_row_v1":
+                raise CalibrationError(f"{case_id}: unsupported row admission kind")
 
 
 def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
@@ -183,12 +186,71 @@ def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
     return manifest
 
 
-def _manifest_has_no_goad_literals(manifest: dict[str, Any]) -> bool:
+def _manifest_has_no_goad_literals(manifest: dict[str, Any], *, results_root: Path) -> bool:
     text = _canonical_json(manifest).casefold()
-    return not any(literal in text for literal in FORBIDDEN_GOAD_LITERALS)
+    for case in manifest.get("cases") or []:
+        admission = case.get("row_admission") if isinstance(case, dict) else None
+        if not isinstance(admission, dict):
+            continue
+        try:
+            contract, _contract_hash = development_row_kernel.load_contract(
+                _safe_artifact_path(results_root, str(admission.get("contract_path") or "")),
+                expected_sha256=str(admission.get("contract_sha256") or ""),
+            )
+            markers = development_row_kernel.contamination_markers(contract)
+        except (OSError, ValueError, development_row_kernel.gate1p_stagea.ProtocolError):
+            return False
+        if any(marker in text for marker in markers):
+            return False
+    return True
 
 
-def _row_invariant_failures(row: dict[str, Any]) -> list[str]:
+def _development_row_invariant_failures(
+    case: dict[str, Any], row: dict[str, Any], *, results_root: Path,
+) -> list[str]:
+    admission = case.get("row_admission")
+    if not isinstance(admission, dict):
+        return []
+    contract_path = _safe_artifact_path(results_root, str(admission["contract_path"]))
+    try:
+        contract, observed_hash = development_row_kernel.load_contract(
+            contract_path,
+            expected_sha256=str(admission["contract_sha256"]),
+        )
+    except (OSError, ValueError, development_row_kernel.gate1p_stagea.ProtocolError):
+        return ["contract_identity_invalid"]
+    if observed_hash != admission["contract_sha256"]:
+        return ["contract_identity_invalid"]
+    binding = contract.get("range_binding") or {}
+    signal = contract.get("prospective_signal") or {}
+    initial = (contract.get("matrix") or {}).get("initial_live_tranche") or {}
+    policy_counts = {
+        policy: list(initial.get("policies") or []).count(policy)
+        for policy in POLICY_MODES
+    }
+    if (
+        case.get("scenario") != binding.get("scenario")
+        or case.get("decisive_frontier_hash") != signal.get("decisive_frontier_hash")
+        or case.get("expected_candidate_count") != signal.get("expected_candidate_count")
+        or case.get("expected_policy_order") != signal.get("expected_policy_order")
+        or any(count != case.get("expected_rows_per_policy") for count in policy_counts.values())
+    ):
+        return ["contract_case_mismatch"]
+    disposition = development_row_kernel.admission_disposition(
+        contract,
+        contract_sha256=observed_hash,
+        row=row,
+        history_root=results_root,
+    )
+    failures = list(disposition.get("failures") or [])
+    if row.get("row_state") != "admitted" or row.get("burned") is not False:
+        failures.append("row_not_admitted")
+    return list(dict.fromkeys(failures))
+
+
+def _row_invariant_failures(
+    row: dict[str, Any], case: dict[str, Any] | None = None, *, results_root: Path | None = None,
+) -> list[str]:
     failures: list[str] = []
     if row.get("objective_proven") is not True:
         failures.append("objective_proven")
@@ -206,6 +268,13 @@ def _row_invariant_failures(row: dict[str, Any]) -> list[str]:
     observed = str(row.get("policy_mode") or "").strip().casefold()
     if configured != observed:
         failures.append("policy_mode_mismatch")
+    if case is not None:
+        if results_root is None:
+            failures.append("development_results_root_missing")
+        else:
+            failures.extend(
+                _development_row_invariant_failures(case, row, results_root=results_root)
+            )
     return failures
 
 
@@ -346,6 +415,8 @@ def _summarize_null_model_factorial() -> dict[str, Any]:
 def _build_case_report(
     case: dict[str, Any],
     rows: list[dict[str, Any]],
+    *,
+    results_root: Path,
 ) -> dict[str, Any]:
     scenario = str(case["scenario"])
     frontier_hash = str(case["decisive_frontier_hash"])
@@ -368,7 +439,7 @@ def _build_case_report(
         metric_values: list[float] = []
         choices: list[dict[str, Any]] = []
         for row_index, row in enumerate(matching_rows):
-            failures = _row_invariant_failures(row)
+            failures = _row_invariant_failures(row, case, results_root=results_root)
             if failures:
                 row_failures.append({
                     "policy_mode": policy_mode,
@@ -417,6 +488,15 @@ def _build_case_report(
         "decisive_frontier_replayed": decisive_frontier_found,
         "decisive_frontier_candidate_count": candidate_counts == {expected_candidate_count},
         "policy_choices_stable": all(summary["stable_choice"] for summary in policy_summaries.values()),
+        "row_ids_unique": (
+            len({
+                str(row.get("row_id") or "")
+                for rows_for_policy in policy_rows.values()
+                for row in rows_for_policy
+            }) == sum(len(rows_for_policy) for rows_for_policy in policy_rows.values())
+            if isinstance(case.get("row_admission"), dict)
+            else True
+        ),
         "expected_policy_order_preserved": observed_order == expected_order,
         "pairwise_agreement": bool(pairwise) and all(item["passes"] for item in pairwise),
     }
@@ -466,13 +546,20 @@ def _build_core_report(
             "scenarios": sorted({str(row.get("scenario") or "") for row in rows}),
         })
     cases = [
-        _build_case_report(case, artifact_rows[str(case["artifact_id"])])
+        _build_case_report(
+            case,
+            artifact_rows[str(case["artifact_id"])],
+            results_root=results_root,
+        )
         for case in manifest["cases"]
     ]
     invariants = [_summarize_null_model_factorial()]
     checks = {
         "artifact_hashes_match": all(item["hash_matches"] for item in artifact_reports),
-        "manifest_has_no_goad_literals": _manifest_has_no_goad_literals(manifest),
+        "manifest_has_no_goad_literals": _manifest_has_no_goad_literals(
+            manifest,
+            results_root=results_root,
+        ),
         "cases_pass": all(case["passes_gate"] for case in cases),
         "offline_invariants_pass": all(item["verdict"] == "PASS" for item in invariants),
     }

@@ -1,11 +1,11 @@
 ---
 name: sage-foothold-launch
-description: Rebuild a live Apollo foothold on the GOAD range as NORTH\samwell.tarly with NO operator, NO RDP client, and NO X display — a pure WinRM scheduled-task (batch-logon) launch. Use to reset the range and re-establish a foothold end to end unattended (headless agent or cron), or to launch a foothold against an already-booted, clock-synced range. Supersedes the RDP/Xvfb path (launch_apollo_foothold.sh) for unaided use.
+description: Build a live Apollo foothold on the GOAD range as NORTH\samwell.tarly through a pure WinRM scheduled-task batch logon. Use only when the selected Mythic payload is genuinely downloadable and the operation accepts a batch-logon token; staged interactive benchmark snapshots use launch-existing instead.
 ---
 
 # Sage Foothold Launch
 
-Rebuilds a live Apollo callback as `NORTH\samwell.tarly` without an operator, an RDP session, or an
+Builds a live Apollo callback as `NORTH\samwell.tarly` without an operator, an RDP session, or an
 X display. Where `sage-callback-bootstrap` creates the Apollo payload and `launch_apollo_foothold.sh`
 requires a live Xwayland/Xvfb display plus an `xfreerdp3` PTY to open an interactive Samwell desktop,
 this skill launches the payload through a **WinRM-created scheduled task that runs as samwell (batch
@@ -13,6 +13,23 @@ logon)** — the same exec path `sync_range_time.py` uses (`winrm_session()`/`ru
 ansible-inventory admin credentials) and the same launch primitive
 `deploy_payload_via_ludus.py --launch-method scheduled-task` already implements. Nothing needs a desktop,
 so a headless agent or cron can rebuild a foothold end to end.
+
+## Scope Guard
+
+This launcher always invokes `deploy_payload_via_ludus.py deploy`, downloads the selected Mythic payload, and
+creates a batch-logon process. Use it only when both facts are part of the declared start contract.
+
+- A pre-staged snapshot with imported retained callback metadata uses
+  `skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh`, which opens the interactive session and
+  calls `launch-existing` without downloading or restaging Apollo.
+- An imported payload row with an empty server-side path is not downloadable payload evidence.
+- Being a headless caller does not authorize changing an interactive benchmark foothold into a batch-logon
+  foothold; use the interactive wrapper's PTY when its display prerequisite is ready, otherwise stop before
+  allocation.
+- Retain the selected bootstrap mode and bounded child stdout/stderr before a live allocation begins or a launch
+  failure is summarized.
+
+See the snapshot-to-bootstrap decision table in `skills/sage-mythic-payload-deploy/SKILL.md`.
 
 ## Why this exists
 
@@ -31,7 +48,7 @@ closes it the pure-WinRM way: it **grants `SeBatchLogonRight` to the run-as user
 admin session before the batch launch (reversible, range-local), then the batch task starts and Apollo
 checks in. Verified 2026-07-28: reset → grant → batch launch → unique live foothold, unaided.
 
-Trade-off: the resulting Apollo runs under a **batch** logon, not interactive. That is sufficient for
+Trade-off: the resulting Apollo runs under a **batch** logon. That is sufficient for
 bounded native canaries (which only need a live, taskable Apollo as samwell). If a specific attack path
 requires an *interactive* logon type, use the RDP path
 (`skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh`), documented as the fallback below.
@@ -110,7 +127,7 @@ trigger a second deploy (which would create a duplicate lane).
 - **Re-verify `foothold.ready == true` immediately before any effect-intending canary** (standing process
   rule from the 2026-07-26 operator error) — `verify` is the one-line way to do it.
 
-## Fallback: interactive (RDP) logon
+## Interactive staged benchmark path
 
 If an interactive logon type is required, use the proven RDP path (needs a live X display):
 

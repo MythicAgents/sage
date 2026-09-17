@@ -512,6 +512,40 @@ def test_llm_policy_completed_call_boundary_retains_response_but_fails_closed_wi
     assert decision.rationale == "completed model call omitted authoritative token usage"
 
 
+def test_llm_policy_retains_wrong_route_response_but_refuses_its_action():
+    class Response:
+        content = json.dumps({
+            "disposition": "select",
+            "capability": "first",
+            "target": "a",
+        })
+        usage_metadata = {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
+        response_metadata = {"model_provider": "openai", "model_name": "wrong-model"}
+
+    async def decide(_request):
+        return Response()
+
+    decision = asyncio.run(policy.LLMPolicy(
+        decide,
+        catalog=[{"name": "first", "description": "first semantic capability"}],
+        completed_call_token_ceiling=10,
+        expected_response_provider="openai",
+        expected_response_model="expected-model",
+    ).select(
+        episode_id="episode-route",
+        objective="test",
+        state=State(),
+        candidates=[Action("first", "a", "effect:a")],
+        history=[],
+    ))
+
+    assert decision.disposition == "stop"
+    assert decision.model_response_observed is True
+    assert decision.effective_backend == "openai:wrong-model"
+    assert decision.token_usage["total_tokens"] == 6
+    assert "route mismatch" in decision.rationale
+
+
 @pytest.mark.parametrize(
     "usage",
     [

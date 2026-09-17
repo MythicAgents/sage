@@ -4,6 +4,21 @@ import asyncio
 import contextlib
 import contextvars
 import inspect
+from pathlib import Path
+import sys
+
+try:
+    from ai import task_budget
+except ModuleNotFoundError as exc:
+    if exc.name != "ai":
+        raise
+    # Some operator scripts intentionally load this module from the langgraph directory as a
+    # top-level module. Restore the canonical Sage package root before importing the shared budget
+    # so those scripts and package imports use the same `ai.task_budget` module and ContextVar.
+    _SAGE_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+    if str(_SAGE_PACKAGE_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SAGE_PACKAGE_ROOT))
+    from ai import task_budget
 from dataclasses import asdict, is_dataclass, replace
 try:
     from . import auth_context
@@ -387,7 +402,6 @@ def _graph_facts_missing_credential_domains(graph_facts, credential_domains) -> 
 
 import json
 import re as _re_mod
-from pathlib import Path
 
 
 def _engagement_ledger_mod():
@@ -6260,6 +6274,7 @@ class MythicTools:
         now: str,
         force: bool = False,
         proof_envelope: dict | None = None,
+        covered_domains: list[str] | None = None,
     ) -> None:
         """Refresh the cached BloodHound graph facts (ACL edges → engagement predicates) that feed the
         forward planner / per-turn injection. TTL-bounded (the read-only cypher runs at most ~every 2 min
@@ -6362,7 +6377,10 @@ class MythicTools:
             ) or [])
             facts = list(reconciled_facts)
             if reconciled_facts:
-                covered_domains = await _bloodhound_collected_domains()
+                # A completed ingest already read this snapshot. Empty results also represent read
+                # failures, so retain the fresh-read recovery path unless coverage is nonempty.
+                if not covered_domains:
+                    covered_domains = await _bloodhound_collected_domains()
                 existing_predicates = {
                     engagement_state._normalize_predicate(getattr(fact, "predicate", ""))
                     for fact in facts
@@ -9833,6 +9851,19 @@ class MythicTools:
                     )
                     if fallback_result is not None:
                         return fallback_result
+                    fallback_result = await self._capability_executor_try_pkinit_fallback(
+                        action_obj,
+                        input_values,
+                        int(callback_id),
+                        capabilities,
+                        before_effects,
+                        all_issued,
+                        materialized_payload,
+                        transaction,
+                        output,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
                     fallback_result = await self._capability_executor_try_schannel_fallback(
                         action_obj,
                         input_values,
@@ -10108,6 +10139,19 @@ class MythicTools:
                                 retry_payload["native_export_repair"] = "sharpdpapi"
                                 retry_payload["native_export_blocker"] = verification.reason
                                 return json.dumps(retry_payload, sort_keys=True)
+                        fallback_result = await self._capability_executor_try_pkinit_fallback(
+                            action_obj,
+                            input_values,
+                            int(callback_id),
+                            capabilities,
+                            before_effects,
+                            all_issued,
+                            materialized_payload,
+                            transaction,
+                            output,
+                        )
+                        if fallback_result is not None:
+                            return fallback_result
                         fallback_result = await self._capability_executor_try_schannel_fallback(
                             action_obj,
                             input_values,
@@ -10138,6 +10182,19 @@ class MythicTools:
 
                 if self._capability_executor_task_failed(issued_item):
                     self._capability_transaction_record_task_failure(transaction, command_obj, issued_item)
+                    fallback_result = await self._capability_executor_try_pkinit_fallback(
+                        action_obj,
+                        input_values,
+                        int(callback_id),
+                        capabilities,
+                        before_effects,
+                        all_issued,
+                        materialized_payload,
+                        transaction,
+                        output,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
                     fallback_result = await self._capability_executor_try_schannel_fallback(
                         action_obj,
                         input_values,
@@ -12862,6 +12919,98 @@ class MythicTools:
                 retry_payload["recorded_effects"] = sorted(self._capability_achieved_effects() - before_effects)
             return json.dumps(retry_payload, sort_keys=True)
         return None
+
+    async def _capability_executor_try_pkinit_fallback(
+        self,
+        action,
+        inputs: dict,
+        callback_id: int,
+        capabilities_mod,
+        before_effects: set[str],
+        all_issued: list[dict],
+        materialized_payload: dict | None,
+        prior_transaction: dict,
+        output: str,
+    ) -> str | None:
+        """Fall back to the existing PKINIT transaction after control-first Schannel fails."""
+        capability = self._capability_text(getattr(action, "name", "")).casefold()
+        if capability != "adcs-certificate-auth":
+            return None
+        if self._capability_input_bool(inputs, "_pkinit_fallback_attempted"):
+            return None
+        auth_method, control_proof_first = capabilities_mod.adcs_certificate_auth_route(action, inputs)
+        explicit_schannel_fallback = (
+            auth_method in capabilities_mod._ADCS_SCHANNEL_AUTH_METHODS
+            and self._capability_input_bool(inputs, "allow_pkinit_fallback")
+        )
+        if not control_proof_first and not explicit_schannel_fallback:
+            return None
+        status = self._capability_text(
+            prior_transaction.get("status") if isinstance(prior_transaction, dict) else ""
+        ).casefold()
+        if status in {"artifact_invalid", "artifact_missing"}:
+            return None
+        if not self._capability_executor_schannel_pkinit_fallback_eligible(output, prior_transaction):
+            return None
+
+        fallback_inputs = dict(inputs)
+        fallback_inputs["_pkinit_fallback_attempted"] = True
+        # The control-first Schannel transaction already ran.  If PKINIT reports a
+        # compatibility error, do not bounce back into the same failed primary route.
+        fallback_inputs["_schannel_fallback_attempted"] = True
+        fallback_inputs["certificate_auth_method"] = "pkinit-kerberos"
+        fallback_inputs["preflight_existing_context"] = False
+        fallback_inputs["certificate_already_forged"] = True
+        fallback_inputs["skip_certificate_forge"] = True
+        retry_raw = await self.execute_capability(action, fallback_inputs)
+        try:
+            retry_payload = json.loads(retry_raw)
+        except Exception:
+            retry_payload = {
+                "ok": False,
+                "verdict": "failed",
+                "capability": capability,
+                "reason": self._capability_text(retry_raw),
+                "issued": [],
+                "recorded_effects": [],
+            }
+        if not isinstance(retry_payload, dict):
+            return None
+        retry_issued = retry_payload.get("issued") if isinstance(retry_payload.get("issued"), list) else []
+        retry_payload["issued"] = self._capability_executor_public_issued(all_issued) + retry_issued
+        retry_payload["control_proof_transaction"] = prior_transaction
+        retry_payload["fallback"] = "pkinit-kerberos"
+        if "materialized" not in retry_payload:
+            retry_payload["materialized"] = self._capability_executor_materialized_summary(materialized_payload)
+        if retry_payload.get("recorded_effects") is None:
+            retry_payload["recorded_effects"] = sorted(self._capability_achieved_effects() - before_effects)
+        return json.dumps(retry_payload, sort_keys=True)
+
+    def _capability_executor_schannel_pkinit_fallback_eligible(
+        self,
+        output: str,
+        transaction: dict,
+    ) -> bool:
+        """Admit only Schannel compatibility/availability failures to PKINIT fallback."""
+        status = self._capability_text(
+            transaction.get("status") if isinstance(transaction, dict) else ""
+        ).casefold()
+        if status == "command_failed":
+            return True
+        low = self._capability_text(output).casefold()
+        return any(marker in low for marker in (
+            "cert_auth_ldap_bind=false",
+            "cert_auth_status=failed",
+            "cert_auth_attempt_ldaps_status=failed",
+            "cert_auth_attempt_starttls_status=failed",
+            "control_bind=false",
+            "ldap server unavailable",
+            "server is not operational",
+            "connection refused",
+            "connection timed out",
+            "could not establish trust relationship",
+            "the ldap server is unavailable",
+        ))
 
     async def _capability_executor_try_schannel_fallback(
         self,
@@ -17238,6 +17387,7 @@ class MythicTools:
                 datetime.now(timezone.utc).isoformat(),
                 force=True,
                 proof_envelope=collection_proof,
+                covered_domains=covered_domains,
             )
         except Exception:
             pass
@@ -17877,14 +18027,35 @@ class MythicTools:
         `make_token` with `Supplied Arguments, []`, its `credential` parameter sitting in
         `credential_store`.
         """
-        if not parameter_group_name:
-            return await mythic.issue_task(
-                mythic=self.client, command_name=command, parameters=parameters,
-                callback_display_id=callback_display_id, wait_for_complete=False, timeout=timeout,
-            )
-        return await self._issue_task_with_parameter_group(
-            command, parameters, callback_display_id, parameter_group_name,
+        remaining = task_budget.admit_task()
+        requested_timeout = float(timeout) if timeout is not None else remaining
+        bounded_timeout = (
+            min(requested_timeout, remaining)
+            if remaining is not None and requested_timeout is not None
+            else requested_timeout
         )
+        if bounded_timeout is not None and bounded_timeout <= 0:
+            raise task_budget.TaskBudgetExceeded("task execution deadline reached")
+        if not parameter_group_name:
+            submission = mythic.issue_task(
+                mythic=self.client, command_name=command, parameters=parameters,
+                callback_display_id=callback_display_id, wait_for_complete=False,
+                timeout=bounded_timeout,
+            )
+        else:
+            submission = self._issue_task_with_parameter_group(
+                command, parameters, callback_display_id, parameter_group_name,
+            )
+        result = (
+            await asyncio.wait_for(submission, timeout=bounded_timeout)
+            if bounded_timeout is not None
+            else await submission
+        )
+        task_id = result.get("display_id") if isinstance(result, dict) else None
+        if type(task_id) is not int or task_id <= 0:
+            raise RuntimeError("Mythic task submission omitted a positive display_id")
+        task_budget.record_task_id(task_id)
+        return result
 
     async def _issue_task_with_parameter_group(
         self, command, parameters, callback_display_id, parameter_group_name

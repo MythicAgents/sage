@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.util
 import json
 import math
@@ -91,6 +92,14 @@ def _load_range_profiles():
 
 
 _RANGE_PROFILES = _load_range_profiles()
+
+
+def _development_row_kernel():
+    if str(PAYLOAD) not in sys.path:
+        sys.path.insert(0, str(PAYLOAD))
+    from ai.hillclimb import development_row_kernel  # type: ignore
+
+    return development_row_kernel
 
 
 def _load_sage_model_environment() -> dict[str, str]:
@@ -357,6 +366,7 @@ class FootholdSpec:
         range_profile_id: str = _RANGE_PROFILES.DEFAULT_PROFILE_ID,
         callback_settle_seconds: int = 0,
         require_unique_callback: bool = False,
+        direct_retained_launch: bool = False,
     ) -> None:
         self.host = host
         self.ip = ip
@@ -369,6 +379,7 @@ class FootholdSpec:
         self.range_profile_id = range_profile_id
         self.callback_settle_seconds = max(0, int(callback_settle_seconds))
         self.require_unique_callback = bool(require_unique_callback)
+        self.direct_retained_launch = bool(direct_retained_launch)
 
     def launch_argv(self) -> list[str]:
         argv = [
@@ -725,6 +736,70 @@ def _run(name, argv, cwd, timeout, env: dict[str, str] | None = None):
         raise SystemExit(f"ABORT: step '{name}' failed (exit {proc.returncode}) — not running the gauge on a bad range.")
 
 
+def _replication_direct_launch_vectors(foothold: FootholdSpec) -> dict[str, list[str]]:
+    deploy = str(
+        ROOT / "skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py"
+    )
+    common = [
+        "--ludus-range-id", str(foothold.ludus_range_id or ""),
+        "--ludus-mcp-server", str(foothold.ludus_mcp_server or ""),
+        "--target-host", foothold.host,
+        "--target-ip", foothold.ip,
+    ]
+    return {
+        "logoff": [PY, deploy, "logoff-user", *common, "--username", "localuser"],
+        "rdp": [
+            sys.executable,
+            str(ROOT / "skills/sage-mythic-payload-deploy/scripts/open_rdp_session.py"),
+            "--target-ip", foothold.ip,
+            "--run-as-user", foothold.user,
+        ],
+        "launch": [
+            PY, deploy, "launch-existing", *common,
+            "--run-as-user", foothold.user,
+            "--callback-host", foothold.callback_host,
+            "--callback-user", foothold.callback_user,
+            "--wait-callbacks-seconds", "90",
+            "--callback-settle-seconds", "90",
+            "--require-unique-callback",
+            "--wait-interactive-session-seconds", "600",
+        ],
+    }
+
+
+def _launch_replication_foothold_direct(foothold: FootholdSpec) -> None:
+    """Run the attempt-003 qualified direct-helper sequence and always reap local RDP."""
+    vectors = _replication_direct_launch_vectors(foothold)
+    env = foothold.launch_env()
+    logoff = subprocess.run(
+        vectors["logoff"], cwd=str(ROOT), capture_output=True, text=True, timeout=180, env=env,
+    )
+    if logoff.returncode != 0:
+        try:
+            error = str(json.loads(logoff.stderr).get("error") or "")
+        except (json.JSONDecodeError, AttributeError):
+            error = ""
+        expected = "No session owned by 'localuser' was found; refusing to report cleanup success."
+        if logoff.returncode != 2 or error != expected:
+            detail = (logoff.stderr or logoff.stdout or "no diagnostic output").strip()
+            raise SystemExit(f"ABORT: replication prelaunch session cleanup failed: {detail}")
+    rdp = subprocess.Popen(
+        vectors["rdp"], cwd=str(ROOT), env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        _run("launch retained replication Apollo", vectors["launch"], ROOT, 900, env=env)
+    finally:
+        if rdp.poll() is None:
+            rdp.terminate()
+            try:
+                rdp.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                rdp.kill()
+                rdp.wait(timeout=15)
+
+
 def _poll(
     name,
     argv,
@@ -1042,7 +1117,10 @@ def full_reset_and_ready(
         timeout=1800,
         env=range_env,
     )
-    _run("launch retained apollo", foothold.launch_argv(), ROOT, 900, env=foothold.launch_env())
+    if foothold.direct_retained_launch:
+        _launch_replication_foothold_direct(foothold)
+    else:
+        _run("launch retained apollo", foothold.launch_argv(), ROOT, 900, env=foothold.launch_env())
     _poll(
         "sage chat + apollo ready",
         foothold.readiness_argv(),
@@ -1128,8 +1206,11 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
              max_output_tokens: int | None = None,
              source_version: str | None = None,
              live_authority_id: str | None = None,
+             row_contract: Path | None = None,
+             row_contract_sha256: str | None = None,
+             row_id: str | None = None,
              skip_preflight: bool = False,
-             before_reset: Callable[[], None] | None = None) -> None:
+             before_reset: Callable[[], None] | None = None) -> int:
     foothold = _configure_foothold_for_scenario(scenario, foothold)
     if measurement_kind == "row" and pair_id:
         gate1p = _gate1p_stagea_protocol()
@@ -1211,6 +1292,12 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         argv.extend(["--source-version", source_version])
     if live_authority_id:
         argv.extend(["--live-authority-id", live_authority_id])
+    if row_contract is not None:
+        argv.extend(["--row-contract", str(row_contract)])
+    if row_contract_sha256:
+        argv.extend(["--row-contract-sha256", row_contract_sha256])
+    if row_id:
+        argv.extend(["--row-id", row_id])
     if go:
         argv.append("--go")
     # The subprocess cap MUST exceed the solve-timeout or it kills a still-progressing solve early (the bug
@@ -1227,8 +1314,8 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         "SAGE_BLOODHOUND_MCP_DIR": BH,
         **restart_env,
     }
-    if measurement_kind == "row" and pair_id:
-        child_env["SAGE_EVAL_RESET_READINESS_JSON"] = json.dumps({
+    if measurement_kind == "row":
+        reset_readiness = {
             "ready": True,
             "snapshot": snapshot,
             "range_id": ludus_range_id,
@@ -1239,7 +1326,26 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
             "initial_callback_display_id": int(apollo_cb),
             "unique_initial_callback": True,
             "pre_arm_task_count": 0,
-        }, sort_keys=True)
+        }
+        if not pair_id:
+            profile = _RANGE_PROFILES.get_profile(foothold.range_profile_id)
+            summary = _RANGE_PROFILES.profile_summary(profile)
+            catalog = ROOT / "ludus/sage-purpose-ranges/substrate_profiles.json"
+            reset_readiness.update({
+                "range_profile": summary["id"],
+                "topology_identity": summary["topology_identity"],
+                "profile_catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+                "qualification_receipt": summary["qualification"]["receipt"],
+                "ludus_mcp_server": ludus_mcp_server,
+                "foothold_host": foothold.host,
+                "foothold_ip": foothold.ip,
+                "foothold_principal": foothold.user,
+                "callback_host": foothold.callback_host,
+                "callback_user": foothold.callback_user,
+            })
+        child_env["SAGE_EVAL_RESET_READINESS_JSON"] = json.dumps(
+            reset_readiness, sort_keys=True
+        )
     if scenario.startswith("laps-family-transfer-"):
         child_env.pop("SAGE_EVAL_FORCE_CAPABILITY_PREFIX_JSON", None)
         child_env.pop("SAGE_EVAL_PHASE6_FORCED_PATH", None)
@@ -1276,6 +1382,7 @@ def run_side(scenario: str, side: str, *, go: bool, solve_timeout: int, policy_m
         child_env["SAGE_EVAL_RESULTS_PATH"] = str(_gate1p_results_path(route_env))
         child_env["SAGE_EVAL_PAIR_CONTROL_PATH"] = str(_gate1p_pair_control_path(route_env))
     _run(f"gauge {side}/{scenario}", argv, PAYLOAD, step_timeout, env=child_env)
+    return int(apollo_cb)
 
 
 def compare(
@@ -2442,6 +2549,330 @@ def _dry_run_plan(scenario, side, seeds, solve_timeout, policy_mode, provider=No
         print("\nRe-run with --go to execute. ABORTS on any reset/bootstrap/callback failure.")
 
 
+def _load_isc11_contract(path: Path, *, expected_sha256: str) -> tuple[dict, str]:
+    try:
+        contract, observed = _development_row_kernel().load_contract(
+            path,
+            expected_sha256=expected_sha256,
+        )
+    except Exception as exc:
+        raise SystemExit(f"ABORT: ISC-11 contract is unreadable: {exc}") from exc
+    if not str(contract.get("contract_id") or "").strip():
+        raise SystemExit("ABORT: ISC-11 contract identity is missing")
+    return contract, observed
+
+
+def _git_text(*args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=str(ROOT), capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(f"ABORT: git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()}")
+    return proc.stdout.strip()
+
+
+def _validate_isc11_source(contract: dict) -> None:
+    source = contract.get("source_identity") or {}
+    observed = {
+        "branch": _git_text("branch", "--show-current"),
+        "tree": _git_text("write-tree"),
+    }
+    if source.get("commit"):
+        observed["commit"] = _git_text("rev-parse", "HEAD")
+    mismatches = [key for key, value in observed.items() if value != source.get(key)]
+    if _git_text("status", "--porcelain", "--untracked-files=no"):
+        mismatches.append("working_tree_clean")
+    catalog = ROOT / "ludus/sage-purpose-ranges/substrate_profiles.json"
+    if hashlib.sha256(catalog.read_bytes()).hexdigest() != source.get("profile_catalog_sha256"):
+        mismatches.append("profile_catalog_sha256")
+    if mismatches:
+        raise SystemExit(
+            "ABORT: ISC-11 source identity differs from the frozen contract: "
+            + ", ".join(sorted(set(mismatches)))
+        )
+
+
+def _validate_isc11_contract(
+    contract: dict,
+    *,
+    contract_hash: str,
+    expected_contract_hash: str,
+    args,
+    range_profile: dict,
+    foothold: FootholdSpec,
+    require_live: bool,
+) -> None:
+    source = contract.get("source_identity") or {}
+    binding = contract.get("range_binding") or {}
+    execution = contract.get("execution_identity") or {}
+    matrix = contract.get("matrix") or {}
+    gate = contract.get("authority_gate") or {}
+    summary = _RANGE_PROFILES.profile_summary(range_profile)
+    selected = {
+        "profile": range_profile.get("id"),
+        "scenario": args.scenario,
+        "objective_domain": "replication.local",
+        "ludus_mcp_server": args.ludus_mcp_server,
+        "ludus_range_id": args.ludus_range_id,
+        "snapshot": args.snapshot,
+        "foothold_host": foothold.host,
+        "foothold_callback_host": foothold.callback_host,
+        "foothold_ip": foothold.ip,
+        "foothold_principal": foothold.user,
+        "foothold_callback_user": foothold.callback_user,
+        "foothold_password_env": foothold.password_env,
+        "retained_callback_config": str(
+            (ROOT / args.retained_callback_config).resolve().relative_to(ROOT)
+        ),
+    }
+    mismatches = [key for key, value in selected.items() if binding.get(key) != value]
+    if summary.get("topology_identity") != source.get("topology_identity"):
+        mismatches.append("topology_identity")
+    if (summary.get("qualification") or {}).get("state") != "live_qualified":
+        mismatches.append("qualification_state")
+    if (summary.get("qualification") or {}).get("receipt") != source.get("qualification_receipt"):
+        mismatches.append("qualification_receipt")
+    initial = matrix.get("initial_live_tranche") or {}
+    if (
+        initial.get("rows") != [1, 2, 3]
+        or initial.get("policies") != ["symbolic", "llm", "hybrid"]
+        or initial.get("whole_row_retries") != 0
+        or (matrix.get("order") or [])[:3] != ["symbolic", "llm", "hybrid"]
+    ):
+        mismatches.append("initial_live_tranche")
+    if (
+        execution.get("side") != "harness"
+        or execution.get("provider") != args.provider
+        or execution.get("model") != args.model
+        or execution.get("solve_timeout_seconds") != args.solve_timeout
+        or execution.get("model_context_limit") != args.model_context_limit
+        or execution.get("max_output_tokens") != args.max_output_tokens
+    ):
+        mismatches.append("execution_identity")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_contract_hash)
+        or contract_hash != expected_contract_hash
+    ):
+        mismatches.append("contract_hash")
+    if require_live and args.live_authority_id != gate.get("live_authority_id"):
+        mismatches.append("live_authority_id")
+    if mismatches:
+        raise SystemExit(
+            "ABORT: ISC-11 invocation differs from the frozen contract: "
+            + ", ".join(sorted(set(mismatches)))
+        )
+
+
+def _isc11_results_environment(contract: dict, route_env: dict[str, str]) -> dict[str, str]:
+    try:
+        root, ledger = _development_row_kernel().contract_storage_paths(
+            contract,
+            repo_root=ROOT,
+        )
+    except Exception as exc:
+        raise SystemExit(f"ABORT: {exc}") from exc
+    root.mkdir(parents=True, exist_ok=True)
+    return {
+        **route_env,
+        "SAGE_EVAL_ARTIFACT_DIR": str(root),
+        "SAGE_EVAL_RESULTS_PATH": str(ledger),
+    }
+
+
+def _isc11_result_records(route_env: dict[str, str]) -> list[dict]:
+    path = Path(route_env["SAGE_EVAL_RESULTS_PATH"])
+    if not path.exists():
+        return []
+    try:
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"ABORT: ISC-11 result ledger is unreadable: {exc}") from exc
+
+
+def _isc11_append(route_env: dict[str, str], record: dict) -> None:
+    path = Path(route_env["SAGE_EVAL_RESULTS_PATH"])
+    _development_row_kernel().append_jsonl_durable(path, record)
+
+
+def _isc11_cleanup(
+    *, row_id: str, callback_id: int | None, contract: dict,
+    foothold: FootholdSpec, route_env: dict[str, str],
+) -> dict:
+    binding = contract["range_binding"]
+    range_env = _range_env(
+        binding["ludus_range_id"], binding["ludus_mcp_server"], binding["profile"],
+    )
+    steps: list[dict[str, object]] = []
+    errors: list[str] = []
+    commands = [
+        ("stop sage", ["/bin/bash", "skills/sage-goad-reset/scripts/sage_stop.sh"], ROOT, 120),
+        ("archive dbs", [PY, "skills/sage-goad-reset/scripts/archive_runtime_dbs.py"], ROOT, 180),
+        ("verify no running tasks", [PY, "ai/hillclimb/run_gauge_live.py", "verify-no-running-tasks"], PAYLOAD, 120),
+        ("restore staged snapshot", _ludus_argv("rollback", binding["snapshot"], "--yes", range_id=binding["ludus_range_id"], mcp_server=binding["ludus_mcp_server"]), ROOT, 2400),
+        ("power off range", _ludus_argv("poweroff", "all", range_id=binding["ludus_range_id"], mcp_server=binding["ludus_mcp_server"]), ROOT, 900),
+        ("wipe bloodhound", ["uv", "--directory", BH, "run", "python", str(ROOT / "skills/sage-goad-reset/scripts/bh_reset.py"), "wipe", "--yes"], ROOT, 180),
+    ]
+    for name, argv, cwd, timeout in commands:
+        try:
+            _run(f"ISC-11 cleanup: {name}", argv, cwd, timeout, env=range_env)
+        except (OSError, SystemExit, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{name}: {exc}")
+            steps.append({"name": name, "ok": False, "error": str(exc)})
+        else:
+            steps.append({"name": name, "ok": True})
+    try:
+        _poll(
+            "ISC-11 cleanup BloodHound empty",
+            ["uv", "--directory", BH, "run", "python", str(ROOT / "skills/sage-goad-reset/scripts/bh_reset.py"), "status"],
+            ROOT, _bloodhound_is_empty, timeout=120, interval=5, env=range_env,
+        )
+        steps.append({"name": "bloodhound empty", "ok": True})
+    except (OSError, SystemExit, subprocess.TimeoutExpired) as exc:
+        errors.append(f"bloodhound empty: {exc}")
+        steps.append({"name": "bloodhound empty", "ok": False, "error": str(exc)})
+    try:
+        expected_guests = len(_RANGE_PROFILES.get_profile(binding["profile"])["vms"])
+        _poll(
+            "ISC-11 cleanup range powered off",
+            _ludus_argv("status", range_id=binding["ludus_range_id"], mcp_server=binding["ludus_mcp_server"]),
+            ROOT,
+            lambda out: len(re.findall(r"^\s*OFF\s+", out, re.MULTILINE)) == expected_guests,
+            timeout=300, interval=10, env=range_env,
+        )
+        steps.append({"name": "range powered off", "ok": True})
+    except (OSError, SystemExit, subprocess.TimeoutExpired) as exc:
+        errors.append(f"range powered off: {exc}")
+        steps.append({"name": "range powered off", "ok": False, "error": str(exc)})
+    if callback_id is not None:
+        try:
+            _poll(
+                "ISC-11 cleanup callback inactive", CALLBACKS, ROOT,
+                lambda out: re.search(rf"\bid={callback_id}\b", out) is None,
+                timeout=180, interval=10, env=range_env,
+            )
+            steps.append({"name": "callback inactive", "ok": True})
+        except (OSError, SystemExit, subprocess.TimeoutExpired) as exc:
+            errors.append(f"callback inactive: {exc}")
+            steps.append({"name": "callback inactive", "ok": False, "error": str(exc)})
+    report = {
+        "record_type": "cleanup", "measurement_kind": "row", "row_id": row_id,
+        "callback_id": callback_id, "complete": not errors, "errors": errors,
+        "steps": steps, "ts": time.time(),
+    }
+    _isc11_append(route_env, report)
+    if errors:
+        raise SystemExit(f"ABORT: ISC-11 cleanup incomplete for {row_id}: {'; '.join(errors)}")
+    return report
+
+
+def _run_isc11_canary(
+    args, contract: dict, contract_path: Path, *, expected_contract_hash: str,
+    route_env, foothold,
+) -> dict:
+    _validate_isc11_source(contract)
+    row_env = _isc11_results_environment(contract, route_env)
+    records = _isc11_result_records(row_env)
+    kernel = _development_row_kernel()
+    evidence_root = Path(row_env["SAGE_EVAL_RESULTS_PATH"]).parent
+    results = [record for record in records if record.get("record_type") == "result"]
+    cleanups = [record for record in records if record.get("record_type") == "cleanup"]
+    completed = [str(record.get("row_id") or "") for record in results]
+    expected_ids = [f"isc11-row-{index:03d}" for index in (1, 2, 3)]
+    if completed != expected_ids[:len(completed)] or len(completed) > 3:
+        raise SystemExit("ABORT: ISC-11 retry-zero result ledger is out of order or over budget")
+    for record in results:
+        admission = kernel.admission_disposition(
+            contract,
+            contract_sha256=expected_contract_hash,
+            row=record,
+            history_root=evidence_root,
+        )
+        if (
+            admission.get("countable") is not True
+            or record.get("row_state") != "admitted"
+            or record.get("burned") is not False
+            or not any(item.get("row_id") == record.get("row_id") and item.get("complete") is True for item in cleanups)
+        ):
+            raise SystemExit("ABORT: ISC-11 prior row is not admitted with complete cleanup")
+    policies = contract["matrix"]["initial_live_tranche"]["policies"]
+    for row_index in range(len(completed) + 1, 4):
+        row_id = f"isc11-row-{row_index:03d}"
+        policy = policies[row_index - 1]
+        _validate_isc11_source(contract)
+        reset_started = False
+        callback_id: int | None = None
+
+        def before_reset() -> None:
+            nonlocal reset_started
+            try:
+                _development_row_kernel().begin_row(
+                    contract,
+                    repo_root=ROOT,
+                    row_id=row_id,
+                    protocol_id=str(contract["contract_id"]),
+                    contract_sha256=expected_contract_hash,
+                    timestamp=time.time(),
+                )
+            except Exception as exc:
+                raise SystemExit(f"ABORT: {exc}") from exc
+            reset_started = True
+
+        try:
+            callback_id = run_side(
+                args.scenario, "harness", go=True, solve_timeout=args.solve_timeout,
+                policy_mode=policy, provider=args.provider, model=args.model,
+                route_env=row_env, snapshot=args.snapshot,
+                retained_callback_config=args.retained_callback_config, foothold=foothold,
+                ludus_range_id=args.ludus_range_id, ludus_mcp_server=args.ludus_mcp_server,
+                engagement_netbios_map=args.engagement_netbios_map,
+                measurement_kind="row", protocol_id=contract["contract_id"],
+                model_token_budget=contract["execution_identity"]["completed_call_token_ceiling_per_row"],
+                model_context_limit=args.model_context_limit, max_output_tokens=args.max_output_tokens,
+                source_version=(
+                    contract["source_identity"].get("tree")
+                    or contract["source_identity"].get("commit")
+                ),
+                live_authority_id=args.live_authority_id,
+                row_contract=contract_path,
+                row_contract_sha256=expected_contract_hash,
+                row_id=row_id, before_reset=before_reset,
+            )
+        finally:
+            if reset_started:
+                _isc11_cleanup(
+                    row_id=row_id, callback_id=callback_id, contract=contract,
+                    foothold=foothold, route_env=row_env,
+                )
+        records = _isc11_result_records(row_env)
+        result = next(
+            (record for record in records if record.get("record_type") == "result" and record.get("row_id") == row_id),
+            None,
+        )
+        admission = (
+            kernel.admission_disposition(
+                contract,
+                contract_sha256=expected_contract_hash,
+                row=result,
+                history_root=evidence_root,
+            )
+            if isinstance(result, dict)
+            else {"countable": False}
+        )
+        if (
+            admission.get("countable") is not True
+            or result.get("row_state") != "admitted"
+            or result.get("burned") is not False
+        ):
+            raise SystemExit(f"ABORT: ISC-11 {row_id} failed independent row admission")
+    disposition = {
+        "schema": "sage-isc11-canary-disposition-v1", "contract_id": contract["contract_id"],
+        "rows": expected_ids, "policies": policies, "countable_rows": 3,
+        "matrix_expansion_authorized": False, "complete": True,
+    }
+    print(json.dumps({"isc11_canary_disposition": disposition}, sort_keys=True))
+    return disposition
+
+
 def main(argv=None) -> int:
     sage_model_environment = _load_sage_model_environment()
     ap = argparse.ArgumentParser(description="Bare-vs-harness gauge orchestrator (resets the lab per run).")
@@ -2468,6 +2899,17 @@ def main(argv=None) -> int:
         "--gate1p-control-floor-canary",
         action="store_true",
         help="assemble or execute the allocated dual-endpoint, 1M-token control-floor canary",
+    )
+    ap.add_argument(
+        "--isc11-replication-canary-contract",
+        type=Path,
+        default=None,
+        help="execute exactly the frozen first three ISC-11 non-GOAD replication rows",
+    )
+    ap.add_argument(
+        "--isc11-contract-sha256",
+        default=None,
+        help="independently expected SHA-256 identity of the ISC-11 contract",
     )
     ap.add_argument("--model-context-limit", type=int, default=None,
                     help="verified provider per-request context limit for the paired row")
@@ -2599,6 +3041,22 @@ def main(argv=None) -> int:
     ap.add_argument("--controller", action="store_true",
                     help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    isc11_contract = None
+    isc11_contract_hash = None
+    if args.isc11_replication_canary_contract is not None:
+        if not args.isc11_contract_sha256:
+            ap.error("--isc11-contract-sha256 is required with an ISC-11 canary contract")
+        isc11_contract, isc11_contract_hash = _load_isc11_contract(
+            args.isc11_replication_canary_contract,
+            expected_sha256=args.isc11_contract_sha256,
+        )
+        execution = isc11_contract["execution_identity"]
+        args.provider = args.provider or execution["provider"]
+        args.model = args.model or execution["model"]
+        args.model_context_limit = args.model_context_limit or execution["model_context_limit"]
+        args.max_output_tokens = args.max_output_tokens or execution["max_output_tokens"]
+        source = isc11_contract["source_identity"]
+        args.source_version = args.source_version or source.get("tree") or source.get("commit")
     try:
         range_profile = _RANGE_PROFILES.get_profile(args.range_profile)
         range_binding = None
@@ -2618,6 +3076,7 @@ def main(argv=None) -> int:
         ludus_range_id=args.ludus_range_id,
         ludus_mcp_server=args.ludus_mcp_server,
         range_profile_id=range_profile["id"],
+        direct_retained_launch=args.isc11_replication_canary_contract is not None,
     )
     foothold = _configure_foothold_for_scenario(args.scenario, foothold)
     if range_binding is not None:
@@ -2664,8 +3123,14 @@ def main(argv=None) -> int:
         args.gate1p_stage_a_pair,
         args.gate1p_stage_b_protocol,
         args.gate1p_control_floor_canary,
+        args.isc11_replication_canary_contract is not None,
     ))) > 1:
-        ap.error("Gate 1P diagnostic, Stage A pair, Stage B, and control-floor modes are mutually exclusive")
+        ap.error("Gate 1P modes are mutually exclusive with the ISC-11 replication canary")
+    if args.isc11_replication_canary_contract is not None:
+        if args.side is not None or args.seeds != 1 or null_model or args.treatment:
+            ap.error("the ISC-11 canary requires no --side, --seeds 1, and no ablation/treatment")
+        if args.scenario != "replication-purpose-range-visible-cost":
+            ap.error("the ISC-11 canary requires replication-purpose-range-visible-cost")
     if args.gate1p_stage_a_diagnostic:
         if args.scenario != "child-domain-control" or args.side != "harness" or args.seeds != 1:
             ap.error(
@@ -2791,6 +3256,16 @@ def main(argv=None) -> int:
             "API_ENDPOINT": route["api_endpoint"],
             "API_KEY": route["api_key"],
         }
+    if isc11_contract is not None:
+        _validate_isc11_contract(
+            isc11_contract,
+            contract_hash=str(isc11_contract_hash),
+            expected_contract_hash=str(args.isc11_contract_sha256 or ""),
+            args=args,
+            range_profile=range_profile,
+            foothold=foothold,
+            require_live=bool(args.go),
+        )
     gate1p = _gate1p_stagea_protocol()
     if args.gate1p_stage_a_pair:
         if args.scenario != gate1p.SCENARIO or args.side is not None or args.seeds != 1:
@@ -2843,6 +3318,25 @@ def main(argv=None) -> int:
             validate_gate1p_storage(route_env)
 
     if not args.go:
+        if isc11_contract is not None:
+            print(json.dumps({
+                "isc11_canary_plan": {
+                    "contract_id": isc11_contract["contract_id"],
+                    "contract_sha256": isc11_contract_hash,
+                    "rows": [
+                        {"row_id": f"isc11-row-{index:03d}", "policy": policy}
+                        for index, policy in enumerate(
+                            isc11_contract["matrix"]["initial_live_tranche"]["policies"], 1
+                        )
+                    ],
+                    "range_profile": range_profile["id"],
+                    "direct_launch": _replication_direct_launch_vectors(foothold),
+                    "cleanup_after_every_row": True,
+                    "whole_row_retries": 0,
+                }
+            }, sort_keys=True))
+            print("VALIDATED DRY RUN: no reset, model, Mythic, BloodHound, range, target, or row call was made.")
+            return 0
         for selected_mode in policy_modes:
             _dry_run_plan(args.scenario, "harness" if args.null_model_factorial else args.side,
                           args.seeds, args.solve_timeout, selected_mode,
@@ -2889,6 +3383,16 @@ def main(argv=None) -> int:
         args.ludus_range_id,
         args.ludus_mcp_server,
     )
+    if isc11_contract is not None:
+        _run_isc11_canary(
+            args,
+            isc11_contract,
+            args.isc11_replication_canary_contract.resolve(),
+            expected_contract_hash=str(args.isc11_contract_sha256),
+            route_env=route_env,
+            foothold=foothold,
+        )
+        return 0
     if args.gate1p_stage_b_protocol:
         _run_gate1p_stageb_matrix(
             args, stageb, policy_mode=policy_mode, route_env=route_env, foothold=foothold,

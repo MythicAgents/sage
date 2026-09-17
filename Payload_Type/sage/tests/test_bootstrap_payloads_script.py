@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -31,6 +33,46 @@ MCP_CHECK_SPEC = importlib.util.spec_from_file_location("mcp_check", MCP_CHECK_S
 mcp_check = importlib.util.module_from_spec(MCP_CHECK_SPEC)
 assert MCP_CHECK_SPEC and MCP_CHECK_SPEC.loader
 MCP_CHECK_SPEC.loader.exec_module(mcp_check)
+
+
+def test_documented_bootstrap_cli_imports_in_clean_subprocess():
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=SCRIPT.parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "bootstrap-reset" in result.stdout
+
+
+def test_top_level_mythic_tools_reuses_canonical_task_budget_module_in_clean_subprocess():
+    sage_root = SCRIPT.parents[3] / "Payload_Type" / "sage"
+    langgraph_root = sage_root / "ai" / "langgraph"
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(langgraph_root)!r}); "
+        "import mythic_tools; "
+        "from ai import task_budget; "
+        "assert mythic_tools.task_budget is task_budget"
+    )
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=SCRIPT.parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(autouse=True)

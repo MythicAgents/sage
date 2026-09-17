@@ -473,14 +473,21 @@ def test_launch_existing_accepts_windows_normalized_bare_principal(monkeypatch):
         lambda *args, **kwargs: {"session_id": "4"},
     )
 
+    responses = iter([
+        (
+            '{"TaskName":"SageApolloBootstrap","RunAsUser":"samwell.tarly",'
+            '"State":"Ready","Execute":"C:\\\\Users\\\\Public\\\\apollo.exe",'
+            '"ExecutableSha256":"abc123"}'
+        ),
+        (
+            '{"Method":"existing-scheduled-task-interactive",'
+            '"TaskName":"SageApolloBootstrap","RunAsUser":"samwell.tarly"}'
+        ),
+    ])
+
     def fake_run_ps(session, script):
         scripts.append(script)
-        return {
-            "stdout": (
-                '{"Method":"existing-scheduled-task-interactive",'
-                '"TaskName":"SageApolloBootstrap","RunAsUser":"samwell.tarly"}'
-            )
-        }
+        return {"stdout": next(responses)}
 
     monkeypatch.setattr(deploy, "run_ps", fake_run_ps)
 
@@ -490,11 +497,63 @@ def test_launch_existing_accepts_windows_normalized_bare_principal(monkeypatch):
         r"NORTH\samwell.tarly",
         timeout_seconds=30,
         poll_interval=1.0,
+        expected_task_state="Ready",
+        expected_remote_path=r"C:\Users\Public\apollo.exe",
+        expected_remote_sha256="abc123",
     )
 
     assert result["RunAsUser"] == "samwell.tarly"
     assert "$actualUser -notmatch '\\\\'" in scripts[0]
     assert "$actualUser -eq $expectedLeaf" in scripts[0]
+    assert "Start-ScheduledTask" not in scripts[0]
+    assert "Start-ScheduledTask" in scripts[1]
+    assert result["prelaunch"]["State"] == "Ready"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("State", "Running", "state is"),
+        ("Execute", r"C:\\Windows\\temp\\apollo.exe", "executable path"),
+        ("ExecutableSha256", "wrong", "executable hash"),
+    ],
+)
+def test_launch_existing_rejects_fixture_mismatch_before_start(monkeypatch, field, value, match):
+    monkeypatch.setattr(
+        deploy,
+        "wait_for_active_interactive_session",
+        lambda *args, **kwargs: {"session_id": "4"},
+    )
+    prelaunch = {
+        "TaskName": "SageApolloBootstrap",
+        "RunAsUser": "samwell.tarly",
+        "State": "Ready",
+        "Execute": r"C:\Users\Public\apollo.exe",
+        "ExecutableSha256": "abc123",
+    }
+    prelaunch[field] = value
+    scripts = []
+
+    def fake_run_ps(session, script):
+        scripts.append(script)
+        return {"stdout": json.dumps(prelaunch)}
+
+    monkeypatch.setattr(deploy, "run_ps", fake_run_ps)
+
+    with pytest.raises(deploy.DeployError, match=match):
+        deploy.launch_existing_scheduled_task_interactive(
+            object(),
+            "SageApolloBootstrap",
+            r"NORTH\samwell.tarly",
+            timeout_seconds=30,
+            poll_interval=1.0,
+            expected_task_state="Ready",
+            expected_remote_path=r"C:\Users\Public\apollo.exe",
+            expected_remote_sha256="abc123",
+        )
+
+    assert len(scripts) == 1
+    assert "Start-ScheduledTask" not in scripts[0]
 
 
 def test_launch_scheduled_task_interactive_uses_manual_only_far_future_trigger(monkeypatch):

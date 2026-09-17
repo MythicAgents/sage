@@ -77,6 +77,18 @@ def test_bare_runner_records_only_exact_objective_terminal_as_recognition(
     assert result.objective_recognized is recognized
 
 
+@pytest.mark.parametrize("ceiling", [0, -1, False, True, 1.5, "100"])
+def test_invalid_explicit_token_ceiling_is_rejected(ceiling):
+    with pytest.raises(ValueError, match="token ceiling"):
+        br.BareModelRunner(lambda *_: {}, lambda _: None, token_ceiling=ceiling)
+
+
+@pytest.mark.parametrize("timeout", [True, -1, False, float("nan"), float("inf"), float("-inf")])
+def test_invalid_explicit_wall_limit_is_rejected(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        br.BareModelRunner(lambda *_: {}, lambda _: None, timeout=timeout)
+
+
 def test_loop_hits_budget():
     res = br.BareModelRunner(lambda s, t, h: {"tool": "x", "args": {}}, lambda c: "ok", max_steps=5).run("obj")
     assert res.stopped == "budget" and res.steps == 5
@@ -96,6 +108,59 @@ def test_model_response_after_wall_deadline_cannot_dispatch_target_tool():
     ).run("obj")
 
     assert result.stopped == "timeout"
+
+
+def test_provider_timeout_retains_attempt_and_marks_cost_incomplete():
+    events = []
+
+    def provider_timeout(*_args):
+        raise TimeoutError("request deadline")
+
+    result = br.BareModelRunner(
+        provider_timeout,
+        lambda _call: pytest.fail("tool dispatch attempted"),
+        timeout=1.0,
+        event_sink=events.append,
+    ).run("obj")
+
+    assert result.stopped == "timeout"
+    assert result.termination == {"cause": "wall_time", "subtype": "wrapper_timeout"}
+    assert result.model_attempts == 1
+    assert result.model_calls == 0
+    assert result.model_response_records == []
+    assert result.total_tokens == 0
+    assert result.token_usage_complete is False
+    assert events == [{"event": "model_request_started", "model_attempt": 1}]
+
+
+def test_response_is_durably_emitted_before_validation_and_cannot_dispatch():
+    events = []
+    tool_calls = []
+
+    def reject(record):
+        assert events[-1]["event"] == "model_response_retained"
+        raise ValueError("wrong route")
+
+    result = br.BareModelRunner(
+        lambda *_args: {
+            "tool": "issue_command",
+            "args": {},
+            "_usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            "_backend": {"effective_backend": "openai:wrong"},
+        },
+        lambda call: tool_calls.append(call),
+        token_ceiling=100,
+        require_complete_usage=True,
+        event_sink=events.append,
+        response_validator=reject,
+    ).run("obj")
+
+    assert result.stopped == "measurement_error"
+    assert result.total_tokens == 3
+    assert tool_calls == []
+    assert [event["event"] for event in events] == [
+        "model_request_started", "model_response_retained",
+    ]
     assert result.model_calls == 1
     assert result.steps == 0
     assert tool_calls == []
@@ -282,6 +347,74 @@ def test_compare_equal_n5_retains_uncertainty_instead_of_claiming_resolution():
     assert cmp.min_detectable_effect > 0
     assert cmp.resolved is False
     assert cmp.verdict == "indistinguishable-at-current-sample"
+
+
+def test_single_matched_observation_does_not_resolve_overlapping_intervals():
+    comparison = br.compare_bare_vs_harness("fixture", [_comparison_card(False)], [_comparison_card(True)])
+    assert comparison.delta == 1.0
+    assert comparison.bare_success_interval[1] > comparison.harness_success_interval[0]
+    assert comparison.resolved is False
+
+
+@pytest.mark.parametrize("missing", [None, "false", 0, {}, []])
+def test_missing_or_malformed_objective_is_not_counted_as_failure(missing):
+    comparison = br.compare_bare_vs_harness(
+        "fixture", [_comparison_card(missing)], [_comparison_card(False)], allow_missing_rates=True,
+    )
+    assert comparison.bare_objective_success_rate is None
+    assert comparison.harness_objective_success_rate == 0
+    assert comparison.bare_outcomes["unmeasured"] == 1
+    assert comparison.bare_outcomes["disproven"] == 0
+    assert comparison.delta is None
+    assert comparison.resolved is False
+
+
+@pytest.mark.parametrize("disposition", ["invalid", "unmeasured", "proven", "bad", [], {}])
+def test_unavailable_or_contradictory_proof_stays_out_of_success_denominator(disposition):
+    card = _comparison_card(False)
+    card.objective_proof_disposition = disposition
+    result = br.compare_bare_vs_harness("fixture", [card], [_comparison_card(True)], allow_missing_rates=True)
+    assert result.bare_outcomes["observed"] == 0
+    assert result.bare_outcomes["total"] == 1
+    assert result.verdict == "insufficient-outcome-evidence"
+
+
+def test_expensive_observed_failure_is_retained_with_missing_other_outcome():
+    failure = _comparison_card(False, total_tokens=1_000_010, cost_countable={"total_tokens": True})
+    missing = _comparison_card(None, total_tokens=20, cost_countable={"total_tokens": True})
+    result = br.compare_bare_vs_harness("fixture", [failure, missing], [_comparison_card(True)])
+    assert result.bare_outcomes == {"total": 2, "observed": 1, "proven": 0, "disproven": 1,
+                                    "unmeasured": 1, "invalid": 0}
+    assert result.bare_cost_mean["total_tokens"] == 500_015
+    assert result.bare_objective_success_rate == 0
+    assert result.resolved is False
+
+
+@pytest.mark.parametrize("outcome,disposition", [(True, "proven"), (False, "disproven"), (None, "invalid")])
+def test_actual_probe_score_summary_keeps_objective_disposition(outcome, disposition):
+    scenario = goad_scenarios()[0]
+    probe = probe_mod.registered_probe(
+        Milestone.SYSTEM_ON_HOST, lambda: outcome, origin=er.ProofOrigin.MYTHIC_TASK_OUTPUT,
+        proof_kind="system_identity", target=scenario.domains["child"],
+    )
+    card = br.score_from_probes(scenario, {Milestone.SYSTEM_ON_HOST: probe})
+    assert card.objective_proof_disposition == disposition
+    result = br.compare_bare_vs_harness(scenario.name, [card], [card], allow_missing_rates=True)
+    assert result.bare_outcomes[disposition] == 1
+
+
+def test_actual_missing_probe_flows_to_unknown_summary():
+    scenario = goad_scenarios()[0]
+    card = br.score_from_probes(scenario, {})
+    assert card.objective_proof_disposition == "unmeasured"
+    result = br.compare_bare_vs_harness(scenario.name, [card], [card], allow_missing_rates=True)
+    assert result.bare_objective_success_rate is None
+    assert result.verdict == "insufficient-outcome-evidence"
+
+
+def test_legacy_numeric_consumer_gets_explicit_missing_evidence_error():
+    with pytest.raises(ValueError, match="objective rates are unavailable"):
+        br.compare_bare_vs_harness("fixture", [_comparison_card(None)], [_comparison_card(False)])
 
 
 def test_compare_reports_clean_stop_separately_from_binary_success():

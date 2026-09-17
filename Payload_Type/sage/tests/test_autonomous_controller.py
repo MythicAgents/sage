@@ -767,6 +767,27 @@ def test_async_seam_timeout_halts_cleanly():
     assert r.status == ac.STATUS_BLOCKED, r.to_dict()
 
 
+def test_absolute_wall_deadline_clamps_a_longer_async_seam_timeout():
+    import asyncio as _asyncio
+    w = World({"remote-exec:braavos@essos.local"})
+
+    async def slow_execute(action):
+        await _asyncio.sleep(5.0)
+        return {"ok": True}
+
+    c = ac.AutonomousController(
+        observe=w.observe,
+        execute=slow_execute,
+        frontier_fn=lambda s: [FakeAction("adcs-certificate-auth", "b", effects=["da:essos.local"])],
+        config=ac.ControllerConfig(seam_timeout_s=10, wall_clock_budget_s=0.01),
+    )
+    started = __import__("time").monotonic()
+    r = run(c)
+    assert __import__("time").monotonic() - started < 1
+    assert r.status == ac.STATUS_NO_ACTION, r.to_dict()
+    assert "wall_clock_budget_s" in str(r.blocker)
+
+
 def test_budget_meter_failure_fails_closed():
     """Forge NEW-5: if the token/clock meter raises, the ceiling must fail CLOSED (halt), never silently
     disable the last-resort runaway guard."""

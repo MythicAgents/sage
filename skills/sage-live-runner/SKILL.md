@@ -33,6 +33,10 @@ evaluation consumers may select `--output-mode eval` to receive only the version
 evidence projection. Eval mode does not alter what Sage sees or what Mythic stores and displays.
 While a request is in flight, the runner now emits JSONL request-start/progress/terminal events on stderr so
 the channel ID, request ID, and evolving status are visible immediately without waiting for the terminal JSON.
+The observer deadline also bounds each status query. Expiration raises `RequestWaitTimeout` (a `TimeoutError`)
+and emits `request_wait_timeout`; this stops observation and does not attest that remote execution stopped.
+The exception retains the last observed snapshot for private evidence capture. Cancellation or independent
+quiescence verification remains a separate caller responsibility.
 Pass `--manifest-path <path>` to write a redacted demo manifest that binds clean/resumed status, runtime identity,
 range/snapshot context, callback/channel/request identity, tasks/proofs, and artifact hashes when those inputs are
 available. Allocate that path with `sage-artifact-retention` and record it after the run; a decision-bearing demo

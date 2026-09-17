@@ -1,4 +1,5 @@
 import dataclasses
+import pytest
 import sys
 from pathlib import Path
 
@@ -115,6 +116,74 @@ def test_domain_admin_requires_matched_allow_deny_differential():
             expected_target="branch.local",
         )
         assert result.disposition is er.ProofDisposition.INVALID
+
+
+@pytest.mark.parametrize("control_subject", [
+    "samwell@north.sevenkingdoms.local",
+    "administrator@north.sevenkingdoms.local",
+    "NORTH.SEVENKINGDOMS.LOCAL\\Administrator",
+])
+def test_objective_domain_admin_differential_allows_cross_domain_negative_control(control_subject):
+    observation = _observation(
+        Milestone.OBJECTIVE,
+        origin=er.ProofOrigin.MYTHIC_TASK_OUTPUT,
+        proof_kind="domain_admin_differential",
+        target="essos.local",
+        subject="administrator@essos.local",
+        envelope_id="operation-8-domain-sacl",
+        negative_control_denied=True,
+        control_target="essos.local",
+        control_subject=control_subject,
+        control_envelope_id="operation-8-domain-sacl",
+    )
+
+    result = er.admit_observation(
+        Milestone.OBJECTIVE,
+        observation,
+        expected_target="essos.local",
+    )
+
+    assert result.disposition is er.ProofDisposition.PROVEN
+
+
+def test_objective_domain_admin_differential_rejects_different_control_target():
+    observation = _observation(
+        Milestone.OBJECTIVE,
+        origin=er.ProofOrigin.MYTHIC_TASK_OUTPUT,
+        proof_kind="domain_admin_differential",
+        target="essos.local",
+        subject="administrator@essos.local",
+        envelope_id="operation-8-domain-sacl",
+        negative_control_denied=True,
+        control_target="north.sevenkingdoms.local",
+        control_subject="samwell@north.sevenkingdoms.local",
+        control_envelope_id="operation-8-domain-sacl",
+    )
+
+    result = er.admit_observation(
+        Milestone.OBJECTIVE,
+        observation,
+        expected_target="essos.local",
+    )
+
+    assert result.disposition is er.ProofDisposition.INVALID
+    assert result.reason == "domain-admin control target mismatch"
+
+
+@pytest.mark.parametrize("control_subject", [
+    "ADMINISTRATOR@ESSOS.LOCAL.", r"essos.local\Administrator", "administrator", "",
+])
+def test_objective_differential_rejects_same_or_unqualified_principal(control_subject):
+    observation = _observation(
+        Milestone.OBJECTIVE, origin=er.ProofOrigin.MYTHIC_TASK_OUTPUT,
+        proof_kind="domain_admin_differential", target="essos.local",
+        subject="administrator@essos.local", envelope_id="task-54",
+        negative_control_denied=True, control_target="essos.local",
+        control_subject=control_subject, control_envelope_id="task-54",
+    )
+    assert er.admit_observation(
+        Milestone.OBJECTIVE, observation, expected_target="essos.local",
+    ).disposition is er.ProofDisposition.INVALID
 
 
 def test_exact_binding_accepts_case_only_and_rejects_suffix_collision_class():

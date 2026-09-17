@@ -277,6 +277,43 @@ def test_gate1p_task_states_rejects_non_mapping_task_rows(monkeypatch):
         ls.mythic_operation_task_states(expected_operation_id=41)
 
 
+@pytest.mark.parametrize("operation", [42, None, True, "41"])
+def test_task_state_observer_rejects_response_operation_drift(monkeypatch, operation):
+    async def login():
+        return types.SimpleNamespace(current_operation_id=41)
+    async def query(*args, **kwargs):
+        return {"task": [{"operation_id": operation, "display_id": 3, "completed": True}]}
+    monkeypatch.setattr(ls, "_mythic_login_async_safe", login)
+    monkeypatch.setitem(sys.modules, "mythic", types.SimpleNamespace(
+        mythic=types.SimpleNamespace(execute_custom_query=query)))
+    with pytest.raises(RuntimeError, match="mismatched operation"):
+        ls.mythic_operation_task_states(expected_operation_id=41)
+
+
+@pytest.mark.parametrize("rows", [None, {}, [None], [{}],
+    [{"operation_id": 42, "display_id": 1, "completed": True}],
+    [{"operation_id": 41, "display_id": 1, "completed": "true"}],
+    [{"operation_id": 41, "display_id": True, "completed": True}],
+    [{"operation_id": 41, "display_id": 1, "completed": True}] * 2,
+])
+def test_quiescence_missing_malformed_or_foreign_evidence_is_unknown(rows):
+    result = ls.summarize_task_quiescence(rows, expected_operation_id=41)
+    assert result["task_quiescent"] is None
+    assert result["unknown_reason"]
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_quiescence_reports_observed_task_state(completed):
+    result = ls.summarize_task_quiescence([
+        {"operation_id": 41, "display_id": 3, "completed": completed,
+         "original_params": "PRIVATE CONTENT"}
+    ], expected_operation_id=41)
+    assert result["task_quiescent"] is completed
+    assert result["running_task_ids"] == ([] if completed else [3])
+    assert "PRIVATE CONTENT" not in str(result)
+    assert ls.summarize_task_quiescence([], expected_operation_id=41)["task_quiescent"] is True
+
+
 def test_parse_model_decision_final():
     assert ls.parse_model_decision(_Msg(content="objective complete")) == {"final": "objective complete"}
 

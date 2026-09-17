@@ -184,6 +184,7 @@ class ScoreCard:
     request_completed: bool = False
     objective_recognized: bool = False
     objective_proven: bool = False
+    objective_proof_disposition: str = "unmeasured"
     clean_stop: bool = False
     controller_terminal_reason: str = ""
     policy_mode: str = "unknown"
@@ -976,6 +977,11 @@ def score(
     _objective_reached = (
         _terminal is not None and _terminal != Milestone.FOOTHOLD and ground_truth.furthest == _terminal
     )
+    terminal_proof = getattr(ground_truth, "proof_results", {}).get(_terminal)
+    objective_proof_disposition = (
+        terminal_proof.disposition.value if terminal_proof is not None
+        else "proven" if _objective_reached else "unmeasured"
+    )
     status = str(r.get("status", "")).strip().casefold()
     request_completed = bool(
         r.get("request_completed")
@@ -1062,6 +1068,7 @@ def score(
         request_completed=request_completed,
         objective_recognized=objective_recognized,
         objective_proven=bool(_objective_reached),
+        objective_proof_disposition=objective_proof_disposition,
         clean_stop=clean_stop,
         controller_terminal_reason=str(r.get("controller_terminal_reason", "") or ""),
         policy_mode=str(r.get("policy_mode", "unknown") or "unknown"),

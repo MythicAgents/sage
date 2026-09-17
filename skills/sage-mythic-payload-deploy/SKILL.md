@@ -11,17 +11,43 @@ Use the bundled script for deterministic payload redeploys from Mythic into the 
 
 After rolling back the disk-only Apollo-staged snapshot and importing the retained callback config, open an RDP session as Samwell and run `launch-existing`. It starts the preserved `SageApolloBootstrap` task, waits for the retained callback check-in to advance, and disconnects the RDP session.
 
+Treat a staged foothold as one fixture, never as independently selected defaults. The qualified Trust Walker fixture is:
+
+- snapshot `sage-seed-apollo-v252-mythic4-20260829`;
+- retained config `skills/sage-callback-bootstrap/apollo_callback_config.json`, SHA-256 `d7ef31912788a78b46c45bdd05920ef3519b31ab298889f52348d41a2163fe82`, payload UUID `aef50036-02ad-4c7a-8786-7ca778281ad2`;
+- scheduled task `SageApolloBootstrap` in prelaunch state `Ready`;
+- executable `C:\Users\Public\apollo.exe`, SHA-256 `aea555ddff1b6f1941714fdffe7a760deb5058c20861965ab711c7aa19091b37`.
+
+Fail before starting the task if any identity differs. In particular, do not pair the mutable retained-config default
+with the older `sage-seed-apollo-staged-20260710` snapshot; that snapshot contains payload UUID
+`465d689e-6971-4811-96d7-da395f302223`, which the current retained Mythic metadata cannot accept.
+
 ## Canonical Apollo Bootstrap
 
-Use `deploy` only when a new payload must be transferred to a clean baseline. Use `launch-existing` when the
-snapshot already contains the staged Apollo file and `SageApolloBootstrap` task; rebuilding or restaging in that
-case adds noise and can create duplicate callback lanes.
+Choose the bootstrap mode from the range state and required Windows logon token. Caller environment does not
+choose the mode: a headless Codex or cron process can invoke the PTY-backed interactive launcher when the host has
+the required Xwayland/Xvfb display. If that prerequisite is absent and the benchmark requires an interactive token,
+stop before allocation instead of substituting batch logon.
 
-For retained or purpose-range footholds, use the one-command launcher with the uniqueness gate instead of rebuilding
-the RDP/Apollo sequence manually:
+| Range and payload state | Required token | Canonical entry point | Mythic payload download |
+|---|---|---|---|
+| Snapshot already contains Apollo plus `SageApolloBootstrap`; retained callback metadata is imported | Interactive benchmark foothold | `launch_apollo_foothold.sh` → `launch-existing` | Forbidden |
+| Clean baseline has no staged Apollo; a current Mythic payload has real downloadable bytes | Interactive foothold | `deploy --launch-method scheduled-task-interactive` | Required |
+| Current Mythic payload has real downloadable bytes and the operation explicitly accepts a batch-logon token | Batch-logon canary foothold | `sage-foothold-launch/scripts/foothold_launch.py launch` | Required |
+
+An imported retained-callback payload row may have an empty server-side file path. It is identity metadata for the
+already-staged executable, not a payload-download source. Never route that state through `deploy` or
+`mythic.download_payload`; use `launch-existing`.
+
+Before a live allocation starts, retain the snapshot, payload source (`snapshot` or `mythic-download`), required
+logon type, exact launcher entry point, whether a Mythic download is expected, callback settle window, and
+uniqueness requirement. On launcher failure, retain bounded stdout/stderr and the terminal phase before reducing
+the result to a generic reset error.
+
+For retained staged footholds, use the one-command interactive launcher with the uniqueness gate:
 
 ```bash
-skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh <target-ip> '<DOMAIN\user>' -- --ludus-range-id <range-id> --target-host <host> --callback-host <host> --callback-user <user> --callback-settle-seconds 90 --require-unique-callback
+skills/sage-mythic-payload-deploy/scripts/launch_apollo_foothold.sh <target-ip> '<DOMAIN\user>' -- --ludus-range-id <range-id> --target-host <host> --callback-host <host> --callback-user <user> --task-name SageApolloBootstrap --expected-task-state Ready --expected-remote-path 'C:\Users\Public\apollo.exe' --expected-remote-sha256 aea555ddff1b6f1941714fdffe7a760deb5058c20861965ab711c7aa19091b37 --callback-settle-seconds 90 --require-unique-callback
 ```
 
 The settle window is part of the evidence gate: if another matching callback appears during it, treat the attempt as

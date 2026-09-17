@@ -88,11 +88,31 @@ For a custom DreadGOAD-format purpose range, keep source validation and runtime 
 
 ## Order
 
+Before step 1, select and retain the bootstrap mode from
+`skills/sage-mythic-payload-deploy/SKILL.md`:
+
+- A pre-staged Apollo snapshot plus imported retained callback metadata uses the interactive
+  `launch_apollo_foothold.sh` → `launch-existing` path and performs no Mythic payload download.
+- A clean baseline without staged Apollo uses a newly built, verified-downloadable Mythic payload and `deploy`.
+- `sage-foothold-launch` is the batch-logon path only when the operation explicitly accepts that token type and
+  the selected Mythic payload has real downloadable bytes.
+
+Record the snapshot, payload source, token type, launcher, download expectation, settle window, and callback
+uniqueness rule before live allocation. Retain bounded launcher output on failure. Do not infer bootstrap mode from
+the caller being interactive or headless.
+
+For the qualified Trust Walker retained foothold, use the complete immutable fixture named in
+`skills/sage-mythic-payload-deploy/SKILL.md`. Validate its snapshot, config hash, payload UUID, task state,
+executable path, and executable hash together before starting the task.
+
 1. Stop local Sage before moving its databases:
 
 ```bash
 /bin/bash skills/sage-goad-reset/scripts/sage_stop.sh
 ```
+
+An absent `sage` tmux session is an idempotent already-stopped state. A present Sage process that survives the
+bounded interrupt sequence remains a hard failure.
 
 2. Archive the active databases. The helper moves them beside their originals as
    `sage_YYYYMMDD-HHMM.db` and `phoenix_YYYYMMDD-HHMM.db`. It never overwrites an existing archive:
@@ -110,7 +130,7 @@ For a custom DreadGOAD-format purpose range, keep source validation and runtime 
 4. Reset/verify GOAD, then wipe BloodHound and require zero domains before continuing:
 
 ```bash
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" wipe --yes
 ```
 
    The wipe command includes its own delayed verification and must finish with `available-domains: count=0`.
@@ -124,10 +144,11 @@ uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scri
 Any extra `KEY=VAL` positional args are applied as env overrides to the relaunched Sage, winning over the snapshotted env (last value wins). The eval-gauge Gate Experiment uses this to pin `SAGE_ENGAGEMENT_ID=<run token>` (and per-config settings) so Sage writes its ledger under the token the gauge reads — see `skills/sage-eval-gauge/SKILL.md`.
 The launcher is canonical for local Sage restarts: it always uses the repo virtualenv, reads
 `SAGE_BLOODHOUND_MCP_DIR` from the Sage runtime env (`Payload_Type/sage/.env`) and **fails closed** if it is
-still unset — it no longer guesses a sibling checkout — and records a redacted startup identity under
+still unset — it no longer guesses a sibling checkout — creates the maintained `sage` tmux session when it is
+absent, and records a redacted startup identity under
 `/tmp/sage_startup_identity.json` for later readiness/manifest inspection.
 
-6. Run:
+6. For a fresh clean baseline, run:
 
 ```bash
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset
@@ -137,7 +158,7 @@ still unset — it no longer guesses a sibling checkout — and records a redact
    empty locked AI channel named `Sage GOAD Ready`, then builds/downloads a fresh Apollo payload for the
    clean-baseline workflow. It does not create a Sage payload or callback.
 
-   For an intentional retained foothold reuse such as the current Merlin R-C2 flow, replace that command with:
+   For an intentional retained foothold reuse, replace that command with:
 
 ```bash
 .venv/bin/python skills/sage-callback-bootstrap/scripts/bootstrap_payloads.py bootstrap-reset --use-retained-callback --retained-callback-config skills/sage-callback-bootstrap/merlin_callback_config.json
@@ -145,12 +166,15 @@ still unset — it no longer guesses a sibling checkout — and records a redact
 
    This imports the exported callback config and stops before target-side payload execution. After the operator
    launches the retained payload, use `readiness --runtime-dbs-archived --foothold-payload-type merlin`.
-7. Open an RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then launch the fresh Apollo
+7. For the fresh clean-baseline mode, open an RDP session as `NORTH\samwell.tarly` on CASTELBLACK, then launch the fresh Apollo
    payload with `skills/sage-mythic-payload-deploy/scripts/deploy_payload_via_ludus.py deploy` using
    `--launch-method scheduled-task-interactive --add-defender-exclusion`. The exclusion is scoped to the staged
    bootstrap payload file, which defaults to `C:\Users\Public\apollo.exe`; without it, Defender quarantines stock
    Apollo on clean-baseline. After a new callback is observed, the deploy helper disconnects the RDP session with
    `tsdiscon` by default so the local RDP client exits without logging off Apollo's Windows session.
+
+   For a pre-staged snapshot, do not repeat this download/deploy step. Run the retained interactive launcher from
+   the bootstrap decision above so it starts the preserved `SageApolloBootstrap` task through `launch-existing`.
 8. Run:
 
 ```bash
@@ -227,8 +251,8 @@ Mythic, Apollo, or a PFX.
 ## BloodHound
 
 ```bash
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py wipe --yes
-uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python skills/sage-goad-reset/scripts/bh_reset.py status
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" wipe --yes
+uv --directory "$SAGE_BLOODHOUND_MCP_DIR" run python "$PWD/skills/sage-goad-reset/scripts/bh_reset.py" status
 ```
 
 The wipe is mandatory for every full reset. It waits 10 seconds before its first verification poll, then polls

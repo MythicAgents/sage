@@ -906,6 +906,9 @@ def launch_existing_scheduled_task_interactive(
     *,
     timeout_seconds: int,
     poll_interval: float,
+    expected_task_state: str | None = None,
+    expected_remote_path: str | None = None,
+    expected_remote_sha256: str | None = None,
 ) -> dict[str, Any]:
     session_info = wait_for_active_interactive_session(
         session,
@@ -913,7 +916,7 @@ def launch_existing_scheduled_task_interactive(
         timeout_seconds=timeout_seconds,
         poll_interval=poll_interval,
     )
-    script = f"""
+    inspect_script = f"""
 $ErrorActionPreference = 'Stop'
 $taskName = {ps_quote(task_name)}
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
@@ -924,6 +927,40 @@ $principalMatches = ($actualUser -eq $expectedUser) -or (($actualUser -notmatch 
 if (-not $principalMatches) {{
   throw "Task $taskName runs as $($task.Principal.UserId), expected {run_as_user}"
 }}
+$actions = @($task.Actions)
+if ($actions.Count -ne 1) {{ throw "Task $taskName has $($actions.Count) actions; expected exactly one" }}
+$execute = [Environment]::ExpandEnvironmentVariables([string]$actions[0].Execute)
+if (-not (Test-Path -LiteralPath $execute -PathType Leaf)) {{ throw "Task $taskName executable is missing" }}
+$fileHash = (Get-FileHash -LiteralPath $execute -Algorithm SHA256).Hash.ToLowerInvariant()
+[PSCustomObject]@{{
+  TaskName = $taskName
+  RunAsUser = $task.Principal.UserId
+  State = $task.State.ToString()
+  Execute = $execute
+  ExecutableSha256 = $fileHash
+}} | ConvertTo-Json -Compress
+"""
+    prelaunch = parse_json_object(run_ps(session, inspect_script)["stdout"]) or {}
+    if expected_task_state is not None and str(prelaunch.get("State") or "").casefold() != expected_task_state.casefold():
+        raise DeployError(
+            f"Task {task_name} state is {prelaunch.get('State')!r}, expected {expected_task_state!r}; refusing launch."
+        )
+    if expected_remote_path is not None:
+        observed_path = str(prelaunch.get("Execute") or "").replace("/", "\\").rstrip("\\").casefold()
+        wanted_path = expected_remote_path.replace("/", "\\").rstrip("\\").casefold()
+        if observed_path != wanted_path:
+            raise DeployError(
+                f"Task {task_name} executable path does not match the bound staged fixture; refusing launch."
+            )
+    if expected_remote_sha256 is not None:
+        observed_sha256 = str(prelaunch.get("ExecutableSha256") or "").casefold()
+        if observed_sha256 != expected_remote_sha256.casefold():
+            raise DeployError(
+                f"Task {task_name} executable hash does not match the bound staged fixture; refusing launch."
+            )
+    launch_script = f"""
+$ErrorActionPreference = 'Stop'
+$taskName = {ps_quote(task_name)}
 Start-ScheduledTask -TaskName $taskName
 Start-Sleep -Seconds 2
 $info = Get-ScheduledTaskInfo -TaskName $taskName
@@ -937,7 +974,8 @@ $task = Get-ScheduledTask -TaskName $taskName
   LastRunTime = $info.LastRunTime
 }} | ConvertTo-Json -Compress
 """
-    result = parse_json_object(run_ps(session, script)["stdout"]) or {}
+    result = parse_json_object(run_ps(session, launch_script)["stdout"]) or {}
+    result["prelaunch"] = prelaunch
     result["interactive_session"] = session_info
     return result
 
@@ -1489,6 +1527,9 @@ async def command_launch_existing(args: argparse.Namespace) -> None:
         args.run_as_user,
         timeout_seconds=args.wait_interactive_session_seconds,
         poll_interval=args.poll_interval,
+        expected_task_state=getattr(args, "expected_task_state", None),
+        expected_remote_path=getattr(args, "expected_remote_path", None),
+        expected_remote_sha256=getattr(args, "expected_remote_sha256", None),
     )
     callbacks_after, callback = await wait_for_callback_checkin_advance(
         client,
@@ -1690,6 +1731,9 @@ def build_parser() -> argparse.ArgumentParser:
     relaunch_parser.add_argument("--target-host", default="CASTELBLACK")
     relaunch_parser.add_argument("--target-ip", default=None)
     relaunch_parser.add_argument("--task-name", default="SageApolloBootstrap")
+    relaunch_parser.add_argument("--expected-task-state", default=None)
+    relaunch_parser.add_argument("--expected-remote-path", default=None)
+    relaunch_parser.add_argument("--expected-remote-sha256", default=None)
     relaunch_parser.add_argument("--run-as-user", default=r"NORTH\samwell.tarly")
     relaunch_parser.add_argument("--callback-host", default="CASTELBLACK")
     relaunch_parser.add_argument("--callback-user", default="samwell.tarly")

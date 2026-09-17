@@ -1869,6 +1869,14 @@ def test_build_model_kwargs_threads_eval_force_prefix_from_channel_config(monkey
     assert kwargs["eval_force_capability_prefix_json"] == raw
 
 
+def test_build_model_kwargs_threads_absolute_eval_deadline_from_channel_config():
+    req = build_chat_request("hi", config={"SAGE_EVAL_ARM_DEADLINE_EPOCH": "1789325100.25"})
+
+    kwargs = build_model_kwargs(req)
+
+    assert kwargs["eval_arm_deadline_epoch"] == 1789325100.25
+
+
 def test_channel_session_key_is_channel_id():
     req = build_chat_request("hi", channel_id=77)
     assert channel_session_key(req) == "77"

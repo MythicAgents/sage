@@ -437,6 +437,54 @@ def test_run_native_chat_turn_emits_request_identity_and_progress(monkeypatch):
     }
 
 
+def test_run_native_chat_turn_rejects_channel_route_before_prompt(monkeypatch):
+    messages = []
+
+    async def fake_channel(*args, **kwargs):
+        return {
+            "chat_channel_id": 10,
+            "chat_channel_name": "seed",
+            "api_token_id": 2,
+            "chat_runtime_identity": {
+                "provider": "openai",
+                "model": "wrong-model",
+                "route": "https://example.invalid",
+            },
+        }
+
+    async def fake_message(*args, **kwargs):
+        messages.append((args, kwargs))
+        return {"chat_message_id": 20, "chat_request_id": 30}
+
+    async def no_prepared_channel(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(native_chat, "create_locked_channel", fake_channel)
+    monkeypatch.setattr(native_chat, "find_prepared_channel", no_prepared_channel)
+    monkeypatch.setattr(native_chat, "create_message", fake_message)
+    monkeypatch.setattr(
+        native_chat,
+        "fetch_channel_runtime_identity",
+        lambda *_args: asyncio.sleep(0, result={
+            "provider": "openai",
+            "model": "wrong-model",
+            "route": "https://example.invalid",
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="before prompt"):
+        asyncio.run(native_chat.run_native_chat_turn(
+            object(),
+            "objective",
+            expected_runtime_identity={
+                "provider": "openai",
+                "model": "expected-model",
+                "route": "https://expected.invalid",
+            },
+        ))
+    assert messages == []
+
+
 def test_extract_runtime_telemetry_reads_terminal_metadata():
     telemetry = {
         "policy_mode": "llm",
@@ -567,6 +615,76 @@ def test_build_demo_manifest_fails_closed_on_missing_artifact(tmp_path):
             {"runtime_telemetry": {}},
             artifact_paths=[tmp_path / "missing.json"],
         )
+
+
+def test_wait_for_request_bounds_stalled_query_without_claiming_remote_stop(monkeypatch):
+    cancelled = []
+    events = []
+
+    async def stalled(*args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", stalled)
+
+    async def run():
+        waiter = asyncio.create_task(native_chat.wait_for_request(
+            object(), 7, timeout_seconds=0.01, progress_sink=events.append,
+        ))
+        done, pending = await asyncio.wait({waiter}, timeout=1)
+        if pending:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            pytest.fail("status query outlived the observer deadline")
+        with pytest.raises(native_chat.RequestWaitTimeout) as caught:
+            await waiter
+        assert caught.value.remote_stop_confirmed is False
+        assert caught.value.last_snapshot is None
+        assert caught.value.request_id == 7
+
+    asyncio.run(run())
+    assert cancelled == [True]
+    assert events == [{"event": "request_wait_timeout", "chat_request_id": 7,
+                       "remote_stop_confirmed": False}]
+
+
+def test_wait_for_request_retains_late_snapshot_without_accepting_completion(monkeypatch):
+    clock = {"now": 0.0}
+    snapshot = {"request": {"id": 7, "status": "complete"},
+                "messages": [{"content": "private observation"}]}
+
+    async def late(*args):
+        clock["now"] = 2.0
+        return snapshot
+
+    monkeypatch.setattr(native_chat.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", late)
+    with pytest.raises(native_chat.RequestWaitTimeout) as caught:
+        asyncio.run(native_chat.wait_for_request(object(), 7, timeout_seconds=1))
+    assert caught.value.last_snapshot == snapshot
+    assert caught.value.remote_stop_confirmed is False
+    assert "private observation" not in str(caught.value)
+
+
+def test_wait_for_request_keeps_last_snapshot_after_a_stalled_query(monkeypatch):
+    snapshot = {"request": {"id": 7, "status": "running"}, "messages": []}
+    calls = []
+
+    async def query(*args):
+        calls.append(True)
+        if len(calls) == 1:
+            return snapshot
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", query)
+    with pytest.raises(native_chat.RequestWaitTimeout) as caught:
+        asyncio.run(native_chat.wait_for_request(
+            object(), 7, timeout_seconds=0.02, poll_interval_seconds=0,
+        ))
+    assert caught.value.last_snapshot == snapshot
+    assert caught.value.remote_stop_confirmed is False
 
 
 def test_wait_for_request_emits_safe_heartbeat_and_metadata_changes(monkeypatch):

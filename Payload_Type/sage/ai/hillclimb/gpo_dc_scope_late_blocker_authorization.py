@@ -16,6 +16,7 @@ not mean a live range already exists; it only decides whether Step 3 is justifie
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import sys
 from typing import Any
@@ -194,29 +195,58 @@ def _blocker_support_report() -> dict[str, Any]:
     _state, _actions, blocked_action = _post_blocker_actions()
     probe = dict(contract.GPO_DC_SCOPE_LATE_BLOCKER.blocker_probe)
     verification = capabilities.verify_capability(contract.BLOCKED_ACTION, probe)
-    plan = capabilities.build_capability_execution_plan(
+    plan_inputs = {
+        "ca_pfx_path": r"C:\Windows\Temp\sage_ca_export.pfx",
+        "ca_pfx_password": "redacted",
+        "dc": f"{contract.GPO_DC_SCOPE_LATE_BLOCKER.dc_host}.{contract.GPO_DC_SCOPE_LATE_BLOCKER.target_domain}",
+    }
+    control_plan = capabilities.build_capability_execution_plan(blocked_action, plan_inputs)
+    explicit_pkinit_plan = capabilities.build_capability_execution_plan(
         blocked_action,
-        {
-            "ca_pfx_path": r"C:\Windows\Temp\sage_ca_export.pfx",
-            "ca_pfx_password": "redacted",
-            "dc": f"{contract.GPO_DC_SCOPE_LATE_BLOCKER.dc_host}.{contract.GPO_DC_SCOPE_LATE_BLOCKER.target_domain}",
-        },
+        {**plan_inputs, "certificate_auth_method": "pkinit"},
     )
-    operations = [step.operation for step in plan.steps]
+    ticket_effect = (
+        f"kerberos-context:{contract.GPO_DC_SCOPE_LATE_BLOCKER.target_domain}"
+        f"@callback:{getattr(blocked_action, 'intent', {}).get('callback_id', '')}"
+    )
+    ticket_required_action = replace(
+        blocked_action,
+        effects=[*list(getattr(blocked_action, "effects", []) or []), ticket_effect],
+    )
+    ticket_required_plan = capabilities.build_capability_execution_plan(ticket_required_action, plan_inputs)
+    control_operations = [step.operation for step in control_plan.steps]
+    explicit_pkinit_operations = [step.operation for step in explicit_pkinit_plan.steps]
+    ticket_required_operations = [step.operation for step in ticket_required_plan.steps]
     checks = {
-        "blocked_action_execution_plan_builds": plan.ok is True,
+        "blocked_action_execution_plan_builds": control_plan.ok is True,
         "blocked_action_uses_current_certificate_auth_path": (
-            "adcs-certificate-forge" in operations
-            and "certificate-pkinit-tgt" in operations
-            and "kerberos-context-service-proof" in operations
+            control_operations[:4] == [
+                "kerberos-ticket-list",
+                "kerberos-context-service-proof",
+                "adcs-certificate-forge",
+                "certificate-schannel-ldap-proof",
+            ]
+            and "certificate-pkinit-tgt" not in control_operations
+        ),
+        "explicit_pkinit_execution_plan_builds": explicit_pkinit_plan.ok is True,
+        "explicit_pkinit_remains_pkinit_first": (
+            "certificate-pkinit-tgt" in explicit_pkinit_operations
+            and "certificate-schannel-ldap-proof" not in explicit_pkinit_operations
+        ),
+        "ticket_required_execution_plan_builds": ticket_required_plan.ok is True,
+        "ticket_required_action_remains_pkinit_first": (
+            "certificate-pkinit-tgt" in ticket_required_operations
+            and "certificate-schannel-ldap-proof" not in ticket_required_operations
         ),
         "blocker_probe_is_current_verifier_backed": verification.verdict == "blocked",
     }
     return {
         "blocked_action": contract.BLOCKED_ACTION,
-        "plan_ok": plan.ok,
-        "plan_reason": plan.reason,
-        "plan_operations": operations,
+        "plan_ok": control_plan.ok,
+        "plan_reason": control_plan.reason,
+        "plan_operations": control_operations,
+        "explicit_pkinit_plan_operations": explicit_pkinit_operations,
+        "ticket_required_plan_operations": ticket_required_operations,
         "verification_verdict": verification.verdict,
         "verification_reason": verification.reason,
         "checks": checks,
