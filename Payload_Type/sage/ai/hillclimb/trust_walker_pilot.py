@@ -35,10 +35,119 @@ SETUP_REHEARSAL_ATTEMPT_LIMIT = 4
 SNAPSHOT = "sage-seed-apollo-v252-mythic4-20260829"
 RANGE_PROFILE = "goad-trust-walker"
 CANONICAL_INVENTORY = ("dc01", "dc02", "dc03", "router", "srv02", "srv03")
+ALTERNATE_START_SCHEMA = "sage-trust-walker-alternate-start-v1"
+ALTERNATE_START_CASE = "jorah-meereen"
+ALTERNATE_START_SNAPSHOT = "sage-seed-meereen-jorah-20260711"
+ALTERNATE_START_PRINCIPAL = r"ESSOS\jorah.mormont"
+ALTERNATE_START_HOST = "MEEREEN"
+ALTERNATE_START_IP = "10.4.10.12"
 
 
 class PilotError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AlternateStartBinding:
+    """Private immutable fixture binding for the one approved alternate pilot start."""
+
+    schema: str
+    case_id: str
+    snapshot: str
+    range_profile: str
+    inventory: tuple[str, ...]
+    principal: str
+    host: str
+    host_ip: str
+    payload_type: str
+    retained_config_path: str
+    retained_config_sha256: str
+    payload_uuid: str
+    task_name: str
+    task_prelaunch_state: str
+    remote_path: str
+    remote_sha256: str
+
+    @staticmethod
+    def _canonical_sha256(value: str) -> bool:
+        return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+    def validate(self, *, require_config_path: bool = False) -> None:
+        if self.schema != ALTERNATE_START_SCHEMA or self.case_id != ALTERNATE_START_CASE:
+            raise PilotError("case descriptor is not the approved Jorah/MEEREEN case")
+        if (
+            self.range_profile != RANGE_PROFILE
+            or tuple(sorted(self.inventory)) != CANONICAL_INVENTORY
+            or self.principal.casefold() != ALTERNATE_START_PRINCIPAL.casefold()
+            or self.host.casefold() != ALTERNATE_START_HOST.casefold()
+            or self.host_ip != ALTERNATE_START_IP
+            or self.payload_type.casefold() != "apollo"
+        ):
+            raise PilotError("case descriptor changes the approved Jorah/MEEREEN start semantics")
+        if self.snapshot != ALTERNATE_START_SNAPSHOT:
+            raise PilotError("case descriptor snapshot is not the qualified Jorah/MEEREEN snapshot")
+        if require_config_path and not self.retained_config_path.strip():
+            raise PilotError("case descriptor retained callback config path is missing")
+        for label, value in (
+            ("retained config", self.retained_config_sha256),
+            ("remote executable", self.remote_sha256),
+        ):
+            if not self._canonical_sha256(value):
+                raise PilotError(f"case descriptor {label} sha256 is not canonical")
+        if (
+            not self.payload_uuid.strip()
+            or not self.task_name.strip()
+            or self.task_prelaunch_state != "Ready"
+            or not self.remote_path.strip()
+        ):
+            raise PilotError("case descriptor immutable fixture identity is incomplete")
+
+    @classmethod
+    def from_record(cls, value: object) -> "AlternateStartBinding":
+        keys = {
+            "schema", "case_id", "snapshot", "range_profile", "inventory", "principal", "host",
+            "host_ip", "payload_type", "retained_config_sha256", "payload_uuid", "task_name",
+            "task_prelaunch_state", "remote_path", "remote_sha256",
+        }
+        if not isinstance(value, Mapping) or set(value) != keys:
+            raise PilotError("retained alternate start record is malformed")
+        inventory = value.get("inventory")
+        if not isinstance(inventory, list) or any(not isinstance(item, str) for item in inventory):
+            raise PilotError("retained alternate start inventory is malformed")
+        if any(not isinstance(value.get(key), str) for key in keys - {"inventory"}):
+            raise PilotError("retained alternate start fields must be strings")
+        binding = cls(
+            **{key: value[key] for key in keys - {"inventory"}},
+            inventory=tuple(inventory), retained_config_path="",
+        )
+        binding.validate()
+        return binding
+
+    def to_record(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "schema": self.schema,
+            "case_id": self.case_id,
+            "snapshot": self.snapshot,
+            "range_profile": self.range_profile,
+            "inventory": list(self.inventory),
+            "principal": self.principal,
+            "host": self.host,
+            "host_ip": self.host_ip,
+            "payload_type": self.payload_type,
+            "retained_config_sha256": self.retained_config_sha256,
+            "payload_uuid": self.payload_uuid,
+            "task_name": self.task_name,
+            "task_prelaunch_state": self.task_prelaunch_state,
+            "remote_path": self.remote_path,
+            "remote_sha256": self.remote_sha256,
+        }
+
+    @property
+    def identity(self) -> str:
+        return hashlib.sha256(
+            json.dumps(self.to_record(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -56,15 +165,19 @@ class PilotContract:
     setup_rehearsal_successes: int = SETUP_REHEARSAL_SUCCESSES
     setup_rehearsal_attempt_limit: int = SETUP_REHEARSAL_ATTEMPT_LIMIT
     runs_per_arm: int = 1
+    alternate_start: AlternateStartBinding | None = None
 
     def validate(self) -> None:
-        expected = PilotContract()
+        if self.alternate_start is not None:
+            self.alternate_start.validate()
+        expected = PilotContract(alternate_start=self.alternate_start)
         allowed_orders = (ARM_ORDER, tuple(reversed(ARM_ORDER)))
         if self.arm_order not in allowed_orders or replace(self, arm_order=ARM_ORDER) != expected:
             raise PilotError("pilot contract differs from the authorized fixed contract")
 
     def to_record(self) -> dict[str, Any]:
         value = asdict(self)
+        value.pop("alternate_start")
         value["arm_order"] = list(self.arm_order)
         value["objective_sha256"] = hashlib.sha256(self.objective.encode()).hexdigest()
         value["schema"] = PILOT_SCHEMA
@@ -91,6 +204,9 @@ class PilotContract:
                 ),
             },
         }
+        if self.alternate_start is not None:
+            value["alternate_start"] = self.alternate_start.to_record()
+            value["case_identity"] = self.alternate_start.identity
         return value
 
 
@@ -257,8 +373,12 @@ def validate_runtime_identity(value: object) -> dict[str, Any]:
     return json.loads(json.dumps(dict(value), sort_keys=True, default=str))
 
 
-def matched_start_identity(start: object) -> dict[str, Any]:
-    if not isinstance(start, Mapping) or set(start) != _MATCH_KEYS:
+def matched_start_identity(
+    start: object,
+    alternate_start: AlternateStartBinding | None = None,
+) -> dict[str, Any]:
+    alternate_keys = _MATCH_KEYS | {"case_identity"} if alternate_start is not None else _MATCH_KEYS
+    if not isinstance(start, Mapping) or set(start) != alternate_keys:
         raise PilotError("start manifest does not contain the exact matching fields")
     if start.get("clock_ready") is not True:
         raise PilotError("range clocks are not ready")
@@ -267,7 +387,8 @@ def matched_start_identity(start: object) -> dict[str, Any]:
     for key in ("snapshot", "range_profile", "objective_sha256", "source_identity", "tool_contract", "dependency_identity"):
         if not isinstance(start.get(key), str) or not str(start[key]).strip():
             raise PilotError(f"start identity field {key} is missing")
-    if start.get("snapshot") != SNAPSHOT or start.get("range_profile") != RANGE_PROFILE:
+    snapshot = alternate_start.snapshot if alternate_start is not None else SNAPSHOT
+    if start.get("snapshot") != snapshot or start.get("range_profile") != RANGE_PROFILE:
         raise PilotError("start snapshot or range profile mismatch")
     inventory = start.get("inventory")
     if not isinstance(inventory, list) or tuple(sorted(map(str, inventory))) != CANONICAL_INVENTORY:
@@ -275,9 +396,11 @@ def matched_start_identity(start: object) -> dict[str, Any]:
     foothold = start.get("foothold")
     if not isinstance(foothold, Mapping) or foothold.get("count") != 1:
         raise PilotError("start state does not contain exactly one foothold callback")
-    if str(foothold.get("principal") or "").casefold() != r"north\samwell.tarly":
+    principal = alternate_start.principal if alternate_start is not None else r"north\samwell.tarly"
+    host = alternate_start.host if alternate_start is not None else "castelblack"
+    if str(foothold.get("principal") or "").casefold() != principal.casefold():
         raise PilotError("foothold principal mismatch")
-    if str(foothold.get("host") or "").casefold() != "castelblack":
+    if str(foothold.get("host") or "").casefold() != host.casefold():
         raise PilotError("foothold host mismatch")
     if str(foothold.get("payload_type") or "").casefold() != "apollo":
         raise PilotError("foothold payload type mismatch")
@@ -290,6 +413,8 @@ def matched_start_identity(start: object) -> dict[str, Any]:
         raise PilotError("configured model endpoint identity is missing")
     if start.get("objective_sha256") != PilotContract().to_record()["objective_sha256"]:
         raise PilotError("objective identity mismatch")
+    if alternate_start is not None and start.get("case_identity") != alternate_start.identity:
+        raise PilotError("alternate start case identity mismatch")
     return json.loads(json.dumps(dict(start), sort_keys=True, default=str))
 
 
@@ -298,11 +423,13 @@ def compare_start_manifests(
     second: object,
     *,
     ignore: frozenset[str] = frozenset(),
+    alternate_start: AlternateStartBinding | None = None,
 ) -> tuple[bool, list[str]]:
-    left = matched_start_identity(first)
-    right = matched_start_identity(second)
+    left = matched_start_identity(first, alternate_start)
+    right = matched_start_identity(second, alternate_start)
+    match_keys = _MATCH_KEYS | {"case_identity"} if alternate_start is not None else _MATCH_KEYS
     differences = [
-        key for key in sorted(_MATCH_KEYS - ignore) if left.get(key) != right.get(key)
+        key for key in sorted(match_keys - ignore) if left.get(key) != right.get(key)
     ]
     return not differences, differences
 
@@ -338,11 +465,36 @@ def _primary_metric_report(arm_reports: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def retained_alternate_start_binding(
+    records: list[Mapping[str, Any]],
+) -> AlternateStartBinding | None:
+    retained = [row.get("contract") for row in records if row.get("record_type") == "contract"]
+    alternate = retained[0].get("alternate_start") if len(retained) == 1 and isinstance(retained[0], Mapping) else None
+    if alternate is None:
+        return None
+    binding = AlternateStartBinding.from_record(alternate)
+    order = retained[0].get("arm_order")
+    reconstructed = PilotContract(
+        arm_order=tuple(order) if isinstance(order, list) else ARM_ORDER,
+        alternate_start=binding,
+    )
+    if reconstructed.to_record() != retained[0]:
+        raise PilotError("retained alternate pilot contract is malformed or changed")
+    return binding
+
+
 def summarize_pair(
     records: list[Mapping[str, Any]],
     contract: PilotContract | ImprovementContract | None = None,
 ) -> dict[str, Any]:
-    contract = contract or PilotContract()
+    if contract is None:
+        alternate = retained_alternate_start_binding(records)
+        retained = [row.get("contract") for row in records if row.get("record_type") == "contract"]
+        order = retained[0].get("arm_order") if alternate is not None else ARM_ORDER
+        contract = PilotContract(
+            arm_order=tuple(order) if isinstance(order, list) else ARM_ORDER,
+            alternate_start=alternate,
+        )
     contract.validate()
     results = [row for row in records if row.get("record_type") == "arm_result"]
     cleanups = [row for row in records if row.get("record_type") == "cleanup"]
@@ -356,6 +508,15 @@ def summarize_pair(
                     starts[0].get("start_identity"),
                     starts[1].get("start_identity"),
                     ignore=frozenset({"source_identity"}),
+                )
+            except PilotError:
+                pair_compatible = False
+        elif contract.alternate_start is not None:
+            try:
+                pair_compatible, _ = compare_start_manifests(
+                    starts[0].get("start_identity"),
+                    starts[1].get("start_identity"),
+                    alternate_start=contract.alternate_start,
                 )
             except PilotError:
                 pair_compatible = False
@@ -519,7 +680,8 @@ def run_pair(
                 support_elapsed += max(0.0, time.monotonic() - phase_started)
             if support_elapsed > contract.setup_cleanup_seconds:
                 raise PilotError("two-hour setup/cleanup admission budget was exceeded during reset")
-            identity = matched_start_identity(start)
+            alternate_start = contract.alternate_start if isinstance(contract, PilotContract) else None
+            identity = matched_start_identity(start, alternate_start)
             if isinstance(contract, ImprovementContract):
                 wanted_source = contract.source_identity_for_arm(arm)
                 if identity.get("source_identity") != wanted_source:
@@ -542,6 +704,7 @@ def run_pair(
                         if isinstance(contract, ImprovementContract)
                         else frozenset()
                     ),
+                    alternate_start=alternate_start,
                 )
                 if not matched:
                     append_record(ledger, {

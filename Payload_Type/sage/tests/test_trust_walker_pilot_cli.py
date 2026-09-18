@@ -15,6 +15,7 @@ import pytest
 
 from ai.hillclimb.trust_walker_outcome import classify_terminal_snapshot
 from ai.hillclimb.trust_walker_pilot import summarize_pair
+from ai.hillclimb import trust_walker_pilot as pilot
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "skills" / "sage-eval-gauge" / "scripts" / "run_trust_walker_pilot.py"
@@ -22,6 +23,211 @@ SPEC = importlib.util.spec_from_file_location("trust_walker_pilot_cli", SCRIPT)
 cli = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(cli)
+
+
+def retained_native_pair(tmp_path, monkeypatch, contract=None):
+    """Exercise the real pair/observer producer with synthetic control-plane responses."""
+    contract = contract or cli.PilotContract()
+    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
+    monkeypatch.setattr(cli.live_seams, "bloodhound_domain_count", lambda **_kw: 0)
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+
+    def reset(arm, _env):
+        runtime.current_arm = arm
+        runtime.current_started_at = datetime(2026, 9, 13, 12 + contract.arm_order.index(arm), tzinfo=UTC)
+        runtime.current_deadline_at = runtime.current_started_at + timedelta(seconds=contract.wall_seconds)
+        start = setup_start()
+        if isinstance(contract, cli.ImprovementContract):
+            start["source_identity"] = contract.source_identity_for_arm(arm)
+        elif contract.alternate_start:
+            alternate = contract.alternate_start
+            start.update(snapshot=alternate.snapshot, case_identity=alternate.identity)
+            start["foothold"].update(principal=alternate.principal, host=alternate.host)
+        return start
+
+    def observation(*_args):
+        timestamp = (runtime.current_started_at + timedelta(seconds=10)).isoformat()
+        return {
+            "task": [{
+                "operation_id": 8, "display_id": 1, "command_name": "whoami",
+                "display_params": "", "original_params": "", "completed": True, "status": "completed",
+                "timestamp": timestamp, "status_timestamp_preprocessing": timestamp,
+                "status_timestamp_submitted": timestamp, "status_timestamp_processing": timestamp,
+                "status_timestamp_processed": timestamp, "callback": {"domain": "ESSOS"},
+                "responses": [{
+                    "id": 2, "sequence_number": 1, "timestamp": timestamp,
+                    "response_text": base64.b64encode(b"synthetic-native-body-do-not-print").decode(),
+                }],
+            }],
+            "credential": [{
+                "operation_id": 8, "id": 3, "task_id": 1, "timestamp": timestamp,
+                "account": "krbtgt", "realm": "essos.local",
+                "credential_text": "synthetic-credential-do-not-print",
+            }] if runtime.current_arm == contract.arm_order[0] else [],
+            "callback": [{"operation_id": 8, "display_id": 4}],
+        }
+
+    runtime._operation_snapshot = observation
+
+    def run_arm(*_args):
+        return {
+            "arm_started_at": runtime.current_started_at.isoformat(),
+            "arm_deadline_at": runtime.current_deadline_at.isoformat(),
+            "termination": "done", "protocol_error": False, "resource_complete": True,
+            "cost": {"model_calls": 1, "total_tokens": 10, "payload_tasks": 1},
+            "response_records": [{"response_index": 1, "effective_backend": cli.EXPECTED_BACKEND, "total_tokens": 10}],
+            "task_budget": {"limit": 100, "reservations": 1, "confirmed_task_ids": [1]},
+        }
+
+    dependencies = cli.PilotDependencies(
+        preflight=lambda *_: {"ready": True}, reset=reset,
+        runtime_identity=lambda: {"operation_id": 8, "callback_id": 4}, run_arm=run_arm,
+        stop_and_settle=lambda _a, _s, execution: {"complete": True, "execution": execution},
+        observe=runtime.observe, teardown=lambda *_: {"complete": True},
+        attest_preserved_state=lambda *_: {"complete": False},
+    )
+    cli.run_pair(contract, tmp_path, dependencies)
+    return cli.read_records(tmp_path / "pilot.jsonl")
+
+
+@pytest.mark.parametrize("kind", ["default", "reverse", "alternate", "improvement"])
+def test_offline_replay_reconstructs_produced_pair_without_live_dependencies(tmp_path, monkeypatch, capsys, kind):
+    contract = cli.PilotContract()
+    if kind == "reverse":
+        contract = cli.PilotContract(arm_order=tuple(reversed(cli.ARM_ORDER)))
+    elif kind == "alternate":
+        descriptor, _ = write_alternate_descriptor(tmp_path)
+        contract = cli.PilotContract(alternate_start=cli._load_alternate_start(descriptor))
+    elif kind == "improvement":
+        contract = cli.ImprovementContract(baseline_source_identity="a" * 64, candidate_source_identity="b" * 64)
+    records = retained_native_pair(tmp_path, monkeypatch, contract)
+    before = (tmp_path / "pilot.jsonl").read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("offline replay attempted a live dependency")
+
+    for name in ("_runtime", "_route", "_orchestrate", "_resolve_live_authority", "_safe_command"):
+        monkeypatch.setattr(cli, name, forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(cli.RuntimePilot, "__init__", forbidden)
+    assert cli.main(["replay-pair", "--artifact-dir", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    assert report["reproduced"] is True
+    assert [arm["outcome"]["disposition"] for arm in report["arms"]] == ["proven", "disproven"]
+    assert all(report["dimensions"].values())
+    assert report["arms"][0]["outcome"]["accepted_proof"]["observation"]["observation_id"] == "operation-8-credential-3"
+    assert "synthetic-credential-do-not-print" not in output
+    assert "synthetic-native-body-do-not-print" not in output
+    assert (tmp_path / "pilot.jsonl").read_bytes() == before
+    assert len([row for row in records if row["record_type"] == "arm_result"]) == 2
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing", "hash", "arm", "operation", "query", "swap", "native-operation", "duplicate-task",
+    "late-response", "credential", "outcome", "cost", "comparison", "contract", "duplicate-result",
+])
+def test_offline_replay_rejects_changed_or_misbound_evidence(tmp_path, monkeypatch, capsys, mutation):
+    records = retained_native_pair(tmp_path, monkeypatch)
+    results = [row for row in records if row["record_type"] == "arm_result"]
+    result = results[0]
+    native = result["terminal_snapshot"]["native_evidence"]
+    path = Path(native["path"])
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "hash":
+        path.write_text("{}")
+    elif mutation in {"arm", "operation", "query"}:
+        native[{"arm": "arm", "operation": "operation_id", "query": "query_sha256"}[mutation]] = "wrong"
+    elif mutation == "swap":
+        other = results[1]["terminal_snapshot"]["native_evidence"]
+        native.update(path=other["path"], sha256=other["sha256"])
+    elif mutation in {"native-operation", "duplicate-task", "late-response", "credential"}:
+        observed = json.loads(path.read_text())
+        if mutation == "native-operation":
+            observed["callback"][0]["operation_id"] = 9
+        elif mutation == "duplicate-task":
+            observed["task"].append(observed["task"][0])
+        elif mutation == "late-response":
+            observed["credential"][0]["timestamp"] = "2026-09-13T12:46:00+00:00"
+        else:
+            observed["credential"][0]["credential_text"] = "changed-synthetic-material"
+        path.write_text(json.dumps(observed))
+        native["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif mutation == "outcome":
+        result["outcome"]["disposition"] = "disproven"
+    elif mutation == "cost":
+        result["execution"]["cost"]["total_tokens"] += 1
+    elif mutation == "comparison":
+        next(row for row in records if row["record_type"] == "comparison")["protocol_valid"] = False
+    elif mutation == "contract":
+        records[0]["contract"]["wall_seconds"] += 1
+    elif mutation == "duplicate-result":
+        records.append(result)
+    (tmp_path / "pilot.jsonl").write_text("\n".join(json.dumps(row) for row in records) + "\n")
+    assert cli.main(["replay-pair", "--artifact-dir", str(tmp_path)]) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output)["reproduced"] is False
+    assert "synthetic-credential-do-not-print" not in output
+
+
+def test_external_native_capture_is_explicit_and_cannot_override_observer_binding(tmp_path, monkeypatch):
+    records = retained_native_pair(tmp_path, monkeypatch)
+    results = [row for row in records if row["record_type"] == "arm_result"]
+    manifest = tmp_path / "captures.json"
+    manifest.write_text(json.dumps({
+        "schema": "sage-native-mythic-evidence-capture-receipt-v1",
+        "query_sha256": hashlib.sha256(cli.TASK_OUTPUT_QUERY.encode()).hexdigest(),
+        "captures": [row["terminal_snapshot"]["native_evidence"] for row in results],
+    }))
+    with pytest.raises(cli.PilotError, match="cannot replace"):
+        cli.replay_pair(tmp_path, manifest)
+    for row in results:
+        row["terminal_snapshot"].pop("native_evidence")
+    (tmp_path / "pilot.jsonl").write_text("\n".join(json.dumps(row) for row in records) + "\n")
+    with pytest.raises(cli.PilotError, match="original native evidence is missing"):
+        cli.replay_pair(tmp_path)
+    replay = cli.replay_pair(tmp_path, manifest)
+    assert replay["reproduced"] is True
+    assert all(row["binding"] == "external_capture_manifest" for row in replay["arms"])
+
+
+def test_native_retention_never_overwrites_and_is_private_before_publish(tmp_path, monkeypatch):
+    original_link = cli.os.link
+    staged_modes = []
+
+    def inspect_link(source, destination):
+        staged_modes.append(Path(source).stat().st_mode & 0o777)
+        return original_link(source, destination)
+
+    monkeypatch.setattr(cli.os, "link", inspect_link)
+    path = tmp_path / "native.json"
+    cli._retain_native_observation(path, {"task": []})
+    original = path.read_bytes()
+    with pytest.raises(FileExistsError):
+        cli._retain_native_observation(path, {"task": ["different"]})
+    assert path.read_bytes() == original
+    assert staged_modes == [0o600, 0o600]
+    assert not list(tmp_path.glob(".native-observation-*"))
+
+
+def test_native_retention_survives_projection_failure(tmp_path, monkeypatch):
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path
+    runtime.current_client = object()
+    runtime.current_operation_id = 8
+    runtime._operation_snapshot = lambda *_: {"task": [], "callback": [], "credential": []}
+
+    def fail(**_kw):
+        raise RuntimeError("synthetic BloodHound failure")
+
+    monkeypatch.setattr(cli.live_seams, "bloodhound_domain_count", fail)
+    with pytest.raises(RuntimeError, match="synthetic BloodHound"):
+        runtime.observe("shipping-sage", {}, {}, {})
+    assert json.loads((tmp_path / "shipping-sage-native-observation.json").read_text()) == runtime._operation_snapshot()
 
 
 def setup_start(**changes):
@@ -50,6 +256,68 @@ def setup_start(**changes):
     }
     value.update(changes)
     return value
+
+
+def write_alternate_descriptor(tmp_path: Path, **changes) -> tuple[Path, Path]:
+    config = tmp_path / "jorah-config.json"
+    config.write_text(json.dumps({
+        "config": {"payload": {"uuid": "11111111-2222-3333-4444-555555555555"}},
+    }), encoding="utf-8")
+    descriptor = {
+        "schema": cli.ALTERNATE_START_SCHEMA,
+        "case_id": "jorah-meereen",
+        "snapshot": "sage-seed-meereen-jorah-20260711",
+        "range_profile": cli.RANGE_PROFILE,
+        "inventory": list(cli.CANONICAL_INVENTORY),
+        "principal": r"ESSOS\jorah.mormont",
+        "host": "MEEREEN",
+        "host_ip": "10.4.10.12",
+        "payload_type": "apollo",
+        "retained_config": {
+            "path": str(config),
+            "sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "payload_uuid": "11111111-2222-3333-4444-555555555555",
+        },
+        "staged_executable": {
+            "task_name": "SageApolloJorahBootstrap",
+            "task_prelaunch_state": "Ready",
+            "remote_path": r"C:\Users\Public\apollo.exe",
+            "sha256": "b" * 64,
+        },
+    }
+    for key, value in changes.items():
+        if "." in key:
+            section, field = key.split(".", 1)
+            descriptor[section][field] = value
+        else:
+            descriptor[key] = value
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(descriptor), encoding="utf-8")
+    return path, config
+
+
+def write_orphaned_setup(root: Path, authority_id: str, contract=None) -> None:
+    preflight = {
+        "record_type": "setup_preflight", "ready": True,
+        "live_authority_id": authority_id, "setup_cleanup_elapsed_seconds": 0.0,
+    }
+    if contract is not None:
+        preflight["contract"] = contract.to_record()
+    cli.append_record(root / "setup-rehearsals.jsonl", preflight)
+    cli.append_record(root / "setup-rehearsals.jsonl", {
+        "record_type": "setup_attempted", "attempt": 1, "rehearsal_id": "setup-rehearsal-1",
+    })
+    (root / "attempt-001-abort-report.json").write_text(json.dumps({
+        "schema": "sage-trust-walker-setup-rehearsal-abort-v1",
+        "authority_id": authority_id,
+        "attempt": 1,
+        "disposition": "stopped_before_reset_mutation",
+        "resource_and_activity_counts": {
+            "setup_attempts_consumed": 1, "model_provider_calls": 0,
+            "measured_arms_started": 0, "readiness_payload_tasks": 0,
+        },
+        "continuation": {"performed": False},
+    }), encoding="utf-8")
 
 
 def standing_authority_document(*contracts, status="active", endpoint_identity="e" * 64):
@@ -93,6 +361,131 @@ def write_standing_authority(path: Path, *contracts, **changes) -> dict:
     document.update(changes)
     path.write_text(json.dumps(document), encoding="utf-8")
     return document
+
+
+def test_alternate_descriptor_plan_binds_normalized_identity_without_private_path(tmp_path, capsys):
+    descriptor, config = write_alternate_descriptor(tmp_path)
+
+    code = cli.main(["plan", "--case-descriptor", str(descriptor)])
+    output = capsys.readouterr().out
+    result = json.loads(output)
+
+    assert code == 0
+    assert result["contract"]["alternate_start"]["principal"] == r"ESSOS\jorah.mormont"
+    assert result["contract"]["case_identity"]
+    assert str(config) not in output
+
+
+def test_alternate_plan_actual_cli_positive_and_semantic_negative(tmp_path):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    positive = subprocess.run(
+        [sys.executable, str(SCRIPT), "plan", "--case-descriptor", str(descriptor)],
+        cwd=cli.ROOT, text=True, capture_output=True, timeout=30,
+    )
+    wrong, _config = write_alternate_descriptor(tmp_path, principal=r"ESSOS\other.user")
+    negative = subprocess.run(
+        [sys.executable, str(SCRIPT), "plan", "--case-descriptor", str(wrong)],
+        cwd=cli.ROOT, text=True, capture_output=True, timeout=30,
+    )
+
+    assert positive.returncode == 0
+    assert json.loads(positive.stdout)["contract"]["case_identity"]
+    assert negative.returncode != 0
+    assert "changes the approved Jorah/MEEREEN start semantics" in negative.stdout
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"principal": r"ESSOS\other.user"}, "start semantics"),
+        ({"host": "BRAAVOS"}, "start semantics"),
+        ({"snapshot": cli.SNAPSHOT}, "qualified Jorah/MEEREEN snapshot"),
+        ({"range_profile": "another-profile"}, "start semantics"),
+        ({"retained_config.sha256": "A" * 64}, "canonical"),
+        ({"staged_executable.task_prelaunch_state": "Running"}, "incomplete"),
+    ],
+)
+def test_alternate_descriptor_rejects_near_match_semantics(tmp_path, change, reason):
+    descriptor, _config = write_alternate_descriptor(tmp_path, **change)
+
+    with pytest.raises(cli.PilotError, match=reason):
+        cli._load_alternate_start(descriptor)
+
+
+def test_alternate_fixture_rechecks_retained_config_hash(tmp_path):
+    descriptor, config = write_alternate_descriptor(tmp_path)
+    binding = cli._load_alternate_start(descriptor)
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["unqualified_change"] = True
+    config.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(cli.PilotError, match="config hash mismatch"):
+        cli._staged_foothold_fixture(cli.ROOT, binding)
+
+
+def test_alternate_fixture_rechecks_payload_uuid(tmp_path):
+    descriptor, _config = write_alternate_descriptor(
+        tmp_path, **{"retained_config.payload_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+    )
+    binding = cli._load_alternate_start(descriptor)
+
+    with pytest.raises(cli.PilotError, match="payload UUID mismatch"):
+        cli._staged_foothold_fixture(cli.ROOT, binding)
+
+
+def test_alternate_case_rejects_old_standing_authority_before_runtime(tmp_path, monkeypatch, capsys):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    authority = tmp_path / "standing.json"
+    write_standing_authority(authority, cli.PilotContract())
+    monkeypatch.setattr(cli, "_runtime", lambda *_args: pytest.fail("runtime was created"))
+
+    code = cli.main([
+        "run-pair", "--case-descriptor", str(descriptor),
+        "--artifact-dir", str(tmp_path / "attempt"),
+        "--protected-manifest", str(tmp_path / "protected.json"),
+        "--route-smoke", str(tmp_path / "route.json"),
+        "--live-authority-file", str(authority),
+    ])
+
+    assert code == 1
+    assert "cannot authorize the alternate" in capsys.readouterr().out
+
+
+def test_alternate_setup_rehearsal_requires_two_compatible_case_starts(tmp_path, monkeypatch):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    binding = cli._load_alternate_start(descriptor)
+    contract = cli.PilotContract(alternate_start=binding)
+
+    class Runtime:
+        current_reset_started = False
+        live_authority_id = "alternate-authority"
+
+        def preflight(self, _contract):
+            return {"ready": True, "live_authority_id": self.live_authority_id, "contract": contract.to_record()}
+
+        def reset(self, _arm, _env):
+            self.current_reset_started = True
+            start = setup_start(snapshot=binding.snapshot, foothold={
+                "count": 1, "principal": binding.principal,
+                "host": binding.host, "payload_type": binding.payload_type,
+            })
+            start["case_identity"] = binding.identity
+            return start
+
+        def runtime_identity(self):
+            return {"operation_id": 8, "callback_id": 4}
+
+        def teardown(self, *_args):
+            self.current_reset_started = False
+            return {"complete": True}
+
+    monkeypatch.setattr(cli, "validate_artifact_dir", lambda _path: tmp_path / "setup")
+    result = cli.run_setup_rehearsals(Runtime(), contract, tmp_path)
+
+    assert result["complete"] is True
+    records = cli.read_records(tmp_path / "setup" / "setup-rehearsals.jsonl")
+    starts = [row["start_identity"] for row in records if row.get("record_type") == "setup_attempt"]
+    assert [start["case_identity"] for start in starts] == [binding.identity, binding.identity]
 
 
 def test_standing_authority_accepts_successor_identities_and_returns_safe_receipt(tmp_path):
@@ -378,6 +771,31 @@ def test_setup_rehearsal_continuation_counts_orphaned_attempt_and_allows_only_th
     assert recovered[0]["cleanup"]["state"] == "not_required_no_mutation"
 
 
+def test_alternate_setup_continuation_rejects_orphan_without_recorded_case_contract(tmp_path):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    contract = cli.PilotContract(alternate_start=cli._load_alternate_start(descriptor))
+    write_orphaned_setup(tmp_path, "alternate-authority")
+
+    with pytest.raises(cli.PilotError, match="exact orphaned attempt-1 ledger"):
+        cli._setup_continuation_state(
+            tmp_path, cli.read_records(tmp_path / "setup-rehearsals.jsonl"),
+            "alternate-authority", contract,
+        )
+
+
+def test_alternate_setup_continuation_accepts_exact_recorded_case_contract(tmp_path):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    contract = cli.PilotContract(alternate_start=cli._load_alternate_start(descriptor))
+    write_orphaned_setup(tmp_path, "alternate-authority", contract)
+
+    attempt, elapsed, _report = cli._setup_continuation_state(
+        tmp_path, cli.read_records(tmp_path / "setup-rehearsals.jsonl"),
+        "alternate-authority", contract,
+    )
+
+    assert (attempt, elapsed) == (2, 0.0)
+
+
 def test_setup_rehearsal_continuation_rejects_missing_abort_report(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "validate_artifact_dir", lambda _path: tmp_path)
     cli.append_record(tmp_path / "setup-rehearsals.jsonl", {
@@ -488,6 +906,28 @@ def test_staged_snapshot_uses_interactive_launch_existing_path(retained_callback
     assert argv[argv.index("--expected-remote-path") + 1] == cli.STAGED_FOOTHOLD_REMOTE_PATH
     assert argv[argv.index("--expected-remote-sha256") + 1] == cli.STAGED_FOOTHOLD_REMOTE_SHA256
     assert "skills/sage-foothold-launch/scripts/foothold_launch.py" not in argv
+    assert foothold.password_env == "SAGE_RUN_AS_PASSWORD"
+
+
+def test_alternate_launch_resolves_jorah_credential_instead_of_default(monkeypatch, tmp_path):
+    descriptor, _config = write_alternate_descriptor(tmp_path)
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.orchestrate = cli._orchestrate()
+    runtime.alternate_start = cli._load_alternate_start(descriptor)
+    selected = []
+
+    def resolve(key):
+        selected.append(key)
+        return {"SAGE_MEEREEN_JORAH_PASSWORD": "test-jorah",
+                "SAGE_RUN_AS_PASSWORD": "test-default"}[key]
+
+    monkeypatch.setenv("SAGE_RUN_AS_PASSWORD", "test-default")
+    monkeypatch.setattr(runtime.orchestrate, "_resolve_password_source", resolve)
+    foothold = runtime._staged_interactive_foothold()
+
+    assert foothold.password_env == "SAGE_MEEREEN_JORAH_PASSWORD"
+    assert foothold.launch_env()["SAGE_RUN_AS_PASSWORD"] == "test-jorah"
+    assert selected == ["SAGE_MEEREEN_JORAH_PASSWORD"]
 
 
 def test_staged_fixture_binds_snapshot_config_uuid_and_executable(retained_callback_fixture):
@@ -661,6 +1101,105 @@ def test_reset_propagates_attempt_scoped_engagement_id_to_sage_restart(monkeypat
     assert "attempt-007" in expected
     assert runtime.runtime_identity()["engagement_id"] == expected
     assert start["mythic_clean"] is True
+
+
+def test_alternate_reset_threads_fixture_through_launcher_and_both_readiness_consumers(monkeypatch, tmp_path):
+    descriptor, config = write_alternate_descriptor(tmp_path)
+    binding = cli._load_alternate_start(descriptor)
+    captured = {}
+
+    class FootholdSpec:
+        def __init__(self, **values):
+            self.__dict__.update(values)
+            self.direct_retained_launch = False
+
+        def launch_argv(self):
+            return [
+                "/bin/bash", cli.STAGED_FOOTHOLD_LAUNCHER, self.ip, self.user, "--",
+                "--target-host", self.host, "--callback-host", self.callback_host,
+                "--callback-user", self.callback_user,
+                "--callback-settle-seconds", str(self.callback_settle_seconds),
+                "--require-unique-callback",
+            ]
+
+        def readiness_argv(self):
+            captured["reset_readiness"] = (self.callback_host, self.callback_user)
+            return ["readiness"]
+
+    def full_reset_and_ready(*, restart_env, snapshot, retained_callback_config, foothold):
+        captured.update({
+            "snapshot": snapshot,
+            "retained_callback_config": retained_callback_config,
+            "launch_argv": foothold.launch_argv(),
+        })
+        foothold.readiness_argv()
+        return {}, 2
+
+    async def selected_readiness(_client, **kwargs):
+        captured["native_readiness"] = kwargs
+        return {
+            "ready": True,
+            "ludus": {
+                "range_profile": {
+                    "id": cli.RANGE_PROFILE,
+                    "qualification": {"state": "live_qualified"},
+                    "scenarios": [cli.SCENARIO],
+                    "topology_identity": "topology",
+                },
+                "vms": [{"canonical_name": name} for name in cli.CANONICAL_INVENTORY],
+            },
+            "clock": {"ready": True},
+            "foothold": {"callbacks": [{"display_id": 2, "payloadtype": "apollo"}]},
+        }
+
+    class Client:
+        current_operation_id = 1
+
+    async def alternate_login():
+        return Client()
+
+    runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = cli.ROOT / ".sage_history" / "evaluation" / "pilot" / "jorah"
+    runtime.protected_manifest = tmp_path / "protected.json"
+    runtime.source_root = cli.ROOT
+    runtime.source_roots = {}
+    runtime.source_identities = {}
+    runtime.alternate_start = binding
+    runtime.orchestrate = SimpleNamespace(FootholdSpec=FootholdSpec, full_reset_and_ready=full_reset_and_ready)
+    runtime.native = SimpleNamespace(login=alternate_login)
+    runtime._operation_snapshot = lambda *_args: {
+        "task": [], "credential": [],
+        "callback": [{
+            "display_id": 2, "active": True, "host": "MEEREEN", "domain": "ESSOS",
+            "user": "jorah.mormont", "payload": {"payloadtype": {"name": "apollo"}},
+        }],
+    }
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("SAGE_BLOODHOUND_MCP_DIR", str(tmp_path / "bloodhound"))
+    monkeypatch.setattr(cli, "_load", lambda *_args: SimpleNamespace(readiness=selected_readiness))
+    monkeypatch.setattr(cli, "_validate_protected_at", lambda *_args: {})
+    monkeypatch.setattr(cli, "assert_rejected_kernel_absent", lambda: None)
+    monkeypatch.setattr(cli, "_validate_external_paths", lambda: {})
+    monkeypatch.setattr(cli, "_source_identity_at", lambda *_args: "source")
+    monkeypatch.setattr(cli, "_tool_contract", lambda: "tools")
+    monkeypatch.setattr(cli, "_route", lambda _orchestrate: {
+        "provider": cli.PROVIDER, "model": cli.MODEL,
+        "api_endpoint": "https://model.invalid:7443", "api_key": "not-retained",
+    })
+    monkeypatch.setattr(
+        cli.live_seams, "bloodhound_empty_state_evidence",
+        lambda: {"returncode": 0, "domain_count": 0},
+    )
+
+    start = runtime.reset("shipping-sage", {})
+
+    assert captured["snapshot"] == "sage-seed-meereen-jorah-20260711"
+    assert captured["retained_callback_config"] == config
+    assert captured["launch_argv"][2:4] == ["10.4.10.12", r"ESSOS\jorah.mormont"]
+    assert captured["reset_readiness"] == ("MEEREEN", "jorah.mormont")
+    assert captured["native_readiness"]["foothold_host"] == "MEEREEN"
+    assert captured["native_readiness"]["foothold_user_match"] == "jorah.mormont"
+    assert start["case_identity"] == binding.identity
 
 
 def test_callback_census_accepts_one_active_plus_imported_inactive_metadata():
@@ -850,7 +1389,7 @@ def test_task_observer_query_requests_mythic_lifecycle_and_response_timestamps()
     (r"u:ESSOS\Administrator", False),
     ("administrator@ESSOS.LOCAL.", False),
 ])
-def test_runtime_observer_emits_evaluator_owned_certificate_admin_proof(monkeypatch, control, proven):
+def test_runtime_observer_emits_evaluator_owned_certificate_admin_proof(monkeypatch, tmp_path, control, proven):
     source = "\n".join((
         "System.DirectoryServices.Protocols.SecurityDescriptorFlagControl",
         "[System.DirectoryServices.Protocols.SecurityMasks]::Sacl",
@@ -883,6 +1422,7 @@ CERT_AUTH_STATUS=OK
     output = output.replace(r"u:NORTH\samwell.tarly", control)
     started = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
     runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path
     runtime.current_client = object()
     runtime.current_operation_id = 8
     runtime.current_started_at = started
@@ -919,6 +1459,12 @@ CERT_AUTH_STATUS=OK
         {},
     )
 
+    native = tmp_path / "shipping-sage-native-observation.json"
+    assert native.is_file()
+    assert native.stat().st_mode & 0o777 == 0o600
+    assert json.loads(native.read_text()) == runtime._operation_snapshot()
+    assert observed["native_evidence"]["sha256"] == hashlib.sha256(native.read_bytes()).hexdigest()
+
     outcome = classify_terminal_snapshot(observed).to_record()
     report = summarize_pair([{
         "record_type": "arm_result", "arm": "shipping-sage",
@@ -949,9 +1495,10 @@ CERT_AUTH_STATUS=OK
     assert proof["observation"]["proof_kind"] == "domain_admin_differential"
 
 
-def test_runtime_observer_treats_pre_agent_task_creation_error_as_terminal_nonproof(monkeypatch):
+def test_runtime_observer_treats_pre_agent_task_creation_error_as_terminal_nonproof(monkeypatch, tmp_path):
     started = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
     runtime = object.__new__(cli.RuntimePilot)
+    runtime.artifact_dir = tmp_path
     runtime.current_client = object()
     runtime.current_operation_id = 8
     runtime.current_started_at = started

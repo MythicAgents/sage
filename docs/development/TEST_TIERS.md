@@ -53,6 +53,58 @@ migrating them means changing both sides together. Until then, do not add new `P
 For a small change, run the directly affected modules first, then the full suite. Live range checks are a separate
 lifecycle and never substitute for offline tests.
 
+## Replaying retained development comparisons
+
+The maintained Trust Walker runner retains the terminal observer's original operation-scoped Mythic task,
+response, credential, and callback rows in a private file before interpreting them or tearing down the range.
+The terminal ledger snapshot binds that file by arm, operation, query, and SHA-256. Existing files are never
+replaced. These evaluator files can contain sensitive material; keep them under private history, outside model
+context and public artifacts.
+
+Recompute a completed v4 matched pair or ISC-8 pair locally:
+
+```bash
+.venv/bin/python skills/sage-eval-gauge/scripts/run_trust_walker_pilot.py replay-pair --artifact-dir <private-pair-directory>
+```
+
+This command uses the same terminal projection and objective parser as observation, checks native file bindings,
+reconciles retained per-response token totals, and compares the reconstructed outcomes and comparison dimensions
+with the ledger. It needs no credentials, fixture, provider, control plane, or range connection and does not alter
+the evidence. Missing, altered, or inconsistent evidence returns a nonzero exit status without printing raw
+responses or credential material.
+
+Older runs with a separately retained `sage-native-mythic-evidence-capture-receipt-v1` can supply it explicitly
+with `--native-evidence-manifest <private-capture-receipt.json>`. This records an external-capture binding; it
+cannot replace an observer-bound capture. A historical run without original native evidence is not replayable
+through this command. That absence does not retroactively invalidate its original observation.
+
+Replay establishes consistency of retained evidence under the identified current parser. It is not another live
+run or authentication of the original source. BloodHound counts, start checks, lifecycle records, and provider
+telemetry remain retained observations; they are not independently re-observed by this command.
+
+## Interpreting matched development comparisons
+
+Record each start, objective, model/version, wrapper/source revision, provider route, runtime authority mode and
+execution path with its result. The maintained runner supports its default Samwell start and an explicitly bound
+Jorah alternate start. Different starts in the same GOAD environment do not establish different topology families.
+Pair only compatible starts and keep each prospective protocol's outcome definition and resource limits intact.
+
+The native autonomous capability controller and the Supervisor/worker graph are separate execution paths.
+A same-model controller-versus-minimal-raw-loop comparison measures the whole selected system, including its
+tool, knowledge, state, verification and stopping differences. It does not identify the contribution of any one
+component or establish multi-agent superiority. Preserve failures and recoverable errors alongside successes.
+
+Keep protocol validity, independently proven objective success, settlement/cleanup and resource use separate.
+Report repeated results per start with their sample counts. Consumed-arm tokens and elapsed time include failed
+runs and any continuation after first proof; they are not cost or time to first proof. Under a completed-call
+token ceiling, retain the entire crossing call's usage and suppress its subsequent dispatch. Report that overage
+explicitly; a nominal ceiling is not a hard invoice cap. Do not invent dollar cost without verified route pricing.
+
+Offline replay supports reproduction; it cannot turn a development corpus into an untouched holdout. Capability
+success alone does not establish composite safe-success, supervised proposal quality, structural transfer or
+general reliability. Private run results and original captures remain outside public documentation; a published
+claim needs its own curated evidence and applicable authority.
+
 ---
 
 # Test layers
@@ -130,4 +182,3 @@ at build time in about five seconds, before reaching a model — including a bar
 tests. The suite was 3955 green. The defect was found by a human typing into the chat window.
 
 The fix was one keyword. The gap was that the cheapest possible test — *does it assemble?* — did not exist.
-

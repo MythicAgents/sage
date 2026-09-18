@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import signal
@@ -37,14 +38,17 @@ from ai.hillclimb.trust_walker_outcome import (
     PROOF_CONTRACT,
     SNAPSHOT_SCHEMA,
     certificate_admin_candidate,
+    classify_terminal_snapshot,
 )
 from ai.hillclimb.trust_walker_pilot import (
     ARM_ORDER, IMPROVEMENT_ARM_ORDER, CANONICAL_INVENTORY, MODEL, OBJECTIVE, PROVIDER, SNAPSHOT,
+    ALTERNATE_START_SCHEMA, AlternateStartBinding,
     RECOVERY_CLEANUP_ATTEMPT_LIMIT, TASK_SETTLEMENT_SECONDS,
     SETUP_REHEARSAL_ATTEMPT_LIMIT, SETUP_REHEARSAL_SUCCESSES,
     ImprovementContract, PilotContract, PilotDependencies, PilotError,
     append_record, arm_environment, assert_rejected_kernel_absent,
-    compare_start_manifests, matched_start_identity, read_records, run_pair,
+    compare_start_manifests, matched_start_identity, read_records, retained_alternate_start_binding, run_pair,
+    summarize_pair,
     validate_artifact_dir, validate_runtime_identity,
 )
 
@@ -240,36 +244,74 @@ def _write_private(path: Path, value: Any) -> dict[str, str]:
     return {"path": str(path), "sha256": _sha256(path)}
 
 
-def _staged_foothold_fixture(source_root: Path = ROOT) -> dict[str, Any]:
+def _retain_native_observation(path: Path, observed: Mapping[str, Any]) -> dict[str, str]:
+    """Retain evaluator-only source evidence without replacing an earlier observation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(observed, indent=2, sort_keys=True, default=str) + "\n").encode()
+    # Stage on the destination filesystem, private from creation. Linking publishes atomically
+    # and fails if an earlier observation (including a symlink) already occupies this path.
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".native-observation-") as temporary:
+        temporary.write(data)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        os.link(temporary.name, path)
+    return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _staged_foothold_fixture(
+    source_root: Path = ROOT,
+    alternate_start: AlternateStartBinding | None = None,
+) -> dict[str, Any]:
     """Validate and return the non-secret identity of the staged foothold fixture."""
-    config_path = (
-        STAGED_FOOTHOLD_CONFIG
-        if source_root.resolve() == ROOT.resolve()
-        else source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
-    )
-    if SNAPSHOT != "sage-seed-apollo-v252-mythic4-20260829":
-        raise PilotError("staged foothold snapshot is not the qualified Apollo v2.5.2 fixture")
+    if alternate_start is not None:
+        alternate_start.validate(require_config_path=True)
+        config_path = Path(alternate_start.retained_config_path).expanduser().resolve()
+        expected_config_sha256 = alternate_start.retained_config_sha256
+        expected_payload_uuid = alternate_start.payload_uuid
+        snapshot = alternate_start.snapshot
+        task_name = alternate_start.task_name
+        task_prelaunch_state = alternate_start.task_prelaunch_state
+        remote_path = alternate_start.remote_path
+        remote_sha256 = alternate_start.remote_sha256
+    else:
+        config_path = (
+            STAGED_FOOTHOLD_CONFIG
+            if source_root.resolve() == ROOT.resolve()
+            else source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
+        )
+        expected_config_sha256 = STAGED_FOOTHOLD_CONFIG_SHA256
+        expected_payload_uuid = STAGED_FOOTHOLD_PAYLOAD_UUID
+        snapshot = SNAPSHOT
+        task_name = STAGED_FOOTHOLD_TASK
+        task_prelaunch_state = "Ready"
+        remote_path = STAGED_FOOTHOLD_REMOTE_PATH
+        remote_sha256 = STAGED_FOOTHOLD_REMOTE_SHA256
+        if snapshot != "sage-seed-apollo-v252-mythic4-20260829":
+            raise PilotError("staged foothold snapshot is not the qualified Apollo v2.5.2 fixture")
     if not config_path.is_file():
         raise PilotError("staged foothold retained callback config is missing")
     observed_config_sha256 = _sha256(config_path)
-    if observed_config_sha256 != STAGED_FOOTHOLD_CONFIG_SHA256:
+    if observed_config_sha256 != expected_config_sha256:
         raise PilotError("staged foothold retained callback config hash mismatch")
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         observed_payload_uuid = config["config"]["payload"]["uuid"]
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
         raise PilotError("staged foothold retained callback config is malformed") from exc
-    if observed_payload_uuid != STAGED_FOOTHOLD_PAYLOAD_UUID:
+    if observed_payload_uuid != expected_payload_uuid:
         raise PilotError("staged foothold retained callback payload UUID mismatch")
-    return {
-        "snapshot": SNAPSHOT,
+    fixture = {
+        "snapshot": snapshot,
         "retained_config_sha256": observed_config_sha256,
         "payload_uuid": observed_payload_uuid,
-        "task_name": STAGED_FOOTHOLD_TASK,
-        "task_prelaunch_state": "Ready",
-        "remote_path": STAGED_FOOTHOLD_REMOTE_PATH,
-        "remote_sha256": STAGED_FOOTHOLD_REMOTE_SHA256,
+        "task_name": task_name,
+        "task_prelaunch_state": task_prelaunch_state,
+        "remote_path": remote_path,
+        "remote_sha256": remote_sha256,
     }
+    if alternate_start is not None:
+        fixture["case_identity"] = alternate_start.identity
+    return fixture
 
 
 class _FixtureBoundFoothold:
@@ -400,12 +442,67 @@ def _validate_protected_at(path: Path, source_root: Path) -> dict[str, Any]:
     )
 
 
-def _fixture_at(source_root: Path) -> dict[str, Any]:
+def _fixture_at(
+    source_root: Path,
+    alternate_start: AlternateStartBinding | None = None,
+) -> dict[str, Any]:
+    if alternate_start is not None:
+        return _staged_foothold_fixture(source_root, alternate_start)
     return (
         _staged_foothold_fixture()
         if source_root.resolve() == ROOT.resolve()
         else _staged_foothold_fixture(source_root)
     )
+
+
+def _load_alternate_start(path: str | Path) -> AlternateStartBinding:
+    """Load the exact private Jorah/MEEREEN descriptor without retaining its path."""
+    try:
+        descriptor = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PilotError("case descriptor is missing or malformed") from exc
+    top_keys = {
+        "schema", "case_id", "snapshot", "range_profile", "inventory", "principal", "host",
+        "host_ip", "payload_type", "retained_config", "staged_executable",
+    }
+    if not isinstance(descriptor, Mapping) or set(descriptor) != top_keys:
+        raise PilotError("case descriptor does not contain the exact alternate-start fields")
+    retained = descriptor.get("retained_config")
+    executable = descriptor.get("staged_executable")
+    if not isinstance(retained, Mapping) or set(retained) != {"path", "sha256", "payload_uuid"}:
+        raise PilotError("case descriptor retained_config fields are incomplete")
+    if not isinstance(executable, Mapping) or set(executable) != {
+        "task_name", "task_prelaunch_state", "remote_path", "sha256",
+    }:
+        raise PilotError("case descriptor staged_executable fields are incomplete")
+    inventory = descriptor.get("inventory")
+    if not isinstance(inventory, list) or any(not isinstance(item, str) for item in inventory):
+        raise PilotError("case descriptor inventory is malformed")
+    scalar_keys = top_keys - {"inventory", "retained_config", "staged_executable"}
+    if any(not isinstance(descriptor.get(key), str) for key in scalar_keys) or any(
+        not isinstance(value, str) for value in retained.values()
+    ) or any(not isinstance(value, str) for value in executable.values()):
+        raise PilotError("case descriptor scalar fields must be strings")
+    binding = AlternateStartBinding(
+        schema=descriptor["schema"],
+        case_id=descriptor["case_id"],
+        snapshot=descriptor["snapshot"],
+        range_profile=descriptor["range_profile"],
+        inventory=tuple(inventory),
+        principal=descriptor["principal"],
+        host=descriptor["host"],
+        host_ip=descriptor["host_ip"],
+        payload_type=descriptor["payload_type"],
+        retained_config_path=str(Path(retained["path"]).expanduser().resolve()),
+        retained_config_sha256=retained["sha256"],
+        payload_uuid=retained["payload_uuid"],
+        task_name=executable["task_name"],
+        task_prelaunch_state=executable["task_prelaunch_state"],
+        remote_path=executable["remote_path"],
+        remote_sha256=executable["sha256"],
+    )
+    binding.validate(require_config_path=True)
+    return binding
 
 
 def _route(orchestrate) -> dict[str, str]:
@@ -553,6 +650,7 @@ def _live_contract_binding(contract: PilotContract | ImprovementContract) -> dic
         "runs_per_arm",
         "primary_metric",
         "timing_policy",
+        "case_identity",
     )
     return {key: record[key] for key in keys if key in record}
 
@@ -653,6 +751,8 @@ def _resolve_live_authority(
 ) -> dict[str, Any]:
     authority_id = str(getattr(args, "live_authority_id", "") or "").strip()
     authority_file = str(getattr(args, "live_authority_file", "") or "").strip()
+    if isinstance(contract, PilotContract) and contract.alternate_start is not None and authority_file:
+        raise PilotError("standing live authority cannot authorize the alternate Jorah/MEEREEN case")
     if authority_file:
         receipt = _load_standing_live_authority(
             Path(authority_file), command=str(args.command), contract=contract,
@@ -1524,6 +1624,7 @@ class RuntimePilot:
         *,
         source_roots: Mapping[str, Path] | None = None,
         source_identities: Mapping[str, str] | None = None,
+        alternate_start: AlternateStartBinding | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1533,6 +1634,7 @@ class RuntimePilot:
             for arm, path in (source_roots or {}).items()
         }
         self.source_identities = dict(source_identities or {})
+        self.alternate_start = alternate_start
         initial_root = next(iter(self.source_roots.values()), ROOT)
         self.source_root = initial_root
         self.orchestrate = _orchestrate(initial_root)
@@ -1658,6 +1760,7 @@ class RuntimePilot:
         obj.source_root = recorded_source_root
         obj.source_roots = {str(last.get("arm") or ""): recorded_source_root}
         obj.source_identities = {str(last.get("arm") or ""): expected_source_identity}
+        obj.alternate_start = retained_alternate_start_binding(records)
         obj.orchestrate = _orchestrate(recorded_source_root)
         obj.native = (
             _native_chat()
@@ -1737,6 +1840,7 @@ class RuntimePilot:
         obj.source_root = recorded_source_root
         obj.source_roots = {str(last.get("arm") or "unknown"): recorded_source_root}
         obj.source_identities = {}
+        obj.alternate_start = retained_alternate_start_binding(records)
         obj.orchestrate = None
         obj.native = (
             _native_chat()
@@ -1784,6 +1888,10 @@ class RuntimePilot:
         return obj, dict(last.get("start_identity") or {}) if last else None, execution
 
     def preflight(self, contract: PilotContract | ImprovementContract) -> Mapping[str, Any]:
+        if isinstance(contract, ImprovementContract) and self.alternate_start is not None:
+            raise PilotError("improvement pair cannot select an alternate start")
+        if isinstance(contract, PilotContract) and contract.alternate_start != self.alternate_start:
+            raise PilotError("runtime case binding does not match the pilot contract")
         source_bindings = {}
         if isinstance(contract, ImprovementContract):
             if set(self.source_roots) != set(IMPROVEMENT_ARM_ORDER):
@@ -1799,7 +1907,7 @@ class RuntimePilot:
             self._activate_source(contract.arm_order[0])
         self.route = _route(self.orchestrate)
         self.safe_route = _safe_route_identity(self.route)
-        fixture = _fixture_at(self.source_root)
+        fixture = _fixture_at(self.source_root, self.alternate_start)
         foothold = self._staged_interactive_foothold()
         protected = _validate_protected_at(self.protected_manifest, self.source_root)
         paths = _validate_external_paths()
@@ -1820,7 +1928,7 @@ class RuntimePilot:
             "tool_contract": _tool_contract(),
             "engagement_state": engagement_state,
             "foothold_bootstrap": {
-                "snapshot": SNAPSHOT,
+                "snapshot": fixture["snapshot"],
                 "mode": "pre-staged-interactive-launch-existing",
                 "launcher": foothold.launch_argv()[1],
                 "callback_settle_seconds": foothold.callback_settle_seconds,
@@ -1857,11 +1965,23 @@ class RuntimePilot:
 
     def _staged_interactive_foothold(self):
         self.source_root = getattr(self, "source_root", ROOT)
-        fixture = _fixture_at(self.source_root)
-        foothold = _FixtureBoundFoothold(self.orchestrate.FootholdSpec(
-            callback_settle_seconds=STAGED_FOOTHOLD_CALLBACK_SETTLE_SECONDS,
-            require_unique_callback=True,
-        ), fixture)
+        alternate_start = getattr(self, "alternate_start", None)
+        fixture = _fixture_at(self.source_root, alternate_start)
+        foothold_args: dict[str, Any] = {
+            "callback_settle_seconds": STAGED_FOOTHOLD_CALLBACK_SETTLE_SECONDS,
+            "require_unique_callback": True,
+        }
+        if alternate_start is not None:
+            foothold_args.update({
+                "host": alternate_start.host,
+                "ip": alternate_start.host_ip,
+                "user": alternate_start.principal,
+                "password_env": "SAGE_MEEREEN_JORAH_PASSWORD",
+                "callback_host": alternate_start.host,
+                "callback_user": alternate_start.principal.split("\\", 1)[1],
+                "range_profile_id": alternate_start.range_profile,
+            })
+        foothold = _FixtureBoundFoothold(self.orchestrate.FootholdSpec(**foothold_args), fixture)
         argv = foothold.launch_argv()
         def argument_value(flag: str) -> str | None:
             try:
@@ -1879,13 +1999,39 @@ class RuntimePilot:
             or "--require-unique-callback" not in argv
             or settle_seconds != str(STAGED_FOOTHOLD_CALLBACK_SETTLE_SECONDS)
             or argument_value("--expected-task-state") != "Ready"
-            or argument_value("--expected-remote-path") != STAGED_FOOTHOLD_REMOTE_PATH
-            or argument_value("--expected-remote-sha256") != STAGED_FOOTHOLD_REMOTE_SHA256
+            or argument_value("--expected-remote-path") != fixture["remote_path"]
+            or argument_value("--expected-remote-sha256") != fixture["remote_sha256"]
+            or (
+                alternate_start is not None
+                and (
+                    argv[2:4] != [alternate_start.host_ip, alternate_start.principal]
+                    or argument_value("--target-host") != alternate_start.host
+                    or argument_value("--callback-host") != alternate_start.host
+                    or argument_value("--callback-user") != alternate_start.principal.split("\\", 1)[1]
+                )
+            )
         ):
             raise PilotError(
                 "staged Trust Walker snapshot is not bound to the canonical interactive launch-existing path"
             )
         return foothold
+
+    def _post_reset_readiness(self, client: Any) -> dict[str, Any]:
+        alternate_start = getattr(self, "alternate_start", None)
+        if alternate_start is None:
+            return asyncio.run(self.native.inspect_readiness(client, runtime_dbs_archived=True))
+        bootstrap = _load(
+            "trust_walker_alternate_start_readiness",
+            self.source_root / "skills" / "sage-callback-bootstrap" / "scripts" / "bootstrap_payloads.py",
+        )
+        return asyncio.run(bootstrap.readiness(
+            client,
+            repo_root=self.source_root,
+            runtime_dbs_archived=True,
+            foothold_payload_type=alternate_start.payload_type,
+            foothold_host=alternate_start.host,
+            foothold_user_match=alternate_start.principal.split("\\", 1)[1],
+        ))
 
     def _operation_snapshot(self, client: Any, operation_id: int, *, timeout: float = 60) -> dict[str, Any]:
         async def query():
@@ -2096,7 +2242,8 @@ class RuntimePilot:
         self._activate_source(arm)
         _validate_protected_at(self.protected_manifest, self.source_root)
         assert_rejected_kernel_absent()
-        fixture = _fixture_at(self.source_root)
+        alternate_start = getattr(self, "alternate_start", None)
+        fixture = _fixture_at(self.source_root, alternate_start)
         foothold = self._staged_interactive_foothold()
         self._fresh_engagement_state((arm,))
         engagement_id = self._engagement_id(arm)
@@ -2110,15 +2257,17 @@ class RuntimePilot:
         self.current_reset_started = True
         _unused, callback_id = self.orchestrate.full_reset_and_ready(
             restart_env=restart_env,
-            snapshot=SNAPSHOT,
+            snapshot=alternate_start.snapshot if alternate_start is not None else SNAPSHOT,
             retained_callback_config=(
-                self.source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
+                Path(alternate_start.retained_config_path)
+                if alternate_start is not None
+                else self.source_root / "skills" / "sage-callback-bootstrap" / "apollo_callback_config.json"
             ),
             foothold=foothold,
         )
         client = self.native.login
         logged_in = asyncio.run(client())
-        readiness = asyncio.run(self.native.inspect_readiness(logged_in, runtime_dbs_archived=True))
+        readiness = self._post_reset_readiness(logged_in)
         clean_bh = live_seams.bloodhound_empty_state_evidence()
         if readiness.get("ready") is not True:
             raise SetupInvariantError("post-reset shared readiness contract is not ready")
@@ -2157,6 +2306,10 @@ class RuntimePilot:
         domain = str(callback.get("domain") or "").strip()
         user = str(callback.get("user") or "").strip()
         principal = user if "\\" in user else f"{domain}\\{user}"
+        expected_principal = alternate_start.principal if alternate_start is not None else r"NORTH\samwell.tarly"
+        expected_host = alternate_start.host if alternate_start is not None else "CASTELBLACK"
+        if principal.casefold() != expected_principal.casefold() or str(callback.get("host") or "").casefold() != expected_host.casefold():
+            raise SetupInvariantError("post-reset callback does not match the selected foothold principal and host")
         try:
             self.route = _route(self.orchestrate)
         except PilotError as exc:
@@ -2180,8 +2333,8 @@ class RuntimePilot:
         self.current_deadline_at = None
         self.current_budget = None
         self.current_execution = None
-        return {
-            "snapshot": SNAPSHOT,
+        start = {
+            "snapshot": alternate_start.snapshot if alternate_start is not None else SNAPSHOT,
             "range_profile": observed_profile.get("id"),
             "inventory": sorted(str(row.get("canonical_name") or "") for row in ludus.get("vms") or []),
             "clock_ready": clock.get("ready") is True,
@@ -2199,6 +2352,9 @@ class RuntimePilot:
             "tool_contract": tool_identity,
             "dependency_identity": dependency_identity,
         }
+        if alternate_start is not None:
+            start["case_identity"] = alternate_start.identity
+        return start
 
     def runtime_identity(self) -> Mapping[str, Any]:
         return {
@@ -2612,12 +2768,38 @@ class RuntimePilot:
     ) -> Mapping[str, Any]:
         if self.current_client is None or self.current_operation_id is None:
             raise PilotError("terminal observer has no bound operation")
+        if arm not in (*ARM_ORDER, *IMPROVEMENT_ARM_ORDER):
+            raise PilotError("terminal observer has an unknown arm")
 
         observed = self._operation_snapshot(self.current_client, self.current_operation_id)
+        native_evidence = _retain_native_observation(
+            self.artifact_dir / f"{arm}-native-observation.json", observed,
+        )
+        bh_count = live_seams.bloodhound_domain_count(timeout=60)
+        snapshot = self._terminal_snapshot_from_observation(
+            arm, observed, execution, bh_count=bh_count,
+        )
+        snapshot["native_evidence"] = {
+            **native_evidence,
+            "arm": arm,
+            "operation_id": self.current_operation_id,
+            "query_sha256": hashlib.sha256(TASK_OUTPUT_QUERY.encode()).hexdigest(),
+        }
+        return snapshot
+
+    def _terminal_snapshot_from_observation(
+        self,
+        arm: str,
+        observed: Mapping[str, Any],
+        execution: Mapping[str, Any],
+        *,
+        bh_count: int | None,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Use the same outcome projection for live observation and local evidence replay."""
         rows = observed.get("task")
         credentials = observed.get("credential")
         callbacks = observed.get("callback")
-        bh_count = live_seams.bloodhound_domain_count(timeout=60)
         complete = {
             "tasks": isinstance(rows, list),
             "credentials": bool(isinstance(credentials, list) and all(
@@ -2810,7 +2992,7 @@ class RuntimePilot:
             "proof_contract": PROOF_CONTRACT,
             "arm_started_at": self.current_started_at.isoformat() if self.current_started_at else None,
             "arm_deadline_at": self.current_deadline_at.isoformat() if self.current_deadline_at else None,
-            "observed_at": datetime.now(UTC).isoformat(),
+            "observed_at": observed_at or datetime.now(UTC).isoformat(),
             "observer_complete": complete,
             "tasks": task_states,
             "proof_candidates": candidates,
@@ -2878,6 +3060,7 @@ def _setup_continuation_state(
     root: Path,
     records: list[dict[str, Any]],
     authority_id: str,
+    contract: PilotContract,
 ) -> tuple[int, float, dict[str, Any]]:
     if any(row.get("record_type") == "setup_rehearsal_result" for row in records):
         raise PilotError("completed setup rehearsal series cannot be continued")
@@ -2892,6 +3075,11 @@ def _setup_continuation_state(
         or len(preflights) != 1
         or preflights[0].get("ready") is not True
         or preflights[0].get("live_authority_id") != authority_id
+        or (
+            preflights[0].get("contract") != contract.to_record()
+            if contract.alternate_start is not None
+            else preflights[0].get("contract", contract.to_record()) != contract.to_record()
+        )
     ):
         raise PilotError("setup continuation requires the exact orphaned attempt-1 ledger")
     report_path = root / "attempt-001-abort-report.json"
@@ -2941,7 +3129,7 @@ def run_setup_rehearsals(
     abort_report: dict[str, Any] | None = None
     if resume:
         start_attempt, support_elapsed, abort_report = _setup_continuation_state(
-            root, records, runtime.live_authority_id,
+            root, records, runtime.live_authority_id, contract,
         )
     preflight_started = time.monotonic()
     try:
@@ -3012,10 +3200,12 @@ def run_setup_rehearsals(
         invariant_error: Exception | None = None
         if reset_error is None:
             try:
-                identity = matched_start_identity(start)
+                identity = matched_start_identity(start, contract.alternate_start)
                 runtime_identity = validate_runtime_identity(runtime.runtime_identity())
                 if expected_start is not None:
-                    matched, differences = compare_start_manifests(expected_start, identity)
+                    matched, differences = compare_start_manifests(
+                        expected_start, identity, alternate_start=contract.alternate_start,
+                    )
                     if not matched:
                         raise SetupInvariantError(
                             "consecutive setup starts differ: " + ", ".join(differences)
@@ -3137,6 +3327,7 @@ def _runtime(
         Path(args.route_smoke).expanduser().resolve(),
         source_roots=source_roots,
         source_identities=source_identities,
+        alternate_start=(contract.alternate_start if isinstance(contract, PilotContract) else None),
     )
 
 
@@ -3198,6 +3389,209 @@ def _retained_pair(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(contracts[0], Mapping):
         raise PilotError("improvement pair contract record is malformed")
     return dict(contracts[0]), dict(comparisons[0])
+
+
+def _replay_contract(records: list[dict[str, Any]]) -> PilotContract | ImprovementContract:
+    retained = [row.get("contract") for row in records if row.get("record_type") == "contract"]
+    if len(retained) != 1 or not isinstance(retained[0], Mapping):
+        raise PilotError("replay requires one retained contract")
+    value = retained[0]
+    order = value.get("arm_order")
+    if not isinstance(order, list):
+        raise PilotError("retained contract lacks an arm order")
+    if value.get("schema") == PilotContract().to_record()["schema"]:
+        contract = PilotContract(
+            arm_order=tuple(order), alternate_start=retained_alternate_start_binding(records),
+        )
+    elif value.get("schema") == "sage-trust-walker-isc8-improvement-pair-v1":
+        contract = ImprovementContract(
+            baseline_source_identity=str(value.get("baseline_source_identity") or ""),
+            candidate_source_identity=str(value.get("candidate_source_identity") or ""),
+            arm_order=tuple(order),
+        )
+    else:
+        raise PilotError("retained protocol version is not supported for replay")
+    contract.validate()
+    if contract.to_record() != value:
+        raise PilotError("retained contract is malformed or changed")
+    return contract
+
+
+def _check_native_rows(observed: object, operation_id: int) -> None:
+    if not isinstance(observed, Mapping):
+        raise PilotError("native observation is malformed")
+    for key, id_key in (("task", "display_id"), ("credential", "id"), ("callback", "display_id")):
+        rows = observed.get(key)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, Mapping)
+            or type(row.get("operation_id")) is not int
+            or row["operation_id"] != operation_id
+            or type(row.get(id_key)) is not int
+            for row in rows
+        ):
+            raise PilotError("native observation rows lack the bound operation or identifiers")
+        if len({row[id_key] for row in rows}) != len(rows):
+            raise PilotError("native observation contains duplicate identifiers")
+    response_ids = set()
+    for row in observed["task"]:
+        responses = row.get("responses")
+        if not isinstance(responses, list):
+            raise PilotError("native observation lacks task response rows")
+        for response in responses:
+            if (
+                not isinstance(response, Mapping)
+                or type(response.get("id")) is not int
+                or response["id"] in response_ids
+                or not isinstance(response.get("response_text"), str)
+                or not isinstance(response.get("timestamp"), str)
+            ):
+                raise PilotError("native observation has malformed or duplicate responses")
+            response_ids.add(response["id"])
+
+
+def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path | None = None) -> dict[str, Any]:
+    """Recompute retained outcomes locally; hashes bind files, not live-source authenticity."""
+    root = Path(artifact_dir).expanduser().resolve()
+    ledger = root / "pilot.jsonl"
+    ledger_bytes = ledger.read_bytes()
+    records = [json.loads(line) for line in ledger_bytes.decode().splitlines() if line.strip()]
+    if not all(isinstance(row, dict) for row in records):
+        raise PilotError("retained ledger contains malformed records")
+    contract = _replay_contract(records)
+    external = {}
+    manifest_receipt = None
+    if native_evidence_manifest is not None:
+        manifest_path = Path(native_evidence_manifest).expanduser().resolve()
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("schema") != "sage-native-mythic-evidence-capture-receipt-v1"
+            or manifest.get("query_sha256") != hashlib.sha256(TASK_OUTPUT_QUERY.encode()).hexdigest()
+            or not isinstance(manifest.get("captures"), list)
+        ):
+            raise PilotError("external native evidence manifest is malformed or uses a different query")
+        for capture in manifest["captures"]:
+            if not isinstance(capture, Mapping) or capture.get("arm") not in contract.arm_order:
+                raise PilotError("external native evidence manifest has an unknown arm")
+            if capture["arm"] in external:
+                raise PilotError("external native evidence manifest duplicates an arm")
+            external[capture["arm"]] = {**capture, "query_sha256": manifest["query_sha256"]}
+        manifest_receipt = {"sha256": hashlib.sha256(manifest_bytes).hexdigest()}
+
+    reports = []
+    replayed_records = [dict(row) for row in records]
+    for arm in contract.arm_order:
+        selected = {}
+        for kind in ("arm_started", "arm_result"):
+            rows = [row for row in replayed_records if row.get("record_type") == kind and row.get("arm") == arm]
+            if len(rows) != 1:
+                raise PilotError("replay requires one start and terminal result per arm")
+            selected[kind] = rows[0]
+        start, result = selected["arm_started"], selected["arm_result"]
+        snapshot, execution = result.get("terminal_snapshot"), result.get("execution")
+        if not isinstance(snapshot, Mapping) or not isinstance(execution, Mapping):
+            raise PilotError("retained terminal result is malformed")
+        operation_id = (start.get("runtime_identity") or {}).get("operation_id")
+        if type(operation_id) is not int or snapshot.get("operation_id") != operation_id or snapshot.get("arm") != arm:
+            raise PilotError("retained terminal result does not match the started arm")
+        native = snapshot.get("native_evidence")
+        binding = "terminal_observer"
+        evidence_root = root
+        if native is None:
+            native = external.get(arm)
+            binding = "external_capture_manifest"
+            if native_evidence_manifest is not None:
+                evidence_root = manifest_path.parent
+        elif arm in external:
+            raise PilotError("external capture cannot replace an observer-bound observation")
+        if native is None:
+            raise PilotError("original native evidence is missing; this retained arm cannot be replayed")
+        if (
+            not isinstance(native, Mapping) or native.get("arm") != arm
+            or native.get("operation_id") != operation_id
+            or native.get("query_sha256") != hashlib.sha256(TASK_OUTPUT_QUERY.encode()).hexdigest()
+            or not isinstance(native.get("path"), str) or not native["path"]
+        ):
+            raise PilotError("native evidence receipt does not match the arm, operation, or query")
+        native_path = evidence_root / Path(native["path"]).expanduser()
+        native_bytes = native_path.read_bytes()
+        if hashlib.sha256(native_bytes).hexdigest() != native.get("sha256"):
+            raise PilotError("native evidence hash mismatch")
+        observed = json.loads(native_bytes)
+        _check_native_rows(observed, operation_id)
+        # Bypass RuntimePilot construction: replay needs no credentials, fixtures, or live adapters.
+        projector = object.__new__(RuntimePilot)
+        projector.current_operation_id = operation_id
+        for key in ("arm_started_at", "arm_deadline_at"):
+            if not isinstance(snapshot.get(key), str) or snapshot[key] != execution.get(key):
+                raise PilotError("terminal observation and execution windows disagree")
+        projector.current_started_at = datetime.fromisoformat(snapshot["arm_started_at"])
+        projector.current_deadline_at = datetime.fromisoformat(snapshot["arm_deadline_at"])
+        if (
+            projector.current_started_at.tzinfo is None or projector.current_deadline_at.tzinfo is None
+            or (projector.current_deadline_at - projector.current_started_at).total_seconds() != contract.wall_seconds
+        ):
+            raise PilotError("retained execution window differs from the fixed contract")
+        projected = projector._terminal_snapshot_from_observation(
+            arm, observed, execution, bh_count=snapshot.get("bloodhound_domain_count"),
+            observed_at=snapshot.get("observed_at"),
+        )
+        if projected != {key: value for key, value in snapshot.items() if key != "native_evidence"}:
+            raise PilotError("native evidence does not reproduce the retained terminal observation")
+        outcome = classify_terminal_snapshot(projected).to_record()
+        if outcome != result.get("outcome"):
+            raise PilotError("native evidence does not reproduce the retained outcome")
+        cost = execution.get("cost") or {}
+        responses = execution.get("response_records")
+        if (
+            not isinstance(responses, list) or type(cost.get("model_calls")) is not int
+            or len(responses) != cost["model_calls"]
+            or any(
+                not isinstance(row, Mapping) or row.get("response_index") != index
+                or row.get("effective_backend") != f"{contract.provider}:{contract.model}"
+                or (row.get("total_tokens") is not None and (
+                    type(row["total_tokens"]) is not int or row["total_tokens"] < 0
+                ))
+                for index, row in enumerate(responses, 1)
+            )
+        ):
+            raise PilotError("retained response accounting is incomplete or has a different route")
+        usage_complete = all(type(row.get("total_tokens")) is int for row in responses)
+        tokens = sum(row["total_tokens"] for row in responses) if usage_complete else None
+        if tokens != cost.get("total_tokens") or (execution.get("resource_complete") is True and not usage_complete):
+            raise PilotError("response-derived usage disagrees with retained cost")
+        result.update(terminal_snapshot=projected, outcome=outcome)
+        reports.append({
+            "arm": arm, "binding": binding, "native_sha256": native["sha256"],
+            "operation_id": operation_id, "native_tasks": len(observed["task"]),
+            "native_responses": sum(len(row["responses"]) for row in observed["task"]),
+            "outcome": outcome, "model_calls": cost.get("model_calls"), "total_tokens": tokens,
+            "source_identity": (start.get("start_identity") or {}).get("source_identity"),
+        })
+    summary = summarize_pair(replayed_records, contract)
+    comparisons = [row for row in records if row.get("record_type") == "comparison"]
+    if len(comparisons) != 1 or summary != {
+        key: value for key, value in comparisons[0].items() if key not in {"record_type", "recorded_at"}
+    }:
+        raise PilotError("reconstructed comparison differs from the retained comparison")
+    return {
+        "schema": "sage-trust-walker-offline-replay-v1", "reproduced": True,
+        "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+        "external_manifest": manifest_receipt, "contract": contract.to_record(),
+        "projection_sha256": _sha256(Path(__file__)),
+        "outcome_parser_sha256": _sha256(PAYLOAD / "ai/hillclimb/trust_walker_outcome.py"),
+        "arms": reports,
+        "dimensions": {key: summary[key] for key in (
+            "protocol_valid", "pair_compatible", "comparison_ready", "lifecycle_complete",
+            "isolation_complete", "resources_complete", "run_complete",
+        )},
+        "limitations": [
+            "Local reproduction checks retained files and their bindings, not live-source authenticity.",
+            "BloodHound count, start, settlement, cleanup, and provider telemetry remain retained observations.",
+            "Replay uses the identified current parser; it does not rerun the measured model or range.",
+        ],
+    }
 
 
 def _require_first_pair_ready(path: str | Path, contract: ImprovementContract) -> None:
@@ -3297,7 +3691,8 @@ def summarize_improvement_comparisons(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("plan")
+    plan = sub.add_parser("plan")
+    plan.add_argument("--case-descriptor")
     improvement_plan = sub.add_parser("improvement-plan")
     _add_improvement_identity_args(improvement_plan, roots=False)
     improvement_prepare = sub.add_parser("prepare-improvement-pair")
@@ -3307,6 +3702,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--artifact-dir", required=True)
         command.add_argument("--protected-manifest", required=True)
         command.add_argument("--route-smoke", required=True)
+        command.add_argument("--case-descriptor")
         if name in {"rehearse-setup", "continue-setup", "run-pair"}:
             _add_live_authority_args(command)
         if name == "run-pair":
@@ -3332,20 +3728,44 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--pair-one-artifact-dir", required=True)
     summary.add_argument("--pair-two-artifact-dir", required=True)
     _add_improvement_identity_args(summary, roots=False)
+    replay = sub.add_parser("replay-pair", help="Reproduce a retained comparison from native evidence, offline.")
+    replay.add_argument("--artifact-dir", required=True)
+    replay.add_argument("--native-evidence-manifest", help="Explicit capture receipt for older runs without observer retention.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command in {
-        "improvement-plan", "prepare-improvement-pair", "run-improvement-pair", "summarize-improvement",
-    }:
-        contract: PilotContract | ImprovementContract = _improvement_contract(args)
-    else:
-        arm_order = ARM_ORDER
-        if getattr(args, "arm_order", "shipping-first") == "raw-first":
-            arm_order = tuple(reversed(ARM_ORDER))
-        contract = PilotContract(arm_order=arm_order)
+    if args.command == "replay-pair":
+        try:
+            replayed = replay_pair(args.artifact_dir, args.native_evidence_manifest)
+        except (PilotError, OSError, ValueError, TypeError, KeyError) as exc:
+            print(json.dumps({
+                "reproduced": False, "error_type": type(exc).__name__,
+                "reason": str(exc) if isinstance(exc, PilotError) else "retained evidence is missing or malformed",
+            }, indent=2, sort_keys=True))
+            return 1
+        print(json.dumps(replayed, indent=2, sort_keys=True))
+        return 0
+    try:
+        if args.command in {
+            "improvement-plan", "prepare-improvement-pair", "run-improvement-pair", "summarize-improvement",
+        }:
+            contract: PilotContract | ImprovementContract = _improvement_contract(args)
+        else:
+            arm_order = ARM_ORDER
+            if getattr(args, "arm_order", "shipping-first") == "raw-first":
+                arm_order = tuple(reversed(ARM_ORDER))
+            alternate_start = (
+                _load_alternate_start(args.case_descriptor)
+                if getattr(args, "case_descriptor", None)
+                else None
+            )
+            contract = PilotContract(arm_order=arm_order, alternate_start=alternate_start)
+        contract.validate()
+    except (PilotError, OSError) as exc:
+        print(json.dumps({"ready": False, "error_type": type(exc).__name__, "reason": str(exc)}, indent=2, sort_keys=True))
+        return 1
     authority_receipt: dict[str, Any] = {}
     if args.command in STANDING_LIVE_COMMANDS:
         try:
@@ -3495,7 +3915,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run-improvement-pair":
             prepared = _prepared_improvement_dependencies(args, contract)
             _bind_authority_to_preledger(authority_receipt, prepared)
-        runtime = _runtime(args, contract) if isinstance(contract, ImprovementContract) else _runtime(args)
+        runtime = (
+            _runtime(args, contract)
+            if isinstance(contract, ImprovementContract) or contract.alternate_start is not None
+            else _runtime(args)
+        )
         runtime.live_authority_id = str(authority_receipt.get("authority_id") or "")
         runtime.live_authority_receipt = dict(authority_receipt)
         if args.command == "preflight":

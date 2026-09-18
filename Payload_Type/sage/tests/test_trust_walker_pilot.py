@@ -41,6 +41,44 @@ def start_manifest(**changes):
     return value
 
 
+def alternate_binding(**changes):
+    values = {
+        "schema": pilot.ALTERNATE_START_SCHEMA,
+        "case_id": pilot.ALTERNATE_START_CASE,
+        "snapshot": pilot.ALTERNATE_START_SNAPSHOT,
+        "range_profile": pilot.RANGE_PROFILE,
+        "inventory": pilot.CANONICAL_INVENTORY,
+        "principal": pilot.ALTERNATE_START_PRINCIPAL,
+        "host": pilot.ALTERNATE_START_HOST,
+        "host_ip": pilot.ALTERNATE_START_IP,
+        "payload_type": "apollo",
+        "retained_config_path": "/private/fixture.json",
+        "retained_config_sha256": "a" * 64,
+        "payload_uuid": "11111111-2222-3333-4444-555555555555",
+        "task_name": "SageApolloJorahBootstrap",
+        "task_prelaunch_state": "Ready",
+        "remote_path": r"C:\Users\Public\apollo.exe",
+        "remote_sha256": "b" * 64,
+    }
+    values.update(changes)
+    return pilot.AlternateStartBinding(**values)
+
+
+def alternate_start_manifest(binding, **changes):
+    value = start_manifest(
+        snapshot=binding.snapshot,
+        foothold={
+            "count": 1,
+            "principal": binding.principal,
+            "host": binding.host,
+            "payload_type": binding.payload_type,
+        },
+    )
+    value["case_identity"] = binding.identity
+    value.update(changes)
+    return value
+
+
 def terminal_snapshot(disposition="disproven"):
     proof_candidates = []
     return {
@@ -150,6 +188,78 @@ def test_contract_and_environment_are_fixed():
     reverse = pilot.PilotContract(arm_order=tuple(reversed(pilot.ARM_ORDER)))
     reverse.validate()
     assert pilot.arm_environment(reverse) == pilot.arm_environment(contract)
+
+
+def test_alternate_start_contract_is_identity_bound_and_default_record_is_unchanged():
+    default = pilot.PilotContract().to_record()
+    binding = alternate_binding()
+    selected = pilot.PilotContract(alternate_start=binding)
+
+    selected.validate()
+    assert "alternate_start" not in default
+    assert "case_identity" not in default
+    assert selected.to_record()["case_identity"] == binding.identity
+    assert "retained_config_path" not in json.dumps(selected.to_record())
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"case_id": "another-case"}, "approved Jorah/MEEREEN"),
+        ({"snapshot": "another-snapshot"}, "qualified Jorah/MEEREEN snapshot"),
+        ({"principal": r"ESSOS\other.user"}, "start semantics"),
+        ({"host": "BRAAVOS"}, "start semantics"),
+        ({"host_ip": "10.4.10.23"}, "start semantics"),
+        ({"retained_config_sha256": "A" * 64}, "canonical"),
+        ({"task_prelaunch_state": "Running"}, "incomplete"),
+    ],
+)
+def test_alternate_start_contract_rejects_semantic_and_fixture_drift(change, reason):
+    with pytest.raises(pilot.PilotError, match=reason):
+        pilot.PilotContract(alternate_start=alternate_binding(**change)).validate()
+
+
+def test_alternate_start_pair_consumes_the_same_explicit_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
+    binding = alternate_binding()
+    contract = pilot.PilotContract(alternate_start=binding)
+    events = []
+    deps = dependencies(events, second_start=alternate_start_manifest(binding))
+    deps.reset = lambda arm, env: (
+        events.append(("reset", arm, dict(env))) or alternate_start_manifest(binding)
+    )
+
+    result = pilot.run_pair(contract, tmp_path / "alternate", deps)
+
+    assert result["run_complete"] is True
+    assert result["pair_compatible"] is True
+    assert [event[1] for event in events if isinstance(event, tuple) and event[0] == "run"] == list(contract.arm_order)
+    assert pilot.summarize_pair(pilot.read_records(tmp_path / "alternate" / "pilot.jsonl"))["pair_compatible"] is True
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"snapshot": pilot.SNAPSHOT}, "snapshot"),
+        ({"foothold": {"count": 1, "principal": r"NORTH\samwell.tarly", "host": "MEEREEN", "payload_type": "apollo"}}, "principal"),
+        ({"foothold": {"count": 1, "principal": r"ESSOS\jorah.mormont", "host": "CASTELBLACK", "payload_type": "apollo"}}, "host"),
+        ({"case_identity": "0" * 64}, "case identity"),
+    ],
+)
+def test_alternate_start_pair_rejects_wrong_bound_start_before_execution(tmp_path, monkeypatch, change, reason):
+    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
+    binding = alternate_binding()
+    executed = []
+    deps = dependencies([], second_start=alternate_start_manifest(binding, **change))
+    deps.reset = lambda _arm, _env: alternate_start_manifest(binding, **change)
+    deps.run_arm = lambda arm, *_args: executed.append(arm)
+
+    result = pilot.run_pair(
+        pilot.PilotContract(alternate_start=binding), tmp_path / f"wrong-{reason}", deps,
+    )
+
+    assert executed == []
+    assert result["protocol_valid"] is False
     with pytest.raises(pilot.PilotError, match="fixed contract"):
         pilot.PilotContract(arm_order=(pilot.ARM_ORDER[0], pilot.ARM_ORDER[0])).validate()
 

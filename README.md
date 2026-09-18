@@ -114,13 +114,16 @@ The split of LLM judgment from deterministic execution and verification draws on
 
 ### Agents
 
-A request is routed by a **Supervisor** to one of six specialists. Each agent's system prompt is a plain
+The agent graph routes requests through a **Supervisor** and six specialists. Configured autonomous objectives
+can instead use the native capability controller, which owns the policy-selection/execution/verification loop
+and bypasses Supervisor/worker negotiation. A result from that controller path does not measure the specialist
+graph. Each agent's system prompt is a plain
 markdown file under `Payload_Type/sage/prompts/` — edit the body, start a new chat, and that agent's behavior
 changes with no Python edit and no restart. This is how you ship your own playbook with an engagement.
 
 | Agent | Role |
 |---|---|
-| Supervisor | Routes the request to the right specialist and drives the autonomous solve loop |
+| Supervisor | Routes requests and coordinates specialists on the agent-graph path |
 | Mythic_Operator | All Mythic C2 operations and in-memory offensive tradecraft |
 | Mythic_Payload | Builds and configures Mythic payloads and C2 profiles |
 | BloodHound | Attack-graph lifecycle — collects, ingests, and analyzes BloodHound facts |
