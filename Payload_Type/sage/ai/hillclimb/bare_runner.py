@@ -497,6 +497,7 @@ class BareVsHarness:
     harness_outcomes: dict = field(default_factory=dict)
     bare_success_interval: tuple = (0.0, 1.0)
     harness_success_interval: tuple = (0.0, 1.0)
+    measurement: dict = field(default_factory=dict)
 
 
 def _binary_arm_summary(cards: list) -> dict:
@@ -582,6 +583,7 @@ def compare_bare_vs_harness(
     Rates use explicitly observed outcomes; the returned counts retain missing/invalid evidence.
     This is descriptive, not a pairing, protocol-validity, or promotion decision.
     Legacy numeric consumers fail clearly without observed rates; missing-aware reports may opt in."""
+    from ai.hillclimb.reproducible_claims import measurement_labels
     bare = _binary_arm_summary(bare_cards)
     harness = _binary_arm_summary(harness_cards)
     delta = harness["rate"] - bare["rate"] if bare["n"] and harness["n"] else None
@@ -615,6 +617,8 @@ def compare_bare_vs_harness(
         min_detectable_effect=mde,
         resolved=resolved,
         verdict=verdict,
+        measurement=measurement_labels([getattr(card, "measurement_identity", None)
+                                        for card in (*bare_cards, *harness_cards)]),
         bare_cost_mean=bare["cost_mean"],
         harness_cost_mean=harness["cost_mean"],
         bare_outcomes=bare["outcomes"],

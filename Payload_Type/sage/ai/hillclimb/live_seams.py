@@ -762,6 +762,16 @@ _CALLBACK_PROOF_QUERY = """
           }
         }
         """
+_OPERATION_TASK_EVIDENCE_QUERY = """
+        query EvaluationTaskEvidence($operationId: Int!, $limit: Int!) {
+          task(where: {operation_id: {_eq: $operationId}, completed: {_eq: true}},
+               order_by: {display_id: desc}, limit: $limit) {
+            operation_id display_id command_name display_params original_params completed status
+            callback { display_id host domain active }
+            responses { id response_text }
+          }
+        }
+        """
 _CLEAN_MYTHIC_STATE_QUERY = """
         query Gate1PCleanState {
           task(order_by: {display_id: asc}, limit: 1) { display_id }
@@ -889,9 +899,10 @@ def _fetch_credentials_for_probe(*, timeout: int = 60) -> list[dict]:
     from mythic import mythic  # type: ignore
 
     async def _q():
-        client = await _mythic_login_async_safe()
-        r = await asyncio.wait_for(
-            mythic.execute_custom_query(client, _CREDENTIAL_QUERY, variables={}), timeout=timeout)
+        async def read():
+            client = await _mythic_login_async_safe()
+            return await mythic.execute_custom_query(client, _CREDENTIAL_QUERY, variables={})
+        r = await asyncio.wait_for(read(), timeout=timeout)
         return r.get("credential", []) or []
 
     try:
@@ -1038,6 +1049,49 @@ class ProbeReadError(RuntimeError):
     """An independent proof source was unavailable rather than negative."""
 
 
+def operation_task_evidence(*, expected_operation_id: int, timeout: int = 60, limit: int = 300) -> list[dict]:
+    """Read exact-operation completed tasks for independent evaluator parsers.
+
+    No task is issued. Login and the query share one timeout; missing or
+    mismatched operation identity is unavailable, never an observed negative.
+    """
+    if type(expected_operation_id) is not int or expected_operation_id <= 0:
+        raise ProbeReadError("evaluation operation identity is unavailable")
+    from mythic import mythic  # type: ignore
+
+    async def read():
+        client = await _mythic_login_async_safe()
+        if getattr(client, "current_operation_id", None) != expected_operation_id:
+            raise ProbeReadError("evaluation operation identity changed")
+        return await mythic.execute_custom_query(
+            client, _OPERATION_TASK_EVIDENCE_QUERY,
+            variables={"operationId": expected_operation_id, "limit": limit},
+        )
+
+    async def bounded():
+        return await asyncio.wait_for(read(), timeout=timeout)
+
+    try:
+        response = asyncio.run(bounded())
+        rows = response.get("task")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or row.get("operation_id") != expected_operation_id
+            or row.get("completed") is not True or type(row.get("display_id")) is not int
+            or row["display_id"] <= 0 for row in rows
+        ):
+            raise ProbeReadError("evaluation task evidence is malformed or outside the operation")
+        if len({row["display_id"] for row in rows}) != len(rows):
+            raise ProbeReadError("evaluation task evidence contains duplicate task identities")
+        return [{**row, "output": _decode_mythic_response_rows(row.get("responses")),
+                 "callback_display_id": (row.get("callback") or {}).get("display_id"),
+                 "callback_active": (row.get("callback") or {}).get("active")}
+                for row in rows]
+    except Exception as exc:
+        if isinstance(exc, ProbeReadError):
+            raise
+        raise ProbeReadError("evaluation task evidence read failed") from exc
+
+
 def _fetch_completed_task_outputs(
     *,
     timeout: int = 60,
@@ -1048,15 +1102,14 @@ def _fetch_completed_task_outputs(
     from mythic import mythic  # type: ignore
 
     async def _q():
-        client = await _mythic_login_async_safe()
-        result = await asyncio.wait_for(
-            mythic.execute_custom_query(
+        async def read():
+            client = await _mythic_login_async_safe()
+            return await mythic.execute_custom_query(
                 client,
                 _CERTIFICATE_AUTH_TASK_QUERY,
                 variables={"limit": int(limit)},
-            ),
-            timeout=timeout,
-        )
+            )
+        result = await asyncio.wait_for(read(), timeout=timeout)
         return result.get("task", []) or []
 
     try:
@@ -1082,11 +1135,10 @@ def _fetch_callbacks_for_probe(*, timeout: int = 60) -> list[dict]:
     from mythic import mythic  # type: ignore
 
     async def _q():
-        client = await _mythic_login_async_safe()
-        result = await asyncio.wait_for(
-            mythic.execute_custom_query(client, _CALLBACK_PROOF_QUERY, variables={}),
-            timeout=timeout,
-        )
+        async def read():
+            client = await _mythic_login_async_safe()
+            return await mythic.execute_custom_query(client, _CALLBACK_PROOF_QUERY, variables={})
+        result = await asyncio.wait_for(read(), timeout=timeout)
         return result.get("callback", []) or []
 
     try:
@@ -1252,11 +1304,14 @@ def remote_execution_probe(
     """
     wanted_host = str(target_host or "").strip()
     wanted_realm = str(realm or "").strip()
+    factory_started = time.monotonic()
     baseline_ids = {
         str(row.get("display_id") or "").strip()
         for row in _fetch_callbacks_for_probe(timeout=timeout)
         if str(row.get("display_id") or "").strip()
     }
+
+    factory_wall_seconds = time.monotonic() - factory_started
 
     def probe() -> bool:
         try:
@@ -1275,6 +1330,8 @@ def remote_execution_probe(
             return False
         return False
 
+    setattr(probe, "_verifier_factory_invocations", 1)
+    setattr(probe, "_verifier_factory_wall_seconds", factory_wall_seconds)
     return probe
 
 
@@ -1301,10 +1358,12 @@ def ticket_admin_control_probe(
         try:
             try:
                 from ..langgraph import capabilities, credential_artifacts
+                from . import ticket_context
             except Exception:
                 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "langgraph"))
                 import capabilities  # type: ignore
                 import credential_artifacts  # type: ignore
+                import ticket_context  # type: ignore
 
             rows = _fetch_certificate_auth_task_outputs(timeout=timeout, raise_on_error=True)
             window = max(0, int(task_window))
@@ -1315,6 +1374,8 @@ def ticket_admin_control_probe(
                     expected_domain=realm,
                 )
                 if not anchor_probe.get("service_access_proven"):
+                    continue
+                if not ticket_context.recognized_access_request(anchor, realm):
                     continue
 
                 anchor_id = _display_id(anchor)
@@ -1331,6 +1392,7 @@ def ticket_admin_control_probe(
                     row
                     for row in related
                     if _display_id(row) < anchor_id
+                    and ticket_context.recognized_forge_request(row, realm)
                     and credential_artifacts.extract_ticket_probe(
                         str(row.get("output") or ""),
                         expected_domain=realm,
@@ -1512,11 +1574,12 @@ def _fetch_krbtgt_dcsync_task_outputs(*, timeout: int = 60) -> list[dict]:
     from mythic import mythic  # type: ignore
 
     async def _q():
-        client = await _mythic_login_async_safe()
-        return await asyncio.wait_for(
-            mythic.execute_custom_query(client, _KRBTGT_DCSYNC_TASK_QUERY, variables={"limit": 250}),
-            timeout=timeout,
-        )
+        async def read():
+            client = await _mythic_login_async_safe()
+            return await mythic.execute_custom_query(
+                client, _KRBTGT_DCSYNC_TASK_QUERY, variables={"limit": 250}
+            )
+        return await asyncio.wait_for(read(), timeout=timeout)
 
     try:
         rows = (asyncio.run(_q()).get("task", []) or [])

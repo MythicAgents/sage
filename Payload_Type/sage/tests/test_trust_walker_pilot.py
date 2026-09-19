@@ -488,7 +488,7 @@ def test_execution_protocol_error_is_retained_and_blocks_second_arm(tmp_path, mo
 
 def test_unmeasured_outcome_is_protocol_valid_but_not_comparison_ready():
     records = [
-        {"record_type": "arm_started", "arm": arm, "start_identity": {"same": True}}
+        {"record_type": "arm_started", "arm": arm, "start_identity": start_manifest()}
         for arm in pilot.ARM_ORDER
     ] + [
         {"record_type": "settlement", "arm": arm, "complete": True}
@@ -512,7 +512,7 @@ def test_unmeasured_outcome_is_protocol_valid_but_not_comparison_ready():
 
 def test_missing_resource_metric_does_not_erase_interpretable_objective():
     records = [
-        {"record_type": "arm_started", "arm": arm, "start_identity": {"same": True}}
+        {"record_type": "arm_started", "arm": arm, "start_identity": start_manifest()}
         for arm in pilot.ARM_ORDER
     ] + [
         {"record_type": "settlement", "arm": arm, "complete": True}
@@ -547,6 +547,62 @@ def test_missing_resource_metric_does_not_erase_interpretable_objective():
     assert summary["resources_complete"] is False
     assert summary["run_complete"] is True
     assert summary["arms"][1]["objective_disposition"] == "disproven"
+
+
+@pytest.mark.parametrize(
+    ("contract", "identities"),
+    [
+        (pilot.PilotContract(), lambda: (start_manifest(), start_manifest())),
+        (
+            pilot.PilotContract(alternate_start=alternate_binding()),
+            lambda: (
+                alternate_start_manifest(alternate_binding()),
+                alternate_start_manifest(alternate_binding()),
+            ),
+        ),
+        (
+            pilot.ImprovementContract("a" * 64, "b" * 64),
+            lambda: (start_manifest(source_identity="a" * 64), start_manifest(source_identity="b" * 64)),
+        ),
+    ],
+    ids=("default", "alternate", "improvement"),
+)
+def test_summary_accepts_valid_start_identities_for_each_contract(contract, identities):
+    records = [
+        {"record_type": "arm_started", "arm": arm, "start_identity": identity}
+        for arm, identity in zip(contract.arm_order, identities(), strict=True)
+    ]
+
+    assert pilot.summarize_pair(records, contract)["pair_compatible"] is True
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({}, {}),
+        (
+            start_manifest(route={"provider": "stale", "model": "stale", "endpoint_identity": "stale"}),
+            start_manifest(route={"provider": "stale", "model": "stale", "endpoint_identity": "stale"}),
+        ),
+        (
+            start_manifest(),
+            start_manifest(route={"provider": "wrong", "model": pilot.MODEL, "endpoint_identity": "route-a"}),
+        ),
+        (start_manifest(), start_manifest(source_identity="tree-b")),
+        (start_manifest(), start_manifest(objective_sha256="0" * 64)),
+    ],
+    ids=("both-empty", "equal-stale", "wrong-route", "wrong-source", "wrong-objective"),
+)
+def test_default_summary_rejects_missing_stale_and_mismatched_start_identities(first, second):
+    records = [
+        {"record_type": "arm_started", "arm": arm, "start_identity": identity}
+        for arm, identity in zip(pilot.ARM_ORDER, (first, second), strict=True)
+    ]
+
+    summary = pilot.summarize_pair(records, pilot.PilotContract())
+
+    assert summary["pair_compatible"] is False
+    assert summary["protocol_valid"] is False
 
 
 def test_loaded_rejected_kernel_fails_before_preflight(tmp_path, monkeypatch):
@@ -788,3 +844,34 @@ def test_improvement_pair_rejects_wrong_arm_source_identity(tmp_path, monkeypatc
     records = pilot.read_records(tmp_path / "wrong-source" / "pilot.jsonl")
     invalid = next(row for row in records if row["record_type"] == "start_invalid")
     assert invalid["reason"] == "arm source identity mismatch"
+
+
+def test_new_pair_retains_incomplete_terminal_cost_and_blocks_performance_assertion(tmp_path, monkeypatch):
+    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
+    result = pilot.run_pair(pilot.PilotContract(), tmp_path / "cost", dependencies([]))
+    records = pilot.read_records(tmp_path / "cost" / "pilot.jsonl")
+    costs = [row["terminal_verifier_cost"] for row in records if row["record_type"] == "arm_result"]
+    assert len(costs) == 2
+    assert all(cost["monetary_cost_usd"] is None and cost["monetary_cost_status"] == "unavailable" for cost in costs)
+    identities = [row["measurement_identity"] for row in records if row["record_type"] == "arm_result"]
+    assert all(identity["logical_seed"] is None and identity["generation_config"] is None for identity in identities)
+    assert result["terminal_verifier_costs_complete"] is False
+    assert result["performance_assertion_allowed"] is False
+
+
+def test_retry_zero_rejects_orphan_indexed_terminal_result():
+    with pytest.raises(pilot.PilotError, match="no started arm"):
+        pilot.summarize_pair([{
+            "record_type": "arm_result", "arm": pilot.ARM_ORDER[0], "arm_index": 0,
+            "execution": {}, "outcome": {}, "terminal_snapshot": {},
+        }])
+
+
+def test_pair_identity_is_unique_per_retained_artifact(tmp_path, monkeypatch):
+    monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
+    first = pilot.run_pair(pilot.PilotContract(), tmp_path / "one", dependencies([]))
+    second = pilot.run_pair(pilot.PilotContract(), tmp_path / "two", dependencies([]))
+    first_ids = [row["measurement_identity"]["pair_id"] for row in pilot.read_records(tmp_path / "one" / "pilot.jsonl") if row["record_type"] == "arm_result"]
+    second_ids = [row["measurement_identity"]["pair_id"] for row in pilot.read_records(tmp_path / "two" / "pilot.jsonl") if row["record_type"] == "arm_result"]
+    assert len(set(first_ids)) == len(set(second_ids)) == 1
+    assert first_ids[0] != second_ids[0]

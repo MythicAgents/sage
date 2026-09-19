@@ -146,8 +146,18 @@ _DEMO_PROFILES = {
 }
 
 
-def _print_report(report: gx.GateExperimentReport) -> None:
+def _measurement_allowed(report: gx.GateExperimentReport) -> bool:
+    return bool(getattr(report, "measurement", {}).get("performance_assertion_allowed"))
+
+
+def _print_report(report: gx.GateExperimentReport, *, diagnostic: bool = False) -> None:
+    if not _measurement_allowed(report) and not diagnostic:
+        print("gate-experiment: performance assertion refused: missing or stale measurement labels", file=sys.stderr)
+        return
     print(json.dumps({"kind": "gate_experiment", **report.to_dict()}, indent=2, default=str))
+    if diagnostic:
+        print("\nDIAGNOSTIC ONLY: synthetic gate output is not a retained benchmark-performance claim.", flush=True)
+        return
     rho = "n/a" if report.spearman_rho is None else f"{report.spearman_rho:.3f}"
     print(
         f"\nVERDICT: {report.verdict}  (rho={rho}, "
@@ -155,6 +165,39 @@ def _print_report(report: gx.GateExperimentReport) -> None:
         f"{report.note}",
         flush=True,
     )
+
+
+def _retained_gate_cards(path: str) -> dict[str, list]:
+    """Load explicit ``{config, card}`` retained rows without invoking a runner."""
+    source = Path(path)
+    text = source.read_text(encoding="utf-8")
+    parsed = json.loads(text) if source.suffix.lower() == ".json" else [
+        json.loads(line) for line in text.splitlines() if line.strip()
+    ]
+    rows = parsed.get("records") if isinstance(parsed, dict) else parsed
+    if not isinstance(rows, list):
+        raise ValueError("retained gate cards must be a JSON/JSONL list of {config, card} rows")
+    grouped: dict[str, list] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("config"), str) or not isinstance(row.get("card"), dict):
+            raise ValueError("each retained gate row requires string config and ScoreCard card")
+        grouped.setdefault(row["config"], []).append(gx.ScoreCard(**row["card"]))
+    if not grouped:
+        raise ValueError("no retained gate cards")
+    return grouped
+
+
+def _cmd_verify_claims(args: argparse.Namespace) -> int:
+    """Forward a named retained manifest to the shared offline verifier only."""
+    try:
+        from .reproducible_claims import verify_claims
+        report = verify_claims(args.manifest)
+    except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+        print(json.dumps({"verified": False, "error": "claim reproduction failed; check labels, source/evaluator bindings, dependencies and asserted output",
+                          **({"verifier_cost": exc.verifier_cost} if hasattr(exc, "verifier_cost") else {})}))
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+    return 0
 
 
 def _orchestrate_reset_fn():
@@ -182,6 +225,20 @@ def _orchestrate_reset_fn():
 
 
 def _cmd_gate_experiment(args: argparse.Namespace) -> int:
+    if args.scorecards:
+        try:
+            report = gx.aggregate_gate_experiment(
+                _retained_gate_cards(args.scorecards), seeds=args.seeds,
+                rho_threshold=args.rho_threshold, write_record=False,
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            print("gate-experiment: could not load retained ScoreCards", file=sys.stderr)
+            return 2
+        if not _measurement_allowed(report):
+            _print_report(report)
+            return 2
+        _print_report(report)
+        return 0 if report.verdict == "PASS" else 1
     scenarios = goad_scenarios(args.engagement_id)
     if args.scenario:
         scenarios = [s for s in scenarios if s.name == args.scenario]
@@ -195,7 +252,7 @@ def _cmd_gate_experiment(args: argparse.Namespace) -> int:
             gx.synthetic_runner(_DEMO_PROFILES),
             seeds=args.seeds, results_dir=args.results_dir, write_record=bool(args.results_dir),
         )
-        _print_report(report)
+        _print_report(report, diagnostic=True)
         return 0 if report.verdict == "PASS" else 1
 
     if not args.live:
@@ -219,6 +276,9 @@ def _cmd_gate_experiment(args: argparse.Namespace) -> int:
         seeds=args.seeds, sage_cb=args.sage_cb, db=args.db, out_dir=args.out,
         results_dir=args.results_dir, rho_threshold=args.rho_threshold,
     )
+    if not _measurement_allowed(report):
+        _print_report(report)
+        return 2
     _print_report(report)
     return 0 if report.verdict == "PASS" else 1
 
@@ -232,6 +292,9 @@ def _cmd_noise_floor(args: argparse.Namespace) -> int:
         )
     except Exception as e:
         print(f"noise-floor: {e}", file=sys.stderr)
+        return 2
+    if not report.measurement.get("performance_assertion_allowed"):
+        print("noise-floor: performance assertion refused: missing or stale measurement labels", file=sys.stderr)
         return 2
     print(json.dumps(asdict(report), indent=2, default=str))
     print(
@@ -378,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
     ge.add_argument("--seeds", type=int, default=5)
     ge.add_argument("--engagement-id", default="Operation_GOAD")
     ge.add_argument("--results-dir", default=None)
+    ge.add_argument("--scorecards", default=None,
+                    help="retained JSON/JSONL {config, card} rows; pure offline aggregate, no runner")
     ge.set_defaults(func=_cmd_gate_experiment)
 
     nf = sub.add_parser("noise-floor", help="compute noise floor + MDE from already-recorded gauge runs (no lab)")
@@ -386,6 +451,10 @@ def main(argv: list[str] | None = None) -> int:
     nf.add_argument("--n", type=int, default=None, help="use only the last N recorded runs (default: all)")
     nf.add_argument("--results", default=None, help="path to bare_vs_harness.jsonl (default: .hillclimb/results/)")
     nf.set_defaults(func=_cmd_noise_floor)
+
+    vc = sub.add_parser("verify-claims", help="reproduce a retained source-bound claim manifest offline")
+    vc.add_argument("manifest", help="retained claim manifest JSON")
+    vc.set_defaults(func=_cmd_verify_claims)
 
     nm = sub.add_parser(
         "null-model-factorial",

@@ -32,6 +32,25 @@ def test_capability_from_ground_truth_orders_runs():
     assert fitness.to_scalar(hi) > fitness.to_scalar(lo)
 
 
+def test_unknown_historical_verifier_cost_is_not_reported_as_zero():
+    from range_state import VerifierCost
+    truth = _gt(Milestone.KRBTGT_DUMPED, Milestone.KRBTGT_DUMPED)
+    assert fitness.score(_RUN, truth).verifier_wall_seconds is None
+    truth.verifier_costs = {Milestone.KRBTGT_DUMPED: VerifierCost.legacy_unknown("KRBTGT_DUMPED")}
+    card = fitness.score(_RUN, truth)
+    assert card.verifier_wall_seconds is None
+    assert card.verifier_costs["KRBTGT_DUMPED"]["raw_probe_invocations"] is None
+    truth.verifier_costs[Milestone.KRBTGT_DUMPED] = VerifierCost(
+        effect="KRBTGT_DUMPED", raw_probe_invocations=2, wall_seconds=1.25)
+    assert fitness.score(_RUN, truth).verifier_wall_seconds == 1.25
+    partial = VerifierCost.from_record({"monetary_cost_status": "unavailable", "completeness": "incomplete"})
+    assert partial.wall_seconds is None and partial.raw_probe_invocations is None
+    unqualified = VerifierCost.from_record({"monetary_cost_status": "measured", "monetary_cost_usd": 1,
+                                           "completeness": "complete"})
+    assert unqualified.monetary_cost_usd is None and unqualified.monetary_cost_status == "unavailable"
+    assert unqualified.completeness == "incomplete"
+
+
 def test_goodhart_gap_fires_when_substring_disagrees():
     # substring eval says 0.9, ground truth barely past foothold -> large gap = Goodhart alarm
     lo = fitness.score(_RUN, _gt(Milestone.GRAPH_COLLECTED, Milestone.GRAPH_COLLECTED))
@@ -61,6 +80,14 @@ def test_verifier_hash_versions_the_gauge():
     assert h1 != h2 and h1.startswith("sha256:")
     # stable for the same version
     assert fitness.verifier_hash(None, "phase0-1") == h1
+
+
+def test_dense_reward_keeps_unknown_money_unavailable_not_free():
+    reward = fitness.dense_reward_from_trace({"monetary_cost_usd": None})
+    components = reward.to_dict()["components"]
+    assert reward.reward_version == "dense-reward-v2"
+    assert components["monetary_cost_usd"]["value"] is None
+    assert components["monetary_cost_available"]["value"] is False
 
 
 def test_public_canonical_row_replay_validator_rejects_noncanonical_input():

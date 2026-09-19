@@ -78,6 +78,33 @@ REGISTRY: tuple[OracleContract, ...] = (
                               "domain_admin_differential"}), "objective"),
 )
 
+# Capability effects remain separate from the frozen gauge milestone/weight
+# vocabulary. They use the same typed proof admission and versioned oracle IDs;
+# registering one does not add a score, task, or runtime capability.
+CAPABILITY_EFFECT_REGISTRY: tuple[OracleContract, ...] = (
+    OracleContract("DA_PARENT", "mythic.task.parent-domain-admin-differential.v1",
+                   frozenset({ProofOrigin.MYTHIC_TASK_OUTPUT}), frozenset({"domain_admin_differential"}),
+                   "parent", True),
+    OracleContract("ACCOUNT_CREDENTIAL_MATERIAL", "mythic.account-credential-material.v1", _MYTHIC_SECRET,
+                   frozenset({"account_credential_material"})),
+    OracleContract("ACCOUNT_KERBEROS_CONTEXT", "mythic.account-kerberos-context.v1", _MYTHIC_RESULT,
+                   frozenset({"account_kerberos_context"})),
+    OracleContract("MANAGED_LOCAL_ADMIN_SECRET", "mythic.managed-local-admin-secret.v1", _MYTHIC_RESULT,
+                   frozenset({"managed_local_admin_secret"})),
+    OracleContract("MANAGED_LOCAL_ADMIN_ACCESS", "mythic.managed-local-admin-access.v1", _MYTHIC_RESULT,
+                   frozenset({"managed_local_admin_access"})),
+    OracleContract("ENDPOINT_PROTECTION_STATE", "mythic.endpoint-protection-state.v1", _MYTHIC_RESULT,
+                   frozenset({"endpoint_protection_state"})),
+    OracleContract("CA_KEY_EXPORTED", "mythic.ca-private-key-material.v1", _MYTHIC_RESULT,
+                   frozenset({"ca_private_key_material"})),
+    OracleContract("CERTIFICATE_ENROLLED", "mythic.certificate-enrollment.v1", _MYTHIC_RESULT,
+                   frozenset({"certificate_enrollment"})),
+    OracleContract("HOST_CREDENTIAL_MATERIAL", "mythic.host-credential-material.v1", _MYTHIC_SECRET,
+                   frozenset({"host_credential_material"})),
+    OracleContract("RBCD_RIGHTS", "bloodhound.rbcd-rights.v1",
+                   frozenset({ProofOrigin.PAYLOAD_BLOODHOUND_FACT}), frozenset({"rbcd_rights"})),
+)
+
 
 def validate_registry(contracts: Iterable[OracleContract] | None = None) -> dict[str, OracleContract]:
     by_milestone: dict[str, OracleContract] = {}
@@ -95,12 +122,13 @@ def validate_registry(contracts: Iterable[OracleContract] | None = None) -> dict
 
 
 _BY_MILESTONE = validate_registry()
+_BY_CAPABILITY_EFFECT = validate_registry(CAPABILITY_EFFECT_REGISTRY)
 
 
 def contract_for(milestone: object) -> OracleContract:
     name = getattr(milestone, "name", str(milestone))
     try:
-        return _BY_MILESTONE[name]
+        return {**_BY_MILESTONE, **_BY_CAPABILITY_EFFECT}[name]
     except KeyError as exc:
         raise KeyError(f"unregistered scored milestone: {name}") from exc
 

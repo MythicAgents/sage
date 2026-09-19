@@ -93,6 +93,7 @@ def _persist_ground_truth_probe_results(
     *,
     recorded_milestones: set[Milestone],
     verifier_hash: str | None = None,
+    verifier_costs: dict | None = None,
 ) -> dict:
     """Add the captured live-probe vector to the engagement ledger.
 
@@ -113,6 +114,14 @@ def _persist_ground_truth_probe_results(
     }
     if verifier_hash:
         record["_verifier_hash"] = verifier_hash
+    if verifier_costs:
+        record["_verifier_costs"] = {
+            milestone.name if isinstance(milestone, Milestone) else str(milestone): (
+                cost.to_record() if hasattr(cost, "to_record") else dict(cost)
+            )
+            for milestone, cost in verifier_costs.items()
+            if milestone in recorded_milestones
+        }
     data = engagement_ledger.load(engagement_id)
     data["ground_truth_probes"] = record
     engagement_ledger.save(data, engagement_id)
@@ -221,6 +230,7 @@ class LiveRunner:
             gt.proof_results,
             recorded_milestones=recordable,
             verifier_hash=current_verifier_hash(scenario, self.gauge_version),
+            verifier_costs=gt.verifier_costs,
         )
 
     def run_batch(self, config, scenario, seeds: int = 5) -> list[ScoreCard]:

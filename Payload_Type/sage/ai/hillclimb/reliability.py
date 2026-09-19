@@ -101,10 +101,12 @@ class ReliabilityReport:
     least_stable_milestone: str | None = None
     least_stable_agreement: float = 1.0
     mde_sigma: float = 2.0
+    measurement: dict = field(default_factory=dict)
 
 
 def noise_floor(scorecards: Sequence[ScoreCard], *, mde_sigma: float = 2.0) -> ReliabilityReport:
     """Pure noise-floor statistics over N ScoreCards of the SAME config (same verifier_hash)."""
+    from ai.hillclimb.reproducible_claims import measurement_labels
     cards = list(scorecards)
     if not cards:
         raise ValueError("noise_floor needs at least one ScoreCard")
@@ -146,6 +148,7 @@ def noise_floor(scorecards: Sequence[ScoreCard], *, mde_sigma: float = 2.0) -> R
         least_stable_milestone=least,
         least_stable_agreement=(agreement[least] if least is not None else 1.0),
         mde_sigma=mde_sigma,
+        measurement=measurement_labels([getattr(card, "measurement_identity", None) for card in cards]),
     )
 
 

@@ -42,11 +42,16 @@ from ai.hillclimb.experiment_contracts import (
     TypedVerdict,
     AttemptContract,
     CostMeasurement,
+    CostLimits,
+    PriceProvenance,
+    CampaignContract,
+    aggregate_attempt_costs,
     append_attempt_record,
     content_hash,
     load_attempt_records,
     validate_attempt_contract,
     validate_attempt_records,
+    resolve_attempt_records,
 )
 from ai.hillclimb import fitness
 from ai.hillclimb.fitness import dense_reward_from_trace
@@ -211,11 +216,12 @@ def test_attempt_contract_extends_frozen_schema_and_appends_without_rewrite(tmp_
         immutable_hashes=_hashes(),
         started_at="2026-07-14T00:00:00+00:00",
         status="started",
+        evidence_state="burned",
         cost=CostMeasurement(child_task_count=1, wall_time_seconds=1.5),
     )
     interrupted = AttemptContract(
         attempt_id="attempt-2",
-        supersedes_attempt_id="attempt-1",
+        replacement_for_attempt_id="attempt-1",
         experiment_id="experiment-1",
         treatment_id="treatment-1",
         candidate=_candidate(),
@@ -231,11 +237,11 @@ def test_attempt_contract_extends_frozen_schema_and_appends_without_rewrite(tmp_
     append_attempt_record(path, interrupted)
     rows = load_attempt_records(path)
     assert len(rows) == 2
-    assert rows[0]["schema_version"] == 1
+    assert rows[0]["schema_version"] == 2
     assert rows[0]["candidate"]["candidate_id"] == "candidate-1"
     assert rows[0]["immutable_hashes"]["active_ledger_hash_before"] == "4" * 64
     assert rows[0]["record_hash"] == started.content_hash
-    assert rows[1]["supersedes_attempt_id"] == "attempt-1"
+    assert rows[1]["replacement_for_attempt_id"] == "attempt-1"
     assert rows[1]["status"] == "failed"
     assert rows[1]["cost"]["termination_reason"] == "interrupted"
     assert validate_attempt_contract(started) == ()
@@ -246,6 +252,139 @@ def test_verifier_hash_changes_when_dense_reward_version_changes(monkeypatch):
     before = fitness.verifier_hash()
     monkeypatch.setattr(fitness, "DENSE_REWARD_VERSION", "dense-reward-fixture-v2")
     assert fitness.verifier_hash() != before
+
+
+def test_cost_measurement_keeps_unknown_money_distinct_from_measured_zero_and_legacy():
+    unavailable = CostMeasurement()
+    assert unavailable.monetary_cost_usd is None
+    assert unavailable.monetary_cost_status == "unavailable"
+    measured_zero = CostMeasurement(
+        monetary_cost_usd=0.0,
+        monetary_cost_status="measured",
+        price_provenance=PriceProvenance(
+            source_id="fixture-rate-card",
+            route_model_identity="provider:model",
+            effective_date_or_version="2026-09-18",
+        ),
+    )
+    assert measured_zero.monetary_cost_countable is True
+    legacy = CostMeasurement.from_dict({"monetary_cost_usd": 0.0}, schema_version=1)
+    assert legacy.monetary_cost_status == "legacy_unknown"
+    assert legacy.monetary_cost_countable is False
+
+
+def test_cost_aggregation_charges_burned_replacements_once_and_marks_unavailable_money():
+    base = AttemptContract(
+        attempt_id="burned", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        evidence_state="burned", cost=CostMeasurement(child_task_count=1, wall_time_seconds=2),
+    )
+    replacement = AttemptContract(
+        attempt_id="replacement", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        replacement_for_attempt_id="burned", cost=CostMeasurement(child_task_count=2, wall_time_seconds=3),
+    )
+    amendment = AttemptContract(
+        attempt_id="amendment", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        supersedes_attempt_id="replacement", amendment_reason="correct metadata",
+        cost=CostMeasurement(child_task_count=2, wall_time_seconds=3),
+    )
+    summary = aggregate_attempt_costs(
+        (base, replacement, amendment), limits=CostLimits(child_task_count=2, wall_time_seconds=4, monetary_cost_usd=1),
+    )
+    assert summary.charged_attempt_ids == ("burned", "replacement")
+    assert summary.child_task_count == 3
+    assert summary.wall_time_seconds == 5.0
+    assert summary.monetary_cost_usd is None
+    assert summary.unavailable_monetary_attempt_ids == ("burned", "replacement")
+    assert summary.limit_dispositions == {
+        "child_task_count": "exceeded", "wall_time_seconds": "exceeded", "monetary_cost_usd": "unavailable",
+    }
+
+
+def test_legacy_record_remains_outcome_readable_but_its_price_is_not_countable():
+    legacy = {
+        "schema_version": 1,
+        "attempt_id": "legacy", "experiment_id": "exp", "campaign_id": "camp", "treatment_id": "treat",
+        "cost": {"child_task_count": 1, "monetary_cost_usd": 0.0},
+    }
+    row = {"record_hash": content_hash(legacy), **legacy}
+    resolved = resolve_attempt_records((row,))
+    assert resolved.valid is True
+    assert resolved.effective_admitted_head_ids == ("legacy",)
+    cost = CostMeasurement.from_dict(legacy["cost"], schema_version=legacy["schema_version"])
+    assert cost.monetary_cost_status == "legacy_unknown"
+    assert cost.monetary_cost_countable is False
+
+
+def test_admitted_amendment_becomes_effective_without_charging_its_cost_twice():
+    original = AttemptContract(
+        attempt_id="original", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        source={"fixture": "same"}, cost=CostMeasurement(child_task_count=1),
+    )
+    amendment = AttemptContract(
+        attempt_id="amended", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        supersedes_attempt_id="original", amendment_reason="corrected outcome metadata",
+        source={"fixture": "same"}, cost=CostMeasurement(child_task_count=1),
+    )
+    rows = tuple({"record_hash": item.content_hash, **item.to_dict()} for item in (original, amendment))
+    resolution = resolve_attempt_records(rows)
+    assert resolution.valid is True
+    assert resolution.effective_admitted_head_ids == ("amended",)
+    assert aggregate_attempt_costs((original, amendment)).child_task_count == 1
+
+
+def test_invalid_amendment_cannot_suppress_attempted_spend_or_start_campaign():
+    original = AttemptContract(attempt_id="original", experiment_id="exp", campaign_id="camp", treatment_id="treat", cost=CostMeasurement(child_task_count=5))
+    changed = AttemptContract(attempt_id="changed", experiment_id="exp", campaign_id="camp", treatment_id="treat", supersedes_attempt_id="original", amendment_reason="incorrect", cost=CostMeasurement(child_task_count=7))
+    summary = aggregate_attempt_costs((original, changed))
+    assert summary.authoritative is False
+    assert summary.child_task_count == 12
+    assert summary.conservative_upper_bound is True
+
+
+def test_lifecycle_resolver_rejects_forks_cross_identity_unknown_and_burned_promotion():
+    base = AttemptContract(
+        attempt_id="burned", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        evidence_state="burned", source={"kind": "fixture"}, cost=CostMeasurement(child_task_count=1),
+    ).to_dict()
+    promote_burned = AttemptContract(
+        attempt_id="bad-promote", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        supersedes_attempt_id="burned", amendment_reason="incorrect burn", source={"kind": "fixture"},
+        cost=CostMeasurement(child_task_count=1),
+    ).to_dict()
+    fork = AttemptContract(
+        attempt_id="fork", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        evidence_state="burned", supersedes_attempt_id="burned", amendment_reason="also", source={"kind": "fixture"},
+        cost=CostMeasurement(child_task_count=1),
+    ).to_dict()
+    cross = AttemptContract(
+        attempt_id="cross", experiment_id="exp", campaign_id="other", treatment_id="treat",
+        evidence_state="burned", supersedes_attempt_id="burned", amendment_reason="cross", source={"kind": "fixture"},
+        cost=CostMeasurement(child_task_count=1),
+    ).to_dict()
+    unknown = AttemptContract(
+        attempt_id="unknown", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        supersedes_attempt_id="missing", amendment_reason="unknown", cost=CostMeasurement(),
+    ).to_dict()
+    resolution = resolve_attempt_records((base, promote_burned, fork, cross, unknown))
+    assert "row_1:burned_attempt_cannot_be_admitted" in resolution.validation_failures
+    assert "row_2:supersession_fork:burned" in resolution.validation_failures
+    assert "row_3:cross_identity_supersession" in resolution.validation_failures
+    assert "row_4:unknown_supersedes_attempt_id" in resolution.validation_failures
+    assert resolution.effective_admitted_head_ids == ()
+
+
+def test_campaign_serializes_all_attempt_cost_and_effective_evidence_separately():
+    burned = AttemptContract(
+        attempt_id="old", experiment_id="exp", campaign_id="camp", treatment_id="treat", evidence_state="burned",
+        cost=CostMeasurement(child_task_count=1),
+    )
+    current = AttemptContract(
+        attempt_id="current", experiment_id="exp", campaign_id="camp", treatment_id="treat",
+        replacement_for_attempt_id="old", cost=CostMeasurement(child_task_count=2),
+    )
+    row = CampaignContract("camp", "exp", [burned, current]).to_dict()
+    assert row["cost_summary"]["child_task_count"] == 3
+    assert row["effective_evidence_ids"] == ["current"]
 
 
 def test_attempt_contract_carries_phase4_identity_measurement_provider_and_risk_fields():

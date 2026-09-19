@@ -50,7 +50,7 @@ def _has_sensitive_key(value: Any) -> bool:
             if _has_sensitive_key(nested):
                 return True
     return isinstance(value, (list, tuple)) and any(_has_sensitive_key(item) for item in value)
-def _identity(value: Mapping[str, Any]) -> dict[str, Any]:
+def validate_measurement_identity(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != _IDENTITY_FIELDS:
         raise CompositeGaugeError("measurement identity fields must match the positive allowlist exactly")
     result = {name: _text(value[name], name) for name in _STRINGS}
@@ -72,6 +72,10 @@ def _identity(value: Mapping[str, Any]) -> dict[str, Any]:
     if result["authority_mode"] not in AUTHORITY_MODES:
         raise CompositeGaugeError("authority_mode is not a supported Sage authority mode")
     return {name: result[name] for name in _IDENTITY_FIELDS}
+
+# Compatibility for existing composition callers. All reporting consumers share
+# the same positive allowlist and validation, rather than a second label schema.
+_identity = validate_measurement_identity
 def _opsec(states: Mapping[str, str]) -> str:
     if set(states) != set(CORE_DIMENSIONS) or any(
         state not in safe_success.DIMENSION_STATES for state in states.values()

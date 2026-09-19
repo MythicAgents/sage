@@ -22,10 +22,10 @@ import sys
 from typing import Any
 
 try:  # package import
-    from . import development_row_kernel, effect_registry, null_model_factorial
+    from . import development_row_kernel, effect_registry, experiment_contracts, null_model_factorial
 except Exception:  # script / flat import
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from ai.hillclimb import development_row_kernel, effect_registry, null_model_factorial  # type: ignore
+    from ai.hillclimb import development_row_kernel, effect_registry, experiment_contracts, null_model_factorial  # type: ignore
 
 
 DEFAULT_MANIFEST_PATH = Path(__file__).with_name("policy_replay_calibration_manifest.json")
@@ -245,6 +245,13 @@ def _development_row_invariant_failures(
     failures = list(disposition.get("failures") or [])
     if row.get("row_state") != "admitted" or row.get("burned") is not False:
         failures.append("row_not_admitted")
+    if any(row.get(field) is not None for field in ("supersedes_attempt_id", "replacement_for_attempt_id")):
+        failures.append("row_lifecycle_not_supported")
+    attempt_id = str(row.get("attempt_id") or "").strip()
+    if attempt_id:
+        resolution = experiment_contracts.resolve_attempt_records([row])
+        if not resolution.valid or attempt_id not in resolution.effective_admitted_head_ids:
+            failures.append("row_not_effective")
     return list(dict.fromkeys(failures))
 
 

@@ -472,6 +472,32 @@ def test_compare_preserves_ordinary_non_gate_record_behavior(tmp_path, monkeypat
     assert constructed == [{"raw": "harness"}, {"raw": "bare"}]
 
 
+def test_compare_excludes_burned_ordinary_rows(tmp_path, monkeypatch):
+    path = tmp_path / "ordinary.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(path))
+    records = [
+        {"record_type": "result", "scenario": "ordinary-scenario", "side": "harness", "card": {"raw": "burned"}, "burned": True},
+        {"record_type": "result", "scenario": "ordinary-scenario", "side": "harness", "card": {"raw": "kept"}, "burned": False},
+        {"record_type": "result", "scenario": "ordinary-scenario", "side": "bare", "card": {"raw": "bare"}, "burned": False},
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    constructed = []
+
+    class _Card:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+    class _Comparison:
+        verdict = "test"
+        delta = harness_objective_success_rate = bare_objective_success_rate = 0.0
+        min_detectable_effect = 1.0
+
+    monkeypatch.setattr(rgl, "ScoreCard", _Card)
+    monkeypatch.setattr(rgl.bare_runner, "compare_bare_vs_harness", lambda *_args: _Comparison())
+    rgl.compare(rgl.Config(), "ordinary-scenario")
+    assert constructed == [{"raw": "kept"}, {"raw": "bare"}]
+
+
 def test_pair_arm_retry_ledger_ignores_prestart_snapshot_but_blocks_started_arm(tmp_path):
     path = tmp_path / "pair.jsonl"
     protocol = {"pair_id": rgl.gate1p_stagea.PAIR_ID, "arm": "shipping_sage"}
@@ -620,6 +646,84 @@ def test_native_harness_threads_eval_force_prefix_into_channel_solver(tmp_path, 
     assert row["phase8_policy_arm"] == "symbolic"
     assert row["phase8_planned_row_id"] == "phase8-symbolic-seed-1"
     assert row["phase8_attempt_index"] == 1
+
+
+@pytest.mark.parametrize(
+    ("verifier_wall_seconds", "expected_countable", "expected_value"),
+    [
+        (None, False, None),
+        (0.0, True, 0.0),
+        (2.5, True, 2.5),
+    ],
+)
+def test_run_side_verifier_wall_countability_requires_complete_aggregate(
+    tmp_path,
+    monkeypatch,
+    verifier_wall_seconds,
+    expected_countable,
+    expected_value,
+):
+    """A nonempty legacy vector must not promote an unknown wall aggregate."""
+    results_path = tmp_path / "verifier-wall.jsonl"
+    monkeypatch.setenv("SAGE_EVAL_RESULTS_PATH", str(results_path))
+    monkeypatch.setattr(
+        rgl,
+        "_scenario",
+        lambda _cfg, _name: SimpleNamespace(objective="objective"),
+    )
+    monkeypatch.setattr(rgl.live_seams, "default_mythic_client", lambda: "CLIENT")
+    monkeypatch.setattr(rgl, "_scored_referee_domains", lambda _scn: set())
+    monkeypatch.setattr(rgl, "build_probes", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        rgl,
+        "_resolved_harness_model_route",
+        lambda _cfg: {"provider": None, "model": None, "api_endpoint": None, "api_key": None},
+    )
+    monkeypatch.setattr(rgl.live_seams, "load_sage_defaults", lambda: {})
+    monkeypatch.setattr(rgl, "validate_harness_runtime_telemetry", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(rgl, "asdict", lambda _card: {})
+
+    def _make_solver(_client, **_kwargs):
+        def _solve(_objective):
+            return "completed"
+
+        _solve.last_result = {"runtime_telemetry": {}}
+        return _solve
+
+    monkeypatch.setattr(rgl.live_seams, "make_native_chat_solver", _make_solver)
+    monkeypatch.setattr(
+        rgl.bare_runner,
+        "score_from_probes",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            policy_mode="symbolic",
+            configured_policy_mode="symbolic",
+            policy_identity_valid=True,
+            request_completed=True,
+            objective_recognized=True,
+            objective_proven=True,
+            clean_stop=True,
+            objective_clean_stop=True,
+            controller_terminal_reason="complete",
+            semantic_transaction_count=1,
+            authorized_transaction_count=1,
+            semantic_policy_coverage=1.0,
+            effective_backends=[],
+            effective_backend_requests=[],
+            capability=1.0,
+            furthest_milestone="OBJECTIVE",
+            verifier_costs={"objective": {"wall_seconds": None}},
+            verifier_wall_seconds=verifier_wall_seconds,
+        ),
+    )
+
+    rgl.run_side(rgl.Config(policy_mode="symbolic", solve_timeout=1), "harness", "scenario")
+
+    row = json.loads(results_path.read_text(encoding="utf-8").strip())
+    assert row["cost_countable"]["verifier_wall_seconds"] is expected_countable
+    assert row["countability"]["cost"]["verifier_wall_seconds"] == {
+        "countable": expected_countable,
+        "value": expected_value,
+    }
 
 
 def test_runtime_evidence_fields_persists_branch_and_cycle_provenance():

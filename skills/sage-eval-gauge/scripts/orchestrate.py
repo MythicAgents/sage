@@ -2772,6 +2772,12 @@ def _run_isc11_canary(
     _validate_isc11_source(contract)
     row_env = _isc11_results_environment(contract, route_env)
     records = _isc11_result_records(row_env)
+    if any(
+        record.get(field) is not None
+        for record in records
+        for field in ("supersedes_attempt_id", "replacement_for_attempt_id", "amendment_reason")
+    ):
+        raise SystemExit("ABORT: ISC-11 retry-zero protocol does not define amendments or replacements")
     kernel = _development_row_kernel()
     evidence_root = Path(row_env["SAGE_EVAL_RESULTS_PATH"]).parent
     results = [record for record in records if record.get("record_type") == "result"]

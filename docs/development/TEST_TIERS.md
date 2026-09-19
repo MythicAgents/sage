@@ -53,6 +53,12 @@ migrating them means changing both sides together. Until then, do not add new `P
 For a small change, run the directly affected modules first, then the full suite. Live range checks are a separate
 lifecycle and never substitute for offline tests.
 
+Phoenix evaluation accounting has read-only SQLite/WAL, exact-trace pricing,
+changed-evidence replay, completed-call ceiling, and pre-client campaign refusal
+coverage in `test_phoenix_accounting.py`, `test_phoenix_report.py`, and
+`test_phoenix_ceiling.py`. These use local fixtures and retained token evidence;
+they do not send model requests or establish provider billing enforcement.
+
 ## Replaying retained development comparisons
 
 The maintained Trust Walker runner retains the terminal observer's original operation-scoped Mythic task,
@@ -104,6 +110,106 @@ Offline replay supports reproduction; it cannot turn a development corpus into a
 success alone does not establish composite safe-success, supervised proposal quality, structural transfer or
 general reliability. Private run results and original captures remain outside public documentation; a published
 claim needs its own curated evidence and applicable authority.
+
+## Reproducing development claims offline
+
+Use the maintained verifier with an explicitly retained claim manifest:
+
+```bash
+.venv/bin/python skills/sage-eval-gauge/scripts/verify_claims.py claim-manifest.json
+```
+
+`--inventory` lists the supported reducers and exact evaluator source hashes. The equivalent module command is
+`PYTHONPATH=Payload_Type/sage .venv/bin/python -m ai.hillclimb verify-claims claim-manifest.json`.
+Neither command discovers credentials or executes a provider, range, reset, readiness, or recovery operation.
+
+The manifest schema is `sage-reproducible-claims-v1`. Its four fields are `schema`, `evaluator_bindings`,
+`sources`, and `claims`. Each source names a path relative to the manifest, SHA-256, version, and `json`,
+`jsonl`, or `binary` format. Binary artifacts expose only the `/bytes` locator to the in-process parser;
+their contents are never printed in reports. Inputs, expected outputs, and identities use the existing `EvidenceLocator` fields inside a
+`source` object. A recomputed dependency is `{"claim": "earlier-claim-id", "pointer": "/result"}`; deeper
+pointers select a field in that result. Literal parameters belong in a bound source document.
+
+Each claim has `id`, `reducer`, `inputs`, `identities`, `expected`, `supersedes`, and `amendment_reason`.
+All fourteen existing composite measurement labels are required, including model version, configuration,
+wrapper/source revisions, backend route, runtime authority mode, and execution path. Labels must agree with
+the actual producer packet. Missing historical labels remain unknown and the claim command fails with exit 2.
+Local file hashes establish consistency, not authenticated origin.
+
+The supported current reporting paths are:
+
+| Producer | Reproduction path |
+|---|---|
+| Independent proof records and explicit scoring inputs | `scorecard`; never an ambient engagement ledger or trajectory DB |
+| Retained scored runs | `scorecard` children → `noise_floor` or `gate_experiment` |
+| Bare/harness result records | `comparison`, with retained result identities |
+| Native Trust Walker observations | `trust_walker_pair` → `trust_walker_batch` or the existing `trust_walker_improvement` report |
+| Canonical evaluator packets | `canonical_row` → `canonical_aggregate` |
+| Typed canonical/tradecraft records | `composite_row` and `composite_report` |
+| Exact native task/response/artifact and payload-collection packets | `capability_effect`, using the existing independent proof registry |
+
+Standalone sensitivity/calibration functions remain nested arithmetic, not independent performance claims.
+The verifier rechecks bytes, evaluator/parser identities, producer labels, expected values, and all declared
+dependencies. Missing or unused sources, forward references, duplicate IDs, and forked or unexplained result
+amendments fail. Retain amendments as new artifacts containing the original claim plus the explained successor;
+do not overwrite original evidence. Frozen retry-zero Trust Walker ledgers reject post-hoc result amendments.
+Informational progress events are not independent result authority.
+
+The ordinary comparison, noise-floor, and Gate Experiment reporters refuse performance output without complete
+labels. Synthetic gate runs remain explicitly diagnostic. Native pair replay can still report whether historical
+observations reproduce; its separate `performance_assertion_allowed` field stays false when labels are absent.
+Neither an unavailable label nor an unavailable price may be backfilled from a guess.
+
+Verifier accounting records baseline, terminal, and fallback invocations separately from model execution.
+The evaluator reads use bounded login-plus-query windows. Composed probe ceilings include the eager remote
+callback baseline and all fallback reads. A completed crossing call remains charged; subsequent calls stop.
+Underlying control-plane request counts remain unavailable when an adapter can fan out. Original verifier elapsed
+time is a retained observation, not a number that a later replay can measure again.
+Pure capability-effect replays use a 30-second parser limit on the CLI main thread and record the effect,
+oracle, invocation count, elapsed time, and zero control-plane/model calls. A parser timeout returns failure
+with its cost record. Replay dollars remain unavailable. Other report reducers record their offline elapsed
+time separately from historical execution cost.
+
+Campaign accounting charges fresh attempts, burned attempts, and replacements; valid metadata amendments do not
+charge the same attempt twice. Invalid amendment chains cannot erase spend and cannot admit another attempt.
+Optional declared campaign limits are checked before client creation. Required unavailable axes, exhausted limits,
+and missing prospective pricing for a dollar limit fail closed. Total tokens do not imply an input/output split.
+Unpriced dollars serialize as `null`, not zero; old unqualified monetary values remain `legacy_unknown`.
+The ordinary runner accepts `--campaign-limits <json-file>` using the existing `CostLimits` field names and
+repeatable `--campaign-required-axis` declarations. Missing retained measurements also block a declared limit.
+Use `--campaign-id` to aggregate multiple scenarios within the same retained ledger; otherwise the scenario
+names the campaign. The ledger must contain all spend for the declared campaign.
+
+The versioned `effect_coverage.effect_coverage_inventory()` maps the entire runtime and legacy catalogs to the
+canonical oracle registry. `supported`, `declared_unproduced`, and `unscored` describe actual coverage; declaring
+an effect unsupported does not satisfy a requirement for a working oracle. Parent-domain krbtgt material reuses
+the existing exact-realm parser; it does not establish support for arbitrary parent-account secrets. No coverage
+entry grants runtime authority or changes the original milestone requirements.
+
+The general runner also supports two bounded raw-task producers: a fresh certificate SACL allow/non-admin denial
+for `DA_CHILD`, and a fresh forged-ticket then exact-parent service-access sequence for `CROSS_DOMAIN_CONTEXT`.
+Both require an exact operation and a pre-arm task baseline; context proof also requires an active, exact callback.
+These are specific observation routes, not universal DA or Kerberos coverage. Certificate identity aliases can be
+supplied prospectively with `--evaluator-netbios-domains <json-file>`; missing aliases remain unavailable.
+The original ten gauge milestones and weights are unchanged. A separate capability-effect registry covers exact
+target-domain administrator state, account credential material, account Kerberos context, managed local-admin secret/read and access, endpoint
+protection state, CA private-key material, certificate enrollment, host credential material, and RBCD rights.
+The `capability_effect` reducer invokes their pure parsers; it also supports forged certificate material and
+the existing cross-domain context and replication-rights effects. Synthetic fixtures establish parser behavior,
+not a live effect or universal route coverage.
+
+Replication and RBCD require exact payload-collection receipts committed to the query, principal, target,
+artifact lineage and returned rows. Certificate proofs require native request/response identities, frozen
+producer parameters and actual certificate/private-key bytes. Those bytes are parsed in memory; the report
+contains only hashes and public identity. Arbitrary task echoes and generated capability verdicts are not proof.
+Missing capture fields remain unmeasured. Pure replay support does not imply that the generic live assembly
+collects those packets. Account-context service proof is currently limited to the callback's current logon
+session; a different targeted LUID needs matching service-task session evidence.
+
+Optional [provider accounting](EVALUATION_ACCOUNTING.md) imports and replays LiteLLM spend evidence in the
+evaluation plane. Its collector is exercised with injected HTTP responses; offline import, immutable sidecar
+replay, decimal budget arithmetic and pre-client stop-loss are tested without gateway requests. These checks do
+not establish deployed gateway pricing, completed spend ingestion or an in-flight dollar ceiling.
 
 ---
 

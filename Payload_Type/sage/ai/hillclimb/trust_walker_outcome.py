@@ -127,21 +127,32 @@ def _dn_matches_account_domain(value: object, account: str, target: str) -> bool
     )
 
 
-def certificate_admin_candidate(
+def domain_admin_differential_candidate(
     row: Mapping[str, Any],
     output: str,
     *,
+    milestone: object | None = None,
+    effect: object | None = None,
     effect_at: str | None,
     operation_id: int,
     target: str,
     netbios_domains: Mapping[str, str],
     rejected_proofs: list[dict[str, str]] | None = None,
 ) -> dict[str, Any] | None:
-    """Reconstruct a certificate-auth domain-admin proof from raw Mythic task evidence.
+    """Reconstruct a domain-admin differential from raw Mythic task evidence.
 
     This parser is evaluator-owned and deliberately does not consume Sage's capability verdict or
     the script's ``DA_ONLY_READ_PROVEN`` / ``CERT_AUTH_DOMAIN_ADMIN`` summary markers.
     """
+    selected_effect = effect if effect is not None else milestone
+    if effect is not None and milestone is not None and (
+        getattr(effect, "name", str(effect)) != getattr(milestone, "name", str(milestone))
+    ):
+        return None
+    if getattr(selected_effect, "name", str(selected_effect)) not in {
+        "OBJECTIVE", "DA_CHILD", "DA_PARENT",
+    }:
+        return None
     target = effect_registry.normalize_binding(target)
     task_id = row.get("display_id")
     if (
@@ -215,7 +226,7 @@ def certificate_admin_candidate(
     parameter_sha256 = hashlib.sha256(parameters.encode()).hexdigest()
     output_sha256 = hashlib.sha256(output.encode()).hexdigest()
     envelope_id = f"operation-{operation_id}-task-{task_id}-parameters-{parameter_sha256}"
-    contract = effect_registry.contract_for(Milestone.OBJECTIVE)
+    contract = effect_registry.contract_for(selected_effect)
     observation = effect_registry.OracleObservation(
         registry_version=effect_registry.REGISTRY_VERSION,
         oracle_id=contract.oracle_id,
@@ -232,7 +243,7 @@ def certificate_admin_candidate(
         control_envelope_id=envelope_id,
     )
     proof = effect_registry.admit_observation(
-        Milestone.OBJECTIVE, observation, expected_target=target,
+        selected_effect, observation, expected_target=target,
     )
     if not proof.proven:
         return reject(proof.reason)
@@ -245,6 +256,54 @@ def certificate_admin_candidate(
         "task_parameter_sha256": parameter_sha256,
         "proof_record": proof.to_record(),
     }
+
+
+def domain_admin_observation(
+    row: Mapping[str, Any],
+    output: str,
+    *,
+    effect: object,
+    effect_at: str | None,
+    operation_id: int,
+    target: str,
+    netbios_domains: Mapping[str, str],
+) -> effect_registry.OracleObservation | None:
+    """Return the typed observation produced by the shared raw SACL parser."""
+    candidate = domain_admin_differential_candidate(
+        row, output, effect=effect, effect_at=effect_at,
+        operation_id=operation_id, target=target,
+        netbios_domains=netbios_domains,
+    )
+    proof = candidate.get("proof_record") if isinstance(candidate, Mapping) else None
+    raw = proof.get("observation") if isinstance(proof, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return effect_registry.OracleObservation.from_dict(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def certificate_admin_candidate(
+    row: Mapping[str, Any],
+    output: str,
+    *,
+    effect_at: str | None,
+    operation_id: int,
+    target: str,
+    netbios_domains: Mapping[str, str],
+    rejected_proofs: list[dict[str, str]] | None = None,
+) -> dict[str, Any] | None:
+    """Preserve the historical objective certificate-admin parser contract."""
+    return domain_admin_differential_candidate(
+        row, output,
+        milestone=Milestone.OBJECTIVE,
+        effect_at=effect_at,
+        operation_id=operation_id,
+        target=target,
+        netbios_domains=netbios_domains,
+        rejected_proofs=rejected_proofs,
+    )
 
 
 def classify_terminal_snapshot(snapshot: object) -> OutcomeDisposition:

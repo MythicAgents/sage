@@ -1625,6 +1625,7 @@ class RuntimePilot:
         source_roots: Mapping[str, Path] | None = None,
         source_identities: Mapping[str, str] | None = None,
         alternate_start: AlternateStartBinding | None = None,
+        measurement_metadata: Mapping[str, Any] | None = None,
     ):
         self.artifact_dir = artifact_dir
         self.protected_manifest = protected_manifest
@@ -1656,6 +1657,7 @@ class RuntimePilot:
         self.current_reset_started = False
         self.live_authority_id = ""
         self.live_authority_receipt: dict[str, Any] = {}
+        self.measurement_metadata = dict(measurement_metadata or {})
 
     def _source_runtime_preflight(self, arm: str, source_root: Path, expected: str) -> dict[str, Any]:
         required = (
@@ -2463,6 +2465,7 @@ class RuntimePilot:
             "arm_started_at": started_at.isoformat(),
             "arm_deadline_at": deadline_at.isoformat(),
         })
+        declared_metadata = getattr(self, "measurement_metadata", {})
         if self._shipping_arm(arm):
             def shipping_progress(event):
                 if isinstance(event, Mapping) and event.get("event") == "request_started":
@@ -2481,6 +2484,7 @@ class RuntimePilot:
                 "max_steps": 0,
                 "SAGE_EVAL_ARM_DEADLINE_EPOCH": str(deadline_at.timestamp()),
             })
+            metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config=config)
             try:
                 async def execute_shipping():
                     remaining = max(0.001, deadline - time.monotonic())
@@ -2517,11 +2521,17 @@ class RuntimePilot:
                 "arm_deadline_at": deadline_at.isoformat(),
                 "pending_finalization": True,
                 "resource_complete": False,
+                "measurement_metadata": metadata_fields,
             }
             self.current_execution = {**execution, "_shipping_result": result}
             return execution
         if arm != "raw-mythic-bloodhound":
             raise PilotError("unexpected pilot arm")
+        metadata_fields = _assembled_measurement_metadata(declared_metadata, arm=arm, config={
+            "provider": PROVIDER, "model": MODEL, "mode": "auto", "max_steps": 0,
+            "max_retries": 0, "max_output_tokens": None,
+            "request_timeout_policy": "remaining_arm_wall_seconds",
+        })
         budget = task_budget.TaskBudget(100, deadline, event_sink=progress)
         self.current_budget = budget
         runner = self._raw_runner(deadline, progress)
@@ -2583,6 +2593,7 @@ class RuntimePilot:
                     result.token_budget_overshoot if type(total_tokens) is int else None
                 ),
             },
+            "measurement_metadata": metadata_fields,
         }
         self.current_execution = execution
         return execution
@@ -2784,6 +2795,15 @@ class RuntimePilot:
             "arm": arm,
             "operation_id": self.current_operation_id,
             "query_sha256": hashlib.sha256(TASK_OUTPUT_QUERY.encode()).hexdigest(),
+        }
+        # These are two adapter reads plus a local projection. The BloodHound
+        # status helper can perform multiple endpoint reads, so do not equate
+        # adapter invocations with actual control-plane request counts.
+        snapshot["_terminal_verifier_cost"] = {
+            "raw_observer_invocation_count": 3,
+            "control_plane_read_count": None,
+            "complete": False,
+            "incomplete_reason": "underlying control-plane request count unavailable",
         }
         return snapshot
 
@@ -3328,7 +3348,60 @@ def _runtime(
         source_roots=source_roots,
         source_identities=source_identities,
         alternate_start=(contract.alternate_start if isinstance(contract, PilotContract) else None),
+        measurement_metadata=_measurement_metadata(getattr(args, "measurement_metadata", None)),
     )
+
+
+def _measurement_metadata(path: str | None) -> dict[str, Any]:
+    """Load only non-secret declared producer facts; absent metadata stays unknown."""
+    if path is None:
+        return {}
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    allowed = {"logical_seed", "model_version", "generation_config"}
+    if not isinstance(value, Mapping) or set(value) != allowed:
+        raise PilotError("measurement metadata must contain exactly logical_seed, model_version, generation_config")
+    if type(value["logical_seed"]) is not int or value["logical_seed"] < 0:
+        raise PilotError("measurement logical_seed must be a non-negative integer")
+    if not isinstance(value["model_version"], str) or not value["model_version"].strip():
+        raise PilotError("measurement model_version is required")
+    if not isinstance(value["generation_config"], Mapping) or not value["generation_config"]:
+        raise PilotError("measurement generation_config is required")
+    from ai.hillclimb.composite_gauge import _has_sensitive_key
+    if _has_sensitive_key(value["generation_config"]):
+        raise PilotError("measurement generation_config contains a forbidden key")
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        raise PilotError("measurement metadata must be finite JSON") from exc
+    return {"logical_seed": value["logical_seed"], "model_version": value["model_version"].strip(),
+            "generation_config": dict(value["generation_config"])}
+
+
+def _assembled_measurement_metadata(declared: Mapping[str, Any], *, arm: str,
+                                    config: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain the actual non-secret entry configuration, checking declarations.
+
+    This records explicit configuration only. Omitted SDK/provider defaults are
+    not assigned invented values. The wrapper/source bindings identify the code
+    that interprets this configuration. No request parameters are changed.
+    """
+    safe_fields = {"provider", "model", "mode", "autonomous_solve", "max_steps", "temperature",
+                   "top_p", "max_tokens", "max_output_tokens", "reasoning_effort", "max_retries",
+                   "request_timeout_policy"}
+    actual = {key: value for key, value in config.items() if key in safe_fields}
+    requested = declared.get("generation_config", {})
+    if not isinstance(requested, Mapping) or any(key not in actual or actual[key] != value
+                                               for key, value in requested.items()):
+        raise PilotError("declared generation configuration differs from the assembled producer")
+    from ai.hillclimb.composite_gauge import _has_sensitive_key
+    if _has_sensitive_key(actual):
+        raise PilotError("assembled measurement configuration contains a sensitive field")
+    json.dumps(actual, allow_nan=False)
+    shipping = RuntimePilot._shipping_arm(arm)
+    return {"logical_seed": declared.get("logical_seed"), "model_version": declared.get("model_version"),
+            "generation_config": actual, "wrapper_id": "native_mythic_chat" if shipping else "bare_model_runner",
+            "wrapper_revision": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "authority_mode": "auto", "execution_path": "policy_selected_controller" if shipping else "true_naive_raw_tools"}
 
 
 def _add_improvement_identity_args(command: argparse.ArgumentParser, *, roots: bool) -> None:
@@ -3568,12 +3641,31 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
             "native_responses": sum(len(row["responses"]) for row in observed["task"]),
             "outcome": outcome, "model_calls": cost.get("model_calls"), "total_tokens": tokens,
             "source_identity": (start.get("start_identity") or {}).get("source_identity"),
+            "measurement_identity": result.get("measurement_identity"),
         })
     summary = summarize_pair(replayed_records, contract)
     comparisons = [row for row in records if row.get("record_type") == "comparison"]
-    if len(comparisons) != 1 or summary != {
+    retained_comparison = {
         key: value for key, value in comparisons[0].items() if key not in {"record_type", "recorded_at"}
-    }:
+    } if len(comparisons) == 1 else {}
+    # Retained v4 comparisons did not have reporting-only M1 fields.  Project
+    # only absent new fields away; never invent them or alter old dimensions.
+    reconstructed_comparison = {
+        key: value for key, value in summary.items()
+        if key in retained_comparison or key not in {
+            "terminal_verifier_costs_complete", "terminal_verifier_cost_summary",
+            "measurement_labels", "performance_assertion_allowed",
+        }
+    }
+    if isinstance(retained_comparison.get("arms"), list) and isinstance(reconstructed_comparison.get("arms"), list):
+        reconstructed_comparison["arms"] = [
+            {key: value for key, value in arm.items() if key in retained_arm or key not in {
+                "terminal_verifier_cost", "measurement_identity", "measurement_identity_complete",
+            }}
+            for arm, retained_arm in zip(reconstructed_comparison["arms"], retained_comparison["arms"])
+            if isinstance(arm, Mapping) and isinstance(retained_arm, Mapping)
+        ]
+    if len(comparisons) != 1 or reconstructed_comparison != retained_comparison:
         raise PilotError("reconstructed comparison differs from the retained comparison")
     return {
         "schema": "sage-trust-walker-offline-replay-v1", "reproduced": True,
@@ -3581,7 +3673,13 @@ def replay_pair(artifact_dir: str | Path, native_evidence_manifest: str | Path |
         "external_manifest": manifest_receipt, "contract": contract.to_record(),
         "projection_sha256": _sha256(Path(__file__)),
         "outcome_parser_sha256": _sha256(PAYLOAD / "ai/hillclimb/trust_walker_outcome.py"),
+        # This is the current, native-evidence-derived comparison.  Consumers
+        # must not substitute the generated ledger comparison for this value.
+        "comparison": summary,
         "arms": reports,
+        "measurement_labels": summary["measurement_labels"],
+        "performance_assertion_allowed": summary["performance_assertion_allowed"],
+        "terminal_verifier_cost_summary": summary["terminal_verifier_cost_summary"],
         "dimensions": {key: summary[key] for key in (
             "protocol_valid", "pair_compatible", "comparison_ready", "lifecycle_complete",
             "isolation_complete", "resources_complete", "run_complete",
@@ -3615,10 +3713,91 @@ def summarize_improvement_experiment(
     pair_two: str | Path,
     contract: ImprovementContract,
 ) -> dict[str, Any]:
-    first_contract, first = _retained_pair(pair_one)
-    second_contract, second = _retained_pair(pair_two)
+    return reduce_improvement_replays(
+        [replay_pair(pair_one), replay_pair(pair_two)], contract.to_record(),
+    )
+
+
+def reduce_improvement_replays(
+    pairs: list[dict[str, Any]],
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reduce exactly two current native pair replays under one frozen contract.
+
+    The input boundary is intentionally replay outputs, never retained
+    ``comparison`` records.  This makes generated pass flags, stale parser
+    projections, and missing measurement labels inadmissible to the final
+    improvement decision.
+    """
+    if not isinstance(pairs, list) or len(pairs) != 2 or any(not isinstance(pair, Mapping) for pair in pairs):
+        raise PilotError("improvement reduction requires exactly two pair replay outputs")
+    if not isinstance(contract, Mapping):
+        raise PilotError("improvement reduction requires one frozen improvement contract record")
+    try:
+        frozen_contract = ImprovementContract(
+            baseline_source_identity=str(contract.get("baseline_source_identity") or ""),
+            candidate_source_identity=str(contract.get("candidate_source_identity") or ""),
+            arm_order=tuple(contract.get("arm_order") or ()),
+        )
+        frozen_contract.validate()
+    except (PilotError, TypeError, ValueError) as exc:
+        raise PilotError("frozen improvement contract record is malformed") from exc
+    if frozen_contract.to_record() != dict(contract):
+        raise PilotError("frozen improvement contract record is malformed or changed")
+    if frozen_contract.arm_order != IMPROVEMENT_ARM_ORDER:
+        raise PilotError("frozen improvement contract must bind the baseline-first pair order")
+
+    expected_bindings = {
+        "projection_sha256": _sha256(Path(__file__)),
+        "outcome_parser_sha256": _sha256(PAYLOAD / "ai/hillclimb/trust_walker_outcome.py"),
+    }
+    ledgers: set[str] = set()
+    contracts: list[Mapping[str, Any]] = []
+    comparisons: list[Mapping[str, Any]] = []
+    for pair in pairs:
+        if pair.get("schema") != "sage-trust-walker-offline-replay-v1" or pair.get("reproduced") is not True:
+            raise PilotError("improvement reduction requires reproduced native pair replays")
+        if any(pair.get(key) != value for key, value in expected_bindings.items()):
+            raise PilotError("improvement reduction evaluator/parser binding is stale")
+        ledger = pair.get("ledger_sha256")
+        if not isinstance(ledger, str) or len(ledger) != 64 or ledger in ledgers:
+            raise PilotError("improvement reduction has a missing or duplicate pair replay")
+        ledgers.add(ledger)
+        retained_contract = pair.get("contract")
+        comparison = pair.get("comparison")
+        expected_pair_contract = ImprovementContract(
+            frozen_contract.baseline_source_identity,
+            frozen_contract.candidate_source_identity,
+            arm_order=(IMPROVEMENT_ARM_ORDER if len(contracts) == 0 else tuple(reversed(IMPROVEMENT_ARM_ORDER))),
+        ).to_record()
+        if not isinstance(retained_contract, Mapping) or retained_contract != expected_pair_contract:
+            raise PilotError("pair replay contract differs from the frozen improvement contract")
+        if not isinstance(comparison, Mapping):
+            raise PilotError("pair replay lacks a native-evidence-derived comparison")
+        arms = comparison.get("arms")
+        labels = comparison.get("measurement_labels")
+        if (
+            comparison.get("performance_assertion_allowed") is not True
+            or not isinstance(arms, list) or len(arms) != 2
+            or {arm.get("arm") for arm in arms if isinstance(arm, Mapping)} != set(IMPROVEMENT_ARM_ORDER)
+            or any(not isinstance(arm, Mapping) or arm.get("measurement_identity_complete") is not True for arm in arms)
+            or not isinstance(labels, Mapping) or labels.get("performance_assertion_allowed") is not True
+            or labels.get("identities") != [arm.get("measurement_identity") for arm in arms]
+        ):
+            raise PilotError("pair replay has incomplete or mismatched measurement labels")
+        expected_sources = {
+            "baseline-sage": frozen_contract.baseline_source_identity,
+            "candidate-sage": frozen_contract.candidate_source_identity,
+        }
+        if any(
+            arm["measurement_identity"].get("source_version") != expected_sources[arm["arm"]]
+            for arm in arms
+        ):
+            raise PilotError("pair replay measurement labels do not bind the frozen sources")
+        contracts.append(retained_contract)
+        comparisons.append(comparison)
     return summarize_improvement_comparisons(
-        (first_contract, second_contract), (first, second), contract,
+        (contracts[0], contracts[1]), (comparisons[0], comparisons[1]), frozen_contract,
     )
 
 
@@ -3712,6 +3891,7 @@ def build_parser() -> argparse.ArgumentParser:
                 default="shipping-first",
                 help="Prospectively select one of the two fixed matched-pair arm orders.",
             )
+            command.add_argument("--measurement-metadata", help="Non-secret JSON producer metadata for M1 labels.")
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--artifact-dir", required=True)
     inspect_preserved = sub.add_parser("inspect-preserved")
@@ -3724,6 +3904,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     improvement.add_argument("--prior-pair-artifact-dir")
     _improvement_dependency_args(improvement)
+    improvement.add_argument("--measurement-metadata", help="Non-secret JSON producer metadata for M1 labels.")
     summary = sub.add_parser("summarize-improvement")
     summary.add_argument("--pair-one-artifact-dir", required=True)
     summary.add_argument("--pair-two-artifact-dir", required=True)

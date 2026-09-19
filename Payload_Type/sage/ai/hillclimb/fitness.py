@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping
 
 try:
@@ -75,7 +75,7 @@ except Exception:  # script / sys.path import
 
 
 GAUGE_VERSION = "phase0-3"
-DENSE_REWARD_VERSION = "dense-reward-v1"
+DENSE_REWARD_VERSION = "dense-reward-v2"
 CANONICAL_PROMOTION_AUTHORITY_VERSION = "canonical-promotion-authority-v3"
 CANONICAL_ROW_VERDICT_SCHEMA = "canonical-row-verdict-v2"
 CANONICAL_AGGREGATE_VERDICT_SCHEMA = "canonical-aggregate-verdict-v3"
@@ -161,6 +161,12 @@ class ScoreCard:
     total_tokens: int
     wall_seconds: float
     per_agent_tokens: dict = field(default_factory=dict)
+    verifier_costs: dict = field(default_factory=dict)
+    verifier_wall_seconds: float | None = None
+    verifier_control_plane_reads: int | None = None
+    verifier_cost_complete: bool = False
+    verifier_monetary_cost_usd: float | None = None
+    verifier_monetary_cost_status: str = "unavailable"
     # --- tradecraft / gauge health (C1b) ---
     unclassified_rate: float = 0.0
     failure_class_counts: dict = field(default_factory=dict)
@@ -199,12 +205,19 @@ class ScoreCard:
     semantic_policy_coverage: float = 0.0
     dense_reward_version: str = DENSE_REWARD_VERSION
     dense_reward: dict = field(default_factory=dict)
+    # Missing historical identity is retained as missing.  Numerical diagnostics
+    # alone are not permission to assert a labeled performance comparison.
+    measurement_identity: dict | None = None
+    measurement: dict = field(default_factory=lambda: {
+        "performance_assertion_allowed": False, "identities": [],
+        "identity_failures": ["measurement identity unavailable"],
+    })
 
 
 @dataclass(frozen=True)
 class RewardComponent:
     name: str
-    value: float | int | bool
+    value: Any
     source_fields: tuple[str, ...]
     authority: str = "proof_or_typed_trace"
 
@@ -289,7 +302,15 @@ def dense_reward_from_trace(
     task_count = int(row.get("child_task_count") or row.get("task_count") or 0)
     model_tokens = int(row.get("total_tokens") or row.get("model_tokens") or 0)
     wall_seconds = float(row.get("wall_seconds") or 0.0)
-    monetary_cost = float(row.get("monetary_cost_usd") or 0.0)
+    raw_monetary_cost = row.get("monetary_cost_usd")
+    monetary_cost = (
+        float(raw_monetary_cost)
+        if isinstance(raw_monetary_cost, (int, float)) and not isinstance(raw_monetary_cost, bool)
+        else None
+    )
+    monetary_cost_available = monetary_cost is not None and str(
+        row.get("monetary_cost_status") or "unavailable"
+    ).casefold() in {"measured", "not_applicable"}
     provider_failures = int(row.get("provider_failure_count") or len(row.get("provider_failures") or []))
     risk_count = sum(
         int(row.get(field_name) or 0)
@@ -333,7 +354,13 @@ def dense_reward_from_trace(
         "retry_count": RewardComponent("retry_count", retry_count, ("retry_count",)),
         "model_tokens": RewardComponent("model_tokens", model_tokens, ("total_tokens", "model_tokens")),
         "wall_seconds": RewardComponent("wall_seconds", wall_seconds, ("wall_seconds",)),
-        "monetary_cost_usd": RewardComponent("monetary_cost_usd", monetary_cost, ("monetary_cost_usd",)),
+        "monetary_cost_usd": RewardComponent(
+            "monetary_cost_usd", monetary_cost if monetary_cost_available else None,
+            ("monetary_cost_usd", "monetary_cost_status"),
+        ),
+        "monetary_cost_available": RewardComponent(
+            "monetary_cost_available", monetary_cost_available, ("monetary_cost_usd", "monetary_cost_status"),
+        ),
         "provider_failure_count": RewardComponent("provider_failure_count", provider_failures, ("provider_failure_count", "provider_failures")),
         "operational_risk": RewardComponent(
             "operational_risk",
@@ -364,7 +391,8 @@ def dense_reward_from_trace(
         -retry_count,
         -model_tokens,
         -wall_seconds,
-        -monetary_cost,
+        monetary_cost_available,
+        -(monetary_cost if monetary_cost_available else 0.0),
         -complexity,
         portability,
     )
@@ -963,7 +991,9 @@ def score(
 ) -> ScoreCard:
     """Build the ScoreCard vector. Capability is ground truth (C1); the harness `score`
     is recorded only as the Goodhart-gap reference, never as capability."""
+    from ai.hillclimb.reproducible_claims import measurement_labels
     r = run_record or {}
+    measurement = measurement_labels([r.get("measurement_identity")])
     milestones = dict(ground_truth.milestones)
     reached = sum(1 for v in milestones.values() if v)
     capability = ground_truth.furthest.value / _MAX_MILESTONE if _MAX_MILESTONE else 0.0
@@ -1037,6 +1067,19 @@ def score(
         ),
     )
 
+    verifier_costs = dict(getattr(ground_truth, "verifier_costs", {}) or {})
+    verifier_cost_values = list(verifier_costs.values())
+    verifier_reads_complete = bool(verifier_cost_values) and all(
+        getattr(value, "control_plane_reads", None) is not None for value in verifier_cost_values
+    )
+    verifier_walls_complete = bool(verifier_cost_values) and all(
+        getattr(value, "wall_seconds", None) is not None for value in verifier_cost_values
+    )
+    verifier_money_complete = bool(verifier_cost_values) and all(
+        getattr(value, "monetary_cost_status", "unavailable") in {"measured", "not_applicable"}
+        and getattr(value, "monetary_cost_usd", None) is not None
+        for value in verifier_cost_values
+    )
     return ScoreCard(
         scenario=ground_truth.scenario,
         verifier_hash=verifier_hash(scenario, gauge_version),
@@ -1056,6 +1099,24 @@ def score(
         total_tokens=_i(r, "total_tokens"),
         wall_seconds=_f(r, "wall_seconds"),
         per_agent_tokens=dict(r.get("per_agent_tokens") or {}),
+        verifier_costs={
+            getattr(milestone, "name", str(milestone)): asdict(value)
+            for milestone, value in verifier_costs.items()
+        },
+        verifier_wall_seconds=(sum(float(value.wall_seconds) for value in verifier_cost_values)
+                               if verifier_walls_complete else None),
+        verifier_control_plane_reads=(
+            sum(int(getattr(value, "control_plane_reads", 0) or 0) for value in verifier_cost_values)
+            if verifier_reads_complete else None
+        ),
+        verifier_cost_complete=bool(verifier_cost_values) and all(
+            getattr(value, "completeness", "incomplete") == "complete" for value in verifier_cost_values
+        ),
+        verifier_monetary_cost_usd=(
+            sum(float(getattr(value, "monetary_cost_usd", 0.0) or 0.0) for value in verifier_cost_values)
+            if verifier_money_complete else None
+        ),
+        verifier_monetary_cost_status="measured" if verifier_money_complete else "unavailable",
         unclassified_rate=(process.unclassified_rate if process else 0.0),
         failure_class_counts=(dict(process.failure_class_counts) if process else {}),
         probe_disagreements=[getattr(m, "name", str(m))
@@ -1083,6 +1144,8 @@ def score(
         semantic_policy_coverage=_f(r, "semantic_policy_coverage"),
         dense_reward_version=DENSE_REWARD_VERSION,
         dense_reward=dict(canonical_reward_row.get("dense_reward") or {}),
+        measurement_identity=(measurement["identities"][0] if measurement["performance_assertion_allowed"] else None),
+        measurement=measurement,
     )
 
 

@@ -5,6 +5,7 @@ here. These pin the parsing: LLM decision, BloodHound literals, and the domain-c
 """
 import sys
 import base64
+import json
 import time
 import types
 from pathlib import Path
@@ -769,6 +770,8 @@ def _golden_ticket_admin_task_rows():
         {
             "display_id": 18,
             "callback_display_id": 2,
+            "command_name": "shell",
+            "original_params": r"dir \\DC01.RANGE.LOCAL\C$",
             "output": " Directory of \\\\DC01.RANGE.LOCAL\\C$\nWindows",
         },
         {
@@ -789,6 +792,11 @@ def _golden_ticket_admin_task_rows():
         {
             "display_id": 14,
             "callback_display_id": 2,
+            "command_name": "execute_assembly",
+            "original_params": json.dumps({
+                "assembly_name": "Rubeus.exe",
+                "assembly_arguments": "golden /domain:range.local /sid:S-1-5-21-1",
+            }),
             "output": "[*] Action: Build TGT\n[*] Building PAC",
         },
         {
@@ -813,6 +821,21 @@ def test_ticket_admin_control_probe_rejects_other_realm(monkeypatch):
 
 def test_ticket_admin_control_probe_rejects_listing_without_forge(monkeypatch):
     monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: _golden_ticket_admin_task_rows()[:2])
+
+    assert ls.ticket_admin_control_probe(realm="range.local")() is False
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda rows: rows[4].update({"command_name": "shell", "original_params": "echo golden /domain:range.local"}),
+    lambda rows: rows[0].update({"original_params": r"echo dir \\DC01.RANGE.LOCAL\C$"}),
+    lambda rows: rows[4].update({"original_params": json.dumps({
+        "assembly_name": "Rubeus.exe", "assembly_arguments": "golden /domain:other.local /sid:S-1-5-21-1",
+    })}),
+], ids=("echoed-forge", "echoed-listing", "wrong-request-target"))
+def test_ticket_admin_control_probe_requires_builder_bound_requests(monkeypatch, mutate):
+    rows = _golden_ticket_admin_task_rows()
+    mutate(rows)
+    monkeypatch.setattr(ls, "_fetch_certificate_auth_task_outputs", lambda **kw: rows)
 
     assert ls.ticket_admin_control_probe(realm="range.local")() is False
 

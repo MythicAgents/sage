@@ -25,7 +25,7 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(cli)
 
 
-def retained_native_pair(tmp_path, monkeypatch, contract=None):
+def retained_native_pair(tmp_path, monkeypatch, contract=None, measurement_metadata=None, improvement_metric=False):
     """Exercise the real pair/observer producer with synthetic control-plane responses."""
     contract = contract or cli.PilotContract()
     monkeypatch.setattr(pilot, "_history_root", lambda: tmp_path)
@@ -50,6 +50,32 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None):
 
     def observation(*_args):
         timestamp = (runtime.current_started_at + timedelta(seconds=10)).isoformat()
+        if improvement_metric:
+            task_specs = [
+                ("run", "klist", ""),
+                ("shell", r"dir \\essos.local\c$", ""),
+                ("upload", "sage_ca_signing_test.pfx", ""),
+                ("execute_assembly", "certify.exe forge sage_forged_cert_test", ""),
+            ]
+            if runtime.current_arm == "baseline-sage":
+                task_specs.append(("execute_assembly", "rubeus.exe asktgt /certificate:test", "KRB-ERROR (16)"))
+            task_specs.append(("powerpick", "", "cert_auth_method=schannel-ldap\ncert_auth_status=ok"))
+            tasks = [{
+                "operation_id": 8, "display_id": index, "command_name": command,
+                "display_params": params, "original_params": params, "completed": True, "status": "completed",
+                "timestamp": timestamp, "status_timestamp_preprocessing": timestamp,
+                "status_timestamp_submitted": timestamp, "status_timestamp_processing": timestamp,
+                "status_timestamp_processed": timestamp, "callback": {"domain": "ESSOS"},
+                "responses": [{"id": 100 + index, "sequence_number": 1, "timestamp": timestamp,
+                               "response_text": base64.b64encode(output.encode()).decode()}],
+            } for index, (command, params, output) in enumerate(task_specs, 1)]
+            return {
+                "task": tasks,
+                "credential": [{"operation_id": 8, "id": 300, "task_id": tasks[-1]["display_id"],
+                                "timestamp": timestamp, "account": "krbtgt", "realm": "essos.local",
+                                "credential_text": "synthetic-credential-do-not-print"}],
+                "callback": [{"operation_id": 8, "display_id": 4}],
+            }
         return {
             "task": [{
                 "operation_id": 8, "display_id": 1, "command_name": "whoami",
@@ -73,13 +99,18 @@ def retained_native_pair(tmp_path, monkeypatch, contract=None):
     runtime._operation_snapshot = observation
 
     def run_arm(*_args):
+        task_count = 6 if improvement_metric and runtime.current_arm == "baseline-sage" else 5 if improvement_metric else 1
         return {
             "arm_started_at": runtime.current_started_at.isoformat(),
             "arm_deadline_at": runtime.current_deadline_at.isoformat(),
             "termination": "done", "protocol_error": False, "resource_complete": True,
-            "cost": {"model_calls": 1, "total_tokens": 10, "payload_tasks": 1},
+            "cost": {"model_calls": 1, "total_tokens": 10, "payload_tasks": task_count},
             "response_records": [{"response_index": 1, "effective_backend": cli.EXPECTED_BACKEND, "total_tokens": 10}],
-            "task_budget": {"limit": 100, "reservations": 1, "confirmed_task_ids": [1]},
+            "task_budget": {"limit": 100, "reservations": task_count,
+                            "confirmed_task_ids": list(range(1, task_count + 1))},
+            **({"measurement_metadata": measurement_metadata(runtime.current_arm)
+                if callable(measurement_metadata) else measurement_metadata}
+               if measurement_metadata is not None else {}),
         }
 
     dependencies = cli.PilotDependencies(
@@ -2198,41 +2229,129 @@ def _write_retained_improvement_pair(path, contract, order, *, candidate_metric=
     })
 
 
-def test_improvement_summary_accepts_only_two_order_balanced_threshold_passing_pairs(tmp_path):
-    contract = cli.ImprovementContract("a" * 64, "b" * 64)
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
-    _write_retained_improvement_pair(first, contract, cli.IMPROVEMENT_ARM_ORDER)
-    _write_retained_improvement_pair(
-        second, contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)),
+def _replayed_improvement_pair(contract, order, *, ledger, candidate_metric=True):
+    pair_contract = cli.ImprovementContract(
+        contract.baseline_source_identity, contract.candidate_source_identity, arm_order=order,
     )
+    arms = [
+        {
+            "arm": arm,
+            "objective_disposition": "proven",
+            "measurement_identity_complete": True,
+            "measurement_identity": {"source_version": pair_contract.source_identity_for_arm(arm)},
+        }
+        for arm in order
+    ]
+    comparison = {
+        "comparison_ready": True,
+        "lifecycle_complete": True,
+        "isolation_complete": True,
+        "resources_complete": True,
+        "run_complete": True,
+        "performance_assertion_allowed": True,
+        "measurement_labels": {"performance_assertion_allowed": True,
+                               "identities": [arm["measurement_identity"] for arm in arms]},
+        "arms": arms,
+        "primary_metric": {"complete": True, "baseline_reproduced": True,
+                           "candidate_threshold_met": candidate_metric,
+                           "meaningful_effect_met": candidate_metric},
+    }
+    return {
+        "schema": "sage-trust-walker-offline-replay-v1", "reproduced": True,
+        "ledger_sha256": ledger,
+        "projection_sha256": cli._sha256(cli.Path(cli.__file__)),
+        "outcome_parser_sha256": cli._sha256(cli.PAYLOAD / "ai/hillclimb/trust_walker_outcome.py"),
+        "contract": pair_contract.to_record(), "comparison": comparison,
+    }
 
-    result = cli.summarize_improvement_experiment(first, second, contract)
+
+def test_improvement_reducer_accepts_only_two_order_balanced_threshold_passing_native_replays():
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    result = cli.reduce_improvement_replays([
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64),
+    ], contract.to_record())
 
     assert result["disposition"] == "accept"
     assert result["meaningful_effect_met_in_both_pairs"] is True
 
 
-def test_improvement_summary_direction_neutrally_rejects_flat_candidate(tmp_path):
+def test_improvement_reducer_direction_neutrally_rejects_flat_candidate():
     contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    result = cli.reduce_improvement_replays([
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64,
+                                  candidate_metric=False),
+    ], contract.to_record())
+
+    assert result["disposition"] == "reject"
+    assert "threshold" in result["reason"]
+
+
+@pytest.mark.parametrize("mutation, reason", [
+    ("stale", "binding is stale"),
+    ("duplicate", "duplicate pair replay"),
+    ("order", "contract differs"),
+    ("source", "frozen sources"),
+    ("labels", "measurement labels"),
+])
+def test_improvement_reducer_rejects_unreplayable_or_mismatched_inputs(mutation, reason):
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    pairs = [
+        _replayed_improvement_pair(contract, cli.IMPROVEMENT_ARM_ORDER, ledger="1" * 64),
+        _replayed_improvement_pair(contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)), ledger="2" * 64),
+    ]
+    if mutation == "stale":
+        pairs[0]["projection_sha256"] = "0" * 64
+    elif mutation == "duplicate":
+        pairs[1]["ledger_sha256"] = pairs[0]["ledger_sha256"]
+    elif mutation == "order":
+        pairs[1]["contract"] = pairs[0]["contract"]
+    elif mutation == "source":
+        pairs[0]["comparison"]["arms"][0]["measurement_identity"]["source_version"] = "c" * 64
+    else:
+        pairs[0]["comparison"]["measurement_labels"] = {"performance_assertion_allowed": False, "identities": []}
+    with pytest.raises(cli.PilotError, match=reason):
+        cli.reduce_improvement_replays(pairs, contract.to_record())
+
+
+def test_improvement_summary_cli_refuses_generated_comparison_without_native_replay(tmp_path, capsys):
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_retained_improvement_pair(first, contract, cli.IMPROVEMENT_ARM_ORDER)
+    _write_retained_improvement_pair(second, contract, tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)))
+    assert cli.main([
+        "summarize-improvement", "--pair-one-artifact-dir", str(first),
+        "--pair-two-artifact-dir", str(second), "--baseline-source-identity", "a" * 64,
+        "--candidate-source-identity", "b" * 64,
+    ]) == 1
+    assert "replay requires" in json.loads(capsys.readouterr().out)["reason"]
+
+
+def test_improvement_reducer_accepts_complete_native_replays(tmp_path, monkeypatch):
+    contract = cli.ImprovementContract("a" * 64, "b" * 64)
+
+    def metadata(arm):
+        return cli._assembled_measurement_metadata(
+            {"logical_seed": 1, "model_version": "synthetic-v1", "generation_config": {"provider": cli.PROVIDER}},
+            arm=arm, config={"provider": cli.PROVIDER, "model": cli.MODEL, "mode": "auto", "max_steps": 0},
+        )
+
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
-    _write_retained_improvement_pair(first, contract, cli.IMPROVEMENT_ARM_ORDER)
-    _write_retained_improvement_pair(
-        second,
-        contract,
-        tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)),
-        candidate_metric=False,
+    retained_native_pair(first, monkeypatch, contract, metadata, improvement_metric=True)
+    retained_native_pair(second, monkeypatch, cli.ImprovementContract(
+        contract.baseline_source_identity, contract.candidate_source_identity,
+        arm_order=tuple(reversed(cli.IMPROVEMENT_ARM_ORDER)),
+    ), metadata, improvement_metric=True)
+    result = cli.reduce_improvement_replays(
+        [cli.replay_pair(first), cli.replay_pair(second)], contract.to_record(),
     )
-
-    result = cli.summarize_improvement_experiment(first, second, contract)
-
-    assert result["disposition"] == "reject"
-    assert "threshold" in result["reason"]
+    assert result["disposition"] == "accept"
 
 
 def test_improvement_cli_binds_external_roots_and_shipping_order(monkeypatch, tmp_path):

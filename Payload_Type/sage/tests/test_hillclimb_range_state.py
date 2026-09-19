@@ -81,6 +81,25 @@ def test_missing_ledger_is_empty_not_crash(tmp_path, monkeypatch):
     assert all(v is False for v in gt.milestones.values())
 
 
+def test_reader_accounts_caller_supplied_foothold_as_zero_local_adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path))
+    scenario = rs.Scenario(
+        name="foothold-only", engagement_id="none", domains={"child": CHILD},
+        milestone_subset=(rs.Milestone.FOOTHOLD,),
+    )
+    proven = rs.read_ground_truth(scenario, foothold_seen=True)
+    disproven = rs.read_ground_truth(scenario, foothold_seen=False)
+    unknown = rs.read_ground_truth(scenario, foothold_seen=None)
+    for truth, expected in ((proven, True), (disproven, False)):
+        assert truth.milestones[rs.Milestone.FOOTHOLD] is expected
+        cost = truth.verifier_costs[rs.Milestone.FOOTHOLD]
+        assert (cost.raw_probe_invocations, cost.control_plane_reads, cost.wall_seconds) == (0, 0, 0.0)
+        assert cost.completeness == "complete"
+        assert cost.monetary_cost_status == "not_applicable"
+        assert "outside this local verifier" in cost.not_applicable_reason
+    assert rs.Milestone.FOOTHOLD not in unknown.verifier_costs
+
+
 def test_reader_does_not_mutate_state(tmp_path, monkeypatch):
     _seed_ledger(tmp_path, monkeypatch)
     before = rs.ledger_state_hash("run1")
@@ -101,6 +120,17 @@ def test_typed_direct_negative_is_measured_disproven(tmp_path, monkeypatch):
     gt = rs.read_ground_truth(scn, run_live_probes=True)
     assert gt.proof_results[rs.Milestone.GRAPH_COLLECTED].disposition is er.ProofDisposition.DISPROVEN
     assert rs.Milestone.GRAPH_COLLECTED not in gt.probe_disagreements
+
+
+def test_plain_live_callable_has_outer_timing_but_unknown_reads(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+    scn = _scenario("run1")
+    scn.direct_probes = {rs.Milestone.GRAPH_COLLECTED: lambda: True}
+    gt = rs.read_ground_truth(scn, run_live_probes=True)
+    cost = gt.verifier_costs[rs.Milestone.GRAPH_COLLECTED]
+    assert cost.raw_probe_invocations == 1
+    assert cost.control_plane_reads is None
+    assert cost.completeness == "incomplete"
 
 
 def test_probeable_milestone_without_verifier_is_flagged_offline(tmp_path, monkeypatch):
@@ -198,3 +228,31 @@ def test_recorded_probe_declaration_without_record_stays_unmeasured(tmp_path, mo
     assert gt.milestones[rs.Milestone.KRBTGT_DUMPED] is False
     assert gt.proof_results[rs.Milestone.KRBTGT_DUMPED].disposition is er.ProofDisposition.UNMEASURED
     assert rs.Milestone.KRBTGT_DUMPED in gt.probe_disagreements
+
+
+def test_legacy_recorded_probe_cost_is_unknown_not_zero(tmp_path, monkeypatch):
+    _seed_ledger(tmp_path, monkeypatch)
+    data = engagement_ledger.load("run1")
+    contract = er.contract_for(rs.Milestone.KRBTGT_DUMPED)
+    observation = er.OracleObservation(
+        registry_version=er.REGISTRY_VERSION, oracle_id=contract.oracle_id,
+        origin=er.ProofOrigin.MYTHIC_CREDENTIAL_STORE, proof_kind="krbtgt_material",
+        outcome=False, observation_id="legacy-cost", target=CHILD,
+    )
+    data["ground_truth_probes"] = {
+        "KRBTGT_DUMPED": er.admit_observation(
+            rs.Milestone.KRBTGT_DUMPED, observation, expected_target=CHILD
+        ).to_record(),
+        "_captured_at": "2026-06-21T00:00:00+00:00",
+        "_source": "independent_evaluator", "_registry_version": er.REGISTRY_VERSION,
+    }
+    engagement_ledger.save(data, engagement_id="run1")
+    scn = rs.Scenario(
+        name="legacy-cost", engagement_id="run1", domains={"child": CHILD},
+        milestone_subset=(rs.Milestone.KRBTGT_DUMPED,),
+        recorded_probe_milestones=frozenset({rs.Milestone.KRBTGT_DUMPED}),
+    )
+    cost = rs.read_ground_truth(scn).verifier_costs[rs.Milestone.KRBTGT_DUMPED]
+    assert cost.monetary_cost_usd is None
+    assert cost.monetary_cost_status == "legacy_unknown"
+    assert cost.completeness == "legacy_unknown"

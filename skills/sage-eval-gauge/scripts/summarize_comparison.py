@@ -13,9 +13,11 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "Payload_Type" / "sage"))
 
 from ai.hillclimb.bare_runner import compare_bare_vs_harness
+from ai.hillclimb.experiment_contracts import select_comparison_results
 from ai.hillclimb.fitness import ScoreCard
 from ai.hillclimb.live_seams import summarize_task_quiescence
 from ai.hillclimb.range_state import Milestone
+from ai.hillclimb.reproducible_claims import comparison_labels
 
 
 def summarize(records: list, scenario: str) -> dict:
@@ -23,8 +25,12 @@ def summarize(records: list, scenario: str) -> dict:
     cards = {"bare": [], "harness": []}
     kinds: Counter = Counter()
     invalid = []
+    identity_mismatches = []
     other_scenarios = 0
+    identities = []
     card_fields = {field.name for field in fields(ScoreCard)}
+    selected = select_comparison_results(records, scenario)
+    selected_ids = {id(record) for record in selected}
     for line, record in enumerate(records, 1):
         if not isinstance(record, dict):
             invalid.append(line)
@@ -34,7 +40,7 @@ def summarize(records: list, scenario: str) -> dict:
         if record.get("scenario") != scenario:
             other_scenarios += 1
             continue
-        if kind != "result":
+        if id(record) not in selected_ids:
             continue
         side = record.get("side")
         payload = record.get("card")
@@ -57,12 +63,24 @@ def summarize(records: list, scenario: str) -> dict:
                 card.objective_proof_disposition = card.proof_dispositions.get(terminal.name, "unmeasured")
         card.cost_countable = payload.get("cost_countable", record.get("cost_countable", {}))
         cards[side].append(card)
+        retained_identity = record.get("measurement_identity")
+        identities.append(retained_identity)
+        if card.measurement_identity != retained_identity:
+            identity_mismatches.append(line)
     comparison = asdict(compare_bare_vs_harness(
         scenario, cards["bare"], cards["harness"], allow_missing_rates=True,
     ))
     if invalid:
         comparison["resolved"] = False
         comparison["verdict"] = "incomplete-result-records"
+    measurement = comparison_labels(identities)
+    if identity_mismatches:
+        measurement = {
+            **measurement,
+            "performance_assertion_allowed": False,
+            "identity_failures": [*measurement["identity_failures"],
+                                  "ScoreCard labels differ from retained result metadata"],
+        }
     return {
         "scope": "descriptive_summary_only",
         "protocol_validity": "not_assessed",
@@ -71,6 +89,8 @@ def summarize(records: list, scenario: str) -> dict:
         "other_or_unscoped_scenario_records": other_scenarios,
         "invalid_record_lines": invalid,
         "comparison": comparison,
+        "measurement": measurement,
+        "identity_mismatch_lines": identity_mismatches,
     }
 
 
@@ -99,6 +119,34 @@ def main(argv: list[str] | None = None) -> int:
             report["task_snapshot"] = summarize_task_quiescence(rows, expected_operation_id=args.operation_id)
     except (OSError, UnicodeError):
         print(json.dumps({"error": "input_file_unreadable"}))
+        return 2
+    except ValueError:
+        print(json.dumps({
+            "scope": "descriptive_summary_only",
+            "protocol_validity": "not_assessed",
+            "measurement": {"performance_assertion_allowed": False, "identities": [],
+                            "identity_failures": ["comparison_lifecycle_unavailable"]},
+            "comparison": {"available": False, "reason": "comparison_lifecycle_unavailable"},
+        }))
+        return 2
+    if report["measurement"]["performance_assertion_allowed"] is not True:
+        # ``summarize`` intentionally retains descriptive arithmetic for local
+        # diagnosis.  This public CLI must not render it as a performance report
+        # when its producer labels are unavailable or contradictory.
+        safe_report = {
+            "scope": report["scope"],
+            "protocol_validity": report["protocol_validity"],
+            "record_count": report["record_count"],
+            "record_types": report["record_types"],
+            "other_or_unscoped_scenario_records": report["other_or_unscoped_scenario_records"],
+            "invalid_record_lines": report["invalid_record_lines"],
+            "identity_mismatch_lines": report["identity_mismatch_lines"],
+            "measurement": report["measurement"],
+            "comparison": {"available": False, "reason": "measurement_labels_unavailable"},
+        }
+        if "task_snapshot" in report:
+            safe_report["task_snapshot"] = report["task_snapshot"]
+        print(json.dumps(safe_report, indent=2, allow_nan=False))
         return 2
     print(json.dumps(report, indent=2, allow_nan=False))
     return 2 if report["invalid_record_lines"] else 0

@@ -150,6 +150,23 @@ def test_run_batch_capture_persists_ground_truth_probes_by_engagement_id(monkeyp
     assert isinstance(data["ground_truth_probes"]["_captured_at"], str)
 
 
+def test_capture_persists_non_secret_verifier_cost_vector(monkeypatch, tmp_path):
+    _hermetic(monkeypatch, tmp_path)
+    cost = lr.probes_mod.VerifierCost(
+        effect="GRAPH_COLLECTED", oracle_id="graph-oracle", raw_probe_invocations=2,
+        wall_seconds=0.25, monetary_cost_usd=None, monetary_cost_status="unavailable",
+    )
+    result = er.unavailable_result(Milestone.GRAPH_COLLECTED, "test")
+    lr._persist_ground_truth_probe_results(
+        "cost-vector", {Milestone.GRAPH_COLLECTED: result},
+        recorded_milestones={Milestone.GRAPH_COLLECTED},
+        verifier_costs={Milestone.GRAPH_COLLECTED: cost},
+    )
+    record = engagement_ledger.load("cost-vector")["ground_truth_probes"]["_verifier_costs"]
+    assert record["GRAPH_COLLECTED"]["monetary_cost_usd"] is None
+    assert record["GRAPH_COLLECTED"]["monetary_cost_status"] == "unavailable"
+
+
 def test_as_run_fn_memoizes_one_batch_per_config_scenario(monkeypatch, tmp_path):
     _hermetic(monkeypatch, tmp_path)
     scn = goad_scenarios("Op")[0]

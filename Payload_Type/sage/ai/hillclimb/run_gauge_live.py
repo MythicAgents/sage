@@ -27,10 +27,10 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 try:
-    from . import (development_row_kernel, effect_registry, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams,
+    from . import (development_row_kernel, effect_registry, experiment_contracts, gate1p_protocol, gate1p_stagea, gate1p_stageb, live_seams, reproducible_claims,
                    bare_runner, bare_mythic_tools, bare_bloodhound, probes as probes_mod)
     from .scenarios import all_scenarios, CHILD, OBJECTIVE
     from .range_state import Milestone
@@ -42,6 +42,8 @@ except Exception:
         gate1p_stageb,
         gate1p_protocol,
         development_row_kernel,
+        experiment_contracts,
+        reproducible_claims,
         effect_registry,
         live_seams,
         bare_runner,
@@ -79,12 +81,21 @@ class Config:
     model_context_limit: int | None = None
     max_output_tokens: int | None = None
     source_version: str | None = None
+    model_version: str | None = None
+    logical_seed: int | None = None
     live_authority_id: str | None = None
     row_contract_path: str | None = None
     row_contract_sha256: str | None = None
     row_id: str | None = None
     development_results_path: Path | None = None
     development_artifact_dir: Path | None = None
+    campaign_limits: experiment_contracts.CostLimits | None = None
+    campaign_required_axes: frozenset[str] = frozenset()
+    campaign_id: str | None = None
+    campaign_accounting_bundle: Path | None = None
+    campaign_price_provenance: Path | None = None
+    run_estimate_rates: Path | None = None
+    evaluator_netbios_domains: dict[str, str] | None = None
 
     @property
     def results_path(self) -> Path:
@@ -106,6 +117,92 @@ class Config:
 _DEVELOPMENT_ROW_SCHEMA = development_row_kernel.CONTRACT_SCHEMA
 _DEVELOPMENT_ROW_OBSERVER_VERSION = development_row_kernel.OBSERVER_VERSION
 _DEVELOPMENT_ROW_ID = development_row_kernel.ROW_ID
+
+
+def _measurement_identity_for_run(cfg: Config, card: ScoreCard, side: str,
+                                  model_route: Mapping | None = None) -> tuple[dict | None, dict]:
+    """Bind a result label to declared inputs and the route observed on its card."""
+    provider = str(getattr(card, "model_provider", "") or "").strip()
+    model = str(getattr(card, "model_id", "") or "").strip()
+    backends = sorted({str(item).strip() for item in getattr(card, "effective_backends", []) if str(item).strip()})
+    expected_route = f"{provider}:{model}" if provider and model else ""
+    route = expected_route if len(backends) == 1 and backends[0] == expected_route else "unknown"
+    selected_route = model_route or {"provider": cfg.model_provider, "model": cfg.model_id,
+                                     "api_endpoint": cfg.model_api_endpoint}
+    endpoint = selected_route.get("api_endpoint")
+    if any(selected_route.get(key) and selected_route[key] != value for key, value in (("provider", provider), ("model", model))):
+        route = "unknown"
+    if route != "unknown" and isinstance(endpoint, str) and endpoint:
+        route += "#endpoint:" + hashlib.sha256(endpoint.encode()).hexdigest()
+    else:
+        route = "unknown"
+    execution_path = "true_naive_raw_tools" if side == "bare" else "unknown"
+    if (side == "harness" and getattr(card, "policy_identity_valid", False) is True
+            and getattr(card, "policy_mode", "") in {"llm", "hybrid", "symbolic"}):
+        execution_path = "policy_selected_controller"
+    identity = {
+        "protocol_id": str(cfg.protocol_id or "unknown"),
+        "pair_id": str(cfg.pair_id or "unknown"),
+        "logical_seed": cfg.logical_seed,
+        "policy_arm": str(getattr(card, "policy_mode", "") or "unknown"),
+        "model_provider": provider or "unknown",
+        "model_id": model or "unknown",
+        "model_version": str(cfg.model_version or "unknown"),
+        "backend_route": route,
+        "generation_config": {
+            "max_output_tokens": cfg.max_output_tokens,
+            "model_context_limit": cfg.model_context_limit,
+            "max_steps": cfg.max_steps,
+            "solve_timeout": cfg.solve_timeout,
+            "token_ceiling": cfg.model_token_budget if cfg.measurement_kind == "row" else None,
+            "null_model": cfg.null_model,
+        },
+        "wrapper_id": "run_gauge_live",
+        "wrapper_revision": "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "authority_mode": "auto",
+        "execution_path": execution_path,
+        "source_version": str(cfg.source_version or "unknown"),
+    }
+    labels = reproducible_claims.measurement_labels([identity])
+    return (labels["identities"][0] if labels["performance_assertion_allowed"] else None), labels
+
+
+def _performance_labels(cards: list[ScoreCard], cfg: Config | None = None,
+                        records: list[Mapping] | None = None) -> dict:
+    """Admit public comparison numbers only for compatible retained producers.
+
+    Wrappers and execution paths deliberately differ between the raw and
+    harness arms.  The compared producer identity must otherwise be the same,
+    and the record envelope must repeat exactly the ScoreCard label used for
+    the arithmetic.
+    """
+    labels = reproducible_claims.measurement_labels([getattr(card, "measurement_identity", None) for card in cards])
+    if labels["performance_assertion_allowed"] and cfg is not None:
+        expected = {
+            "protocol_id": cfg.protocol_id,
+            "pair_id": cfg.pair_id,
+            "logical_seed": cfg.logical_seed,
+            "model_version": cfg.model_version,
+            "source_version": cfg.source_version,
+        }
+        stale = [key for key, value in expected.items()
+                 if value is not None and any(identity.get(key) != value for identity in labels["identities"])]
+        if stale:
+            labels = {**labels, "performance_assertion_allowed": False,
+                      "identity_failures": [f"stale measurement label: {key}" for key in stale]}
+    if not labels["performance_assertion_allowed"]:
+        return labels
+    if records is not None:
+        if len(records) != len(cards) or any(
+            not isinstance(record, Mapping)
+            or getattr(card, "measurement_identity", None) != record.get("measurement_identity")
+            for card, record in zip(cards, records, strict=True)
+        ):
+            return {**labels, "performance_assertion_allowed": False,
+                    "identity_failures": ["ScoreCard labels differ from retained result metadata"]}
+    return reproducible_claims.comparison_labels(labels["identities"])
+
+
 def _hash_path(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -545,7 +642,8 @@ def _resolved_harness_model_route(cfg: Config) -> dict[str, str | None]:
 
 
 def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
-                 settle_interval: float = 20) -> dict:
+                 settle_interval: float = 20, operation_id: int | None = None,
+                 callback_id: int | None = None, netbios_domains: Mapping[str, str] | None = None) -> dict:
     """Build typed, registry-bound probes shared by harness and bare-model runs.
 
     Legacy readers in ``live_seams`` are fail-soft Booleans. They are therefore admitted only on a positive
@@ -554,8 +652,13 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
     sub = set(getattr(scenario, "milestone_subset", None) or tuple(Milestone))
     domains = dict(getattr(scenario, "domains", {}) or {})
     child_domain = str(domains.get("child") or CHILD)
+    parent_domain = str(domains.get("parent") or "")
     objective_domain = str(domains.get("objective") or OBJECTIVE)
     probes = {}
+    operation_bound = type(operation_id) is int and operation_id > 0
+
+    def task_records():
+        return live_seams.operation_task_evidence(expected_operation_id=operation_id)
 
     def typed_positive(milestone, raw_probe, *, origin, proof_kind, target=""):
         return probes_mod.registered_probe(
@@ -567,6 +670,9 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
         )
 
     def krbtgt_paths(milestone, realm, target):
+        proof_kind = (
+            "dcsync_material" if milestone == Milestone.DCSYNC_PARENT else "krbtgt_material"
+        )
         return probes_mod.any_registered_probe(
             typed_positive(
                 milestone,
@@ -574,14 +680,14 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
                     "krbtgt", realm=realm, require_bound_realm=True,
                 ),
                 origin=effect_registry.ProofOrigin.MYTHIC_CREDENTIAL_STORE,
-                proof_kind="krbtgt_material",
+                proof_kind=proof_kind,
                 target=target,
             ),
             typed_positive(
                 milestone,
                 lambda: live_seams._krbtgt_task_output_has_material(realm=realm),
                 origin=effect_registry.ProofOrigin.MYTHIC_TASK_OUTPUT,
-                proof_kind="krbtgt_material",
+                proof_kind=proof_kind,
                 target=target,
             ),
         )
@@ -598,10 +704,49 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
         probes[Milestone.KRBTGT_DUMPED] = krbtgt_paths(
             Milestone.KRBTGT_DUMPED, child_domain, child_domain
         )
-    if Milestone.DA_CHILD in sub:
-        probes[Milestone.DA_CHILD] = probes_mod.unavailable_probe(
-            "matched admin/non-admin Mythic task evidence is not configured"
+    if Milestone.DCSYNC_PARENT in sub:
+        if not parent_domain:
+            raise ValueError("DCSYNC_PARENT requires a parent-domain binding")
+        probes[Milestone.DCSYNC_PARENT] = krbtgt_paths(
+            Milestone.DCSYNC_PARENT, parent_domain, parent_domain
         )
+    if Milestone.DA_CHILD in sub:
+        if operation_bound:
+            from ai.hillclimb.trust_walker_outcome import domain_admin_differential_candidate
+
+            def child_admin(rows, baseline_ids):
+                for row in rows:
+                    task_id = row.get("display_id")
+                    if type(task_id) is not int or task_id <= max(baseline_ids, default=0):
+                        continue
+                    candidate = domain_admin_differential_candidate(
+                        row, row.get("output", ""), milestone=Milestone.DA_CHILD,
+                        effect_at=None, operation_id=operation_id, target=child_domain,
+                        netbios_domains=dict(netbios_domains or {}),
+                    )
+                    if candidate is not None:
+                        return effect_registry.OracleObservation.from_dict(candidate["proof_record"]["observation"])
+                return None
+
+            probes[Milestone.DA_CHILD] = probes_mod.fresh_record_probe(Milestone.DA_CHILD, task_records, child_admin)
+        else:
+            probes[Milestone.DA_CHILD] = probes_mod.unavailable_probe(
+                "matched admin/non-admin Mythic task evidence requires an exact operation binding"
+            )
+    if Milestone.CROSS_DOMAIN_CONTEXT in sub:
+        if operation_bound and type(callback_id) is int and callback_id > 0 and parent_domain:
+            from ai.hillclimb.ticket_context import cross_domain_context_candidate
+            probes[Milestone.CROSS_DOMAIN_CONTEXT] = probes_mod.fresh_record_probe(
+                Milestone.CROSS_DOMAIN_CONTEXT, task_records,
+                lambda rows, ids: cross_domain_context_candidate(
+                    rows, operation_id=operation_id, callback_id=callback_id,
+                    target=parent_domain, baseline_task_ids=ids,
+                ),
+            )
+        else:
+            probes[Milestone.CROSS_DOMAIN_CONTEXT] = probes_mod.unavailable_probe(
+                "parent context proof requires exact operation, callback, and parent-domain bindings"
+            )
     if Milestone.OBJECTIVE in sub:
         if getattr(scenario, "name", "") == gate1p_stageb.SCENARIO:
             probes[Milestone.OBJECTIVE] = krbtgt_paths(
@@ -633,6 +778,19 @@ def build_probes(reader, baseline: dict, scenario, *, settle_timeout: float = 0,
             origin=effect_registry.ProofOrigin.PAYLOAD_BLOODHOUND_FACT,
             proof_kind="graph_fact",
         )
+    wall_limits = {
+        Milestone.SYSTEM_ON_HOST: 120.0,
+        Milestone.GRAPH_COLLECTED: 120.0,
+        Milestone.KRBTGT_DUMPED: 240.0,
+        Milestone.DCSYNC_PARENT: 240.0,
+        Milestone.DA_CHILD: 120.0 if operation_bound else 0.0,
+        Milestone.CROSS_DOMAIN_CONTEXT: 120.0,
+        Milestone.OBJECTIVE: 180.0 if _objective_uses_remote_exec_probe(scenario) else 240.0,
+    }
+    for milestone, probe in probes.items():
+        # These are composed 60-second evaluator read-window ceilings. The
+        # control-plane read axis has no endpoint measurement and stays unknown.
+        probes_mod.bind_verifier_cost(probe, declared_wall_seconds=wall_limits[milestone])
     return probes
 
 
@@ -1105,12 +1263,15 @@ def episode_protocol_snapshot(
 ) -> dict:
     """The concise per-attempt development-measurement protocol; no sealing or forensic receipt layer."""
     if development_protocol is not None:
-        return development_protocol.snapshot(
+        snapshot = development_protocol.snapshot(
             cfg=cfg,
             side=side,
             scenario=scenario_name,
             model_route=model_route,
         )
+        if cfg.run_estimate_rates is not None:
+            snapshot["estimated_run_ceiling"] = _run_estimate_ceiling(cfg, side, model_route)
+        return snapshot
     snapshot = {
         "protocol_id": cfg.protocol_id,
         "measurement_kind": cfg.measurement_kind,
@@ -1148,7 +1309,27 @@ def episode_protocol_snapshot(
                 pair_id=str(cfg.pair_id or ""),
             ),
         })
+    if cfg.run_estimate_rates is not None:
+        snapshot["estimated_run_ceiling"] = _run_estimate_ceiling(cfg, side, model_route)
     return snapshot
+
+
+def _run_estimate_ceiling(cfg: Config, side: str, model_route: Mapping) -> dict | None:
+    """Declare the existing row token guard's USD bound before any client opens."""
+    if cfg.run_estimate_rates is None:
+        return None
+    from ai.hillclimb.phoenix_report import completed_call_estimate_ceiling
+
+    if (cfg.measurement_kind != "row" or side not in {"bare", "harness"}
+            or cfg.policy_mode != "llm" or cfg.null_model):
+        raise SystemExit("run estimate requires a bounded raw or controller LLM row")
+    try:
+        return completed_call_estimate_ceiling(
+            cfg.run_estimate_rates, provider=model_route.get("provider"), model=model_route.get("model"),
+            token_ceiling=cfg.model_token_budget,
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        raise SystemExit("run estimate requires exact model rates and positive request/token bounds") from None
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
@@ -1180,6 +1361,52 @@ def _pair_arm_has_started(path: Path, *, pair_id: str, arm: str) -> bool:
     return False
 
 
+def _check_campaign_limits(cfg: Config, scenario_name: str) -> None:
+    """Read the authoritative result ledger before opening any client."""
+    price = None
+    if cfg.campaign_price_provenance is not None:
+        from ai.hillclimb.accounting_report import load_json, validate_price_provenance
+        try:
+            price = experiment_contracts.PriceProvenance(**load_json(cfg.campaign_price_provenance))
+            validate_price_provenance(price)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            raise SystemExit("campaign next-attempt refused: prospective USD price unavailable") from None
+    if cfg.campaign_accounting_bundle is not None:
+        # Opt-in evaluator-only resource supplement. Normal Sage imports none of
+        # this, and ordinary gauge invocations keep their existing behavior.
+        from ai.hillclimb.accounting_report import accounted_campaign_start
+        if cfg.campaign_limits is None or cfg.campaign_price_provenance is None:
+            raise SystemExit("campaign accounting requires limits and prospective price provenance")
+        try:
+            disposition = accounted_campaign_start(
+                cfg.campaign_accounting_bundle, limits=cfg.campaign_limits,
+                next_attempt_price=price, required_axes=cfg.campaign_required_axes,
+                expected_ledger_path=cfg.results_path,
+                expected_campaign_id=cfg.campaign_id or scenario_name,
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            raise SystemExit("campaign next-attempt refused: accounting evidence unavailable or stale") from None
+        if not disposition.may_start:
+            raise SystemExit(f"campaign next-attempt refused: {disposition.reason}")
+        if (disposition.summary.monetary_cost_status == "estimated"
+                and cfg.run_estimate_rates is None):
+            raise SystemExit("estimated campaign budget requires --run-estimate-rates for a bounded row")
+        return
+    if cfg.campaign_limits is not None:
+        retained = ([json.loads(line) for line in cfg.results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    if cfg.results_path.exists() else [])
+        retained = [row for row in retained if
+                    (row.get("campaign_id") == cfg.campaign_id if cfg.campaign_id else row.get("scenario") == scenario_name)
+                    and (row.get("record_type") == "result" or row.get("attempt_id")
+                         or row.get("supersedes_attempt_id") or row.get("replacement_for_attempt_id"))]
+        disposition = experiment_contracts.campaign_start_disposition(
+            retained, limits=cfg.campaign_limits, required_axes=cfg.campaign_required_axes,
+            next_attempt_price=price,
+        )
+        if not disposition.may_start:
+            raise SystemExit(f"campaign next-attempt refused: {disposition.reason}")
+
+
 def run_side(
     cfg: Config,
     side: str,
@@ -1188,7 +1415,11 @@ def run_side(
     evaluation_reader_factory: Callable[[], Callable[[str], set]] | None = None,
 ) -> ScoreCard:
     """Run ONE side on ONE scenario (range assumed freshly reset), score via the shared probes, record."""
+    attempt_started = time.monotonic()
     row_arm = ""
+    generic_row = cfg.measurement_kind == "row" and scenario_name not in _GATE1P_PRIMARY_SCENARIOS
+    if not generic_row:
+        _check_campaign_limits(cfg, scenario_name)
     row_protocol: gate1p_protocol.Gate1PProtocol | DevelopmentRowProtocol | None = None
     if cfg.measurement_kind == "row" and scenario_name in _GATE1P_PRIMARY_SCENARIOS:
         row_protocol = gate1p_protocol.protocol_for_request(
@@ -1223,6 +1454,7 @@ def run_side(
                 f"live paired-row execution requires separate authority ID {row_protocol.allocation_id!r}"
             )
     resolved_model_route = _resolved_harness_model_route(cfg)
+    _run_estimate_ceiling(cfg, side, resolved_model_route)
     if cfg.measurement_kind == "row" and scenario_name not in _GATE1P_PRIMARY_SCENARIOS:
         if not cfg.row_contract_path or not cfg.row_contract_sha256 or not cfg.row_id:
             raise gate1p_stagea.ProtocolError(
@@ -1234,6 +1466,7 @@ def run_side(
             expected_contract_sha256=cfg.row_contract_sha256,
         )
         _bind_development_row_storage(cfg, row_protocol)
+        _check_campaign_limits(cfg, scenario_name)
         row_arm = row_protocol.validate_request(
             scenario=scenario_name,
             side=side,
@@ -1305,7 +1538,9 @@ def run_side(
     reader = reader_factory() if needed else (lambda _d: set())
     baseline = {d: reader(d) for d in needed}
     probes = build_probes(reader, baseline, scn,
-                          settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval)
+                          settle_timeout=cfg.da_settle_timeout, settle_interval=cfg.da_settle_interval,
+                          operation_id=mythic_operation_id, callback_id=cfg.apollo_cb,
+                          netbios_domains=cfg.evaluator_netbios_domains)
     protocol_snapshot = episode_protocol_snapshot(
         cfg,
         side=side,
@@ -1690,6 +1925,8 @@ def run_side(
         card.policy_identity_valid = True
         card.model_provider = str(_defs.get("provider") or "")
         card.model_id = str(_defs.get("model") or "")
+    card.measurement_identity, measurement_labels = _measurement_identity_for_run(cfg, card, side, resolved_model_route)
+    card.measurement = measurement_labels
     _now = time.time()
     wrapper_tool_countable = side == "bare" or "tool_calls" in runtime_telemetry
     token_cost_countable = (
@@ -1716,7 +1953,9 @@ def run_side(
                 and observer_evidence.get("task_window_observed") is True
             ),
             "wrapper_tool_invocations": wrapper_tool_countable,
-            "control_plane_reads": False,
+            "control_plane_reads": bool(getattr(card, "verifier_control_plane_reads", None) is not None),
+            "verifier_wall_seconds": getattr(card, "verifier_wall_seconds", None) is not None,
+            "verifier_monetary_cost_usd": getattr(card, "verifier_monetary_cost_status", "unavailable") in {"measured", "not_applicable"},
             "wall_seconds": True,
         }
         cost_values = {
@@ -1724,7 +1963,9 @@ def run_side(
             "total_tokens": int(getattr(card, "total_tokens", 0) or 0),
             "environment_actions": len(observer_result.get("tasks") or []),
             "wrapper_tool_invocations": int(getattr(card, "tool_calls", 0) or 0),
-            "control_plane_reads": None,
+            "control_plane_reads": getattr(card, "verifier_control_plane_reads", None),
+            "verifier_wall_seconds": float(getattr(card, "verifier_wall_seconds", 0.0) or 0.0),
+            "verifier_monetary_cost_usd": getattr(card, "verifier_monetary_cost_usd", None),
             "wall_seconds": float(getattr(card, "wall_seconds", 0.0) or 0.0),
         }
     else:
@@ -1733,6 +1974,9 @@ def run_side(
             "model_calls": side == "bare" or "model_calls" in runtime_telemetry,
             "total_tokens": token_cost_countable,
             "wall_seconds": True,
+            "verifier_wall_seconds": getattr(card, "verifier_wall_seconds", None) is not None,
+            "verifier_control_plane_reads": bool(getattr(card, "verifier_control_plane_reads", None) is not None),
+            "verifier_monetary_cost_usd": getattr(card, "verifier_monetary_cost_status", "unavailable") in {"measured", "not_applicable"},
         }
         cost_values = None
     stop_observation_available = bool(
@@ -1835,6 +2079,8 @@ def run_side(
            "policy_mode": card.policy_mode,
            "configured_policy_mode": card.configured_policy_mode,
            "policy_identity_valid": card.policy_identity_valid,
+           "measurement_identity": card.measurement_identity,
+           "measurement": measurement_labels,
            "request_completed": card.request_completed,
            "objective_recognized": card.objective_recognized,
            "objective_proven": card.objective_proven,
@@ -1887,6 +2133,32 @@ def run_side(
            # sage_<YYYYMMDD-HHMM>.db / phoenix_<...>.db moved at the NEXT reset (which holds THIS run's data).
            "ts": _now, "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_now)),
            "card": asdict(card)}
+    # Ordinary result rows are lifecycle records too.  These fields are ignored
+    # by legacy readers but let comparison resolve amendments before card use.
+    rec.update({
+        "schema_version": 2,
+        "attempt_id": f"{scenario_name}:{side}:{int(_now * 1_000_000)}",
+        "evidence_state": "burned" if rec.get("burned") is True else "admitted",
+        "supersedes_attempt_id": None,
+        "replacement_for_attempt_id": None,
+        "amendment_reason": None,
+        "experiment_id": scenario_name,
+        "campaign_id": cfg.campaign_id or scenario_name,
+        "treatment_id": side,
+        "source": {"ordinary_result": True},
+        "cost": {
+            "model_call_count": (int(getattr(card, "model_calls", 0) or 0)
+                                 if cost_countable.get("model_calls") is True else None),
+            "input_tokens": None, "output_tokens": None,
+            "total_tokens": (
+                int(getattr(card, "total_tokens", 0) or 0) if token_cost_countable else None
+            ),
+            "child_task_count": ((cost_values or {}).get("environment_actions")
+                                 if cost_countable.get("environment_actions") is True else None),
+            "wall_time_seconds": max(0.0, time.monotonic() - attempt_started),
+            "monetary_cost_usd": None, "monetary_cost_status": "unavailable",
+        },
+    })
     for env_key, row_key in (
         ("SAGE_EVAL_PHASE6_MANIFEST_HASH", "phase6_manifest_hash"),
         ("SAGE_EVAL_PHASE6_TOPOLOGY_HASH", "phase6_topology_hash"),
@@ -1942,10 +2214,16 @@ def run_side(
         rec["row_admission"] = admission
         rec["row_state"] = "admitted" if admission.get("countable") is True else "burned"
         rec["burned"] = admission.get("countable") is not True
+    rec["evidence_state"] = "burned" if rec.get("burned") is True else "admitted"
     p = cfg.results_path
+    rec["record_hash"] = experiment_contracts.content_hash(rec)
     _append_jsonl(p, rec)
-    print(f"[{side}/{scenario_name}] capability={card.capability:.3f} furthest={card.furthest_milestone} "
-          f"-> recorded to {p}", flush=True)
+    if measurement_labels["performance_assertion_allowed"]:
+        print(f"[{side}/{scenario_name}] capability={card.capability:.3f} furthest={card.furthest_milestone} "
+              f"-> recorded to {p}", flush=True)
+    else:
+        print(f"[{side}/{scenario_name}] retained diagnostic result; performance assertion refused: "
+              f"{'; '.join(measurement_labels['identity_failures'])}", flush=True)
     if isinstance(row_protocol, DevelopmentRowProtocol):
         if rec["row_admission"].get("countable") is not True:
             raise RuntimeError(
@@ -2039,24 +2317,35 @@ def compare(cfg: Config, scenario_name: str) -> None:
         if disposition.get("countable") is not True:
             raise SystemExit(f"Gate 1P pair is not comparison-countable: {disposition.get('reason')}")
         comparison_inputs = disposition["comparison_inputs"]
-        bare, harness = [], []
+        bare, harness, bare_records, harness_records = [], [], [], []
         for item in comparison_inputs:
             card = ScoreCard(**item["card"])
             card.cost_countable = dict(item["cost_countable"])
-            (harness if item["side"] == "harness" else bare).append(card)
+            if item["side"] == "harness":
+                harness.append(card); harness_records.append(item)
+            else:
+                bare.append(card); bare_records.append(item)
     else:
-        bare, harness = [], []
-        for rec in parsed_records:
-            if rec.get("record_type") != "result" or rec.get("scenario") != scenario_name:
-                continue
-            if scenario_name in _GATE1P_PRIMARY_SCENARIOS and rec.get("measurement_kind") != "row":
-                continue
+        bare, harness, bare_records, harness_records = [], [], [], []
+        try:
+            candidates = experiment_contracts.select_comparison_results(parsed_records, scenario_name)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        for rec in candidates:
             card = ScoreCard(**rec["card"])
             card.cost_countable = dict(rec.get("cost_countable") or {})
-            (harness if rec["side"] == "harness" else bare).append(card)
+            if rec["side"] == "harness":
+                harness.append(card); harness_records.append(rec)
+            else:
+                bare.append(card); bare_records.append(rec)
     if not bare or not harness:
         raise SystemExit(f"need >=1 bare and >=1 harness record for {scenario_name} "
                          f"(have bare={len(bare)} harness={len(harness)})")
+    labels = _performance_labels([*bare, *harness], cfg, [*bare_records, *harness_records])
+    if not labels["performance_assertion_allowed"]:
+        print(f"[{scenario_name}] retained comparison diagnostics; performance assertion refused: "
+              f"{'; '.join(labels['identity_failures'])}")
+        return
     cmp = bare_runner.compare_bare_vs_harness(scenario_name, bare, harness)
     print(f"[{scenario_name}] verdict={cmp.verdict} delta={cmp.delta:+.3f} "
           f"(harness={cmp.harness_objective_success_rate:.3f} "
@@ -2110,6 +2399,23 @@ def main(argv=None) -> int:
     r.add_argument("--max-output-tokens", type=int, default=None)
     r.add_argument("--source-version", default=None,
                    help="exact tested source version; may also come from SAGE_EVAL_SOURCE_VERSION")
+    r.add_argument("--model-version", default=None,
+                   help="source-bound model version required for a performance assertion")
+    r.add_argument("--logical-seed", type=int, default=None,
+                   help="prospective non-negative logical seed required for a performance assertion")
+    r.add_argument("--campaign-limits", type=Path,
+                   help="JSON object of declared CostLimits; unavailable axes fail before client creation")
+    r.add_argument("--campaign-id", help="Retained campaign identity shared across scenarios in this ledger")
+    r.add_argument("--campaign-accounting-bundle", type=Path,
+                   help="Opt-in verified provider-cost sidecar for this exact result ledger")
+    r.add_argument("--campaign-price-provenance", type=Path,
+                   help="Prospective USD PriceProvenance JSON for campaign budget checks")
+    r.add_argument("--run-estimate-rates", type=Path,
+                   help="Phoenix rate card with model request maxima; declare the bounded row's conservative USD ceiling")
+    r.add_argument("--campaign-required-axis", action="append", default=[],
+                   choices=tuple(experiment_contracts.CostLimits.__dataclass_fields__))
+    r.add_argument("--evaluator-netbios-domains", type=Path,
+                   help="JSON mapping of prospectively bound NetBIOS aliases to exact DNS domains")
     r.add_argument(
         "--live-authority-id",
         default=None,
@@ -2231,6 +2537,33 @@ def main(argv=None) -> int:
         cfg.max_output_tokens = args.max_output_tokens
     if getattr(args, "source_version", None):
         cfg.source_version = args.source_version
+    if getattr(args, "model_version", None):
+        cfg.model_version = args.model_version
+    if getattr(args, "logical_seed", None) is not None:
+        cfg.logical_seed = args.logical_seed
+    if getattr(args, "campaign_limits", None) is not None:
+        cfg.campaign_limits = experiment_contracts.CostLimits(**json.loads(args.campaign_limits.read_text()))
+    cfg.campaign_id = getattr(args, "campaign_id", None)
+    cfg.campaign_accounting_bundle = getattr(args, "campaign_accounting_bundle", None)
+    cfg.campaign_price_provenance = getattr(args, "campaign_price_provenance", None)
+    cfg.run_estimate_rates = getattr(args, "run_estimate_rates", None)
+    if cfg.campaign_accounting_bundle is not None and (
+        cfg.campaign_limits is None or cfg.campaign_price_provenance is None
+    ):
+        ap.error("--campaign-accounting-bundle requires --campaign-limits and --campaign-price-provenance")
+    if cfg.campaign_price_provenance is not None and cfg.campaign_limits is None:
+        ap.error("--campaign-price-provenance requires --campaign-limits")
+    cfg.campaign_required_axes = frozenset(getattr(args, "campaign_required_axis", ()))
+    if cfg.campaign_required_axes and cfg.campaign_limits is None:
+        ap.error("--campaign-required-axis requires --campaign-limits")
+    if getattr(args, "evaluator_netbios_domains", None) is not None:
+        aliases = json.loads(args.evaluator_netbios_domains.read_text())
+        if not isinstance(aliases, dict) or any(
+            not isinstance(key, str) or not key.strip() or not isinstance(value, str) or not value.strip()
+            for key, value in aliases.items()
+        ):
+            ap.error("evaluator NetBIOS aliases must be a mapping of nonempty strings")
+        cfg.evaluator_netbios_domains = aliases
     if getattr(args, "live_authority_id", None):
         cfg.live_authority_id = args.live_authority_id
     if getattr(args, "row_contract", None):

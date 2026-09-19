@@ -22,7 +22,7 @@ import statistics
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import NormalDist
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 try:
     from .experiment_contracts import NOT_ESTIMABLE, READINESS_ELIGIBLE, READINESS_NOT_READY
@@ -109,6 +109,10 @@ class GateExperimentReport:
     provider_canary_passed: bool | None = None
     reset_automation_passed: bool | None = None
     authorization_boundary_passed: bool | None = None
+    # Shared producer labels for this aggregate.  Old retained cards deliberately
+    # remain representable as an unavailable measurement instead of receiving
+    # invented labels.
+    measurement: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -450,17 +454,16 @@ def default_results_dir() -> Path:
     return Path(__file__).resolve().parents[2] / ".hillclimb" / "results"
 
 
-def run_gate_experiment(
-    configs: Sequence,
-    scenarios: Sequence,
-    run_fn: Callable[[object, object, int], ScoreCard],
+def aggregate_gate_experiment(
+    cards_by_config: Mapping[str, Sequence[ScoreCard]],
     *,
     seeds: int = 5,
+    scenarios: int | None = None,
     rho_threshold: float = 0.7,
     high_eval: float = 0.7,
     low_truth: float = 0.3,
     results_dir: str | os.PathLike | None = None,
-    write_record: bool = True,
+    write_record: bool = False,
     candidate_surface: str = "",
     t0_disposition: str = "",
     t1_substrate_status: str = "",
@@ -486,6 +489,14 @@ def run_gate_experiment(
     paired_incumbent_scores: Sequence[float] | None = None,
     alpha: float = 0.05,
 ) -> GateExperimentReport:
+    """Pure Gate Experiment aggregate over retained ScoreCards.
+
+    ``cards_by_config`` is deliberately explicit: config membership cannot be
+    recovered safely from a ScoreCard alone.  This function never calls a
+    runner, provider, or control plane and is the replay/reducer boundary for
+    retained gate records.
+    """
+    from ai.hillclimb.reproducible_claims import measurement_labels
     per_config: list[dict] = []
     subs: list[float] = []
     caps: list[float] = []
@@ -493,16 +504,13 @@ def run_gate_experiment(
     hashes: set[str] = set()
     total = 0
 
-    for config in configs:
-        cards: list[ScoreCard] = []
-        for scn in scenarios:
-            for seed in range(seeds):
-                card = run_fn(config, scn, seed)
-                if card is None:                  # a dropped/failed run (e.g. empty batch) — skip, don't crash
-                    continue
-                cards.append(card)
-                hashes.add(card.verifier_hash)
-                total += 1
+    all_cards: list[ScoreCard] = []
+    for config, source_cards in cards_by_config.items():
+        cards = [card for card in source_cards if card is not None]
+        for card in cards:
+            hashes.add(card.verifier_hash)
+            total += 1
+            all_cards.append(card)
         if not cards:
             continue
         sm = sum(c.substring_score for c in cards) / len(cards)
@@ -567,7 +575,9 @@ def run_gate_experiment(
         alpha=alpha,
     )
     report = GateExperimentReport(
-        verifier_hash=vh, seeds=seeds, scenarios=len(scenarios), total_runs=total,
+        verifier_hash=vh, seeds=seeds,
+        scenarios=(scenarios if scenarios is not None else len({card.scenario for card in all_cards})),
+        total_runs=total,
         per_config=per_config, spearman_rho=rho, high_eval_low_truth_count=len(danger),
         high_eval_low_truth_configs=danger, rho_threshold=rho_threshold, high_eval=high_eval,
         low_truth=low_truth, verdict=verdict, note=note,
@@ -592,6 +602,7 @@ def run_gate_experiment(
         provider_canary_passed=calibration.provider_canary_passed,
         reset_automation_passed=calibration.reset_automation_passed,
         authorization_boundary_passed=calibration.authorization_boundary_passed,
+        measurement=measurement_labels([getattr(card, "measurement_identity", None) for card in all_cards]),
     )
     if write_record:
         try:
@@ -600,6 +611,42 @@ def run_gate_experiment(
         except Exception:
             report.record_written = False  # a multi-hour run with no durable record must be visible, not silent
     return report
+
+
+def run_gate_experiment(
+    configs: Sequence,
+    scenarios: Sequence,
+    run_fn: Callable[[object, object, int], ScoreCard],
+    *,
+    seeds: int = 5,
+    rho_threshold: float = 0.7,
+    high_eval: float = 0.7,
+    low_truth: float = 0.3,
+    results_dir: str | os.PathLike | None = None,
+    write_record: bool = True,
+    **kwargs,
+) -> GateExperimentReport:
+    """Run the injected producer, then reduce its cards through the pure aggregate."""
+    cards_by_config: dict[str, list[ScoreCard]] = {}
+    for config in configs:
+        cards: list[ScoreCard] = []
+        for scn in scenarios:
+            for seed in range(seeds):
+                card = run_fn(config, scn, seed)
+                if card is not None:  # dropped/failed run: retain the historical skip behavior
+                    cards.append(card)
+        cards_by_config[str(config)] = cards
+    return aggregate_gate_experiment(
+        cards_by_config,
+        seeds=seeds,
+        scenarios=len(scenarios),
+        rho_threshold=rho_threshold,
+        high_eval=high_eval,
+        low_truth=low_truth,
+        results_dir=results_dir,
+        write_record=write_record,
+        **kwargs,
+    )
 
 
 def write_gate_record(report: GateExperimentReport, *, results_dir: str | os.PathLike | None = None) -> str:

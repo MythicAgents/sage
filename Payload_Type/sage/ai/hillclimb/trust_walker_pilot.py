@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -295,6 +296,10 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def assert_rejected_kernel_absent() -> None:
     if any(name == "development_row_kernel" or name.endswith(".development_row_kernel") for name in sys.modules):
         raise PilotError("rejected development-row kernel is loaded")
@@ -483,6 +488,128 @@ def retained_alternate_start_binding(
     return binding
 
 
+_TERMINAL_VERIFIER_COST_SCHEMA = "sage-terminal-verifier-cost-v1"
+_RESULT_METADATA_KEYS = frozenset({
+    "terminal_verifier_cost", "measurement_identity", "measurement_labels",
+    "performance_assertion_allowed", "terminal_verifier_costs_complete",
+    "terminal_verifier_cost_summary",
+})
+
+
+def _terminal_verifier_cost(value: object, *, observed_wall_seconds: float | None, wall_limit_seconds: float) -> dict[str, Any]:
+    """Normalize an observer's actual measurement without guessing missing reads."""
+    supplied = dict(value) if isinstance(value, Mapping) else {}
+    reads = supplied.get("control_plane_read_count")
+    reads_known = type(reads) is int and reads >= 0
+    wall = supplied.get("wall_seconds", observed_wall_seconds)
+    if wall is not None and (type(wall) not in {int, float} or not math.isfinite(wall) or wall < 0):
+        raise PilotError("terminal verifier wall cost is invalid")
+    for key in ("control_plane_read_count", "raw_observer_invocation_count"):
+        if supplied.get(key) is not None and (type(supplied[key]) is not int or supplied[key] < 0):
+            raise PilotError("terminal verifier counter is invalid")
+    complete = bool(supplied.get("complete") is True and reads_known and wall is not None)
+    return {
+        "schema": _TERMINAL_VERIFIER_COST_SCHEMA,
+        "wall_seconds": wall,
+        "raw_observer_invocation_count": (
+            supplied.get("raw_observer_invocation_count")
+            if type(supplied.get("raw_observer_invocation_count")) is int else None
+        ),
+        "control_plane_read_count": reads if reads_known else None,
+        "read_count_complete": reads_known,
+        "monetary_cost_usd": None,
+        "monetary_cost_status": "unavailable",
+        "price_provenance": None,
+        "wall_limit_seconds": wall_limit_seconds,
+        "limit_disposition": "unavailable" if wall is None else "exceeded" if wall > wall_limit_seconds else "within",
+        "complete": complete,
+        "incomplete_reason": "" if complete else str(supplied.get("incomplete_reason") or "observer read count unavailable"),
+    }
+
+
+def _measurement_identity(
+    contract: PilotContract | ImprovementContract, arm: str, start: Mapping[str, Any], execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the existing 14-label shape; unknown source facts stay unknown."""
+    metadata = execution.get("measurement_metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    start_identity = start.get("start_identity") if isinstance(start.get("start_identity"), Mapping) else {}
+    responses = execution.get("response_records")
+    actual_route = execution.get("effective_backend")
+    if not isinstance(actual_route, str) and isinstance(responses, list) and responses:
+        values = {row.get("effective_backend") for row in responses if isinstance(row, Mapping)}
+        actual_route = values.pop() if len(values) == 1 and isinstance(next(iter(values), None), str) else "unknown"
+    actual_route = actual_route if isinstance(actual_route, str) and actual_route else "unknown"
+    endpoint = (start_identity.get("route") or {}).get("endpoint_identity")
+    if actual_route != "unknown" and isinstance(endpoint, str) and endpoint:
+        actual_route = f"{actual_route}#endpoint:{endpoint}"
+    else:
+        actual_route = "unknown"
+    source_version = start_identity.get("source_identity")
+    source_version = source_version if isinstance(source_version, str) and source_version else "unknown"
+    return {
+        "protocol_id": hashlib.sha256(_canonical_json(contract.to_record()).encode()).hexdigest(),
+        # The contract identifies the paired artifact; per-arm source identity is
+        # deliberately carried separately in source_version.
+        "pair_id": execution.get("pair_artifact_identity") if isinstance(execution.get("pair_artifact_identity"), str)
+        else "unknown",
+        "logical_seed": metadata.get("logical_seed") if type(metadata.get("logical_seed")) is int else None,
+        "policy_arm": arm,
+        "model_provider": contract.provider,
+        "model_id": contract.model,
+        "model_version": metadata.get("model_version") if isinstance(metadata.get("model_version"), str) else "unknown",
+        "backend_route": actual_route,
+        # Source hashes belong to their own fields.  Generation parameters must
+        # come from the measured producer record or remain explicitly unknown.
+        "generation_config": dict(metadata["generation_config"])
+        if isinstance(metadata.get("generation_config"), Mapping) and metadata["generation_config"]
+        else None,
+        "wrapper_id": metadata.get("wrapper_id") if isinstance(metadata.get("wrapper_id"), str) else "unknown",
+        "wrapper_revision": metadata.get("wrapper_revision") if isinstance(metadata.get("wrapper_revision"), str) else "unknown",
+        "authority_mode": metadata.get("authority_mode") if isinstance(metadata.get("authority_mode"), str) else "unknown",
+        "execution_path": metadata.get("execution_path") if isinstance(metadata.get("execution_path"), str) else "unknown",
+        "source_version": source_version,
+    }
+
+
+def _measurement_identity_complete(identity: Mapping[str, Any], execution: Mapping[str, Any]) -> bool:
+    metadata = execution.get("measurement_metadata")
+    return bool(
+        isinstance(metadata, Mapping)
+        and type(metadata.get("logical_seed")) is int
+        and isinstance(metadata.get("generation_config"), Mapping)
+        and bool(metadata.get("generation_config"))
+        and all(isinstance(metadata.get(key), str) and metadata[key].strip() for key in (
+            "model_version", "wrapper_id", "wrapper_revision", "authority_mode", "execution_path",
+        ))
+        and identity.get("backend_route") != "unknown"
+        and identity.get("source_version") != "unknown"
+    )
+
+
+def _validate_result_lifecycle(records: list[Mapping[str, Any]], contract: PilotContract | ImprovementContract) -> None:
+    starts: dict[str, int] = {}
+    results: dict[str, int] = {}
+    for row in records:
+        kind, arm = row.get("record_type"), row.get("arm")
+        if isinstance(kind, str) and kind.startswith("arm_result") and kind != "arm_result":
+            raise PilotError("retry-zero protocol rejects posthoc arm-result amendments")
+        if kind not in {"arm_started", "arm_result"}:
+            continue
+        if arm not in contract.arm_order:
+            raise PilotError("result-related record has an unknown arm")
+        target = starts if kind == "arm_started" else results
+        target[arm] = target.get(arm, 0) + 1
+        if target[arm] != 1:
+            raise PilotError("result-related record is duplicated")
+    # Historical unit projections passed an isolated result without lifecycle
+    # rows.  Persisted retry-zero results carry arm_index and must have a start.
+    if starts and any(arm not in starts for arm in results):
+        raise PilotError("terminal result has no started arm")
+    if not starts and any("arm_index" in row for row in records if row.get("record_type") == "arm_result"):
+        raise PilotError("terminal result has no started arm")
+
+
 def summarize_pair(
     records: list[Mapping[str, Any]],
     contract: PilotContract | ImprovementContract | None = None,
@@ -496,9 +623,11 @@ def summarize_pair(
             alternate_start=alternate,
         )
     contract.validate()
+    _validate_result_lifecycle(records, contract)
     results = [row for row in records if row.get("record_type") == "arm_result"]
     cleanups = [row for row in records if row.get("record_type") == "cleanup"]
     starts = [row for row in records if row.get("record_type") == "arm_started"]
+    start_by_arm = {row.get("arm"): row for row in starts}
     settlements = [row for row in records if row.get("record_type") == "settlement"]
     pair_compatible = False
     if len(starts) == 2:
@@ -521,7 +650,13 @@ def summarize_pair(
             except PilotError:
                 pair_compatible = False
         else:
-            pair_compatible = starts[0].get("start_identity") == starts[1].get("start_identity")
+            try:
+                pair_compatible, _ = compare_start_manifests(
+                    starts[0].get("start_identity"),
+                    starts[1].get("start_identity"),
+                )
+            except PilotError:
+                pair_compatible = False
     result_by_arm = {row.get("arm"): row for row in results}
     settlement_by_arm = {row.get("arm"): row for row in settlements}
     cleanup_by_arm = {row.get("arm"): row for row in cleanups}
@@ -551,6 +686,15 @@ def summarize_pair(
             and not (result.get("terminal_snapshot") or {}).get("observer_error_type")
         )
         cost = execution.get("cost")
+        verifier_cost = _terminal_verifier_cost(
+            result.get("terminal_verifier_cost") if isinstance(result, Mapping) else None,
+            observed_wall_seconds=None,
+            wall_limit_seconds=float(contract.setup_cleanup_seconds),
+        )
+        identity = result.get("measurement_identity") if isinstance(result, Mapping) else None
+        identity = dict(identity) if isinstance(identity, Mapping) else None
+        if identity is not None and identity != _measurement_identity(contract, arm, start_by_arm.get(arm, {}), execution):
+            raise PilotError("measurement labels contradict the retained producer or start")
         resources_complete = bool(
             execution.get("resource_complete") is True
             and isinstance(cost, Mapping)
@@ -587,6 +731,9 @@ def summarize_pair(
                 "cost": cost,
                 "cost_error": execution.get("cost_error"),
             },
+            "terminal_verifier_cost": verifier_cost,
+            "measurement_identity": identity,
+            "measurement_identity_complete": bool(identity and _measurement_identity_complete(identity, execution)),
             "terminal_snapshot": (
                 dict(result.get("terminal_snapshot") or {})
                 if isinstance(contract, ImprovementContract) and isinstance(result, Mapping)
@@ -615,6 +762,18 @@ def summarize_pair(
     resources_complete = bool(
         len(arm_reports) == 2 and all(row["resources"]["complete"] is True for row in arm_reports)
     )
+    verifier_costs_complete = bool(
+        len(arm_reports) == 2 and all(row["terminal_verifier_cost"]["complete"] is True for row in arm_reports)
+    )
+    verifier_walls = [row["terminal_verifier_cost"]["wall_seconds"] for row in arm_reports]
+    total_verifier_wall = sum(verifier_walls) if verifier_walls and all(value is not None for value in verifier_walls) else None
+    verifier_reads = [row["terminal_verifier_cost"]["control_plane_read_count"] for row in arm_reports]
+    from .reproducible_claims import measurement_labels  # Lazy: reporting module imports this reducer.
+    labels = measurement_labels([row["measurement_identity"] for row in arm_reports])
+    measurement_complete = bool(
+        labels["performance_assertion_allowed"]
+        and all(row["measurement_identity_complete"] for row in arm_reports)
+    )
     summary = {
         "schema": IMPROVEMENT_SCHEMA if isinstance(contract, ImprovementContract) else PILOT_SCHEMA,
         "protocol_valid": protocol_valid,
@@ -623,6 +782,16 @@ def summarize_pair(
         "lifecycle_complete": lifecycle_complete,
         "isolation_complete": isolation_complete,
         "resources_complete": resources_complete,
+        "terminal_verifier_costs_complete": verifier_costs_complete,
+        "terminal_verifier_cost_summary": {
+            "wall_seconds": total_verifier_wall,
+            "control_plane_read_count": sum(verifier_reads) if all(type(item) is int for item in verifier_reads) else None,
+            "monetary_cost_usd": None,
+            "monetary_cost_status": "unavailable",
+            "within_support_budget": total_verifier_wall <= contract.setup_cleanup_seconds if total_verifier_wall is not None else None,
+        },
+        "measurement_labels": labels,
+        "performance_assertion_allowed": measurement_complete,
         "run_complete": bool(comparison_ready and lifecycle_complete and isolation_complete),
         "arms": arm_reports,
         "hypothesis": (
@@ -755,12 +924,16 @@ def run_pair(
             })
             try:
                 observe_started = time.monotonic()
+                supplied_verifier_cost: object = None
                 try:
                     terminal_snapshot = dict(dependencies.observe(arm, start, execution, settlement))
+                    supplied_verifier_cost = terminal_snapshot.pop("_terminal_verifier_cost", None)
                     outcome = classify_terminal_snapshot(terminal_snapshot).to_record()
                 finally:
-                    support_elapsed += max(0.0, time.monotonic() - observe_started)
+                    observed_wall_seconds = max(0.0, time.monotonic() - observe_started)
+                    support_elapsed += observed_wall_seconds
             except BaseException as exc:
+                observed_wall_seconds = max(0.0, time.monotonic() - observe_started)
                 terminal_snapshot = {"observer_error_type": type(exc).__name__}
                 outcome = {
                     "disposition": "unmeasured",
@@ -768,10 +941,26 @@ def run_pair(
                     "accepted_proof": None,
                     "rejected_proofs": [],
                 }
+                supplied_verifier_cost = {"complete": False, "incomplete_reason": "terminal observer failed"}
+            verifier_cost = _terminal_verifier_cost(
+                supplied_verifier_cost,
+                observed_wall_seconds=observed_wall_seconds,
+                wall_limit_seconds=float(contract.setup_cleanup_seconds),
+            )
+            execution = {
+                **execution,
+                "pair_artifact_identity": hashlib.sha256(
+                    f"{root.resolve()}:{_canonical_json(contract.to_record())}".encode()
+                ).hexdigest(),
+            }
             append_record(ledger, {
                 "record_type": "arm_result", "arm": arm, "arm_index": arm_index,
                 "execution": execution, "outcome": outcome,
                 "terminal_snapshot": terminal_snapshot,
+                "terminal_verifier_cost": verifier_cost,
+                "measurement_identity": _measurement_identity(contract, arm, {
+                    "start_identity": identity, "runtime_identity": runtime_identity,
+                }, execution),
             })
             if abnormal is None and settlement.get("complete") is not True:
                 abnormal = {

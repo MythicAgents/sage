@@ -8,11 +8,14 @@ promotion evidence.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 PROMOTION_EVIDENCE_FIELDS = (
@@ -51,7 +54,9 @@ DECISION_OWNER_SYMBOLIC_CONTROL = "symbolic_control"
 DECISION_OWNER_FORCED_INTERVENTION = "forced_intervention"
 DECISION_OWNER_OPERATOR = "operator"
 
-ATTEMPT_SCHEMA_VERSION = 1
+# Version 1 rows predate explicit price availability and lifecycle semantics.  They
+# remain readable, but are never silently treated as measured/free cost records.
+ATTEMPT_SCHEMA_VERSION = 2
 SURFACE_CLASS_LEXICAL_IDENTITY_SECRET = "lexical_identity_secret"
 SURFACE_CLASS_STRUCTURAL = "structural"
 T1_LEXICAL_UNAVAILABLE = "t1_lexical_substrate_unavailable_or_underpowered"
@@ -805,16 +810,45 @@ class AuthorizationBoundary:
 
 
 @dataclass(frozen=True)
+class PriceProvenance:
+    """Non-secret evidence for a route/model price measurement."""
+
+    source_id: str = ""
+    artifact_path: str = ""
+    artifact_sha256: str = ""
+    route_model_identity: str = ""
+    currency: str = "USD"
+    effective_date_or_version: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "source_id", "artifact_path", "artifact_sha256", "route_model_identity",
+            "currency", "effective_date_or_version",
+        ):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name)))
+
+    @property
+    def valid(self) -> bool:
+        anchor = bool(self.source_id or self.artifact_path)
+        artifact_ok = not self.artifact_path or bool(self.artifact_sha256)
+        return bool(anchor and artifact_ok and self.route_model_identity and self.currency and self.effective_date_or_version)
+
+
+@dataclass(frozen=True)
 class CostMeasurement:
-    semantic_transaction_count: int = 0
-    child_task_count: int = 0
-    wait_count: int = 0
-    retry_count: int = 0
-    wall_time_seconds: float = 0.0
-    model_call_count: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    monetary_cost_usd: float = 0.0
+    semantic_transaction_count: int | None = 0
+    child_task_count: int | None = 0
+    wait_count: int | None = 0
+    retry_count: int | None = 0
+    wall_time_seconds: float | None = 0.0
+    model_call_count: int | None = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    monetary_cost_usd: float | None = None
+    monetary_cost_status: Literal["measured", "estimated", "unavailable", "not_applicable", "legacy_unknown"] = "unavailable"
+    price_provenance: PriceProvenance | None = None
+    not_applicable_reason: str = ""
     termination_reason: str = ""
 
     def __post_init__(self) -> None:
@@ -824,13 +858,112 @@ class CostMeasurement:
             "wait_count",
             "retry_count",
             "model_call_count",
-            "input_tokens",
-            "output_tokens",
         ):
-            object.__setattr__(self, field_name, max(0, int(getattr(self, field_name) or 0)))
-        for field_name in ("wall_time_seconds", "monetary_cost_usd"):
-            object.__setattr__(self, field_name, max(0.0, float(getattr(self, field_name) or 0.0)))
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{field_name} must be a non-negative integer or unavailable")
+        for field_name in ("input_tokens", "output_tokens", "total_tokens"):
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{field_name} must be a non-negative integer or unavailable")
+        if self.input_tokens is not None and self.output_tokens is not None:
+            summed = self.input_tokens + self.output_tokens
+            if self.total_tokens is not None and self.total_tokens != summed:
+                raise ValueError("total tokens contradict retained input/output usage")
+            object.__setattr__(self, "total_tokens", summed)
+        if self.wall_time_seconds is not None:
+            wall = float(self.wall_time_seconds)
+            if not math.isfinite(wall) or wall < 0:
+                raise ValueError("wall_time_seconds must be finite and non-negative or unavailable")
+            object.__setattr__(self, "wall_time_seconds", wall)
+        status = _text(self.monetary_cost_status).casefold() or "unavailable"
+        if status not in {"measured", "estimated", "unavailable", "not_applicable", "legacy_unknown"}:
+            raise ValueError("invalid monetary_cost_status")
+        value = self.monetary_cost_usd
+        if value is not None:
+            value = float(value)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("monetary_cost_usd must be finite and non-negative")
+        provenance = self.price_provenance
+        if isinstance(provenance, Mapping):
+            provenance = PriceProvenance(**dict(provenance))
+        if status in {"measured", "estimated"} and (value is None or provenance is None or not provenance.valid):
+            raise ValueError(f"{status} monetary cost requires value and price provenance")
+        if status == "unavailable" and value is not None:
+            raise ValueError("unavailable monetary cost must be null")
+        reason = _text(self.not_applicable_reason)
+        if status == "not_applicable" and (value != 0.0 or not reason):
+            raise ValueError("not_applicable monetary cost requires explicit zero and reason")
+        object.__setattr__(self, "monetary_cost_usd", value)
+        object.__setattr__(self, "monetary_cost_status", status)
+        object.__setattr__(self, "price_provenance", provenance)
+        object.__setattr__(self, "not_applicable_reason", reason)
         object.__setattr__(self, "termination_reason", _text(self.termination_reason))
+
+    @property
+    def monetary_cost_countable(self) -> bool:
+        return self.monetary_cost_status in {"measured", "estimated", "not_applicable"}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any] | None, *, schema_version: int = ATTEMPT_SCHEMA_VERSION) -> "CostMeasurement":
+        payload = dict(value or {})
+        # Missing retained measurements are unknown, even when an in-memory
+        # constructor uses explicit zero defaults for a new unspent attempt.
+        for name in ("semantic_transaction_count", "child_task_count", "wait_count", "retry_count",
+                     "wall_time_seconds", "model_call_count", "input_tokens", "output_tokens", "total_tokens"):
+            payload.setdefault(name, None)
+        if int(schema_version or 1) < 2 and "monetary_cost_status" not in payload:
+            # Preserve old numeric text exactly, but make its availability explicit.
+            payload["monetary_cost_status"] = "legacy_unknown"
+            payload["price_provenance"] = None
+        return cls(**{key: payload[key] for key in cls.__dataclass_fields__ if key in payload})
+
+
+@dataclass(frozen=True)
+class CostLimits:
+    """Optional declared ceilings; absence leaves that axis unenforced."""
+
+    semantic_transaction_count: int | None = None
+    child_task_count: int | None = None
+    wait_count: int | None = None
+    retry_count: int | None = None
+    wall_time_seconds: float | None = None
+    model_call_count: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    monetary_cost_usd: float | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in self.__dataclass_fields__:
+            value = getattr(self, field_name)
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(f"{field_name} limit must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class CostSummary:
+    attempt_ids: tuple[str, ...]
+    charged_attempt_ids: tuple[str, ...]
+    semantic_transaction_count: int | None
+    child_task_count: int | None
+    wait_count: int | None
+    retry_count: int | None
+    wall_time_seconds: float | None
+    model_call_count: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    monetary_cost_usd: float | None
+    monetary_cost_status: Literal["measured", "estimated", "unavailable"]
+    unavailable_monetary_attempt_ids: tuple[str, ...] = field(default_factory=tuple)
+    limit_dispositions: dict[str, Literal["within", "exceeded", "unavailable"]] = field(default_factory=dict)
+    authoritative: bool = True
+    validation_failures: tuple[str, ...] = field(default_factory=tuple)
+    conservative_upper_bound: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -992,7 +1125,12 @@ class AttemptContract:
     independently_observed_outcome: dict[str, Any] | None = None
     modeled_score: dict[str, Any] | None = None
     schema_version: int = ATTEMPT_SCHEMA_VERSION
+    # A supersession is a metadata/evidence amendment to the same attempted work.
+    # A replacement is fresh work and therefore contributes a separate cost.
+    evidence_state: Literal["admitted", "burned"] = "admitted"
     supersedes_attempt_id: str = ""
+    replacement_for_attempt_id: str = ""
+    amendment_reason: str = ""
     created_at: str = field(default_factory=utc_now)
     started_at: str = ""
     completed_at: str = ""
@@ -1021,7 +1159,10 @@ class AttemptContract:
             "experiment_id",
             "treatment_id",
             "campaign_id",
+            "evidence_state",
             "supersedes_attempt_id",
+            "replacement_for_attempt_id",
+            "amendment_reason",
             "created_at",
             "started_at",
             "completed_at",
@@ -1029,6 +1170,13 @@ class AttemptContract:
             "status",
         ):
             setattr(self, field_name, _text(getattr(self, field_name)))
+        self.evidence_state = self.evidence_state.casefold() or "admitted"
+        if self.evidence_state not in {"admitted", "burned"}:
+            raise ValueError("evidence_state must be admitted or burned")
+        if self.supersedes_attempt_id and self.replacement_for_attempt_id:
+            raise ValueError("an attempt cannot be both amendment and replacement")
+        if int(self.schema_version or 0) >= 2 and self.cost.monetary_cost_status == "legacy_unknown":
+            raise ValueError("new attempt records cannot write legacy_unknown monetary status")
         self.notes = tuple(_text(item) for item in self.notes if _text(item))
         self.provider_failures = tuple(self.provider_failures)
 
@@ -1056,7 +1204,10 @@ class AttemptContract:
         return {
             "schema_version": self.schema_version,
             "attempt_id": self.attempt_id,
+            "evidence_state": self.evidence_state,
             "supersedes_attempt_id": self.supersedes_attempt_id or None,
+            "replacement_for_attempt_id": self.replacement_for_attempt_id or None,
+            "amendment_reason": self.amendment_reason or None,
             "experiment_id": self.experiment_id,
             "campaign_id": self.campaign_id or None,
             "treatment_id": self.treatment_id,
@@ -1136,14 +1287,103 @@ class CampaignContract:
             exposure.provider_failure_count += source.provider_failure_count
         return exposure
 
+    @property
+    def cost_summary(self) -> CostSummary:
+        return aggregate_attempt_costs(self.attempts)
+
+    def assess_cost_limits(self, limits: CostLimits | None = None) -> CostSummary:
+        return aggregate_attempt_costs(self.attempts, limits=limits)
+
+    @property
+    def effective_evidence_ids(self) -> tuple[str, ...]:
+        return resolve_attempt_records([
+            {"record_hash": attempt.content_hash, **attempt.to_dict()} for attempt in self.attempts
+        ]).effective_admitted_head_ids
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "campaign_id": self.campaign_id,
             "experiment_id": self.experiment_id,
             "attempts": [attempt.to_dict() for attempt in self.attempts],
             "training_exposure": self.training_exposure.to_dict(),
+            "cost_summary": self.cost_summary.to_dict(),
+            "effective_evidence_ids": list(self.effective_evidence_ids),
             "content_hash": content_hash([attempt.to_dict() for attempt in self.attempts]),
         }
+
+
+def aggregate_attempt_costs(
+    attempts: Sequence[AttemptContract], *, limits: CostLimits | None = None,
+) -> CostSummary:
+    """Sum resources spent by every fresh attempt, never charging an amendment twice."""
+
+    lifecycle = resolve_attempt_records([
+        {"record_hash": attempt.content_hash, **attempt.to_dict()} for attempt in attempts
+    ])
+    attempt_map = {attempt.attempt_id: attempt for attempt in attempts if attempt.attempt_id}
+    charged: list[AttemptContract] = []
+    for attempt in attempts:
+        # An amendment retains its target's resource facts.  If that target is
+        # present, count the original fact once.  Orphan rows remain charged so a
+        # malformed ledger cannot make spend disappear.
+        if lifecycle.valid and attempt.supersedes_attempt_id and attempt.supersedes_attempt_id in attempt_map:
+            continue
+        charged.append(attempt)
+    totals: dict[str, int | float | None] = {
+        "semantic_transaction_count": 0, "child_task_count": 0, "wait_count": 0,
+        "retry_count": 0, "wall_time_seconds": 0.0, "model_call_count": 0,
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+    }
+    unavailable: list[str] = []
+    # Sum the retained decimal amounts before converting to the public JSON
+    # number. Binary addition can otherwise leave a false residual budget at
+    # exact exhaustion (for example 0.7 + 0.1 < 0.8).
+    money = Decimal("0")
+    for attempt in charged:
+        cost = attempt.cost
+        for field_name in totals:
+            value = getattr(cost, field_name)
+            totals[field_name] = (totals[field_name] + value
+                                  if totals[field_name] is not None and value is not None else None)
+        if cost.monetary_cost_countable:
+            money += Decimal(str(cost.monetary_cost_usd or 0.0))
+        else:
+            unavailable.append(attempt.attempt_id)
+    # Invalid amendments are never allowed to erase spend.  The numeric axes
+    # below are an explicitly conservative upper bound, not a campaign total.
+    monetary_cost_usd = None if unavailable or not lifecycle.valid else float(money)
+    dispositions: dict[str, Literal["within", "exceeded", "unavailable"]] = {}
+    if limits is not None:
+        for field_name in limits.__dataclass_fields__:
+            limit = getattr(limits, field_name)
+            if limit is None:
+                continue
+            observed = monetary_cost_usd if field_name == "monetary_cost_usd" else totals[field_name]
+            dispositions[field_name] = (
+                "unavailable" if observed is None else "exceeded" if observed > limit else "within"
+            )
+    return CostSummary(
+        attempt_ids=tuple(attempt.attempt_id for attempt in attempts),
+        charged_attempt_ids=tuple(attempt.attempt_id for attempt in charged),
+        semantic_transaction_count=totals["semantic_transaction_count"],
+        child_task_count=totals["child_task_count"],
+        wait_count=totals["wait_count"],
+        retry_count=totals["retry_count"],
+        wall_time_seconds=totals["wall_time_seconds"],
+        model_call_count=totals["model_call_count"],
+        input_tokens=totals["input_tokens"],
+        output_tokens=totals["output_tokens"],
+        total_tokens=totals["total_tokens"],
+        monetary_cost_usd=monetary_cost_usd,
+        monetary_cost_status=("unavailable" if unavailable or not lifecycle.valid else
+                              "estimated" if any(a.cost.monetary_cost_status == "estimated" for a in charged)
+                              else "measured"),
+        unavailable_monetary_attempt_ids=tuple(unavailable),
+        limit_dispositions=dispositions,
+        authoritative=lifecycle.valid,
+        validation_failures=lifecycle.validation_failures,
+        conservative_upper_bound=not lifecycle.valid,
+    )
 
 
 def blocked_action_remains_blocked(
@@ -1170,6 +1410,8 @@ def append_attempt_record(path: str | Path, attempt: AttemptContract) -> str:
     with output.open("a", encoding="utf-8") as handle:
         handle.write(canonical_json(row))
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     return str(output)
 
 
@@ -1188,7 +1430,7 @@ def validate_attempt_contract(attempt: AttemptContract) -> tuple[str, ...]:
     """Validate a countable attempt against the frozen Phase 0/Phase 4 contract."""
 
     failures: list[str] = []
-    if int(attempt.schema_version or 0) != ATTEMPT_SCHEMA_VERSION:
+    if int(attempt.schema_version or 0) not in {1, ATTEMPT_SCHEMA_VERSION}:
         failures.append("schema_version_mismatch")
     for field_name in ("attempt_id", "experiment_id", "treatment_id", "created_at", "phase", "status"):
         if not _text(getattr(attempt, field_name)):
@@ -1203,14 +1445,70 @@ def validate_attempt_contract(attempt: AttemptContract) -> tuple[str, ...]:
         failures.append("authorization_boundary_failed")
     if attempt.outcome_source == OUTCOME_INDEPENDENTLY_OBSERVED and attempt.lineage_validation.valid is not True:
         failures.append("independently_observed_outcome_missing_exact_lineage")
+    if int(attempt.schema_version or 0) >= 2 and attempt.supersedes_attempt_id and not attempt.amendment_reason:
+        failures.append("amendment_reason_missing")
     return tuple(dict.fromkeys(failures))
 
 
-def validate_attempt_records(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
-    """Validate append-only record hashes and supersession links without rewriting rows."""
+@dataclass(frozen=True)
+class AttemptRecordResolution:
+    all_attempt_ids: tuple[str, ...]
+    effective_admitted_head_ids: tuple[str, ...]
+    burned_attempt_ids: tuple[str, ...]
+    superseded_attempt_ids: tuple[str, ...]
+    replacement_relationships: tuple[tuple[str, str], ...]
+    validation_failures: tuple[str, ...]
+
+    @property
+    def valid(self) -> bool:
+        return not self.validation_failures
+
+
+@dataclass(frozen=True)
+class CampaignStartDisposition:
+    may_start: bool
+    resolution: AttemptRecordResolution
+    summary: CostSummary
+    exceeded_axes: tuple[str, ...] = field(default_factory=tuple)
+    unavailable_axes: tuple[str, ...] = field(default_factory=tuple)
+    reason: str = "within_limits"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _row_schema_version(row: Mapping[str, Any]) -> int:
+    try:
+        return int(row.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _same_amendment_identity(source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    # `source` and `model_identity` bind the producer route without turning an
+    # arbitrary descriptive string into an admission marker.
+    return all(
+        canonical_json(source.get(field_name)) == canonical_json(target.get(field_name))
+        for field_name in ("experiment_id", "campaign_id", "treatment_id", "source", "model_identity")
+    )
+
+
+def _same_campaign_identity(source: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    return all(
+        canonical_json(source.get(field_name)) == canonical_json(target.get(field_name))
+        for field_name in ("experiment_id", "campaign_id", "treatment_id")
+    )
+
+
+def resolve_attempt_records(rows: Sequence[Mapping[str, Any]]) -> AttemptRecordResolution:
+    """Resolve typed append-only lifecycle rows without rewriting the ledger."""
 
     failures: list[str] = []
-    prior_attempt_ids: set[str] = set()
+    prior: dict[str, Mapping[str, Any]] = {}
+    all_ids: list[str] = []
+    superseded: set[str] = set()
+    superseder_by_target: dict[str, str] = {}
+    replacements: list[tuple[str, str]] = []
     for index, row in enumerate(rows):
         payload = dict(row)
         record_hash = _text(payload.pop("record_hash", ""))
@@ -1221,10 +1519,164 @@ def validate_attempt_records(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ..
         attempt_id = _text(payload.get("attempt_id"))
         if not attempt_id:
             failures.append(f"row_{index}:missing_attempt_id")
-        elif attempt_id in prior_attempt_ids:
+        elif attempt_id in prior:
             failures.append(f"row_{index}:duplicate_attempt_id")
+        else:
+            all_ids.append(attempt_id)
+
         supersedes = _text(payload.get("supersedes_attempt_id"))
-        if supersedes and supersedes not in prior_attempt_ids:
-            failures.append(f"row_{index}:unknown_supersedes_attempt_id")
-        prior_attempt_ids.add(attempt_id)
-    return tuple(dict.fromkeys(failures))
+        replacement_for = _text(payload.get("replacement_for_attempt_id"))
+        version = _row_schema_version(payload)
+        state = _text(payload.get("evidence_state") or "admitted").casefold()
+        if version >= 2 and state not in {"admitted", "burned"}:
+            failures.append(f"row_{index}:invalid_evidence_state")
+        if supersedes and replacement_for:
+            failures.append(f"row_{index}:conflicting_amendment_replacement")
+        if supersedes and supersedes == attempt_id:
+            failures.append(f"row_{index}:self_supersedes_attempt_id")
+        if supersedes:
+            target = prior.get(supersedes)
+            if target is None:
+                failures.append(f"row_{index}:unknown_supersedes_attempt_id")
+            else:
+                superseded.add(supersedes)
+                existing = superseder_by_target.get(supersedes)
+                if existing:
+                    failures.append(f"row_{index}:supersession_fork:{supersedes}")
+                else:
+                    superseder_by_target[supersedes] = attempt_id
+                if version >= 2:
+                    if not _text(payload.get("amendment_reason")):
+                        failures.append(f"row_{index}:amendment_reason_missing")
+                    if not _same_amendment_identity(payload, target):
+                        failures.append(f"row_{index}:cross_identity_supersession")
+                    if canonical_json(payload.get("cost")) != canonical_json(target.get("cost")):
+                        failures.append(f"row_{index}:amendment_cost_changed")
+                    target_state = _text(target.get("evidence_state") or "admitted").casefold()
+                    if target_state == "burned" and state != "burned":
+                        failures.append(f"row_{index}:burned_attempt_cannot_be_admitted")
+                    elif state != target_state:
+                        failures.append(f"row_{index}:amendment_evidence_state_changed")
+        if replacement_for:
+            if replacement_for == attempt_id:
+                failures.append(f"row_{index}:self_replacement_for_attempt_id")
+            target = prior.get(replacement_for)
+            if target is None:
+                failures.append(f"row_{index}:unknown_replacement_for_attempt_id")
+            else:
+                target_state = _text(target.get("evidence_state") or "admitted").casefold()
+                if target_state != "burned":
+                    failures.append(f"row_{index}:replacement_predecessor_not_burned")
+                if not _same_campaign_identity(payload, target):
+                    failures.append(f"row_{index}:cross_identity_replacement")
+                replacements.append((replacement_for, attempt_id))
+        if attempt_id and attempt_id not in prior:
+            prior[attempt_id] = payload
+
+    burned = tuple(
+        attempt_id for attempt_id in all_ids
+        if _text(prior[attempt_id].get("evidence_state") or "admitted").casefold() == "burned"
+    )
+    effective = tuple(
+        attempt_id for attempt_id in all_ids
+        if attempt_id not in superseded
+        and _text(prior[attempt_id].get("evidence_state") or "admitted").casefold() == "admitted"
+    )
+    # Consumers must reject an ambiguous lifecycle rather than selecting a
+    # convenient row from it.
+    if failures:
+        effective = ()
+    return AttemptRecordResolution(
+        all_attempt_ids=tuple(all_ids),
+        effective_admitted_head_ids=effective,
+        burned_attempt_ids=burned,
+        superseded_attempt_ids=tuple(sorted(superseded)),
+        replacement_relationships=tuple(replacements),
+        validation_failures=tuple(dict.fromkeys(failures)),
+    )
+
+
+def validate_attempt_records(rows: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Validate append-only record hashes and typed lifecycle links."""
+
+    return resolve_attempt_records(rows).validation_failures
+
+
+def select_comparison_results(records: Sequence[Mapping[str, Any]], scenario: str) -> list[Mapping[str, Any]]:
+    """Select admitted result heads using the existing append-only lifecycle.
+
+    Progress/cleanup events do not assert results. An attempt or amendment does,
+    so a missing result packet cannot silently disappear before validation.
+    Legacy results remain readable but cannot be mixed with typed lifecycle rows.
+    """
+    scoped = [row for row in records if isinstance(row, Mapping) and row.get("scenario") == scenario
+              and (row.get("record_type") == "result" or row.get("attempt_id")
+                   or row.get("supersedes_attempt_id") or row.get("replacement_for_attempt_id"))]
+    effective_ids = None
+    if any(row.get("attempt_id") or row.get("supersedes_attempt_id") or row.get("replacement_for_attempt_id")
+           for row in scoped):
+        if any(not row.get("attempt_id") or row.get("record_type") != "result"
+               or not isinstance(row.get("card"), Mapping) for row in scoped):
+            raise ValueError("comparison mixes lifecycle and unbound result rows")
+        resolution = resolve_attempt_records(scoped)
+        if not resolution.valid:
+            raise ValueError("comparison attempt ledger is ambiguous or invalid")
+        effective_ids = set(resolution.effective_admitted_head_ids)
+    return [row for row in scoped if row.get("record_type") == "result"
+            and row.get("burned") is not True and row.get("row_state") != "burned"
+            and row.get("evidence_state") != "burned"
+            and (effective_ids is None or row.get("attempt_id") in effective_ids)]
+
+
+def campaign_start_disposition(
+    rows: Sequence[Mapping[str, Any]] | Sequence[AttemptContract], *, limits: CostLimits,
+    required_axes: frozenset[str] = frozenset(),
+    next_attempt_price: PriceProvenance | None = None,
+) -> CampaignStartDisposition:
+    """Pure next-attempt stop-loss decision over retained typed attempt rows."""
+    attempts: list[AttemptContract] = []
+    normalized_rows: list[Mapping[str, Any]] = []
+    for item in rows:
+        if isinstance(item, AttemptContract):
+            attempts.append(item)
+            normalized_rows.append({"record_hash": item.content_hash, **item.to_dict()})
+            continue
+        row = dict(item)
+        normalized_rows.append(row)
+        cost = CostMeasurement.from_dict(row.get("cost"), schema_version=_row_schema_version(row))
+        attempts.append(AttemptContract(
+            attempt_id=_text(row.get("attempt_id")), experiment_id=_text(row.get("experiment_id")),
+            campaign_id=_text(row.get("campaign_id")), treatment_id=_text(row.get("treatment_id")),
+            schema_version=_row_schema_version(row), evidence_state=_text(row.get("evidence_state") or "admitted"),
+            supersedes_attempt_id=_text(row.get("supersedes_attempt_id")),
+            replacement_for_attempt_id=_text(row.get("replacement_for_attempt_id")),
+            amendment_reason=_text(row.get("amendment_reason")), cost=cost,
+            source=dict(row.get("source") or {}), model_identity=None,
+        ))
+    resolution = resolve_attempt_records(normalized_rows)
+    summary = aggregate_attempt_costs(attempts, limits=limits)
+    exceeded = tuple(sorted(axis for axis, value in summary.limit_dispositions.items() if value == "exceeded"))
+    unknown_axes = set(required_axes) - set(CostLimits.__dataclass_fields__)
+    if unknown_axes:
+        raise ValueError("unknown required campaign cost axis")
+    unavailable_set = {axis for axis in required_axes
+                       if getattr(limits, axis) is None or summary.limit_dispositions.get(axis) == "unavailable"}
+    unavailable_set.update(axis for axis, disposition in summary.limit_dispositions.items()
+                           if disposition == "unavailable")
+    if (limits.monetary_cost_usd is not None or "monetary_cost_usd" in required_axes) and (
+        next_attempt_price is None or not next_attempt_price.valid
+    ):
+        unavailable_set.add("monetary_cost_usd")
+    unavailable = tuple(sorted(unavailable_set))
+    if not resolution.valid:
+        return CampaignStartDisposition(False, resolution, summary, exceeded, unavailable, "invalid_ledger")
+    if exceeded:
+        return CampaignStartDisposition(False, resolution, summary, exceeded, unavailable, "limit_exceeded")
+    if unavailable:
+        return CampaignStartDisposition(False, resolution, summary, exceeded, unavailable, "required_axis_unavailable")
+    exhausted = tuple(axis for axis in CostLimits.__dataclass_fields__
+                      if getattr(limits, axis) is not None and getattr(summary, axis) is not None
+                      and getattr(summary, axis) >= getattr(limits, axis))
+    if exhausted:
+        return CampaignStartDisposition(False, resolution, summary, exhausted, unavailable, "limit_exhausted")
+    return CampaignStartDisposition(True, resolution, summary, exceeded, unavailable)
