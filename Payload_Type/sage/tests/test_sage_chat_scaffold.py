@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+import sage_chat.session as chat_session
 from sage_chat.config import build_model_kwargs, resolve_environment_llm_profile
 from sage_chat.models import SAGE_MODELS
 from sage_chat.session import (
@@ -26,6 +27,19 @@ from sage_chat.headless import HeadlessSageChat, build_chat_request
 
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_channel_marker_db(tmp_path, monkeypatch):
+    import sage_chat.service as service
+
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
+    # Most scaffold tests use a fake Model factory without registering sessions.
+    # Keep their established contract; marker tests below restore the real claim.
+    async def always_new(_request):
+        return True
+
+    monkeypatch.setattr(service, "claim_channel_marker", always_new)
 
 
 class _FakeModel:
@@ -96,6 +110,132 @@ def test_happy_path_emits_exactly_one_terminal():
     assert terminals[0]["kind"] == "complete"
     # prompt threaded through, first turn → is_interactive False
     assert model.invoked_with == ("do the thing", False)
+
+
+def test_restarted_native_channel_refuses_lost_scope_before_model_invoke():
+    from mythic_container.ChatBase import ChatMessageContext
+
+    model = _FakeModel()
+    chat = _DriverChat(model)
+    request = build_chat_request("continue the investigation", channel_id=90501, request_id=90502)
+    request.RequestMessageID = 70502
+    request.Context = [
+        ChatMessageContext(id=70501, author_type="operator", message="only inspect existing evidence"),
+        ChatMessageContext(id=70502, author_type="operator", message=request.Prompt),
+    ]
+
+    _run(chat.chat(request))
+
+    assert model.invoked_with is None
+    assert len(chat.terminal_emissions) == 1
+    terminal = chat.terminal_emissions[0]
+    assert terminal["kind"] == "complete"
+    assert "prior scope and evidence are not restored" in terminal["content"]
+    assert "No tools were used" in terminal["content"]
+
+
+def test_restarted_native_channel_with_empty_context_refuses_by_persisted_marker(monkeypatch):
+    import sage_chat.service as service
+
+    monkeypatch.setattr(service, "claim_channel_marker", chat_session.claim_channel_marker)
+    first = build_chat_request("inspect", channel_id=90507, request_id=90508)
+    _run(_DriverChat(_FakeModel()).chat(first))
+
+    resumed_model = _FakeModel()
+    resumed = build_chat_request("continue", channel_id=90507, request_id=90509)
+    resumed.Context = []
+    resumed_chat = _DriverChat(resumed_model)
+    _run(resumed_chat.chat(resumed))
+
+    assert resumed_model.invoked_with is None
+    assert "prior scope and evidence are not restored" in resumed_chat.terminal_emissions[0]["content"]
+
+
+def test_channel_marker_is_operation_scoped_and_claim_is_atomic():
+    from sage_chat.session import claim_channel_marker
+
+    first = build_chat_request("first", channel_id=90510, operation_id=1)
+    other_operation = build_chat_request("first", channel_id=90510, operation_id=2)
+
+    async def competing_claims():
+        return await asyncio.gather(
+            claim_channel_marker(first),
+            claim_channel_marker(first),
+        )
+
+    assert sorted(_run(competing_claims())) == [False, True]
+    assert _run(claim_channel_marker(other_operation)) is True
+
+
+def test_channel_marker_db_failure_prevents_model_invoke(monkeypatch, tmp_path):
+    import sage_chat.service as service
+
+    monkeypatch.setattr(service, "claim_channel_marker", chat_session.claim_channel_marker)
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "missing" / "sage.db"))
+    model = _FakeModel()
+    chat = _DriverChat(model)
+    _run(chat.chat(build_chat_request("inspect", channel_id=90511)))
+    assert model.invoked_with is None
+    assert chat.terminal_emissions[0]["kind"] == "error"
+
+
+def test_restarted_channel_rejects_stale_native_approval(monkeypatch):
+    import sage_chat.service as service
+    from mythic_container.ChatBase import ChatInputResponse
+
+    monkeypatch.setattr(service, "claim_channel_marker", chat_session.claim_channel_marker)
+    first = build_chat_request("inspect", channel_id=90512, request_id=90513)
+    _run(_DriverChat(_FakeModel()).chat(first))
+
+    stale_model = _FakeModel()
+    resumed = build_chat_request("", channel_id=90512, request_id=90514)
+    resumed.InputResponse = ChatInputResponse(action="accept")
+    chat = _DriverChat(stale_model)
+    _run(chat.chat(resumed))
+    assert stale_model.invoked_with is None
+    assert chat.terminal_emissions[0]["kind"] == "complete"
+    assert "No tools were used" in chat.terminal_emissions[0]["content"]
+
+
+def test_fresh_channel_and_live_session_allow_native_turns_with_context():
+    from mythic_container.ChatBase import ChatMessageContext
+
+    fresh_model = _FakeModel()
+    fresh_chat = _DriverChat(fresh_model)
+    fresh = build_chat_request("inspect", channel_id=90503, request_id=90504)
+    fresh.RequestMessageID = 70504
+    fresh.Context = [ChatMessageContext(id=70504, author_type="operator", message="inspect")]
+    _run(fresh_chat.chat(fresh))
+    assert fresh_model.invoked_with == ("inspect", False)
+
+    live_model = _FakeModel()
+    live_chat = _DriverChat(live_model, preexisted=True)
+    continued = build_chat_request("continue", channel_id=90505, request_id=90506)
+    continued.RequestMessageID = 70506
+    continued.Context = [ChatMessageContext(id=70505, author_type="operator", message="prior scope")]
+    _run(put_channel_session(continued, live_model))
+    try:
+        _run(live_chat.chat(continued))
+        assert live_model.invoked_with == ("continue", True)
+    finally:
+        _run(drop_channel_session(continued))
+
+
+def test_local_resource_denial_is_distinct_from_provider_outage():
+    from ai.resource_budget import ResourceBudgetExceeded
+    from sage_chat.service import _resource_budget_notice
+
+    try:
+        try:
+            raise ResourceBudgetExceeded("provider_tokens")
+        except ResourceBudgetExceeded as denied:
+            raise RuntimeError("Connection error.") from denied
+    except RuntimeError as wrapped:
+        assert _resource_budget_notice(wrapped) == (
+            "Sage's configured resource budget stopped this request."
+        )
+    assert _resource_budget_notice(RuntimeError("Connection error.")) == ""
+    assert _resource_budget_notice(RuntimeError("ResourceBudgetExceeded")) == ""
 
 
 def test_native_service_reconciles_one_typed_terminal_after_request_terminal():
@@ -220,6 +360,51 @@ def test_native_service_reconciles_one_typed_terminal_after_request_terminal():
     error_transcript = error_model.ledger.reconstruct_transcript()
     assert error_transcript[-2]["content"] == "error"
     assert error_transcript[-1]["content"] == "boom"
+
+    from ai.resource_budget import ResourceBudgetExceeded
+
+    class _BudgetDeniedModel(_LifecycleModel):
+        async def invoke(self, prompt, is_interactive=False):
+            try:
+                raise ResourceBudgetExceeded("provider_tokens")
+            except ResourceBudgetExceeded as denied:
+                raise RuntimeError("Connection error.") from denied
+
+    budget_model = _BudgetDeniedModel(stream=())
+    budget_chat = _DriverChat(budget_model)
+    _run(budget_chat.chat(build_chat_request(
+        "budgeted prompt", channel_id=508, request_id=93,
+    )))
+    budget_terminal = budget_chat.terminal_emissions[0]
+    assert budget_terminal["kind"] == "error"
+    assert budget_terminal["error"] == (
+        "Sage's configured resource budget stopped this request."
+    )
+
+    from ai.langgraph.model import STOP_REASON_STEP_LIMIT, _OperatorStopRequested
+
+    class _HaltModel(_LifecycleModel):
+        async def invoke(self, prompt, is_interactive=False):
+            raise _OperatorStopRequested(
+                STOP_REASON_STEP_LIMIT, "Step budget: 21 used, limit 20."
+            )
+
+    halt_chat = _DriverChat(_HaltModel(stream=()))
+    _run(halt_chat.chat(build_chat_request("halted", channel_id=509, request_id=94)))
+    halt_text = halt_chat.terminal_emissions[0]["error"]
+    assert "step budget" in halt_text.lower()
+    assert "21 used, limit 20" in halt_text
+    assert "Sage request failed." not in halt_text
+
+    class _UnsafePayloadModel(_LifecycleModel):
+        async def invoke(self, prompt, is_interactive=False):
+            raise RuntimeError({"private_message": "must not publish"})
+
+    unsafe_chat = _DriverChat(_UnsafePayloadModel(stream=()))
+    _run(unsafe_chat.chat(build_chat_request("unsafe error", channel_id=510, request_id=95)))
+    unsafe_text = unsafe_chat.terminal_emissions[0]["error"]
+    assert "RuntimeError" in unsafe_text
+    assert "must not publish" not in unsafe_text
 
 
 def test_same_channel_turns_are_serialized():
@@ -1038,7 +1223,7 @@ def test_channel_metadata_tracks_active_agent_then_returns_idle(monkeypatch):
 
 def test_cancel_reraises_and_cooperatively_stops():
     model = _FakeModel(behavior="cancel")
-    chat = _DriverChat(model)
+    chat = _DriverChat(model, preexisted=True)
     req = build_chat_request("go", channel_id=505, request_id=11)
     _run(put_channel_session(req, model))
     with pytest.raises(asyncio.CancelledError):
@@ -2511,6 +2696,30 @@ def test_slash_dispatched_via_chat_without_creating_model():
     chat = _NoModelChat()
     _run(chat.chat(_slash_req("state", channel_id=9, request_id=3)))
     assert len(chat.terminal_emissions) == 1
+
+
+@pytest.mark.parametrize(
+    ("slash_name", "slash_arg", "channel_id"),
+    (("mode", "supervised", 90515), ("help", "", 90518)),
+)
+def test_new_channel_slash_then_prompt_can_establish_scope(
+    monkeypatch, slash_name, slash_arg, channel_id,
+):
+    import sage_chat.service as service
+    from mythic_container.ChatBase import ChatMessageContext
+
+    monkeypatch.setattr(service, "claim_channel_marker", chat_session.claim_channel_marker)
+    model = _FakeModel()
+    chat = _DriverChat(model)
+    first = _slash_req(slash_name, slash_arg, channel_id=channel_id, request_id=90516)
+    _run(chat.chat(first))
+    assert model.invoked_with is None
+
+    prompt = build_chat_request("inspect", channel_id=channel_id, request_id=90517)
+    prompt.RequestMessageID = 70517
+    prompt.Context = [ChatMessageContext(id=70516, author_type="operator", message=f"/{slash_name}")]
+    _run(chat.chat(prompt))
+    assert model.invoked_with == ("inspect", False)
 
 
 def test_slash_sandbox_dispatched_via_chat_without_creating_model(monkeypatch):

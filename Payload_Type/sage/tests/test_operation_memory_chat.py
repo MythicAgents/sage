@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from mythic_container.ChatBase import ChatSlashCommandInvocation
 import pytest
 
+import sage_chat.service as chat_service
 from sage_chat.headless import HeadlessSageChat, build_chat_request
 from sage_chat.findings_watcher import FindingsWatcherManager
 from sage_chat.config import ResolvedLLMProfile
@@ -25,6 +26,16 @@ from sage_chat.operation_memory_runtime import (
 from sage_chat.operation_memory_source import MythicOperationMemorySource
 from sage_chat.operation_reasoner import OperationFindingReasoner
 from sage_chat.watcher_control import WatcherChannel
+
+
+@pytest.fixture(autouse=True)
+def _fake_driver_without_channel_marker(monkeypatch):
+    # These operation-memory fixtures replace Model creation and do not register
+    # native channel sessions. The restart marker has its own assembled tests.
+    async def always_new(_request):
+        return True
+
+    monkeypatch.setattr(chat_service, "claim_channel_marker", always_new)
 
 
 def _encoded(value) -> str:

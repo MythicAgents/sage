@@ -172,15 +172,10 @@ def test_exception_with_no_args_renders_empty_so_callers_use_their_fallback():
     assert operator_error_text(RuntimeError()) == ""
 
 
-def test_both_operator_surfaces_use_the_safe_formatter():
-    """Neither surface may regress to str(exc); each is a separate publication path."""
+def test_model_operator_surface_uses_the_safe_formatter():
+    """The native chat error path is exercised with a non-string payload in its assembled test."""
 
     repo_root = Path(__file__).resolve().parents[3]
     model_src = (repo_root / "Payload_Type/sage/ai/langgraph/model.py").read_text()
-    service_src = (repo_root / "Payload_Type/sage/sage_chat/service.py").read_text()
-
     assert "error_msg = operator_error_text(e)" in model_src
     assert "error_msg = str(e)" not in model_src
-
-    assert "error_text = operator_error_text(error)" in service_src
-    assert "error_text = str(error)" not in service_src

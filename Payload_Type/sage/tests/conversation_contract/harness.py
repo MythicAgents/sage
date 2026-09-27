@@ -7,16 +7,36 @@ result/evidence assertions cover request authority, subgoal control, and termina
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from ai.langgraph.turn_authority import (
     TurnAuthority,
     authority_from_request_contract,
 )
 from sage_chat.headless import HeadlessSageChat, build_chat_request
+from sage_chat import session as chat_session
+from sage_chat.session import drop_channel_session, put_channel_session
 
 from .cases import ConversationCase
+
+
+_RUN_CASE_LOCKS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+
+
+def _run_case_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _RUN_CASE_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _RUN_CASE_LOCKS[loop] = lock
+    return lock
+
+
 
 
 @dataclass(frozen=True)
@@ -133,7 +153,7 @@ class _HarnessChat(HeadlessSageChat):
         return await super().chat(request)
 
     async def _get_or_create_model(self, request):
-        del request
+        await put_channel_session(request, self.model)
         return self.model, False
 
 
@@ -162,7 +182,19 @@ async def run_case(case: ConversationCase) -> CaseResult:
         request_id=int(case.case_id[1:3]),
         config={"mode": case.session_mode, "autonomous_solve": False},
     )
-    await chat.chat(request)
+    # Each case keeps the canonical channel ID used by the golden transcript.
+    # Parallel perturbation trials serialize this tiny native-chat probe while
+    # temporarily selecting its disposable marker DB; provider generation remains
+    # concurrent outside run_case.
+    async with _run_case_lock():
+        with TemporaryDirectory(prefix="sage-conversation-case-") as scratch:
+            previous_marker_path = chat_session._CHANNEL_MARKER_DB_PATH
+            try:
+                chat_session._CHANNEL_MARKER_DB_PATH = str(Path(scratch) / "sage.db")
+                await chat.chat(request)
+            finally:
+                await drop_channel_session(request, expected_model=model)
+                chat_session._CHANNEL_MARKER_DB_PATH = previous_marker_path
     events = tuple(model.events)
     return CaseResult(
         case_id=case.case_id,

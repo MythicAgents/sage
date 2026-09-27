@@ -51,6 +51,7 @@ from .operation_memory import WatcherOwnerConflict
 from .session import (
     bind_channel_thread_id,
     channel_session_key,
+    claim_channel_marker,
     drop_channel_session,
     get_channel_session,
     put_channel_session,
@@ -64,6 +65,9 @@ from .watcher_graph import build_watcher_graph, render_watcher_explanation
 _CHANNEL_METADATA_HEARTBEAT_SECONDS = 2.0
 _CHANNEL_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 _WATCHER_TURN_TASKS: dict[tuple[int, int], asyncio.Task[Any]] = {}
+# A new channel can receive /help or /mode before its first Model exists. This
+# process-local exception permits its first real prompt; a restart clears it.
+_NEW_CHANNEL_WITHOUT_SESSION: set[tuple[int, int]] = set()
 
 
 def _nonempty_native_response_text(value: Any) -> str:
@@ -72,6 +76,47 @@ def _nonempty_native_response_text(value: Any) -> str:
         return ""
     text = value if isinstance(value, str) else str(value)
     return text if text.strip() else ""
+
+
+def _channel_has_prior_context(request: ChatRequest) -> bool:
+    """Detect an existing native channel from Mythic's persisted message context.
+
+    The current operator message may itself be present in ``Context``. Only a different
+    persisted message proves that this is a continuation whose in-memory scope could
+    have been lost by a Sage restart. No inference is made from globally allocated
+    request/message numbers, which are shared across channels.
+    """
+    current_id = getattr(request, "RequestMessageID", None)
+    for message in getattr(request, "Context", ()) or ():
+        message_id = getattr(message, "ID", None)
+        if message_id and message_id != current_id:
+            return True
+    return False
+
+
+def _resource_budget_notice(error: BaseException) -> str:
+    """Distinguish a locally refused reservation from a provider connection failure.
+
+    OpenAI-compatible clients may wrap transport exceptions in ``APIConnectionError``.
+    Walk only the exception chain and match the concrete local budget class; arbitrary
+    error text mentioning a budget is not evidence of a local refusal.
+    """
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if (
+            type(current).__name__ == "ResourceBudgetExceeded"
+            and type(current).__module__.endswith("resource_budget")
+        ):
+            return "Sage's configured resource budget stopped this request."
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return ""
 
 
 def _with_task_provenance(model: Any, content: str) -> str:
@@ -749,6 +794,31 @@ class SageChat(Chat):
         async def _serialized_handler(turn) -> dict[str, Any] | None:
             model: Any | None = None
             native_response_text = ""
+            # A process restart clears the channel-keyed Model registry. Its scope,
+            # evidence selections, and turn authority are not reconstructed from chat
+            # prose. The marker in Sage's existing checkpoint DB catches a resumed
+            # channel even when Mythic omits Context; prior Context catches an old
+            # unmarked channel during rollout.
+            existing_at_entry = await get_channel_session(request)
+            first_channel_claim = await claim_channel_marker(request)
+            channel_identity = (int(request.OperationID), int(request.ChannelID))
+            slash_only_new_channel = channel_identity in _NEW_CHANNEL_WITHOUT_SESSION
+            if existing_at_entry is None and (
+                (not first_channel_claim and not slash_only_new_channel)
+                or (first_channel_claim and _channel_has_prior_context(request))
+            ):
+                await self.send_complete(
+                    request,
+                    turn.response_key,
+                    content=(
+                        "Sage restarted or this channel's session was replaced. Its prior "
+                        "scope and evidence are not restored. Start a new Sage chat and "
+                        "state the current scope and evidence before continuing. No tools "
+                        "were used for this request."
+                    ),
+                    complete_request=True,
+                )
+                return None
             # Slash commands dispatch first — they operate on the existing session (if any) and don't
             # need a fresh Model.initialize(). A handled command sends its own terminal → return None.
             # Unknown structured slash commands also terminate locally; control input is never
@@ -759,9 +829,27 @@ class SageChat(Chat):
                 if existing is not None:
                     await self._refresh_auth_context(existing, request)
                 if await handle_slash(self, request, existing, f"slash:{request.RequestID}"):
+                    if first_channel_claim and existing_at_entry is None:
+                        _NEW_CHANNEL_WITHOUT_SESSION.add(channel_identity)
                     return None
 
+            _NEW_CHANNEL_WITHOUT_SESSION.discard(channel_identity)
             model, preexisted = await self._get_or_create_model(request)
+            if existing_at_entry is not None and not preexisted:
+                # Config/auth rotation also loses the prior scope. A new Model may have
+                # initialized, but it must not consume this old channel's next prompt.
+                await drop_channel_session(request, expected_model=model)
+                await self.send_complete(
+                    request,
+                    turn.response_key,
+                    content=(
+                        "Sage replaced this channel's session. Its prior scope and evidence "
+                        "are not restored. Start a new Sage chat and state the current scope "
+                        "and evidence before continuing. No action was issued."
+                    ),
+                    complete_request=True,
+                )
+                return None
             thread_id = bind_channel_thread_id(request, model)
             has_input_response = getattr(request, "InputResponse", None) is not None
             controller_pending = isinstance(getattr(model, "_controller_hitl_pending", None), dict)
@@ -1122,7 +1210,11 @@ class SageChat(Chat):
                             str(getattr(error, "stop_detail", "") or ""),
                         ).strip()
                     else:
-                        error_text = operator_error_text(error) or "Sage request failed."
+                        error_text = (
+                            _resource_budget_notice(error)
+                            or operator_error_text(error)
+                            or "Sage request failed."
+                        )
                     error_text = _with_task_provenance(model, error_text)
                     preterminal = await finalize_visibility(require_final=False)
                     if not preterminal.get("ok", False):

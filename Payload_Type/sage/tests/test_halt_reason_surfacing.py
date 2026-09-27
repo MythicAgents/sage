@@ -44,9 +44,8 @@ class _Model:
 def _render(exc: BaseException) -> str:
     """Mirror of service.py's error branch.
 
-    This is a COPY of production logic, so on its own it proves only that the logic is right — not
-    that service.py runs it. `test_service_error_branch_actually_renders_the_halt_reason` below
-    pins the real call site so this mirror cannot drift away from it unnoticed.
+    This isolates the notice selection. The assembled SageChat error path is exercised in
+    test_sage_chat_scaffold.py, including the step-limit detail and generic-error fallback.
     """
 
     halt_reason = str(getattr(exc, "stop_reason", "") or "")
@@ -200,20 +199,3 @@ def test_no_step_limit_no_halt():
 
     mw = _StopCheckMiddleware(_Model(max_steps=20, step_count=18))
     assert mw.before_model(state={}, runtime=None) is None
-
-
-def test_service_error_branch_actually_renders_the_halt_reason():
-    """The mirror above is only worth something if production runs the same branch."""
-
-    from pathlib import Path
-
-    src = (
-        Path(__file__).resolve().parents[1] / "sage_chat" / "service.py"
-    ).read_text()
-
-    assert 'getattr(error, "stop_reason", "")' in src, (
-        "service.py no longer consults the halt reason; the mirror in this file is now fiction"
-    )
-    assert "stop_notice_for(" in src
-    # The fallback must survive for genuine crashes — it just must not be the only path.
-    assert 'operator_error_text(error) or "Sage request failed."' in src

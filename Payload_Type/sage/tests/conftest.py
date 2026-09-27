@@ -85,4 +85,10 @@ def _isolate_engagement_ledger(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("SAGE_ENGAGEMENT_STATE_DIR", str(tmp_path / "engagement"))
     monkeypatch.setenv("SAGE_TRAJECTORY_STORE", str(tmp_path / "trajectory" / "transitions.jsonl"))
+    # Native chat marks first-seen channels in Sage's runtime SQLite file. Test
+    # channel IDs are reused across modules; never let one test's marker make
+    # another test appear to be a resumed production channel.
+    from sage_chat import session as chat_session
+
+    monkeypatch.setattr(chat_session, "_CHANNEL_MARKER_DB_PATH", str(tmp_path / "sage.db"))
     yield
