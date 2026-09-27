@@ -1273,6 +1273,7 @@ STOP_REASON_RESUME_REFUSED = "resume_refused"
 # A graph/runtime exception also tears the lifecycle down. Its status is `error`, so this wording is
 # not normally emitted, but the flag must still carry the truth rather than inheriting "operator".
 STOP_REASON_RUNTIME_ERROR = "runtime_error"
+STOP_REASON_PROVIDER_FILTER = "provider_filter"
 # Default for callers that do not state their intent. A new caller that forgets to pass a reason
 # degrades to neutral wording rather than silently blaming the operator. Callers that genuinely ARE
 # the operator (request_stop_for_sessions, the /stop slash command) pass STOP_REASON_OPERATOR explicitly.
@@ -1311,6 +1312,11 @@ _STOP_NOTICE_BY_REASON = {
     STOP_REASON_RUNTIME_ERROR: (
         "\n🛑 **Session ended on an internal error.** This was a fault in Sage, not something you did. "
         "The request's error output has the detail.\n"
+    ),
+    STOP_REASON_PROVIDER_FILTER: (
+        "\n🛑 **Model response filtered.** The model route reported `content_filter`, so Sage "
+        "stopped this request without treating the filtered response as a completed answer. "
+        "Any work shown above already happened.\n"
     ),
     STOP_REASON_UNSPECIFIED: "\n🛑 Session halted.\n",
     # Self-contained for the same reason as the no-progress notice: the halt ends the graph, so this
@@ -1402,6 +1408,15 @@ class _OperatorStopRequested(Exception):
         self.stop_detail = str(detail or "")
 
 
+class _ProviderFilteredResponse(Exception):
+    """An explicit provider filter is a terminal result, not an empty worker answer."""
+
+    stop_reason = STOP_REASON_PROVIDER_FILTER
+
+    def __init__(self):
+        super().__init__("Model response filtered by the provider route (content_filter).")
+
+
 class _ControllerHitlPause(BaseException):
     """Escape the controller loop without classifying a pending approval as a capability failure.
 
@@ -1416,12 +1431,14 @@ class _ControllerHitlPause(BaseException):
 #:
 #: LangGraph's runner already keeps `GraphBubbleUp` subclasses away from error handlers, which covers
 #: HITL interrupts and `ParentCommand`; `_ControllerHitlPause` is a `BaseException` and is likewise
-#: never caught by the runner's `except Exception`. These three are NOT covered by either mechanism:
+#: never caught by the runner's `except Exception`. The exceptions below are not covered by either mechanism:
 #: `_OperatorStopRequested` is a plain Exception, `GraphRecursionError` has a dedicated summary path
 #: in `invoke()`, and `NodeCancelledError` is what LangGraph converts a node-raised
-#: `asyncio.CancelledError` into. Absorbing the first would disable the operator kill-switch.
+#: `asyncio.CancelledError` into. Absorbing the first would disable the operator kill-switch;
+#: absorbing `_ProviderFilteredResponse` would redelegate a provider-blocked request.
 _NODE_FAILURE_CONTROL_EXCEPTIONS = (
     _OperatorStopRequested,
+    _ProviderFilteredResponse,
     GraphRecursionError,
     NodeCancelledError,
 )
@@ -1485,6 +1502,37 @@ class _StopCheckMiddleware(AgentMiddleware):
         if getattr(self._model, "_stop_requested", False):
             raise self._halt()
         return handler(request)
+
+
+class _ProviderFilterMiddleware(AgentMiddleware):
+    """Stop on the provider's typed filter status before create_agent handles the reply.
+
+    This is the outermost model wrapper so inner optional injections cannot catch this
+    exception and retry a response that the provider has already filtered.
+    """
+
+    @staticmethod
+    def _check(response: Any) -> Any:
+        for message in getattr(response, "result", ()) or ():
+            if _is_provider_filtered_message(message):
+                raise _ProviderFilteredResponse()
+        return response
+
+    def wrap_model_call(self, request, handler):
+        return self._check(handler(request))
+
+    async def awrap_model_call(self, request, handler):
+        return self._check(await handler(request))
+
+
+def _is_provider_filtered_message(message: Any) -> bool:
+    """Read only the provider's explicit metadata status, never response prose."""
+    metadata = getattr(message, "response_metadata", None)
+    return isinstance(metadata, dict) and any(
+        isinstance(metadata.get(key), str)
+        and metadata[key].strip().casefold() == "content_filter"
+        for key in ("finish_reason", "stop_reason")
+    )
 
 
 class _TurnAuthorityToolMiddleware(AgentMiddleware):
@@ -3812,6 +3860,11 @@ class MessageCaptureCallback(AsyncCallbackHandler):
                     if isinstance(generation, ChatGeneration) and hasattr(generation, 'message') and generation.message:
                         msg = generation.message
                         if isinstance(msg, AIMessage):
+                            # LangChain calls on_llm_end before model middleware receives
+                            # the response. A filtered message must not stream text or
+                            # open a tool card during that gap.
+                            if _is_provider_filtered_message(msg):
+                                continue
                             # Tag with agent name for display
                             msg.name = self.agent_name
                             self.captured_messages.append(msg)
@@ -10857,8 +10910,9 @@ class Model:
         # on-demand PARAMETER schema from being re-fetched.
         _STATIC_SCHEMA_TOOLS = ("get_all_commands_for_payloadtype",)
         mw = [
+            _ProviderFilterMiddleware(),
             # Kill-switch honored INSIDE each agent loop (not just at top-level handoffs) — see
-            # _StopCheckMiddleware / task-626. Listed first so it gates before the model call.
+            # _StopCheckMiddleware / task-626. Its before_model hook gates the model call.
             _StopCheckMiddleware(self),
             # Cap oversized tool results BEFORE the context-editing size trigger evaluates them,
             # at the awrap_tool_call seam that provably fires (unlike the v1 tool wrapper).
@@ -12701,6 +12755,10 @@ Be specific and accurate (3-5 bullet points). Only summarize YOUR OWN actions ba
             logger.info(f"Returning recursion summary with continuation prompt")
             return ""  # All output already streamed to Mythic
 
+        except _ProviderFilteredResponse:
+            # The native service closes request/delegation lifecycles and reports the
+            # provider-filter notice as a terminal error. Do not synthesize an answer.
+            raise
         except Exception as e:
             # Catch any other errors (API errors, context limit exceeded, etc.)
             logger.error(f"Error during graph execution: {e}", exc_info=True)
