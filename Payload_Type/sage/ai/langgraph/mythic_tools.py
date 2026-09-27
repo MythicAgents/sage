@@ -3,6 +3,7 @@ import os
 import asyncio
 import contextlib
 import contextvars
+import functools
 import inspect
 from pathlib import Path
 import sys
@@ -129,6 +130,10 @@ async def _graph_heartbeat(interval: int | None = None):
             pass
 _task_visibility_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sage_mythic_task_visibility_context",
+    default=None,
+)
+_task_issuance_receipt_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sage_mythic_task_issuance_receipt_context",
     default=None,
 )
 _POLICY_EVIDENCE_FIELDS = (
@@ -3517,6 +3522,26 @@ class MythicTools:
             if hasattr(self, method_name):
                 method = getattr(self, method_name)
                 if asyncio.iscoroutinefunction(method):
+                    if method_name == "issue_task_and_waitfor_task_output":
+                        @functools.wraps(method)
+                        async def _registered_issue_task(*args, __method=method, **kwargs):
+                            receipt: dict = {}
+                            token = _task_issuance_receipt_context.set(receipt)
+                            try:
+                                result = await __method(*args, **kwargs)
+                                task_id = receipt.get("task_id")
+                                if type(task_id) is int and task_id > 0:
+                                    return (
+                                        "[Mythic task issuance identity] "
+                                        f"task_display_id={task_id} "
+                                        f"callback_display_id={receipt.get('callback_id')} "
+                                        f"requested_command={receipt.get('command')}\n\n{result}"
+                                    )
+                                return result
+                            finally:
+                                _task_issuance_receipt_context.reset(token)
+
+                        method = _registered_issue_task
                     tools.append(StructuredTool.from_function(
                         coroutine=method,
                         name=method_name,
@@ -5488,6 +5513,19 @@ class MythicTools:
                                 "own defaults instead of failing to parse an empty string (ISC-65)"
                             )
                             parameters = "{}"
+                    # Bind observer facts before the asynchronous issue/wait. A later
+                    # request must not inherit an old task's approval or outcome.
+                    execution_request_id = self._current_request_id()
+                    execution_contract_digest = str(getattr(
+                        getattr(self, "_request_contract", None), "digest", "") or "")
+                    execution_claim = getattr(self, "_active_approval_claim", None)
+                    execution_approval_id = (
+                        str(execution_claim.get("approval_id") or "")
+                        if isinstance(execution_claim, dict)
+                        and execution_claim.get("request_id") == execution_request_id
+                        and execution_claim.get("request_contract_digest") == execution_contract_digest
+                        else ""
+                    )
                     try:
                         task = await self._issue_mythic_task(
                             command, parameters, callback_display_id, timeout=timeout,
@@ -5539,6 +5577,13 @@ class MythicTools:
                     tdid = task.get("display_id") if isinstance(task, dict) else None
                     if tdid is None:
                         raise Exception("Failed to create task")
+                    issuance_receipt = _task_issuance_receipt_context.get()
+                    if isinstance(issuance_receipt, dict):
+                        issuance_receipt.update({
+                            "task_id": tdid,
+                            "callback_id": callback_display_id,
+                            "command": command,
+                        })
                     self._last_issued_task_display_id = tdid
                     # ISC-71: task creation is the lineage boundary. Record before waiting so a timeout,
                     # subscription failure, or failed command cannot make an accepted Mythic task look manual.
@@ -5558,6 +5603,11 @@ class MythicTools:
                     base_event = {
                         "event_id": event_id,
                         "source": "mythic",
+                        "request_id": execution_request_id,
+                        "request_contract_digest": execution_contract_digest,
+                        "approval_id": execution_approval_id,
+                        "task_completed": None,
+                        "task_status": "",
                         "tool_name": command,
                         "callback_id": callback_display_id,
                         "task_id": tdid,
@@ -5608,8 +5658,15 @@ class MythicTools:
                         success=result_class == command_builder.ResultClass.SUCCESS.value,
                         status=self._last_issued_task_terminal_status,
                     )
+                    # The SDK can return partial output after a subscription timeout.
+                    # Output classification alone therefore cannot prove completion.
+                    task_state = (
+                        await self._supervised_task_state(tdid, callback_display_id, command)
+                        if execution_approval_id else {}
+                    )
                     await self._notify_execution_observer({
                         **base_event,
+                        **task_state,
                         "status": (
                             "completed"
                             if result_class == command_builder.ResultClass.SUCCESS.value
@@ -16732,6 +16789,12 @@ class MythicTools:
             resp = await mythic.get_all_task_output_by_id(
                 mythic=self.client,
                 task_display_id=exact_task_id,
+                # Preserve source identity in the existing output read, including for historical
+                # tasks from another callback. Command parameters are deliberately not fetched.
+                custom_return_attributes=(
+                    "id timestamp response_text task { id display_id status completed "
+                    "agent_task_id command_name timestamp callback { display_id } }"
+                ),
             )
             resp = copy.deepcopy(resp)
 
@@ -16786,6 +16849,40 @@ class MythicTools:
             },
             sort_keys=True,
         )
+
+    async def _supervised_task_state(
+        self, task_display_id: int, callback_display_id: int, command: str,
+    ) -> dict[str, Any]:
+        """Observe one issued task's state; missing or mismatched metadata stays unknown."""
+        unknown = {"task_completed": None, "task_status": ""}
+        task_id = self._exact_task_display_id(task_display_id)
+        callback_id = self._exact_task_display_id(callback_display_id)
+        if self.client is None or task_id is None or callback_id is None:
+            return unknown
+        try:
+            result = await asyncio.wait_for(mythic.execute_custom_query(
+                self.client,
+                "query supervisedTaskState($id:Int!){ task(where:{display_id:{_eq:$id}}){ "
+                "display_id completed status command_name callback { display_id } } }",
+                variables={"id": task_id},
+            ), timeout=5.0)
+            rows = result.get("task", []) if isinstance(result, dict) else []
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                return unknown
+            row = rows[0]
+            callback = row.get("callback")
+            if (
+                self._exact_task_display_id(row.get("display_id")) != task_id
+                or not isinstance(callback, dict)
+                or self._exact_task_display_id(callback.get("display_id")) != callback_id
+                or row.get("command_name") != command
+                or type(row.get("completed")) is not bool
+            ):
+                return unknown
+            return {"task_completed": row["completed"],
+                    "task_status": str(row.get("status") or "")[:80]}
+        except Exception:
+            return unknown
 
     async def _is_task_completed(self, task_display_id: int) -> bool:
         """True if the Mythic task is in a terminal (completed) state — gates completed-task output caching."""

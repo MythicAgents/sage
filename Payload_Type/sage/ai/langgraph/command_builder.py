@@ -71,12 +71,9 @@ _TRANSIENT_SIGNATURES = (
     "no output",
 )
 
-_GENERIC_ERROR_HINTS = (
-    "error",
-    "failed",
-    "failure",
-    "exception",
-    "traceback",
+_GENERIC_ERROR_HINT_RE = re.compile(
+    r"(?<!\w)(?:error(?:_(?!control\b)[a-z0-9_]+)?|failed|failure|exception|traceback)\b",
+    re.IGNORECASE,
 )
 
 _SHARPHOUND_COMMAND_SELECTORS = {
@@ -149,7 +146,7 @@ def classify_result(command: str, output: str, exception: str | None = None, par
         sharphound_completion = _sharphound_completion_override(command, output, parameters)
         if sharphound_completion is not None:
             return ResultClass.SUCCESS.value if sharphound_completion else ResultClass.TRANSIENT.value
-        if any(signature in low for signature in _GENERIC_ERROR_HINTS):
+        if _GENERIC_ERROR_HINT_RE.search(low):
             return ResultClass.TRANSIENT.value
         return ResultClass.SUCCESS.value
     except Exception:
