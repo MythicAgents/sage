@@ -37,6 +37,72 @@ def test_find_active_interactive_session_matches_only_active_named_user():
     }
 
 
+def test_wait_for_active_interactive_session_preserves_active_named_user(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": (
+                " localuser             console             1  Active      none   now\r\n"
+                " samwell.tarly         rdp-tcp#4           4  Active          .  now\r\n"
+            ),
+            "status_code": 0,
+        },
+    )
+
+    result = deploy.wait_for_active_interactive_session(
+        object(), r"NORTH\samwell.tarly", timeout_seconds=0, poll_interval=0.25
+    )
+
+    assert result["session_id"] == "4"
+
+
+def test_wait_for_active_interactive_session_rejects_unavailable_census(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": "Access is denied.", "status_code": 5},
+    )
+
+    with pytest.raises(deploy.DeployError, match="Could not enumerate Windows sessions") as exc:
+        deploy.wait_for_active_interactive_session(
+            object(), r"NORTH\samwell.tarly", timeout_seconds=0, poll_interval=0.25
+        )
+
+    assert "Access is denied" not in str(exc.value)
+
+
+def test_wait_for_active_interactive_session_reports_genuine_empty_census(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": "quser : No User exists for *", "status_code": 1},
+    )
+
+    with pytest.raises(deploy.DeployError, match="No Windows user sessions are available yet"):
+        deploy.wait_for_active_interactive_session(
+            object(), r"NORTH\samwell.tarly", timeout_seconds=0, poll_interval=0.25
+        )
+
+
+def test_wait_for_active_interactive_session_reports_inactive_near_match_without_rows(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": " samwell.tarly                             3  Disc           10  now\r\n",
+            "status_code": 0,
+        },
+    )
+
+    with pytest.raises(deploy.DeployError, match="matching user sessions: 1") as exc:
+        deploy.wait_for_active_interactive_session(
+            object(), r"NORTH\samwell.tarly", timeout_seconds=0, poll_interval=0.25
+        )
+
+    assert "samwell.tarly                             3" not in str(exc.value)
+
+
 def test_find_user_sessions_matches_named_user_in_any_state():
     output = (
         " USERNAME              SESSIONNAME        ID  STATE   IDLE TIME  LOGON TIME\r\n"
@@ -86,10 +152,13 @@ def test_logoff_user_sessions_only_logs_off_named_user(monkeypatch):
         },
     )
 
-    result = deploy.logoff_user_sessions(object(), "localuser")
+    result = deploy.logoff_user_sessions(
+        object(), "localuser", allow_already_absent=True
+    )
 
     assert [row["session_id"] for row in result["logged_off"]] == ["1"]
     assert result["remaining"] == []
+    assert result["already_absent"] is False
     assert len(scripts) == 1
     assert "logoff.exe" in scripts[0]
     assert "'1'" in scripts[0]
@@ -160,6 +229,68 @@ def test_logoff_user_sessions_rejects_zero_match_without_touching_other_users(mo
         deploy.logoff_user_sessions(object(), "localuser")
 
     assert scripts == []
+
+
+def test_logoff_user_sessions_allows_verified_absence_without_touching_other_users(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {
+            "output": " robb.stark            rdp-tcp#1           3  Active          .  now\r\n",
+            "status_code": 0,
+        },
+    )
+    monkeypatch.setattr(deploy, "run_ps", lambda session, script: scripts.append(script))
+
+    result = deploy.logoff_user_sessions(
+        object(), "localuser", allow_already_absent=True
+    )
+
+    assert result["already_absent"] is True
+    assert result["logged_off"] == []
+    assert scripts == []
+
+
+def test_logoff_user_sessions_allows_recognized_empty_census(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": "quser : No User exists for *", "status_code": 1},
+    )
+
+    result = deploy.logoff_user_sessions(
+        object(), "localuser", allow_already_absent=True
+    )
+
+    assert result["already_absent"] is True
+    assert result["logged_off"] == []
+
+
+def test_logoff_user_sessions_allow_absent_rejects_ambiguous_named_row(monkeypatch):
+    scripts = []
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": " localuser unknown output", "status_code": 0},
+    )
+    monkeypatch.setattr(deploy, "run_ps", lambda session, script: scripts.append(script))
+
+    with pytest.raises(deploy.DeployError, match="ambiguous named row"):
+        deploy.logoff_user_sessions(object(), "localuser", allow_already_absent=True)
+
+    assert scripts == []
+
+
+def test_logoff_user_sessions_allow_absent_rejects_enumeration_error(monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "query_user_sessions",
+        lambda session: {"output": "Access is denied.", "status_code": 1},
+    )
+
+    with pytest.raises(deploy.DeployError, match="Could not enumerate Windows sessions"):
+        deploy.logoff_user_sessions(object(), "localuser", allow_already_absent=True)
 
 
 def test_logoff_user_sessions_accepts_verified_empty_after_exact_logoff(monkeypatch):

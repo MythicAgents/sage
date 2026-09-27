@@ -23,8 +23,56 @@ from __future__ import annotations
 import argparse
 import os
 import pty
+import signal
 import sys
+import time
 from pathlib import Path
+
+
+_CLEANUP_GRACE_SECONDS = 0.25
+
+
+class _TerminationSignal(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def _cleanup_pty_group(pid: int) -> int | None:
+    status = None
+    reaped = False
+    try:
+        waited, child_status = os.waitpid(pid, os.WNOHANG)
+        if waited:
+            status, reaped = child_status, True
+    except ChildProcessError:
+        reaped = True
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + _CLEANUP_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            waited_now, child_status = os.waitpid(pid, os.WNOHANG)
+            if waited_now:
+                status, reaped = child_status, True
+        except ChildProcessError:
+            pass
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if not reaped:
+        try:
+            _waited, status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    return status
 
 
 def _resolve_password(explicit: str | None, env_path: str | None) -> str:
@@ -109,19 +157,39 @@ def main() -> int:
         os.execvp(argv[0], argv)
         os._exit(127)
 
-    # parent: drain the pty to the log and stay alive so the RDP session persists while
-    # launch-existing starts the scheduled task in it.
-    with open(args.log, "wb", buffering=0) as logf:
-        logf.write(f"# open_rdp_session -> {user}@{domain or '(no-domain)'} on {args.target_ip} (DISPLAY={args.display})\n".encode())
-        while True:
-            try:
-                data = os.read(fd, 4096)
-            except OSError:
-                break
-            if not data:
-                break
-            logf.write(data)
-    _, status = os.waitpid(pid, 0)
+    def handle_signal(caught: int, _frame) -> None:
+        raise _TerminationSignal(caught)
+    prior_handlers = {
+        signum: signal.signal(signum, handle_signal) for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+    terminating = None
+    status = None
+    try:
+        # parent: drain the pty to the log and stay alive while launch-existing runs.
+        with open(args.log, "wb", buffering=0) as logf:
+            logf.write(f"# open_rdp_session -> {user}@{domain or '(no-domain)'} on {args.target_ip} (DISPLAY={args.display})\n".encode())
+            while True:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                logf.write(data)
+    except _TerminationSignal as caught:
+        terminating = caught.signum
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        status = _cleanup_pty_group(pid)
+        for signum, handler in prior_handlers.items():
+            signal.signal(signum, handler)
+    if terminating is not None:
+        return 128 + terminating
+    if status is None:
+        return 1
     return os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
 
 

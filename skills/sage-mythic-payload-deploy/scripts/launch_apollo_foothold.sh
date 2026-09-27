@@ -24,6 +24,17 @@ RUN_AS="${2:-NORTH\\samwell.tarly}"
 shift $(( $# >= 2 ? 2 : $# )) || true
 [ "${1:-}" = "--" ] && shift || true
 
+# The canonical launcher relies on Mythic's operator configuration later in launch-existing.
+# Fail locally before any target-facing helper when that explicit discovery binding is unusable.
+if [ -z "${MYTHIC_ENV_PATH:-}" ]; then
+  echo "launch_apollo_foothold: MYTHIC_ENV_PATH must name a readable regular file" >&2
+  exit 2
+fi
+if [ ! -f "$MYTHIC_ENV_PATH" ] || [ ! -r "$MYTHIC_ENV_PATH" ]; then
+  echo "launch_apollo_foothold: MYTHIC_ENV_PATH must name a readable regular file" >&2
+  exit 2
+fi
+
 # The retained-launch arguments also carry the target host selector. Reuse it for the
 # pre-RDP localuser logoff instead of letting that helper fall back to CASTELBLACK.
 TARGET_HOST="CASTELBLACK"
@@ -85,6 +96,7 @@ fi
 # Resolve the run-as password durably and export it so BOTH the RDP opener and launch-existing see it.
 if [ -z "${SAGE_RUN_AS_PASSWORD:-}" ]; then
   for f in \
+    "$REPO/skills/sage-foothold-launch/.env" \
     "${SAGE_RUNAS_FILE:-}" \
     "$HOME/.config/sage/runas.env" \
     "$REPO/Payload_Type/sage/.env" \
@@ -105,7 +117,8 @@ fi
 LOGOFF_LOG=/tmp/sage_localuser_logoff.log
 for attempt in $(seq 1 30); do
   if "$REPO/.venv/bin/python" "$HERE/deploy_payload_via_ludus.py" logoff-user \
-      --target-host "$TARGET_HOST" --target-ip "$TARGET_IP" --username localuser >"$LOGOFF_LOG" 2>&1; then
+      --target-host "$TARGET_HOST" --target-ip "$TARGET_IP" --username localuser \
+      --allow-already-absent >"$LOGOFF_LOG" 2>&1; then
     echo "Apollo foothold: localuser session cleared"
     break
   fi

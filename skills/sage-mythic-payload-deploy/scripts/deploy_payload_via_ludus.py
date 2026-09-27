@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -118,6 +119,41 @@ query DeployCredentials {
 
 class DeployError(RuntimeError):
     """Expected operational failure with a concise message."""
+
+
+def configured_resource_ledger() -> Any:
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+
+    ledger = resource_budget.configured_ledger()
+    if ledger is not None:
+        from ai import resource_clients
+        resource_clients.install()
+    return ledger
+
+
+def reserve_effect(amounts: dict[str, int], operation: str) -> None:
+    ledger = configured_resource_ledger()
+    if ledger is not None:
+        ledger.reserve(amounts, operation)
+
+
+def metered_ludus_urlopen(request: Any, *, timeout: float, context: ssl.SSLContext) -> Any:
+    ledger = configured_resource_ledger()
+    if ledger is None:
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+    path = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py"
+    spec = importlib.util.spec_from_file_location("sage_payload_deploy_ludus_meter", path)
+    if spec is None or spec.loader is None:
+        raise DeployError("could not load maintained Ludus meter")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._metered_urlopen(
+        request, timeout=timeout, context=context, ledger=ledger,
+        operation="ludus-control-request",
+    )
 
 
 class QuietHTTPRequestHandler(SimpleHTTPRequestHandler):
@@ -394,7 +430,7 @@ def ludus_get(
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(request, timeout=30, context=ctx) as response:
+        with metered_ludus_urlopen(request, timeout=30, context=ctx) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")[:500]
@@ -539,6 +575,7 @@ def decode_stream(value: bytes | str | None) -> str:
 
 
 def winrm_session(host: dict[str, Any], operation_timeout_sec: int, read_timeout_sec: int) -> Any:
+    configured_resource_ledger()
     import winrm
 
     ansible_host = host.get("ansible_host")
@@ -558,6 +595,9 @@ def winrm_session(host: dict[str, Any], operation_timeout_sec: int, read_timeout
 
 
 def run_ps(session: Any, script: str, *, check: bool = True) -> dict[str, Any]:
+    ledger = configured_resource_ledger()
+    if ledger is not None:
+        ledger.reserve({"guest_commands": 1}, "guest-command-run-ps")
     result = session.run_ps(script)
     stdout = decode_stream(result.std_out)
     stderr = decode_stream(result.std_err)
@@ -646,6 +686,7 @@ $ErrorActionPreference = 'Stop'
 $p = Start-Process -FilePath {ps_quote(remote_path)} -WindowStyle Hidden -PassThru
 [PSCustomObject]@{{ Method = 'current-user'; ProcessId = $p.Id; HasExited = $p.HasExited }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     return parse_json_object(result["stdout"]) or result
 
@@ -658,6 +699,7 @@ $cred = New-Object System.Management.Automation.PSCredential({ps_quote(run_as_us
 $p = Start-Process -FilePath {ps_quote(remote_path)} -Credential $cred -WindowStyle Hidden -PassThru
 [PSCustomObject]@{{ Method = 'start-process-credential'; ProcessId = $p.Id; HasExited = $p.HasExited }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     return parse_json_object(result["stdout"]) or result
 
@@ -686,6 +728,7 @@ Start-Sleep -Seconds 2
 $query = & schtasks.exe /Query /TN $taskName /V /FO LIST 2>&1 | Out-String
 [PSCustomObject]@{{ Method = 'scheduled-task'; TaskName = $taskName; Create = $create.Trim(); Run = $run.Trim(); Query = $query.Trim() }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     return parse_json_object(result["stdout"]) or result
 
@@ -720,6 +763,7 @@ $registered = Get-ScheduledTask -TaskName $taskName
   NextRunTime = $info.NextRunTime
 }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     return parse_json_object(result["stdout"]) or result
 
@@ -788,11 +832,22 @@ def classify_user_session_query(result: dict[str, Any]) -> str:
     return "error"
 
 
-def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
+def logoff_user_sessions(
+    session: Any, username: str, *, allow_already_absent: bool = False
+) -> dict[str, Any]:
     """Log off only sessions owned by username and report the before/after rows."""
     before = query_user_sessions(session)
     before_state = classify_user_session_query(before)
     if before_state == "empty":
+        if allow_already_absent:
+            return {
+                "username": username,
+                "logged_off": [],
+                "remaining": [],
+                "before_state": before_state,
+                "after_state": before_state,
+                "already_absent": True,
+            }
         raise DeployError(
             f"No Windows user sessions are available yet; expected a session owned by {username!r}."
         )
@@ -802,7 +857,31 @@ def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
             f"(status {before.get('status_code')!r})."
         )
     matches = find_user_sessions(before.get("output", ""), username)
+    short_user = run_as_short_user(username).casefold()
+    parsed_named_rows = {row["line"] for row in matches}
+    ambiguous_named_rows = [
+        line
+        for raw_line in str(before.get("output") or "").splitlines()
+        if (line := raw_line.lstrip(">").strip())
+        and not line.casefold().startswith("username")
+        and line.split()[0].casefold() == short_user
+        and line not in parsed_named_rows
+    ]
+    if ambiguous_named_rows:
+        raise DeployError(
+            f"Could not reliably parse the Windows session census for {username!r}; "
+            "refusing to treat an ambiguous named row as absence."
+        )
     if not matches:
+        if allow_already_absent:
+            return {
+                "username": username,
+                "logged_off": [],
+                "remaining": [],
+                "before_state": before_state,
+                "after_state": before_state,
+                "already_absent": True,
+            }
         raise DeployError(
             f"No session owned by {username!r} was found; refusing to report cleanup success."
         )
@@ -833,6 +912,7 @@ def logoff_user_sessions(session: Any, username: str) -> dict[str, Any]:
         "remaining": remaining,
         "before_state": before_state,
         "after_state": after_state,
+        "already_absent": False,
     }
 
 
@@ -845,9 +925,19 @@ def wait_for_active_interactive_session(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(0, timeout_seconds)
     latest = {"output": "", "status_code": None}
+    census_state = "error"
+    matching_user_sessions = 0
     while True:
         latest = query_user_sessions(session)
-        match = find_active_interactive_session(latest.get("output", ""), run_as_user)
+        census_state = classify_user_session_query(latest)
+        if census_state == "error":
+            raise DeployError(
+                f"Could not enumerate Windows sessions while waiting for {run_as_user!r} "
+                f"(status {latest.get('status_code')!r})."
+            )
+        output = latest.get("output", "")
+        matching_user_sessions = len(find_user_sessions(output, run_as_user))
+        match = find_active_interactive_session(output, run_as_user)
         if match:
             return {
                 "run_as_user": run_as_user,
@@ -857,10 +947,17 @@ def wait_for_active_interactive_session(
                 "quser_output": latest["output"],
             }
         if time.monotonic() >= deadline:
+            if census_state == "empty":
+                raise DeployError(
+                    f"No Windows user sessions are available yet; expected an active session "
+                    f"for {run_as_user!r} within {timeout_seconds}s. Last census status "
+                    f"{latest.get('status_code')!r}; matching user sessions: 0."
+                )
             raise DeployError(
                 f"No active interactive session found for {run_as_user!r} within {timeout_seconds}s. "
                 f"Open and keep an RDP session active before using scheduled-task-interactive. "
-                f"Last quser output: {latest.get('output')!r}"
+                f"Last census status {latest.get('status_code')!r}; matching user sessions: "
+                f"{matching_user_sessions}."
             )
         time.sleep(max(0.25, poll_interval))
 
@@ -895,6 +992,7 @@ $registered = Get-ScheduledTask -TaskName $taskName
   NextRunTime = $info.NextRunTime
 }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     return parse_json_object(result["stdout"]) or result
 
@@ -974,6 +1072,7 @@ $task = Get-ScheduledTask -TaskName $taskName
   LastRunTime = $info.LastRunTime
 }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = parse_json_object(run_ps(session, launch_script)["stdout"]) or {}
     result["prelaunch"] = prelaunch
     result["interactive_session"] = session_info
@@ -1110,6 +1209,7 @@ $stderr = Get-Content -LiteralPath "$env:TEMP\\sage_rubeus_err.txt" -Raw -ErrorA
   Stderr = $stderr
 }} | ConvertTo-Json -Compress
 """
+    reserve_effect({"callback_launches": 1}, "callback-launch")
     result = run_ps(session, script)
     parsed = parse_json_object(result["stdout"]) or result
     if "Stdout" in parsed:
@@ -1592,7 +1692,9 @@ async def command_logoff_user(args: argparse.Namespace) -> None:
         args.winrm_operation_timeout_seconds,
         args.winrm_read_timeout_seconds,
     )
-    result = logoff_user_sessions(session, args.username)
+    result = logoff_user_sessions(
+        session, args.username, allow_already_absent=args.allow_already_absent
+    )
     result["target"] = {
         "inventory_hostname": host.get("inventory_hostname"),
         "ansible_host": host.get("ansible_host"),
@@ -1771,6 +1873,11 @@ def build_parser() -> argparse.ArgumentParser:
     logoff_parser.add_argument("--target-host", default="CASTELBLACK")
     logoff_parser.add_argument("--target-ip", default=None)
     logoff_parser.add_argument("--username", default="localuser")
+    logoff_parser.add_argument(
+        "--allow-already-absent",
+        action="store_true",
+        help="Succeed only when a valid session census confirms that the named user is absent.",
+    )
     logoff_parser.add_argument("--winrm-operation-timeout-seconds", type=int, default=45)
     logoff_parser.add_argument("--winrm-read-timeout-seconds", type=int, default=75)
     logoff_parser.set_defaults(func=command_logoff_user)
