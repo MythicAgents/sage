@@ -63,6 +63,12 @@ On the first tool-using turn of a session, print exactly one line: `CANARY: AGEN
 - External dependency paths must be explicitly configured, never guessed from sibling checkout names.
   `MYTHIC_ENV_PATH` and `MYTHIC_CLI` must identify the same install; `SAGE_BLOODHOUND_MCP_DIR` identifies
   BloodHound's integration. Missing configuration fails closed naming the variable to set.
+- For standalone HTTPS clients or a TLS connection failure, inspect Sage's existing
+  `Payload_Type/sage/ssl_bootstrap.py` and the optional `Payload_Type/sage/certs/bundle.pem` before changing
+  trust settings or blaming the endpoint. Reuse `configure_sage_ssl_cert_file`; clients that disable HTTPX
+  environment trust must pass the selected CA bundle in an explicit verified SSL context. Verify the connection
+  with that context. The bundle may be absent, in which case use normal platform trust; never disable TLS
+  verification to make a probe pass.
 - The repo-root `.env` is operator discovery only and is not auto-loaded. `Payload_Type/sage/.env` is tracked,
   ships commented out, and configures the deployed runtime. Existing environment wins; empty values set nothing.
   Do not commit real values or duplicate keys between these two scopes.
