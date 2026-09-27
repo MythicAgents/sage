@@ -9,6 +9,9 @@ import os
 from threading import Lock
 import time
 from typing import Any, Callable
+from uuid import uuid4
+
+from . import resource_budget
 
 
 TASK_LIMIT_ENV = "SAGE_EVAL_PAYLOAD_TASK_BUDGET"
@@ -94,6 +97,12 @@ class TaskBudget:
 _active: ContextVar[TaskBudget | None] = ContextVar("sage_task_budget", default=None)
 
 
+def _capture(payload: dict[str, Any]) -> None:
+    from . import observation_channel
+    if os.environ.get(observation_channel.ENV_NAME, ""):
+        observation_channel.emit("tool_event", payload)
+
+
 def configured_budget(wall_seconds: float, *, deadline_epoch: float | None = None) -> TaskBudget | None:
     raw = os.environ.get(TASK_LIMIT_ENV, "").strip()
     if not raw:
@@ -116,12 +125,23 @@ def task_budget_scope(budget: TaskBudget | None):
 
 
 def admit_task() -> float | None:
-    budget = _active.get()
-    if budget is not None:
-        return budget.admit()
-    elif os.environ.get(TASK_LIMIT_ENV, "").strip():
-        raise TaskBudgetExceeded("configured task budget has no active run scope")
-    return None
+    attempt_id = uuid4().hex
+    _capture({"event": "payload_task_admission_attempt", "attempt_id": attempt_id})
+    try:
+        budget = _active.get()
+        if budget is not None:
+            remaining = budget.admit()
+        elif os.environ.get(TASK_LIMIT_ENV, "").strip():
+            raise TaskBudgetExceeded("configured task budget has no active run scope")
+        else:
+            remaining = None
+        resource_budget.reserve_configured({"payload_task_attempts": 1}, "payload-task-attempt")
+    except BaseException as exc:
+        _capture({"event": "payload_task_admission_result", "attempt_id": attempt_id,
+                  "outcome": "denied_before_dispatch", "exception_type": type(exc).__name__})
+        raise
+    _capture({"event": "payload_task_admission_result", "attempt_id": attempt_id, "outcome": "admitted"})
+    return remaining
 
 
 def current_snapshot():
@@ -138,6 +158,7 @@ def record_task_id(task_id: int) -> None:
     budget = _active.get()
     if budget is not None:
         budget.record_task_id(task_id)
+    _capture({"event": "payload_task_identity_returned", "task_id": task_id})
 
 
 def record_task_result(task_id: int) -> None:

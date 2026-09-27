@@ -138,6 +138,10 @@ def terminal_cause(stopped: object, final_text: object = "", error: BaseExceptio
     if state == "error" and error is not None:
         cause = getattr(error, "termination_cause", None)
         subtype = getattr(error, "termination_subtype", None)
+        if subtype == "completed_response_boundary" and cause in {
+            "per_request_context_limit", "other_declared_boundary",
+        }:
+            return {"cause": cause, "subtype": subtype}
         if cause == "per_request_context_limit" and subtype in {
             "provider_typed_code", "local_pre_request_boundary",
         }:

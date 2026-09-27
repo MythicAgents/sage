@@ -267,6 +267,30 @@ def test_typed_context_limit_failure_is_reported_without_message_inference():
     }
 
 
+@pytest.mark.parametrize("reason,expected_cause", [
+    ("per_call_token_overrun", "per_request_context_limit"),
+    ("usage_unavailable", "other_declared_boundary"),
+])
+def test_completed_response_boundary_taxonomy_is_preserved(reason, expected_cause):
+    from ai.resource_http import ProviderResponseBoundaryError
+    result = br.BareModelRunner(
+        lambda *_args: (_ for _ in ()).throw(ProviderResponseBoundaryError(reason)),
+        lambda _call: pytest.fail("completed response dispatched an action"),
+    ).run("obj")
+    assert result.termination == {
+        "cause": expected_cause, "subtype": "completed_response_boundary",
+    }
+
+
+def test_exact_completed_response_without_boundary_can_dispatch_normally():
+    calls = []
+    result = br.BareModelRunner(
+        lambda *_args: {"tool": "x", "args": {}, "_usage": {"total_tokens": 32768}},
+        lambda call: calls.append(call) or "ok", max_steps=1,
+    ).run("obj")
+    assert len(calls) == 1 and result.stopped == "budget"
+
+
 @pytest.mark.parametrize(
     ("final", "subtype"),
     [("OBJECTIVE_MET", "objective_met"), ("STUCK", "stuck"), ("done", "other_final")],

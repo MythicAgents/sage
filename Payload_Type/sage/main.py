@@ -10,10 +10,38 @@ from ssl_bootstrap import configure_sage_ssl_cert_file
 
 _dotenv_applied = load_sage_dotenv()
 
+# Passive measurement must be active before control clients or telemetry start.
+_observation_capture = bool(os.environ.get("SAGE_OBSERVATION_DIRECTORY"))
+if _observation_capture:
+    from ai.observation_process import install as _install_observation_process
+    _install_observation_process()
+
+# Measurement is opt-in and installed before any control client starts.  Ordinary
+# startup neither imports nor patches the measurement client hooks.
+if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURCE_BUDGET_LEDGER"):
+    from ai.resource_clients import install as _install_resource_clients
+    from ai.resource_rpc import install as _install_resource_rpc
+    _install_resource_clients()
+    _install_resource_rpc()
+
 import mythic_container
 from mythic_container.logging import logger
 import sage_chat # Registers SageChat (native v4.0.0 chat container) via Chat.__subclasses__().
                  # Phase 4 complete: the PayloadType (`container`) has been removed — Sage is chat-only.
+if _observation_capture:
+    from ai.observation_channel import emit as _emit_observation
+    from sage_chat import findings_slack as _findings_slack
+    _effective_notification_webhook = os.environ.get(
+        _findings_slack.SLACK_FINDINGS_WEBHOOK_ENV, ""
+    ).strip()
+    _effective_notification_channel = os.environ.get(
+        _findings_slack.SLACK_FINDINGS_CHANNEL_ID_ENV, ""
+    ).strip()
+    _emit_observation("config_snapshot", {
+        "event": "effective_notification_config",
+        "webhook_present": bool(_effective_notification_webhook),
+        "channel_present": bool(_effective_notification_channel),
+    })
 import phoenix as px
 from phoenix.otel import register
 from openinference.instrumentation.langchain import LangChainInstrumentor
@@ -44,14 +72,49 @@ os.environ["PHOENIX_WORKING_DIR"] = str(_phoenix_working_dir)
 # during a context blowup — at the cost of truncated (not dropped) large inputs/outputs.
 os.environ.setdefault("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT", "131072")  # 128 KB per attribute value
 
-px.launch_app(use_temp_dir=False)
+if _observation_capture:
+    from ai.phoenix_process_compat import launch_capture_phoenix as _launch_capture_phoenix
+    _phoenix_session = _launch_capture_phoenix(px)
+    if _phoenix_session is None or _phoenix_session.active is not True:
+        raise RuntimeError("capture Phoenix process did not become active")
+else:
+    px.launch_app(use_temp_dir=False)
 
-# Initialize global LangChain instrumentation for Phoenix tracing
-tracer_provider = register(
-    project_name="Sage",
-    auto_instrument=False,  # We manually instrument LangChain below
-    batch=False,
-)
-LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+# Initialize global LangChain instrumentation for Phoenix tracing.  Captured
+# measurements construct the same Phoenix-selected transport, but every exported
+# span crosses the metadata-only boundary first.
+if _observation_capture:
+    from ai.observation_tracing import create_provider as _create_observation_provider
+    from openinference.instrumentation import TraceConfig as _TraceConfig
+    from opentelemetry import trace as _otel_trace
+    from phoenix.otel import SimpleSpanProcessor as _PhoenixSimpleSpanProcessor
+
+    _phoenix_transport = _PhoenixSimpleSpanProcessor()
+    tracer_provider = _create_observation_provider(_phoenix_transport.span_exporter)
+    _otel_trace.set_tracer_provider(tracer_provider)
+    _trace_config = _TraceConfig(
+        hide_inputs=True,
+        hide_outputs=True,
+        hide_llm_invocation_parameters=True,
+        hide_llm_tools=True,
+        hide_input_messages=True,
+        hide_output_messages=True,
+        hide_input_images=True,
+        hide_input_text=True,
+        hide_output_text=True,
+        hide_embedding_vectors=True,
+        hide_embeddings_vectors=True,
+        hide_embeddings_text=True,
+        hide_prompts=True,
+        hide_choices=True,
+    )
+    LangChainInstrumentor().instrument(tracer_provider=tracer_provider, config=_trace_config)
+else:
+    tracer_provider = register(
+        project_name="Sage",
+        auto_instrument=False,  # We manually instrument LangChain below
+        batch=False,
+    )
+    LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
 
 mythic_container.mythic_service.start_and_run_forever()
