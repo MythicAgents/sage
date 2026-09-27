@@ -1458,6 +1458,8 @@ def test_bounded_objective_final_sink_denies_disallowed_capability_context():
 
 
 def test_resolved_objective_contract_is_injected_exactly_and_ephemerally_for_each_agent_call():
+    from langchain.agents.middleware.types import ModelRequest
+
     model_mod = importlib.import_module("ai.langgraph.model")
     authority = _load_turn_authority().compile_turn_authority(
         "Complete the objective.",
@@ -1472,12 +1474,13 @@ def test_resolved_objective_contract_is_injected_exactly_and_ephemerally_for_eac
 
     for agent_name in ("Supervisor", "Mythic_Operator"):
         visible = [HumanMessage(content=f"operator-visible:{agent_name}")]
-        request = _FakeModelRequest(visible)
+        request = ModelRequest(model=None, messages=visible)
         augmented = middleware._augment(request)
 
         assert request.messages == visible
-        assert len(augmented.messages) == 2
-        assert augmented.messages[-1].content == rendered
+        assert augmented.messages == visible
+        assert request.system_message is None
+        assert rendered in augmented.system_message.content
         assert rendered not in request.messages[0].content
 
     compact = rendered[rendered.index("{"):]

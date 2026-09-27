@@ -153,6 +153,28 @@ def test_sanitize_preserves_assistant_message_behavior_unchanged():
     assert any(isinstance(x, AIMessage) and x.content == "did the thing" for x in out)
 
 
+def test_trailing_assistant_continuation_does_not_impersonate_operator_request():
+    m = _bare()
+    operator = HumanMessage(content="Report the completed task output.")
+    out = m._sanitize_messages([
+        SystemMessage(content="s"), operator, AIMessage(content="task result"),
+    ])
+
+    assert out[1] is operator
+    assert len(out) == 4
+    continuation = out[-1]
+    assert isinstance(continuation, HumanMessage)
+    assert continuation.additional_kwargs["_synthetic_nudge"] == "provider_requires_user_turn"
+    assert continuation.additional_kwargs["_hide_from_stream"] is True
+    assert "internal conversation continuation" in continuation.content.lower()
+    assert "decide your next action" not in continuation.content.lower()
+
+    explicit = HumanMessage(content="Decide your next action.")
+    explicit_out = m._sanitize_messages([SystemMessage(content="s"), explicit])
+    assert explicit_out[-1] is explicit
+    assert len(explicit_out) == 2
+
+
 def test_sanitize_strips_non_adjacent_tool_call_metadata():
     m = _bare()
     out = m._sanitize_messages([
