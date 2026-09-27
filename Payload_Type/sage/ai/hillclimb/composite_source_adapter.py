@@ -23,10 +23,21 @@ BUNDLE_SCHEMA = "composite-source-admission-bundle-v1"
 SUPPLEMENT_SCHEMA = "composite-source-evidence-v1"
 RESULT_SCHEMA = "composite-source-admission-result-v1"
 MECHANISM_ID = "composite-source-admission-v1"
+BUNDLE_SCHEMA_V2 = "composite-source-admission-bundle-v2"
+SUPPLEMENT_SCHEMA_V2 = "composite-source-evidence-v2"
+RESULT_SCHEMA_V2 = "composite-source-admission-result-v2"
+MECHANISM_ID_V2 = "composite-source-admission-v2"
 EPISODE_SCHEMA = "gate1p-stagea-episode-artifact-v17"
+CAPTURE_EPISODE_SCHEMA = "sage-measurement-capture-episode-v1"
+_CAPTURE_EPISODE_FIELDS = frozenset({
+    "event", "schema", "episode_id", "requested_identity", "native_solver_result", "raw_result",
+    "response_records", "scorecard", "proof_records", "oracle", "complete_inventory", "missing_facts",
+    "task_state_observation", "telemetry_validation_error",
+})
 
 _BUNDLE_FIELDS = frozenset({"schema", "episode", "evidence_supplement", "source_bindings", "identity"})
 _SUPPLEMENT_FIELDS = frozenset({"schema", "episode_source_ref", "claims", "typed_atoms"})
+_SUPPLEMENT_FIELDS_V2 = _SUPPLEMENT_FIELDS | {"mutation_atoms"}
 _BINDING_FIELDS = frozenset({"path", "source_version", "source_sha256"})
 _CLAIM_FIELDS = frozenset({"value", "locator"})
 _ROW_ID_FIELDS = frozenset({"row_id", "policy_arm", "surface_id", "family_id"})
@@ -79,10 +90,10 @@ def _slug(value: Any) -> str:
     return re.sub(r"[^a-z0-9_.-]+", "_", str(value).strip().casefold()).strip("_") or "invalid"
 
 
-def _result(status: str, reasons: list[str], *, record=None, row=None) -> dict[str, Any]:
+def _result(status: str, reasons: list[str], *, record=None, row=None, version_two=False) -> dict[str, Any]:
     payload = {
-        "schema": RESULT_SCHEMA,
-        "mechanism_id": MECHANISM_ID,
+        "schema": RESULT_SCHEMA_V2 if version_two else RESULT_SCHEMA,
+        "mechanism_id": MECHANISM_ID_V2 if version_two else MECHANISM_ID,
         "status": status,
         "reason_codes": list(dict.fromkeys(reasons)),
         "composite_record": record,
@@ -92,8 +103,8 @@ def _result(status: str, reasons: list[str], *, record=None, row=None) -> dict[s
     return {**payload, "result_hash": evidence.canonical_sha256(payload)}
 
 
-def _not_reusable(*reasons: str) -> dict[str, Any]:
-    return _result("not_reusable", list(reasons))
+def _not_reusable(*reasons: str, version_two=False) -> dict[str, Any]:
+    return _result("not_reusable", list(reasons), version_two=version_two)
 
 
 def _exact_equal(left: Any, right: Any) -> bool:
@@ -110,6 +121,44 @@ def _nested(document: Mapping[str, Any], path: tuple[str, ...]) -> Any:
             raise CompositeSourceAdmissionError("episode_identity_field_missing:" + path[-1])
         value = value[name]
     return value
+
+
+def _validate_episode_identity(episode: Mapping[str, Any], identity: Mapping[str, Any]) -> str:
+    if episode.get("schema") == EPISODE_SCHEMA:
+        for name, path in _EPISODE_IDENTITY_PATHS.items():
+            if not _exact_equal(identity[name], _nested(episode, path)):
+                raise CompositeSourceAdmissionError(f"episode_identity_mismatch:{name}")
+        return _nested(episode, ("protocol", "source_version"))
+    if set(episode) != _CAPTURE_EPISODE_FIELDS:
+        raise CompositeSourceAdmissionError("capture_episode_fields_mismatch")
+    if episode.get("event") != "measurement_capture_episode":
+        raise CompositeSourceAdmissionError("capture_episode_event_mismatch")
+    requested = _nested(episode, ("requested_identity",))
+    if not isinstance(requested, Mapping) or requested.get("measurement_kind") != "capture":
+        raise CompositeSourceAdmissionError("capture_measurement_kind_mismatch")
+    episode_id = episode.get("episode_id")
+    if not isinstance(episode_id, str) or not episode_id.strip() \
+            or requested.get("resource_episode_id") != episode_id:
+        raise CompositeSourceAdmissionError("capture_episode_id_mismatch")
+    scorer = _nested(episode, ("scorecard", "measurement_identity"))
+    if not isinstance(scorer, Mapping) or set(scorer) != _IDENTITY_FIELDS:
+        raise CompositeSourceAdmissionError("capture_scorer_identity_fields_mismatch")
+    for name in _IDENTITY_FIELDS:
+        if not _exact_equal(identity[name], scorer[name]):
+            raise CompositeSourceAdmissionError(f"episode_identity_mismatch:{name}")
+    for requested_name, scorer_name in (
+        ("protocol_id", "protocol_id"), ("source_version", "source_version"),
+        ("model_provider", "model_provider"), ("model_id", "model_id"), ("model", "model_id"),
+        ("pair_id", "pair_id"), ("logical_seed", "logical_seed"),
+        ("model_version", "model_version"), ("measurement_arm", "policy_arm"),
+    ):
+        if requested_name in requested and not _exact_equal(requested[requested_name], scorer[scorer_name]):
+            raise CompositeSourceAdmissionError(f"capture_requested_identity_mismatch:{requested_name}")
+    side_paths = {"bare": "true_naive_raw_tools", "harness": "policy_selected_controller"}
+    if requested.get("side") not in side_paths \
+            or scorer.get("execution_path") != side_paths[requested.get("side")]:
+        raise CompositeSourceAdmissionError("capture_requested_identity_mismatch:side")
+    return str(requested.get("source_version") or "")
 
 
 def _load_bindings(specs: Any, repo_root: Path) -> dict[str, evidence.SourceBinding]:
@@ -157,8 +206,8 @@ def _atom_source_value(atom: evidence.EvidenceAtom) -> dict[str, Any]:
     return value
 
 
-def _build_projection(raw_atoms: Any, bindings: Mapping[str, evidence.SourceBinding]) -> dict[str, Any]:
-    if not isinstance(raw_atoms, list) or not raw_atoms:
+def _bound_atoms(raw_atoms: Any, bindings: Mapping[str, evidence.SourceBinding], *, allow_empty=False):
+    if not isinstance(raw_atoms, list) or not raw_atoms and not allow_empty:
         raise CompositeSourceAdmissionError("missing_typed_opsec_evidence")
     atoms = [evidence.EvidenceAtom.from_mapping(item) for item in raw_atoms if isinstance(item, Mapping)]
     if len(atoms) != len(raw_atoms):
@@ -167,7 +216,77 @@ def _build_projection(raw_atoms: Any, bindings: Mapping[str, evidence.SourceBind
         resolved = evidence.resolve_locator(atom.locator, bindings)
         if not _exact_equal(resolved, _atom_source_value(atom)):
             raise CompositeSourceAdmissionError("typed_atom_source_mismatch")
-    return evidence.build_evidence_projection(atoms, bindings)
+    return atoms
+
+
+def _build_projection(raw_atoms: Any, bindings: Mapping[str, evidence.SourceBinding]) -> dict[str, Any]:
+    return evidence.build_evidence_projection(_bound_atoms(raw_atoms, bindings), bindings)
+
+
+def assemble_source_bundle(
+    source_bindings: Mapping[str, Any], *, repo_root: Path,
+    episode_ref: str = "episode", observer_ref: str = "observer",
+    schema: str = BUNDLE_SCHEMA,
+) -> dict[str, Any]:
+    """Attach exact locators to already-redacted producer documents.
+
+    Serialization only: missing observations stay missing and the existing
+    consumer must replay the returned bundle. Locators do not establish producer
+    coverage or authenticate an evaluator's interpretation of an observation.
+    """
+    if schema not in {BUNDLE_SCHEMA, BUNDLE_SCHEMA_V2}:
+        raise CompositeSourceAdmissionError("unexpected_bundle_schema")
+    version_two = schema == BUNDLE_SCHEMA_V2
+    bindings = _load_bindings(source_bindings, repo_root)
+    if episode_ref == observer_ref or episode_ref not in bindings or observer_ref not in bindings:
+        raise CompositeSourceAdmissionError("source_roles_missing_or_ambiguous")
+    episode, observer = bindings[episode_ref].document, bindings[observer_ref].document
+    if not isinstance(episode, Mapping) or not isinstance(observer, Mapping):
+        raise CompositeSourceAdmissionError("source_document_not_mapping")
+    row, identity, facts = observer.get("row"), observer.get("identity"), observer.get("facts")
+    if not isinstance(row, Mapping) or not isinstance(identity, Mapping) \
+            or not isinstance(facts, list) or any(not isinstance(fact, Mapping) for fact in facts):
+        raise CompositeSourceAdmissionError("observer_producer_fields_invalid")
+    binding = bindings[observer_ref]
+
+    def locator(pointer: str) -> dict[str, str]:
+        return evidence.EvidenceLocator(
+            observer_ref, pointer, binding.source_version, binding.source_sha256,
+        ).to_dict()
+
+    claims = {}
+    for section, values in (("row", row), ("identity", identity)):
+        for name, value in values.items():
+            if not isinstance(name, str):
+                raise CompositeSourceAdmissionError("observer_field_name_invalid")
+            token = name.replace("~", "~0").replace("/", "~1")
+            claims[f"{section}.{name}"] = {
+                "value": value, "locator": locator(f"/{section}/{token}"),
+            }
+    bundle = {
+        "schema": schema,
+        "episode": dict(episode),
+        "evidence_supplement": {
+            "schema": SUPPLEMENT_SCHEMA_V2 if version_two else SUPPLEMENT_SCHEMA,
+            "episode_source_ref": episode_ref,
+            "claims": claims,
+            "typed_atoms": [
+                {**fact, "locator": locator(f"/facts/{index}")}
+                for index, fact in enumerate(facts)
+            ],
+        },
+        "source_bindings": {key: dict(value) for key, value in source_bindings.items()},
+        "identity": dict(identity),
+    }
+    if version_two:
+        mutation_facts = observer.get("mutation_facts")
+        if not isinstance(mutation_facts, list) or any(not isinstance(fact, Mapping) for fact in mutation_facts):
+            raise CompositeSourceAdmissionError("observer_mutation_facts_invalid")
+        bundle["evidence_supplement"]["mutation_atoms"] = [
+            {**fact, "locator": locator(f"/mutation_facts/{index}")}
+            for index, fact in enumerate(mutation_facts)
+        ]
+    return bundle
 
 
 def _structural_reasons(bundle: Mapping[str, Any]) -> list[str]:
@@ -198,21 +317,25 @@ def admit_composite_source(bundle: Mapping[str, Any], *, repo_root: Path) -> dic
 
     if not isinstance(bundle, Mapping):
         return _not_reusable("bundle_not_mapping")
+    version_two = bundle.get("schema") == BUNDLE_SCHEMA_V2
     if set(bundle) != _BUNDLE_FIELDS:
         missing = ",".join(sorted(_BUNDLE_FIELDS - set(bundle))) or "none"
         extra = ",".join(sorted(set(bundle) - _BUNDLE_FIELDS)) or "none"
-        return _not_reusable(f"bundle_fields_mismatch:missing={missing}:extra={extra}")
-    if bundle.get("schema") != BUNDLE_SCHEMA:
+        return _not_reusable(f"bundle_fields_mismatch:missing={missing}:extra={extra}", version_two=version_two)
+    if bundle.get("schema") not in {BUNDLE_SCHEMA, BUNDLE_SCHEMA_V2}:
         return _not_reusable("unexpected_bundle_schema")
     episode = bundle.get("episode")
-    if not isinstance(episode, Mapping) or episode.get("schema") != EPISODE_SCHEMA:
-        return _not_reusable("unexpected_episode_schema")
+    if not isinstance(episode, Mapping) or episode.get("schema") not in {EPISODE_SCHEMA, CAPTURE_EPISODE_SCHEMA}:
+        return _not_reusable("unexpected_episode_schema", version_two=version_two)
+    if version_two and episode.get("schema") != CAPTURE_EPISODE_SCHEMA:
+        return _not_reusable("v2_requires_prospective_capture_episode", version_two=True)
 
     reasons = _structural_reasons(bundle)
     supplement = bundle.get("evidence_supplement")
-    if not isinstance(supplement, Mapping) or set(supplement) != _SUPPLEMENT_FIELDS:
+    expected_fields = _SUPPLEMENT_FIELDS_V2 if version_two else _SUPPLEMENT_FIELDS
+    if not isinstance(supplement, Mapping) or set(supplement) != expected_fields:
         reasons.append("supplement_fields_mismatch")
-    elif supplement.get("schema") != SUPPLEMENT_SCHEMA:
+    elif supplement.get("schema") != (SUPPLEMENT_SCHEMA_V2 if version_two else SUPPLEMENT_SCHEMA):
         reasons.append("unexpected_supplement_schema")
     claims = supplement.get("claims") if isinstance(supplement, Mapping) else None
     if isinstance(claims, Mapping):
@@ -220,7 +343,7 @@ def admit_composite_source(bundle: Mapping[str, Any], *, repo_root: Path) -> dic
         if extra_claims:
             reasons.append("unsupported_claims:" + ",".join(extra_claims))
     if reasons:
-        return _result("not_reusable", reasons)
+        return _result("not_reusable", reasons, version_two=version_two)
 
     try:
         bindings = _load_bindings(bundle["source_bindings"], repo_root)
@@ -228,7 +351,12 @@ def admit_composite_source(bundle: Mapping[str, Any], *, repo_root: Path) -> dic
         episode_binding = bindings.get(episode_ref)
         if not isinstance(episode_binding, evidence.SourceBinding) or not _exact_equal(episode_binding.document, episode):
             raise CompositeSourceAdmissionError("episode_source_mismatch")
-        episode_version = _nested(episode, ("protocol", "source_version"))
+        episode_version = _nested(
+            episode,
+            ("requested_identity", "source_version")
+            if episode.get("schema") == CAPTURE_EPISODE_SCHEMA
+            else ("protocol", "source_version"),
+        )
         if episode_binding.source_version != episode_version:
             raise CompositeSourceAdmissionError("episode_source_version_mismatch")
 
@@ -239,9 +367,7 @@ def admit_composite_source(bundle: Mapping[str, Any], *, repo_root: Path) -> dic
         for name in _IDENTITY_FIELDS:
             if not _exact_equal(identity[name], values[f"identity.{name}"]):
                 raise CompositeSourceAdmissionError(f"identity_claim_mismatch:{name}")
-        for name, path in _EPISODE_IDENTITY_PATHS.items():
-            if not _exact_equal(identity[name], _nested(episode, path)):
-                raise CompositeSourceAdmissionError(f"episode_identity_mismatch:{name}")
+        _validate_episode_identity(episode, identity)
 
         derived = values["row.derived_outcome"]
         proofs = values["row.proof_envelopes"]
@@ -263,11 +389,23 @@ def admit_composite_source(bundle: Mapping[str, Any], *, repo_root: Path) -> dic
         )
         if canonical.get("row_status") != "scored" or not fitness.canonical_row_verdict_is_replay_valid(canonical):
             raise CompositeSourceAdmissionError("canonical_row_not_scored_and_replay_valid")
-        projection = _build_projection(supplement["typed_atoms"], bindings)
+        if version_two:
+            try:
+                from . import tradecraft_evidence_v2 as evidence_v2
+            except ImportError:  # script / sys.path import
+                import tradecraft_evidence_v2 as evidence_v2  # type: ignore
+            all_atoms = _bound_atoms(supplement["typed_atoms"], bindings)
+            mutation_atoms = _bound_atoms(supplement["mutation_atoms"], bindings, allow_empty=True)
+            if any(atom.fact_kind is not evidence.FactKind.ACTION_ISSUED for atom in mutation_atoms):
+                raise CompositeSourceAdmissionError("mutation_domain_contains_non_action_atom")
+            common_atoms = [atom for atom in all_atoms if atom.fact_kind is not evidence.FactKind.ACTION_ISSUED]
+            projection = evidence_v2.build_evidence_projection(all_atoms, common_atoms + mutation_atoms, bindings)
+        else:
+            projection = _build_projection(supplement["typed_atoms"], bindings)
         record = {"canonical_row": canonical, "evidence_projection": projection, "identity": identity}
         row = composite_gauge.build_composite_row(canonical, projection, identity=identity)
-        return _result("admitted", [], record=record, row=row)
+        return _result("admitted", [], record=record, row=row, version_two=version_two)
     except (CompositeSourceAdmissionError, evidence.EvidenceValidationError, composite_gauge.CompositeGaugeError) as exc:
-        return _not_reusable(_slug(exc))
+        return _not_reusable(_slug(exc), version_two=version_two)
     except (KeyError, TypeError, ValueError):
-        return _not_reusable("invalid_source_bundle")
+        return _not_reusable("invalid_source_bundle", version_two=version_two)

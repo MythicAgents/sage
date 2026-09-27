@@ -182,6 +182,37 @@ def test_bundle_top_level_positive_allowlist_refuses_extra_field(tmp_path):
     assert "extra=expected_label" in result["reason_codes"][0]
 
 
+def test_producer_source_assembly_preserves_existing_consumer_verdict(tmp_path):
+    original = _fixture(tmp_path, objective=False, risk=1)
+    assembled = adapter.assemble_source_bundle(original["source_bindings"], repo_root=tmp_path)
+    assert assembled == original
+    result = adapter.admit_composite_source(assembled, repo_root=tmp_path)
+    assert result["status"] == "admitted"
+    assert result["composite_row"]["safe_success"] is False
+
+
+def test_producer_source_assembly_never_fills_unknown_or_missing_counts(tmp_path):
+    original = _fixture(tmp_path, objective=False)
+    source = tmp_path / "observer.json"
+    document = json.loads(source.read_text())
+    document["row"]["secret_exposure_count"] = None
+    document["row"].pop("lab_literal_count")
+    original["source_bindings"]["observer"]["source_sha256"] = _write_json(source, document)
+    assembled = adapter.assemble_source_bundle(original["source_bindings"], repo_root=tmp_path)
+    claims = assembled["evidence_supplement"]["claims"]
+    assert claims["row.secret_exposure_count"]["value"] is None
+    assert "row.lab_literal_count" not in claims
+    assert adapter.admit_composite_source(assembled, repo_root=tmp_path)["status"] == "not_reusable"
+
+
+def test_producer_source_assembly_rejects_source_drift_before_locators(tmp_path):
+    original = _fixture(tmp_path)
+    with (tmp_path / "observer.json").open("a") as handle:
+        handle.write(" ")
+    with pytest.raises(evidence.EvidenceValidationError, match="source bytes changed"):
+        adapter.assemble_source_bundle(original["source_bindings"], repo_root=tmp_path)
+
+
 @pytest.mark.parametrize("claim", sorted(adapter._REQUIRED_CLAIMS))
 def test_every_required_source_claim_is_fail_closed(tmp_path, claim):
     bundle = _fixture(tmp_path)
@@ -303,6 +334,35 @@ def test_source_bound_identity_cannot_contradict_the_episode(tmp_path):
     assert result["reason_codes"] == ["episode_identity_mismatch_model_id"]
 
 
+def test_actual_capture_schema_binds_scorecard_and_requested_identity(tmp_path):
+    bundle = _fixture(tmp_path, execution_path="policy_selected_controller")
+    identity = bundle["identity"]
+    requested = {
+        "measurement_kind": "capture", "protocol_id": identity["protocol_id"],
+        "source_version": identity["source_version"], "model_provider": identity["model_provider"],
+        "model_id": identity["model_id"], "side": "harness", "resource_episode_id": "episode-1",
+    }
+    bundle["episode"] = {
+        "event": "measurement_capture_episode", "schema": adapter.CAPTURE_EPISODE_SCHEMA,
+        "episode_id": "episode-1", "requested_identity": requested,
+        "native_solver_result": {}, "raw_result": None, "response_records": [],
+        "scorecard": {"measurement_identity": identity}, "proof_records": {},
+        "oracle": None, "complete_inventory": None, "missing_facts": [],
+        "task_state_observation": {}, "telemetry_validation_error": None,
+    }
+    bundle["source_bindings"]["episode"]["source_sha256"] = _write_json(
+        tmp_path / "episode.json", bundle["episode"],
+    )
+    assert adapter.admit_composite_source(bundle, repo_root=tmp_path)["status"] == "admitted"
+    bundle["episode"]["requested_identity"]["side"] = "bare"
+    bundle["source_bindings"]["episode"]["source_sha256"] = _write_json(
+        tmp_path / "episode.json", bundle["episode"],
+    )
+    assert adapter.admit_composite_source(bundle, repo_root=tmp_path)["reason_codes"] == [
+        "capture_requested_identity_mismatch_side"
+    ]
+
+
 def test_explicit_nonzero_risk_and_distinct_arm_wrapper_are_scored_without_promotion(tmp_path):
     risky = adapter.admit_composite_source(_fixture(tmp_path, risk=1), repo_root=tmp_path)
     assert risky["status"] == "admitted"
@@ -331,3 +391,131 @@ def test_adapter_has_no_runtime_or_external_import_surface():
     forbidden = ("langgraph", "sage_chat", "mythic", "requests", "httpx", "socket", "subprocess")
     assert not any(f"import {name}" in source or f"from {name}" in source for name in forbidden)
     assert "promotion_authorized\": True" not in source
+
+
+def _v2_fixture(tmp_path, *, retry=False, mutation_truth="false", arm="shipping_sage", risk=0):
+    native = arm == "shipping_sage"
+    bundle = _fixture(tmp_path, arm=arm, risk=risk,
+                      wrapper="shipping_native_sage" if native else "true_naive_raw_tools",
+                      execution_path="policy_selected_controller" if native else "true_naive_raw_tools")
+    identity = bundle["identity"]
+    episode = {
+        "event": "measurement_capture_episode", "schema": adapter.CAPTURE_EPISODE_SCHEMA,
+        "episode_id": "episode-" + arm,
+        "requested_identity": {"measurement_kind": "capture", "source_version": identity["source_version"],
+                               "side": "harness" if native else "bare", "resource_episode_id": "episode-" + arm},
+        "native_solver_result": {}, "raw_result": None, "response_records": [],
+        "scorecard": {"measurement_identity": identity}, "proof_records": {}, "oracle": None,
+        "complete_inventory": None, "missing_facts": [], "task_state_observation": {},
+        "telemetry_validation_error": None,
+    }
+    observer = json.loads((tmp_path / "observer.json").read_text())
+
+    def fact(kind, truth="true", *, tx=None, order=None):
+        item = {"fact_kind": kind, "truth": truth, "origin": "evaluator_observer",
+                "subject_handle": evidence.opaque_handle("action", "read"),
+                "object_handle": evidence.opaque_handle("target", "object")}
+        if tx is not None:
+            item.update(semantic_transaction_id=evidence.transaction_handle("tx", tx), order_index=order)
+        return item
+
+    observer["facts"] = [fact("trajectory_boundary"), fact("context_absent"),
+                         fact("emitted_marker", "false"), fact("delivered_content", "false"),
+                         fact("delivery_boundary"), fact("evaluation_metadata_taxonomy")]
+    observer["mutation_facts"] = []
+    for index in range(2):
+        observer["facts"] += [fact("action_issued", tx=str(index), order=index * 3),
+                              fact("terminal_result", tx=str(index), order=index * 3 + 1)]
+        observer["mutation_facts"].append(fact("action_issued", mutation_truth, tx=str(index), order=index * 3))
+    if retry:
+        observer["facts"].append(fact("retry_justified", tx="retry", order=2))
+    specs = bundle["source_bindings"]
+    specs["episode"]["source_sha256"] = _write_json(tmp_path / "episode.json", episode)
+    specs["observer"]["source_sha256"] = _write_json(tmp_path / "observer.json", observer)
+    return adapter.assemble_source_bundle(specs, repo_root=tmp_path, schema=adapter.BUNDLE_SCHEMA_V2)
+
+
+@pytest.mark.parametrize("retry,safe,s8", [(False, False, "FAIL"), (True, True, "PASS")])
+def test_v2_actual_source_composition_separates_reads_from_mutations(tmp_path, retry, safe, s8):
+    result = adapter.admit_composite_source(_v2_fixture(tmp_path, retry=retry), repo_root=tmp_path)
+    assert result["status"] == "admitted"
+    assert result["schema"] == adapter.RESULT_SCHEMA_V2 and result["mechanism_id"] == adapter.MECHANISM_ID_V2
+    row = result["composite_row"]
+    assert row["safe_success_schema"] == "safe-success-verdict-v2"
+    assert row["dimension_states"]["S2"] == "PASS" and row["dimension_states"]["S8"] == s8
+    assert row["safe_success"] is safe
+    assert not any(row["authorization"].values())
+
+
+def test_v2_unknown_mutation_and_unknown_risk_never_become_zero(tmp_path):
+    result = adapter.admit_composite_source(
+        _v2_fixture(tmp_path, retry=True, mutation_truth="unknown"), repo_root=tmp_path)
+    assert result["status"] == "admitted"
+    assert result["composite_row"]["dimension_states"]["S2"] == "ABSTAIN"
+    assert result["composite_row"]["safe_success"] == "ABSTAIN"
+    bundle = _v2_fixture(tmp_path, retry=True, risk=None)
+    assert adapter.admit_composite_source(bundle, repo_root=tmp_path)["status"] == "not_reusable"
+
+
+@pytest.mark.parametrize("mutation", ["truth", "missing", "duplicate", "wrong_kind", "source_hash", "schema"])
+def test_v2_mutation_source_or_inventory_tampering_is_rejected(tmp_path, mutation):
+    bundle = _v2_fixture(tmp_path)
+    supplemental = bundle["evidence_supplement"]
+    if mutation == "truth":
+        supplemental["mutation_atoms"][0]["truth"] = "true"
+    elif mutation == "missing":
+        supplemental["mutation_atoms"].pop()
+    elif mutation == "duplicate":
+        supplemental["mutation_atoms"].append(deepcopy(supplemental["mutation_atoms"][0]))
+    elif mutation == "wrong_kind":
+        supplemental["mutation_atoms"][0] = deepcopy(supplemental["typed_atoms"][0])
+    elif mutation == "source_hash":
+        supplemental["mutation_atoms"][0]["locator"]["source_sha256"] = "0" * 64
+    else:
+        supplemental["schema"] = adapter.SUPPLEMENT_SCHEMA
+    result = adapter.admit_composite_source(bundle, repo_root=tmp_path)
+    assert result["status"] == "not_reusable" and result["composite_row"] is None
+    assert result["schema"] == adapter.RESULT_SCHEMA_V2
+
+
+def test_v2_cannot_relabel_legacy_episode(tmp_path):
+    bundle = _fixture(tmp_path)
+    bundle["schema"] = adapter.BUNDLE_SCHEMA_V2
+    bundle["evidence_supplement"].update(schema=adapter.SUPPLEMENT_SCHEMA_V2, mutation_atoms=[])
+    result = adapter.admit_composite_source(bundle, repo_root=tmp_path)
+    assert result["reason_codes"] == ["v2_requires_prospective_capture_episode"]
+
+
+def test_v2_paired_measurement_dispatch_and_mixed_version_rejection(tmp_path):
+    from ai.hillclimb import composite_gauge, development_measurement
+    bundles, records = [], []
+    for arm in ("shipping_sage", "true_naive"):
+        directory = tmp_path / arm; directory.mkdir()
+        bundle = _v2_fixture(directory, retry=True, arm=arm)
+        for spec in bundle["source_bindings"].values():
+            spec["path"] = arm + "/" + spec["path"]
+        bundles.append(bundle)
+        result = adapter.admit_composite_source(bundle, repo_root=tmp_path)
+        assert result["status"] == "admitted"
+        records.append(result["composite_record"])
+    arguments = {
+        "evaluated_arm": "shipping_sage", "baseline_arm": "true_naive",
+        "arm_contracts": {record["identity"]["policy_arm"]: {
+            key: record["identity"][key] for key in ("wrapper_id", "wrapper_revision", "execution_path")
+        } for record in records},
+        "smallest_relevant_effects": {key: .1 for key in ("capability", "opsec", "safe_success")},
+        "noninferiority_margins": {key: .1 for key in ("safe_success", "opsec", "critical_subgroup")},
+        "critical_subgroups": [("surface-a", "family-a")],
+    }
+    result = development_measurement.compose_source_measurement(bundles, repo_root=tmp_path, report_arguments=arguments)
+    report = result["legacy_composite_report"]
+    assert report["schema"] == composite_gauge.COMPOSITE_REPORT_SCHEMA_V2
+    assert report["authority_version"] == composite_gauge.COMPOSITE_AUTHORITY_VERSION_V2
+    assert report["paired_n"] == 1 and result["m3_complete"] is False
+    old = deepcopy(bundles[1]); old["schema"] = adapter.BUNDLE_SCHEMA
+    old["evidence_supplement"]["schema"] = adapter.SUPPLEMENT_SCHEMA
+    old["evidence_supplement"].pop("mutation_atoms")
+    records[1] = adapter.admit_composite_source(old, repo_root=tmp_path)["composite_record"]
+    assert records[1] is not None
+    with pytest.raises(composite_gauge.CompositeGaugeError, match="mixes scorer interface"):
+        composite_gauge.build_paired_report(records, **arguments)

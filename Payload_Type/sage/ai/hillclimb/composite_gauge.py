@@ -16,6 +16,10 @@ except ImportError:  # script / sys.path import
 COMPOSITE_ROW_SCHEMA = "canonical-safe-success-composite-row-v1"
 COMPOSITE_REPORT_SCHEMA = "canonical-safe-success-composite-report-v1"
 COMPOSITE_AUTHORITY_VERSION = "canonical-safe-success-composite-v1"
+COMPOSITE_ROW_SCHEMA_V2 = "canonical-safe-success-composite-row-v2"
+COMPOSITE_REPORT_SCHEMA_V2 = "canonical-safe-success-composite-report-v2"
+COMPOSITE_AUTHORITY_VERSION_V2 = "canonical-safe-success-composite-v2"
+_PROJECTION_SCHEMA_V2 = "sage.tradecraft-evidence-projection.v2"
 CORE_DIMENSIONS = ("S1", "S2", "S5", "S7", "S8")
 AUTHORITY_MODES = {"conversation", "supervised", "auto"}
 MINIMUM_COMPLETE_PAIRS = 5
@@ -93,8 +97,15 @@ def build_composite_row(canonical_row, evidence_projection, *, identity) -> dict
     identity = _identity(identity)
     if identity["policy_arm"] != str(canonical_row.get("policy_arm") or "").strip().casefold():
         raise CompositeGaugeError("measurement identity policy_arm contradicts the canonical row")
+    version_two = isinstance(evidence_projection, Mapping) and evidence_projection.get("schema") == _PROJECTION_SCHEMA_V2
+    scorer = safe_success
+    if version_two:
+        try:
+            from . import safe_success_v2 as scorer
+        except ImportError:  # script / sys.path import
+            import safe_success_v2 as scorer  # type: ignore
     try:
-        sidecar = safe_success.build_safe_success_sidecar(canonical_row, evidence_projection)
+        sidecar = scorer.build_safe_success_sidecar(canonical_row, evidence_projection)
     except (safe_success.SafeSuccessError, KeyError, TypeError, ValueError) as exc:
         raise CompositeGaugeError(f"safe-success sidecar derivation failed: {exc}") from exc
     dimensions = sidecar.get("dimension_verdicts")
@@ -111,7 +122,8 @@ def build_composite_row(canonical_row, evidence_projection, *, identity) -> dict
     if safe is not True and safe is not False and safe != "ABSTAIN":
         raise CompositeGaugeError("safe-success value is not three-valued")
     payload = {
-        "schema": COMPOSITE_ROW_SCHEMA, "authority_version": COMPOSITE_AUTHORITY_VERSION,
+        "schema": COMPOSITE_ROW_SCHEMA_V2 if version_two else COMPOSITE_ROW_SCHEMA,
+        "authority_version": COMPOSITE_AUTHORITY_VERSION_V2 if version_two else COMPOSITE_AUTHORITY_VERSION,
         "row_id": _text(canonical_row.get("row_id"), "canonical row_id"),
         "surface_id": _text(canonical_row.get("surface_id"), "canonical surface_id"),
         "family_id": _text(canonical_row.get("family_id"), "canonical family_id"),
@@ -212,6 +224,10 @@ def build_paired_report(
         rows.append(build_composite_row(record["canonical_row"], record["evidence_projection"], identity=record["identity"]))
     if not rows:
         raise CompositeGaugeError("paired report requires at least one source record")
+    authorities = {row["authority_version"] for row in rows}
+    if len(authorities) != 1:
+        raise CompositeGaugeError("paired report mixes scorer interface versions")
+    version_two = rows[0]["authority_version"] == COMPOSITE_AUTHORITY_VERSION_V2
     pairs, pair_ids, row_ids, hashes, invariant = {}, {}, set(), set(), None
     for row in rows:
         identity, arm = row["identity"], row["identity"]["policy_arm"]
@@ -282,7 +298,8 @@ def build_paired_report(
     direction = lambda delta: NOT_ESTIMABLE if delta is None else "evaluated_higher" if delta > 0 else "evaluated_lower" if delta < 0 else "tie"
     first = rows[0]["identity"]
     payload = {
-        "schema": COMPOSITE_REPORT_SCHEMA, "authority_version": COMPOSITE_AUTHORITY_VERSION,
+        "schema": COMPOSITE_REPORT_SCHEMA_V2 if version_two else COMPOSITE_REPORT_SCHEMA,
+        "authority_version": COMPOSITE_AUTHORITY_VERSION_V2 if version_two else COMPOSITE_AUTHORITY_VERSION,
         "review_lane": "development_measurement", "evaluated_arm": arms[0], "baseline_arm": arms[1],
         "shared_identity": {name: first[name] for name in _SHARED}, "arm_contracts": contracts,
         "critical_subgroups": [{"surface_id": a, "family_id": b} for a, b in subgroups],
