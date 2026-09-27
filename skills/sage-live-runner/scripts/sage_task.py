@@ -33,6 +33,16 @@ MYTHIC_ENV_PATHS: tuple[Path, ...] = (
 )
 
 
+def install_control_meter() -> None:
+    sage_root = Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+    if resource_budget.configured_ledger() is not None:
+        from ai import resource_clients
+        resource_clients.install()
+
+
 def resolve_password(env_paths: Path | tuple[Path, ...] = MYTHIC_ENV_PATHS) -> str:
     env_value = os.environ.get("MYTHIC_ADMIN_PASSWORD")
     if env_value:
@@ -90,6 +100,7 @@ def normalize_task_parameters(command: str, params, *, explicit_verbose: bool | 
 async def main():
     argv, explicit_verbose = strip_verbose_args(sys.argv[1:])
     mode = argv[0] if argv else "callbacks"
+    install_control_meter()
     client = await mythic.login(server_ip=SERVER, username=USER, password=resolve_password())
     cbs = await mythic.get_all_active_callbacks(client)
 

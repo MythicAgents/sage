@@ -7,6 +7,7 @@ import os
 import re
 import asyncio
 import aiosqlite
+import httpx
 import threading
 import time
 from collections import Counter
@@ -59,7 +60,7 @@ from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
-from ai import observation_channel
+from ai import observation_channel, resource_budget, resource_http
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -5746,6 +5747,12 @@ class Model:
             eval_max_output_tokens = int(os.environ.get("SAGE_EVAL_MAX_OUTPUT_TOKENS") or 0)
         except (TypeError, ValueError):
             eval_max_output_tokens = 0
+        eval_temperature = _eval_temperature()
+        ledger = resource_budget.configured_ledger()
+        if ledger is not None and self.provider.lower() != "openai":
+            raise resource_http.ResourceHTTPError(
+                "native resource metering supports only the OpenAI-compatible provider"
+            )
         if self.provider.lower() == "bedrock" and cfg is not None:
             # Set region to cfg.get("region") if it exists, else default to "us-east-1"
             region = cfg.get("region")
@@ -5767,6 +5774,8 @@ class Model:
             bedrock_kwargs: dict[str, Any] = {}
             if eval_max_output_tokens > 0:
                 bedrock_kwargs["max_tokens"] = eval_max_output_tokens
+            if eval_temperature is not None:
+                bedrock_kwargs["temperature"] = eval_temperature
             llm = init_chat_model(model_provider=self.provider, model=self.model, region=region, aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, aws_session_token=aws_session_token, **bedrock_kwargs)
         else:
             model_kwargs: dict[str, Any] = {}
@@ -5776,6 +5785,18 @@ class Model:
                 model_kwargs["base_url"] = cfg["base_url"]
             if eval_max_output_tokens > 0:
                 model_kwargs["max_tokens"] = eval_max_output_tokens
+            if eval_temperature is not None:
+                model_kwargs["temperature"] = eval_temperature
+            if ledger is not None:
+                model_kwargs.update({
+                    "http_client": httpx.Client(
+                        transport=resource_http.MeteredHTTPTransport("provider", ledger=ledger)
+                    ),
+                    "http_async_client": httpx.AsyncClient(
+                        transport=resource_http.MeteredAsyncHTTPTransport("provider", ledger=ledger)
+                    ),
+                    "max_retries": 0,
+                })
             logger.debug(
                 f"Initializing model with provider={self.provider}, model={self.model}, "
                 f"api_key={'configured' if 'api_key' in model_kwargs else 'provider default'}, "

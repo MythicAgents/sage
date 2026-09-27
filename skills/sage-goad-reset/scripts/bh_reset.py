@@ -19,9 +19,19 @@ DEFAULT_BLOODHOUND_MCP_DIR = Path(
 )
 _client = None
 
+def _install_control_meter():
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+    if resource_budget.configured_ledger() is not None:
+        from ai import resource_clients
+        resource_clients.install(clients=("requests",))
+
 def _get_client():
     global _client
     if _client is None:
+        _install_control_meter()
         sys.path.insert(0, str(DEFAULT_BLOODHOUND_MCP_DIR))
         from lib.bloodhound_api import BloodhoundBaseClient
         _client = BloodhoundBaseClient()
