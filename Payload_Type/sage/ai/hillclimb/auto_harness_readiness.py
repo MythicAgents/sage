@@ -1,4 +1,4 @@
-"""Phase 9 auto-harness-improvement readiness verdict.
+"""Readiness verdict for automated harness improvement.
 
 This module is a report composer over the existing evaluation foundation. It freezes
 one existing replay experiment record for one structural selector surface, proves the
@@ -139,7 +139,7 @@ def _immutable_hashes(root: Path, *, before: tuple[str, str, str], after: tuple[
     })
     test_hash = _hash_globs(
         runtime_root / "tests",
-        ("test_phase4_evaluation_foundation.py", "test_phase9_auto_harness_readiness.py"),
+        ("test_evaluation_foundation.py", "test_auto_harness_readiness.py"),
         root=root,
         absent_label="readiness-tests",
     )

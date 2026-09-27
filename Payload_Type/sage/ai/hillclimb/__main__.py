@@ -79,7 +79,7 @@ try:  # package import
     from . import laps_family_transfer_matrix
     from . import trust_context_corroboration
     from . import phase8_goad_regression
-    from . import phase9_auto_harness_readiness
+    from . import auto_harness_readiness
     from . import phase10_evidence_bundle
     from . import phase12_proof_binding_audit
     from . import phase13_canonical_promotion
@@ -123,7 +123,7 @@ except Exception:  # script / sys.path import
     import laps_family_transfer_matrix  # type: ignore
     import trust_context_corroboration  # type: ignore
     import phase8_goad_regression  # type: ignore
-    import phase9_auto_harness_readiness  # type: ignore
+    import auto_harness_readiness  # type: ignore
     import phase10_evidence_bundle  # type: ignore
     import phase12_proof_binding_audit  # type: ignore
     import phase13_canonical_promotion  # type: ignore
@@ -409,9 +409,9 @@ def _cmd_phase4_readiness_report(args: argparse.Namespace) -> int:
     return 0 if decision in {"auto_harness_not_ready", "eligible_for_supervised_artifact_campaign"} else 1
 
 
-def _cmd_phase9_auto_harness_readiness(args: argparse.Namespace) -> int:
-    report = phase9_auto_harness_readiness.build_phase9_readiness_report()
-    rendered = phase9_auto_harness_readiness.render_report(report)
+def _cmd_auto_harness_readiness(args: argparse.Namespace) -> int:
+    report = auto_harness_readiness.build_phase9_readiness_report()
+    rendered = auto_harness_readiness.render_report(report)
     print(rendered)
     if args.output:
         Path(args.output).write_text(rendered + "\n", encoding="utf-8")
@@ -513,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         help="emit the Phase 9 typed auto-harness-improvement readiness verdict",
     )
     p9.add_argument("--output", default=None, help="optional JSON report path")
-    p9.set_defaults(func=_cmd_phase9_auto_harness_readiness)
+    p9.set_defaults(func=_cmd_auto_harness_readiness)
 
     decision_benchmark.add_cli(sub)
     operator_replay_benchmark.add_cli(sub)

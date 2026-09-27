@@ -8,11 +8,14 @@ mutate runtime state, or authorize a live campaign.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+from contextlib import contextmanager
 from pathlib import Path
+import fcntl
 import hashlib
 import json
+import os
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .experiment_contracts import (
     AuthorizationBoundary,
@@ -59,6 +62,167 @@ DEFAULT_LAB_LITERAL_PATTERNS = (
     re.compile(r"/home/[^/\s]+/"),
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+\\", re.IGNORECASE),
 )
+
+
+# M2 split metadata stays evaluator-side.  It deliberately identifies semantic
+# ancestry explicitly instead of trying to infer it from case prose or live-range
+# names.  A producer that cannot supply the ancestry is development-only.
+EVALUATION_ROLES = frozenset({"dev", "promotion_validation", "final_audit"})
+SPLIT_USE_SCHEMA = "sage-evaluation-split-use-v1"
+
+
+@dataclass(frozen=True)
+class SemanticAncestry:
+    source_id: str
+    parent_source_id: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_id", _text(self.source_id))
+        object.__setattr__(self, "parent_source_id", _text(self.parent_source_id))
+
+
+@dataclass(frozen=True)
+class EvaluationCohort:
+    cohort_id: str
+    role: str
+    topology_cluster_id: str
+    source_case_ids: tuple[str, ...]
+    semantic_source_ids: tuple[str, ...]
+    prospective_budget_id: str = ""
+    prospective_case_budget: int = 0
+    prospective_look_count: int = 0
+    multiplicity_policy_id: str = ""
+    multiplicity_alpha: float | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "cohort_id", "role", "topology_cluster_id", "prospective_budget_id", "multiplicity_policy_id",
+        ):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name)))
+        object.__setattr__(self, "role", self.role.casefold())
+        object.__setattr__(
+            self, "source_case_ids", tuple(_text(item) for item in self.source_case_ids if _text(item)),
+        )
+        object.__setattr__(
+            self, "semantic_source_ids", tuple(_text(item) for item in self.semantic_source_ids if _text(item)),
+        )
+        object.__setattr__(self, "prospective_case_budget", max(0, int(self.prospective_case_budget or 0)))
+        object.__setattr__(self, "prospective_look_count", max(0, int(self.prospective_look_count or 0)))
+        alpha = self.multiplicity_alpha
+        object.__setattr__(self, "multiplicity_alpha", float(alpha) if isinstance(alpha, (int, float)) and not isinstance(alpha, bool) else None)
+
+
+@dataclass(frozen=True)
+class FinalAuditReceipt:
+    """Append-only metadata binding one final cohort to one computed report."""
+
+    cohort_id: str
+    report_id: str
+    source_case_ids: tuple[str, ...]
+    reducer_name: str
+    result_sha256: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("cohort_id", "report_id", "reducer_name", "result_sha256"):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name)))
+        object.__setattr__(
+            self, "source_case_ids", tuple(_text(item) for item in self.source_case_ids if _text(item)),
+        )
+
+
+@dataclass(frozen=True)
+class EvaluationSplitReport:
+    cohorts: tuple[EvaluationCohort, ...]
+    ancestry_roots: dict[str, str]
+    failures: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def valid(self) -> bool:
+        return not self.failures
+
+
+@dataclass(frozen=True)
+class SplitUseRecord:
+    """One append-only reservation or final-report retirement, with no case content."""
+
+    record_kind: str
+    reservation_id: str
+    registry_id: str
+    release_cohort_id: str
+    cohort_id: str
+    role: str
+    topology_cluster_id: str
+    ancestry_roots: tuple[str, ...]
+    source_case_ids: tuple[str, ...]
+    prospective_budget_id: str = ""
+    reducer_name: str = ""
+    result_sha256: str = ""
+    report_id: str = ""
+    multiplicity_alpha_allocation: float | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "record_kind", "reservation_id", "registry_id", "release_cohort_id", "cohort_id", "role",
+            "topology_cluster_id", "prospective_budget_id", "reducer_name", "result_sha256", "report_id",
+        ):
+            object.__setattr__(self, field_name, _text(getattr(self, field_name)))
+        object.__setattr__(self, "record_kind", self.record_kind.casefold())
+        object.__setattr__(self, "role", self.role.casefold())
+        object.__setattr__(self, "ancestry_roots", tuple(_text(item) for item in self.ancestry_roots if _text(item)))
+        object.__setattr__(self, "source_case_ids", tuple(_text(item) for item in self.source_case_ids if _text(item)))
+        allocation = self.multiplicity_alpha_allocation
+        object.__setattr__(
+            self, "multiplicity_alpha_allocation",
+            float(allocation) if isinstance(allocation, (int, float)) and not isinstance(allocation, bool) else None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": SPLIT_USE_SCHEMA,
+            "record_kind": self.record_kind,
+            "reservation_id": self.reservation_id,
+            "registry_id": self.registry_id,
+            "release_cohort_id": self.release_cohort_id,
+            "cohort_id": self.cohort_id,
+            "role": self.role,
+            "topology_cluster_id": self.topology_cluster_id,
+            "ancestry_roots": list(self.ancestry_roots),
+            "source_case_ids": list(self.source_case_ids),
+            "prospective_budget_id": self.prospective_budget_id or None,
+            "reducer_name": self.reducer_name or None,
+            "result_sha256": self.result_sha256 or None,
+            "report_id": self.report_id or None,
+            "multiplicity_alpha_allocation": self.multiplicity_alpha_allocation,
+        }
+
+
+@dataclass(frozen=True)
+class HeadlineLiftDecision:
+    measurement_scope: str
+    headline_lift_allowed: bool
+    reason_codes: tuple[str, ...]
+    reducer_name: str
+    reduced_result_sha256: str
+    final_audit_receipt: FinalAuditReceipt | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "measurement_scope": self.measurement_scope,
+            "headline_lift_allowed": self.headline_lift_allowed,
+            "headline_lift_reason_codes": list(self.reason_codes),
+            "headline_lift_reducer": self.reducer_name or None,
+            "headline_lift_result_sha256": self.reduced_result_sha256 or None,
+            "final_audit_receipt": (
+                {
+                    "cohort_id": self.final_audit_receipt.cohort_id,
+                    "report_id": self.final_audit_receipt.report_id,
+                    "source_case_ids": list(self.final_audit_receipt.source_case_ids),
+                    "reducer_name": self.final_audit_receipt.reducer_name,
+                    "result_sha256": self.final_audit_receipt.result_sha256,
+                }
+                if self.final_audit_receipt is not None else None
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -176,6 +340,472 @@ class T2AnchorReport:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _ancestry_roots(nodes: Sequence[SemanticAncestry]) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Resolve each source to its transitive root, rejecting unknown parents and cycles."""
+
+    parents: dict[str, str] = {}
+    failures: list[str] = []
+    for node in nodes:
+        if not node.source_id:
+            failures.append("semantic_ancestry_missing_source_id")
+            continue
+        if node.source_id in parents:
+            failures.append(f"duplicate_semantic_source:{node.source_id}")
+            continue
+        parents[node.source_id] = node.parent_source_id
+    roots: dict[str, str] = {}
+    for source_id in parents:
+        seen: list[str] = []
+        current = source_id
+        while current:
+            if current in seen:
+                failures.append(f"semantic_ancestry_cycle:{source_id}")
+                break
+            seen.append(current)
+            parent = parents.get(current)
+            if parent is None:
+                failures.append(f"semantic_ancestry_unknown_parent:{current}")
+                break
+            if not parent:
+                roots[source_id] = current
+                break
+            current = parent
+    return roots, tuple(dict.fromkeys(failures))
+
+
+def validate_evaluation_split(
+    cohorts: Sequence[EvaluationCohort],
+    ancestry: Sequence[SemanticAncestry],
+) -> EvaluationSplitReport:
+    """Validate M2 roles over complete topology clusters and semantic relatives.
+
+    Semantic similarity is an explicit producer assertion.  This validator protects
+    known reconstructed/renamed descendants transitively; it does not claim to
+    discover an unrecorded relationship from a case name or outcome packet.
+    """
+
+    roots, ancestry_failures = _ancestry_roots(ancestry)
+    failures: list[str] = list(ancestry_failures)
+    cohort_ids: set[str] = set()
+    case_owners: dict[str, str] = {}
+    cluster_roles: dict[str, set[str]] = {}
+    ancestry_roles: dict[str, set[str]] = {}
+    for cohort in cohorts:
+        if not cohort.cohort_id or cohort.cohort_id in cohort_ids:
+            failures.append(f"duplicate_or_missing_cohort_id:{cohort.cohort_id or '<missing>'}")
+        cohort_ids.add(cohort.cohort_id)
+        if cohort.role not in EVALUATION_ROLES:
+            failures.append(f"unknown_evaluation_role:{cohort.role or '<missing>'}")
+        if not cohort.topology_cluster_id:
+            failures.append(f"{cohort.cohort_id}:missing_topology_cluster_id")
+        if not cohort.source_case_ids:
+            failures.append(f"{cohort.cohort_id}:missing_source_case_ids")
+        if not cohort.semantic_source_ids:
+            failures.append(f"{cohort.cohort_id}:missing_semantic_source_ids")
+        if cohort.role in {"promotion_validation", "final_audit"} and (
+            not cohort.prospective_budget_id
+            or cohort.prospective_case_budget <= 0
+            or len(cohort.source_case_ids) > cohort.prospective_case_budget
+        ):
+            failures.append(f"{cohort.cohort_id}:validation_role_missing_or_exceeding_prospective_case_budget")
+        if cohort.role == "promotion_validation" and (
+            not cohort.multiplicity_policy_id
+            or cohort.multiplicity_policy_id.casefold() != "bonferroni"
+            or cohort.multiplicity_alpha is None
+            or not 0.0 < cohort.multiplicity_alpha <= 1.0
+            or cohort.prospective_look_count <= 0
+        ):
+            failures.append(f"{cohort.cohort_id}:promotion_validation_missing_multiplicity_policy")
+        for case_id in cohort.source_case_ids:
+            owner = case_owners.setdefault(case_id, cohort.cohort_id)
+            if owner != cohort.cohort_id:
+                failures.append(f"source_case_cross_role_or_cohort:{case_id}")
+        cluster_roles.setdefault(cohort.topology_cluster_id, set()).add(cohort.role)
+        for source_id in cohort.semantic_source_ids:
+            root = roots.get(source_id)
+            if root is None:
+                failures.append(f"{cohort.cohort_id}:semantic_source_not_in_ancestry:{source_id}")
+                continue
+            ancestry_roles.setdefault(root, set()).add(cohort.role)
+    for cluster_id, roles in cluster_roles.items():
+        if len(roles) > 1:
+            failures.append(f"topology_cluster_cross_role:{cluster_id}")
+    for root, roles in ancestry_roles.items():
+        if len(roles) > 1:
+            failures.append(f"semantic_ancestry_cross_role:{root}")
+    return EvaluationSplitReport(
+        cohorts=tuple(cohorts),
+        ancestry_roots=roots,
+        failures=tuple(dict.fromkeys(failures)),
+    )
+
+
+@contextmanager
+def _split_use_lock(path: str | Path):
+    """Serialize local evaluator reservations; the history has one writer at a time."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output.with_name(f"{output.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield output
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _append_split_use_record(output: Path, record: SplitUseRecord) -> str:
+    payload = record.to_dict()
+    with output.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"record_hash": content_hash(payload), **payload}, sort_keys=True))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return str(output)
+
+
+def append_split_use_record(path: str | Path, record: SplitUseRecord) -> str:
+    """Durably append evaluator metadata before any protected-case opener runs."""
+
+    with _split_use_lock(path) as output:
+        return _append_split_use_record(output, record)
+
+
+def _load_split_use_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def load_split_use_history(path: str | Path) -> list[dict[str, Any]]:
+    with _split_use_lock(path) as output:
+        return _load_split_use_history(output)
+
+
+def validate_split_use_history(rows: Sequence[Mapping[str, Any]]) -> tuple[SplitUseRecord, ...]:
+    """Validate an append-only split-use history without reading case contents."""
+
+    records: list[SplitUseRecord] = []
+    reservations: dict[str, SplitUseRecord] = {}
+    retired: set[str] = set()
+    for index, row in enumerate(rows):
+        payload = dict(row)
+        record_hash = _text(payload.pop("record_hash", ""))
+        if record_hash != content_hash(payload):
+            raise ValueError(f"split_use_row_{index}:record_hash_mismatch")
+        if payload.pop("schema", "") != SPLIT_USE_SCHEMA:
+            raise ValueError(f"split_use_row_{index}:schema_mismatch")
+        record = SplitUseRecord(**payload)
+        if record.record_kind not in {"reservation", "retirement"}:
+            raise ValueError(f"split_use_row_{index}:unknown_record_kind")
+        if not all((record.reservation_id, record.registry_id, record.release_cohort_id, record.cohort_id, record.role)):
+            raise ValueError(f"split_use_row_{index}:missing_identity")
+        if record.record_kind == "reservation":
+            if record.reservation_id in reservations:
+                raise ValueError(f"split_use_row_{index}:duplicate_reservation")
+            if not record.source_case_ids or not record.ancestry_roots or not record.topology_cluster_id:
+                raise ValueError(f"split_use_row_{index}:reservation_metadata_missing")
+            reservations[record.reservation_id] = record
+        else:
+            reservation = reservations.get(record.reservation_id)
+            if reservation is None:
+                raise ValueError(f"split_use_row_{index}:retirement_without_reservation")
+            if record.reservation_id in retired:
+                raise ValueError(f"split_use_row_{index}:duplicate_retirement")
+            if (record.role != "final_audit" or not record.reducer_name or not record.result_sha256
+                    or not record.report_id):
+                raise ValueError(f"split_use_row_{index}:retirement_binding_missing")
+            if any(
+                getattr(record, field_name) != getattr(reservation, field_name)
+                for field_name in ("registry_id", "release_cohort_id", "cohort_id", "role", "topology_cluster_id", "ancestry_roots", "source_case_ids", "prospective_budget_id", "multiplicity_alpha_allocation")
+            ):
+                raise ValueError(f"split_use_row_{index}:retirement_identity_mismatch")
+            retired.add(record.reservation_id)
+        if record.role == "promotion_validation" and (
+            record.record_kind != "reservation" or record.multiplicity_alpha_allocation is None
+            or not 0.0 < record.multiplicity_alpha_allocation <= 1.0
+        ):
+            raise ValueError(f"split_use_row_{index}:promotion_multiplicity_allocation_missing")
+        records.append(record)
+    return tuple(records)
+
+
+def reserve_evaluation_cohort(
+    history_path: str | Path,
+    *,
+    registry_id: str,
+    release_cohort_id: str,
+    cohort_id: str,
+    cohorts: Sequence[EvaluationCohort],
+    ancestry: Sequence[SemanticAncestry],
+    reservation_id: str,
+    opener: Callable[[tuple[str, ...]], Any],
+) -> Any:
+    """Reserve first, then invoke the supplied case opener.
+
+    The reservation itself consumes a final use, including when ``opener`` raises
+    or the process stops before retirement is written.  Only registered case IDs
+    reach the opener; this helper never reads an outcome packet or path itself.
+    """
+
+    split = validate_evaluation_split(cohorts, ancestry)
+    if not split.valid:
+        raise ValueError("evaluation_split_invalid:" + ";".join(split.failures))
+    registry = _text(registry_id)
+    release = _text(release_cohort_id)
+    reservation = _text(reservation_id)
+    cohort = next((item for item in cohorts if item.cohort_id == _text(cohort_id)), None)
+    if not registry or not release or not reservation or cohort is None:
+        raise ValueError("split_reservation_identity_missing")
+    roots = tuple(sorted({split.ancestry_roots[source] for source in cohort.semantic_source_ids}))
+    record = SplitUseRecord(
+        record_kind="reservation", reservation_id=reservation, registry_id=registry,
+        release_cohort_id=release, cohort_id=cohort.cohort_id, role=cohort.role,
+        topology_cluster_id=cohort.topology_cluster_id, ancestry_roots=roots,
+        source_case_ids=cohort.source_case_ids,
+        prospective_budget_id=cohort.prospective_budget_id,
+        multiplicity_alpha_allocation=(
+            cohort.multiplicity_alpha / cohort.prospective_look_count
+            if cohort.role == "promotion_validation" and cohort.multiplicity_alpha is not None
+            else None
+        ),
+    )
+    # The read/check/append sequence is one serialized local operation.  The
+    # opener runs only after its durable reservation is released from the lock.
+    with _split_use_lock(history_path) as output:
+        existing = validate_split_use_history(_load_split_use_history(output))
+        if any(item.record_kind == "reservation" and item.reservation_id == reservation for item in existing):
+            raise ValueError("split_reservation_id_already_used")
+        for prior in existing:
+            if prior.record_kind != "reservation" or prior.registry_id != registry:
+                continue
+            same_family = prior.topology_cluster_id == cohort.topology_cluster_id or bool(set(prior.ancestry_roots) & set(roots))
+            if cohort.role in {"promotion_validation", "final_audit"} and prior.role == "dev" and same_family:
+                raise ValueError("protected_cohort_previously_exposed_to_dev")
+            if cohort.role in {"promotion_validation", "final_audit"} and prior.role in {"promotion_validation", "final_audit"} and prior.role != cohort.role and same_family:
+                raise ValueError("protected_cohort_previously_assigned_to_different_role")
+            if cohort.role == "final_audit" and prior.role == "final_audit" and same_family:
+                raise ValueError("final_audit_cohort_already_reserved")
+        if cohort.role == "promotion_validation":
+            used = sum(
+                item.record_kind == "reservation" and item.registry_id == registry
+                and item.role == "promotion_validation"
+                and (item.topology_cluster_id == cohort.topology_cluster_id
+                     or bool(set(item.ancestry_roots) & set(roots)))
+                for item in existing
+            )
+            if used >= cohort.prospective_look_count:
+                raise ValueError("promotion_validation_look_budget_exhausted")
+        _append_split_use_record(output, record)
+    return opener(cohort.source_case_ids)
+
+
+def retire_final_audit_reservation(
+    history_path: str | Path,
+    *,
+    reservation_id: str,
+    report_id: str,
+    reducer_name: str,
+    reduced_result: Mapping[str, Any],
+) -> SplitUseRecord:
+    """Append a report binding for a previously consumed final-audit reservation."""
+
+    with _split_use_lock(history_path) as output:
+        records = validate_split_use_history(_load_split_use_history(output))
+        reservation = next((item for item in records if item.record_kind == "reservation" and item.reservation_id == _text(reservation_id)), None)
+        if reservation is None or reservation.role != "final_audit":
+            raise ValueError("final_audit_reservation_not_found")
+        if any(item.record_kind == "retirement" and item.reservation_id == reservation.reservation_id for item in records):
+            raise ValueError("final_audit_reservation_already_retired")
+        record = SplitUseRecord(
+            record_kind="retirement", reservation_id=reservation.reservation_id, registry_id=reservation.registry_id,
+            release_cohort_id=reservation.release_cohort_id, cohort_id=reservation.cohort_id, role=reservation.role,
+            topology_cluster_id=reservation.topology_cluster_id, ancestry_roots=reservation.ancestry_roots,
+            source_case_ids=reservation.source_case_ids, prospective_budget_id=reservation.prospective_budget_id,
+            reducer_name=_text(reducer_name),
+            result_sha256=content_hash({"reducer_name": _text(reducer_name), "result": dict(reduced_result)}),
+            report_id=_text(report_id), multiplicity_alpha_allocation=reservation.multiplicity_alpha_allocation,
+        )
+        _append_split_use_record(output, record)
+        return record
+
+
+def _headline_request(value: Mapping[str, Any]) -> tuple[EvaluationSplitReport, str, str, str, str, tuple[Mapping[str, Any], ...]]:
+    """Decode public metadata only; final-audit contents never enter this schema."""
+
+    cohort_rows = value.get("cohorts")
+    ancestry_rows = value.get("semantic_ancestry")
+    history_rows = value.get("split_use_history")
+    if not isinstance(cohort_rows, list) or not isinstance(ancestry_rows, list) or not isinstance(history_rows, list):
+        raise ValueError("headline request requires cohorts, semantic_ancestry, and split_use_history lists")
+    cohorts = tuple(
+        EvaluationCohort(
+            cohort_id=row.get("cohort_id", ""),
+            role=row.get("role", ""),
+            topology_cluster_id=row.get("topology_cluster_id", ""),
+            source_case_ids=tuple(row.get("source_case_ids") or ()),
+            semantic_source_ids=tuple(row.get("semantic_source_ids") or ()),
+            prospective_budget_id=row.get("prospective_budget_id", ""),
+            prospective_case_budget=row.get("prospective_case_budget", 0),
+            prospective_look_count=row.get("prospective_look_count", 0),
+            multiplicity_policy_id=row.get("multiplicity_policy_id", ""),
+            multiplicity_alpha=row.get("multiplicity_alpha"),
+        )
+        for row in cohort_rows
+        if isinstance(row, Mapping)
+    )
+    if len(cohorts) != len(cohort_rows):
+        raise ValueError("headline cohort metadata must be objects")
+    ancestry = tuple(
+        SemanticAncestry(row.get("source_id", ""), row.get("parent_source_id", ""))
+        for row in ancestry_rows
+        if isinstance(row, Mapping)
+    )
+    if len(ancestry) != len(ancestry_rows):
+        raise ValueError("headline ancestry metadata must be objects")
+    if any(not isinstance(row, Mapping) for row in history_rows):
+        raise ValueError("split-use history metadata must be objects")
+    return (
+        validate_evaluation_split(cohorts, ancestry),
+        _text(value.get("split_registry_id")),
+        _text(value.get("release_cohort_id")),
+        _text(value.get("cohort_id")),
+        _text(value.get("report_id")),
+        tuple(history_rows),
+    )
+
+
+def headline_lift_decision(
+    reduced_result: Mapping[str, Any],
+    *,
+    reducer_name: str,
+    headline_request: Mapping[str, Any] | None = None,
+    producer_case_ids: Sequence[str] | None = None,
+    producer_origins: Sequence[Mapping[str, Any]] | None = None,
+    history_source_bound: bool = False,
+) -> HeadlineLiftDecision:
+    """Allow an opt-in headline only when a final cohort has one exact receipt.
+
+    The receipt binds the actual reducer output, so a caller-owned summary flag
+    cannot promote development numbers.  Replaying the same receipt and same
+    bytes stays valid; a second report for that cohort is refused as reuse.
+    """
+
+    reducer = _text(reducer_name)
+    result_hash = content_hash({"reducer_name": reducer, "result": dict(reduced_result)}) if reducer else ""
+    if headline_request is None:
+        return HeadlineLiftDecision("development", False, ("headline_not_requested",), reducer, result_hash)
+    try:
+        split, registry_id, release_cohort_id, cohort_id, report_id, history_rows = _headline_request(headline_request)
+    except (TypeError, ValueError, AttributeError) as exc:
+        return HeadlineLiftDecision("headline_request_refused", False, (f"invalid_headline_request:{type(exc).__name__}",), reducer, result_hash)
+    failures = list(split.failures)
+    cohort = next((item for item in split.cohorts if item.cohort_id == cohort_id), None)
+    if cohort is None:
+        failures.append("headline_cohort_not_found")
+    elif cohort.role != "final_audit":
+        failures.append("headline_requires_final_audit_cohort")
+    if not report_id:
+        failures.append("headline_report_id_missing")
+    if not registry_id:
+        failures.append("headline_split_registry_missing")
+    if not release_cohort_id:
+        failures.append("headline_release_cohort_missing")
+    derived_case_ids = tuple(_text(item) for item in (producer_case_ids or ()) if _text(item))
+    if not derived_case_ids or len(set(derived_case_ids)) != len(derived_case_ids):
+        failures.append("headline_producer_case_ids_unbound")
+    elif cohort is not None and tuple(derived_case_ids) != tuple(cohort.source_case_ids):
+        failures.append("headline_producer_case_ids_mismatch")
+    origins = tuple(producer_origins or ())
+    if not origins:
+        failures.append("headline_producer_origin_unbound")
+    else:
+        origin_case_ids: list[str] = []
+        for origin in origins:
+            if not isinstance(origin, Mapping):
+                failures.append("headline_producer_origin_malformed")
+                continue
+            origin_case_id = _text(origin.get("source_case_id"))
+            origin_case_ids.append(origin_case_id)
+            if not all(_text(origin.get(key)) for key in ("split_registry_id", "cohort_id", "role", "source_case_id")):
+                failures.append("headline_producer_origin_unbound")
+            if _text(origin.get("split_registry_id")) != registry_id:
+                failures.append("headline_producer_registry_mismatch")
+            if _text(origin.get("cohort_id")) != cohort_id:
+                failures.append("headline_producer_cohort_mismatch")
+            if _text(origin.get("role")).casefold() != "final_audit":
+                failures.append("headline_producer_role_not_final_audit")
+        if not all(origin_case_ids) or set(origin_case_ids) != set(derived_case_ids):
+            failures.append("headline_producer_origin_case_ids_mismatch")
+    if history_source_bound is not True:
+        failures.append("headline_receipt_history_not_source_bound")
+    if headline_request.get("receipt_history_complete") is not True:
+        failures.append("headline_receipt_history_unknown")
+    receipt = None
+    try:
+        history = validate_split_use_history(history_rows)
+    except (TypeError, ValueError, AttributeError) as exc:
+        failures.append(f"split_use_history_invalid:{type(exc).__name__}")
+        history = ()
+    reservations = [
+        item for item in history
+        if item.record_kind == "reservation" and item.registry_id == registry_id
+        and item.release_cohort_id == release_cohort_id and item.cohort_id == cohort_id
+    ]
+    if len(reservations) != 1:
+        failures.append("final_audit_reservation_missing_or_reused")
+    else:
+        reservation = reservations[0]
+        if reservation.role != "final_audit" or (
+            cohort is not None and (
+                reservation.topology_cluster_id != cohort.topology_cluster_id
+                or tuple(reservation.source_case_ids) != tuple(cohort.source_case_ids)
+            )
+        ):
+            failures.append("final_audit_reservation_metadata_mismatch")
+        if cohort is not None:
+            cohort_roots = {
+                split.ancestry_roots[source]
+                for source in cohort.semantic_source_ids
+                if source in split.ancestry_roots
+            }
+            family_reservations = [
+                item for item in history
+                if item.record_kind == "reservation" and item.registry_id == registry_id
+                and item.role == "final_audit"
+                and (item.topology_cluster_id == cohort.topology_cluster_id
+                     or bool(set(item.ancestry_roots) & cohort_roots))
+            ]
+            if len(family_reservations) != 1:
+                failures.append("final_audit_reservation_missing_or_reused")
+        retirements = [item for item in history if item.record_kind == "retirement" and item.reservation_id == reservation.reservation_id]
+        if len(retirements) != 1:
+            failures.append("final_audit_retirement_missing_or_reused")
+        else:
+            retirement = retirements[0]
+            receipt = FinalAuditReceipt(
+                cohort_id=retirement.cohort_id, report_id=retirement.report_id,
+                source_case_ids=retirement.source_case_ids, reducer_name=retirement.reducer_name,
+                result_sha256=retirement.result_sha256,
+            )
+            if receipt.report_id != report_id:
+                failures.append("final_audit_retirement_report_id_mismatch")
+            if receipt.reducer_name != reducer:
+                failures.append("final_audit_retirement_reducer_mismatch")
+            if receipt.result_sha256 != result_hash:
+                failures.append("final_audit_retirement_result_mismatch")
+    return HeadlineLiftDecision(
+        measurement_scope="final_audit" if not failures else "headline_request_refused",
+        headline_lift_allowed=not failures,
+        reason_codes=tuple(dict.fromkeys(failures or ["final_audit_receipt_bound"])),
+        reducer_name=reducer,
+        reduced_result_sha256=result_hash,
+        final_audit_receipt=receipt if not failures else None,
+    )
 
 
 def _sha256_file(path: str | Path) -> str:

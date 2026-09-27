@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ai.hillclimb.evaluation_foundation import (
+    EvaluationCohort,
+    FinalAuditReceipt,
     FrozenArtifactConfiguration,
     PairedIdentityValidation,
     bind_candidate_surface,
@@ -12,10 +16,17 @@ from ai.hillclimb.evaluation_foundation import (
     build_t2_anchor_report,
     byte_identity_matches,
     compose_official_reset_workflow,
+    headline_lift_decision,
+    append_split_use_record,
+    load_split_use_history,
+    reserve_evaluation_cohort,
     lint_candidate_text,
     run_integrity_audit,
     run_t0_triage,
     snapshot_byte_hashes,
+    SemanticAncestry,
+    SplitUseRecord,
+    validate_evaluation_split,
     validate_known_different_artifacts,
     validate_paired_identity,
 )
@@ -138,6 +149,213 @@ def _candidate(surface: str = "prompt-overlay", surface_class: str = SURFACE_CLA
         hypothesis="one hypothesis",
         mechanism="one mechanism",
     )
+
+
+def _final_cohort() -> EvaluationCohort:
+    return EvaluationCohort(
+        cohort_id="final-1", role="final_audit", topology_cluster_id="cluster-final",
+        source_case_ids=("final-case-1",), semantic_source_ids=("final-source",),
+        prospective_budget_id="final-budget-1", prospective_case_budget=1,
+    )
+
+
+def _history_row(record: SplitUseRecord) -> dict:
+    payload = record.to_dict()
+    return {"record_hash": content_hash(payload), **payload}
+
+
+def _headline_request(result: dict, *, extra_history=()) -> dict:
+    reservation = SplitUseRecord(
+        record_kind="reservation", reservation_id="reservation-1", registry_id="split-registry-1",
+        release_cohort_id="release-1", cohort_id="final-1", role="final_audit",
+        topology_cluster_id="cluster-final", ancestry_roots=("final-source",), source_case_ids=("final-case-1",),
+    )
+    retirement = SplitUseRecord(
+        record_kind="retirement", reservation_id="reservation-1", registry_id="split-registry-1",
+        release_cohort_id="release-1", cohort_id="final-1", role="final_audit",
+        topology_cluster_id="cluster-final", ancestry_roots=("final-source",), source_case_ids=("final-case-1",),
+        report_id="report-1", reducer_name="comparison",
+        result_sha256=content_hash({"reducer_name": "comparison", "result": result}),
+    )
+    return {
+        "split_registry_id": "split-registry-1", "release_cohort_id": "release-1", "cohort_id": "final-1", "report_id": "report-1", "receipt_history_complete": True,
+        "cohorts": [{
+            "cohort_id": "final-1", "role": "final_audit", "topology_cluster_id": "cluster-final",
+            "source_case_ids": ["final-case-1"], "semantic_source_ids": ["final-source"],
+            "prospective_budget_id": "final-budget-1", "prospective_case_budget": 1,
+        }],
+        "semantic_ancestry": [{"source_id": "final-source"}],
+        "split_use_history": [_history_row(reservation), _history_row(retirement), *extra_history],
+    }
+
+
+def test_split_validator_rejects_transitive_semantic_relatives_and_unbounded_promotion_validation():
+    report = validate_evaluation_split(
+        (
+            EvaluationCohort("dev", "dev", "cluster-dev", ("dev-case",), ("original",)),
+            EvaluationCohort(
+                "final", "final_audit", "cluster-final", ("final-case",), ("reconstructed",),
+                prospective_budget_id="final-budget", prospective_case_budget=1,
+            ),
+            EvaluationCohort(
+                "promotion", "promotion_validation", "cluster-promotion", ("promotion-case",), ("promotion",),
+                prospective_budget_id="promotion-budget", prospective_case_budget=1,
+            ),
+        ),
+        (
+            SemanticAncestry("original"), SemanticAncestry("renamed", "original"),
+            SemanticAncestry("reconstructed", "renamed"), SemanticAncestry("promotion"),
+        ),
+    )
+
+    assert report.valid is False
+    assert "semantic_ancestry_cross_role:original" in report.failures
+    assert "promotion:promotion_validation_missing_multiplicity_policy" in report.failures
+
+
+def test_headline_guard_binds_computed_numbers_case_ids_and_one_final_receipt():
+    result = {"delta": 0.5, "harness": 1, "bare": 0}
+    request = _headline_request(result)
+
+    allowed = headline_lift_decision(
+        result, reducer_name="comparison", headline_request=request,
+        producer_case_ids=("final-case-1",),
+        producer_origins=({"split_registry_id": "split-registry-1", "cohort_id": "final-1", "role": "final_audit", "source_case_id": "final-case-1"},),
+        history_source_bound=True,
+    )
+    assert allowed.headline_lift_allowed is True
+    assert allowed.measurement_scope == "final_audit"
+
+    forged_dev = headline_lift_decision(
+        result, reducer_name="comparison", headline_request=request,
+        producer_case_ids=("dev-case-1",),
+        producer_origins=({"split_registry_id": "split-registry-1", "cohort_id": "final-1", "role": "final_audit", "source_case_id": "dev-case-1"},),
+        history_source_bound=True,
+    )
+    assert forged_dev.headline_lift_allowed is False
+    assert "headline_producer_case_ids_mismatch" in forged_dev.reason_codes
+
+    changed_numbers = headline_lift_decision(
+        {**result, "delta": 0.6}, reducer_name="comparison", headline_request=request,
+        producer_case_ids=("final-case-1",),
+        producer_origins=({"split_registry_id": "split-registry-1", "cohort_id": "final-1", "role": "final_audit", "source_case_id": "final-case-1"},),
+        history_source_bound=True,
+    )
+    assert "final_audit_retirement_result_mismatch" in changed_numbers.reason_codes
+
+    reused = _headline_request(result, extra_history=(_history_row(SplitUseRecord(
+        record_kind="reservation", reservation_id="reservation-2", registry_id="split-registry-1",
+        release_cohort_id="release-1", cohort_id="final-1", role="final_audit",
+        topology_cluster_id="cluster-final", ancestry_roots=("final-source",), source_case_ids=("final-case-1",),
+    )),))
+    reuse_decision = headline_lift_decision(
+        result, reducer_name="comparison", headline_request=reused,
+        producer_case_ids=("final-case-1",),
+        producer_origins=({"split_registry_id": "split-registry-1", "cohort_id": "final-1", "role": "final_audit", "source_case_id": "final-case-1"},),
+        history_source_bound=True,
+    )
+    assert "final_audit_reservation_missing_or_reused" in reuse_decision.reason_codes
+
+
+def test_split_reservation_consumes_before_opener_and_caps_final_and_promotion_uses(tmp_path):
+    history = tmp_path / "split-use.jsonl"
+    final = EvaluationCohort(
+        "final", "final_audit", "cluster-final", ("final-case",), ("final-source",),
+        prospective_budget_id="final-budget", prospective_case_budget=1,
+    )
+    renamed_final = EvaluationCohort(
+        "final-renamed", "final_audit", "cluster-final", ("final-case-renamed",), ("renamed-source",),
+        prospective_budget_id="final-budget", prospective_case_budget=1,
+    )
+    ancestry = (SemanticAncestry("final-source"), SemanticAncestry("renamed-source", "final-source"))
+    opened = []
+
+    def crash_after_open(case_ids):
+        opened.append(case_ids)
+        raise RuntimeError("synthetic opener crash")
+
+    with pytest.raises(RuntimeError, match="synthetic opener crash"):
+        reserve_evaluation_cohort(
+            history, registry_id="registry", release_cohort_id="release", cohort_id="final",
+            cohorts=(final, renamed_final), ancestry=ancestry, reservation_id="reserve-final", opener=crash_after_open,
+        )
+    assert opened == [("final-case",)]
+    assert len(load_split_use_history(history)) == 1
+    with pytest.raises(ValueError, match="final_audit_cohort_already_reserved"):
+        reserve_evaluation_cohort(
+            history, registry_id="registry", release_cohort_id="release", cohort_id="final-renamed",
+            cohorts=(final, renamed_final), ancestry=ancestry, reservation_id="reserve-renamed", opener=lambda _ids: None,
+        )
+    with pytest.raises(ValueError, match="final_audit_cohort_already_reserved"):
+        reserve_evaluation_cohort(
+            history, registry_id="registry", release_cohort_id="later-release", cohort_id="final-renamed",
+            cohorts=(renamed_final,), ancestry=ancestry, reservation_id="reserve-later-release", opener=lambda _ids: None,
+        )
+
+    promotion_history = tmp_path / "promotion-use.jsonl"
+    promotion = EvaluationCohort(
+        "promotion", "promotion_validation", "cluster-promotion", ("promotion-case",), ("promotion-source",),
+        prospective_budget_id="promotion-budget", prospective_case_budget=1, prospective_look_count=2,
+        multiplicity_policy_id="bonferroni", multiplicity_alpha=0.1,
+    )
+    promotion_ancestry = (SemanticAncestry("promotion-source"),)
+    for reservation_id in ("promotion-1", "promotion-2"):
+        reserve_evaluation_cohort(
+            promotion_history, registry_id="registry", release_cohort_id="release", cohort_id="promotion",
+            cohorts=(promotion,), ancestry=promotion_ancestry, reservation_id=reservation_id, opener=lambda ids: ids,
+        )
+    rows = load_split_use_history(promotion_history)
+    assert [row["multiplicity_alpha_allocation"] for row in rows] == [0.05, 0.05]
+    with pytest.raises(ValueError, match="promotion_validation_look_budget_exhausted"):
+        renamed_promotion = EvaluationCohort(
+            "promotion-renamed", "promotion_validation", "cluster-promotion", ("promotion-case-renamed",), ("promotion-source",),
+            prospective_budget_id="promotion-budget", prospective_case_budget=1, prospective_look_count=2,
+            multiplicity_policy_id="bonferroni", multiplicity_alpha=0.1,
+        )
+        reserve_evaluation_cohort(
+            promotion_history, registry_id="registry", release_cohort_id="later-release", cohort_id="promotion-renamed",
+            cohorts=(renamed_promotion,), ancestry=promotion_ancestry, reservation_id="promotion-3", opener=lambda _ids: None,
+        )
+
+
+def test_split_reservation_rejects_prior_dev_exposure_of_the_same_ancestry(tmp_path):
+    history = tmp_path / "dev-use.jsonl"
+    prior_dev = SplitUseRecord(
+        record_kind="reservation", reservation_id="dev-1", registry_id="registry", release_cohort_id="old-release",
+        cohort_id="dev", role="dev", topology_cluster_id="old-cluster", ancestry_roots=("source-root",),
+        source_case_ids=("dev-case",),
+    )
+    append_split_use_record(history, prior_dev)
+    final = EvaluationCohort(
+        "final", "final_audit", "final-cluster", ("final-case",), ("renamed-source",),
+        prospective_budget_id="final-budget", prospective_case_budget=1,
+    )
+    with pytest.raises(ValueError, match="protected_cohort_previously_exposed_to_dev"):
+        reserve_evaluation_cohort(
+            history, registry_id="registry", release_cohort_id="new-release", cohort_id="final", cohorts=(final,),
+            ancestry=(SemanticAncestry("source-root"), SemanticAncestry("renamed-source", "source-root")),
+            reservation_id="final-1", opener=lambda _ids: None,
+        )
+
+
+def test_split_reservation_rejects_prior_promotion_assignment_of_renamed_final_family(tmp_path):
+    history = tmp_path / "promotion-to-final.jsonl"
+    append_split_use_record(history, SplitUseRecord(
+        record_kind="reservation", reservation_id="promotion-1", registry_id="registry", release_cohort_id="old-release",
+        cohort_id="old-promotion", role="promotion_validation", topology_cluster_id="old-cluster",
+        ancestry_roots=("source-root",), source_case_ids=("promotion-case",),
+        prospective_budget_id="old-budget", multiplicity_alpha_allocation=0.05,
+    ))
+    final = EvaluationCohort(
+        "renamed-final", "final_audit", "new-cluster", ("final-case",), ("renamed-source",),
+        prospective_budget_id="final-budget", prospective_case_budget=1,
+    )
+    with pytest.raises(ValueError, match="protected_cohort_previously_assigned_to_different_role"):
+        reserve_evaluation_cohort(
+            history, registry_id="registry", release_cohort_id="new-release", cohort_id="renamed-final", cohorts=(final,),
+            ancestry=(SemanticAncestry("source-root"), SemanticAncestry("renamed-source", "source-root")),
+            reservation_id="final-1", opener=lambda _ids: None,
+        )
 
 
 def _eval_result(

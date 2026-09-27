@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from ai.hillclimb.phase9_auto_harness_readiness import (
+from ai.hillclimb.auto_harness_readiness import (
     build_phase9_readiness_report,
     render_report,
 )
