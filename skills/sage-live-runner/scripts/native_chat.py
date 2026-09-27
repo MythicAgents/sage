@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import UTC, datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -33,6 +34,8 @@ if str(SAGE_PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(SAGE_PYTHON_ROOT))
 
 from ai.langgraph.request_events import control_transition_errors
+from dotenv_bootstrap import apply_dotenv, dotenv_paths
+from dotenv import dotenv_values
 
 # No directory-name fallback: guessing a Mythic checkout name would bake one machine's
 # layout into the repo. Point MYTHIC_ENV_PATH at your install (see .env.example), or set
@@ -122,6 +125,24 @@ query SageChannelRuntimeIdentity($channelId: Int!, $operationId: Int!) {
     where: {id: {_eq: $channelId}, operation_id: {_eq: $operationId}}
     limit: 2
   ) { id ai_metadata }
+}
+"""
+
+SUPERVISED_CHANNEL_NAME_QUERY = """
+query SageSupervisedChannelName($operationId: Int!, $name: String!) {
+  chat_channel(where: {
+    operation_id: {_eq: $operationId}, name: {_eq: $name}, archived: {_eq: false}
+  }, limit: 1) { id }
+}
+"""
+
+SUPERVISED_CHANNEL_READBACK_QUERY = """
+query SageSupervisedChannelReadback($operationId: Int!, $channelId: Int!) {
+  chat_channel(where: {
+    operation_id: {_eq: $operationId}, id: {_eq: $channelId}
+  }, limit: 2) {
+    id name channel_type locked archived last_message_id ai_metadata
+  }
 }
 """
 
@@ -352,17 +373,10 @@ def resolve_password(env_path: str | Path | None = None) -> str:
 
 def _read_env_defaults(path: Path | None = None) -> dict[str, str]:
     path = path or SAGE_ENV_PATH
-    values: dict[str, str] = {}
-    if not path.is_file():
-        return values
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("export "):
-            stripped = stripped[7:]
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
+    values = dict(os.environ)
+    # Match main.py without changing this operator process's environment.
+    for env_path in dotenv_paths(str(path.parent)):
+        apply_dotenv(dotenv_values(env_path), values)
     return values
 
 
@@ -372,10 +386,10 @@ def normalize_provider(value: str) -> str:
 
 
 def default_ai_metadata(extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    file_env = _read_env_defaults()
+    runtime_env = _read_env_defaults()
 
     def value(name: str, default: str = "") -> str:
-        return os.environ.get(name) or file_env.get(name) or default
+        return runtime_env.get(name) or default
 
     config: dict[str, Any] = {
         "provider": normalize_provider(value("provider", "openai")),
@@ -422,6 +436,8 @@ def canary_ai_metadata(
         raise ValueError(f"canary session_mode must be 'supervised' or 'conversation', not {session_mode!r}")
     metadata = default_ai_metadata()
     config = dict(metadata.get("config") or {})
+    if not config.get("model"):
+        raise RuntimeError("Cannot prepare an assisted channel: Sage model is not configured")
     config.update(
         {
             "mode": mode,
@@ -791,6 +807,86 @@ async def prepare_locked_channel(
         metadata=prepared_metadata,
     )
     return {**created, "prepared": True, "reused": False}
+
+
+async def prepare_supervised_channel(
+    client: Any, *, channel_name: str, max_steps: int,
+    expect_provider: str, expect_model: str, expect_endpoint_sha256: str,
+) -> dict[str, Any]:
+    """Create one empty human-operated channel and verify Mythic's stored state."""
+    name = channel_name.strip()
+    if len(name) < 12 or name.casefold() in {"sage", "supervised", "new channel"}:
+        raise ValueError("--channel-name must be a nonempty distinctive visible name")
+    if name != channel_name:
+        raise ValueError("--channel-name must not have leading or trailing whitespace")
+    expected_hash = expect_endpoint_sha256.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise ValueError("--expect-endpoint-sha256 must be 64 hexadecimal characters")
+    metadata = canary_ai_metadata(max_steps=max_steps)
+    config = metadata["config"]
+    endpoint = str(config.get("API_ENDPOINT") or "")
+    actual_hash = hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else ""
+    if (
+        config.get("provider") != expect_provider
+        or config.get("model") != expect_model
+        or actual_hash != expected_hash
+    ):
+        raise RuntimeError("local Sage provider, model, or endpoint does not match the expected contract")
+    operation_id = _require_exact_int(
+        getattr(client, "current_operation_id", None), "Current Mythic operation id"
+    )
+    existing = await mythic.execute_custom_query(
+        client, SUPERVISED_CHANNEL_NAME_QUERY,
+        variables={"operationId": operation_id, "name": name},
+    )
+    if not isinstance(existing, dict) or not isinstance(existing.get("chat_channel"), list):
+        raise RuntimeError("could not check visible channel name in the current operation")
+    if existing["chat_channel"]:
+        raise RuntimeError("visible channel name already exists in the current operation")
+    try:
+        created = await create_locked_channel(
+            client, name=name, description="Human-operated Sage supervised evaluation",
+            metadata=metadata,
+        )
+    except Exception:
+        raise RuntimeError("supervised channel creation failed") from None
+    channel_id = created["chat_channel_id"]
+    try:
+        observed = await mythic.execute_custom_query(
+            client, SUPERVISED_CHANNEL_READBACK_QUERY,
+            variables={"operationId": operation_id, "channelId": channel_id},
+        )
+        rows = observed.get("chat_channel") if isinstance(observed, dict) else None
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise RuntimeError("server readback returned no unique channel")
+        row = rows[0]
+        stored_metadata = row.get("ai_metadata")
+        stored_config = stored_metadata.get("config") if isinstance(stored_metadata, dict) else None
+        if not isinstance(stored_config, dict) or not (
+            type(row.get("id")) is int and row["id"] == channel_id
+            and row.get("name") == name
+            and row.get("channel_type") == "ai"
+            and row.get("locked") is True
+            and row.get("archived") is False
+            and row.get("last_message_id") is None
+            and stored_config.get("provider") == expect_provider
+            and stored_config.get("model") == expect_model
+            and stored_config.get("mode") == "supervised"
+            and stored_config.get("autonomous_solve") is False
+            and type(stored_config.get("max_steps")) is int
+            and stored_config["max_steps"] == max_steps
+            and isinstance(stored_config.get("API_ENDPOINT"), str)
+            and hashlib.sha256(stored_config["API_ENDPOINT"].encode("utf-8")).hexdigest() == expected_hash
+        ):
+            raise RuntimeError("server-stored channel fields differ from the expected contract")
+    except Exception:
+        raise RuntimeError(f"created channel {channel_id} failed server readback") from None
+    return {
+        "chat_channel_id": channel_id, "chat_channel_name": name,
+        "provider": expect_provider, "model": expect_model,
+        "endpoint_sha256": expected_hash, "mode": "supervised",
+        "autonomous_solve": False, "max_steps": max_steps, "empty": True,
+    }
 
 
 async def validate_prepared_channel_bot_ownership(
@@ -1486,6 +1582,30 @@ def build_transcript_export(
     }
 
 
+def build_request_snapshot_export(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Preserve an in-flight request without requiring terminal control transitions."""
+    request = dict(snapshot.get("request") or {})
+    messages = sorted(
+        [dict(row) for row in snapshot.get("messages") or []],
+        key=lambda row: row.get("id") if type(row.get("id")) is int else -1,
+    )
+    _validate_transcript_identity(request, messages)
+    result = request_snapshot_result(
+        {**snapshot, "request": request, "messages": messages}
+    )
+    return {
+        "schema": "sage-native-chat-request-snapshot-v1",
+        "capture_state": (
+            "pending_operator_input"
+            if str(request.get("status") or "").casefold() == APPROVABLE_INPUT_REQUEST_STATUS
+            and _has_input_requested(messages)
+            else "request_snapshot"
+        ),
+        "request": request,
+        **result,
+    }
+
+
 def write_transcript_export(
     path: str | Path, transcript: dict[str, Any]
 ) -> Path:
@@ -1514,7 +1634,21 @@ def default_transcript_export_path(request_id: int) -> Path:
     )
 
 
-def record_transcript_export(path: str | Path, request_id: int) -> dict[str, Any]:
+def default_request_snapshot_export_path(request_id: int) -> Path:
+    retention = _load_module(
+        "sage_artifact_retention_for_native_chat",
+        ARTIFACT_RETENTION_PATH,
+    )
+    return retention.allocate_artifact_path(
+        "transcripts/native-chat",
+        f"request-{request_id}-snapshot.json",
+        root=REPO_ROOT,
+    )
+
+
+def record_transcript_export(
+    path: str | Path, request_id: int, *, artifact_type: str = "native-chat-transcript"
+) -> dict[str, Any]:
     retention = _load_module(
         "sage_artifact_retention_record_for_native_chat",
         ARTIFACT_RETENTION_PATH,
@@ -1531,7 +1665,7 @@ def record_transcript_export(path: str | Path, request_id: int) -> dict[str, Any
     record = retention.record_artifact(
         resolved,
         category="transcripts/native-chat",
-        artifact_type="native-chat-transcript",
+        artifact_type=artifact_type,
         context=f"Mythic native chat request {request_id}",
         root=REPO_ROOT,
     )
@@ -1881,13 +2015,19 @@ async def _run(args: argparse.Namespace) -> int:
             "api_token": await ensure_api_token(client, name=args.token_name),
             "prepared_channel": prepared_channel,
         }
+    elif args.command == "prepare-supervised":
+        result = await prepare_supervised_channel(
+            client, channel_name=args.channel_name, max_steps=args.max_steps,
+            expect_provider=args.expect_provider, expect_model=args.expect_model,
+            expect_endpoint_sha256=args.expect_endpoint_sha256,
+        )
     elif args.command == "demo-prepare":
         result = await prepare_bhusa_demo_channel(
             client,
             channel_name=args.channel_name,
             token_name=args.token_name,
         )
-    elif args.command in {"status", "follow", "transcript"}:
+    elif args.command in {"status", "follow", "transcript", "snapshot"}:
         request_id = await resolve_request_selector(
             client,
             request_id=args.request_id,
@@ -1911,6 +2051,20 @@ async def _run(args: argparse.Namespace) -> int:
             written = write_transcript_export(output_path, result)
             result["export_path"] = str(written)
             result["retention"] = record_transcript_export(written, request_id)
+        elif args.command == "snapshot":
+            capture = build_request_snapshot_export(snapshot)
+            output_path = args.output or default_request_snapshot_export_path(request_id)
+            written = write_transcript_export(output_path, capture)
+            result = {
+                "schema": capture["schema"],
+                "chat_channel_id": capture["chat_channel_id"],
+                "chat_request_id": capture["chat_request_id"],
+                "capture_state": capture["capture_state"],
+                "export_path": str(written),
+                "retention": record_transcript_export(
+                    written, request_id, artifact_type="native-chat-request-snapshot"
+                ),
+            }
         else:
             result = request_snapshot_result(snapshot)
             if args.output_mode == "eval":
@@ -2022,6 +2176,12 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = sub.add_parser("prepare")
     prepare.add_argument("--channel-name", default=DEFAULT_PREPARED_CHANNEL_NAME)
     prepare.add_argument("--token-name", default="Sage native chat")
+    prepare_supervised = sub.add_parser("prepare-supervised")
+    prepare_supervised.add_argument("--channel-name", required=True)
+    prepare_supervised.add_argument("--max-steps", type=int, default=12)
+    prepare_supervised.add_argument("--expect-provider", required=True)
+    prepare_supervised.add_argument("--expect-model", required=True)
+    prepare_supervised.add_argument("--expect-endpoint-sha256", required=True)
     demo_prepare = sub.add_parser("demo-prepare")
     demo_prepare.add_argument("--channel-name", default=DEFAULT_BHUSA_DEMO_CHANNEL_NAME)
     demo_prepare.add_argument("--token-name", default="Sage BHUSA demo")
@@ -2051,6 +2211,9 @@ def build_parser() -> argparse.ArgumentParser:
     transcript = sub.add_parser("transcript")
     add_request_selector(transcript)
     transcript.add_argument("--output")
+    request_snapshot = sub.add_parser("snapshot")
+    add_request_selector(request_snapshot)
+    request_snapshot.add_argument("--output")
     canary = sub.add_parser("canary")
     canary.add_argument("--prompt", required=True)
     canary.add_argument("--timeout", type=int, default=300)

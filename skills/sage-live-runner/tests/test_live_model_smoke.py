@@ -178,6 +178,9 @@ def test_two_turn_same_channel_success_and_exact_nonce(monkeypatch, tmp_path):
     secret_marker = "unit-test-secret-marker"
     monkeypatch.setattr(smoke, "dotenv_bootstrap", SimpleNamespace(load_sage_dotenv=lambda _directory: monkeypatch.setenv("API_KEY", secret_marker) or ["API_KEY"]))
     monkeypatch.setattr(smoke, "configured_identity", lambda: channel["chat_runtime_identity"])
+    monkeypatch.setattr(smoke.native_chat, "_read_env_defaults", lambda: {
+        "provider": "openai", "model": "real-model",
+    })
     monkeypatch.setattr(smoke.native_chat, "login", lambda **_kw: asyncio.sleep(0, result=object()))
     seen_metadata = {}
     async def fake_channel(*_a, **kw):

@@ -274,7 +274,10 @@ def test_ai_metadata_preserves_explicit_display_override():
     assert metadata["channel_metadata_display"] == display_override
 
 
-def test_canary_metadata_inherits_display_without_changing_authority():
+def test_canary_metadata_inherits_display_without_changing_authority(monkeypatch):
+    monkeypatch.setattr(native_chat, "_read_env_defaults", lambda: {
+        "provider": "openai", "model": "synthetic-test-model",
+    })
     metadata = native_chat.canary_ai_metadata(max_steps=8)
 
     assert metadata["channel_metadata_display"] == {"display": "expanded; max=15"}

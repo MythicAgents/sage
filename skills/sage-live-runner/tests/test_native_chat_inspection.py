@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -36,6 +37,238 @@ def test_canary_metadata_is_supervised_without_changing_auto_defaults(
     assert canary["config"]["autonomous_solve"] is False
     assert canary["config"]["max_steps"] == 12
     assert canary["config"]["model"] == "test-model"
+
+
+def test_canary_metadata_uses_runtime_env_precedence(monkeypatch, tmp_path):
+    (tmp_path / ".env.local").write_text(
+        "provider=OpenAI\nmodel=local-model\nAPI_ENDPOINT=https://local.example/v1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "provider=anthropic\nmodel=tracked-model\nAPI_ENDPOINT=https://tracked.example/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_chat, "SAGE_ENV_PATH", tmp_path / ".env")
+    for name in ("provider", "model", "API_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+
+    config = native_chat.canary_ai_metadata(max_steps=12)["config"]
+    assert (config["provider"], config["model"], config["API_ENDPOINT"]) == (
+        "openai", "local-model", "https://local.example/v1"
+    )
+    assert config["mode"] == "supervised"
+    assert config["autonomous_solve"] is False
+
+    monkeypatch.setenv("provider", "bedrock")
+    monkeypatch.setenv("model", "process-model")
+    monkeypatch.setenv("API_ENDPOINT", "https://process.example/v1")
+    config = native_chat.canary_ai_metadata(max_steps=12)["config"]
+    assert (config["provider"], config["model"], config["API_ENDPOINT"]) == (
+        "bedrock", "process-model", "https://process.example/v1"
+    )
+
+
+def test_canary_metadata_skips_empty_file_values_and_rejects_missing_model(
+    monkeypatch, tmp_path
+):
+    (tmp_path / ".env.local").write_text(
+        "provider=\nmodel=\nAPI_ENDPOINT=\nmodel_name=near-match\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "provider=Anthropic\nmodel=tracked-model\nAPI_ENDPOINT=https://tracked.example/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_chat, "SAGE_ENV_PATH", tmp_path / ".env")
+    for name in ("provider", "model", "API_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+
+    config = native_chat.canary_ai_metadata(max_steps=12)["config"]
+    assert (config["provider"], config["model"], config["API_ENDPOINT"]) == (
+        "anthropic", "tracked-model", "https://tracked.example/v1"
+    )
+
+    (tmp_path / ".env").write_text("provider=OpenAI\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Sage model is not configured"):
+        native_chat.canary_ai_metadata(max_steps=12)
+
+
+def test_empty_supervised_channel_sends_resolved_runtime_metadata(monkeypatch, tmp_path):
+    (tmp_path / ".env.local").write_text(
+        "provider=OpenAI\nmodel=local-model\nAPI_ENDPOINT=https://local.example/v1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_chat, "SAGE_ENV_PATH", tmp_path / ".env")
+    for name in ("provider", "model", "API_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SAGE_BACKING_APITOKEN_ID", "7")
+    monkeypatch.setenv("SAGE_CHAT_CONTAINER_ID", "3")
+    sent = []
+
+    async def fake_query(_client, query, variables=None):
+        assert query == native_chat.CREATE_CHANNEL_MUTATION
+        sent.append(variables)
+        return {"chatCreateChannel": {"status": "success", "channel_id": 9}}
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    metadata = native_chat.canary_ai_metadata(max_steps=12)
+    result = asyncio.run(native_chat.create_locked_channel(object(), metadata=metadata))
+
+    assert result["chat_channel_id"] == 9
+    assert len(sent) == 1
+    assert sent[0]["metadata"]["config"] == metadata["config"]
+    config = sent[0]["metadata"]["config"]
+    assert (config["provider"], config["model"], config["API_ENDPOINT"]) == (
+        "openai", "local-model", "https://local.example/v1"
+    )
+
+
+def _supervised_prepare_case(monkeypatch, tmp_path, *, existing=False, stored_change=None):
+    endpoint = "https://provider.example/v1/private"
+    (tmp_path / ".env").write_text(
+        "provider=openai\nmodel=test-model\nAPI_ENDPOINT=" + endpoint + "\nAPI_KEY=secret-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_chat, "SAGE_ENV_PATH", tmp_path / ".env")
+    for key in ("provider", "model", "API_ENDPOINT", "API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SAGE_BACKING_APITOKEN_ID", "7")
+    monkeypatch.setenv("SAGE_CHAT_CONTAINER_ID", "3")
+    client = type("Client", (), {"current_operation_id": 4})()
+    calls = []
+    created_metadata = {}
+
+    async def fake_query(_client, query, variables=None):
+        calls.append((query, variables))
+        if query == native_chat.SUPERVISED_CHANNEL_NAME_QUERY:
+            return {"chat_channel": [{"id": 6}] if existing else []}
+        if query == native_chat.CREATE_CHANNEL_MUTATION:
+            created_metadata.update(variables["metadata"])
+            return {"chatCreateChannel": {"status": "success", "channel_id": 9}}
+        if query == native_chat.SUPERVISED_CHANNEL_READBACK_QUERY:
+            row = {
+                "id": 9, "name": "HUMAN TRIAL 20260924", "channel_type": "ai",
+                "locked": True, "archived": False, "last_message_id": None,
+                "ai_metadata": created_metadata,
+            }
+            if stored_change:
+                stored_change(row)
+            return {"chat_channel": [row]}
+        raise AssertionError("unexpected query")
+
+    monkeypatch.setattr(native_chat.mythic, "execute_custom_query", fake_query)
+    kwargs = {
+        "channel_name": "HUMAN TRIAL 20260924", "max_steps": 12,
+        "expect_provider": "openai", "expect_model": "test-model",
+        "expect_endpoint_sha256": hashlib.sha256(endpoint.encode()).hexdigest(),
+    }
+    return client, calls, kwargs, endpoint
+
+
+def test_prepare_supervised_creates_and_reads_back_empty_channel(monkeypatch, tmp_path):
+    client, calls, kwargs, endpoint = _supervised_prepare_case(monkeypatch, tmp_path)
+    result = asyncio.run(native_chat.prepare_supervised_channel(client, **kwargs))
+    assert [query for query, _ in calls] == [
+        native_chat.SUPERVISED_CHANNEL_NAME_QUERY,
+        native_chat.CREATE_CHANNEL_MUTATION,
+        native_chat.SUPERVISED_CHANNEL_READBACK_QUERY,
+    ]
+    assert calls[0][1] == {"operationId": 4, "name": kwargs["channel_name"]}
+    assert calls[2][1] == {"operationId": 4, "channelId": 9}
+    assert result == {
+        "chat_channel_id": 9, "chat_channel_name": kwargs["channel_name"],
+        "provider": "openai", "model": "test-model",
+        "endpoint_sha256": kwargs["expect_endpoint_sha256"], "mode": "supervised",
+        "autonomous_solve": False, "max_steps": 12, "empty": True,
+    }
+    assert "secret-key" not in json.dumps(result)
+    assert endpoint not in json.dumps(result)
+    sent = calls[1][1]["metadata"]["config"]
+    assert sent["API_KEY"] == "secret-key"
+    assert sent["mode"] == "supervised" and sent["autonomous_solve"] is False
+
+
+@pytest.mark.parametrize("mismatch", ["expect_provider", "expect_model", "expect_endpoint_sha256"])
+def test_prepare_supervised_refuses_local_contract_mismatch_before_creation(
+    monkeypatch, tmp_path, mismatch
+):
+    client, calls, kwargs, _ = _supervised_prepare_case(monkeypatch, tmp_path)
+    kwargs[mismatch] = "0" * 64 if mismatch == "expect_endpoint_sha256" else "wrong"
+    with pytest.raises(RuntimeError, match="local Sage provider, model, or endpoint"):
+        asyncio.run(native_chat.prepare_supervised_channel(client, **kwargs))
+    assert calls == []
+
+
+def test_prepare_supervised_refuses_duplicate_name_before_creation(monkeypatch, tmp_path):
+    client, calls, kwargs, _ = _supervised_prepare_case(monkeypatch, tmp_path, existing=True)
+    with pytest.raises(RuntimeError, match="visible channel name already exists"):
+        asyncio.run(native_chat.prepare_supervised_channel(client, **kwargs))
+    assert [query for query, _ in calls] == [native_chat.SUPERVISED_CHANNEL_NAME_QUERY]
+
+
+@pytest.mark.parametrize("name", ["", "Sage", "TRIAL", "  HUMAN TRIAL 20260924  "])
+def test_prepare_supervised_requires_distinct_visible_name(monkeypatch, tmp_path, name):
+    client, calls, kwargs, _ = _supervised_prepare_case(monkeypatch, tmp_path)
+    kwargs["channel_name"] = name
+    with pytest.raises(ValueError, match="--channel-name"):
+        asyncio.run(native_chat.prepare_supervised_channel(client, **kwargs))
+    assert calls == []
+
+
+@pytest.mark.parametrize("change", [
+    lambda row: row.update(id=10),
+    lambda row: row.update(name="wrong"),
+    lambda row: row.update(locked=False),
+    lambda row: row.update(last_message_id=1),
+    lambda row: row["ai_metadata"]["config"].update(mode="auto"),
+    lambda row: row["ai_metadata"]["config"].update(autonomous_solve=True),
+    lambda row: row["ai_metadata"]["config"].update(max_steps=13),
+    lambda row: row["ai_metadata"]["config"].update(API_ENDPOINT="https://wrong.example"),
+])
+def test_prepare_supervised_refuses_stored_drift_with_created_id(
+    monkeypatch, tmp_path, change
+):
+    client, calls, kwargs, endpoint = _supervised_prepare_case(
+        monkeypatch, tmp_path, stored_change=change
+    )
+    with pytest.raises(RuntimeError, match="created channel 9 failed server readback") as exc:
+        asyncio.run(native_chat.prepare_supervised_channel(client, **kwargs))
+    assert endpoint not in str(exc.value)
+    assert "secret-key" not in str(exc.value)
+    assert calls[-1][0] == native_chat.SUPERVISED_CHANNEL_READBACK_QUERY
+
+
+def test_prepare_supervised_parser_requires_contract_and_name():
+    parser = native_chat.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["prepare-supervised", "--channel-name", "TRIAL"])
+    args = parser.parse_args([
+        "prepare-supervised", "--channel-name", "TRIAL 20260924",
+        "--expect-provider", "openai", "--expect-model", "test-model",
+        "--expect-endpoint-sha256", "a" * 64,
+    ])
+    assert args.max_steps == 12
+    assert args.command == "prepare-supervised"
+
+
+def test_prepare_supervised_cli_prints_only_verified_fields(monkeypatch, tmp_path, capsys):
+    client, _calls, kwargs, endpoint = _supervised_prepare_case(monkeypatch, tmp_path)
+
+    async def fake_login(**_kwargs):
+        return client
+
+    monkeypatch.setattr(native_chat, "login", fake_login)
+    args = native_chat.build_parser().parse_args([
+        "prepare-supervised", "--channel-name", kwargs["channel_name"],
+        "--expect-provider", kwargs["expect_provider"],
+        "--expect-model", kwargs["expect_model"],
+        "--expect-endpoint-sha256", kwargs["expect_endpoint_sha256"],
+    ])
+    assert asyncio.run(native_chat._run(args)) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output)["empty"] is True
+    assert endpoint not in output
+    assert "secret-key" not in output
 
 
 def test_resolve_latest_request_is_scoped_to_sage_channels(monkeypatch):
@@ -800,6 +1033,7 @@ def test_deleted_input_card_does_not_count_as_active_hitl():
 
 def test_canary_cli_never_reuses_prepared_channel(monkeypatch, capsys):
     observed = {}
+    monkeypatch.setenv("model", "inert-test-model")
 
     async def fake_login(**_kwargs):
         return object()
@@ -853,6 +1087,7 @@ def test_canary_cli_never_reuses_prepared_channel(monkeypatch, capsys):
 def test_canary_cli_fails_without_actual_input_request(
     monkeypatch, capsys, result
 ):
+    monkeypatch.setenv("model", "inert-test-model")
     async def fake_login(**_kwargs):
         return object()
 
@@ -878,11 +1113,92 @@ def test_parser_requires_explicit_request_selector():
     status = parser.parse_args(["status", "--request-id", "5"])
     follow = parser.parse_args(["follow", "--latest", "--channel-id", "7"])
     transcript = parser.parse_args(["transcript", "--latest"])
+    request_snapshot = parser.parse_args(["snapshot", "--request-id", "9"])
 
     assert status.request_id == 5
     assert follow.latest is True
     assert follow.channel_id == 7
     assert transcript.command == "transcript"
+    assert request_snapshot.request_id == 9
+
+
+def test_paused_request_snapshot_preserves_card_without_terminal_grammar():
+    snapshot = {
+        "request": {
+            "id": 9,
+            "channel_id": 4,
+            "request_message_id": 1,
+            "status": "streaming",
+            "error": "",
+        },
+        "messages": [
+            {
+                "id": 3,
+                "channel_id": 4,
+                "chat_request_id": 9,
+                "message": "approve getprivs",
+                "metadata": {
+                    "special_type": "input_requested",
+                    "input_requested": {"status": "pending", "type": "tool_approval"},
+                },
+            },
+            {
+                "id": 1,
+                "channel_id": 4,
+                "chat_request_id": None,
+                "message": "Check privileges",
+                "metadata": {},
+            },
+        ],
+    }
+
+    captured = native_chat.build_request_snapshot_export(snapshot)
+    assert captured["schema"] == "sage-native-chat-request-snapshot-v1"
+    assert captured["capture_state"] == "pending_operator_input"
+    assert captured["chat_request_id"] == 9
+    assert captured["chat_channel_id"] == 4
+    assert [row["id"] for row in captured["messages"]] == [1, 3]
+    assert captured["messages"][1]["metadata"]["input_requested"]["status"] == "pending"
+    with pytest.raises(RuntimeError, match="control transition sequence"):
+        native_chat.build_transcript_export(snapshot)
+
+    snapshot["messages"][0]["channel_id"] = 5
+    with pytest.raises(RuntimeError, match="channel_id"):
+        native_chat.build_request_snapshot_export(snapshot)
+
+
+def test_snapshot_command_writes_private_paused_capture(tmp_path, monkeypatch, capsys):
+    async def fake_login(**_kwargs):
+        return object()
+
+    async def fake_fetch(_client, request_id):
+        assert request_id == 9
+        return {
+            "request": {
+                "id": 9, "channel_id": 4, "request_message_id": 1,
+                "status": "streaming", "error": "",
+            },
+            "messages": [
+                {"id": 1, "channel_id": 4, "chat_request_id": None,
+                 "message": "prompt", "metadata": {}},
+                {"id": 3, "channel_id": 4, "chat_request_id": 9,
+                 "message": "card", "metadata": {
+                     "special_type": "input_requested",
+                     "input_requested": {"status": "pending"},
+                 }},
+            ],
+        }
+
+    monkeypatch.setattr(native_chat, "login", fake_login)
+    monkeypatch.setattr(native_chat, "fetch_request_snapshot", fake_fetch)
+    output = tmp_path / "paused.json"
+    args = native_chat.build_parser().parse_args(
+        ["snapshot", "--request-id", "9", "--output", str(output)]
+    )
+    assert asyncio.run(native_chat._run(args)) == 0
+    assert json.loads(output.read_text())["capture_state"] == "pending_operator_input"
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert json.loads(capsys.readouterr().out)["export_path"] == str(output)
 
 
 def test_transcript_writer_is_atomic_json(tmp_path):
