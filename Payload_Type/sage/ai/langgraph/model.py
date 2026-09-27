@@ -1218,6 +1218,19 @@ def _apply_bedrock_patch():
     logger.info("Applied Bedrock empty content fix to _convert_message_to_dict")
 
 
+def _eval_temperature() -> float | None:
+    raw = os.environ.get("SAGE_EVAL_TEMPERATURE")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("SAGE_EVAL_TEMPERATURE must be a finite number from 0 through 2") from None
+    if not math.isfinite(value) or not 0 <= value <= 2:
+        raise ValueError("SAGE_EVAL_TEMPERATURE must be a finite number from 0 through 2")
+    return value
+
+
 def _patch_model_for_bedrock(model: BaseChatModel) -> BaseChatModel:
     """Apply the langchain_openai empty-content monkeypatch and return the model unchanged.
 
@@ -1950,6 +1963,18 @@ class _TurnAuthorityToolMiddleware(AgentMiddleware):
                 self._model._consume_turn_authority_attempt()
         self._record_selected_control_summary(selected_control)
         return handler(request)
+
+
+def _provider_continuation_text(agent_name: str | None) -> str:
+    """Give the provider's required user turn a role-specific internal purpose."""
+    if agent_name == "Supervisor":
+        return (
+            "Internal Supervisor continuation: assess the available specialist results "
+            "against the current operator request. If the request is fulfilled, call "
+            "respond_to_user with the substantive answer through reuse or synthesis. "
+            "If work remains, choose the next step within the existing authorization."
+        )
+    return "Internal conversation continuation. The operator's request and authorization are unchanged."
 
 
 class _TurnAuthorityInjectionMiddleware(AgentMiddleware):
