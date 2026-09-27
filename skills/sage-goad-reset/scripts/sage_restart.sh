@@ -31,7 +31,7 @@ append_snapshot_override() {
 }
 
 normalize_local_mythic_hosts() {
-  [[ "${SAGE_LOCAL_MYTHIC_HOSTS:-1}" == "1" ]] || return
+  [[ "${SAGE_LOCAL_MYTHIC_HOSTS:-1}" == "1" ]] || return 0
 
   local rabbit_host mythic_host nginx_host
   rabbit_host="$(snapshot_last_value RABBITMQ_HOST)"
@@ -96,7 +96,7 @@ require_bloodhound_dir() {
   fi
 }
 
-# 1. Locate Sage as the main.py child of the `sage` tmux pane (robust to the cmdline form).
+# 1. Locate the Sage lifecycle supervisor under the `sage` tmux pane.
 # A clean reset intentionally stops the local process and may leave no tmux session at all.  Create
 # the maintained session here so this helper's documented fresh-start path is actually reachable.
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -106,7 +106,12 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "▶ created tmux session '$SESSION' for fresh local Sage start" >&2
 fi
 PANE_PID="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' | head -1)"
-PID="$(pgrep -P "$PANE_PID" -f 'main.py' | head -1 || true)"
+find_launch_child() {
+  # A capture-mode launch has process_observer.py between the tmux pane and main.py.
+  # Both are owned lifecycle supervisors with the same snapshot environment and cwd.
+  pgrep -P "$PANE_PID" -f 'main.py|process_observer.py' | head -1 || true
+}
+PID="$(find_launch_child)"
 
 # 2. PRE-FLIGHT the relaunch interpreter BEFORE killing anything (never leave Sage down on a bad py).
 [[ -x "$VENV_PY" ]] || { echo "ERR: venv python $VENV_PY not executable" >&2; exit 1; }
@@ -173,12 +178,12 @@ fi
 tmux send-keys -t "$SESSION" "$VENV_PY $HERE/_sage_relaunch.py '$CWD' '$VENV_PY' '$SNAP'" Enter
 NEW_PID=""
 for _ in $(seq 1 "$STARTUP_DISCOVERY_SECONDS"); do
-  NEW_PID="$(pgrep -P "$PANE_PID" -f 'main.py' | head -1 || true)"
+  NEW_PID="$(find_launch_child)"
   [[ -n "$NEW_PID" ]] && break
   sleep 1
 done
 [[ -n "$NEW_PID" ]] || {
-  echo "ERR: Sage relaunch did not produce a main.py child under tmux pane $PANE_PID" >&2
+  echo "ERR: Sage relaunch did not produce a Sage/observer child under tmux pane $PANE_PID" >&2
   exit 1
 }
 for _ in $(seq 1 "$STARTUP_STABILITY_SECONDS"); do

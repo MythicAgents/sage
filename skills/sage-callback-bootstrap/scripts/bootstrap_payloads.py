@@ -75,6 +75,10 @@ DEFAULT_SAGE_CHAT_REGISTRATION_TIMEOUT_SECONDS = 30
 DEFAULT_MAX_CLOCK_SKEW_SECONDS = 60.0
 DEFAULT_FOOTHOLD_HOST = "CASTELBLACK"
 DEFAULT_FOOTHOLD_USER_MATCH = "samwell.tarly"
+REGISTRATION_DIAGNOSTIC_SCHEMA = "sage-chat-registration-diagnostic-v1"
+REGISTRATION_DIAGNOSTIC_STAGE = "sage_chat_container_registration"
+REGISTRATION_DIAGNOSTIC_EVENT = "sage_chat_registration_diagnostic"
+REGISTRATION_DIAGNOSTIC_MAX_ROWS = 32
 REQUIRED_RUNTIME_DBS = (
     "Payload_Type/sage/sage.db",
     "Payload_Type/sage/.phoenix/phoenix.db",
@@ -464,8 +468,25 @@ def summarize_callback_readiness(
 
 
 async def login(args: argparse.Namespace):
+    if os.environ.get("SAGE_RESOURCE_BUDGET_CONFIG") or os.environ.get("SAGE_RESOURCE_BUDGET_LEDGER"):
+        sage_root = REPO_ROOT / "Payload_Type" / "sage"
+        if str(sage_root) not in sys.path:
+            sys.path.insert(0, str(sage_root))
+        from ai.resource_clients import install
+        install()
     password = args.password or resolve_password(Path(args.env_path))
     return await mythic.login(server_ip=args.server, username=args.user, password=password)
+
+
+def reserve_effect(amounts: dict[str, int], operation: str) -> None:
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+
+    ledger = resource_budget.configured_ledger()
+    if ledger is not None:
+        ledger.reserve(amounts, operation)
 
 
 async def inspect(client) -> dict[str, Any]:
@@ -753,6 +774,42 @@ def validate_registration_wait_controls(
     )
 
 
+def _emit_registration_diagnostic(*, status: str, attempt_count: int,
+                                  rows: list[dict[str, Any]], error_category: str | None = None) -> None:
+    if not str(os.environ.get("SAGE_OBSERVATION_DIRECTORY") or "").strip():
+        return
+    module_path = REPO_ROOT / "Payload_Type/sage/ai/observation_channel.py"
+    spec = importlib.util.spec_from_file_location("sage_bootstrap_observation_channel", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    projected = []
+    for row in rows[:REGISTRATION_DIAGNOSTIC_MAX_ROWS]:
+        row_id, running, deleted = row.get("id"), row.get("container_running"), row.get("deleted")
+        if type(row_id) is int and type(running) is bool and type(deleted) is bool:
+            projected.append({"id": row_id, "running": running, "deleted": deleted})
+    payload = {
+        "event": REGISTRATION_DIAGNOSTIC_EVENT,
+        "schema": REGISTRATION_DIAGNOSTIC_SCHEMA,
+        "stage": REGISTRATION_DIAGNOSTIC_STAGE,
+        "status": status,
+        "attempt_count": attempt_count,
+        "containers": projected,
+    }
+    if error_category is not None:
+        payload["error_category"] = error_category
+    module.emit("tool_event", payload)
+
+
+def _registration_error_category(error: BaseException) -> str:
+    if isinstance(error, TimeoutError): return "timeout"
+    if isinstance(error, ConnectionError): return "connection"
+    if isinstance(error, PermissionError): return "permission"
+    if isinstance(error, ValueError): return "value"
+    if isinstance(error, RuntimeError): return "runtime"
+    return "other"
+
+
 async def wait_for_running_sage_chat_container(
     client,
     *,
@@ -765,8 +822,17 @@ async def wait_for_running_sage_chat_container(
     )
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     last_rows: list[dict[str, Any]] = []
+    attempts = 0
     while True:
-        chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+        attempts += 1
+        try:
+            chat = await mythic.execute_custom_query(client, CHAT_CONTAINER_QUERY)
+        except BaseException as exc:
+            _emit_registration_diagnostic(
+                status="error", attempt_count=attempts, rows=last_rows,
+                error_category=_registration_error_category(exc),
+            )
+            raise
         last_rows = chat.get("consuming_container", [])
         running_chat = [
             row
@@ -774,8 +840,12 @@ async def wait_for_running_sage_chat_container(
             if row.get("container_running") and not row.get("deleted")
         ]
         if running_chat:
+            _emit_registration_diagnostic(status="success", attempt_count=attempts, rows=last_rows)
             return running_chat[0]
         if asyncio.get_running_loop().time() >= deadline:
+            _emit_registration_diagnostic(
+                status="timeout", attempt_count=attempts, rows=last_rows, error_category="timeout"
+            )
             raise RuntimeError(
                 "Timed out waiting for Sage chat container registration after restart; "
                 f"last containers: {json.dumps(last_rows, sort_keys=True)}"
@@ -821,6 +891,7 @@ async def post_callback_preflight(
 
 
 async def create_sage(client, args: argparse.Namespace) -> dict[str, Any]:
+    reserve_effect({"replacement_payloads": 1}, "replacement-payload")
     return await mythic.create_payload(
         client,
         payload_type_name="sage",
@@ -840,6 +911,7 @@ async def create_apollo(client, args: argparse.Namespace) -> dict[str, Any]:
             "Set APOLLO_CALLBACK_HOST in skills/sage-callback-bootstrap/.env "
             "or pass --callback-host."
         )
+    reserve_effect({"replacement_payloads": 1}, "replacement-payload")
     return await mythic.create_payload(
         client,
         payload_type_name="apollo",

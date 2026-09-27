@@ -3,10 +3,16 @@ from __future__ import annotations
 import asyncio
 import argparse
 import importlib.util
+import json
 import math
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "Payload_Type" / "sage"))
+from ai import resource_budget
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap_payloads.py"
@@ -14,6 +20,82 @@ SPEC = importlib.util.spec_from_file_location("bootstrap_payloads", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
+
+
+def _replacement_budget(tmp_path, limit=2):
+    config = tmp_path / "replacement-config.json"
+    ledger = tmp_path / "replacement-ledger.jsonl"
+    config.write_text(json.dumps({
+        "schema": resource_budget.CONFIG_SCHEMA,
+        "resources": {"replacement_payloads": {"limit": limit, "cleanup_reserve": 0}},
+        "calendar_seconds": 1000,
+        "cleanup_seconds": 1,
+    }))
+    return resource_budget.ResourceLedger(config, ledger)
+
+
+@pytest.mark.parametrize("metered", [False, True])
+def test_login_installs_optional_meter_before_client_io(monkeypatch, metered):
+    from ai import resource_clients
+    calls = []
+    monkeypatch.delenv("SAGE_RESOURCE_BUDGET_CONFIG", raising=False)
+    monkeypatch.delenv("SAGE_RESOURCE_BUDGET_LEDGER", raising=False)
+    if metered:
+        monkeypatch.setenv("SAGE_RESOURCE_BUDGET_CONFIG", "fixture-config")
+    monkeypatch.setattr(resource_clients, "install", lambda: calls.append("meter"))
+
+    async def fake_login(**kwargs):
+        assert calls == (["meter"] if metered else [])
+        assert kwargs == {"server_ip": "unit.invalid", "username": "fixture", "password": "fixture"}
+        calls.append("login")
+        return "client"
+
+    monkeypatch.setattr(bootstrap.mythic, "login", fake_login)
+    args = argparse.Namespace(server="unit.invalid", user="fixture", password="fixture", env_path="unused")
+    assert asyncio.run(bootstrap.login(args)) == "client"
+    assert calls[-1] == "login"
+
+
+def test_payload_create_reserves_once_and_retains_failed_build(monkeypatch, tmp_path):
+    ledger = _replacement_budget(tmp_path)
+    calls = []
+    monkeypatch.setattr(bootstrap, "reserve_effect", lambda amounts, operation: ledger.reserve(amounts, operation))
+    monkeypatch.setattr(bootstrap, "apollo_c2_profiles", lambda _args: [])
+    monkeypatch.setattr(bootstrap, "apollo_build_parameters", lambda _args: [])
+
+    async def create_payload(_client, **kwargs):
+        calls.append(kwargs["filename"])
+        if len(calls) == 2:
+            raise RuntimeError("build failure")
+        return {"build_phase": "success"}
+
+    monkeypatch.setattr(bootstrap.mythic, "create_payload", create_payload)
+    args = SimpleNamespace(callback_host="https://unit.invalid", apollo_filename="apollo.exe")
+    assert asyncio.run(bootstrap.create_apollo(object(), args))["build_phase"] == "success"
+    with pytest.raises(RuntimeError):
+        asyncio.run(bootstrap.create_apollo(object(), args))
+    assert calls == ["apollo.exe", "apollo.exe"]
+    assert ledger.status()["effective_resource_charges"]["replacement_payloads"] == 2
+
+
+def test_payload_create_prerequisite_and_exhaustion_deny_before_build(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        bootstrap, "reserve_effect", lambda *_a, **_k: pytest.fail("reserved before prerequisite"),
+    )
+    with pytest.raises(ValueError):
+        asyncio.run(bootstrap.create_apollo(object(), SimpleNamespace(callback_host="")))
+
+    ledger = _replacement_budget(tmp_path, 1)
+    ledger.reserve({"replacement_payloads": 1}, "prior")
+    monkeypatch.setattr(bootstrap, "reserve_effect", lambda amounts, operation: ledger.reserve(amounts, operation))
+    monkeypatch.setattr(bootstrap, "apollo_c2_profiles", lambda _args: [])
+    monkeypatch.setattr(bootstrap, "apollo_build_parameters", lambda _args: [])
+    monkeypatch.setattr(
+        bootstrap.mythic, "create_payload", lambda *_args, **_kwargs: pytest.fail("payload build dispatched"),
+    )
+    args = SimpleNamespace(callback_host="https://unit.invalid", apollo_filename="apollo.exe")
+    with pytest.raises(resource_budget.ResourceBudgetExceeded):
+        asyncio.run(bootstrap.create_apollo(object(), args))
 
 
 def _bootstrap_args(**overrides):
@@ -179,6 +261,30 @@ def test_registration_wait_accepts_zero_positive_and_default_controls(
     timeout_seconds, poll_seconds
 ) -> None:
     bootstrap.validate_registration_wait_controls(timeout_seconds, poll_seconds)
+
+
+def test_registration_wait_emits_typed_success_timeout_and_transport_error(monkeypatch):
+    diagnostics = []
+    monkeypatch.setattr(bootstrap, "_emit_registration_diagnostic", lambda **value: diagnostics.append(value))
+    async def success(*_args):
+        return {"consuming_container": [{"id": 7, "container_running": True, "deleted": False,
+                                          "name": "SYNTHETIC_SECRET"}]}
+    monkeypatch.setattr(bootstrap.mythic, "execute_custom_query", success)
+    asyncio.run(bootstrap.wait_for_running_sage_chat_container(object(), timeout_seconds=0, poll_seconds=0))
+    assert diagnostics == [{"status": "success", "attempt_count": 1, "rows": [{"id": 7,
+        "container_running": True, "deleted": False, "name": "SYNTHETIC_SECRET"}]}]
+    diagnostics.clear()
+    async def absent(*_args): return {"consuming_container": []}
+    monkeypatch.setattr(bootstrap.mythic, "execute_custom_query", absent)
+    with pytest.raises(RuntimeError, match="Timed out"):
+        asyncio.run(bootstrap.wait_for_running_sage_chat_container(object(), timeout_seconds=0, poll_seconds=0))
+    assert diagnostics == [{"status": "timeout", "attempt_count": 1, "rows": [], "error_category": "timeout"}]
+    diagnostics.clear()
+    async def failed(*_args): raise ConnectionError("SYNTHETIC_SECRET")
+    monkeypatch.setattr(bootstrap.mythic, "execute_custom_query", failed)
+    with pytest.raises(ConnectionError):
+        asyncio.run(bootstrap.wait_for_running_sage_chat_container(object(), timeout_seconds=0, poll_seconds=0))
+    assert diagnostics[0]["error_category"] == "connection" and "SYNTHETIC_SECRET" not in repr(diagnostics)
 
 
 def test_post_callback_preflight_is_task_free(monkeypatch) -> None:
