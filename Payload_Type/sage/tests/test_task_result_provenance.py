@@ -37,7 +37,7 @@ def _encoded_output(task_id: int, text: str):
 
 
 def _read_output(tools: MythicTools, task_id: int, text: str = "task output"):
-    async def fake_output(*, mythic, task_display_id):
+    async def fake_output(*, mythic, task_display_id, custom_return_attributes):
         assert task_display_id == task_id
         return _encoded_output(task_id, text)
 
@@ -72,6 +72,54 @@ def test_manual_prior_task_output_is_structured_and_marked_historical():
     assert "not issued by this request" in notice
 
 
+def test_output_read_preserves_source_callback_and_timestamps_through_sdk_and_cache():
+    tools = _tools("request-a")
+    row = {
+        "id": 100,
+        "timestamp": "2026-01-02T03:04:06",
+        "response_text": base64.b64encode(b"historical network observation").decode(),
+        "task": {
+            "id": 200,
+            "display_id": 24,
+            "command_name": "run",
+            "status": "completed",
+            "completed": True,
+            "timestamp": "2026-01-02T03:04:05",
+            "callback": {"display_id": 3},
+        },
+    }
+    queries = []
+
+    async def fake_post(*, mythic, query, variables):
+        queries.append((query, variables))
+        assert variables == {"task_display_id": 24}
+        return {"response": [row]}
+
+    async def completed(_task_id):
+        return True
+
+    # Exercise the real SDK query builder, not a mock of the producer being changed.
+    with (
+        patch.object(mythic_tools.mythic.mythic_utilities, "graphql_post", fake_post),
+        patch.object(tools, "_is_task_completed", completed),
+    ):
+        first = json.loads(asyncio.run(tools.get_all_task_output_by_task_id(24)))
+        tools.set_request_contract(_contract("request-b"))
+        second = json.loads(asyncio.run(tools.get_all_task_output_by_task_id(24)))
+
+    assert len(queries) == 1
+    assert "callback { display_id }" in queries[0][0]
+    assert "command_name timestamp" in queries[0][0]
+    assert "params" not in queries[0][0]
+    assert first["task_output"] == second["task_output"]
+    assert first["task_output"][0]["task"]["callback"] == {"display_id": 3}
+    assert first["task_output"][0]["task"]["timestamp"] == "2026-01-02T03:04:05"
+    assert first["task_output"][0]["timestamp"] == "2026-01-02T03:04:06"
+    assert first["task_output"][0]["response_text"] == "historical network observation"
+    assert second["provenance"]["current_request_id"] == "request-b"
+    assert second["provenance"]["origin"] == "historical_or_external"
+
+
 def test_exact_current_task_is_current_and_needs_no_historical_notice():
     tools = _tools()
     tools._record_current_request_task(24)
@@ -87,7 +135,7 @@ def test_completed_output_cache_recomputes_provenance_for_new_request():
     tools = _tools("request-a")
     tools._record_current_request_task(24)
 
-    async def fake_output(*, mythic, task_display_id):
+    async def fake_output(*, mythic, task_display_id, custom_return_attributes):
         return _encoded_output(task_display_id, "cached immutable output")
 
     async def completed(_task_id):
@@ -122,7 +170,7 @@ def test_completed_output_cache_does_not_decode_already_decoded_bytes_twice():
     tools = _tools("request-a")
     tools._record_current_request_task(24)
 
-    async def fake_output(*, mythic, task_display_id):
+    async def fake_output(*, mythic, task_display_id, custom_return_attributes):
         # The decoded text is itself valid base64. A second decode would silently change it to
         # "Test", so this catches request-neutral caches that rerun the wire decoder on a hit.
         return _encoded_output(task_display_id, "VGVzdA==")

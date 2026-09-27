@@ -43,7 +43,7 @@ def test_broad_signatures_are_read_scope_only_not_breaker_scope():
 
 
 def test_failed_task_output_is_clamped_on_second_fetch():
-    async def failed_output(mythic, task_display_id):
+    async def failed_output(mythic, task_display_id, custom_return_attributes):
         return [{"id": 1, "responses": "Traceback (most recent call last): boom"}]
 
     mt = _make_tools()
@@ -57,7 +57,7 @@ def test_failed_task_output_is_clamped_on_second_fetch():
 
 
 def test_success_output_is_never_clamped():
-    async def success_output(mythic, task_display_id):
+    async def success_output(mythic, task_display_id, custom_return_attributes):
         return [{"id": 1, "responses": "whoami => DA\\nuser"}]
 
     mt = _make_tools()

@@ -351,6 +351,25 @@ def test_classify_normal_task_output_as_success():
     assert classify_result("whoami", output) == ResultClass.SUCCESS
 
 
+def test_shell_service_config_error_control_field_is_success():
+    # A real supervised Mythic task returned this valid SC configuration, but the
+    # old substring check rendered its tool card as failed.
+    output = (
+        "[SC] QueryServiceConfig SUCCESS\r\n"
+        "SERVICE_NAME: MSSQL$SQLEXPRESS\r\n"
+        "        ERROR_CONTROL      : 1   NORMAL\r\n"
+        "        SERVICE_START_NAME : north.example\\sql_svc\r\n"
+    )
+    assert classify_result("shell", output) == ResultClass.SUCCESS
+    assert classify_result("shell", output + "Error: service query failed\r\n") == ResultClass.TRANSIENT
+
+
+def test_generic_error_hint_matches_diagnostic_tokens_without_substrings():
+    assert classify_result("shell", "ERROR_NOT_UNIQUE") == ResultClass.TRANSIENT
+    assert classify_result("shell", "Traceback (most recent call last):") == ResultClass.TRANSIENT
+    assert classify_result("shell", "errorcontrol status value: NORMAL") == ResultClass.SUCCESS
+
+
 def test_classify_make_token_hash_rejection_as_construction_failure():
     output = "Credential material is not a plaintext password."
 
