@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import importlib.util
 import json
 import os
 from pathlib import Path
 import ssl
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import urllib.request
 
@@ -24,6 +25,35 @@ DEFAULT_MAX_SKEW_SECONDS = 60.0
 RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"
 DEFAULT_MCP_SERVER = "ludus"
+
+
+def configured_resource_ledger() -> Any:
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+
+    ledger = resource_budget.configured_ledger()
+    if ledger is not None:
+        from ai import resource_clients
+        resource_clients.install()
+    return ledger
+
+
+def metered_ludus_urlopen(request: Any, *, timeout: float, context: ssl.SSLContext) -> Any:
+    ledger = configured_resource_ledger()
+    if ledger is None:
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+    path = REPO_ROOT / "skills" / "sage-goad-reset" / "scripts" / "ludus.py"
+    spec = importlib.util.spec_from_file_location("sage_goad_reset_ludus_meter", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load maintained Ludus meter")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._metered_urlopen(
+        request, timeout=timeout, context=context, ledger=ledger,
+        operation="ludus-control-request",
+    )
 
 
 def selected_mcp_server(mcp_server: str | None = None) -> str:
@@ -73,7 +103,7 @@ def load_inventory(
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(request, timeout=30, context=context) as response:
+    with metered_ludus_urlopen(request, timeout=30, context=context) as response:
         payload: Any = json.loads(response.read().decode("utf-8"))
     if isinstance(payload, dict):
         for key in ("inventory", "ansible_inventory", "result", "data"):
@@ -137,6 +167,7 @@ def windows_hosts(inventory: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def winrm_session(host: dict[str, Any]) -> Any:
+    configured_resource_ledger()
     import winrm
 
     address = host.get("ansible_host")
@@ -157,6 +188,9 @@ def winrm_session(host: dict[str, Any]) -> Any:
 
 
 def run_ps(session: Any, script: str, *, check: bool = True) -> dict[str, Any]:
+    ledger = configured_resource_ledger()
+    if ledger is not None:
+        ledger.reserve({"guest_commands": 1}, "guest-command-run-ps")
     response = session.run_ps(script)
     stdout = response.std_out.decode("utf-8", errors="replace").strip()
     stderr = response.std_err.decode("utf-8", errors="replace").strip()
@@ -263,6 +297,7 @@ DEFAULT_AUTH_POLL_SECONDS = 15.0
 def wait_for_winrm_auth(
     hosts: list[dict[str, Any]],
     *,
+    refresh_hosts: Callable[[], list[dict[str, Any]]] | None = None,
     timeout_seconds: float = DEFAULT_AUTH_WAIT_SECONDS,
     poll_seconds: float = DEFAULT_AUTH_POLL_SECONDS,
     sleep: Any = time.sleep,
@@ -276,11 +311,24 @@ def wait_for_winrm_auth(
     Observed 2026-08-01: `sync` died on DC01 that way, and a read-only `check` minutes later
     authenticated to all five hosts. This waits on the condition that actually matters.
     """
+    expected = {host.get("inventory_hostname"): host.get("ansible_host") for host in hosts}
+    if len(expected) != len(hosts) or not all(expected) or not all(expected.values()):
+        raise RuntimeError("WinRM inventory has duplicate host identities or missing addresses")
     deadline = now() + timeout_seconds
     attempts = 0
     last_error = ""
     while True:
         attempts += 1
+        if attempts > 1 and refresh_hosts is not None:
+            refreshed = refresh_hosts()
+            current = {host.get("inventory_hostname"): host.get("ansible_host") for host in refreshed}
+            if len(current) != len(refreshed) or current != expected:
+                raise RuntimeError("Ludus WinRM host identities changed during auth readiness")
+            by_name = {host["inventory_hostname"]: dict(host) for host in refreshed}
+            for host in hosts:
+                name = host["inventory_hostname"]
+                host.clear()
+                host.update(by_name[name])
         pending = []
         for host in hosts:
             try:
@@ -310,7 +358,10 @@ def sync_clocks(hosts: list[dict[str, Any]]) -> None:
     for host in hosts:
         target = datetime.now(timezone.utc).isoformat()
         run_ps(winrm_session(host), build_clock_sync_script(target))
-        print(f"set {host.get('inventory_hostname')} ({host.get('ansible_host')})")
+        print(
+            f"set {host.get('inventory_hostname')} ({host.get('ansible_host')})",
+            file=sys.stderr,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,8 +401,16 @@ def main() -> int:
         if not args.yes:
             print("sync changes guest clocks; pass --yes", file=sys.stderr)
             return 2
+        if len(hosts) != 5 or len({host.get("inventory_hostname") for host in hosts}) != 5:
+            raise RuntimeError("Expected exactly five GOAD Windows hosts before clock sync")
         if args.auth_wait_seconds > 0:
-            auth = wait_for_winrm_auth(hosts, timeout_seconds=args.auth_wait_seconds)
+            auth = wait_for_winrm_auth(
+                hosts,
+                refresh_hosts=lambda: windows_hosts(
+                    load_inventory(Path(args.mcp_path), args.range_id, args.mcp_server)
+                ),
+                timeout_seconds=args.auth_wait_seconds,
+            )
             if not auth["ready"]:
                 print(
                     json.dumps({"ready": False, "winrm_auth": auth}, indent=2, sort_keys=True),

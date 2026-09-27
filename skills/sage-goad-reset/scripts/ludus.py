@@ -21,9 +21,13 @@ live API on first use; if an endpoint path differs this prints the API error ver
 """
 from __future__ import annotations
 import argparse
+import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import re
+import socket
 import ssl
 import sys
 import urllib.error
@@ -36,6 +40,77 @@ EXIT_AMBIGUOUS = 3  # no name given + multiple snapshots: caller (agent) must pi
 RANGE_ID_ENV = "SAGE_LUDUS_RANGE_ID"
 MCP_SERVER_ENV = "SAGE_LUDUS_MCP_SERVER"
 DEFAULT_MCP_SERVER = "ludus"
+TLS_CONFIG_KEYS = ("LUDUS_CA_FILE", "LUDUS_TLS_SERVER_NAME", "LUDUS_CERT_SHA256")
+
+
+def _configured_resource_ledger():
+    sage_root = REPO_ROOT / "Payload_Type" / "sage"
+    if str(sage_root) not in sys.path:
+        sys.path.insert(0, str(sage_root))
+    from ai import resource_budget
+    return resource_budget.configured_ledger()
+
+
+def _reserve_effect(amounts, operation):
+    ledger = _configured_resource_ledger()
+    if ledger is not None:
+        ledger.reserve(amounts, operation)
+
+
+class _MeteredHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, resource_ledger, resource_operation, **kwargs):
+        self._resource_ledger = resource_ledger
+        self._resource_operation = resource_operation
+        super().__init__(*args, **kwargs)
+
+    def request(self, *args, **kwargs):
+        self._resource_ledger.reserve({"control_requests": 1}, self._resource_operation)
+        return super().request(*args, **kwargs)
+
+
+class _MeteredHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, resource_ledger, resource_operation, **kwargs):
+        self._resource_ledger = resource_ledger
+        self._resource_operation = resource_operation
+        super().__init__(*args, **kwargs)
+
+    def request(self, *args, **kwargs):
+        self._resource_ledger.reserve({"control_requests": 1}, self._resource_operation)
+        return super().request(*args, **kwargs)
+
+
+class _MeteredHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, ledger, operation):
+        super().__init__()
+        self.ledger = ledger
+        self.operation = operation
+
+    def http_open(self, req):
+        factory = lambda host, **kwargs: _MeteredHTTPConnection(
+            host, resource_ledger=self.ledger, resource_operation=self.operation, **kwargs
+        )
+        return self.do_open(factory, req)
+
+
+class _MeteredHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, ledger, operation, context):
+        super().__init__(context=context)
+        self.ledger = ledger
+        self.operation = operation
+
+    def https_open(self, req):
+        factory = lambda host, **kwargs: _MeteredHTTPSConnection(
+            host, resource_ledger=self.ledger, resource_operation=self.operation, **kwargs
+        )
+        return self.do_open(factory, req, context=self._context)
+
+
+def _metered_urlopen(req, *, timeout, context, ledger, operation="ludus-control-request"):
+    opener = urllib.request.build_opener(
+        _MeteredHTTPHandler(ledger, operation),
+        _MeteredHTTPSHandler(ledger, operation, context),
+    )
+    return opener.open(req, timeout=timeout)
 
 def _selected_mcp_server(mcp_server=None):
     value = str(mcp_server or os.environ.get(MCP_SERVER_ENV) or DEFAULT_MCP_SERVER).strip()
@@ -54,6 +129,85 @@ def _creds(mcp_server=None):
         raise RuntimeError(
             f"{MCP} does not contain LUDUS_URL and LUDUS_API_KEY for MCP server {server_name!r}"
         ) from exc
+
+
+def _verified_tls_config(mcp_server=None):
+    """Opt-in endpoint trust; a partial specification must never use legacy TLS."""
+    with open(MCP, encoding="utf-8") as handle:
+        config = json.load(handle)
+    server = (config.get("mcpServers") or config).get(_selected_mcp_server(mcp_server), {})
+    configured = server.get("env", {})
+    values = {key: str(os.environ.get(key) or configured.get(key) or "").strip()
+              for key in TLS_CONFIG_KEYS}
+    if not any(values.values()):
+        return None
+    if not all(values.values()):
+        raise RuntimeError("Ludus verified TLS requires all three LUDUS_CA_FILE, "
+                           "LUDUS_TLS_SERVER_NAME and LUDUS_CERT_SHA256")
+    ca_file = Path(values["LUDUS_CA_FILE"])
+    if not ca_file.is_absolute():
+        ca_file = REPO_ROOT / ca_file
+    if not ca_file.is_file():
+        raise RuntimeError("configured LUDUS_CA_FILE does not exist")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", values["LUDUS_CERT_SHA256"]):
+        raise RuntimeError("configured LUDUS_CERT_SHA256 is not a SHA-256 digest")
+    server_name = values["LUDUS_TLS_SERVER_NAME"]
+    if any(char.isspace() for char in server_name) or "/" in server_name:
+        raise RuntimeError("configured LUDUS_TLS_SERVER_NAME is invalid")
+    return ca_file, server_name, values["LUDUS_CERT_SHA256"].lower()
+
+
+class _VerifiedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, *, context, server_name, certificate_sha256, timeout):
+        super().__init__(host, port, context=context, timeout=timeout)
+        self._verified_server_name = server_name
+        self._certificate_sha256 = certificate_sha256
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw, server_hostname=self._verified_server_name)
+        except BaseException:
+            raw.close()
+            raise
+        try:
+            observed = hashlib.sha256(self.sock.getpeercert(binary_form=True)).hexdigest()
+        except BaseException:
+            self.sock.close()
+            raise
+        if observed != self._certificate_sha256:
+            self.sock.close()
+            raise RuntimeError("Ludus presented certificate does not match configured pin")
+
+
+def _verified_call(method, url, path, data, key, trust, ledger):
+    endpoint = urlsplit(url)
+    if (endpoint.scheme != "https" or not endpoint.hostname or
+            endpoint.username is not None or endpoint.password is not None or
+            endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment):
+        raise RuntimeError("verified Ludus TLS requires a plain HTTPS base URL")
+    ca_file, server_name, certificate_sha256 = trust
+    context = ssl.create_default_context(cafile=str(ca_file))
+    context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    if ledger is not None:
+        ledger.reserve({"control_requests": 1}, "ludus-control-request")
+    connection = _VerifiedHTTPSConnection(
+        endpoint.hostname, endpoint.port or 443, context=context,
+        server_name=server_name, certificate_sha256=certificate_sha256, timeout=30,
+    )
+    try:
+        connection.request(method, path, body=data,
+                           headers={"X-API-KEY": key, "Content-Type": "application/json"})
+        response = connection.getresponse()
+        raw = response.read().decode()
+        if response.status >= 400:
+            return response.status, raw[:500]
+        try:
+            return response.status, json.loads(raw)
+        except Exception:
+            return response.status, raw
+    finally:
+        connection.close()
 
 def _selected_range_id(range_id=None):
     value = str(range_id or os.environ.get(RANGE_ID_ENV) or "").strip()
@@ -75,11 +229,20 @@ def _call(method, path, body=None, range_id=None, mcp_server=None):
     url, key = _creds(mcp_server)
     path = _with_range_id(path, range_id)
     data = json.dumps(body).encode() if body is not None else None
+    trust = _verified_tls_config(mcp_server)
+    if trust is not None:
+        return _verified_call(method, url, path, data, key, trust, _configured_resource_ledger())
     req = urllib.request.Request(url + path, data=data, method=method,
                                  headers={"X-API-KEY": key, "Content-Type": "application/json"})
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+        ledger = _configured_resource_ledger()
+        result = (
+            urllib.request.urlopen(req, timeout=30, context=ctx)
+            if ledger is None else
+            _metered_urlopen(req, timeout=30, context=ctx, ledger=ledger)
+        )
+        with result as r:
             raw = r.read().decode()
             try: return r.status, json.loads(raw)
             except Exception: return r.status, raw
@@ -102,15 +265,26 @@ def logs(range_id=None, mcp_server=None):
 def snapshots(range_id=None, mcp_server=None):
     print(_call("GET", "/api/v2/snapshots/list", range_id=range_id, mcp_server=mcp_server))
 
+def _print_mutation_result(operation, result):
+    code, body = result
+    if not 200 <= code < 300:
+        raise RuntimeError(f"Ludus {operation} failed with HTTP {code}")
+    print((code, body))
+
 def snapshot(name, *, include_ram=False, description=None, range_id=None, mcp_server=None):
-    print(_call("POST", "/api/v2/snapshots/create", {
+    _reserve_effect({"new_staged_snapshots": 1}, "new-staged-snapshot")
+    _print_mutation_result("snapshot create", _call("POST", "/api/v2/snapshots/create", {
         "name": name,
         "description": description or f"snapshot {name}",
         "includeRAM": include_ram,
     }, range_id=range_id, mcp_server=mcp_server))
 
 def rollback(name, range_id=None, mcp_server=None):
-    print(_call("POST", "/api/v2/snapshots/rollback", {"name": name}, range_id=range_id, mcp_server=mcp_server))
+    _reserve_effect({"physical_restores": 1}, "physical-range-restore")
+    _print_mutation_result(
+        "snapshot rollback",
+        _call("POST", "/api/v2/snapshots/rollback", {"name": name}, range_id=range_id, mcp_server=mcp_server),
+    )
 
 def _snapshot_names(range_id=None, mcp_server=None):
     """Distinct snapshot names for the range. The API returns one row per VM, so a
@@ -153,15 +327,52 @@ def _resolve_rollback_target(name, range_id=None, mcp_server=None):
     sys.exit(EXIT_AMBIGUOUS)
 
 def _machines_body(machines):
-    # API wants {"machines": ["all"]} or a list of VMIDs/names; accept "all" or a CSV string.
-    items = [m.strip() for m in machines.split(",")] if isinstance(machines, str) else list(machines)
-    return {"machines": items or ["all"]}
+    items = [m.strip() for m in machines.split(",")] if isinstance(machines, str) else [str(m).strip() for m in machines]
+    if not items or any(not item for item in items) or ("all" in items and items != ["all"]):
+        raise RuntimeError("power operation requires VM names/IDs or 'all' alone")
+    return {"machines": items}
+
+
+def _resolved_machines_body(machines, range_id=None, mcp_server=None):
+    body = _machines_body(machines)
+    if body["machines"] == ["all"]:
+        return body
+    # Ludus 2.0.6 silently ignores numeric IDs yet reports the request count as success.
+    # Validate explicit selectors against the selected range and send VM names only.
+    code, inventory = _call("GET", "/api/v2/range", range_id=range_id, mcp_server=mcp_server)
+    if not 200 <= code < 300 or not isinstance(inventory, dict) or not isinstance(inventory.get("VMs"), list):
+        raise RuntimeError("Ludus range inventory unavailable; power operation not sent")
+    vms = inventory["VMs"]
+    if not vms:
+        raise RuntimeError("Ludus range inventory is empty; power operation not sent")
+    resolved = []
+    for selector in body["machines"]:
+        matches = [vm for vm in vms if isinstance(vm, dict) and
+                   (vm.get("name") == selector or
+                    (re.fullmatch(r"[0-9]+", selector) and str(vm.get("proxmoxID")) == selector))]
+        if len(matches) != 1 or not isinstance(matches[0].get("name"), str) or not matches[0]["name"]:
+            raise RuntimeError(f"Ludus VM selector {selector!r} is unknown or ambiguous; power operation not sent")
+        name = matches[0]["name"]
+        if sum(isinstance(vm, dict) and vm.get("name") == name for vm in vms) != 1:
+            raise RuntimeError(f"Ludus VM name {name!r} is ambiguous; power operation not sent")
+        if name in resolved:
+            raise RuntimeError("Ludus VM selector repeats a VM; power operation not sent")
+        resolved.append(name)
+    return {"machines": resolved}
 
 def poweron(machines="all", range_id=None, mcp_server=None):
-    print(_call("PUT", "/api/v2/range/poweron", _machines_body(machines), range_id=range_id, mcp_server=mcp_server))
+    _print_mutation_result(
+        "power on",
+        _call("PUT", "/api/v2/range/poweron", _resolved_machines_body(machines, range_id, mcp_server),
+              range_id=range_id, mcp_server=mcp_server),
+    )
 
 def poweroff(machines="all", range_id=None, mcp_server=None):
-    print(_call("PUT", "/api/v2/range/poweroff", _machines_body(machines), range_id=range_id, mcp_server=mcp_server))
+    _print_mutation_result(
+        "power off",
+        _call("PUT", "/api/v2/range/poweroff", _resolved_machines_body(machines, range_id, mcp_server),
+              range_id=range_id, mcp_server=mcp_server),
+    )
 
 def _add_ludus_args(parser):
     parser.add_argument(
@@ -204,35 +415,39 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    command = args.command or "status"
-    range_id = getattr(args, "range_id", None)
-    mcp_server = getattr(args, "mcp_server", None)
-    if command == "status":
-        status(range_id, mcp_server)
-    elif command == "logs":
-        logs(range_id, mcp_server)
-    elif command == "snapshots":
-        snapshots(range_id, mcp_server)
-    elif command == "snapshot":
-        snapshot(
-            args.name,
-            include_ram=args.include_ram,
-            description=args.description,
-            range_id=range_id,
-            mcp_server=mcp_server,
-        )
-    elif command == "poweron":
-        poweron(args.machines, range_id, mcp_server)
-    elif command == "poweroff":
-        poweroff(args.machines, range_id, mcp_server)
-    elif command == "rollback":
-        if not args.yes:
-            print("rollback is destructive — pass --yes")
+    try:
+        args = build_parser().parse_args(argv)
+        command = args.command or "status"
+        range_id = getattr(args, "range_id", None)
+        mcp_server = getattr(args, "mcp_server", None)
+        if command == "status":
+            status(range_id, mcp_server)
+        elif command == "logs":
+            logs(range_id, mcp_server)
+        elif command == "snapshots":
+            snapshots(range_id, mcp_server)
+        elif command == "snapshot":
+            snapshot(
+                args.name,
+                include_ram=args.include_ram,
+                description=args.description,
+                range_id=range_id,
+                mcp_server=mcp_server,
+            )
+        elif command == "poweron":
+            poweron(args.machines, range_id, mcp_server)
+        elif command == "poweroff":
+            poweroff(args.machines, range_id, mcp_server)
+        elif command == "rollback":
+            if not args.yes:
+                print("rollback is destructive — pass --yes")
+                return 2
+            rollback(_resolve_rollback_target(args.name, range_id, mcp_server), range_id, mcp_server)
+        else:
+            print(f"unknown: {command}")
             return 2
-        rollback(_resolve_rollback_target(args.name, range_id, mcp_server), range_id, mcp_server)
-    else:
-        print(f"unknown: {command}")
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     return 0
 
