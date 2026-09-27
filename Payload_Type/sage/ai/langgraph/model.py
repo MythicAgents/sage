@@ -1020,15 +1020,15 @@ def _compact_tool_result_str(s: str, *, trigger: int = 4000, ceiling: int = 1600
         return s
 
 
-def _transform_content(content: Any) -> Any:
+def _transform_content(content: Any, *, ceiling: int = 16000) -> Any:
     if isinstance(content, str):
-        return _compact_tool_result_str(content)
+        return _compact_tool_result_str(content, ceiling=ceiling)
     if isinstance(content, list):
         transformed = []
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
                 new_item = dict(item)
-                new_item["text"] = _compact_tool_result_str(item["text"])
+                new_item["text"] = _compact_tool_result_str(item["text"], ceiling=ceiling)
                 transformed.append(new_item)
             else:
                 transformed.append(item)
@@ -2757,7 +2757,19 @@ class _ToolResultCompactionMiddleware(AgentMiddleware):
             name = _tool_name_from_request(request)
             if name in _COMPACTION_PROTECTED_TOOLS:
                 return result
-            new_content = _transform_content(result.content)  # handles str + list-of-blocks
+            ceiling = 16000
+            if name == "get_all_task_output_by_task_id":
+                from .request_contract import RequestContract, RequestLane
+                contract = getattr(self._model, "_request_contract", None)
+                if (isinstance(contract, RequestContract)
+                        and contract.lane in {
+                            RequestLane.CONVERSATIONAL, RequestLane.SUPERVISED_WORKFLOW
+                        }):
+                    # Let an assisted specialist review the same bounded task tail
+                    # that the Supervisor can receive in its 24k handback. The old
+                    # 16k cap hid late values and explicit completion markers.
+                    ceiling = 24000
+            new_content = _transform_content(result.content, ceiling=ceiling)
             if new_content is result.content or new_content == result.content:
                 return result
             try:

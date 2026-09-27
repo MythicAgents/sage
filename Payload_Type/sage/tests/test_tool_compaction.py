@@ -2,6 +2,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import ToolMessage
@@ -19,6 +20,7 @@ from ai.langgraph.model import (  # noqa: E402
     _slim_tool_description,
     _transform_content,
 )
+from ai.langgraph.request_contract import build_request_contract  # noqa: E402
 
 
 def _request(name: str):
@@ -179,6 +181,60 @@ def test_middleware_awrap_caps_oversized_json_string_content():
     assert result.content.startswith("⟦TOON ") or "[truncated" in result.content
     assert result.tool_call_id == "call-1"
     assert result.name == "cypher_query"
+
+
+def test_assisted_historical_task_read_retains_late_values_with_bounded_cap():
+    contract = build_request_contract(request_id="request-1", channel_id="1",
+                                      operation_id="1", mode="supervised",
+                                      autonomous_solve=False)
+    middleware = _ToolResultCompactionMiddleware(
+        model=SimpleNamespace(_request_contract=contract))
+    name = "get_all_task_output_by_task_id"
+    body = ("RAW_SD_BASE64=" + "A" * 21000
+            + "\nACE_49_ACCESS_MASK=983485\nACL_OUTPUT_COMPLETE=true\n")
+    source = json.dumps({
+        "provenance": {"task_id": 17, "origin": "historical_or_external"},
+        "task_output": [{"response_text": body}],
+    })
+    assert 16000 < len(source) < 24000
+    original = ToolMessage(content=source, tool_call_id="call-1", name=name)
+
+    received = middleware.wrap_tool_call(_request(name), lambda _: original)
+
+    assert json.loads(received.content)["task_output"][0]["response_text"] == body
+    assert "ACE_49_ACCESS_MASK=983485" in received.content
+    assert "ACL_OUTPUT_COMPLETE=true" in received.content
+    assert "[truncated" not in received.content
+    assert original.content == source
+
+
+def test_assisted_historical_task_read_still_marks_output_beyond_cap():
+    contract = build_request_contract(request_id="request-1", channel_id="1",
+                                      operation_id="1", mode="conversation",
+                                      autonomous_solve=False)
+    middleware = _ToolResultCompactionMiddleware(
+        model=SimpleNamespace(_request_contract=contract))
+    name = "get_all_task_output_by_task_id"
+    source = json.dumps({"task_output": [{"response_text": "A" * 25000
+                                               + "\nACL_OUTPUT_COMPLETE=true"}]})
+    original = ToolMessage(content=source, tool_call_id="call-1", name=name)
+
+    received = middleware.wrap_tool_call(_request(name), lambda _: original)
+
+    assert "[truncated: 24000 of" in received.content
+    assert "ACL_OUTPUT_COMPLETE=true" not in received.content
+    assert len(received.content) < len(source)
+
+
+def test_autonomous_historical_read_keeps_existing_compaction_limit():
+    name = "get_all_task_output_by_task_id"
+    middleware = _ToolResultCompactionMiddleware(model=object())
+    source = json.dumps({"task_output": [{"response_text": "A" * 20000}]})
+    original = ToolMessage(content=source, tool_call_id="call-1", name=name)
+
+    received = middleware.wrap_tool_call(_request(name), lambda _: original)
+
+    assert "[truncated: 16000 of" in received.content
 
 
 def test_middleware_caps_text_block_in_list_content_preserves_non_text_by_identity():
