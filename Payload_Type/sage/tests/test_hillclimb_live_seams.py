@@ -5,7 +5,9 @@ here. These pin the parsing: LLM decision, BloodHound literals, and the domain-c
 """
 import sys
 import base64
+import importlib.util
 import json
+import threading
 import time
 import types
 from pathlib import Path
@@ -106,6 +108,7 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
         "init_chat_model",
         lambda **kwargs: events.append("model-init") or calls.append(kwargs) or object(),
     )
+    monkeypatch.delenv("SAGE_EVAL_TEMPERATURE", raising=False)
 
     model_fn = ls.make_model_fn(
         "openai",
@@ -124,6 +127,60 @@ def test_bare_model_factory_applies_shared_max_output_tokens(monkeypatch):
         "base_url": "https://provider.invalid/v1",
         "max_tokens": 8192,
     }]
+
+
+def test_bare_model_factory_uses_opt_in_temperature_and_invalid_refuses_init(monkeypatch):
+    import langchain.chat_models
+
+    calls = []
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setenv("SAGE_EVAL_TEMPERATURE", "0")
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", lambda **kwargs: calls.append(kwargs) or object())
+    assert callable(ls.make_model_fn("openai", "model", max_output_tokens=4096))
+    assert calls[0]["temperature"] == 0.0 and calls[0]["max_tokens"] == 4096
+
+    monkeypatch.setenv("SAGE_EVAL_TEMPERATURE", "NaN")
+    monkeypatch.setattr(
+        langchain.chat_models, "init_chat_model", lambda **kwargs: pytest.fail(f"model initialized: {kwargs}"),
+    )
+    with pytest.raises(ValueError, match="SAGE_EVAL_TEMPERATURE"):
+        ls.make_model_fn("openai", "model")
+
+
+def test_bare_model_factory_injects_metered_sync_and_async_clients(monkeypatch):
+    import langchain.chat_models
+
+    ledger = object()
+    calls = []
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(ls.resource_budget, "configured_ledger", lambda: ledger)
+    monkeypatch.setattr(langchain.chat_models, "init_chat_model", lambda **kwargs: calls.append(kwargs) or object())
+
+    ls.make_model_fn("openai", "model", max_retries=0)
+
+    kwargs = calls[0]
+    assert kwargs["max_retries"] == 0
+    assert isinstance(kwargs["http_client"]._transport, ls.resource_http.MeteredHTTPTransport)
+    assert isinstance(kwargs["http_async_client"]._transport, ls.resource_http.MeteredAsyncHTTPTransport)
+    assert kwargs["http_client"]._transport.ledger is ledger
+    assert kwargs["http_async_client"]._transport.ledger is ledger
+    kwargs["http_client"].close()
+    import asyncio
+    asyncio.run(kwargs["http_async_client"].aclose())
+
+
+@pytest.mark.parametrize(("provider", "retries"), [("anthropic", 0), ("openai", 1)])
+def test_metered_model_path_refuses_uncovered_provider_or_retry(monkeypatch, provider, retries):
+    import langchain.chat_models
+
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(ls.resource_budget, "configured_ledger", lambda: object())
+    monkeypatch.setattr(
+        langchain.chat_models, "init_chat_model", lambda **_kwargs: pytest.fail("model initialized"),
+    )
+
+    with pytest.raises(ls.resource_http.ResourceHTTPError):
+        ls.make_model_fn(provider, "model", max_retries=retries)
 
 
 @pytest.mark.parametrize(
@@ -158,6 +215,255 @@ def test_model_factory_classifies_only_typed_provider_context_codes(monkeypatch,
     assert raised.value.termination_subtype == (
         "provider_typed_code" if expected_cause == "per_request_context_limit" else "model_error"
     )
+
+
+@pytest.mark.parametrize("reason,expected_cause", [
+    ("per_call_token_overrun", "per_request_context_limit"),
+    ("usage_unavailable", "other_declared_boundary"),
+])
+@pytest.mark.parametrize("wrapped", (False, True))
+def test_exact_completed_response_boundary_survives_sdk_cause_wrapping(
+    monkeypatch, reason, expected_cause, wrapped,
+):
+    import langchain.chat_models
+    boundary = ls.resource_http.ProviderResponseBoundaryError(reason)
+    if wrapped:
+        try:
+            raise boundary
+        except ls.resource_http.ProviderResponseBoundaryError as cause:
+            try:
+                raise RuntimeError("opaque sdk wrapper") from cause
+            except RuntimeError as error:
+                failure = error
+    else:
+        failure = boundary
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(
+        langchain.chat_models, "init_chat_model",
+        lambda **_kwargs: types.SimpleNamespace(invoke=lambda _messages: (_ for _ in ()).throw(failure)),
+    )
+    invoke = ls.make_model_fn("openai", "model")
+    with pytest.raises(ls.ModelRequestBoundaryError) as raised:
+        invoke("system", [], [])
+    assert raised.value.termination_cause == expected_cause
+    assert raised.value.termination_subtype == "completed_response_boundary"
+
+
+def test_near_match_wrapped_cause_is_not_completed_response_boundary(monkeypatch):
+    import langchain.chat_models
+    fake = RuntimeError("provider response withheld: per_call_token_overrun")
+    fake.code = "context_length_exceeded"
+    try:
+        raise fake
+    except RuntimeError as cause:
+        try:
+            raise RuntimeError("sdk") from cause
+        except RuntimeError as failure:
+            wrapped = failure
+    monkeypatch.setattr(ls, "configure_sage_ssl_cert_file", lambda: "")
+    monkeypatch.setattr(
+        langchain.chat_models, "init_chat_model",
+        lambda **_kwargs: types.SimpleNamespace(invoke=lambda _messages: (_ for _ in ()).throw(wrapped)),
+    )
+    with pytest.raises(ls.ModelRequestBoundaryError) as raised:
+        ls.make_model_fn("openai", "model")("system", [], [])
+    assert raised.value.termination_subtype == "model_error"
+    assert raised.value.provider_code is None
+
+
+def _native_chat_fake(monkeypatch, turn, *, fetched=None, stop=None):
+    module = types.ModuleType("native_chat")
+    module.TERMINAL_STATUSES = {"completed", "complete", "error", "failed", "cancelled", "canceled"}
+    class RequestWaitTimeout(TimeoutError):
+        def __init__(self, request_id, _timeout, last_snapshot):
+            self.request_id, self.last_snapshot = request_id, last_snapshot
+    module.RequestWaitTimeout = RequestWaitTimeout
+    module.run_native_chat_turn = turn
+    async def fetch(*_args):
+        if isinstance(fetched, BaseException): raise fetched
+        return fetched
+    module.fetch_request_snapshot = fetch
+    module.request_snapshot_result = lambda snapshot: {
+        "chat_channel_id": snapshot["request"]["channel_id"],
+        "chat_request_id": snapshot["request"]["id"],
+        "status": snapshot["request"]["status"], "runtime_telemetry": {}, "progress": {},
+    }
+    async def stop_request(*_args, **_kwargs):
+        if isinstance(stop, BaseException): raise stop
+        return stop
+    module.stop_native_chat_request = stop_request
+    monkeypatch.setitem(sys.modules, "native_chat", module)
+    return module
+
+
+def _receiver_module():
+    path = Path(__file__).parents[3] / "skills/sage-eval-gauge/scripts/observation_receiver.py"
+    spec = importlib.util.spec_from_file_location("live_seams_test_observation_receiver", path)
+    module = importlib.util.module_from_spec(spec); assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_capture_native_request_selection_emits_bound_source_event_once(monkeypatch, tmp_path):
+    from ai import observation_channel
+
+    # Each capture CLI owns a fresh producer process. Keep that process-local
+    # sequence isolated when exercising its emitter inside this pytest process.
+    monkeypatch.setattr(observation_channel, "_sequence", 0)
+    events = []
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        selected = {"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8}
+        progress_sink(selected); progress_sink(selected)
+        return {"status": "completed"}
+    _native_chat_fake(monkeypatch, turn)
+    receiver_mod = _receiver_module(); work = tmp_path / "work"; work.mkdir()
+    with receiver_mod.ObservationReceiver(tmp_path / "events.jsonl", events.append,
+                                          temporary_parent=work) as receiver:
+        monkeypatch.setenv("SAGE_OBSERVATION_DIRECTORY", str(receiver.directory))
+        monkeypatch.setenv("SAGE_RESOURCE_EPISODE_ID", "capture-episode")
+        worker = threading.Thread(target=lambda: receiver.serve_one(2), daemon=True); worker.start()
+        client = types.SimpleNamespace(current_operation_id=11)
+        solve = ls.make_native_chat_solver(client, capture_settlement=True)
+        assert solve("objective") == "completed"
+        worker.join(timeout=2)
+    assert not worker.is_alive() and len(events) == 1
+    assert events[0]["kind"] == "tool_event" and events[0]["payload"] == {
+        "event": "m3_native_request_selected", "schema": "sage-m3-native-request-selection-v1",
+        "resource_episode_id": "capture-episode", "operation_id": 11,
+        "chat_channel_id": 7, "chat_request_id": 8}
+
+
+@pytest.mark.parametrize("selected", [
+    [{"event": "request_started", "chat_channel_id": 7}],
+    [{"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8},
+     {"event": "request_started", "chat_channel_id": 7, "chat_request_id": 9}],
+])
+def test_capture_native_request_selection_rejects_malformed_or_conflicting_callback(monkeypatch, selected):
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        for event in selected: progress_sink(event)
+        return {"status": "completed"}
+    _native_chat_fake(monkeypatch, turn)
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    with pytest.raises(RuntimeError, match="request binding is invalid"):
+        solve("objective")
+
+
+def test_noncapture_native_turn_emits_no_request_selection(monkeypatch):
+    async def turn(*_args, **_kwargs): return {"status": "completed"}
+    _native_chat_fake(monkeypatch, turn)
+    monkeypatch.setattr(ls.observation_channel, "emit", lambda *_a, **_k: pytest.fail("capture event emitted"))
+    assert ls.make_native_chat_solver(object())("objective") == "completed"
+
+
+def test_capture_native_success_confirms_terminal_and_preserves_identity(monkeypatch):
+    expected = {"provider": "openai", "model": "model", "route": "https:model.invalid"}
+    async def turn(_client, _objective, *, progress_sink, expected_runtime_identity, **_kwargs):
+        assert expected_runtime_identity == expected
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        return {"status": "completed", "messages": [{"secret": "raw"}], "error": "raw"}
+    _native_chat_fake(monkeypatch, turn)
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True,
+                                       expected_runtime_identity=expected)
+    assert solve("objective") == "completed"
+    assert solve.last_result["producer_settlement"]["native_producer_terminal"] is True
+    assert solve.last_result["chat_channel_id"] == 7
+    assert "messages" not in solve.last_result and "error" not in solve.last_result
+
+
+@pytest.mark.parametrize("stop", [
+    {"stop_sent": True, "stop_request_terminal": True, "original_request_terminal": True,
+     "remote_stop_confirmed": True},
+    {"stop_sent": True, "stop_request_terminal": True, "original_request_terminal": False,
+     "remote_stop_confirmed": False},
+    RuntimeError("refused"),
+])
+def test_capture_native_timeout_settlement_requires_both_terminals(monkeypatch, stop):
+    snapshot = {"request": {"id": 8, "channel_id": 7, "status": "streaming"}}
+    module = None
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        raise module.RequestWaitTimeout(8, 1, snapshot)
+    module = _native_chat_fake(monkeypatch, turn, fetched=snapshot, stop=stop)
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    with pytest.raises(module.RequestWaitTimeout): solve("objective")
+    settlement = solve.last_result["producer_settlement"]
+    expected = isinstance(stop, dict) and stop["remote_stop_confirmed"] is True
+    assert settlement["native_producer_terminal"] is expected
+    assert settlement["remote_stop_confirmed"] is expected
+    assert (settlement["error_types"] == ["RuntimeError"]) is isinstance(stop, RuntimeError)
+
+
+def test_capture_native_returned_nonterminal_near_match_remains_unconfirmed(monkeypatch):
+    snapshot = {"request": {"id": 8, "channel_id": 7, "status": "completed-later"}}
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        return {"status": "completed-later"}
+    _native_chat_fake(monkeypatch, turn, fetched=snapshot, stop={
+        "stop_sent": True, "stop_request_terminal": True,
+        "original_request_terminal": False, "remote_stop_confirmed": False,
+    })
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    assert solve("objective") == "completed-later"
+    assert solve.last_result["producer_settlement"]["native_producer_terminal"] is False
+
+
+def test_capture_native_fetch_failure_still_uses_bound_stop(monkeypatch):
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        return {"status": "streaming"}
+    _native_chat_fake(monkeypatch, turn, fetched=RuntimeError("fetch failed"), stop={
+        "stop_request_terminal": True, "original_request_terminal": True,
+        "remote_stop_confirmed": True,
+    })
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    solve("objective")
+    settlement = solve.last_result["producer_settlement"]
+    assert settlement["native_producer_terminal"] is True
+    assert settlement["error_types"] == ["RuntimeError"]
+
+
+def test_capture_native_returned_terminal_without_bound_request_is_unconfirmed(monkeypatch):
+    async def turn(*_args, **_kwargs): return {"status": "completed"}
+    _native_chat_fake(monkeypatch, turn, stop=RuntimeError("must not stop guessed identity"))
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    assert solve("objective") == "completed"
+    assert solve.last_result["producer_settlement"]["request_identity_bound"] is False
+    assert solve.last_result["producer_settlement"]["native_producer_terminal"] is False
+
+
+def test_capture_native_fetch_timeout_cannot_swallow_aggregate_cancellation(monkeypatch):
+    async def turn(_client, _objective, *, progress_sink, **_kwargs):
+        progress_sink({"event": "request_started", "chat_channel_id": 7, "chat_request_id": 8})
+        return {"status": "streaming"}
+    module = _native_chat_fake(monkeypatch, turn)
+    stopped = []
+    async def fetch(*_args):
+        await ls.asyncio.sleep(10)
+    async def stop(*_args, **_kwargs):
+        stopped.append(True)
+        await ls.asyncio.sleep(10)
+    module.fetch_request_snapshot = fetch
+    module.stop_native_chat_request = stop
+    original_timeout = ls.asyncio.timeout
+    monkeypatch.setattr(ls.asyncio, "timeout", lambda _seconds: original_timeout(.01))
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    assert solve("objective") == "streaming"
+    settlement = solve.last_result["producer_settlement"]
+    assert settlement["error_types"] == ["TimeoutError"]
+    assert settlement["native_producer_terminal"] is False
+    assert stopped == []
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt(), RuntimeError("before-request")])
+def test_capture_native_exception_preserves_result_and_never_guesses_stop(monkeypatch, failure):
+    async def turn(*_args, **_kwargs): raise failure
+    _native_chat_fake(monkeypatch, turn)
+    solve = ls.make_native_chat_solver(object(), capture_settlement=True)
+    with pytest.raises(type(failure)): solve("objective")
+    settlement = solve.last_result["producer_settlement"]
+    assert settlement["request_identity_bound"] is False
+    assert settlement["native_producer_terminal"] is False
+    assert settlement["original_outcome"] == type(failure).__name__
 
 
 def test_model_route_auth_smoke_uses_exact_route_and_returns_only_allowlisted_metadata(monkeypatch):

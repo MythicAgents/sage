@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -26,8 +27,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ssl_bootstrap import configure_sage_ssl_cert_file
+from ai import observation_channel, resource_budget, resource_http
 
 DirectProbe = Callable[[], bool]
+
+
+def _install_control_meter() -> None:
+    if resource_budget.configured_ledger() is not None:
+        from ai import resource_clients
+        resource_clients.install()
 
 _CONTEXT_LIMIT_CODES = frozenset({
     "context_length_exceeded",
@@ -37,27 +45,51 @@ _CONTEXT_LIMIT_CODES = frozenset({
 })
 
 
+def _eval_temperature() -> float | None:
+    raw = os.environ.get("SAGE_EVAL_TEMPERATURE")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("SAGE_EVAL_TEMPERATURE must be a finite number from 0 through 2") from None
+    if not math.isfinite(value) or not 0 <= value <= 2:
+        raise ValueError("SAGE_EVAL_TEMPERATURE must be a finite number from 0 through 2")
+    return value
+
+
 class ModelRequestBoundaryError(RuntimeError):
     """Sanitized typed provider failure used only for terminal-boundary reporting."""
 
-    def __init__(self, *, error_type: str, provider_code: str | None):
+    def __init__(self, *, error_type: str, provider_code: str | None,
+                 completed_response_boundary: tuple[str, str] | None = None):
         self.provider_code = provider_code
-        self.termination_cause = (
-            "per_request_context_limit"
-            if provider_code in _CONTEXT_LIMIT_CODES
-            else "other_declared_boundary"
-        )
-        self.termination_subtype = (
-            "provider_typed_code"
-            if self.termination_cause == "per_request_context_limit"
-            else "model_error"
-        )
+        if completed_response_boundary is not None:
+            self.termination_cause, self.termination_subtype = completed_response_boundary
+        else:
+            self.termination_cause = (
+                "per_request_context_limit"
+                if provider_code in _CONTEXT_LIMIT_CODES
+                else "other_declared_boundary"
+            )
+            self.termination_subtype = (
+                "provider_typed_code"
+                if self.termination_cause == "per_request_context_limit"
+                else "model_error"
+            )
         suffix = f", typed_code={provider_code}" if provider_code else ""
         super().__init__(f"model request failed ({error_type}{suffix})")
 
 
 def _typed_provider_error_code(exc: BaseException) -> str | None:
     """Extract structured provider codes without classifying exception prose."""
+    boundary = _completed_response_boundary(exc)
+    if boundary is not None:
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, resource_http.ProviderResponseBoundaryError):
+                return current.code
+            current = current.__cause__
     direct = getattr(exc, "code", None)
     if isinstance(direct, str) and direct.strip():
         return direct.strip().casefold()
@@ -68,6 +100,17 @@ def _typed_provider_error_code(exc: BaseException) -> str | None:
         for candidate in candidates:
             if isinstance(candidate, str) and candidate.strip():
                 return candidate.strip().casefold()
+    return None
+
+
+def _completed_response_boundary(exc: BaseException) -> tuple[str, str] | None:
+    current: BaseException | None = exc
+    for _ in range(4):
+        if isinstance(current, resource_http.ProviderResponseBoundaryError):
+            return current.termination_cause, current.termination_subtype
+        current = current.__cause__
+        if current is None:
+            break
     return None
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -205,7 +248,26 @@ def make_model_fn(
         kwargs["max_tokens"] = int(max_output_tokens)
     if request_timeout is not None:
         kwargs["timeout"] = float(request_timeout)
-    if max_retries is not None:
+    temperature = _eval_temperature()
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    shared_ledger = resource_budget.configured_ledger()
+    if shared_ledger is not None:
+        if provider.strip().casefold() != "openai":
+            raise resource_http.ResourceHTTPError(
+                "the metered model path supports only the OpenAI-compatible provider"
+            )
+        if max_retries is not None and int(max_retries) != 0:
+            raise resource_http.ResourceHTTPError("the metered model path requires max_retries=0")
+        kwargs["max_retries"] = 0
+        import httpx
+        kwargs["http_client"] = httpx.Client(
+            transport=resource_http.MeteredHTTPTransport("provider", ledger=shared_ledger)
+        )
+        kwargs["http_async_client"] = httpx.AsyncClient(
+            transport=resource_http.MeteredAsyncHTTPTransport("provider", ledger=shared_ledger)
+        )
+    elif max_retries is not None:
         kwargs["max_retries"] = int(max_retries)
     llm = init_chat_model(**kwargs)
 
@@ -218,6 +280,7 @@ def make_model_fn(
             raise ModelRequestBoundaryError(
                 error_type=type(exc).__name__,
                 provider_code=_typed_provider_error_code(exc),
+                completed_response_boundary=_completed_response_boundary(exc),
             ) from exc
         decision = parse_model_decision(message)
         usage = getattr(message, "usage_metadata", None)
@@ -297,6 +360,7 @@ def model_route_auth_smoke(
 
 def default_mythic_client():
     """Log in to local Mythic the way sage_task.py does (validated path)."""
+    _install_control_meter()
     from mythic import mythic  # type: ignore
     return asyncio.run(
         mythic.login(
@@ -443,6 +507,7 @@ def apollo_command_catalog(*, timeout: int = 60) -> list:
     from mythic import mythic  # type: ignore
 
     async def _q():
+        _install_control_meter()
         client = await mythic.login(
             server_ip="127.0.0.1",
             username="mythic_admin",
@@ -512,6 +577,7 @@ def bloodhound_cypher(query: str, *, timeout: int = 60) -> list:
 
 def _mythic_login():
     """Log in to local Mythic (shared by the Mythic-side seams). Returns a client."""
+    _install_control_meter()
     from mythic import mythic  # type: ignore
     return asyncio.run(
         mythic.login(
@@ -609,6 +675,8 @@ def make_native_chat_solver(
     api_endpoint: str | None = None,
     api_key: str | None = None,
     eval_force_capability_prefix_json: str | None = None,
+    capture_settlement: bool = False,
+    expected_runtime_identity: dict[str, str] | None = None,
 ):
     """Run one autonomous objective through a fresh locked Mythic v4 Sage chat channel."""
     scripts = Path(__file__).resolve().parents[4] / "skills" / "sage-live-runner" / "scripts"
@@ -636,18 +704,135 @@ def make_native_chat_solver(
         use_prepared_channel = False
 
     def solve(objective: str) -> str:
-        result = asyncio.run(
-            native_chat.run_native_chat_turn(
+        if not capture_settlement:
+            result = asyncio.run(native_chat.run_native_chat_turn(
                 client,
                 objective,
                 timeout_seconds=timeout,
                 poll_interval_seconds=poll_interval,
                 metadata=treatment_metadata,
                 use_prepared_channel=use_prepared_channel,
+            ))
+            solve.last_result = result
+            return str(result.get("status") or "completed")
+
+        async def captured_turn() -> str:
+            bound: dict[str, int] = {}
+            returned: dict[str, Any] | None = None
+            original_error: BaseException | None = None
+            latest_snapshot: dict[str, Any] | None = None
+
+            def progress(event: Mapping[str, Any]) -> None:
+                if event.get("event") == "request_started":
+                    candidate = {key: event.get(key) for key in ("chat_channel_id", "chat_request_id")}
+                    if any(type(value) is not int or value <= 0 for value in candidate.values()):
+                        raise RuntimeError("native capture request binding is invalid")
+                    if bound:
+                        if bound != candidate:
+                            raise RuntimeError("native capture request binding is invalid")
+                        return
+                    bound.update(candidate)
+                    episode_id = os.environ.get("SAGE_RESOURCE_EPISODE_ID", "")
+                    operation_id = getattr(client, "current_operation_id", None)
+                    if os.environ.get(observation_channel.ENV_NAME):
+                        if not episode_id or type(operation_id) is not int or operation_id <= 0:
+                            raise RuntimeError("native capture request binding is invalid")
+                        observation_channel.emit("tool_event", {
+                            "event": "m3_native_request_selected",
+                            "schema": "sage-m3-native-request-selection-v1",
+                            "resource_episode_id": episode_id,
+                            "operation_id": operation_id,
+                            **candidate,
+                        })
+
+            try:
+                returned = await native_chat.run_native_chat_turn(
+                    client, objective, timeout_seconds=timeout,
+                    poll_interval_seconds=poll_interval, metadata=treatment_metadata,
+                    use_prepared_channel=use_prepared_channel, progress_sink=progress,
+                    expected_runtime_identity=expected_runtime_identity,
+                )
+            except BaseException as exc:
+                original_error = exc
+                if isinstance(exc, native_chat.RequestWaitTimeout) \
+                        and isinstance(exc.last_snapshot, dict):
+                    latest_snapshot = exc.last_snapshot
+
+            settlement_started = time.monotonic()
+            settlement_deadline = settlement_started + 300.0
+            settlement: dict[str, Any] = {
+                "settlement_started_monotonic": settlement_started,
+                "settlement_deadline_monotonic": settlement_deadline,
+                "native_producer_terminal": False,
+                "remote_stop_confirmed": False,
+                "request_identity_bound": set(bound) == {"chat_channel_id", "chat_request_id"},
+                "original_outcome": (
+                    "returned" if original_error is None else type(original_error).__name__
+                ),
+                "error_types": [],
+            }
+            status = str((returned or {}).get("status") or "").casefold()
+            settlement["original_status"] = status or None
+            if settlement["request_identity_bound"] and status in native_chat.TERMINAL_STATUSES:
+                settlement["native_producer_terminal"] = True
+                settlement["remote_stop_confirmed"] = True
+            elif settlement["request_identity_bound"]:
+                try:
+                    async with asyncio.timeout(min(120.0, settlement_deadline - time.monotonic())):
+                        try:
+                            latest_snapshot = await native_chat.fetch_request_snapshot(
+                                client, bound["chat_request_id"]
+                            )
+                            observed = native_chat.request_snapshot_result(latest_snapshot)
+                            observed_status = str(observed.get("status") or "").casefold()
+                            settlement["observed_status"] = observed_status or None
+                            if observed_status in native_chat.TERMINAL_STATUSES:
+                                settlement["native_producer_terminal"] = True
+                                settlement["remote_stop_confirmed"] = True
+                        except Exception as exc:
+                            settlement["error_types"].append(type(exc).__name__)
+                        if settlement["native_producer_terminal"] is not True:
+                            stop = await native_chat.stop_native_chat_request(
+                                client, channel_id=bound["chat_channel_id"],
+                                request_id=bound["chat_request_id"],
+                                timeout_seconds=max(
+                                    0.001, min(120.0, settlement_deadline - time.monotonic())
+                                ), poll_interval_seconds=min(2.0, poll_interval),
+                                progress_sink=progress,
+                            )
+                            settlement["stop"] = dict(stop)
+                            settlement["remote_stop_confirmed"] = bool(
+                                stop.get("remote_stop_confirmed") is True
+                            )
+                            settlement["native_producer_terminal"] = settlement["remote_stop_confirmed"]
+                except BaseException as exc:
+                    settlement["error_types"].append(type(exc).__name__)
+            settlement["settlement_elapsed_seconds"] = max(
+                0.0, time.monotonic() - settlement_started
             )
-        )
-        solve.last_result = result
-        return str(result.get("status") or "completed")
+            safe_result = {
+                key: value for key, value in (returned or {}).items()
+                if key not in {"messages", "error"}
+            }
+            if latest_snapshot is not None:
+                try:
+                    observed = native_chat.request_snapshot_result(latest_snapshot)
+                    safe_result["native_request_observation"] = {
+                        key: observed.get(key)
+                        for key in ("chat_channel_id", "chat_request_id", "status", "runtime_telemetry", "progress")
+                    }
+                    if "runtime_telemetry" not in safe_result:
+                        safe_result["runtime_telemetry"] = observed.get("runtime_telemetry") or {}
+                except Exception as exc:
+                    settlement["error_types"].append(type(exc).__name__)
+            safe_result.update(bound)
+            safe_result["producer_settlement"] = settlement
+            solve.last_result = safe_result
+            if original_error is not None:
+                raise original_error
+            return str((returned or {}).get("status") or "completed")
+
+        return asyncio.run(captured_turn())
 
     solve.last_result = None
     return solve
@@ -1885,6 +2070,7 @@ def ad_domain_admins_probe_via_reader(reader: Callable[[str], set], domain: str,
 
 async def _mythic_login_async_safe():
     """Async Mythic login for use inside an already-async probe body."""
+    _install_control_meter()
     from mythic import mythic  # type: ignore
     return await mythic.login(
         server_ip="127.0.0.1",
