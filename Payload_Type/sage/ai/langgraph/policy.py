@@ -25,6 +25,7 @@ SELECTION_CONTRACT_SYMBOLIC = "symbolic_frontier"
 SELECTION_CONTRACT_HYBRID = POLICY_VERSION_HYBRID
 _MAX_OPERATIONAL_WAIT_SECONDS = 600
 _CAPTURE_DECISION_PACKETS_ENV = "SAGE_EVAL_CAPTURE_POLICY_DECISION_PACKETS"
+_CAPTURE_REPLAY_CONTEXT_ENV = "SAGE_EVAL_CAPTURE_REPLAY_CONTEXT"
 
 
 def resolve_policy_mode(value: Any, default: str = POLICY_DEFAULT) -> tuple[str, str]:
@@ -266,6 +267,7 @@ def _captured_decision_packet(
     history: list["PolicyDecision"],
     budgets: dict[str, Any] | None,
     selection_contract: str,
+    catalog: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], str]:
     if not _env_truthy(_CAPTURE_DECISION_PACKETS_ENV):
         return {}, ""
@@ -277,6 +279,39 @@ def _captured_decision_packet(
         budgets=budgets,
         selection_contract=selection_contract,
     )
+    if _env_truthy(_CAPTURE_REPLAY_CONTEXT_ENV):
+        normalized = packet["normalized_state"]
+        packet = _transport_stable_json_value({
+            **packet,
+            "replay_context": {
+                "schema": "m3-policy-input-replay-v1",
+                "capability_catalog": catalog,
+                "history": [
+                    {
+                        "decision_id": item.decision_id,
+                        "disposition": item.disposition,
+                        "selected_capability": item.selected_capability,
+                        "selected_target": item.selected_target,
+                        "expected_evidence": item.expected_evidence,
+                    }
+                    for item in history
+                ],
+                "hops": [
+                    {
+                        "technique": str(getattr(item, "technique", "") or ""),
+                        "target": str(getattr(item, "target", "") or ""),
+                        "effect": str(getattr(item, "effect", "") or ""),
+                        "status": str(getattr(item, "status", "") or ""),
+                        "preconditions": list(getattr(item, "preconditions", None) or []),
+                        "satisfied_effects": list(getattr(item, "satisfied_effects", None) or []),
+                    }
+                    for item in list(getattr(state, "hops", None) or [])
+                ],
+                "footholds": normalized["footholds"],
+                "graph_facts": normalized["graph_facts"],
+                "achieved_effects": normalized["achieved_effects"],
+            },
+        })
     raw = json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return packet, f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
@@ -757,6 +792,7 @@ class LLMPolicy:
             history=history,
             budgets=budgets,
             selection_contract=self.selection_contract,
+            catalog=self.catalog,
         )
         if not candidates:
             return self._stop(
@@ -1205,6 +1241,7 @@ class HybridPolicy(LLMPolicy):
             history=history,
             budgets=budgets,
             selection_contract=self.selection_contract,
+            catalog=self.catalog,
         )
         selected = candidates[0]
         return PolicyDecision(

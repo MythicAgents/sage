@@ -58,6 +58,7 @@ from .operator_error import operator_error_text
 from . import worker_outcome as _worker_outcome
 from . import prompt_context
 from ai.mcp import MCPManager, MCP_EXECUTION_CONTEXT_OFFENSIVE_RUNTIME
+from ai import observation_channel
 
 # Import logging fix - handle both relative and absolute imports
 try:
@@ -8720,10 +8721,24 @@ class Model:
                     return existing
         elif data in observed:
             return data
-        observed.append(data)
+        recorded = data
+        capture = os.environ.get(observation_channel.ENV_NAME, "").strip() and os.environ.get(
+            "SAGE_EVAL_CAPTURE_REPLAY_CONTEXT", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if capture:
+            delivered = observation_channel.emit("tool_event", {
+                "event": "policy_decision",
+                "decision": data,
+            })
+            if delivered is not True:
+                raise observation_channel.ObservationChannelError("observation delivery failed")
+            recorded = dict(data)
+            recorded.pop("decision_packet", None)
+            recorded.pop("decision_packet_hash", None)
+        observed.append(recorded)
         self._controller_observed_decisions = observed
         self._controller_refresh_runtime_policy_telemetry()
-        return data
+        return recorded
 
     def _controller_record_semantic_transaction(
         self,
